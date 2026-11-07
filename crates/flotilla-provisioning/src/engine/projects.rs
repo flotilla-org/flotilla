@@ -32,6 +32,7 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 
 use super::provenance;
+use super::watch::CommitsSeen;
 use super::watch::EngineWatch;
 use crate::stored::manifest_root::ManifestRoot;
 use crate::stored::project::{ProjectDefinition, ProjectOpsRecord};
@@ -208,6 +209,8 @@ pub struct EngineProjects {
     home: String,
     log: PlainLog,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
     /// This home's dispatch judgements, by Project name.
     judged: Mutex<BTreeMap<String, Judged>>,
     /// Held across each write, so this home's writes of one Project (its definition and its
@@ -230,6 +233,7 @@ impl EngineProjects {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
         let opened = Self {
+            commits: CommitsSeen::follow(&service),
             service,
             home,
             log,
@@ -261,6 +265,9 @@ impl EngineProjects {
     /// Brings the resident map up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         {
             let Resident { follower, records } = &mut *resident;
@@ -279,7 +286,8 @@ impl EngineProjects {
                     }
                     Ok(())
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .inspect_err(|_| self.commits.give_back())?;
         }
         // A judgement outlives no Project of this home: whatever removed it, a later one of the
         // name starts afresh (its log version is above anything the old one read at).

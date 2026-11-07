@@ -26,6 +26,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
 
+use super::watch::CommitsSeen;
 use super::watch::EngineWatch;
 use crate::stored::repository::{RepositoryRecord, VerificationProvenance};
 
@@ -124,6 +125,8 @@ pub struct EngineRepositories {
     home: String,
     log: PlainLog,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -138,8 +141,14 @@ impl EngineRepositories {
     pub fn open(service: Arc<Service>, clock: Arc<dyn flotilla_resources::Clock>) -> Result<Self, String> {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
-        let opened =
-            Self { service, home, log, resident: Mutex::new(Resident { follower: Follower::new([CODE]), records: Records::new() }), clock };
+        let opened = Self {
+            commits: CommitsSeen::follow(&service),
+            service,
+            home,
+            log,
+            resident: Mutex::new(Resident { follower: Follower::new([CODE]), records: Records::new() }),
+            clock,
+        };
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
@@ -162,6 +171,9 @@ impl EngineRepositories {
     /// Brings the resident map up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         {
             let Resident { follower, records } = &mut *resident;
@@ -179,7 +191,8 @@ impl EngineRepositories {
                     }
                     Ok(())
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .inspect_err(|_| self.commits.give_back())?;
         }
         Ok(resident)
     }

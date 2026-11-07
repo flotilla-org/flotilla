@@ -10,6 +10,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
+use super::watch::CommitsSeen;
 use super::watch::EngineWatch;
 use flotilla_engine_store::{
     follow::{Followed, Follower},
@@ -92,6 +93,8 @@ pub struct PlainRecords<K> {
     home: String,
     log: PlainLog,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
     clock: Arc<dyn flotilla_resources::Clock>,
     kind: PhantomData<fn() -> K>,
 }
@@ -108,6 +111,7 @@ impl<K: PlainKind> PlainRecords<K> {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
         let opened = Self {
+            commits: CommitsSeen::follow(&service),
             service,
             home,
             log,
@@ -137,6 +141,9 @@ impl<K: PlainKind> PlainRecords<K> {
     /// Brings the resident map up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         {
             let Resident { follower, records } = &mut *resident;
@@ -154,7 +161,8 @@ impl<K: PlainKind> PlainRecords<K> {
                     }
                     Ok(())
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .inspect_err(|_| self.commits.give_back())?;
         }
         Ok(resident)
     }

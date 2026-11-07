@@ -31,6 +31,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
 
 use super::manifest_root_import::document_name;
+use super::watch::CommitsSeen;
 use crate::stored::manifest_root::{
     Act, Applied, DocumentName, ManifestRoot, Outcome, Rebind, RequestResolution, Resolve, Retire, RootEdge, RootRefusal, RootRequest,
     RootState, SourceFailed, Suspend, Unsuspend,
@@ -66,6 +67,8 @@ pub struct EngineManifestRoots {
     home: String,
     roots: Mutex<Home<ManifestRoot, StoreLog>>,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
     /// The last pass's judgement of each document of each root homed here, by engine name.
     judged: Mutex<BTreeMap<String, BTreeMap<DocumentKey, DocumentState>>>,
     clock: Arc<dyn flotilla_resources::Clock>,
@@ -79,8 +82,15 @@ impl EngineManifestRoots {
         let home = log.home().to_owned();
         let roots = open_home::<ManifestRoot>(log)?;
         let resident = Resident { follower: Follower::new([ROOT]), roots: BTreeMap::new() };
-        let opened =
-            Self { service, home, roots: Mutex::new(roots), resident: Mutex::new(resident), judged: Mutex::new(BTreeMap::new()), clock };
+        let opened = Self {
+            commits: CommitsSeen::follow(&service),
+            service,
+            home,
+            roots: Mutex::new(roots),
+            resident: Mutex::new(resident),
+            judged: Mutex::new(BTreeMap::new()),
+            clock,
+        };
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
@@ -102,6 +112,9 @@ impl EngineManifestRoots {
     /// Brings the resident map up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         self.service
             .with_store(|store| {
@@ -114,7 +127,8 @@ impl EngineManifestRoots {
                 }
                 Ok(())
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())
+            .inspect_err(|_| self.commits.give_back())?;
         Ok(resident)
     }
 

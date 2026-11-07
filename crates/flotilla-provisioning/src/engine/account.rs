@@ -30,6 +30,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
 use futures::stream::BoxStream;
 
+use super::watch::CommitsSeen;
 use super::watch::EngineWatch;
 use crate::stored::account::{
     self as stored, AccountBinding, BindingEdge, BindingSpec, BindingState, Close, ObserveEpoch, ProvisionSpec, Regrant, Revoke,
@@ -64,6 +65,8 @@ pub struct EngineAccounts {
     bindings: Mutex<Home<AccountBinding, StoreLog>>,
     provisions: PlainLog,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -84,7 +87,15 @@ impl EngineAccounts {
         let bindings = open_home::<AccountBinding>(log)?;
         let provisions = PlainLog::new(service.store());
         let resident = Resident { follower: Follower::new([BINDING, PROVISION]), bindings: BTreeMap::new(), provisions: BTreeMap::new() };
-        let accounts = Self { service, home, bindings: Mutex::new(bindings), provisions, resident: Mutex::new(resident), clock };
+        let accounts = Self {
+            commits: CommitsSeen::follow(&service),
+            service,
+            home,
+            bindings: Mutex::new(bindings),
+            provisions,
+            resident: Mutex::new(resident),
+            clock,
+        };
         let homes = accounts.service.homes();
         {
             let mut resident = locked(&accounts.resident);
@@ -106,6 +117,9 @@ impl EngineAccounts {
     /// Brings the resident maps up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         self.service
             .with_store(|store| {
@@ -119,7 +133,8 @@ impl EngineAccounts {
                 }
                 Ok(())
             })
-            .map_err(store_error)?;
+            .map_err(store_error)
+            .inspect_err(|_| self.commits.give_back())?;
         Ok(resident)
     }
 

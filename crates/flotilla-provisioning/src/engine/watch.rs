@@ -88,3 +88,35 @@ impl EngineWatch {
             .map_err(|error| StoreError::Stream(format!("read did not finish: {error}")))?
     }
 }
+
+/// Whether the store has committed since a reader last brought itself up to the log: a reader
+/// that finds nothing new skips its pass, and so the store's lock, entirely.
+pub struct CommitsSeen {
+    dirty: Arc<std::sync::atomic::AtomicBool>,
+    // The store holds the listener weakly: it lapses with this value.
+    _listener: Arc<CommitListener>,
+}
+
+impl CommitsSeen {
+    /// Starts as seen, so the first pass always runs.
+    pub fn follow(service: &Service) -> Self {
+        let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let listener: Arc<CommitListener> = {
+            let dirty = Arc::clone(&dirty);
+            Arc::new(move || dirty.store(true, std::sync::atomic::Ordering::SeqCst))
+        };
+        service.on_commit(Arc::downgrade(&listener));
+        Self { dirty, _listener: listener }
+    }
+
+    /// Whether a commit has landed since the last take. A commit landing after this call sets it
+    /// again, so the pass that follows never misses one.
+    pub fn take(&self) -> bool {
+        self.dirty.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Puts back a commit taken by a pass that failed, so the next pass runs.
+    pub fn give_back(&self) {
+        self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}

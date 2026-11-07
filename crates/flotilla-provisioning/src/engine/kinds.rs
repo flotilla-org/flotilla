@@ -30,6 +30,7 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 
 use super::provenance;
+use super::watch::CommitsSeen;
 use super::watch::EngineWatch;
 use crate::stored::{manifest_root::ManifestRoot, placement::FulfilmentKindDefinition};
 
@@ -172,6 +173,8 @@ pub struct EngineKinds {
     home: String,
     log: PlainLog,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -187,7 +190,14 @@ impl EngineKinds {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
         let follower = Follower::new([CODE, ROOT]);
-        let opened = Self { service, home, log, resident: Mutex::new(Resident { follower, records: Records::new() }), clock };
+        let opened = Self {
+            commits: CommitsSeen::follow(&service),
+            service,
+            home,
+            log,
+            resident: Mutex::new(Resident { follower, records: Records::new() }),
+            clock,
+        };
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
@@ -210,6 +220,9 @@ impl EngineKinds {
     /// Brings the resident map up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         {
             let Resident { follower, records } = &mut *resident;
@@ -225,7 +238,8 @@ impl EngineKinds {
                     }
                     Ok(())
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .inspect_err(|_| self.commits.give_back())?;
         }
         Ok(resident)
     }

@@ -42,6 +42,7 @@ use futures::stream::BoxStream;
 use serde_json::{json, Value};
 
 use super::host_import;
+use super::watch::CommitsSeen;
 use super::watch::EngineWatch;
 use crate::stored::host::{Class, Condition, HostObservation, HostRecord, Readiness};
 
@@ -292,6 +293,8 @@ pub struct EngineHosts {
     own_host: String,
     log: PlainLog,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
     /// Held across a write's read and its edit, so the observers at this home write one at a time.
     writing: tokio::sync::Mutex<()>,
     clock: Arc<dyn flotilla_resources::Clock>,
@@ -311,6 +314,7 @@ impl EngineHosts {
         let home = log.home().to_owned();
         let follower = Follower::new([HOST, OBSERVATION]);
         let opened = Self {
+            commits: CommitsSeen::follow(&service),
             service,
             home,
             own_host,
@@ -341,6 +345,9 @@ impl EngineHosts {
     /// Brings the resident map up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         {
             let Resident { follower, records } = &mut *resident;
@@ -355,7 +362,8 @@ impl EngineHosts {
                     }
                     Ok(())
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .inspect_err(|_| self.commits.give_back())?;
         }
         Ok(resident)
     }
