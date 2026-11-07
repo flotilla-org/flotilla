@@ -1,3 +1,7 @@
 [env]
 # Generated multi-host async tests need more than Rust's default test-thread stack.
 RUST_MIN_STACK = "8388608"
+# The bundled SQLite counts every allocation under one process-wide mutex unless memory
+# statistics are off. Nothing reads them, and with several stores in one process (a daemon's
+# stores and readers, or a test binary's daemons) every connection's allocations queue on it.
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"
