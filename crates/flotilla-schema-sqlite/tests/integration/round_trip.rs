@@ -7,7 +7,7 @@ use hegel::{generators as gs, TestCase};
 
 use crate::fixtures::terminal::Terminal;
 use crate::fixtures::{
-    origin, store, AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource,
+    origin, store, AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource, Service,
     TerminalSession, Ticket, Vessel, LOCAL,
 };
 
@@ -93,6 +93,11 @@ fn person_evolves_by_edges_and_spec_edits(tc: TestCase) {
 }
 
 #[hegel::test]
+fn service_evolves_by_edges_and_spec_edits(tc: TestCase) {
+    drawn::<Resource<Service>>(&tc);
+}
+
+#[hegel::test]
 fn awaiting_reply_evolves_by_edges_and_spec_edits(tc: TestCase) {
     drawn::<Resource<AwaitingReply>>(&tc);
 }
@@ -146,6 +151,11 @@ fn every_variant_round_trips_and_switches_through_writes_agent_session(tc: TestC
 #[hegel::test]
 fn every_variant_round_trips_and_switches_through_writes_person(tc: TestCase) {
     covering::<Resource<Person>>(&tc);
+}
+
+#[hegel::test]
+fn every_variant_round_trips_and_switches_through_writes_service(tc: TestCase) {
+    covering::<Resource<Service>>(&tc);
 }
 
 #[hegel::test]

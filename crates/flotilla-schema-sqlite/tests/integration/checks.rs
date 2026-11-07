@@ -9,7 +9,7 @@ use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, ErrorCode
 
 use crate::fixtures::{
     origin, registry, store, AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource,
-    TerminalSession, Ticket, Vessel,
+    Service, TerminalSession, Ticket, Vessel,
 };
 
 /// A stored value of the column's type that satisfies its own column constraint and foreign key,
@@ -82,6 +82,7 @@ fn insert_all(write: &mut Write<'_>, tc: &TestCase) {
     insert_covering::<Resource<Message>>(write, tc);
     insert_covering::<Resource<AgentSession>>(write, tc);
     insert_covering::<Resource<Person>>(write, tc);
+    insert_covering::<Resource<Service>>(write, tc);
     insert_covering::<Resource<AwaitingReply>>(write, tc);
     insert_covering::<Resource<Convoy>>(write, tc);
     insert_covering::<Resource<Ensure>>(write, tc);
@@ -126,6 +127,11 @@ fn raw_writes_breaking_a_variant_rule_are_refused_agent_session(tc: TestCase) {
 #[hegel::test]
 fn raw_writes_breaking_a_variant_rule_are_refused_person(tc: TestCase) {
     raw_writes_are_refused::<Resource<Person>>(&tc);
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_service(tc: TestCase) {
+    raw_writes_are_refused::<Resource<Service>>(&tc);
 }
 
 #[hegel::test]
@@ -175,6 +181,7 @@ fn every_registered_kind_is_checked() {
         Resource::<Message>::CODE,
         Resource::<AgentSession>::CODE,
         Resource::<Person>::CODE,
+        Resource::<Service>::CODE,
         Resource::<AwaitingReply>::CODE,
         Resource::<Convoy>::CODE,
         Resource::<Ensure>::CODE,

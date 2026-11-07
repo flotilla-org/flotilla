@@ -345,8 +345,8 @@ type DecodeReceipt = fn(&Event) -> Result<Option<(String, Transport)>, EventErro
 /// [`Receipts`] served from the store's log (#3392 G11, D1): the entries
 /// about each message, as a store's `about` read pages them, give the
 /// receipts a message's gates read. Any consumer kind's `Receive` is a
-/// receipt (#3424 ruling 2): an agent session's and a person's are accepted
-/// from the start, and [`ReceiptLog::consumer`] adds a controller's kind. An entry of another
+/// receipt (#3424 ruling 2): an agent session's, a person's and a service's
+/// are accepted from the start, and [`ReceiptLog::consumer`] adds another kind. An entry of another
 /// kind, or of another edge, is no receipt and is skipped without decoding
 /// its arguments; a `Receive` entry whose arguments do not decode is refused. A
 /// message's version is the number of receipts about it: entries are only
@@ -363,7 +363,7 @@ impl Default for ReceiptLog {
         ReceiptLog { consumers: BTreeMap::new(), messages: BTreeMap::new() }
             .consumer::<AgentSession>()
             .consumer::<Person>()
-            .consumer::<super::controller::Controller>()
+            .consumer::<super::service::Service>()
     }
 }
 

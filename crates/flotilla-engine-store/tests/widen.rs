@@ -1,5 +1,5 @@
 //! Opening a store created by a build with fewer codes (#3972): the engine's real Message
-//! tables, rendered from a registry whose `receiver_kind` predates the Controller consumer.
+//! tables, rendered from a registry whose `receiver_kind` predates the Service consumer.
 
 use flotilla_engine_store::registry;
 use flotilla_schema::{Address, ColumnType, KindRegistry, NewChange, State, Timestamp};
@@ -35,8 +35,8 @@ fn narrowed(kinds: KindRegistry, without: &[(&str, &str, &str)]) -> KindRegistry
     older
 }
 
-/// The engine registry before the Controller consumer and the Dependency relation.
-fn registry_without_controllers() -> KindRegistry {
+/// The engine registry before the Service consumer and the Dependency relation.
+fn registry_without_services() -> KindRegistry {
     narrowed(registry().expect("registry"), &[("message", "receiver_kind", "co"), ("message", "relation", "dy")])
 }
 
@@ -70,10 +70,10 @@ fn count(conn: &Connection, table: &str) -> i64 {
 // Behaviour (#3972): a store whose message table was created before `receiver_kind` had `co` and
 // `relation` had `dy` opens under this build, which rebuilds the table with both wider CHECKs: every message and its
 // references (a child table whose foreign key cascades from it) survive, the table is the one
-// this build renders, and a Dependency message for a Controller is written.
+// this build renders, and a Dependency message for a Service is written.
 #[test]
 fn a_store_with_fewer_codes_opens_wider_and_keeps_its_rows() {
-    let mut old = Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry_without_controllers()).expect("old store");
+    let mut old = Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry_without_services()).expect("old store");
     let kept: Vec<_> = ["first", "second"]
         .into_iter()
         .map(|id| {
@@ -81,7 +81,7 @@ fn a_store_with_fewer_codes_opens_wider_and_keeps_its_rows() {
             (id, old.read().expect("read").load::<Resource<Message>>(id).expect("load").expect("stored").value)
         })
         .collect();
-    assert!(insert(&mut old, &message("early", ConsumerKind::Controller, Relation::System)).is_err(), "the old table refuses `co`");
+    assert!(insert(&mut old, &message("early", ConsumerKind::Service, Relation::System)).is_err(), "the old table refuses `co`");
     let conn = old.into_connection();
     let (messages, references) = (count(&conn, "message"), count(&conn, "message_references"));
     assert_eq!((messages, references), (2, 2));
@@ -91,10 +91,10 @@ fn a_store_with_fewer_codes_opens_wider_and_keeps_its_rows() {
         let loaded = store.read().expect("read").load::<Resource<Message>>(*id).expect("load").expect("kept");
         assert_eq!(&loaded.value, value);
     }
-    let controller = message("controller", ConsumerKind::Controller, Relation::Dependency);
-    let id = insert(&mut store, &controller).expect("a Controller's message is written");
+    let service = message("service", ConsumerKind::Service, Relation::Dependency);
+    let id = insert(&mut store, &service).expect("a Service's message is written");
     let written = store.read().expect("read").load::<Resource<Message>>(id).expect("load").expect("written").value;
-    assert_eq!(written.state(), controller.state());
+    assert_eq!(written.state(), service.state());
 
     let conn = store.into_connection();
     assert_eq!((count(&conn, "message"), count(&conn, "message_references")), (messages + 1, references + 1));
@@ -117,7 +117,7 @@ fn a_store_with_fewer_codes_opens_wider_and_keeps_its_rows() {
 #[test]
 fn a_store_with_a_removed_code_is_refused() {
     let mut store = Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry().expect("registry")).expect("store");
-    insert(&mut store, &message("controller", ConsumerKind::Controller, Relation::System)).expect("controller message");
+    insert(&mut store, &message("service", ConsumerKind::Service, Relation::System)).expect("service message");
     let refused =
         Store::open(store.into_connection(), HOME, narrowed(registry().expect("registry"), &[("message", "receiver_kind", "co")]));
     assert!(
@@ -132,9 +132,8 @@ fn a_store_with_a_removed_code_is_refused() {
 // column added by hand-written `ALTER TABLE`, is not rebuilt: opening refuses it.
 #[test]
 fn a_store_with_fewer_codes_and_another_difference_is_refused() {
-    let conn = Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry_without_controllers())
-        .expect("old store")
-        .into_connection();
+    let conn =
+        Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry_without_services()).expect("old store").into_connection();
     conn.execute_batch(
         "DROP VIEW message_view;
          ALTER TABLE message DROP COLUMN delivery_condition;
@@ -154,9 +153,8 @@ fn a_store_with_fewer_codes_and_another_difference_is_refused() {
 // accepting its kind's codes. The old table is rebuilt here without `receiver_kind`'s CHECK.
 #[test]
 fn a_store_with_an_unreadable_code_check_is_refused() {
-    let conn = Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry_without_controllers())
-        .expect("old store")
-        .into_connection();
+    let conn =
+        Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry_without_services()).expect("old store").into_connection();
     let sql: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE name = 'message'", [], |row| row.get(0)).expect("table");
     let start = sql.find(" CHECK (\"receiver_kind\" IN (").expect("receiver_kind CHECK");
     let end = start + sql[start..].find("))").expect("end of CHECK") + 2;
@@ -178,7 +176,7 @@ fn a_store_with_an_unreadable_code_check_is_refused() {
 // gone (written while foreign keys were off) fails the open, which rolls the rebuild back.
 #[test]
 fn widening_a_table_with_a_dangling_row_is_refused() {
-    let mut old = Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry_without_controllers()).expect("old store");
+    let mut old = Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry_without_services()).expect("old store");
     insert(&mut old, &message("first", ConsumerKind::AgentSession, Relation::System)).expect("session message");
     let conn = old.into_connection();
     conn.execute_batch("PRAGMA foreign_keys = OFF; UPDATE message SET id = id + 1000;").expect("dangle the row");

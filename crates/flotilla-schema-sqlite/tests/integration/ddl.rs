@@ -96,6 +96,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "referral",
             "referral_references",
             "resource_identity",
+            "service",
             "snapshot_cause",
             "stream_history",
             "stream_watermark",

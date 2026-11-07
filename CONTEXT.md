@@ -114,7 +114,7 @@ _Avoid_: mailbox, queue (bare).
 **Receipt**:
 A `Receive` edge on a consumer's own resource saying it received a given
 Message, with when and through which transport; its master is the Message. Every
-consumer kind writes one the same way: an **AgentSession**, or a controller's
+consumer kind writes one the same way: an **AgentSession**, or a **Service**'s
 own resource. A person's receipt is their acknowledgement or response, through
 any **Surface**, by them or an agent acting for them; a surface loading the
 Message is not a receipt, and on a shared Inbox the first acknowledgement claims
@@ -124,19 +124,16 @@ records the Message's `deliver` edge once it observes the receipt through
 replication, naming the receiver as a consumer identity: its kind, its
 resource's id and its host (ADR 0064, #3424).
 
-**Controller (consumer record)**:
-"Controller" in general means any deterministic daemon code that reacts to
-records: the reconcilers and engine controllers of the **Control Plane**. Most
-controllers are only that. The `Controller` stored kind (code `cn`) is something
-narrower: the record a controller gets once it consumes an **Inbox**, so that it
-has somewhere to write its **Receipts**. A controller that consumes no Inbox
-never has one. There is one record per such controller per host, homed on that
-host, and only that host writes its receipts. It fills roles through ordinary
-**Role Bindings**; other hosts address the role, never the record. It lasts
-across daemon restarts, and is retired only when that controller is removed from
-the host or the host is retired (#4351). The first is each host's checkout
-inspector, which answers inspection requests.
-_Avoid_: using "Controller" for the record when the code that reacts is meant.
+**Service**:
+The consumer record of daemon code that takes Messages from an **Inbox**, beside
+the **AgentSession** and the person consumer: the stored kind `Service` (code
+`sv`), where that code writes its **Receipts**. Daemon code that consumes no
+Inbox never has one. There is one record per such service per host, homed on
+that host, and only that host writes its receipts. It fills roles through
+ordinary **Role Bindings**; other hosts address the role, never the record. It
+lasts across daemon restarts, and is retired only when that service is removed
+from the host or the host is retired (#4351). The services are each host's
+checkout inspector, which answers inspection requests, and the forge observer.
 
 **Delivery Mode**:
 A consumer's choice of how a matching Message reaches it: `turn` (pushed),

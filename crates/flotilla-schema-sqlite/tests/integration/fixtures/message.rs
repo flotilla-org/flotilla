@@ -27,7 +27,7 @@ use super::{
 pub const COVERING: usize = 80;
 
 pub fn receiver(tc: &TestCase) -> Receiver {
-    let kind = code_enum(tc, Pick::Draw, &[ConsumerKind::AgentSession, ConsumerKind::Controller]);
+    let kind = code_enum(tc, Pick::Draw, &[ConsumerKind::AgentSession, ConsumerKind::Service]);
     Receiver { kind, id: name(tc), host: name(tc) }
 }
 

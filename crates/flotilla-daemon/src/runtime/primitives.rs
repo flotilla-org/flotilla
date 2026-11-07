@@ -126,10 +126,10 @@ impl MessageDelivery {
         self.collect_turns().await;
         let holders = self.holders(now).await?;
         let person = self.primitives.register_person(now).await?;
-        let mut controllers: BTreeSet<_> =
+        let mut consumers: BTreeSet<_> =
             self.primitives.person_inboxes(&self.namespace).await?.into_iter().map(|inbox| (inbox, person.clone())).collect();
-        controllers.insert(self.inspector().await?);
-        self.rebind(&holders, controllers, now).await?;
+        consumers.insert(self.inspector().await?);
+        self.rebind(&holders, consumers, now).await?;
         for holder in holders.values() {
             if !self.inflight.contains_key(&holder.session_id) {
                 self.start_turn(holder).await?;
@@ -148,14 +148,14 @@ impl MessageDelivery {
         Ok(())
     }
 
-    /// This host's checkout inspector (#3108), registered as a controller consumer, and its inbox:
+    /// This host's checkout inspector (#3108), registered as a service, and its inbox:
     /// gates at any home ask it for an inspection there, and a request that finds the inbox unbound
     /// is dropped as undeliverable, which the gate takes as a failed inspection.
     async fn inspector(&self) -> Result<(Address, Receiver), String> {
         let inbox = flotilla_core::primitives::roles::checkout_inspector(self.primitives.home())?;
         let consumer = self
             .primitives
-            .register_controller(flotilla_core::primitives::roles::CHECKOUT_INSPECTOR, Timestamp::from_datetime(&Utc::now()))
+            .register_service(flotilla_core::primitives::roles::CHECKOUT_INSPECTOR, Timestamp::from_datetime(&Utc::now()))
             .await?;
         Ok((inbox, consumer))
     }
@@ -176,17 +176,17 @@ impl MessageDelivery {
     }
 
     /// Binds each live session's record to the inboxes it holds, and the
-    /// person and controller consumers to `controllers`, unbinds the rest, and
+    /// person and service consumers to `consumers`, unbinds the rest, and
     /// ends the records of sessions no longer live.
     async fn rebind(
         &mut self,
         holders: &BTreeMap<String, Holder>,
-        controllers: BTreeSet<(Address, Receiver)>,
+        consumers: BTreeSet<(Address, Receiver)>,
         now: Timestamp,
     ) -> Result<(), String> {
         let mut desired: BTreeSet<_> =
             holders.values().flat_map(|holder| holder.inboxes.iter().map(|inbox| (inbox.clone(), holder.consumer.clone()))).collect();
-        desired.extend(controllers);
+        desired.extend(consumers);
         let inbox = self.primitives.inbox();
         for (address, consumer) in self.bound.difference(&desired).cloned().collect::<Vec<_>>() {
             inbox.unbind(&address, &consumer).await.map_err(|error| error.to_string())?;

@@ -4,10 +4,10 @@
 pub mod agent_session;
 pub mod awaiting_reply;
 pub mod consumer;
-pub mod controller;
 pub mod convoy;
 pub mod ensure;
 pub mod lifecycle;
 pub mod message;
 pub mod person;
+pub mod service;
 pub mod vessel;

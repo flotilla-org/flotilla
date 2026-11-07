@@ -76,8 +76,8 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         terminal_session::TerminalSession,
     };
     use flotilla_state_machines::machines::{
-        agent_session::AgentSession, awaiting_reply::AwaitingReply, controller::Controller, convoy::Convoy, ensure::Ensure,
-        message::Message, person::Person, vessel::Vessel,
+        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
+        service::Service, vessel::Vessel,
     };
     ArchiveKinds::new()
         .with::<Message>()
@@ -102,8 +102,8 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         .with::<ManifestRoot>()
         // A person consumer has no end, so it stays live and is never shipped (#3938).
         .with::<Person>()
-        // A controller's record ends when the controller retires.
-        .with::<Controller>()
+        // A service's record ends when the service retires.
+        .with::<Service>()
 }
 
 /// What one pass did.

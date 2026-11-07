@@ -7,7 +7,7 @@ ADR 0064 and [the owner resolution](https://github.com/flotilla-org/flotilla/iss
 are fixed rules here. There are no design-option or mutant constants in the design.
 
 ```text
-machines/     Message, shared lifecycle, Convoy, Ensure, AwaitingReply, and the consumer kinds AgentSession and controller
+machines/     Message, shared lifecycle, Convoy, Ensure, AwaitingReply, and the consumer kinds AgentSession and Service
 world/        per-home ordered streams, host death, clock, adapter acceptance
 scenarios/    compositions and their safety / conditional liveness properties
 mutants/      single-definition overrides; each must violate a property
@@ -119,7 +119,7 @@ the cause given up with. A receipt is a consumer's `Receive` edge on its own
 resource, whose master is the message; the inbox scenario publishes its stream
 row with that edge, so the message reads the receipts about it. Message stays
 abstract over who consumes it: each consumer kind (an agent session, a
-controller) is its own module, and `controller_delivery` binds one of each to a
+service) is its own module, and `service_delivery` binds one of each to a
 shared inbox, where the first accepted deliver claims the message and a lapsed
 delivery condition lets the turn-rules role withdraw it.
 

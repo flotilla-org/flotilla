@@ -40,24 +40,24 @@ fn kind_codes_are_pinned() {
     let declared = [
         (Resource::<AgentSession>::KIND, Resource::<AgentSession>::CODE),
         (Resource::<AwaitingReply>::KIND, Resource::<AwaitingReply>::CODE),
-        (
-            Resource::<flotilla_state_machines::machines::controller::Controller>::KIND,
-            Resource::<flotilla_state_machines::machines::controller::Controller>::CODE,
-        ),
         (Resource::<Convoy>::KIND, Resource::<Convoy>::CODE),
         (Resource::<Ensure>::KIND, Resource::<Ensure>::CODE),
         (Resource::<Message>::KIND, Resource::<Message>::CODE),
         (Resource::<Person>::KIND, Resource::<Person>::CODE),
+        (
+            Resource::<flotilla_state_machines::machines::service::Service>::KIND,
+            Resource::<flotilla_state_machines::machines::service::Service>::CODE,
+        ),
         (Resource::<Vessel>::KIND, Resource::<Vessel>::CODE),
     ];
     let expected = [
         ("AgentSession", KindCode::new("as")),
         ("AwaitingReply", KindCode::new("ar")),
-        ("Controller", KindCode::new("cn")),
         ("Convoy", KindCode::new("cv")),
         ("Ensure", KindCode::new("en")),
         ("Message", KindCode::new("ms")),
         ("Person", KindCode::new("pn")),
+        ("Service", KindCode::new("sv")),
         ("Vessel", KindCode::new("ve")),
     ];
     assert_eq!(declared, expected);

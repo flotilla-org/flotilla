@@ -737,7 +737,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ms', 'state', 'pe', 'Pending'),
   ('ms', 'state', 'se', 'Settled'),
   ('ms', 'receiver_kind', 'as', 'AgentSession'),
-  ('ms', 'receiver_kind', 'co', 'Controller'),
+  ('ms', 'receiver_kind', 'co', 'Service'),
   ('ms', 'receiver_kind', 'pe', 'Person'),
   ('ms', 'reason', 'cu', 'ConsumerUnreachable'),
   ('ms', 'reason', 'ex', 'Expired'),
@@ -1040,6 +1040,25 @@ CREATE VIEW "referral_references_view" AS SELECT
   "referral_references"."resource",
   "referral_references"."id"
 FROM "referral_references";
+CREATE TABLE "service" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "state" TEXT NOT NULL CHECK ("state" IN ('re', 'ru')),
+  "state_since" INTEGER NOT NULL
+) STRICT;
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('sv', 'state', 're', 'Retired'),
+  ('sv', 'state', 'ru', 'Running'),
+  ('sv', 'log:edge', 'rt', 'Retire'),
+  ('sv', 'log:edge', 'rv', 'Receive'),
+  ('sv', 'log:label', 're', 'Retired'),
+  ('sv', 'log:label', 'ru', 'Running');
+CREATE VIEW "service_view" AS SELECT
+  "service"."id",
+  "service"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'sv' AND "field" = 'state' AND "code" = "service"."state") AS "state",
+  "service"."state_since"
+FROM "service";
 CREATE TABLE "ticket" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

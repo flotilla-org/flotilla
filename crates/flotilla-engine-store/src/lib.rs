@@ -49,8 +49,8 @@ pub fn machine_registry() -> Result<MachineRegistry, RegistryError> {
     register!(Message);
     register!(AgentSession);
     register!(Person);
-    // A controller consumer's receipts: first, each host's checkout inspector (#3108).
-    register!(flotilla_state_machines::machines::controller::Controller);
+    // A service's receipts: first, each host's checkout inspector (#3108).
+    register!(flotilla_state_machines::machines::service::Service);
     register!(convoy::Convoy);
     register!(AwaitingReply);
     Ok(MachineRegistry { kinds, diagrams })
@@ -117,7 +117,7 @@ pub struct StoreLog {
 }
 
 impl StoreLog {
-    /// A log homed at the store's own home, accepting AgentSession, Person and Controller receipts.
+    /// A log homed at the store's own home, accepting AgentSession, Person and Service receipts.
     pub fn new(store: Arc<Mutex<Store>>) -> Self {
         let home = lock_store(&store).home().to_owned();
         Self { store, home, receipts: ReceiptLog::new() }

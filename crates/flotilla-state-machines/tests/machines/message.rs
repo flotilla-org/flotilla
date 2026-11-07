@@ -497,34 +497,34 @@ fn a_lapsed_delivery_condition_withdraws_the_message() {
 #[test]
 fn a_shared_inbox_is_pending_for_each_consumer_until_its_receipt() {
     let agent = session("s1");
-    let controller = Receiver { kind: ConsumerKind::Controller, id: "approve".into(), host: "consumer".into() };
+    let service = Receiver { kind: ConsumerKind::Service, id: "approve".into(), host: "consumer".into() };
     let stranger = session("s9");
     let mut home = home(spec(Expectation::Reply, None));
     let mut world = MemoryMessageWorld::default();
-    world.binding.put(&Ref::new(INBOX), InboxBinding::Bound { consumers: [agent.clone(), controller.clone()].into() });
+    world.binding.put(&Ref::new(INBOX), InboxBinding::Bound { consumers: [agent.clone(), service.clone()].into() });
     let pending = |home: &Home<Message>, world: &MemoryMessageWorld, who: &Receiver| {
         home.judge("m", world, t(1), |h| pending_for(h, who)).expect("exists").value
     };
-    assert!(pending(&home, &world, &agent) && pending(&home, &world, &controller));
+    assert!(pending(&home, &world, &agent) && pending(&home, &world, &service));
     assert!(!pending(&home, &world, &stranger), "not bound, so not pending for it");
     assert_eq!(home.apply("m", drop(DropReason::Undeliverable), &world, t(99)).err(), refused(MessageRefusal::MissingEvidence));
 
     let own = Ref::<Receipts>::new("m");
-    world.receipts.put(&own, [(controller.clone(), Transport::Turn)].into());
-    assert!(!pending(&home, &world, &controller), "the controller has its receipt");
+    world.receipts.put(&own, [(service.clone(), Transport::Turn)].into());
+    assert!(!pending(&home, &world, &service), "the service has its receipt");
     assert!(pending(&home, &world, &agent), "the agent has none yet");
-    world.receipts.put(&own, [(controller.clone(), Transport::Turn), (agent.clone(), Transport::Turn)].into());
-    home.apply("m", Deliver { receiver: controller.clone(), transport: Transport::Turn }, &world, t(2)).expect("claimed");
+    world.receipts.put(&own, [(service.clone(), Transport::Turn), (agent.clone(), Transport::Turn)].into());
+    home.apply("m", Deliver { receiver: service.clone(), transport: Transport::Turn }, &world, t(2)).expect("claimed");
     assert_eq!(
         home.apply("m", deliver("s1", Transport::Turn), &world, t(3)).err(),
         refused(MessageRefusal::WrongState),
         "the first accepted deliver claims it"
     );
     assert!(!pending(&home, &world, &agent), "claimed: pending for nobody");
-    assert_eq!(*state(&home), MessageState::Awaiting { receiver: controller });
+    assert_eq!(*state(&home), MessageState::Awaiting { receiver: service });
 }
 
-// A deterministic controller consuming an inbox through its own resource (#3424 ruling 2): a
+// A service consuming an inbox through its own resource (#3424 ruling 2): a
 // running probe that takes a message by a `Receive` edge about it, or retires.
 states! {
     enum ProbeState => ProbeLabel {
@@ -590,7 +590,7 @@ impl Machine for Probe {
                     .from([Running])
                     .to([Running])
                     .about(|receive| &receive.message)
-                    .ungated("the controller took the message")
+                    .ungated("the service took the message")
                     .effect(|_, state, _| state),
             )
             .edge(
@@ -609,7 +609,7 @@ impl Machine for Probe {
 }
 
 impl Consumer for Probe {
-    const CONSUMER: ConsumerKind = ConsumerKind::Controller;
+    const CONSUMER: ConsumerKind = ConsumerKind::Service;
     const RECEIVE: ProbeEdgeKind = ProbeEdgeKind::Receive;
 
     fn receipt(edge: &ProbeEdge) -> Option<(&str, Transport)> {
@@ -638,7 +638,7 @@ fn entry(kind: &str, name: &str, home: &str, edge: &str, payload: &impl Cbor) ->
 }
 
 // The receipt reader accepts any consumer kind that declares a `Receive` (#3424 ruling 2): an
-// agent session's from the start, a controller's once its kind is added, each naming the
+// agent session's from the start, another kind's once it is added, each naming the
 // consumer by kind, the entry's resource and its home. Entries of a kind not accepted, and the
 // accepted kinds' other edges, are no receipts, and their payloads are never decoded as one: a
 // retirement whose payload is not even the probe's edge document is skipped, not refused.
@@ -651,7 +651,7 @@ fn the_receipt_reader_takes_every_accepted_consumer_kinds_receive() {
     let other = entry("pb", "other", "rata", "rv", &ProbeEdge::Receive(ProbeReceive { message: "n".into(), transport: Transport::Turn }));
     let entries = [session, probe, retired, other];
     let agent = Receiver { kind: ConsumerKind::AgentSession, id: "s1".into(), host: "kiwi".into() };
-    let controller = Receiver { kind: ConsumerKind::Controller, id: "approve".into(), host: "rata".into() };
+    let service = Receiver { kind: ConsumerKind::Service, id: "approve".into(), host: "rata".into() };
 
     let mut sessions_only = ReceiptLog::new();
     sessions_only.insert("m", &entries).expect("the probe's entries are skipped");
@@ -661,7 +661,7 @@ fn the_receipt_reader_takes_every_accepted_consumer_kinds_receive() {
     let mut both = ReceiptLog::new().consumer::<Probe>();
     both.insert("m", &entries).expect("a retirement is not decoded");
     let found = both.lookup(&Ref::new("m")).map(|(version, receipts)| (version, receipts.clone()));
-    assert_eq!(found, Some((Version(2), [(agent, Transport::Turn), (controller, Transport::Notify)].into())));
+    assert_eq!(found, Some((Version(2), [(agent, Transport::Turn), (service, Transport::Notify)].into())));
 
     let broken = entry("pb", "approve", "rata", "rv", &"not an edge document".to_owned());
     assert!(ReceiptLog::new().consumer::<Probe>().insert("m", [&broken]).is_err(), "a Receive that does not decode is refused");

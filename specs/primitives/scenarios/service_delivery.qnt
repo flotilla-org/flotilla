@@ -1,15 +1,15 @@
 // A shared inbox with two kinds of consumer bound (#3424 rulings 1 to 3 and 9,
 // as amended by the owner's schema look-over of 2026-10-18): agent session 1
-// and a deterministic controller, 2. Either may take the message, each through
+// and a service, 2. Either may take the message, each through
 // a Receive edge on its own resource; the first deliver the home accepts claims
 // it. The message is a request expecting an outcome, which whoever took it may
 // bring about, and it may settle from Pending once observed. The envelope
 // carries a delivery condition that may lapse, and the turn-rules role then
 // withdraws the message.
-module controller_delivery {
+module service_delivery {
   import message(IDS = Set(1)) as M from "../machines/message"
   import agent_session(IDS = Set(1)) as A from "../machines/agent_session"
-  import controller(IDS = Set(2)) as C from "../machines/controller"
+  import service(IDS = Set(2)) as C from "../machines/service"
   import stream as S from "../world/stream"
   import clock as K from "../world/clock"
   var now: int
@@ -29,7 +29,7 @@ module controller_delivery {
   val observedOutcome = ids.exists(i => S::seen(stream, "outcome", i))
   val canWrite = stream.rows.length() < maxRows
   pure def published(s: S::Stream, kind: str, who: int): bool = s.rows.indices().exists(i => s.rows[i].kind == kind and s.rows[i].session == who)
-  def live(who: int): bool = if (who == agent) A::live(A::sessions.get(who)) else C::running(C::controllers.get(who))
+  def live(who: int): bool = if (who == agent) A::live(A::sessions.get(who)) else C::running(C::services.get(who))
   val dropEvidence = { reason: M::Undeliverable, now: now, bound: bound != Set(), appliedThrough: S::watermark(stream), met: observedOutcome,
     receipt: observedReceipt, noConsumerPastThreshold: bound == Set() and now - unboundAt > 1, failure: false, supersedes: false,
     authorised: false, conditionFailed: not(conditionHolds) }
@@ -49,7 +49,7 @@ module controller_delivery {
     M::initWith(1, envelope), A::initLive, C::initRunning,
     now' = 0, stream' = S::initial, bound' = ids, took' = Set(), takes' = ids.mapBy(_ => 0), unboundAt' = 0, conditionHolds' = true,
   }
-  // The agent's turn or the controller's run over the message: once per
+  // The agent's turn or the service's run over the message: once per
   // consumer, while it is bound and live, the message is pending and its
   // delivery condition holds.
   action take(who: int): bool = all {
@@ -107,7 +107,7 @@ module controller_delivery {
   val withdrawnAfterLapse = match current { | Dropped(d) => d.reason != M::Withdrawn or not(conditionHolds) | _ => true }
   val safety = receiverTookIt and receiptAfterTake and undeliverableHasNoReceiver and noUndeliverableReceipt and withdrawnAfterLapse
     and ids.forall(i => takes.get(i) <= 1)
-  val view = (M::messages, A::sessions, C::controllers, now, stream, bound, took, takes, unboundAt, conditionHolds)
+  val view = (M::messages, A::sessions, C::services, now, stream, bound, took, takes, unboundAt, conditionHolds)
   action deliverObserved = {
     nondet who = ids.oneOf()
     all {

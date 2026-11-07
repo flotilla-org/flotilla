@@ -27,7 +27,7 @@ fn replay_quint_streams() {
         let file = path.file_name().unwrap().to_string_lossy();
         let field = if file.starts_with("message_race-") {
             "source"
-        } else if file.starts_with("inbox_delivery-") || file.starts_with("controller_delivery-") {
+        } else if file.starts_with("inbox_delivery-") || file.starts_with("service_delivery-") {
             "stream"
         } else {
             continue;

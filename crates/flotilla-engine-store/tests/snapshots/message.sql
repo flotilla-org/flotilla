@@ -161,25 +161,6 @@ CREATE VIEW "agent_session_view" AS SELECT
   "agent_session"."activity_cause",
   (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'reason' AND "code" = "agent_session"."reason") AS "reason"
 FROM "agent_session";
-CREATE TABLE "controller" (
-  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
-  "version" INTEGER NOT NULL,
-  "state" TEXT NOT NULL CHECK ("state" IN ('re', 'ru')),
-  "state_since" INTEGER NOT NULL
-) STRICT;
-INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
-  ('cn', 'state', 're', 'Retired'),
-  ('cn', 'state', 'ru', 'Running'),
-  ('cn', 'log:edge', 'rt', 'Retire'),
-  ('cn', 'log:edge', 'rv', 'Receive'),
-  ('cn', 'log:label', 're', 'Retired'),
-  ('cn', 'log:label', 'ru', 'Running');
-CREATE VIEW "controller_view" AS SELECT
-  "controller"."id",
-  "controller"."version",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'cn' AND "field" = 'state' AND "code" = "controller"."state") AS "state",
-  "controller"."state_since"
-FROM "controller";
 CREATE TABLE "convoy" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -493,7 +474,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ms', 'state', 'pe', 'Pending'),
   ('ms', 'state', 'se', 'Settled'),
   ('ms', 'receiver_kind', 'as', 'AgentSession'),
-  ('ms', 'receiver_kind', 'co', 'Controller'),
+  ('ms', 'receiver_kind', 'co', 'Service'),
   ('ms', 'receiver_kind', 'pe', 'Person'),
   ('ms', 'reason', 'cu', 'ConsumerUnreachable'),
   ('ms', 'reason', 'ex', 'Expired'),
@@ -555,6 +536,25 @@ CREATE VIEW "person_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'pn' AND "field" = 'state' AND "code" = "person"."state") AS "state",
   "person"."state_since"
 FROM "person";
+CREATE TABLE "service" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "state" TEXT NOT NULL CHECK ("state" IN ('re', 'ru')),
+  "state_since" INTEGER NOT NULL
+) STRICT;
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('sv', 'state', 're', 'Retired'),
+  ('sv', 'state', 'ru', 'Running'),
+  ('sv', 'log:edge', 'rt', 'Retire'),
+  ('sv', 'log:edge', 'rv', 'Receive'),
+  ('sv', 'log:label', 're', 'Retired'),
+  ('sv', 'log:label', 'ru', 'Running');
+CREATE VIEW "service_view" AS SELECT
+  "service"."id",
+  "service"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'sv' AND "field" = 'state' AND "code" = "service"."state") AS "state",
+  "service"."state_since"
+FROM "service";
 CREATE VIEW "log_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
   "l"."home_seq",

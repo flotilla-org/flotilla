@@ -50,10 +50,10 @@
 //!   edge about the message, and its stream row is that entry on its way to
 //!   the message's home: the message reads the entries whose row has applied.
 //!   `message_race` has no sessions, so its receipt rows are the evidence. In
-//!   `controller_delivery` the agent's receipts are its session's entries, as
-//!   in `inbox_delivery`; the controller's kind has no Rust machine yet, so its
-//!   receipt rows are the evidence, read as a [`ConsumerKind::Controller`]
-//!   receiver's, and the model's controller store is not compared.
+//!   `service_delivery` the agent's receipts are its session's entries, as
+//!   in `inbox_delivery`; the service's records are not composed here, so its
+//!   receipt rows are the evidence, read as a [`ConsumerKind::Service`]
+//!   receiver's, and the model's service store is not compared.
 //! - **AwaitingReply `Answered` and `Expired`.** The model's `Answered({reply})`
 //!   and `Expired({at})` carry what Rust keeps outside the label: the reply is
 //!   the record's `Answer` log entry's, and the time the state's `since`. The
@@ -1445,25 +1445,25 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
 }
 
 // ---------------------------------------------------------------------------
-// inbox_delivery and controller_delivery: Message and consumer session stores
+// inbox_delivery and service_delivery: Message and consumer session stores
 
 /// These engine compositions differ in their consumers, stream and evidence.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Feed {
     /// Two consumer sessions, a binding that changes, no authority.
     Inbox,
-    /// Agent session 1 and controller 2 bound together; a delivery condition
+    /// Agent session 1 and service 2 bound together; a delivery condition
     /// that may lapse, no authority.
-    Controller,
+    Service,
 }
 
-/// The controller of `controller_delivery`.
+/// The service of `service_delivery`.
 const ROBOT: i64 = 2;
 
 impl Feed {
     fn stream(self, state: &Value) -> &Value {
         match self {
-            Feed::Inbox | Feed::Controller => &state["stream"],
+            Feed::Inbox | Feed::Service => &state["stream"],
         }
     }
 
@@ -1475,8 +1475,8 @@ impl Feed {
     /// The consumer the model numbers `who`.
     fn receiver(self, who: i64) -> message::Receiver {
         match self {
-            Feed::Controller if who == ROBOT => {
-                message::Receiver { kind: ConsumerKind::Controller, id: who.to_string(), host: "consumer".into() }
+            Feed::Service if who == ROBOT => {
+                message::Receiver { kind: ConsumerKind::Service, id: who.to_string(), host: "consumer".into() }
             }
             _ => consumer(who.to_string()),
         }
@@ -1486,7 +1486,7 @@ impl Feed {
     fn binding(self, state: &Value) -> InboxBinding {
         let bound: BTreeSet<i64> = match self {
             Feed::Inbox => [number(&state["bound"])].into_iter().filter(|who| *who != 0).collect(),
-            Feed::Controller => set(&state["bound"]).iter().map(number).collect(),
+            Feed::Service => set(&state["bound"]).iter().map(number).collect(),
         };
         if bound.is_empty() {
             InboxBinding::Unbound { since: moment(number(&state["unboundAt"])) }
@@ -1540,14 +1540,14 @@ impl<'a> MessageReplay<'a> {
         let applied = stream.sessions("receipt");
         let receipts = match &self.sessions {
             // The entries about the message whose rows the message's home has applied.
-            // A controller's rows stand for its entries: its kind has no machine here.
+            // A service's rows stand for its entries: its records are not composed here.
             Some(sessions) => {
                 let about = receipts_about(sessions, ONE);
                 applied
                     .iter()
                     .map(|who| {
                         let receiver = self.feed.receiver(*who);
-                        if receiver.kind == ConsumerKind::Controller {
+                        if receiver.kind == ConsumerKind::Service {
                             return (receiver, Transport::Turn);
                         }
                         let entries =
@@ -1558,7 +1558,7 @@ impl<'a> MessageReplay<'a> {
             }
             None => applied.iter().map(|who| (self.feed.receiver(*who), Transport::Turn)).collect(),
         };
-        let condition = (self.feed == Feed::Controller).then(|| boolean(&state["conditionHolds"]));
+        let condition = (self.feed == Feed::Service).then(|| boolean(&state["conditionHolds"]));
         flotilla_quint_testkit::message::observed_world(ONE, &stream, self.feed.binding(state), receipts, condition, witness)
     }
 
@@ -1566,7 +1566,7 @@ impl<'a> MessageReplay<'a> {
         tally.steps += 1;
         let now = moment(number(&step.before["now"]));
         let who = match self.feed {
-            Feed::Inbox | Feed::Controller => step.chosen("who"),
+            Feed::Inbox | Feed::Service => step.chosen("who"),
         };
         let world = self.world(step.before, false);
         let edge: Option<MessageEdge> = match (self.feed, step.action()) {
@@ -1582,7 +1582,7 @@ impl<'a> MessageReplay<'a> {
                 assert_eq!(tag(model), "Dropped", "{step}: a drop drops");
                 let reason = &payload(model)["reason"];
                 let reason = match (self.feed, tag(reason)) {
-                    (Feed::Controller, "Withdrawn") => withdrawn_by_turn_rules(),
+                    (Feed::Service, "Withdrawn") => withdrawn_by_turn_rules(),
                     _ => drop_reason(reason),
                 };
                 Some(message::DropMessage { reason }.into())
@@ -1602,7 +1602,7 @@ impl<'a> MessageReplay<'a> {
                 accept(sessions, &who.to_string(), End { reason: EndReason::Completed, observed }, &ends, now, step, tally);
                 None
             }
-            (Feed::Controller, "endAgent") => {
+            (Feed::Service, "endAgent") => {
                 let observed = Ref::new("1");
                 let mut ends = MemoryAgentSessionWorld::default();
                 ends.ends.put(&observed, EndReason::Completed);
@@ -1612,8 +1612,8 @@ impl<'a> MessageReplay<'a> {
             }
             // A receipt is the consumer session's Receive edge about the message;
             // its row then travels the stream to the message's home.
-            (Feed::Inbox, "receive") | (Feed::Controller, "receiveAgent") => {
-                let name = if self.feed == Feed::Controller { "1".to_owned() } else { who.to_string() };
+            (Feed::Inbox, "receive") | (Feed::Service, "receiveAgent") => {
+                let name = if self.feed == Feed::Service { "1".to_owned() } else { who.to_string() };
                 let sessions = self.sessions.as_mut().expect("sessions");
                 let receive = Receive { message: ONE.into(), transport: Transport::Turn };
                 accept(sessions, &name, receive, &MemoryAgentSessionWorld::default(), now, step, tally);
@@ -1625,7 +1625,7 @@ impl<'a> MessageReplay<'a> {
                 "turn" | "publish" | "bind" | "unbindEndedWorld" | "unbindSilentWorld" | "applySource" | "applyHome" | "disconnect"
                 | "connect" | "die" | "recover" | "tick",
             )
-            | (Feed::Controller, "take" | "receiveRobot" | "bringAbout" | "retireRobot" | "applyStream" | "tick" | "lapse") => None,
+            | (Feed::Service, "take" | "receiveRobot" | "bringAbout" | "retireRobot" | "applyStream" | "tick" | "lapse") => None,
             (_, other) => panic!("{step}: message operation {other}"),
         };
         if let Some(edge) = edge {
@@ -1691,10 +1691,10 @@ impl<'a> MessageReplay<'a> {
             }
         }
         // `receiverTurned`, `receiverTookIt`: a receipt exists only after the
-        // consumer's turn, or the controller's run.
+        // consumer's turn, or the service's run.
         let took = match self.feed {
             Feed::Inbox => Some(&state["turned"]),
-            Feed::Controller => Some(&state["took"]),
+            Feed::Service => Some(&state["took"]),
         };
         if let Some(took) = took {
             let took: BTreeSet<i64> = set(took).iter().map(number).collect();
@@ -1705,7 +1705,7 @@ impl<'a> MessageReplay<'a> {
             }
         }
         // `withdrawnAfterLapse`: the turn-rules role withdraws only a lapsed message.
-        if self.feed == Feed::Controller
+        if self.feed == Feed::Service
             && would_accept(&self.home, ONE, message::DropMessage { reason: withdrawn_by_turn_rules() }, &world, now, tally)
         {
             assert!(!boolean(&state["conditionHolds"]), "{step}: withdrawn while its delivery condition holds");
@@ -1720,8 +1720,8 @@ fn inbox_delivery(trace: &Trace, tally: &mut Tally) {
     }
 }
 
-fn controller_delivery(trace: &Trace, tally: &mut Tally) {
-    let mut replay = MessageReplay::new(trace, Feed::Controller);
+fn service_delivery(trace: &Trace, tally: &mut Tally) {
+    let mut replay = MessageReplay::new(trace, Feed::Service);
     for step in trace.steps() {
         replay.step(&step, tally);
     }
@@ -1908,7 +1908,7 @@ fn replay_quint_itf_traces() {
         ("ensure_bind", ensure_bind),
         ("inbox_delivery", inbox_delivery),
         ("message_race", message_race::<BareMessage>),
-        ("controller_delivery", controller_delivery),
+        ("service_delivery", service_delivery),
         ("machine_edges", machine_edges),
         ("admission_placement", admission_placement),
         ("reply_exchange", reply_exchange),

@@ -6,7 +6,6 @@ Kind tables only; the shared tables are in `message.sql`.
 |---|---|--:|---|---|---|
 | `awaiting_reply` | root | 12 | – | – | `open_by_sender` (sender), `open_by_subject` (subject), `by_message` (message), `deadline` (deadline) |
 | `agent_session` | root | 9 | – | – | – |
-| `controller` | root | 4 | – | – | – |
 | `convoy` | root | 9 | – | `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_quota` (state data), `convoy_retired` (state data) | `open_by_project` (project) |
 | `convoy_duties` | child | 6 | 1: `scope` 1 | `convoy_duties_scope_promises` (child) | – |
 | `convoy_duties_scope_promises` | child | 3 | – | – | – |
@@ -18,6 +17,7 @@ Kind tables only; the shared tables are in `message.sql`.
 | `message` | root | 23 | 5: `expectation` 2, `reason` 3 | `message_references` (child) | `pending_by_inbox` (inbox, admitted_seq), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
 | `message_references` | child | 5 | – | – | – |
 | `person` | root | 4 | – | – | – |
+| `service` | root | 4 | – | – | – |
 
 Tables wider than 30 columns:
 - none

@@ -35,7 +35,7 @@ pub const STANDING: FleetRole = FleetRole {
 pub const TEARDOWN: FleetRole =
     FleetRole { name: "teardown", purpose: "Reclaims a finished convoy's resources, and tells a person when reclaim is refused." };
 
-/// The checkout inspector (#3108): each host's controller that inspects the checkouts homed there
+/// The checkout inspector (#3108): each host's service that inspects the checkouts homed there
 /// when a gate asks, through its host's inbox `host:<host>/role:checkout-inspector`.
 pub const CHECKOUT_INSPECTOR: &str = "checkout-inspector";
 
@@ -48,7 +48,7 @@ pub fn checkout_inspector(host: &str) -> Result<Address, String> {
         .map_err(|error| format!("checkout inspector of {host}: {error}"))
 }
 
-/// The forge observer (#3108): each host's controller that looks up its repositories' change
+/// The forge observer (#3108): each host's service that looks up its repositories' change
 /// requests by branch when branch validation asks, through `host:<host>/role:forge-observer`.
 pub const FORGE_OBSERVER: &str = "forge-observer";
 

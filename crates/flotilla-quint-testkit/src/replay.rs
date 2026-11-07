@@ -4,7 +4,7 @@ use flotilla_schema::{Address, Timestamp};
 use serde_json::Value;
 use std::{collections::BTreeSet, fmt};
 
-/// The delivery condition of `controller_delivery`'s envelope, and the
+/// The delivery condition of `service_delivery`'s envelope, and the
 /// turn-rules role that withdraws a message once it lapses.
 pub const DELIVERY: &str = "project:still-wanted";
 pub const TURN_RULES: &str = "project:fleet/role:turn-rules";

@@ -1,7 +1,7 @@
-//! A host's controller role served through its inbox (#3108): a controller consumer bound to
+//! A host's service role served through its inbox (#3108): a service bound to
 //! `host:<h>/role:<role>`, answering each request as it arrives. A request is taken with the
-//! controller's receipt, which its sender reads as the answer, or dropped as undeliverable when
-//! the controller could not do what it asked. It wakes on the inbox's watch only.
+//! service's receipt, which its sender reads as the answer, or dropped as undeliverable when
+//! the service could not do what it asked. It wakes on the inbox's watch only.
 
 use std::sync::Arc;
 
@@ -19,18 +19,18 @@ use tracing::{error, warn};
 /// between, before the role stops.
 const WATCH_ATTEMPTS: usize = 3;
 
-/// What the role's controller made of one request.
+/// What the role's service made of one request.
 pub(super) enum Handled {
-    /// Done, or nothing to do: the request takes the controller's receipt.
+    /// Done, or nothing to do: the request takes the service's receipt.
     Answered,
     /// Not done, for this reason: the request is dropped, and its sender's wait fails.
     Failed(String),
 }
 
-/// One controller role at this host.
+/// One service role at this host.
 #[async_trait]
 pub(super) trait RoleRequests: Send + Sync {
-    /// The role's name, which names its controller and its inbox under this host.
+    /// The role's name, which names its service and its inbox under this host.
     fn role(&self) -> &'static str;
     /// The role's inbox at host `home`.
     fn inbox(&self, home: &str) -> Result<Address, String>;
@@ -41,14 +41,14 @@ pub(super) trait RoleRequests: Send + Sync {
 /// Serves `requests` until its inbox cannot be watched.
 pub(super) async fn serve_role(primitives: Arc<MessagePrimitives>, requests: Arc<dyn RoleRequests>) {
     if let Err(error) = serve(&primitives, requests.as_ref()).await {
-        error!(role = requests.role(), %error, "a controller role stopped; requests to it here go unanswered");
+        error!(role = requests.role(), %error, "a service role stopped; requests to it here go unanswered");
     }
 }
 
 async fn serve(primitives: &MessagePrimitives, requests: &dyn RoleRequests) -> Result<(), String> {
     let home = primitives.home().to_owned();
     let address = requests.inbox(&home)?;
-    let consumer = primitives.register_controller(requests.role(), Timestamp::from_datetime(&Utc::now())).await?;
+    let consumer = primitives.register_service(requests.role(), Timestamp::from_datetime(&Utc::now())).await?;
     let inbox = primitives.inbox();
     // Bound here as well as by the delivery pass: binding is an idempotent insert.
     inbox.bind(address.clone(), consumer.clone()).await.map_err(|error| error.to_string())?;
@@ -71,7 +71,7 @@ async fn serve(primitives: &MessagePrimitives, requests: &dyn RoleRequests) -> R
             match futures::StreamExt::next(&mut watch).await {
                 Some(Ok(_)) => failures = 0,
                 Some(Err(error)) => {
-                    warn!(%address, %error, "a controller role's inbox watch failed; it is opened again");
+                    warn!(%address, %error, "a service role's inbox watch failed; it is opened again");
                     failures += 1;
                     break;
                 }
@@ -100,7 +100,7 @@ async fn answer_pending(primitives: &MessagePrimitives, requests: &dyn RoleReque
                 answer(primitives, &item, consumer, handled).await;
             }
         }
-        Err(error) => warn!(%address, %error, "a controller role could not read its inbox; it reads again at the next request"),
+        Err(error) => warn!(%address, %error, "a service role could not read its inbox; it reads again at the next request"),
     }
 }
 
@@ -113,11 +113,11 @@ async fn answer(primitives: &MessagePrimitives, item: &Pending, consumer: &Recei
         }
         .map_err(|error| error.to_string()),
         Handled::Failed(reason) => {
-            warn!(message = %item.message, %reason, "a controller role could not do what a request asked; it is dropped");
+            warn!(message = %item.message, %reason, "a service role could not do what a request asked; it is dropped");
             primitives.fail_request(&item.message).await
         }
     };
     if let Err(error) = answered {
-        warn!(message = %item.message, %error, "a controller role could not answer a request; it answers at the next request");
+        warn!(message = %item.message, %error, "a service role could not answer a request; it answers at the next request");
     }
 }

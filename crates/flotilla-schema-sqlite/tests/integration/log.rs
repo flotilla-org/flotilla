@@ -15,8 +15,8 @@ use flotilla_state_machines::machines::message::MessageSpec;
 use crate::fixtures::{
     addr, carry_changes, message as messages, origin, registry, store,
     synthetic::{workflow, InputValue},
-    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource, TerminalSession, Ticket,
-    Vessel, LOCAL,
+    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource, Service, TerminalSession,
+    Ticket, Vessel, LOCAL,
 };
 
 const REPLICA: &str = "replica";
@@ -104,6 +104,7 @@ fn slots() -> Vec<(KindCode, String)> {
         Resource::<Message>::CODE,
         Resource::<AgentSession>::CODE,
         Resource::<Person>::CODE,
+        Resource::<Service>::CODE,
         Resource::<AwaitingReply>::CODE,
         Resource::<Convoy>::CODE,
         Resource::<Ensure>::CODE,
@@ -174,6 +175,7 @@ fn the_log_replays_into_another_store(tc: TestCase) {
             Resource::<Message>::CODE => step::<Resource<Message>>(&tc, &mut write, live, name, last),
             Resource::<AgentSession>::CODE => step::<Resource<AgentSession>>(&tc, &mut write, live, name, last),
             Resource::<Person>::CODE => step::<Resource<Person>>(&tc, &mut write, live, name, last),
+            Resource::<Service>::CODE => step::<Resource<Service>>(&tc, &mut write, live, name, last),
             Resource::<AwaitingReply>::CODE => step::<Resource<AwaitingReply>>(&tc, &mut write, live, name, last),
             Resource::<Convoy>::CODE => step::<Resource<Convoy>>(&tc, &mut write, live, name, last),
             Resource::<Ensure>::CODE => step::<Resource<Ensure>>(&tc, &mut write, live, name, last),
@@ -471,6 +473,11 @@ fn a_snapshot_plus_its_tail_is_the_newest_snapshot_agent_session(tc: TestCase) {
 #[hegel::test]
 fn a_snapshot_plus_its_tail_is_the_newest_snapshot_person(tc: TestCase) {
     snapshot_plus_tail::<Resource<Person>>(&tc);
+}
+
+#[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_service(tc: TestCase) {
+    snapshot_plus_tail::<Resource<Service>>(&tc);
 }
 
 #[hegel::test]

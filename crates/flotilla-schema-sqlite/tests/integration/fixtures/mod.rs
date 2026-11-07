@@ -32,6 +32,7 @@ pub mod engine;
 pub mod ensure;
 pub mod message;
 pub mod person;
+pub mod service;
 pub mod synthetic;
 pub mod terminal;
 pub mod ticket;
@@ -47,7 +48,7 @@ use flotilla_schema_sqlite::{Store, Write};
 pub use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
-        vessel::Vessel,
+        service::Service, vessel::Vessel,
     },
     Resource,
 };

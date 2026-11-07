@@ -1,8 +1,8 @@
 // Pure typed rules, followed by this resource kind's store and named operations.
-// A deterministic controller's consumer resource (#3424 ruling 2): running
-// until its retirement is observed. Its Receive edge is the controller's
+// A service's consumer resource (#3424 ruling 2), for daemon code that takes messages: running
+// until its retirement is observed. Its Receive edge is the service's
 // receipt, written when it takes the message, as an agent session's is.
-module controller {
+module service {
   type State = Running | Retired
   type Event = Receive({ message: int, transport: str }) | Retire({ observed: bool })
   type Refusal = AlreadyRetired | MissingEvidence
@@ -20,20 +20,20 @@ module controller {
   // Resource-kind store. Refused rules disable actions and append nothing.
   type Slot = Absent | Present(State)
   const IDS: Set[int]
-  var controllers: int -> Slot
+  var services: int -> Slot
   pure def moved(n: Next): bool = match n { | Moved(_) => true | Refused(_) => false }
   pure def target(n: Next, old: Slot): Slot = match n { | Moved(s) => Present(s) | Refused(_) => old }
-  action init = controllers' = IDS.mapBy(_ => Absent)
-  action initRunning = controllers' = IDS.mapBy(_ => Present(Running))
-  action unchanged = controllers' = controllers
+  action init = services' = IDS.mapBy(_ => Absent)
+  action initRunning = services' = IDS.mapBy(_ => Present(Running))
+  action unchanged = services' = services
   action request(id: int): bool = all {
-    controllers.get(id) == Absent,
-    controllers' = controllers.set(id, Present(Running)),
+    services.get(id) == Absent,
+    services' = services.set(id, Present(Running)),
   }
-  action fire(id: int, e: Event): bool = match controllers.get(id) {
-    | Absent => all { false, controllers' = controllers }
+  action fire(id: int, e: Event): bool = match services.get(id) {
+    | Absent => all { false, services' = services }
     | Present(s) => val n = step(s, e)
-        all { moved(n), controllers' = controllers.set(id, target(n, controllers.get(id))) }
+        all { moved(n), services' = services.set(id, target(n, services.get(id))) }
   }
   action receive(id: int, message: int, transport: str): bool = fire(id, Receive({ message: message, transport: transport }))
   action retire(id: int, observed: bool): bool = fire(id, Retire({ observed: observed }))

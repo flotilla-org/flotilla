@@ -60,7 +60,7 @@ if [[ "$part" = all || "$part" = scenarios ]]; then
   quint test tests/stream_properties.qnt --backend typescript
   quint test tests/lifecycle_endings.qnt --backend typescript
   quint test tests/manifest_root_rules.qnt --backend typescript
-  for scenario in agent_activity convoy_deliver ensure_bind inbox_delivery message_race controller_delivery machine_edges admission_placement reply_exchange; do
+  for scenario in agent_activity convoy_deliver ensure_bind inbox_delivery message_race service_delivery machine_edges admission_placement reply_exchange; do
     # Assignment coverage is mandatory even for branches unreachable at depth one.
     # Simulation/typecheck alone can silently lose an unassigned world variable.
     step_log "$run/$scenario.frames.log" quint verify ${server[@]+"${server[@]}"} "scenarios/$scenario.qnt" --invariant safety --max-steps 1

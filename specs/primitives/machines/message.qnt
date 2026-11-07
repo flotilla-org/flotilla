@@ -4,7 +4,7 @@ module message {
   // hasCondition: the envelope carries a delivery condition (#3424 ruling 9).
   type Envelope = { expectation: Expectation, hasDeadline: bool, deadline: int, hasCondition: bool }
   // A consumer identity, compared only for equality: which kind of consumer
-  // (agent session, controller) is the consumer modules'
+  // (agent session, service) is the consumer modules'
   // concern, never this machine's (#3424 rulings 1 and 2).
   type Receiver = { consumer: int, host: str }
   type Delivery = { envelope: Envelope, receiver: Receiver }

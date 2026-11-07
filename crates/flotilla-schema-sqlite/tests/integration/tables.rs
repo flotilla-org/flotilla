@@ -20,8 +20,8 @@ use crate::fixtures::{
     engine::{step, NAME},
     ensure, message, origin, registry, store,
     synthetic::{workflow, Deliverable, DeliverableState, Evidence, InputValue, PromiseKind, PromiseSource},
-    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource, TerminalSession, Vessel,
-    LOCAL,
+    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource, Service, TerminalSession,
+    Vessel, LOCAL,
 };
 
 fn evidence(reference: &str) -> Evidence {
@@ -341,6 +341,11 @@ fn deleting_a_resource_empties_every_table_agent_session(tc: TestCase) {
 #[hegel::test]
 fn deleting_a_resource_empties_every_table_person(tc: TestCase) {
     delete_cascades::<Resource<Person>>(&tc);
+}
+
+#[hegel::test]
+fn deleting_a_resource_empties_every_table_service(tc: TestCase) {
+    delete_cascades::<Resource<Service>>(&tc);
 }
 
 #[hegel::test]

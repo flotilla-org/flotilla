@@ -1,6 +1,6 @@
-//! A controller consumes an inbox through its own record (#3108): the checkout inspector is
-//! registered as a Controller consumer, takes a request bound to its inbox with a receipt on its
-//! record, and a request to an inspector whose inbox stays unbound fails.
+//! A service consumes an inbox through its own record (#3108): the checkout inspector is
+//! registered as a Service, takes a request bound to its inbox with a receipt on its record, and
+//! a request to an inspector whose inbox stays unbound fails.
 
 use std::sync::Arc;
 
@@ -16,8 +16,8 @@ use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
     machines::{
         consumer::ConsumerKind,
-        controller::ControllerState,
         message::{Deliver, MessageBody, MessageSpec, Relation, RequestBody},
+        service::ServiceState,
     },
     Transport,
 };
@@ -71,18 +71,18 @@ fn now() -> Timestamp {
     Timestamp::from_datetime(&chrono::Utc::now())
 }
 
-// Behaviour: registering keeps one Running record per controller, and a request bound to its
+// Behaviour: registering keeps one Running record per service, and a request bound to its
 // inbox is answered once its receipt is on that record.
 #[tokio::test]
-async fn a_bound_controller_answers_a_request_with_its_receipt() {
+async fn a_bound_service_answers_a_request_with_its_receipt() {
     let dir = tempfile::tempdir().expect("tempdir");
     let primitives = primitives(&dir).await;
-    let inspector = primitives.register_controller(CHECKOUT_INSPECTOR, now()).await.expect("registered");
-    assert_eq!(inspector.kind, ConsumerKind::Controller);
+    let inspector = primitives.register_service(CHECKOUT_INSPECTOR, now()).await.expect("registered");
+    assert_eq!(inspector.kind, ConsumerKind::Service);
     assert_eq!(inspector.host, HOME);
-    assert_eq!(primitives.register_controller(CHECKOUT_INSPECTOR, now()).await.expect("again"), inspector);
-    let record = primitives.controllers().get(CHECKOUT_INSPECTOR).expect("record");
-    assert_eq!(*record.state(), ControllerState::Running);
+    assert_eq!(primitives.register_service(CHECKOUT_INSPECTOR, now()).await.expect("again"), inspector);
+    let record = primitives.services().get(CHECKOUT_INSPECTOR).expect("record");
+    assert_eq!(*record.state(), ServiceState::Running);
 
     let request = inspection(&primitives, HOME).await;
     let inbox = primitives.inbox();

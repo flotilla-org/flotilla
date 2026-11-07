@@ -28,6 +28,7 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 | `person` | root | 4 | – | – | – |
 | `referral` | root | 24 | 12: `subject` 6, `condition_address` 6 | `referral_references` (child) | `by_session` (session, seq), `by_reply` (in_reply_to) |
 | `referral_references` | child | 11 | 9: `tag` 9 | – | `repository_ref` (repository), `resource_ref` (resource) |
+| `service` | root | 4 | – | – | – |
 | `ticket` | root | 14 | – | `ticket_assignees` (state data), `ticket_notes` (state data) | `open_by_queue` (queue) |
 | `ticket_assignees` | state data | 2 | – | – | – |
 | `ticket_notes` | state data | 3 | – | – | – |
