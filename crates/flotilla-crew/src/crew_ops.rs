@@ -92,7 +92,7 @@ fn vessel_ending_reason(
     })
 }
 
-pub use flotilla_store::resolve_local_convoy_name;
+pub use flotilla_store::resolve_convoy_record;
 
 /// The sender's awaiting-reply record kind for a send (#3587 layer 7): none
 /// for a send expecting nothing, a stall for a stalled crew's supervision,

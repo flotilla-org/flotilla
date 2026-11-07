@@ -2057,6 +2057,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bon",
+ "flotilla-address",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -2530,6 +2531,7 @@ dependencies = [
  "flotilla-tracing",
  "flotilla-transport",
  "flotilla-vcs",
+ "flotilla-verbs",
  "flotilla-vessel-delivery",
  "futures",
  "getrandom 0.2.17",
@@ -3342,6 +3344,7 @@ dependencies = [
  "flotilla-store-memory",
  "flotilla-store-sqlite",
  "flotilla-store-testkit",
+ "flotilla-verbs",
  "futures",
  "hegeltest",
  "rigging-tls",
@@ -3696,6 +3699,7 @@ dependencies = [
  "bon",
  "bytes",
  "chrono",
+ "flotilla-address",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -4078,6 +4082,25 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "flotilla-verbs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "flotilla-address",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-protocol",
+ "flotilla-schema-derive",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

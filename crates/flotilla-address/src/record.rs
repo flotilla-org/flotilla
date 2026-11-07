@@ -18,6 +18,11 @@ const GITHUB_RECORD_SERVICE: &str = "github.com";
 /// - usage account: `usage-<sha256 prefix of provider and account>`;
 /// - project, convoy and host: their name.
 ///
+/// A standing convoy's address names its role while its record is `convoy-<uuid>` or
+/// `ensure-<hash>`, so a convoy address needs the role-and-project lookup
+/// (`flotilla_store::ConvoyName`) as well; both go once the engine names a convoy by its
+/// address (#3108).
+///
 /// These are the names records already carry, so this is a read and write
 /// boundary, not a stored-shape change. A convoy's Project does not take part
 /// in an artifact's name, so `project:P/convoy:C/role:R/artifact:…` and

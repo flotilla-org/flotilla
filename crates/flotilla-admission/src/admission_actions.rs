@@ -76,7 +76,7 @@ impl AdmissionActions<'_> {
             Some(namespace) => namespace.clone(),
             None => self.provisioning_namespace().await,
         };
-        let result = match flotilla_store::resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
+        let result = match flotilla_store::resolve_convoy_record(self.resource_backend, &namespace, name).await {
             Ok(record) => match self.admission.rebind_account(&namespace, &record, role, account.as_deref()).await {
                 Ok(binding) => CommandValue::AccountRebound {
                     convoy: name.clone(),

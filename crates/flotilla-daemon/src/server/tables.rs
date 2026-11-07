@@ -6,9 +6,9 @@ mod query;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use flotilla_address::{Address, Kind};
 use flotilla_protocol::table::{Message, Row};
-use flotilla_resources::{WatchStart, PROJECT_LABEL};
+use flotilla_resources::WatchStart;
 use flotilla_schema::{ColumnType, Filterable, Layout, Table, TableSet};
-use flotilla_store::{query_resource_kind, watch_resource_kind_from, ResourceBackend, REGISTERED_RESOURCE_KINDS};
+use flotilla_store::{query_resource_kind, watch_resource_kind_from, ConvoyIdentity, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use futures::{stream::BoxStream, StreamExt};
 pub(crate) use query::QueryFeed;
 use serde::{Deserialize, Serialize};
@@ -36,16 +36,11 @@ fn resource_subject(plural: &str) -> Option<Kind> {
     }
 }
 
-/// The canonical address of a resource document's subject, derived from its key: a convoy is
-/// `convoy:<record name>`, under `project:<project>` when it has one, as its roles' inboxes are.
-/// The project is the convoy's project label, which convoy addresses resolve by.
+/// The canonical address of a resource document's subject: a convoy's is the address
+/// `flotilla_store::ConvoyName` selects it by (`flotilla_store::ConvoyIdentity::address`).
 fn resource_address(kind: Kind, document: &Value) -> Option<Address> {
-    let name = document.pointer("/metadata/name")?.as_str()?;
     match kind {
-        Kind::Convoy => match document["metadata"]["labels"][PROJECT_LABEL].as_str().filter(|project| !project.is_empty()) {
-            Some(project) => Address::project(project).and_then(|project| project.child(Kind::Convoy, name)).ok(),
-            None => Address::convoy(name).ok(),
-        },
+        Kind::Convoy => ConvoyIdentity::of_document(document)?.address(),
         _ => None,
     }
 }

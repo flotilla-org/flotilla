@@ -10,8 +10,8 @@ use super::attach::{run_attach_plan, stamp_pane_identity};
 use super::connection::{connect_daemon, reset_sigpipe};
 use super::manifest::run_manifest_resolution;
 use super::targets::{
-    inject_repo_context, resolve_command_repositories, resolve_environment_target, resolve_host_target, resolve_optional_host_node,
-    set_context_repo,
+    complete_command_convoy, inject_repo_context, resolve_command_repositories, resolve_environment_target, resolve_host_target,
+    resolve_optional_host_node, set_context_repo,
 };
 
 pub use crate::frontend::artifact::run_artifact_command;
@@ -26,6 +26,9 @@ pub async fn run_control_command(cli: &Cli, mut command: Command, format: Output
     };
     let daemon = connect_daemon(cli).await?;
     if let Err(message) = resolve_command_repositories(&*daemon, &mut command).await {
+        exit_command_error(message, format);
+    }
+    if let Err(message) = complete_command_convoy(daemon.clone(), &mut command).await {
         exit_command_error(message, format);
     }
     let result = match crate::cli::run_command(&*daemon, command, format).await {

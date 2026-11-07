@@ -11,6 +11,7 @@ aws-lc-provider = []
 skip-no-sandbox-tests = []
 
 [dependencies]
+flotilla-address = { path = "../flotilla-address" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 serde = { workspace = true, features = ["derive"] }

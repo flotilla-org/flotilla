@@ -13,8 +13,7 @@ pub async fn convoy_routing_falls_back_to_a_unique_terminal_generation_and_refus
     seed_convoy_routing_row(&daemon, "convoy-two", Some("reviewer"), Some("flotilla"), flotilla_protocol::ConvoyPhase::Failed).await;
     assert_eq!(
         daemon.resolve_existing_convoy_target(&action).await,
-        Err("convoy address `reviewer@flotilla` matches multiple terminal records; use an exact record name: convoy-one, convoy-two"
-            .to_string())
+        Err("convoy `reviewer@flotilla` is held by several records; name one by its record: convoy-one, convoy-two".to_string())
     );
 }
 
@@ -131,20 +130,28 @@ pub async fn convoy_explain_refuses_multiple_terminal_generations(factory: &dyn 
 
     assert_eq!(
         daemon.explain_convoy_internal(None, "reviewer@flotilla").await,
-        Err("convoy address `reviewer@flotilla` matches multiple terminal records; use an exact record name: convoy-one, convoy-two"
-            .to_string())
+        Err("convoy `reviewer@flotilla` is held by several records; name one by its record: convoy-one, convoy-two".to_string())
     );
 }
 
-pub async fn convoy_explain_rejects_projectless_and_project_bound_role_ambiguity(factory: &dyn EnsureScenarioController) {
+// #4272: the lookup is exact. A bare role names the convoy of no project holding it, not one in
+// any project; the client completes a role from its context before sending it.
+pub async fn convoy_explain_names_a_bare_role_only_without_a_project(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     create_identity_convoy(&backend, "convoy-one", "reviewer", None).await;
     create_identity_convoy(&backend, "convoy-two", "reviewer", Some("beta")).await;
+    // Each convoy's status message is its record name, so the explanation says which was found.
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    for name in ["convoy-one", "convoy-two"] {
+        let created = convoys.get(name).await.expect("convoy");
+        let status = ConvoyStatus { message: Some(name.into()), ..Default::default() };
+        convoys.update_status(name, &created.metadata.resource_version, &status).await.expect("convoy status");
+    }
 
-    assert_eq!(
-        daemon.explain_convoy_internal(None, "reviewer").await.expect_err("bare role must be ambiguous"),
-        "convoy role `reviewer` is ambiguous; use one of: reviewer@, reviewer@beta"
-    );
+    for (address, record) in [("reviewer", "convoy-one"), ("reviewer@", "convoy-one"), ("reviewer@beta", "convoy-two")] {
+        let explanation = daemon.explain_convoy_internal(None, address).await.expect("explained");
+        assert_eq!(explanation.message.as_deref(), Some(record), "{address}");
+    }
 }
 
 pub async fn ensure_roll_targets_the_running_convoy_home_over_an_explicit_other_host(factory: &dyn EnsureScenarioController) {

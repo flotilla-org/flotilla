@@ -1,45 +1,29 @@
-//! Native verbs (#4182, #4197): typed operations on a subject kind, implemented in code,
-//! listed in the `verbs` table and invoked through `POST /verbs/{name}`.
+//! Serving native verbs (#4182, #4197, #4267): typed operations on a subject kind, declared by
+//! the crates that perform their effects, listed in the `verbs` table and invoked through
+//! `POST /verbs/{name}`. The daemon declares no verbs; the composition root collects them into a
+//! `flotilla_verbs::VerbRegistry` (`runtime::verb_registry`).
 //!
-//! - [`catalog`]: the declarations joined with their presentation entries, checked at load.
+//! - [`catalog`]: the registered verbs, checked at load.
 //! - [`invoke`]: one invocation: request checks, per-subject checks and runs, and the
 //!   `verb.invocation` span that records the intent.
 //! - [`when`]: applicability conditions over a subject's row.
-//! - [`convoy`]: convoy subjects and `convoy.explain`.
+//! - [`subjects`]: subjects' rows, from the table describing each kind's rows.
 pub(crate) mod catalog;
-pub(crate) mod convoy;
 pub(crate) mod invoke;
+pub(crate) mod subjects;
 pub(crate) mod when;
 
 use std::sync::Arc;
 
-use flotilla_core::in_process::InProcessDaemon;
-use flotilla_store::ResourceBackend;
+use flotilla_verbs::VerbRegistry;
 
 use crate::server::tables::DerivedSet;
-use catalog::{Catalog, Handler, Picks, Presentation};
+use catalog::{Catalog, Subjects};
 pub(crate) use invoke::{Refusal, Verbs};
 
-/// The built-in native verbs.
-fn natives(daemon: Option<Arc<InProcessDaemon>>) -> Vec<Arc<dyn Handler>> {
-    vec![Arc::new(convoy::ExplainConvoy { daemon })]
-}
-
-/// The built-in presentation entries, until #4198 bakes them from `verbs/*.yaml`.
-fn presentations() -> Vec<Presentation> {
-    vec![Presentation {
-        verb: "convoy.explain",
-        label: Some("Explain convoy"),
-        help: Some("Why the convoy is where it is, and what it waits on"),
-        picks: Picks::Each,
-        ..Presentation::default()
-    }]
-}
-
-/// The verb route over the daemon's resources, or over a bare backend in resource-handler tests.
-pub(crate) fn builtin(backend: ResourceBackend, daemon: Option<Arc<InProcessDaemon>>) -> Verbs {
-    let subjects = Arc::new(convoy::ResourceSubjects::new(backend));
-    Verbs { catalog: Catalog::new(natives(daemon), presentations(), subjects.as_ref()), subjects, policy: invoke::allow_all }
+/// The verb route over `registry`'s verbs and `subjects`' rows.
+pub(crate) fn serve(registry: VerbRegistry, subjects: Arc<dyn Subjects>) -> Verbs {
+    Verbs { catalog: Catalog::new(registry, subjects.as_ref()), subjects, policy: invoke::allow_all }
 }
 
 impl Verbs {

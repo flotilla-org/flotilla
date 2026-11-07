@@ -22,7 +22,7 @@ use flotilla_store::apply_status_patch_checked as apply_resource_status_patch_ch
 use flotilla_store::ResourceBackend;
 
 use crate::crew_ops;
-use crate::crew_ops::resolve_local_convoy_name;
+use crate::crew_ops::resolve_convoy_record;
 use crate::crew_ops::ConvoyResumeOutcome;
 use crate::crew_ops::CrewSupervisionRequest;
 use flotilla_daemon_api::action_events::ActionEvents;
@@ -90,7 +90,7 @@ impl CrewActions<'_> {
             let intent = if *reopen { ResumeIntent::Reopen } else { ResumeIntent::Reminder };
             let mutation_action = if *reopen { "reopened" } else { "convoy_resume" };
             let namespace = namespace.clone().unwrap_or(self.crew.provisioning_namespace().await);
-            let result = match resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
+            let result = match resolve_convoy_record(self.resource_backend, &namespace, name).await {
                 Ok(record_name) => {
                     match Box::pin(self.crew.convoy_resume_with_sender_internal(
                         &namespace,
@@ -138,7 +138,7 @@ impl CrewActions<'_> {
         if let CommandAction::ConvoyWithdrawPendingBrief { namespace, name } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let namespace = namespace.clone().unwrap_or(self.crew.provisioning_namespace().await);
-            let result = match resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
+            let result = match resolve_convoy_record(self.resource_backend, &namespace, name).await {
                 Ok(record_name) => match self.crew.withdraw_pending_brief(&namespace, &record_name).await {
                     Ok(withdrawn) => CommandValue::ConvoyBriefWithdrawn { withdrawn },
                     Err(message) => CommandValue::Error { message },
@@ -233,7 +233,7 @@ impl CrewActions<'_> {
         if let CommandAction::CrewSupervise { namespace, convoy, vessel, role, operation, message, actor_crew_id } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let namespace = namespace.clone().unwrap_or(self.crew.provisioning_namespace().await);
-            let result = match resolve_local_convoy_name(self.resource_backend, &namespace, convoy).await {
+            let result = match resolve_convoy_record(self.resource_backend, &namespace, convoy).await {
                 Ok(name) => match self
                     .crew
                     .supervise(
@@ -281,7 +281,7 @@ impl CrewActions<'_> {
                 Some(namespace) => namespace.clone(),
                 None => self.crew.provisioning_namespace().await,
             };
-            let result = match resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
+            let result = match resolve_convoy_record(self.resource_backend, &namespace, name).await {
                 Ok(record_name) => self.port.link_convoy_subject(&namespace, &record_name, reference, Some(*relationship)).await,
                 Err(error) => Err(error),
             };
@@ -298,7 +298,7 @@ impl CrewActions<'_> {
                 Some(namespace) => namespace.clone(),
                 None => self.crew.provisioning_namespace().await,
             };
-            let result = match resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
+            let result = match resolve_convoy_record(self.resource_backend, &namespace, name).await {
                 Ok(record_name) => self.port.link_convoy_subject(&namespace, &record_name, reference, None).await,
                 Err(error) => Err(error),
             };
@@ -316,7 +316,7 @@ impl CrewActions<'_> {
                 Some(namespace) => namespace.clone(),
                 None => self.crew.provisioning_namespace().await,
             };
-            let result = match resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
+            let result = match resolve_convoy_record(self.resource_backend, &namespace, name).await {
                 Ok(record_name) => match self.crew.reap(&namespace, &record_name, *force).await {
                     Ok(()) => {
                         // Finalizers retain an explainable convoy after delete; a fully
@@ -351,7 +351,7 @@ impl CrewActions<'_> {
                 Some(namespace) => namespace.clone(),
                 None => self.crew.provisioning_namespace().await,
             };
-            let result = match resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
+            let result = match resolve_convoy_record(self.resource_backend, &namespace, name).await {
                 Ok(record_name) => match self.crew.abandon(&namespace, &record_name, reason, dispatching_principal_ref.as_ref()).await {
                     Ok(archives) => {
                         self.crew
@@ -379,7 +379,7 @@ impl CrewActions<'_> {
             let empty_identity = self.events.start(id, command.description().to_string());
             let namespace = self.crew.provisioning_namespace().await;
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
-            let record_name = match resolve_local_convoy_name(self.resource_backend, &namespace, convoy).await {
+            let record_name = match resolve_convoy_record(self.resource_backend, &namespace, convoy).await {
                 Ok(record_name) => record_name,
                 Err(message) => {
                     self.events.finish(id, empty_identity, CommandValue::Error { message });
@@ -449,7 +449,7 @@ impl CrewActions<'_> {
                     return Err("a promise verdict requires a non-empty reason".to_string());
                 }
                 let namespace = self.crew.provisioning_namespace().await;
-                let record_name = resolve_local_convoy_name(self.resource_backend, &namespace, convoy).await?;
+                let record_name = resolve_convoy_record(self.resource_backend, &namespace, convoy).await?;
                 let current = self
                     .resource_backend
                     .clone()

@@ -40,6 +40,8 @@ pub mod salience;
 mod scoped_store;
 mod standing_roles;
 pub mod terminal_health;
+mod verbs;
+pub use verbs::register_verbs;
 
 /// Run one aggregator lifetime, including its provider resolvers and watch sources.
 /// Dropping the future releases its watches and materialization tasks; the runtime

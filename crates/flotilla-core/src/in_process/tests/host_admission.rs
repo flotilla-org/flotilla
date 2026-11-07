@@ -1,5 +1,4 @@
 use flotilla_resources::convoy_address::convoy_record_name;
-use flotilla_resources::parse_role_address;
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -14,102 +13,10 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{create_docker_placement, create_identity_convoy, host_direct_kind, test_meta};
+use super::support::{create_docker_placement, host_direct_kind, test_meta};
 use crate::in_process::{placement_target_host, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_admission::convoy_admission::allocate_convoy_generation;
-use flotilla_crew::crew_ops::resolve_local_convoy_name;
-
-#[test]
-fn convoy_role_addresses_reject_malformed_values() {
-    assert_eq!(parse_role_address("reviewer"), Ok(("reviewer", None)));
-    assert_eq!(parse_role_address("reviewer@flotilla"), Ok(("reviewer", Some("flotilla"))));
-    assert_eq!(parse_role_address("reviewer@"), Ok(("reviewer", Some(""))));
-    for value in ["@project", "a@b@c"] {
-        assert_eq!(parse_role_address(value), Err(format!("invalid convoy address `{value}`: expected role@project")));
-    }
-    assert_eq!(parse_role_address(""), Err("convoy role cannot be empty".to_string()));
-}
-
-#[tokio::test]
-async fn convoy_role_resolution_can_disambiguate_a_projectless_convoy() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_identity_convoy(&backend, "convoy-one", "reviewer", None).await;
-    create_identity_convoy(&backend, "convoy-two", "reviewer", Some("beta")).await;
-
-    assert_eq!(
-        resolve_local_convoy_name(&backend, "flotilla", "reviewer").await,
-        Err("convoy role `reviewer` is ambiguous; use one of: reviewer@, reviewer@beta".to_string())
-    );
-    assert_eq!(resolve_local_convoy_name(&backend, "flotilla", "reviewer@").await, Ok("convoy-one".to_string()));
-    assert_eq!(resolve_local_convoy_name(&backend, "flotilla", "reviewer@beta").await, Ok("convoy-two".to_string()));
-}
-
-#[tokio::test]
-async fn convoy_resolution_falls_back_to_a_unique_terminal_generation() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_identity_convoy(&backend, "convoy-one", "reviewer", Some("flotilla")).await;
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys.get("convoy-one").await.expect("terminal convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
-        )
-        .await
-        .expect("mark convoy terminal");
-
-    assert_eq!(resolve_local_convoy_name(&backend, "flotilla", "reviewer@flotilla").await, Ok("convoy-one".to_string()));
-}
-
-#[tokio::test]
-async fn convoy_resolution_refuses_multiple_terminal_generations() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_identity_convoy(&backend, "convoy-one", "reviewer", Some("flotilla")).await;
-    create_identity_convoy(&backend, "convoy-two", "reviewer", Some("flotilla")).await;
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    for name in ["convoy-one", "convoy-two"] {
-        let created = convoys.get(name).await.expect("terminal convoy");
-        convoys
-            .update_status(
-                &created.metadata.name,
-                &created.metadata.resource_version,
-                &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
-            )
-            .await
-            .expect("mark convoy terminal");
-    }
-
-    assert_eq!(
-        resolve_local_convoy_name(&backend, "flotilla", "reviewer@flotilla").await,
-        Err("convoy address `reviewer@flotilla` matches multiple terminal records; use an exact record name: convoy-one, convoy-two"
-            .to_string())
-    );
-}
-
-#[tokio::test]
-async fn convoy_resolution_prefers_an_exact_unlabelled_record_name() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("pre-identity-record".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("review".to_string()).build(),
-        )
-        .await
-        .expect("pre-identity convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
-        )
-        .await
-        .expect("mark convoy terminal");
-
-    assert_eq!(resolve_local_convoy_name(&backend, "flotilla", "pre-identity-record").await, Ok("pre-identity-record".to_string()));
-}
 
 #[tokio::test]
 async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_named_standalone() {

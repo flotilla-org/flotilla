@@ -103,8 +103,8 @@ async fn convoy_explain_refuses_multiple_terminal_generations() {
 }
 
 #[tokio::test]
-async fn convoy_explain_rejects_projectless_and_project_bound_role_ambiguity() {
-    ensure_scenarios::convoy_explain_rejects_projectless_and_project_bound_role_ambiguity(&Controller).await;
+async fn convoy_explain_names_a_bare_role_only_without_a_project() {
+    ensure_scenarios::convoy_explain_names_a_bare_role_only_without_a_project(&Controller).await;
 }
 
 #[tokio::test]

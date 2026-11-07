@@ -23,6 +23,7 @@ use flotilla_transport::message::MessageSession;
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
+pub mod address_context;
 #[cfg(unix)]
 pub mod bridge;
 pub mod endpoint;
