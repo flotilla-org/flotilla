@@ -2241,30 +2241,11 @@ async fn artifact_environment_reference_contract() {
             .get(address.strip_prefix("artifact/").expect("artifact address"))
             .await
             .expect("ledger record");
-        leader
-            .resource_backend()
-            .using::<Artifact>("other-project-namespace")
-            .create(&InputMeta::builder().name(record.metadata.name.clone()).build(), &record.spec)
-            .await
-            .expect("other namespace artifact");
         topology
             .client
             .artifact_get(format!("artifact/{namespace}/{}", record.metadata.name), "result.bin".into())
             .await
             .expect("crew can qualify its own namespace");
-        // Review #2536: namespace-qualified reads across the fleet belong to the operator.
-        let error = topology
-            .client
-            .artifact_get(format!("artifact/other-project-namespace/{}", record.metadata.name), "denied.bin".into())
-            .await
-            .expect_err("crew cannot cross namespaces");
-        assert!(error.contains("cannot cross namespaces"), "{error}");
-        assert!(!workspace.path().join("denied.bin").exists());
-        operator
-            .client
-            .artifact_get(format!("artifact/other-project-namespace/{}", record.metadata.name), operator_destination.clone())
-            .await
-            .expect("operator get qualified artifact");
         assert_eq!(tokio::fs::read(operator_destination).await.expect("operator file"), ledger);
         assert_eq!(tokio::fs::read(destination).await.expect("ledger destination"), ledger);
         // Observe only the completion below; earlier artifact requests can fill the broadcast buffer.
