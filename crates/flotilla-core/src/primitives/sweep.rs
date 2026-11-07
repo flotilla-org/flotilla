@@ -6,7 +6,10 @@
 //! home's open messages, and notes the replies and supersessions that name
 //! them. A sweep then reads only those open messages.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use flotilla_schema::{Kind, Timestamp};
 use flotilla_state_machines::{
@@ -14,7 +17,7 @@ use flotilla_state_machines::{
     Ref, Resource, Source,
 };
 
-use super::MessagePrimitives;
+use super::{awaiting::AwaitingReplies, MessagePrimitives};
 use flotilla_inbox::{InboxBackend, Observations};
 
 /// This home's open messages, and the replies and successors naming them.
@@ -41,6 +44,26 @@ pub struct SweepReport {
     pub reconciled: usize,
 }
 
+/// What a refresh reads and records to: the store, this home, and the senders' records that a
+/// receiver's drop ends. Each is shared, so a refresh runs on a blocking thread.
+struct LogSources {
+    home: String,
+    service: Arc<flotilla_schema_sqlite::stream::Service>,
+    awaiting: Arc<AwaitingReplies>,
+    world: Arc<super::GateWorld>,
+}
+
+impl LogSources {
+    fn of(primitives: &MessagePrimitives) -> Self {
+        Self {
+            home: primitives.home().to_owned(),
+            service: Arc::clone(primitives.service()),
+            awaiting: Arc::clone(primitives.awaiting()),
+            world: Arc::clone(primitives.world()),
+        }
+    }
+}
+
 impl OpenMessages {
     pub fn open(&self) -> impl Iterator<Item = &str> {
         self.open.iter().map(String::as_str)
@@ -52,18 +75,37 @@ impl OpenMessages {
     /// messages instead, then tails from the sequence preceding that scan.
     /// Writes between pages are replayed, so none can be missed.
     pub fn refresh(&mut self, primitives: &MessagePrimitives) -> Result<(), String> {
-        let own = primitives.home().to_owned();
-        let homes = primitives.service().homes();
+        self.refresh_from(&LogSources::of(primitives))
+    }
+
+    /// [`OpenMessages::refresh`] on a blocking thread: it reads the store under its lock, which an
+    /// async task must not wait on.
+    async fn refresh_off_thread(&mut self, primitives: &MessagePrimitives) -> Result<(), String> {
+        let sources = LogSources::of(primitives);
+        let mut taken = std::mem::take(self);
+        let (taken, refreshed) = tokio::task::spawn_blocking(move || {
+            let refreshed = taken.refresh_from(&sources);
+            (taken, refreshed)
+        })
+        .await
+        .map_err(|error| format!("open-message refresh did not finish: {error}"))?;
+        *self = taken;
+        refreshed
+    }
+
+    fn refresh_from(&mut self, primitives: &LogSources) -> Result<(), String> {
+        let own = primitives.home.clone();
+        let homes = primitives.service.homes();
         for home in &homes {
-            let floor = primitives.service().with_store(|store| store.read()?.resume_floor(home)).map_err(|error| error.to_string())?;
+            let floor = primitives.service.with_store(|store| store.read()?.resume_floor(home)).map_err(|error| error.to_string())?;
             match self.cursors.get(home).copied().filter(|cursor| *cursor >= floor) {
                 None => {
                     let through =
-                        primitives.service().with_store(|store| store.read()?.last_sequence(home)).map_err(|error| error.to_string())?;
+                        primitives.service.with_store(|store| store.read()?.last_sequence(home)).map_err(|error| error.to_string())?;
                     let mut after = None;
                     loop {
                         let (messages, next) = primitives
-                            .service()
+                            .service
                             .with_store(|store| {
                                 let mut read = store.read()?;
                                 let page = read.scan::<Resource<Message>>(home, after, 64)?;
@@ -90,7 +132,7 @@ impl OpenMessages {
                 }
                 Some(mut cursor) => loop {
                     let (last, messages) = primitives
-                        .service()
+                        .service
                         .with_store(|store| {
                             let mut read = store.read()?;
                             let events = read.changes_since(home, cursor, 256)?;
@@ -132,9 +174,9 @@ impl OpenMessages {
         Ok(())
     }
 
-    fn observe_message(&mut self, primitives: &MessagePrimitives, own: &str, home: &str, message: Resource<Message>) -> Result<(), String> {
+    fn observe_message(&mut self, primitives: &LogSources, own: &str, home: &str, message: Resource<Message>) -> Result<(), String> {
         // Store reads finish before this home's sender writes its record.
-        primitives.awaiting().observe_drop(home, &message, primitives.world().now())?;
+        primitives.awaiting.observe_drop(home, &message, primitives.world.now())?;
         self.observe(own, home, message.name().to_owned(), Some(message));
         Ok(())
     }
@@ -199,7 +241,7 @@ impl MessagePrimitives {
     ///
     /// A refused edge is evidence not yet observed; the next sweep retries.
     pub async fn sweep(&self, namespace: &str, now: Timestamp, index: &mut OpenMessages) -> Result<SweepReport, String> {
-        index.refresh(self)?;
+        index.refresh_off_thread(self).await?;
         let mut report = SweepReport::default();
         let roles = self.roles(namespace).await?;
         let inbox = self.inbox();
@@ -292,7 +334,7 @@ impl MessagePrimitives {
                 report.undeliverable += 1;
             }
         }
-        index.refresh(self)?;
+        index.refresh_off_thread(self).await?;
         Ok(report)
     }
 
