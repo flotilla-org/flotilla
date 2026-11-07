@@ -71,11 +71,12 @@ use flotilla_resources::{
     Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy, ConvoyPhase as ResourceConvoyPhase,
     ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSessionStatus,
-    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, FulfilmentKind, FulfilmentKindSpec, Host, HostSpec, HostStatus, InputMeta, Message,
-    RepositoryKey, Resource, ResourceError, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
-    CONVOY_LABEL, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Event, EventRegarding, EventSpec, FulfilmentKind, FulfilmentKindSpec, Host,
+    HostSpec, HostStatus, InputMeta, Message, RepositoryKey, Resource, ResourceError, ResourceProvenance, Selector, SystemClock,
+    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel,
+    VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
+    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, old_store_resource_kinds, ResourceBackend};
 use hegel::generators as gs;
@@ -165,6 +166,18 @@ async fn empty_daemon_named(host_name: &str) -> Arc<InProcessDaemon> {
 }
 
 async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Option<u64>) -> Arc<InProcessDaemon> {
+    let daemon = daemon_named_without_engine(host_name, free_space_floor_gib).await;
+    // Composed with its engine, as the runtime composes a daemon.
+    flotilla_daemon_testkit::engine::engine(&daemon);
+    daemon
+}
+
+/// A daemon a [`DaemonRuntime`] will start, which composes its engine itself.
+async fn runtime_daemon_named(host_name: &str) -> Arc<InProcessDaemon> {
+    daemon_named_without_engine(host_name, None).await
+}
+
+async fn daemon_named_without_engine(host_name: &str, free_space_floor_gib: Option<u64>) -> Arc<InProcessDaemon> {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store_with_floor(tmp.keep(), free_space_floor_gib);
     let daemon = InProcessDaemon::new(
@@ -175,8 +188,6 @@ async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Op
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    // Composed with its engine, as the runtime composes a daemon.
-    flotilla_daemon_testkit::engine::engine(&daemon);
     daemon
         .install_convoy_ensure_reconciler(Arc::new(
             EnsureReconciler::builder()
@@ -384,11 +395,44 @@ async fn assert_no_orphaned_finalizers(hosts: &[Arc<InProcessDaemon>]) {
     }
 }
 
+/// The home-bound kind the replication scenarios author to follow one record, and its deletion,
+/// through the router. Host was that kind until Hosts moved to the engine, where a daemon writes
+/// only its own; Event is a home-bound kind the old store still replicates.
+type Sample = Event;
+
+fn sample_record(name: &str) -> (InputMeta, EventSpec) {
+    sample_record_with_finalizers(name, Vec::new())
+}
+
+fn sample_record_with_finalizers(name: &str, finalizers: Vec<String>) -> (InputMeta, EventSpec) {
+    let at = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+    let spec = EventSpec {
+        regarding: EventRegarding {
+            api_version: "flotilla.work/v1".into(),
+            kind: Convoy::API_PATHS.kind.into(),
+            namespace: "flotilla".into(),
+            name: name.into(),
+        },
+        reason: "Sample".into(),
+        message: "a record replication follows".into(),
+        count: 1,
+        first_seen: at,
+        last_seen: at,
+        expires_at: at + chrono::Duration::days(365 * 1000),
+    };
+    (InputMeta::builder().name(name.to_string()).finalizers(finalizers).build(), spec)
+}
+
+async fn create_sample(host: &InProcessDaemon, name: &str) -> Result<(), ResourceError> {
+    let (meta, spec) = sample_record(name);
+    host.resource_backend().using::<Sample>("flotilla").create(&meta, &spec).await.map(drop)
+}
+
 async fn wait_for_host_resource_visibility(hosts: &[Arc<InProcessDaemon>], name: &str, should_exist: bool) {
-    let failure_message = format!("Host {name} did not become {} on every host", if should_exist { "visible" } else { "absent" });
+    let failure_message = format!("Event {name} did not become {} on every host", if should_exist { "visible" } else { "absent" });
     eventually(Duration::from_secs(5), Duration::from_millis(10), &failure_message, || async {
         for host in hosts {
-            let read = host.resource_backend().including_replicas::<Host>("flotilla").get(name).await;
+            let read = host.resource_backend().including_replicas::<Sample>("flotilla").get(name).await;
             let matches_expected = if should_exist { read.is_ok() } else { matches!(read, Err(ResourceError::NotFound { .. })) };
             if !matches_expected {
                 return false;
@@ -403,19 +447,18 @@ async fn wait_for_host_resource_visibility(hosts: &[Arc<InProcessDaemon>], name:
 async fn finalizer_oracle_detects_a_stuck_registered_resource() {
     let host = empty_daemon_named("orphaned-finalizer").await;
     let hosts = vec![Arc::clone(&host)];
-    let resources = host.resource_backend().using::<Host>("flotilla");
-    resources
-        .create(&InputMeta::builder().name("stuck".to_string()).finalizers(vec!["test/stuck".to_string()]).build(), &HostSpec::default())
-        .await
-        .expect("create resource with finalizer");
+    let resources = host.resource_backend().using::<Sample>("flotilla");
+    let (meta, spec) = sample_record_with_finalizers("stuck", vec!["test/stuck".to_string()]);
+    resources.create(&meta, &spec).await.expect("create resource with finalizer");
     resources.delete("stuck").await.expect("mark deleting");
     let detected = tokio::spawn(async move { assert_no_orphaned_finalizers(&hosts).await }).await;
     assert!(detected.is_err_and(|error| error.is_panic()), "orphaned finalizer escaped registry scan");
 }
 
-// Placement scenarios author Host capacity, a FulfilmentKind, and the admitted Convoy.
-// Replicating only those keeps each rebuilt generated mesh off unrelated watch fanout.
-const PLACEMENT_KINDS: &[&str] = &[Host::API_PATHS.kind, FulfilmentKind::API_PATHS.kind, Convoy::API_PATHS.kind];
+// Placement scenarios author Host capacity, a FulfilmentKind, the admitted Convoy, and a sample
+// record they delete through the router. Replicating only those keeps each rebuilt generated mesh
+// off unrelated watch fanout.
+const PLACEMENT_KINDS: &[&str] = &[Host::API_PATHS.kind, FulfilmentKind::API_PATHS.kind, Convoy::API_PATHS.kind, Sample::API_PATHS.kind];
 
 async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<String> {
     let hosts = vec![empty_daemon_named("pair-a").await, empty_daemon_named("pair-b").await, empty_daemon_named("pair-c").await];
@@ -528,13 +571,9 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
     assert_eq!(result, CommandValue::Ok);
     trace.push("convoy deleted".into());
     assert!(matches!(home.resource_backend().using::<Convoy>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
-    home.resource_backend()
-        .using::<Host>("flotilla")
-        .create(&InputMeta::builder().name("pair-resource".to_string()).build(), &HostSpec::default())
-        .await
-        .expect("pair resource");
+    create_sample(&home, "pair-resource").await.expect("pair resource");
     eventually(Duration::from_secs(5), Duration::from_millis(10), "pair resource visible", || async {
-        mesh.hosts[issuer_index].resource_backend().including_replicas::<Host>("flotilla").get("pair-resource").await.is_ok()
+        mesh.hosts[issuer_index].resource_backend().including_replicas::<Sample>("flotilla").get("pair-resource").await.is_ok()
     })
     .await;
     let mut events = mesh.hosts[issuer_index].subscribe();
@@ -543,7 +582,7 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
             Command::builder()
                 .action(CommandAction::ResourceDelete {
                     namespace: "flotilla".into(),
-                    kind: "hosts".into(),
+                    kind: Sample::API_PATHS.plural.into(),
                     name: "pair-resource".into(),
                     replica_origin: None,
                 })
@@ -589,15 +628,20 @@ fn cross_host_request_fits_one_megabyte_stack() {
 #[test]
 fn paired_world_host_independence_over_every_home_and_issuer() {
     for home in 0..3 {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
-        runtime.block_on(async {
-            let at_home = paired_world_trace(home, home).await;
-            for remote in (0..3).filter(|remote| *remote != home) {
-                let remote_desk = paired_world_trace(home, remote).await;
-                assert_eq!(remote_desk, at_home, "home={home}, remote={remote}");
-            }
-        });
+        let at_home = paired_world_trace_in_own_runtime(home, home);
+        for remote in (0..3).filter(|remote| *remote != home) {
+            let remote_desk = paired_world_trace_in_own_runtime(home, remote);
+            assert_eq!(remote_desk, at_home, "home={home}, remote={remote}");
+        }
     }
+}
+
+/// One trace per paused runtime. A dropped mesh leaves its hosts' change-stream rounds to
+/// their idle deadline, and a round's blocking producer stops paused time from advancing
+/// to it; dropping the runtime closes those rounds before the next world starts.
+fn paired_world_trace_in_own_runtime(home: usize, issuer: usize) -> Vec<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+    runtime.block_on(paired_world_trace(home, issuer))
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -622,12 +666,7 @@ fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
         let hosts = vec![empty_daemon_named("home").await, empty_daemon_named("peer-b").await, empty_daemon_named("peer-c").await];
         let mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("full mesh");
         let name = "deleted-during-partition";
-        hosts[0]
-            .resource_backend()
-            .using::<Host>("flotilla")
-            .create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default())
-            .await
-            .expect("create home resource");
+        create_sample(&hosts[0], name).await.expect("create home resource");
         wait_for_host_resource_visibility(&hosts, name, true).await;
         drop(mesh);
         let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[0])]).await.expect("isolated authority client");
@@ -640,7 +679,7 @@ fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
                 Command::builder()
                     .action(CommandAction::ResourceDelete {
                         namespace: "flotilla".to_string(),
-                        kind: "hosts".to_string(),
+                        kind: Sample::API_PATHS.plural.to_string(),
                         name: name.to_string(),
                         replica_origin: None,
                     })
@@ -657,7 +696,7 @@ fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
         let restarted = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart request runtimes");
         for host in &restarted.hosts {
             assert!(matches!(
-                host.resource_backend().including_replicas::<Host>("flotilla").get(name).await,
+                host.resource_backend().including_replicas::<Sample>("flotilla").get(name).await,
                 Err(ResourceError::NotFound { .. })
             ));
         }
@@ -665,9 +704,9 @@ fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
 }
 
 async fn spawn_tombstone_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
-    // This scenario authors only Host records. Keep their real routed origin and
+    // This scenario authors only sample records. Keep their real routed origin and
     // relay watches, without unrelated resource-watch fanout on every restart.
-    spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(&[Host::API_PATHS.kind])).await
+    spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(&[Sample::API_PATHS.kind])).await
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -684,12 +723,7 @@ async fn tombstone_mesh_replicates_hosts_without_unrelated_watch_commands() {
             .create(&InputMeta::builder().name("unrelated".to_string()).build(), &convoy_spec("scratch", "unrelated"))
             .await
             .expect("create unrelated kind");
-        hosts[0]
-            .resource_backend()
-            .using::<Host>("flotilla")
-            .create(&InputMeta::builder().name("selected".to_string()).build(), &HostSpec::default())
-            .await
-            .expect("create selected kind");
+        create_sample(&hosts[0], "selected").await.expect("create selected kind");
         wait_for_host_resource_visibility(&hosts, "selected", true).await;
         let convoys = hosts[1].resource_backend().including_replicas::<Convoy>("flotilla");
         if focused {
@@ -722,12 +756,7 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
         ];
         let mut mesh = spawn_tombstone_mesh(hosts.clone()).await.expect("initial mesh");
         let name = "transition-tombstone";
-        hosts[home_index]
-            .resource_backend()
-            .using::<Host>("flotilla")
-            .create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default())
-            .await
-            .expect("create at home");
+        create_sample(&hosts[home_index], name).await.expect("create at home");
         wait_for_host_resource_visibility(&hosts, name, true).await;
         if restart_before_delete {
             drop(mesh);
@@ -743,7 +772,7 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
                 Command::builder()
                     .action(CommandAction::ResourceDelete {
                         namespace: "flotilla".into(),
-                        kind: "hosts".into(),
+                        kind: Sample::API_PATHS.plural.into(),
                         name: name.into(),
                         replica_origin: None,
                     })
@@ -758,12 +787,7 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
         wait_for_host_resource_visibility(&hosts, name, false).await;
         for (step, partition_again) in transitions.into_iter().enumerate() {
             let step_name = format!("transition-step-{step}");
-            hosts[home_index]
-                .resource_backend()
-                .using::<Host>("flotilla")
-                .create(&InputMeta::builder().name(step_name.clone()).build(), &HostSpec::default())
-                .await
-                .expect("create next resource at home");
+            create_sample(&hosts[home_index], &step_name).await.expect("create next resource at home");
             wait_for_host_resource_visibility(&hosts, &step_name, true).await;
             drop(mesh);
             if partition_again {
@@ -776,7 +800,7 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
                         Command::builder()
                             .action(CommandAction::ResourceDelete {
                                 namespace: "flotilla".into(),
-                                kind: "hosts".into(),
+                                kind: Sample::API_PATHS.plural.into(),
                                 name: step_name.clone(),
                                 replica_origin: None,
                             })
@@ -796,7 +820,7 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
                         Command::builder()
                             .action(CommandAction::ResourceDelete {
                                 namespace: "flotilla".into(),
-                                kind: "hosts".into(),
+                                kind: Sample::API_PATHS.plural.into(),
                                 name: step_name.clone(),
                                 replica_origin: None,
                             })
@@ -1194,14 +1218,9 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
             Err(ResourceError::NotFound { .. })
         ));
         let resource_name = "generated-resource";
-        placement
-            .resource_backend()
-            .using::<Host>("flotilla")
-            .create(&InputMeta::builder().name(resource_name.to_string()).build(), &HostSpec::default())
-            .await
-            .expect("create resource at home");
+        create_sample(&placement, resource_name).await.expect("create resource at home");
         eventually(Duration::from_secs(5), Duration::from_millis(10), "issuer sees home resource", || async {
-            mesh.hosts[deleting_index].resource_backend().including_replicas::<Host>("flotilla").get(resource_name).await.is_ok()
+            mesh.hosts[deleting_index].resource_backend().including_replicas::<Sample>("flotilla").get(resource_name).await.is_ok()
         })
         .await;
         let mut resource_events = mesh.hosts[deleting_index].subscribe();
@@ -1210,7 +1229,7 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
                 Command::builder()
                     .action(CommandAction::ResourceDelete {
                         namespace: "flotilla".to_string(),
-                        kind: "hosts".to_string(),
+                        kind: Sample::API_PATHS.plural.to_string(),
                         name: resource_name.to_string(),
                         replica_origin: None,
                     })
@@ -1222,7 +1241,7 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
         assert_eq!(node_id, *placement.node_id(), "resource delete must execute at the resource home");
         assert!(matches!(result, CommandValue::ResourceDeleted(_)), "resource delete failed: {result:?}");
         assert!(matches!(
-            placement.resource_backend().using::<Host>("flotilla").get(resource_name).await,
+            placement.resource_backend().using::<Sample>("flotilla").get(resource_name).await,
             Err(ResourceError::NotFound { .. })
         ));
         assert_no_orphaned_finalizers(&mesh.hosts).await;
@@ -1852,12 +1871,12 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
     let home_artifacts = follower.resource_backend().using::<Artifact>(namespace).list().await.expect("home artifacts");
     assert_eq!(home_artifacts.items.len(), 1);
     assert_eq!(home_artifacts.items[0].spec.producer, "coder");
-    leader
-        .resource_backend()
-        .replica_writer::<Artifact>(follower.node_id().clone(), namespace)
-        .replace(&home_artifacts, Utc::now())
-        .await
-        .expect("deliver envelope replica");
+    // The envelope reaches the crew's host as the home's log does.
+    flotilla_provisioning_testkit::replicate_home(
+        &follower.decided_store().expect("home decided store"),
+        follower.node_id().as_str(),
+        &leader.decided_store().expect("crew host decided store"),
+    );
     assert_eq!(
         topology.client.artifact_get(address.clone(), destination.clone()).await.expect("get by address"),
         (bytes.len() as u64, None)
@@ -1900,7 +1919,7 @@ async fn artifact_environment_reference_contract() {
         (ArtifactEnvironment::Provisioned, false),
         (ArtifactEnvironment::RemoteHostDirect, true),
     ] {
-        let leader = empty_daemon_named("artifact-crew-host").await;
+        let leader = runtime_daemon_named("artifact-crew-host").await;
         // Install the real credential collaborator while keeping automatic
         // resource reconciliation gated; this contract drives requests itself.
         let (_startup_tx, startup_ready) = tokio::sync::watch::channel(false);
@@ -3493,38 +3512,30 @@ async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, 
     let namespace = "flotilla";
     seed_trusted_remote_convoy_project(&daemon, namespace).await;
 
-    let hosts = daemon.resource_backend().using::<Host>(namespace);
-    let host = hosts
-        .create(
-            &InputMeta::builder().name("remote-docker-host".to_string()).build(),
-            &HostSpec { display_name: "remote-docker".to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("create remote Docker host");
-    hosts
-        .update_status(
-            "remote-docker-host",
-            &host.metadata.resource_version,
-            &HostStatus {
-                capabilities: [
-                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
-                    (
-                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                    ),
-                    ("docker".to_string(), serde_json::json!(true)),
-                    ("os".to_string(), serde_json::json!("linux")),
-                ]
-                .into_iter()
-                .collect(),
-                fulfilment_facts: BTreeMap::from([("remote-docker".into(), compatible_codex_facts())]),
-                heartbeat_at: Some(Utc::now()),
-                ready: true,
-                ..HostStatus::default()
-            },
-        )
-        .await
-        .expect("mark remote Docker host ready without capacity");
+    // The remote Docker host is homed at its own daemon; its record arrives here as its home's
+    // log would. It is ready and heard, without admission capacity.
+    let host_spec = HostSpec { display_name: "remote-docker".to_string(), connection: Default::default(), ..HostSpec::default() };
+    let mut host_status = HostStatus {
+        capabilities: [
+            (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
+            (
+                flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+            ),
+            ("docker".to_string(), serde_json::json!(true)),
+            ("os".to_string(), serde_json::json!("linux")),
+        ]
+        .into_iter()
+        .collect(),
+        fulfilment_facts: BTreeMap::from([("remote-docker".into(), compatible_codex_facts())]),
+        heartbeat_at: Some(Utc::now()),
+        ready: true,
+        // Below its admission free-space floor: the engine holds the host's judgement as a flag,
+        // which reads back as nothing free of a one-byte floor.
+        disk_free_bytes: Some(0),
+        admission_free_space_floor_bytes: Some(1),
+        ..HostStatus::default()
+    };
     daemon
         .resource_backend()
         .using::<FulfilmentKind>(namespace)
@@ -3545,11 +3556,9 @@ async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, 
         .await
         .expect("remote Docker kind");
 
-    let mut expected = "placement refused on host `remote-docker`: admission free-space floor is unavailable";
+    let mut expected = "placement refused on host `remote-docker`: 0.0 GiB free is below the";
     if let Some(case) = provider_case {
         use flotilla_protocol::provider::{MaterialMode, ProviderReadiness};
-        let host = hosts.get("remote-docker-host").await.unwrap();
-        let mut status = host.status.unwrap();
         let mut providers = flotilla_discovery_testkit::environment::ready_placement_advertisements();
         match case {
             0 => {
@@ -3572,9 +3581,15 @@ async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, 
                 expected = "ambiguous provider instances";
             }
         }
-        status.capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
-        hosts.update_status("remote-docker-host", &host.metadata.resource_version, &status).await.unwrap();
+        host_status.capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
     }
+    flotilla_provisioning_testkit::put_host_at_its_home(
+        &daemon.decided_store().expect("decided store"),
+        "remote-docker-host",
+        &host_spec,
+        Some(&host_status),
+    )
+    .await;
     let mut events = daemon.subscribe();
     let command_id = daemon
         .execute(
