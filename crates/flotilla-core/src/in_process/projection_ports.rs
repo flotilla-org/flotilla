@@ -167,13 +167,17 @@ impl flotilla_projections::ports::AgentSessions for InProcessDaemon {
     }
 }
 
-mod agent_sessions {
-    use std::sync::Arc;
+pub use agent_sessions::DecidedAgentSessions;
 
+mod agent_sessions {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use chrono::{DateTime, Utc};
     use flotilla_engine_store::follow::Followed;
     use flotilla_projections::ports::{AgentSessionFollow, AgentSessionKey, AgentSessionUpdate};
     use flotilla_protocol::{AgentActivity, AgentSessionEnd, AgentSessionReading, NodeId};
     use flotilla_provisioning::engine::watch::EngineWatch;
+    use flotilla_resources::agent_activity::{home_current, AgentActivityView, AgentSessionReads};
     use flotilla_schema::Kind as StoredKind;
     use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
     use flotilla_state_machines::{
@@ -201,19 +205,75 @@ mod agent_sessions {
             })
             .await
             .map_err(|error| error.to_string())?;
-        let updates = futures::stream::unfold(watch, |mut watch| async move {
+        let heard = heard_from(&service);
+        let held_heard = heard.iter().map(|(home, at)| (home.clone(), *at)).collect();
+        // Every commit wakes the watch, a keepalive-only round included, so each home's heard
+        // time is read again then: one wake per keepalive, and no timer.
+        let updates = futures::stream::unfold((watch, service, heard), |(mut watch, service, mut last)| async move {
             loop {
                 // A pass that fails is tried again at the next commit.
-                match watch.next(updates).await {
-                    Ok(updates) if !updates.is_empty() => return Some((futures::stream::iter(updates), watch)),
-                    Ok(_) => {}
-                    Err(error) => tracing::warn!(%error, "the AgentSession follow could not read the log; retrying"),
+                let mut found = match watch.next(updates).await {
+                    Ok(found) => found,
+                    Err(error) => {
+                        tracing::warn!(%error, "the AgentSession follow could not read the log; retrying");
+                        Vec::new()
+                    }
+                };
+                for (home, at) in heard_from(&service) {
+                    if last.get(&home) != Some(&at) {
+                        last.insert(home.clone(), at);
+                        found.push(AgentSessionUpdate::Heard { home, at });
+                    }
+                }
+                if !found.is_empty() {
+                    return Some((futures::stream::iter(found), (watch, service, last)));
                 }
             }
         })
         .flatten()
         .boxed();
-        Ok(AgentSessionFollow { home, held, updates })
+        Ok(AgentSessionFollow { home, held, heard: held_heard, updates })
+    }
+
+    /// When this store last heard from each other home it follows: the home time its latest
+    /// applied keepalive carried. A home never heard from is left out.
+    fn heard_from(service: &Service) -> BTreeMap<NodeId, DateTime<Utc>> {
+        service
+            .homes()
+            .into_iter()
+            .filter(|home| home != service.home())
+            .filter_map(|home| {
+                let at = service.watermark(&home).ok()?.applied_through.to_datetime()?;
+                (at > DateTime::<Utc>::UNIX_EPOCH).then(|| (NodeId::new(&home), at))
+            })
+            .collect()
+    }
+
+    /// Keyed reads of the decided store's AgentSessions, with whether each one's home is current.
+    pub struct DecidedAgentSessions {
+        service: Arc<Service>,
+    }
+
+    impl DecidedAgentSessions {
+        pub fn new(service: Arc<Service>) -> Self {
+            Self { service }
+        }
+    }
+
+    impl AgentSessionReads for DecidedAgentSessions {
+        fn read(&self, name: &str, origin: Option<&str>) -> Result<Option<AgentActivityView>, String> {
+            let own = self.service.home();
+            let home = origin.unwrap_or(own);
+            let reading = self
+                .service
+                .with_store(|store| load(&mut store.read()?, name, home))
+                .map_err(|error| format!("AgentSession/{name}: {error}"))?;
+            let current = home == own || {
+                let heard = self.service.watermark(home).map_err(|error| error.to_string())?.applied_through.to_datetime();
+                home_current(heard.filter(|at| *at > DateTime::<Utc>::UNIX_EPOCH), Utc::now())
+            };
+            Ok(reading.map(|reading| AgentActivityView { reading, current }))
+        }
     }
 
     /// What one pass over the log found, in log order: written sessions as they are now, and
@@ -280,6 +340,7 @@ mod agent_sessions {
             }),
             activity_since: observation.as_ref().and_then(|observation| observation.activity_since.to_datetime()),
             activity_cause: observation.map(|observation| observation.activity_cause),
+            stale: false,
         }
     }
 }

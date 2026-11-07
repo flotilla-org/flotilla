@@ -3231,7 +3231,7 @@ async fn every_held_delivery_immediately_raises_crew_attention() {
         inbox.reconcile_delivery(&router(&transport), at(20)).await.unwrap();
         let terminal = backend.using::<flotilla_resources::TerminalSession>("flotilla").get("terminal").await.unwrap();
         assert!(matches!(
-            flotilla_resources::crew_attention(terminal.status.as_ref(), at(20)),
+            flotilla_resources::crew_attention(terminal.status.as_ref(), None),
             Some(flotilla_protocol::CrewAttention::DeliveryUnconfirmed | flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
         ));
         assert_eq!(backend.using::<flotilla_resources::Demand>("flotilla").list().await.unwrap().items.len(), 1);
@@ -3318,7 +3318,7 @@ async fn operator_delivery_authorization_does_not_follow_a_replacement_session()
     assert_eq!(held.len(), 1, "stale authorization remains listed for operators");
     assert!(held[0].reason.contains("previous receiver activation"));
     let terminal = terminals.get("terminal").await.unwrap();
-    assert!(flotilla_resources::crew_attention(terminal.status.as_ref(), at(30)).is_some());
+    assert!(flotilla_resources::crew_attention(terminal.status.as_ref(), None).is_some());
     for message in messages.list().await.unwrap().items {
         assert!(message.status.unwrap().operator_delivery.is_none());
     }
@@ -3372,7 +3372,7 @@ fn partial_operator_authorization_never_submits_a_batch_prefix(tc: hegel::TestCa
             assert!(accepts.submissions.lock().unwrap().is_empty(), "partial authorization cannot submit a prefix");
             let terminal = terminals.get("terminal").await.unwrap();
             assert!(
-                flotilla_resources::crew_attention(terminal.status.as_ref(), at(second)).is_some(),
+                flotilla_resources::crew_attention(terminal.status.as_ref(), None).is_some(),
                 "partial authorization retains attention"
             );
         }

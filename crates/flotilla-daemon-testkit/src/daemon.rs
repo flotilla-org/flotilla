@@ -290,6 +290,12 @@ impl TestDaemon {
         value
     }
 
+    /// Deliver a harness hook event, as `flotilla hook` does from inside a crew's terminal.
+    pub async fn agent_hook(&self, event: flotilla_protocol::AgentHookEvent) {
+        self.operator.client.send_agent_hook(event).await.expect("the daemon accepts the hook event");
+        self.assert_old_store_untouched();
+    }
+
     /// [`TestDaemon::execute`] in `repository`, as the CLI sends a command
     /// with its `context_repo`.
     pub async fn execute_in(&self, repository: &RepositoryKey, action: CommandAction) -> CommandValue {

@@ -1044,7 +1044,7 @@ mod tests {
         assert_eq!(status.idle_obstruction(), Some(&stray));
         observe(None).apply(&mut status);
         assert_eq!(status.screen_obstruction.as_ref(), Some(&stray), "no screen read keeps it");
-        assert_eq!(crate::read_evidence::crew_attention(Some(&status), at), Some(flotilla_protocol::CrewAttention::IdleComposerText));
+        assert_eq!(crate::crew_attention(Some(&status), None), Some(flotilla_protocol::CrewAttention::IdleComposerText));
         let described = stray.describe("crew-session");
         assert!(described.starts_with("idle, composer holds unsent text `6;24;9t` that looks like a stray terminal reply"), "{described}");
         assert!(described.contains("`cleat send-keys crew-session C-u`"), "{described}");
@@ -1058,7 +1058,7 @@ mod tests {
         status.attention = Some(unobservable.clone());
         observe(Some(None)).apply(&mut status);
         assert_eq!(status.idle_obstruction(), None, "a clear screen read clears it");
-        assert_eq!(crate::read_evidence::crew_attention(Some(&status), at), Some(flotilla_protocol::CrewAttention::Unobservable));
+        assert_eq!(crate::crew_attention(Some(&status), None), None, "nothing obstructs and no agent has reported");
     }
 
     // Hook review is visible as NeedsInput; stale obstructions are hidden after
@@ -1079,7 +1079,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(status.attention_obstruction(), Some(&obstruction));
-        assert_eq!(crate::read_evidence::crew_attention(Some(&status), at), Some(flotilla_protocol::CrewAttention::NeedsInput));
         assert!(obstruction.describe("crew-session").contains("Codex hook trust review"));
         assert_eq!(obstruction.recovery_command("crew-session"), None, "trust requires operator review");
         status.attention.as_mut().unwrap().source = TerminalAttentionSource::Hook;

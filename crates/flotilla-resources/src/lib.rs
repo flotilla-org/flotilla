@@ -4,6 +4,8 @@
 #![allow(clippy::double_must_use)]
 
 pub mod access_delivery;
+pub mod agent_activity;
+pub use agent_activity::crew_attention;
 pub mod account_access;
 pub use access_delivery::{AccessDelivery, AccessDeliverySpec};
 pub use account_access::{AccountBinding, AccountBindingSpec, AccountProvision, AccountProvisionSpec};

@@ -782,11 +782,11 @@ where
 // needs input raises its vessel's salience, and a refused declaration is listed by `fleet list`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn input_needed_and_declaration_refusals_are_read_from_their_records() {
-    use flotilla_protocol::{AwarenessGrouping, AwarenessKind, DeclarationAttentionKind, QueryId, ResultSet, Salience};
-    use flotilla_resources::{
-        DeclarationRefusedCondition, Project, ProjectSpec, ProjectStatusPatch, TerminalAttention, TerminalAttentionSource,
-        TerminalAttentionState, TerminalSessionStatusPatch, CONVOY_LABEL,
+    use flotilla_protocol::{
+        AgentEventType, AgentHarness, AgentHookEvent, AgentHookTerminalRef, AttachableId, AwarenessGrouping, AwarenessKind,
+        DeclarationAttentionKind, QueryId, ResultSet, Salience,
     };
+    use flotilla_resources::{DeclarationRefusedCondition, Project, ProjectSpec, ProjectStatusPatch, TerminalAttentionState, CONVOY_LABEL};
 
     let fleet = TestDaemon::builder().agent("stall_rate = 1.0").start().await;
     let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
@@ -807,14 +807,19 @@ async fn input_needed_and_declaration_refusals_are_read_from_their_records() {
     };
     let before = fleet.wait_query(query.clone(), |_| true).await;
     assert!(salience(&before) < Some(Salience::Attention), "the stalled vessel is not yet raised: {:?}", salience(&before));
-    let needs_input = TerminalSessionStatusPatch::ObserveAttention {
-        attention: TerminalAttention {
-            state: TerminalAttentionState::NeedsInput,
-            as_of: chrono::Utc::now(),
-            source: TerminalAttentionSource::Hook,
-        },
-    };
-    patch_status::<TerminalSession>(&fleet, &session.metadata.name, &needs_input).await;
+    // The harness asks for permission: its hook records NeedsInput on the crew's AgentSession.
+    let terminal = AgentHookTerminalRef { namespace: session.metadata.namespace.clone(), session_name: session.metadata.name.clone() };
+    fleet
+        .agent_hook(
+            AgentHookEvent::builder()
+                .attachable_id(AttachableId::new(format!("terminal:{}/{}", terminal.namespace, terminal.session_name)))
+                .harness(AgentHarness::ClaudeCode)
+                .hook_event("PermissionRequest".into())
+                .event_type(AgentEventType::WaitingForPermission)
+                .terminal(terminal)
+                .build(),
+        )
+        .await;
     fleet.wait_query(query, |result| salience(result) == Some(Salience::Attention)).await;
 
     let refusing = ProjectSpec::builder()

@@ -415,7 +415,6 @@ fn entry_is_terminal(entry: &AwarenessEntry) -> bool {
 mod tests {
     use chrono::TimeZone;
     use flotilla_protocol::{HostName, Issue, IssueRef, IssueSource, IssueState, RepositoryKey, ResourceRef, SessionPhase};
-    use flotilla_resources::TerminalAttentionState;
 
     use super::*;
     use crate::salience::{AttentionFact, RaisedFact};
@@ -688,7 +687,11 @@ mod tests {
             convoys: vec![convoy.clone()],
             salience: SalienceFacts {
                 raised: vec![RaisedFact { target: vessel.clone(), escalated: true, as_of: demand_at }],
-                attention: vec![AttentionFact { target: vessel, state: TerminalAttentionState::NeedsInput, as_of: attention_at }],
+                attention: vec![AttentionFact {
+                    target: vessel,
+                    activity: flotilla_protocol::AgentActivity::NeedsInput,
+                    as_of: attention_at,
+                }],
             },
             state: ResultSetState {
                 demand: Some(flotilla_protocol::DemandBackedMetadata { as_of: base, has_more: false }),

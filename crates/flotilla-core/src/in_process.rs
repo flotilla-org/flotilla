@@ -34,6 +34,7 @@ use flotilla_store::get_resource_kind;
 use flotilla_store::off_frame;
 use flotilla_store::ResolvedCascadeStoreExt;
 use flotilla_store_memory::InMemoryBackend;
+pub use projection_ports::DecidedAgentSessions;
 
 use flotilla_daemon_api::action_events;
 use flotilla_daemon_api::action_namespace;

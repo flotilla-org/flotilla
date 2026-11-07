@@ -64,6 +64,12 @@ pub trait LifecycleReads: Send + Sync {
         Err("checkout records are not served without the engine".into())
     }
 
+    /// The AgentSessions the decided store holds (#3108): every reader of what a crew's agent is
+    /// doing goes through them. Unavailable where no engine is installed.
+    fn agent_sessions(&self) -> Result<&dyn crate::agent_activity::AgentSessionReads, String> {
+        Err("AgentSessions are not served without the engine".into())
+    }
+
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
     /// `None` when the engine holds no such resource: the switch is off, or it was written before.
     ///
@@ -132,6 +138,10 @@ impl LifecycleReads for LateLifecycleReads {
 
     fn checkouts(&self) -> Result<&dyn crate::checkout_records::CheckoutRecords, String> {
         self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.checkouts()
+    }
+
+    fn agent_sessions(&self) -> Result<&dyn crate::agent_activity::AgentSessionReads, String> {
+        self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.agent_sessions()
     }
 
     fn try_reading(

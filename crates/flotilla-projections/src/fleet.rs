@@ -275,7 +275,15 @@ impl FleetService {
                 Some(task) => format!("{task}/{role}"),
                 None => role.clone(),
             };
-            let attention = crew_attention(session.status.as_ref(), now);
+            let origin = remote_origin.map(|(origin_root, _)| origin_root.as_str());
+            let agent = match lifecycles.agent_sessions().and_then(|reads| reads.read(&session.metadata.name, origin)) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    debug!(session = %session.metadata.name, %error, "fleet row shows no agent activity");
+                    None
+                }
+            };
+            let attention = crew_attention(session.status.as_ref(), agent.as_ref());
             let convoy_key = (session.metadata.namespace.clone(), convoy.clone());
             let host = if let Some((origin_root, _)) = remote_origin {
                 // The origin may arrive before its host summary. Wait for the mapping instead of exposing a phantom host.
@@ -546,20 +554,17 @@ pub(crate) fn environment_hosts<'a>(
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::{ConvoyPhase, CrewAttention, ResourceRef};
-    use flotilla_resources::{TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSessionStatus};
+    use flotilla_resources::TerminalSessionStatus;
 
     use super::*;
 
+    // Either delivery reason holds the crew as unconfirmed whether or not its agent has
+    // reported; a stopped session shows none.
     #[test]
     fn crew_attention_keeps_monitoring_distinct_from_lifecycle_state() {
         let now = Utc::now();
-        let mut status = TerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            attention: Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Screen }),
-            ..Default::default()
-        };
-
-        assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::Idle));
+        let mut status = TerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() };
+        assert_eq!(crew_attention(Some(&status), None), None);
 
         status.degraded = Some(flotilla_resources::TerminalSessionDegradedCondition {
             reason: "DeliveryUnconfirmed".to_string(),
@@ -568,16 +573,12 @@ mod tests {
             consecutive_failures: 1,
             observed_at: now,
         });
-        assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::DeliveryUnconfirmed));
+        assert_eq!(crew_attention(Some(&status), None), Some(CrewAttention::DeliveryUnconfirmed));
         status.degraded.as_mut().expect("condition").reason = "DeliveryNotSubmitted".into();
-        assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::DeliveryUnconfirmed));
-        status.degraded = None;
-
-        status.attention.as_mut().expect("attention").as_of = now - TerminalAttention::FRESH_FOR;
-        assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::Unobservable));
+        assert_eq!(crew_attention(Some(&status), None), Some(CrewAttention::DeliveryUnconfirmed));
 
         status.phase = ResourceTerminalSessionPhase::Stopped;
-        assert_eq!(crew_attention(Some(&status), now), None);
+        assert_eq!(crew_attention(Some(&status), None), None);
     }
 
     #[test]

@@ -1404,6 +1404,10 @@ pub struct AgentSessionReading {
     /// What reported it: a harness's native event, or `screen`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_cause: Option<String>,
+    /// Set by the reader: the session's home has not been heard from recently enough to trust
+    /// the reading, so the agent is unobservable from here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]

@@ -36,6 +36,9 @@ pub enum AgentSessionUpdate {
     Changed(Vec<(AgentSessionKey, Option<AgentSessionReading>)>),
     /// Every session held for `home` now, replacing what was held for it.
     Home { home: NodeId, sessions: Vec<(String, AgentSessionReading)> },
+    /// This home last heard from `home` at `at`: its readings are current until
+    /// [`flotilla_resources::agent_activity::HOME_HEARD_WITHIN`] after.
+    Heard { home: NodeId, at: chrono::DateTime<chrono::Utc> },
 }
 
 /// The AgentSessions held when following began, and every update after them.
@@ -43,6 +46,9 @@ pub struct AgentSessionFollow {
     /// The home the store writes; this daemon's own sessions carry it.
     pub home: NodeId,
     pub held: Vec<(AgentSessionKey, AgentSessionReading)>,
+    /// When this home last heard from each other home it follows; one never heard from is
+    /// absent. This home's own sessions are always current.
+    pub heard: Vec<(NodeId, chrono::DateTime<chrono::Utc>)>,
     pub updates: BoxStream<'static, AgentSessionUpdate>,
 }
 

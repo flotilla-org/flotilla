@@ -114,7 +114,7 @@ mod tests {
         assert!(explained.to_string().contains("same session"));
         assert!(!explained.to_string().contains("unconfirmed"));
         assert_eq!(
-            flotilla_resources::crew_attention(Some(&status), now),
+            flotilla_resources::crew_attention(Some(&status), None),
             Some(flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
         );
         assert!(status.delivered_message_id.is_none());

@@ -127,33 +127,5 @@ pub fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> Exp
         },
     }
 }
-use crate::{TerminalAttentionState, TerminalSessionStatus};
-pub fn crew_attention(
-    status: Option<&TerminalSessionStatus>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<flotilla_protocol::CrewAttention> {
-    let status = status.filter(|status| status.phase == TerminalSessionPhase::Running)?;
-    if status.degraded.as_ref().is_some_and(|condition| condition.is_controller_fence_unverifiable()) {
-        return Some(flotilla_protocol::CrewAttention::ControllerFenceUnverifiable);
-    }
-    if status.degraded.as_ref().is_some_and(|condition| condition.is_delivery()) {
-        return Some(flotilla_protocol::CrewAttention::DeliveryUnconfirmed);
-    }
-    let attention = status.attention.as_ref()?;
-    if attention.is_stale_at(now) {
-        return Some(flotilla_protocol::CrewAttention::Unobservable);
-    }
-    Some(match attention.state {
-        TerminalAttentionState::Working => flotilla_protocol::CrewAttention::Working,
-        TerminalAttentionState::NeedsInput => flotilla_protocol::CrewAttention::NeedsInput,
-        TerminalAttentionState::Idle => flotilla_protocol::CrewAttention::Idle,
-        TerminalAttentionState::Unobservable => match status.idle_obstruction() {
-            Some(crate::ScreenObstruction::ComposerText { .. }) => flotilla_protocol::CrewAttention::IdleComposerText,
-            Some(crate::ScreenObstruction::ScrolledBack) => flotilla_protocol::CrewAttention::IdleScrolledBack,
-            Some(crate::ScreenObstruction::HookReview) | None => flotilla_protocol::CrewAttention::Unobservable,
-        },
-    })
-}
-
 /// Maximum age of checkout evidence used to settle or tear down a convoy.
 pub const LANDING_EVIDENCE_TTL: std::time::Duration = std::time::Duration::from_secs(30);

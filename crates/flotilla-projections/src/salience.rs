@@ -1,8 +1,7 @@
 //! Central salience policy for the awareness projection.
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{ResourceRef, Salience};
-use flotilla_resources::TerminalAttentionState;
+use flotilla_protocol::{AgentActivity, ResourceRef, Salience};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SalienceFacts {
@@ -19,9 +18,10 @@ pub struct RaisedFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// What a crew's agent is doing, from its current AgentSession.
 pub struct AttentionFact {
     pub target: ResourceRef,
-    pub state: TerminalAttentionState,
+    pub activity: AgentActivity,
     pub as_of: DateTime<Utc>,
 }
 
@@ -31,19 +31,19 @@ pub struct SalienceEvaluation {
     pub as_of: DateTime<Utc>,
 }
 
-/// The surface-independent salience of one open attention, or of one terminal observation.
+/// The surface-independent salience of one open attention, or of one agent's activity.
 /// Idle evidence alone contributes information; stall routing is projected separately from the
 /// authority's condition.
-pub fn compute_salience(raised: Option<&RaisedFact>, attention: Option<TerminalAttentionState>) -> Salience {
+pub fn compute_salience(raised: Option<&RaisedFact>, activity: Option<AgentActivity>) -> Salience {
     let raised_salience = match raised {
         Some(raised) if raised.escalated => Salience::Urgent,
         Some(_) => Salience::Attention,
         None => Salience::None,
     };
-    let attention_salience = match attention {
-        Some(TerminalAttentionState::NeedsInput) => Salience::Attention,
-        Some(TerminalAttentionState::Working | TerminalAttentionState::Idle) => Salience::Info,
-        Some(TerminalAttentionState::Unobservable) | None => Salience::None,
+    let attention_salience = match activity {
+        Some(AgentActivity::NeedsInput) => Salience::Attention,
+        Some(AgentActivity::Working | AgentActivity::Idle | AgentActivity::Interrupted) => Salience::Info,
+        None => Salience::None,
     };
     raised_salience.max(attention_salience)
 }
@@ -58,7 +58,7 @@ pub fn evaluate_entry(targets: &[ResourceRef], facts: &SalienceFacts, base_as_of
         result.as_of = result.as_of.max(raised.as_of);
     }
     for observation in facts.attention.iter().filter(|observation| about(&observation.target)) {
-        result.salience = result.salience.max(compute_salience(None, Some(observation.state)));
+        result.salience = result.salience.max(compute_salience(None, Some(observation.activity)));
         result.as_of = result.as_of.max(observation.as_of);
     }
     result
@@ -86,12 +86,12 @@ mod tests {
         };
         let cases = [
             (None, None, Salience::None, "no facts"),
-            (None, Some(TerminalAttentionState::Working), Salience::Info, "working observation"),
-            (None, Some(TerminalAttentionState::Idle), Salience::Info, "idle observation"),
-            (None, Some(TerminalAttentionState::NeedsInput), Salience::Attention, "input need"),
-            (None, Some(TerminalAttentionState::Unobservable), Salience::None, "unobservable"),
+            (None, Some(AgentActivity::Working), Salience::Info, "working"),
+            (None, Some(AgentActivity::Idle), Salience::Info, "idle"),
+            (None, Some(AgentActivity::Interrupted), Salience::Info, "interrupted"),
+            (None, Some(AgentActivity::NeedsInput), Salience::Attention, "input need"),
             (Some(raised(false)), None, Salience::Attention, "open attention"),
-            (Some(raised(false)), Some(TerminalAttentionState::NeedsInput), Salience::Attention, "no combination outranks it"),
+            (Some(raised(false)), Some(AgentActivity::NeedsInput), Salience::Attention, "no combination outranks it"),
             (Some(raised(true)), None, Salience::Urgent, "escalated hold"),
         ];
         for (raised, attention, expected, description) in cases {

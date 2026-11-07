@@ -545,7 +545,7 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
     let primitives = Arc::new(
         flotilla_core::primitives::MessagePrimitives::open(
             "home",
-            service,
+            Arc::clone(&service),
             daemon.resource_backend(),
             Arc::new(flotilla_resources::SystemClock),
         )
@@ -560,10 +560,30 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
         target.record = Some(record);
         target
     };
+    // Crew attention reads the agent from its AgentSession (#3108): the screen read that
+    // recorded it is what a reader of the running session sees.
+    let reads = flotilla_core::in_process::DecidedAgentSessions::new(Arc::clone(&service));
+    let crew_attention = |observation: &flotilla_crew::reconcilers::terminal_session::TerminalObservation| {
+        use flotilla_resources::agent_activity::AgentSessionReads as _;
+        let status = flotilla_resources::TerminalSessionStatus {
+            phase: flotilla_resources::TerminalSessionPhase::Running,
+            attention: observation.attention.clone(),
+            screen_obstruction: observation.obstruction.clone(),
+            ..Default::default()
+        };
+        flotilla_resources::crew_attention(Some(&status), reads.read(record, None).expect("read AgentSession").as_ref())
+    };
 
     let observation = runtime.observe_attention(session_name, target()).await.expect("observe prompt").expect("attention observation");
-    assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::NeedsInput);
     assert_eq!(agent_activity(), Some(Activity::NeedsInput));
+    assert_eq!(crew_attention(&observation), Some(flotilla_protocol::CrewAttention::NeedsInput));
+    assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::NeedsInput);
+
+    // #3724: a hook review is a prompt too, and Codex's hooks never report it.
+    pool.set_captured_screen(session_name, include_str!("../../../../flotilla-agent/src/fixtures/codex-3724/review-events.txt")).await;
+    let observation = runtime.observe_attention(session_name, target()).await.expect("observe hook review").expect("observation");
+    assert_eq!(observation.obstruction, Some(flotilla_resources::ScreenObstruction::HookReview));
+    assert_eq!(crew_attention(&observation), Some(flotilla_protocol::CrewAttention::NeedsInput));
 
     pool.set_captured_screen(session_name, "› Ask Codex to do anything\n\ngpt-5.6-sol high · /workspace").await;
     let observation =

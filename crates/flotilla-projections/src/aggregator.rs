@@ -30,15 +30,16 @@ use flotilla_protocol::{
     Change, ConfiguredResourceLimits, DaemonEvent, EnvironmentKind, HostName, LifecycleAuthority, RepoDelta, RepoIdentity, RepositoryKey,
     ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
+use flotilla_resources::agent_activity::{self, AgentActivityView};
 use flotilla_resources::attentions::{Attentions, OpenAttention, Sender, Subject as AttentionSubject, HOLD_ESCALATES_AFTER};
 use flotilla_resources::environment_records::EnvironmentChange;
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
     Demand, FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError,
-    ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState,
-    CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase,
+    VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
@@ -213,8 +214,6 @@ pub struct Aggregator {
     convoy_ensures: BTreeMap<EnsureKey, ResourceObject<ConvoyEnsure>>,
     repositories: HashMap<RepositoryKey, ResourceObject<Repository>>,
     repository_sources: BTreeMap<RepositorySourceKey, ReadResourceObject<Repository>>,
-    #[builder(skip)]
-    attention_expired_through: Option<chrono::DateTime<chrono::Utc>>,
     observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
     #[builder(skip)]
     readiness_vessels: BTreeMap<RepositorySourceKey, ReadResourceObject<Vessel>>,
@@ -280,6 +279,10 @@ pub struct Aggregator {
     /// The home this daemon's own sessions carry, once following has begun.
     #[builder(skip)]
     agent_session_home: Option<flotilla_protocol::NodeId>,
+    /// When this home last heard from each other home: their readings are current until
+    /// `HOME_HEARD_WITHIN` after (#3108).
+    #[builder(skip)]
+    agent_session_heard: HashMap<flotilla_protocol::NodeId, chrono::DateTime<chrono::Utc>>,
     event_sink: Arc<dyn EventSink>,
     event_rx: broadcast::Receiver<DaemonEvent>,
 }
@@ -357,7 +360,6 @@ impl Aggregator {
             convoy_ensures: BTreeMap::new(),
             repositories: HashMap::new(),
             repository_sources: BTreeMap::new(),
-            attention_expired_through: None,
             observed_checkouts: HashMap::new(),
             readiness_vessels: BTreeMap::new(),
             fulfilment_kinds: BTreeMap::new(),
@@ -389,6 +391,7 @@ impl Aggregator {
             agent_session_port: Arc::new(crate::ports::NoAgentSessions),
             agent_sessions: HashMap::new(),
             agent_session_home: None,
+            agent_session_heard: HashMap::new(),
             event_sink,
             event_rx,
         }
@@ -569,6 +572,7 @@ impl Aggregator {
             Ok(follow) => {
                 self.agent_session_home = Some(follow.home);
                 self.agent_sessions = follow.held.into_iter().collect();
+                self.agent_session_heard = follow.heard.into_iter().collect();
                 Some(follow.updates)
             }
             Err(error) => {
@@ -602,7 +606,7 @@ impl Aggregator {
 
         loop {
             let escalation_delay = self.next_escalation_delay(chrono::Utc::now());
-            let attention_expiry_delay = self.next_attention_expiry_delay();
+            let home_stale_delay = self.next_home_stale_delay(chrono::Utc::now());
             let escalation = async move {
                 match escalation_delay {
                     Some(delay) => tokio::time::sleep(delay).await,
@@ -610,13 +614,14 @@ impl Aggregator {
                 }
             };
             tokio::pin!(escalation);
-            let attention_expiry = async move {
-                match attention_expiry_delay {
+            // One wake, at the next moment a quiet home's readings stop being current.
+            let home_stale = async move {
+                match home_stale_delay {
                     Some(delay) => tokio::time::sleep(delay).await,
                     None => futures::future::pending().await,
                 }
             };
-            tokio::pin!(attention_expiry);
+            tokio::pin!(home_stale);
             let projection_deadline = match self.projection_delivery {
                 ConvoyProjectionDelivery::Immediate => None,
                 ConvoyProjectionDelivery::Coalesced { deadline } => deadline,
@@ -691,8 +696,8 @@ impl Aggregator {
                         self.emit_awareness_result_sets().await;
                     }
                 }
-                () = &mut attention_expiry => {
-                    self.expire_due_attention().await;
+                () = &mut home_stale => {
+                    self.rebuild_local_projection().await;
                 }
                 demand = demand_rx.changed() => {
                     if demand.is_err() {
@@ -1842,6 +1847,15 @@ impl Aggregator {
                     self.schedule_local_projection().await;
                 }
             }
+            AgentSessionUpdate::Heard { home, at } => {
+                let now = chrono::Utc::now();
+                let was = agent_activity::home_current(self.agent_session_heard.get(&home).copied(), now);
+                self.agent_session_heard.insert(home, at);
+                // A keepalive from a home already current changes no row.
+                if was != agent_activity::home_current(Some(at), now) {
+                    self.rebuild_local_projection().await;
+                }
+            }
             AgentSessionUpdate::Home { home, sessions } => {
                 let held: HashMap<_, _> =
                     sessions.into_iter().map(|(name, reading)| (AgentSessionKey { home: home.clone(), name }, reading)).collect();
@@ -1875,11 +1889,15 @@ impl Aggregator {
         }
     }
 
-    /// The AgentSession of the crew member running in `session`: the one its home holds under
-    /// the TerminalSession record's name.
-    fn agent_session_of(&self, session: &ReadResourceObject<TerminalSession>) -> Option<&flotilla_protocol::AgentSessionReading> {
+    /// The AgentSession of the crew member running in `session`, the one its home holds under the
+    /// TerminalSession record's name, as this home reads it at `now`: this home's own are always
+    /// current, another home's while that home is heard from.
+    fn agent_view(&self, session: &ReadResourceObject<TerminalSession>, now: chrono::DateTime<chrono::Utc>) -> Option<AgentActivityView> {
         let home = self.agent_session_home_of(session)?;
-        self.agent_sessions.get(&AgentSessionKey { home, name: session.object.metadata.name.clone() })
+        let current = Some(&home) == self.agent_session_home.as_ref()
+            || agent_activity::home_current(self.agent_session_heard.get(&home).copied(), now);
+        let reading = self.agent_sessions.get(&AgentSessionKey { home, name: session.object.metadata.name.clone() })?.clone();
+        Some(AgentActivityView { reading, current })
     }
 
     /// An environment's engine record changed, or any of them may have (`None` or a rescan):
@@ -2335,17 +2353,18 @@ impl Aggregator {
         });
         let attention = sessions
             .into_iter()
-            .flat_map(|session| {
-                let Some(session) = self.terminal_view(session) else { return Vec::new() };
+            .flat_map(|source| {
+                let Some(session) = self.terminal_view(source) else { return Vec::new() };
                 let Some(session_host) = self.read_host(&session.provenance) else { return Vec::new() };
                 let session = &session.object;
                 let Some(convoy) = session.metadata.labels.get(CONVOY_LABEL) else { return Vec::new() };
                 let Some(vessel) = session.metadata.labels.get(VESSEL_LABEL) else { return Vec::new() };
                 let Some(status) = session.status.as_ref() else { return Vec::new() };
-                let Some(observation) = status.attention.as_ref() else { return Vec::new() };
-                if status.phase != TerminalSessionPhase::Running || observation.is_stale_at(now) {
+                if status.phase != TerminalSessionPhase::Running {
                     return Vec::new();
                 }
+                let Some(agent) = self.agent_view(source, now) else { return Vec::new() };
+                let (Some(activity), Some(since)) = (agent.live_activity(), agent.reading.activity_since) else { return Vec::new() };
                 self.convoy_keys_by_name
                     .get(&(session.metadata.namespace.clone(), convoy.clone()))
                     .into_iter()
@@ -2356,8 +2375,8 @@ impl Aggregator {
                         let work = item.object.status.as_ref().and_then(|status| status.work.get(vessel));
                         (self.vessel_host(&reference, work) == session_host).then(|| AttentionFact {
                             target: reference.subresource(format!("vessels/{vessel}")),
-                            state: observation.state,
-                            as_of: observation.as_of,
+                            activity,
+                            as_of: since,
                         })
                     })
                     .collect()
@@ -2366,33 +2385,18 @@ impl Aggregator {
         SalienceFacts { raised, attention }
     }
 
-    fn next_attention_expiry_delay(&self) -> Option<std::time::Duration> {
-        self.next_attention_expiry_delay_at(chrono::Utc::now())
-    }
-
-    fn next_attention_expiry_delay_at(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
-        self.terminal_sessions
-            .values()
-            .filter_map(|session| {
-                let session = self.terminal_view(session)?;
-                let status = session.object.status.as_ref()?;
-                if status.phase != TerminalSessionPhase::Running {
-                    return None;
-                }
-                let attention = status.attention.as_ref()?;
-                if attention.state == TerminalAttentionState::Unobservable {
-                    return None;
-                }
-                attention.as_of.checked_add_signed(TerminalAttention::FRESH_FOR)
-            })
-            .filter(|expiry| self.attention_expired_through.is_none_or(|through| *expiry > through))
+    /// How long until the next home with sessions here stops being current: when its readings
+    /// show as unobservable. A home heard from again before then moves the wake along.
+    fn next_home_stale_delay(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
+        let homes: HashSet<&flotilla_protocol::NodeId> =
+            self.agent_sessions.keys().map(|key| &key.home).filter(|home| Some(*home) != self.agent_session_home.as_ref()).collect();
+        homes
+            .into_iter()
+            .filter_map(|home| self.agent_session_heard.get(home))
+            .map(|heard| agent_activity::home_stale_at(*heard))
+            .filter(|stale| *stale > now)
             .min()
-            .map(|expiry| (expiry - now).to_std().unwrap_or_default())
-    }
-
-    async fn expire_due_attention(&mut self) {
-        self.attention_expired_through = Some(chrono::Utc::now());
-        self.rebuild_local_projection().await;
+            .map(|stale| (stale - now).to_std().unwrap_or_default())
     }
 
     /// How long until the next open hold escalates.
@@ -2944,6 +2948,7 @@ impl Aggregator {
             .and_then(|placement| placement.fields.get("placement_decision"))
             .and_then(|value| serde_json::from_value(value.clone()).ok());
         let (vessel_host, carried_by) = self.vessel_hosts(convoy_ref, state);
+        let now = chrono::Utc::now();
         let vessel_resource =
             placement.and_then(|placement| placement.fields.get("vessel_ref")).and_then(serde_json::Value::as_str).map(|name| {
                 ResourceRef::new(api_version(Vessel::API_PATHS), Vessel::API_PATHS.kind, &convoy_ref.namespace, name)
@@ -2981,11 +2986,10 @@ impl Aggregator {
                     command_preview,
                     requested_stance: requested_stance.clone(),
                     effective_stance: effective_stance.clone(),
-                    agent_session: session.and_then(|session| self.agent_session_of(session)).cloned(),
+                    agent_session: session.and_then(|session| self.agent_view(session, now)).map(|agent| agent.row_reading()),
                 }
             })
             .collect();
-        let now = chrono::Utc::now();
         let selected_sessions = self
             .convoy_sessions(&convoy_ref.namespace, &convoy_ref.name)
             .filter_map(|source| self.terminal_view(source))
@@ -3053,11 +3057,9 @@ impl Aggregator {
             stalled_surface_state(stalled)
         } else {
             matching_sessions()
-                .filter_map(|session| session.object.status.as_ref())
-                .filter(|status| status.phase == TerminalSessionPhase::Running)
-                .filter_map(|status| status.attention.as_ref())
-                .filter(|attention| !attention.is_stale_at(now))
-                .map(|attention| terminal_surface_state(attention.state))
+                .filter(|session| session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running))
+                .filter_map(|session| self.agent_view(session, now)?.live_activity())
+                .map(agent_surface_state)
                 .max_by_key(|state| match state {
                     SurfaceState::NeedsYou => 2,
                     SurfaceState::Working => 1,
@@ -3243,11 +3245,12 @@ fn session_key(session: &ReadResourceObject<TerminalSession>) -> SessionKey {
     (session.object.metadata.namespace.clone(), session.object.metadata.name.clone(), origin)
 }
 
-fn terminal_surface_state(state: TerminalAttentionState) -> SurfaceState {
-    match state {
-        TerminalAttentionState::NeedsInput => SurfaceState::NeedsYou,
-        TerminalAttentionState::Idle => SurfaceState::Available,
-        TerminalAttentionState::Working | TerminalAttentionState::Unobservable => SurfaceState::Working,
+fn agent_surface_state(activity: flotilla_protocol::AgentActivity) -> SurfaceState {
+    use flotilla_protocol::AgentActivity;
+    match activity {
+        AgentActivity::NeedsInput => SurfaceState::NeedsYou,
+        AgentActivity::Idle | AgentActivity::Interrupted => SurfaceState::Available,
+        AgentActivity::Working => SurfaceState::Working,
     }
 }
 
@@ -3328,8 +3331,8 @@ mod tests {
     use flotilla_protocol::{result_set::Rows, PrincipalRef, Subject};
     use flotilla_resources::{
         BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject, InputMeta, ObjectMeta, ObservedCheckoutSpec,
-        PlacementStatus, ProjectSpec, RepositorySpec, TerminalAttention, TerminalAttentionSource, TerminalSessionSource,
-        TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
+        PlacementStatus, ProjectSpec, RepositorySpec, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+        TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
     use flotilla_store::ResourceBackend;
     use futures::stream;
@@ -3338,13 +3341,45 @@ mod tests {
 
     use super::*;
 
+    /// This aggregator's own home, once a test has an agent report on it.
+    const OWN_HOME: &str = "local-node-id";
+
+    /// The crew in TerminalSession `session` reports `activity` on its AgentSession at `home`
+    /// (`None`: this home), as the decided store's follow delivers it.
+    async fn agent_reports(
+        aggregator: &mut Aggregator,
+        home: Option<&str>,
+        session: &str,
+        activity: flotilla_protocol::AgentActivity,
+        since: chrono::DateTime<Utc>,
+    ) {
+        let own = aggregator.agent_session_home.get_or_insert_with(|| flotilla_protocol::NodeId::new(OWN_HOME)).clone();
+        let home = home.map(flotilla_protocol::NodeId::new).unwrap_or(own);
+        let reading = flotilla_protocol::AgentSessionReading {
+            ended: None,
+            activity: Some(activity),
+            activity_since: Some(since),
+            activity_cause: Some("Stop".into()),
+            stale: false,
+        };
+        aggregator
+            .agent_sessions_changed(AgentSessionUpdate::Changed(vec![(AgentSessionKey { home, name: session.into() }, Some(reading))]))
+            .await;
+    }
+
+    /// This home hears from `home` at `at`, as a keepalive or entry on its change stream.
+    async fn home_heard(aggregator: &mut Aggregator, home: &str, at: chrono::DateTime<Utc>) {
+        aggregator.agent_sessions_changed(AgentSessionUpdate::Heard { home: flotilla_protocol::NodeId::new(home), at }).await;
+    }
+
     #[test]
-    fn terminal_evidence_distinguishes_available_from_needs_you() {
-        assert!(terminal_surface_state(TerminalAttentionState::NeedsInput).needs_attention());
-        assert!(terminal_surface_state(TerminalAttentionState::Idle) == SurfaceState::Available);
-        assert!(!terminal_surface_state(TerminalAttentionState::Idle).needs_attention());
-        assert!(!terminal_surface_state(TerminalAttentionState::Working).needs_attention());
-        assert!(!terminal_surface_state(TerminalAttentionState::Unobservable).needs_attention());
+    fn agent_activity_distinguishes_available_from_needs_you() {
+        use flotilla_protocol::AgentActivity;
+        assert!(agent_surface_state(AgentActivity::NeedsInput).needs_attention());
+        assert!(agent_surface_state(AgentActivity::Idle) == SurfaceState::Available);
+        assert!(agent_surface_state(AgentActivity::Interrupted) == SurfaceState::Available);
+        assert!(!agent_surface_state(AgentActivity::Idle).needs_attention());
+        assert!(!agent_surface_state(AgentActivity::Working).needs_attention());
     }
 
     #[tokio::test]
@@ -3431,11 +3466,7 @@ mod tests {
                 let mut session = session_object(&format!("terminal-{name}")).await;
                 session.metadata.labels =
                     BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-                session.status.as_mut().expect("status").attention = Some(TerminalAttention {
-                    state: TerminalAttentionState::Idle,
-                    as_of: Utc::now(),
-                    source: TerminalAttentionSource::Hook,
-                });
+                agent_reports(&mut aggregator, None, &format!("terminal-{name}"), flotilla_protocol::AgentActivity::Idle, Utc::now()).await;
                 aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
             }
         }
@@ -3645,8 +3676,7 @@ mod tests {
         let mut session = session_object("terminal-convoy-a-implement").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: Utc::now(), source: TerminalAttentionSource::Screen });
+        agent_reports(&mut aggregator, None, "terminal-convoy-a-implement", flotilla_protocol::AgentActivity::Idle, Utc::now()).await;
 
         let mut foreign_session = session.clone();
         foreign_session.metadata.namespace = "other".to_string();
@@ -3901,8 +3931,15 @@ mod tests {
         let mut session = session_object("terminal-convoy-a-implement-coder").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::NeedsInput, as_of: now, source: TerminalAttentionSource::Hook });
+        home_heard(&mut aggregator, "feta-node-id", now).await;
+        agent_reports(
+            &mut aggregator,
+            Some("feta-node-id"),
+            "terminal-convoy-a-implement-coder",
+            flotilla_protocol::AgentActivity::NeedsInput,
+            now,
+        )
+        .await;
         let endpoint = flotilla_protocol::result_set::CleatEndpoint {
             runtime_root: "/var/lib/flotilla/cleat".to_owned(),
             daemon: "work@3".to_owned(),
@@ -3931,7 +3968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicated_idle_attention_stays_stable_across_refreshes_and_unrelated_rebuilds() {
+    async fn replicated_idle_agent_stays_stable_across_refreshes_and_unrelated_rebuilds() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
         let resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
@@ -3945,12 +3982,17 @@ mod tests {
         let mut session = session_object("terminal-convoy-a-implement-coder").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        home_heard(&mut aggregator, "feta-node-id", now).await;
         for age in [80, 40, 0] {
-            session.status.as_mut().expect("running status").attention = Some(TerminalAttention {
-                state: TerminalAttentionState::Idle,
-                as_of: now - chrono::Duration::seconds(age),
-                source: TerminalAttentionSource::Screen,
-            });
+            // A reading's age is not its freshness: its home was heard from just now.
+            agent_reports(
+                &mut aggregator,
+                Some("feta-node-id"),
+                "terminal-convoy-a-implement-coder",
+                flotilla_protocol::AgentActivity::Idle,
+                now - chrono::Duration::seconds(age),
+            )
+            .await;
             aggregator
                 .apply_replica_session_event(ReadWatchEvent::Modified(ReadResourceObject {
                     object: session.clone(),
@@ -3970,37 +4012,66 @@ mod tests {
         }
     }
 
+    // A home gone quiet: its crew's readings stop being current once, at the moment
+    // HOME_HEARD_WITHIN after it was last heard, and hearing from it again restores them.
     #[tokio::test]
-    async fn lost_attention_observation_expires_once_at_its_deadline() {
+    async fn a_quiet_homes_agents_become_unobservable_once_at_its_deadline() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
-        let mut session = session_object("terminal-convoy-a-implement").await;
+        let resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(resolver);
+        let mut convoy = convoy_with_vessel("convoy-a").await;
+        let status = convoy.status.as_mut().expect("convoy status");
+        status.work.get_mut("implement").expect("work status").placement =
+            Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
+        status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0]
+            .crew
+            .push(CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "codex".to_string() }).build());
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        let now = Utc::now();
+        let heard = now - agent_activity::HOME_HEARD_WITHIN + chrono::Duration::milliseconds(200);
+        home_heard(&mut aggregator, "feta-node-id", heard).await;
+        let name = "terminal-convoy-a-implement-coder";
+        agent_reports(&mut aggregator, Some("feta-node-id"), name, flotilla_protocol::AgentActivity::Idle, now).await;
+        let mut session = session_object(name).await;
+        session.spec.role = "coder".into();
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        let now = Utc::now();
-        session.status.as_mut().expect("running status").attention = Some(TerminalAttention {
-            state: TerminalAttentionState::Idle,
-            as_of: now - TerminalAttention::FRESH_FOR + chrono::Duration::milliseconds(200),
-            source: TerminalAttentionSource::Screen,
-        });
-        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
+        aggregator
+            .replace_replica_sessions(vec![ReadResourceObject {
+                object: session,
+                provenance: ResourceProvenance::Replica {
+                    origin_root: flotilla_protocol::NodeId::new("feta-node-id"),
+                    last_synced_at: now,
+                },
+            }])
+            .await;
         let before = state.result_set().await;
         assert_eq!(before.rows.as_convoys().expect("convoy rows")[0].surface_state, SurfaceState::Available);
-        let delay = aggregator.next_attention_expiry_delay_at(now).expect("attention expiry is scheduled");
-        assert_eq!(delay, Duration::from_millis(200));
-        tokio::time::sleep(aggregator.next_attention_expiry_delay().expect("attention expiry delay") + Duration::from_millis(5)).await;
-        assert_eq!(aggregator.next_attention_expiry_delay(), Some(Duration::ZERO), "overdue expiry remains scheduled");
-        aggregator.expire_due_attention().await;
-        let expired = state.result_set().await;
-        let convoy = &expired.rows.as_convoys().expect("convoy rows")[0];
-        assert!(!convoy.surface_state.needs_attention());
-        assert!(!convoy.vessels[0].surface_state.needs_attention());
-        assert_eq!(expired.seq, before.seq + 1);
-        assert_eq!(aggregator.next_attention_expiry_delay(), None);
+        assert!(!aggregator.salience_facts_at(now).attention.is_empty());
+        assert_eq!(aggregator.next_home_stale_delay(now), Some(Duration::from_millis(200)));
+
+        tokio::time::sleep(aggregator.next_home_stale_delay(Utc::now()).expect("stale wake") + Duration::from_millis(5)).await;
+        assert_eq!(aggregator.next_home_stale_delay(Utc::now()), None, "a home already stale schedules no wake");
         aggregator.rebuild_local_projection().await;
-        assert_eq!(state.result_set().await.seq, expired.seq, "expiry is reported only once");
+        let stale = state.result_set().await;
+        let convoy = &stale.rows.as_convoys().expect("convoy rows")[0];
+        assert_eq!(convoy.vessels[0].surface_state, SurfaceState::Working, "an unobservable agent is not available");
+        let agent = convoy.vessels[0].crew[0].agent_session.as_ref().expect("the row still shows the reading");
+        assert!(agent.stale);
+        assert_eq!(agent.activity, Some(flotilla_protocol::AgentActivity::Idle));
+        assert!(aggregator.salience_facts_at(Utc::now()).attention.is_empty());
+        assert_eq!(stale.seq, before.seq + 1);
+        aggregator.rebuild_local_projection().await;
+        assert_eq!(state.result_set().await.seq, stale.seq, "going stale is reported once");
+
+        // Heard from again: current, and a keepalive while current changes nothing.
+        home_heard(&mut aggregator, "feta-node-id", Utc::now()).await;
+        let restored = state.result_set().await;
+        assert_eq!(restored.rows.as_convoys().expect("convoy rows")[0].surface_state, SurfaceState::Available);
+        assert!(!restored.rows.as_convoys().expect("convoy rows")[0].vessels[0].crew[0].agent_session.as_ref().expect("reading").stale);
+        home_heard(&mut aggregator, "feta-node-id", Utc::now()).await;
+        assert_eq!(state.result_set().await.seq, restored.seq);
     }
 
     #[tokio::test]
@@ -4094,13 +4165,20 @@ mod tests {
             (CONVOY_LABEL.to_string(), "governor-andamento-01234567".to_string()),
             (VESSEL_LABEL.to_string(), "implement".to_string()),
         ]);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Hook });
+        home_heard(&mut aggregator, "udder-node-id", now).await;
+        agent_reports(
+            &mut aggregator,
+            Some("udder-node-id"),
+            "terminal-governor-implement-coder",
+            flotilla_protocol::AgentActivity::Idle,
+            now,
+        )
+        .await;
         aggregator.replace_replica_sessions(vec![ReadResourceObject { object: session, provenance }]).await;
 
         let facts = aggregator.salience_facts_at(now);
         assert_eq!(facts.attention.len(), 1, "replica provenance must resolve both resources to udder");
-        assert_eq!(facts.attention[0].state, TerminalAttentionState::Idle);
+        assert_eq!(facts.attention[0].activity, flotilla_protocol::AgentActivity::Idle);
         let result = state
             .awareness_result_set(
                 &Some(QueryScope::new("flotilla", "andamento")),
@@ -4500,7 +4578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn awareness_salience_recomputes_on_terminal_attention_and_open_attention_changes() {
+    async fn awareness_salience_recomputes_on_agent_activity_and_open_attention_changes() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
         let attentions = Arc::new(SetAttentions::default());
@@ -4518,9 +4596,8 @@ mod tests {
         let mut session = session_object("terminal-convoy-a-implement").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::NeedsInput, as_of: now, source: TerminalAttentionSource::Hook });
-        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
+        agent_reports(&mut aggregator, None, "terminal-convoy-a-implement", flotilla_protocol::AgentActivity::NeedsInput, now).await;
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
         assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
 
         let credential = open_attention(
@@ -4552,9 +4629,7 @@ mod tests {
         assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
 
         let working_at = now + chrono::Duration::seconds(2);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::Working, as_of: working_at, source: TerminalAttentionSource::Hook });
-        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session)).await;
+        agent_reports(&mut aggregator, None, "terminal-convoy-a-implement", flotilla_protocol::AgentActivity::Working, working_at).await;
         let (salience, as_of) = awareness_vessel_salience_and_time(&state, &query).await;
         assert_eq!(salience, flotilla_protocol::Salience::Info);
         assert_eq!(as_of, working_at);
@@ -5623,13 +5698,12 @@ mod tests {
         let mut session = session_object("terminal-convoy-a-implement").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Hook });
+        agent_reports(&mut aggregator, None, "terminal-convoy-a-implement", flotilla_protocol::AgentActivity::Idle, now).await;
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
 
         let result = state.result_set().await;
         assert_eq!(result.rows.as_convoys().expect("convoy rows")[0].name, "convoy-a");
-        assert_eq!(aggregator.salience_facts_at(now).attention[0].state, TerminalAttentionState::Idle);
+        assert_eq!(aggregator.salience_facts_at(now).attention[0].activity, flotilla_protocol::AgentActivity::Idle);
     }
 
     #[tokio::test]
@@ -7379,11 +7453,14 @@ mod tests {
                         session.metadata.labels.insert(CONVOY_LABEL.into(), convoy.metadata.name.clone());
                         session.metadata.labels.insert(VESSEL_LABEL.into(), "implement".into());
                         session.spec.role = "coder".into();
-                        session.status.as_mut().unwrap().attention = Some(TerminalAttention {
-                            state: TerminalAttentionState::Working,
-                            as_of: Utc::now(),
-                            source: TerminalAttentionSource::Screen,
-                        });
+                        agent_reports(
+                            &mut aggregator,
+                            None,
+                            "terminal-abandoned-coder",
+                            flotilla_protocol::AgentActivity::Working,
+                            Utc::now(),
+                        )
+                        .await;
                         let source = ReadResourceObject { object: session, provenance: ResourceProvenance::Local };
                         aggregator.terminal_sessions.insert(session_key(&source), source);
                     }
@@ -7598,11 +7675,9 @@ mod tests {
             session.spec.role = "coder".into();
             session.metadata.labels =
                 BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone()), (VESSEL_LABEL.into(), "implement".into())]);
-            session.status.as_mut().expect("session status").attention = Some(TerminalAttention {
-                state: TerminalAttentionState::Working,
-                as_of: Utc::now(),
-                source: TerminalAttentionSource::Hook,
-            });
+            home_heard(&mut aggregator, "udder-node", Utc::now()).await;
+            agent_reports(&mut aggregator, Some("udder-node"), "terminal-ssh-coder", flotilla_protocol::AgentActivity::Working, Utc::now())
+                .await;
             let session = ReadResourceObject { object: session, provenance };
             let key = session_key(&session);
             aggregator.replace_replica_sessions(vec![session]).await;

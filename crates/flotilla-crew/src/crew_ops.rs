@@ -1068,7 +1068,13 @@ impl CrewService {
             .served_seats(&context.namespace, &context.vessel_ref)
             .await?
             .into_iter()
-            .map(|(role, session)| (role, session.object))
+            .map(|(role, session)| {
+                let origin = match &session.provenance {
+                    flotilla_resources::ResourceProvenance::Local => None,
+                    flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str().to_owned()),
+                };
+                (role, (session.object, origin))
+            })
             .collect();
         let vessel = Subject::Vessel { convoy: context.convoy.clone(), vessel: context.vessel.clone() };
         let credential_alerts = self
@@ -1096,7 +1102,8 @@ impl CrewService {
             .crew
             .iter()
             .map(|process| {
-                let session = by_role.get(&process.role);
+                let (session, origin) =
+                    by_role.get(&process.role).map_or((None, None), |(session, origin)| (Some(session), origin.as_deref()));
                 let session_phase = session.and_then(|session| session.status.as_ref().map(|status| status.phase));
                 let settled = crew_work
                     .and_then(|crew| crew.get(&process.role))
@@ -1117,6 +1124,15 @@ impl CrewService {
                     }
                 };
                 let crew = session.and_then(|session| session.status.as_ref()).and_then(|status| status.crew.as_ref());
+                let agent = session.and_then(|session| {
+                    match self.lifecycle_reads.agent_sessions().and_then(|reads| reads.read(&session.metadata.name, origin)) {
+                        Ok(agent) => agent,
+                        Err(error) => {
+                            tracing::debug!(session = %session.metadata.name, %error, "crew list shows no agent activity");
+                            None
+                        }
+                    }
+                });
                 CrewListMember::builder()
                     .role(process.role.clone())
                     .kind(if matches!(process.source, CrewSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
@@ -1128,7 +1144,7 @@ impl CrewService {
                             format!("lost, recoverable: {reason}")
                         }
                     }))
-                    .maybe_attention(crew_attention(session.and_then(|session| session.status.as_ref()), Utc::now()))
+                    .maybe_attention(crew_attention(session.and_then(|session| session.status.as_ref()), agent.as_ref()))
                     .maybe_adapter(crew.map(|crew| crew.adapter.clone()))
                     .maybe_model(crew.and_then(|crew| crew.model.clone()))
                     .maybe_stance(crew.map(|crew| crew.stance.clone()))
