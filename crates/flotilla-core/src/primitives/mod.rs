@@ -390,7 +390,7 @@ pub struct MessagePrimitives {
     /// Old record names to their engine id and home, filled as messages are seen.
     located: Mutex<BTreeMap<String, (String, String)>>,
     /// Old-store records, reread at most once a second per namespace.
-    records: tokio::sync::Mutex<BTreeMap<String, (std::time::Instant, Arc<OldStoreRecords>)>>,
+    records: tokio::sync::Mutex<BTreeMap<String, RecordsRead>>,
     /// Signalled after an attention here is raised, cleared or acknowledged, and after another
     /// home's Messages are applied.
     attention_changes: tokio::sync::broadcast::Sender<()>,
@@ -527,15 +527,22 @@ impl MessagePrimitives {
 
     /// Old-store records the views and conversions read, through their port.
     pub async fn records(&self, namespace: &str) -> Result<Arc<OldStoreRecords>, ResourceError> {
+        Ok(self.read_records(namespace, false).await?.0)
+    }
+
+    /// The records and the world time they were read at. A read held from
+    /// before a convoy or session was written does not name it; `reread`
+    /// reads again regardless of the held read's age.
+    async fn read_records(&self, namespace: &str, reread: bool) -> Result<(Arc<OldStoreRecords>, Timestamp), ResourceError> {
         const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(1);
         let mut cache = self.records.lock().await;
-        if let Some((read_at, records)) = cache.get(namespace).filter(|(read_at, _)| read_at.elapsed() < FRESH_FOR) {
-            let _ = read_at;
-            return Ok(Arc::clone(records));
+        if let Some(read) = cache.get(namespace).filter(|read| !reread && read.at.elapsed() < FRESH_FOR) {
+            return Ok((Arc::clone(&read.records), read.world_at));
         }
+        let world_at = self.world.now();
         let records = Arc::new(OldStoreRecords::load(&self.backend, namespace).await?);
-        cache.insert(namespace.to_owned(), (std::time::Instant::now(), Arc::clone(&records)));
-        Ok(records)
+        cache.insert(namespace.to_owned(), RecordsRead { at: std::time::Instant::now(), world_at, records: Arc::clone(&records) });
+        Ok((records, world_at))
     }
 
     /// The consumer identity of a crew session's record at this home.
@@ -1045,8 +1052,7 @@ impl MessagePrimitives {
         let resource = snapshot.into_value::<Resource<Message>>().map_err(|error| ResourceError::decode(error.to_string()))?;
         tracing::info!(message = %id, %home, remote = read.remote, age_micros = read.age_micros, "replica miss read at the message's home");
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let records = self.records(namespace).await?;
-        let object = old_view(&resource, namespace, &roles, &*records).map_err(ResourceError::invalid)?;
+        let object = self.view_of(&resource, namespace, &roles).await?.map_err(ResourceError::invalid)?;
         let synced = chrono::Utc::now() - chrono::Duration::microseconds(read.age_micros);
         Ok(Some(ReadResourceObject {
             object,
@@ -1244,10 +1250,9 @@ impl MessagePrimitives {
     /// code that still reads old Messages (the read half of the port).
     pub async fn views(&self, namespace: &str) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let records = self.records(namespace).await?;
         let mut views = Vec::new();
         for (home, resource) in self.messages().map_err(ResourceError::other)? {
-            match old_view(&resource, namespace, &roles, &*records) {
+            match self.view_of(&resource, namespace, &roles).await? {
                 Ok(object) => views.push(ReadResourceObject { object, provenance: self.provenance(&home) }),
                 Err(error) => tracing::debug!(message = resource.name(), %error, "engine message has no old-shaped view"),
             }
@@ -1286,9 +1291,26 @@ impl MessagePrimitives {
             .map_err(|error| ResourceError::other(error.to_string()))?;
         let Some(resource) = resource else { return Ok(None) };
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let records = self.records(namespace).await?;
-        let object = old_view(&resource, namespace, &roles, &*records).map_err(ResourceError::invalid)?;
+        let object = self.view_of(&resource, namespace, &roles).await?.map_err(ResourceError::invalid)?;
         Ok(Some(ReadResourceObject { object, provenance: self.provenance(&home) }))
+    }
+
+    /// A message in the old shape. Records read before the message last
+    /// changed may predate the convoy or session it names, so a miss on such
+    /// a read is judged again on records read now.
+    async fn view_of(
+        &self,
+        resource: &Resource<Message>,
+        namespace: &str,
+        roles: &FleetRoles,
+    ) -> Result<Result<ResourceObject<OldMessage>, String>, ResourceError> {
+        let (records, read_at) = self.read_records(namespace, false).await?;
+        match old_view(resource, namespace, roles, &*records) {
+            Err(_) if resource.since() >= read_at => {
+                Ok(old_view(resource, namespace, roles, &*self.read_records(namespace, true).await?.0))
+            }
+            view => Ok(view),
+        }
     }
 
     /// Whether `record` names a message here at all.
@@ -1411,6 +1433,13 @@ impl flotilla_messaging::CharterNotices for EngineCharterNotices {
     async fn admit(&self, name: &str, spec: &OldSpec, _: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
         self.primitives.admit(&self.namespace, name, spec).await.map(|_| ())
     }
+}
+
+/// One read of a namespace's old-store records: when, by the clock and by the world's time.
+struct RecordsRead {
+    at: std::time::Instant,
+    world_at: Timestamp,
+    records: Arc<OldStoreRecords>,
 }
 
 /// The old-store facts the new path reads, through one named port (#3317

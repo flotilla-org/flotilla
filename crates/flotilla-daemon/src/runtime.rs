@@ -717,16 +717,6 @@ impl StartupRestoration {
                 },
             )));
         }
-        if let (Some(primitives), Some(state)) = (daemon.message_primitives(), self.state.as_ref()) {
-            let delivery =
-                self::primitives::MessageDelivery::new(Arc::clone(state), primitives, options.namespace.clone(), runtime_health.clone());
-            let interval = options.controller_resync_interval.min(Duration::from_secs(1));
-            controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
-                if let Err(error) = delivery.run(interval).await {
-                    warn!(%error, "engine message delivery stopped");
-                }
-            })));
-        }
         controller_tasks.push(AbortOnDropHandle::new(spawn_dispatch_reconciler_task(
             Arc::clone(daemon),
             options.namespace.clone(),
@@ -1083,8 +1073,17 @@ fn spawn_controller_loops(
         }));
     }
     // The old Message controller runs only while Message is in the old store
-    // (#3317); behind `[primitives]` the engine path's delivery adapter takes over.
-    if state.daemon.message_primitives().is_none() {
+    // (#3317); on the engine path its delivery adapter delivers, with the other controllers.
+    if let Some(primitives) = state.daemon.message_primitives() {
+        let delivery =
+            self::primitives::MessageDelivery::new(Arc::clone(&state), primitives, namespace_string.clone(), runtime_health.clone());
+        let interval = controller_resync_interval.min(Duration::from_secs(1));
+        controllers.push(tokio::spawn(async move {
+            if let Err(error) = delivery.run(interval).await {
+                warn!(%error, "engine message delivery stopped");
+            }
+        }));
+    } else {
         controllers.push({
             let state = Arc::clone(&state);
             let health = runtime_health.clone();

@@ -1,4 +1,5 @@
 use super::*;
+use crate::testkits::engine::runtime_checkouts;
 
 pub(super) async fn crew_provisioning_recovery_scenario() {
     async fn promise(daemon: &InProcessDaemon, context: CrewCommandContext, operation: flotilla_protocol::commands::CrewPromiseOperation) {
@@ -357,13 +358,14 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .await
         .expect("hand back to coder");
     assert_eq!(wait_for_command_result(&mut rx, hand_back_id).await, CommandValue::Ok);
-    let messages = backend.using::<flotilla_resources::Message>(NAMESPACE);
+    // Messages are the engine's: read them through the Message path's views.
+    let messages = daemon.message_primitives().expect("the engine Message path");
     let coder_delivery_id = messages
-        .list()
+        .views(NAMESPACE)
         .await
         .unwrap()
-        .items
         .into_iter()
+        .map(|message| message.object)
         .find(|message| message.spec.receiver.ends_with("/implement/coder") && message.spec.body.ends_with("Address the review findings"))
         .expect("running coder handoff should be accepted in its durable inbox")
         .metadata
@@ -382,14 +384,15 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     .await;
     pool.set_captured_screen(&coder.metadata.name, "• Working (1s • esc to interrupt)\n› Ask Codex to do anything").await;
     wait_until_with_timeout(Duration::from_secs(5), || {
-        let messages = messages.clone();
+        let messages = Arc::clone(&messages);
         let coder_delivery_id = coder_delivery_id.clone();
         async move {
             messages
-                .get(&coder_delivery_id)
+                .views(NAMESPACE)
                 .await
                 .ok()
-                .and_then(|message| message.status)
+                .and_then(|views| views.into_iter().find(|message| message.object.metadata.name == coder_delivery_id))
+                .and_then(|message| message.object.status)
                 .is_some_and(|status| status.phase.has_delivery_evidence())
         }
     })
@@ -569,28 +572,30 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .expect("return to reviewer");
     assert_eq!(wait_for_command_result(&mut rx, return_to_reviewer_id).await, CommandValue::Ok);
 
-    let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
-    let checkout = checkouts
-        .list()
-        .await
-        .expect("checkout list")
-        .items
-        .into_iter()
-        .find(|checkout| checkout.metadata.lifecycle_authority().ok().flatten() == Some(LifecycleAuthority::Adopted))
-        .expect("adopted checkout");
-    let mut integration = checkout.status.expect("checkout status").integration;
-    integration.landed = flotilla_resources::IntegrationCondition::builder()
-        .value(flotilla_resources::ConditionValue::True)
-        .details(vec!["no change request exists for branch".to_string()])
-        .observed_at(Utc::now().to_rfc3339())
-        .build();
-    flotilla_store::apply_status_patch(
-        &checkouts,
-        &checkout.metadata.name,
-        &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration) },
-    )
-    .await
-    .expect("record observed absence of a change request");
+    // The engine holds the adopted checkout; its home's inspection records that its branch landed
+    // with no change request.
+    {
+        use flotilla_resources::checkout_records::{CheckoutRecords as _, Inspection};
+        let checkouts = runtime_checkouts(&daemon);
+        let checkout = checkouts
+            .checkouts
+            .here()
+            .expect("checkouts here")
+            .into_iter()
+            .find(|checkout| !checkout.ended() && matches!(checkout.spec, flotilla_resources::CheckoutSpec::Observed(_)))
+            .expect("adopted checkout");
+        checkouts
+            .checkouts
+            .inspected(
+                &checkout.name,
+                Inspection {
+                    landed: Some(true),
+                    landed_details: vec!["no change request exists for branch".to_string()],
+                    ..Default::default()
+                },
+            )
+            .expect("record observed absence of a change request");
+    }
     record_successful_empty_branch_scan(&backend, &crew_record).await;
     // This recovery fixture's reviewer has no promises. The operator override
     // remains available; advisory completion cannot terminalize an empty role.
