@@ -159,6 +159,7 @@ impl DummyFleet {
             environments_provisioned: environments.provisioned,
             environments_destroyed: environments.destroyed,
             environments_vanished: environments.vanished,
+            environment_destroys_not_found: environments.destroys_not_found,
             live_environments: environments.live,
             sessions_launched: read(Counter::SessionsLaunched),
             turns_received: read(Counter::TurnsReceived),
@@ -209,6 +210,9 @@ pub struct DummyFleetSnapshot {
     pub environments_destroyed: u64,
     /// Backings a vendor deleted of its own accord.
     pub environments_vanished: u64,
+    /// Destroy requests for a vanished backing, which its vendor answered
+    /// not found.
+    pub environment_destroys_not_found: u64,
     /// Backings the vendors hold now.
     pub live_environments: u64,
 }
@@ -248,6 +252,7 @@ impl DummyVendor {
             provisioned: sum.provisioned + counts.provisioned,
             destroyed: sum.destroyed + counts.destroyed,
             vanished: sum.vanished + counts.vanished,
+            destroys_not_found: sum.destroys_not_found + counts.destroys_not_found,
             live: sum.live + counts.live,
         })
     }

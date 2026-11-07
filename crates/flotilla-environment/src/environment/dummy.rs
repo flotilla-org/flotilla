@@ -77,6 +77,9 @@ pub struct DummyEnvironmentCounts {
     pub destroyed: u64,
     /// Backings the vendor deleted of its own accord.
     pub vanished: u64,
+    /// Destroy requests for a backing the vendor had deleted, which it
+    /// answered not found.
+    pub destroys_not_found: u64,
     /// Backings the vendor holds now, running or stopped.
     pub live: u64,
 }
@@ -106,6 +109,7 @@ pub struct DummyEnvironmentProvider {
     refusing: AtomicBool,
     provisioned: AtomicU64,
     destroyed_counter: Arc<AtomicU64>,
+    not_found_counter: Arc<AtomicU64>,
     vanished: AtomicU64,
 }
 
@@ -120,6 +124,7 @@ impl DummyEnvironmentProvider {
             refusing: AtomicBool::new(false),
             provisioned: AtomicU64::new(0),
             destroyed_counter: Arc::default(),
+            not_found_counter: Arc::default(),
             vanished: AtomicU64::new(0),
         }
     }
@@ -147,15 +152,15 @@ impl DummyEnvironmentProvider {
     }
 
     /// The vendor deletes `environment`'s backing, as a sandbox vendor evicts
-    /// one: it leaves the inventory, its handles report it gone, and the
-    /// processes inside it end. False when the vendor holds no such backing.
+    /// one: it leaves the inventory, its handles report it gone, a destroy of
+    /// it is answered not found, and the processes inside it end. False when
+    /// the vendor holds no such backing.
     pub fn vanish(&self, environment: &str) -> bool {
         let Some(handle) = self.backing(environment) else { return false };
         if handle.vendor.swap(VANISHED, Ordering::AcqRel) == VANISHED {
             return false;
         }
         self.vanished.fetch_add(1, Ordering::Relaxed);
-        self.handles().retain(|_, current| !Arc::ptr_eq(current, &handle));
         if let Some(cleanup) = &self.cleanup {
             cleanup(handle.id.as_str());
         }
@@ -178,6 +183,7 @@ impl DummyEnvironmentProvider {
             provisioned: self.provisioned.load(Ordering::Relaxed),
             destroyed: self.destroyed_counter.load(Ordering::Relaxed),
             vanished: self.vanished.load(Ordering::Relaxed),
+            destroys_not_found: self.not_found_counter.load(Ordering::Relaxed),
             live: self.handles().values().filter(|handle| handle.held()).count() as u64,
         }
     }
@@ -292,6 +298,7 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
             vendor: AtomicU8::new(RUNNING),
             cleanup: self.cleanup.clone(),
             destroyed_count: Arc::clone(&self.destroyed_counter),
+            not_found_count: Arc::clone(&self.not_found_counter),
         });
         let mut handles = self.handles();
         let held = handles.entry(id).or_insert_with(|| {
@@ -359,6 +366,7 @@ struct DummyEnvironment {
     vendor: AtomicU8,
     cleanup: Option<DummyEnvironmentCleanup>,
     destroyed_count: Arc<AtomicU64>,
+    not_found_count: Arc<AtomicU64>,
     id: EnvironmentId,
     image: ImageId,
     local_image_id: String,
@@ -430,7 +438,12 @@ impl ProvisionedEnvironment for DummyEnvironment {
         Arc::new(super::vessel_ops::RunnerVesselAgent(self.runner()))
     }
     async fn destroy(&self) -> Result<(), String> {
-        if !self.destroyed.swap(true, Ordering::AcqRel) && self.vendor.load(Ordering::Acquire) != VANISHED {
+        if self.vendor.load(Ordering::Acquire) == VANISHED {
+            // A sandbox vendor answers a destroy of a backing it deleted with not found.
+            self.not_found_count.fetch_add(1, Ordering::Relaxed);
+            return Err(format!("dummy vendor holds no backing {}: not found", self.container_name));
+        }
+        if !self.destroyed.swap(true, Ordering::AcqRel) {
             self.destroyed_count.fetch_add(1, Ordering::Relaxed);
             if let Some(cleanup) = &self.cleanup {
                 cleanup(self.id.as_str());
@@ -729,6 +742,8 @@ mod tests {
         assert!(!provider.vanish("gone"), "a vanished backing is no longer held");
         assert_eq!(gone.observe().await.state, super::super::ObservationState::Gone { cause: super::super::GoneCause::EvictedByProvider });
         assert!(EnvironmentProvider::inspect(&provider, &EnvironmentId::new("gone")).await.expect("inspect").is_none());
+        assert!(gone.destroy().await.is_err(), "a vanished backing's destroy is answered not found");
+        assert!(provider.destroy("gone").await.is_err(), "by name too");
         assert_eq!(*removed.lock().expect("removed"), vec!["gone"]);
 
         assert!(provider.stop("paused"));
@@ -746,7 +761,7 @@ mod tests {
         provision(&provider, "accepted").await.expect("accepted");
         paused.destroy().await.expect("destroy");
         assert!(!provider.vanish("paused"), "a destroyed backing cannot vanish");
-        assert_eq!(provider.counts(), DummyEnvironmentCounts { provisioned: 3, destroyed: 1, vanished: 1, live: 1 });
+        assert_eq!(provider.counts(), DummyEnvironmentCounts { provisioned: 3, destroyed: 1, vanished: 1, destroys_not_found: 2, live: 1 });
     }
 
     // A cloud-class vendor takes cloud sandbox inputs and offers no local image

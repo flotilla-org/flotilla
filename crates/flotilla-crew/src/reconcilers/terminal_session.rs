@@ -1048,14 +1048,15 @@ where
             return Ok(());
         }
         let environment_exists = match self.environments.get(&obj.spec.env_ref).await {
-            Ok(_) => true,
+            Ok(environment) => !environment.status.as_ref().is_some_and(|status| status.backing_gone_reason().is_some()),
             Err(ResourceError::NotFound { .. }) => false,
             Err(error) => return Err(error),
         };
         let mut errors = Vec::new();
         // Once the environment record is gone, its teardown has already removed the
-        // backing container. Its terminal pool and agent adapter are no longer
-        // available, so there is nothing left for either runtime hook to clean.
+        // backing container; a backing its provider confirmed gone is the same (#4304).
+        // Its terminal pool and agent adapter are no longer available, so there is
+        // nothing left for either runtime hook to clean.
         if environment_exists {
             if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
                 if self.runtime.teardown_pending(session_id).await {
