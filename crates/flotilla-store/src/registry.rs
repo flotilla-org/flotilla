@@ -27,6 +27,9 @@ pub struct RegisteredResourceKind {
     pub kind: &'static str,
     pub plural: &'static str,
     pub replication_class: ReplicationClass,
+    /// The engine holds this kind's records; the old store keeps only rows a previous generation
+    /// wrote, for the cut-over import to read. Nothing else reads or watches the kind here.
+    pub engine_held: bool,
     aliases: &'static [&'static str],
     resource: RegisteredResource,
 }
@@ -111,8 +114,8 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<Artifact>(RegisteredResource::Artifact, &[]),
     kind::<ChangeRequest>(RegisteredResource::ChangeRequest, &["cr", "change_request", "change-request"]),
     kind::<Issue>(RegisteredResource::Issue, &[]),
-    kind::<Checkout>(RegisteredResource::Checkout, &[]),
-    kind::<CloneResource>(RegisteredResource::Clone, &[]),
+    engine_kind::<Checkout>(RegisteredResource::Checkout, &[]),
+    engine_kind::<CloneResource>(RegisteredResource::Clone, &[]),
     kind::<Convoy>(RegisteredResource::Convoy, &[]),
     kind::<ConvoyEnsure>(RegisteredResource::ConvoyEnsure, &["convoyensure", "convoy_ensure", "convoy-ensure"]),
     kind::<CredentialGrant>(
@@ -130,7 +133,7 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<AccountBinding>(RegisteredResource::AccountBinding, &["account-binding"]),
     kind::<AccountProvision>(RegisteredResource::AccountProvision, &["account-provision"]),
     kind::<AccessDelivery>(RegisteredResource::AccessDelivery, &["access-delivery"]),
-    kind::<Environment>(RegisteredResource::Environment, &[]),
+    engine_kind::<Environment>(RegisteredResource::Environment, &[]),
     kind::<Event>(RegisteredResource::Event, &[]),
     kind::<FleetDesignation>(RegisteredResource::FleetDesignation, &["fleet-designation"]),
     kind::<Forge>(RegisteredResource::Forge, &[]),
@@ -202,9 +205,26 @@ const fn kind<T: Resource>(resource: RegisteredResource, aliases: &'static [&'st
         kind: T::API_PATHS.kind,
         plural: T::API_PATHS.plural,
         replication_class: T::REPLICATION_CLASS,
+        engine_held: false,
         aliases,
         resource,
     }
+}
+
+const fn engine_kind<T: Resource>(resource: RegisteredResource, aliases: &'static [&'static str]) -> RegisteredResourceKind {
+    RegisteredResourceKind { engine_held: true, ..kind::<T>(resource, aliases) }
+}
+
+/// The registered kinds whose records the old store still holds: every kind but those the engine
+/// holds.
+pub fn old_store_resource_kinds() -> impl Iterator<Item = &'static RegisteredResourceKind> {
+    REGISTERED_RESOURCE_KINDS.iter().filter(|kind| !kind.engine_held)
+}
+
+/// Whether an owner reference names a kind whose records this store holds. An engine-held or
+/// unknown owner is not evidence of an absent owner here.
+fn collectable_owner(owner: &OwnerReference) -> bool {
+    owner.controller && owner.api_version == "flotilla.work/v1" && old_store_resource_kinds().any(|kind| kind.kind == owner.kind)
 }
 
 macro_rules! poll_typed_resource {
@@ -490,7 +510,7 @@ pub async fn home_bound_authorship_collisions(
 ) -> Result<Vec<HomeBoundAuthorshipCollision>, ResourceError> {
     let local_root = backend.local_root()?;
     let mut collisions = Vec::new();
-    for registered in REGISTERED_RESOURCE_KINDS {
+    for registered in old_store_resource_kinds() {
         if registered.replication_class != ReplicationClass::HomeBoundRuntime {
             continue;
         }
@@ -598,7 +618,7 @@ pub(crate) async fn collect_owned_resources(
     namespace: &str,
     deleted_owner: Option<&OwnerReference>,
 ) -> Result<(), ResourceError> {
-    for kind in REGISTERED_RESOURCE_KINDS {
+    for kind in old_store_resource_kinds() {
         dispatch_resource_kind!(kind.resource, collect_owned_typed(backend, namespace, deleted_owner).await)?;
     }
     Ok(())
@@ -657,11 +677,7 @@ async fn collect_owned_child<T: Resource>(
         return Ok(());
     }
     for owner in &child.metadata.owner_references {
-        if !owner.controller || deleted_owner.is_some_and(|deleted| deleted != owner) {
-            continue;
-        }
-        // Unknown groups/kinds are not evidence of an absent owner.
-        if owner.api_version != "flotilla.work/v1" || !REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.kind == owner.kind) {
+        if !collectable_owner(owner) || deleted_owner.is_some_and(|deleted| deleted != owner) {
             continue;
         }
         match get_resource_kind_including_replicas(backend, namespace, &owner.kind, &owner.name).await {

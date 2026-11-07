@@ -9,10 +9,10 @@ use std::{
 use futures::{stream::SelectAll, StreamExt};
 
 use crate::{
+    old_store_resource_kinds,
     registry::{collect_indexed_child, collect_owned_resources},
     replica::ORIGIN_ROOT_ANNOTATION,
     watch_resource_kind, watch_resource_kind_including_replicas, OwnerReference, ReplicationClass, ResourceBackend, ResourceError,
-    REGISTERED_RESOURCE_KINDS,
 };
 
 type ChildKey = (String, String);
@@ -58,7 +58,7 @@ impl ControlledChildren {
             .filter(|owner| {
                 owner.controller
                     && owner.api_version == "flotilla.work/v1"
-                    && REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.kind == owner.kind)
+                    && old_store_resource_kinds().any(|kind| kind.kind == owner.kind)
             })
             .collect();
         let previous = self.by_child.get(&child).cloned().unwrap_or_default();
@@ -96,7 +96,8 @@ impl OwnerGarbageCollector {
         let mut children = ControlledChildren::default();
         // Establish every watch before recovery, so deletes during the sweep
         // remain queued. The daemon supervisor restarts and relists on errors.
-        for kind in REGISTERED_RESOURCE_KINDS {
+        // Engine-held kinds have no records here to own or be owned.
+        for kind in old_store_resource_kinds() {
             let watch = if kind.replication_class == ReplicationClass::None {
                 watch_resource_kind(&self.backend, &self.namespace, kind.kind).await?
             } else {

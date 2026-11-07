@@ -23,7 +23,7 @@ use flotilla_resources::{
     HostStatusPatch, ReplicationClass, SystemClock, Vessel, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, LOCAL_ROWS_MISSING_REASON, PROJECTION_PARITY_CONDITION,
 };
-use flotilla_store::{home_bound_authorship_collisions, ResourceBackend, REGISTERED_RESOURCE_KINDS};
+use flotilla_store::{home_bound_authorship_collisions, ResourceBackend};
 use serde_json::json;
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
@@ -738,7 +738,7 @@ pub(super) async fn resource_replication_content_condition(
     let mut peers_without_cursors = Vec::new();
     for peer in connected_peers {
         let mut cursor_count = 0;
-        for kind in REGISTERED_RESOURCE_KINDS {
+        for kind in flotilla_store::old_store_resource_kinds() {
             if kind.replication_class == ReplicationClass::None {
                 continue;
             }

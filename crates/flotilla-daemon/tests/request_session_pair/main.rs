@@ -77,7 +77,7 @@ use flotilla_resources::{
     WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
     CONVOY_LABEL, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{controller::ControllerLoop, list_resource_kind, ResourceBackend, REGISTERED_RESOURCE_KINDS};
+use flotilla_store::{controller::ControllerLoop, list_resource_kind, old_store_resource_kinds, ResourceBackend};
 use hegel::generators as gs;
 
 // A convoy's checkouts are the engine's, released at their home when the convoy ends (#3108):
@@ -367,7 +367,7 @@ where
 async fn assert_no_orphaned_finalizers(hosts: &[Arc<InProcessDaemon>]) {
     for (host_index, host) in hosts.iter().enumerate() {
         let backend = host.resource_backend();
-        for kind in REGISTERED_RESOURCE_KINDS {
+        for kind in old_store_resource_kinds() {
             let listed = list_resource_kind(&backend, "flotilla", kind.plural).await.expect("list registered kind");
             for item in listed.value["items"].as_array().expect("resource list items") {
                 let metadata = &item["metadata"];
