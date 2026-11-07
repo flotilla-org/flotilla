@@ -226,6 +226,7 @@ async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable
         profile.host_id.clone(),
         profile.host_direct_environment_name(),
     ));
+    let events = backend.clone().using::<flotilla_resources::Event>(NAMESPACE);
     let loop_task = tokio::spawn(
         ControllerLoop {
             primary: sessions.clone(),
@@ -238,12 +239,33 @@ async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable
         .run(),
     );
 
-    for delay in [0, 60, 120, 240, 480] {
+    // Each attempt is awaited until the controller records its failure, so the next one is due
+    // when the clock next moves. An attempt takes as many polls as the restarted daemon's other
+    // tasks leave it, so a fixed number of yields does not cover it under load, and an attempt
+    // that finishes after the clock moves pushes every later one past the test's last step.
+    let attempts = || async {
+        events
+            .list()
+            .await
+            .map(|events| {
+                events
+                    .items
+                    .iter()
+                    .filter(|event| event.spec.reason == "ReconcileFailed" && event.spec.regarding.name == session_name)
+                    .map(|event| event.spec.count)
+                    .sum::<u64>()
+            })
+            .unwrap_or(0)
+    };
+    for (attempt, delay) in [0, 60, 120, 240, 480].into_iter().enumerate() {
         if delay > 0 {
             tokio::time::advance(Duration::from_secs(delay)).await;
         }
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
+        let mut waited = 0;
+        while attempts().await < attempt as u64 + 1 {
+            assert!(waited < 2_000, "attempt {} was never made", attempt + 1);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            waited += 1;
         }
     }
 
@@ -260,11 +282,11 @@ async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable
 
     pool.set_available(true);
     tokio::time::advance(Duration::from_secs(15 * 60)).await;
-    for _ in 0..40 {
-        tokio::task::yield_now().await;
+    for _ in 0..2_000 {
         if sessions.get(session_name).await.ok().and_then(|session| session.status).is_some_and(|status| status.degraded.is_none()) {
             break;
         }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
     let recovered = sessions.get(session_name).await.expect("recovered terminal").status.expect("recovered terminal status");
