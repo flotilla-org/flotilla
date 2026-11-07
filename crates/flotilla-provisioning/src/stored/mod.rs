@@ -43,6 +43,7 @@ pub mod manifest_root;
 pub mod placement;
 pub mod project;
 pub mod repository;
+pub mod terminal_facts;
 pub mod terminal_session;
 
 use std::collections::BTreeMap;
@@ -143,6 +144,17 @@ pub fn crew_registry() -> Result<KindRegistry, RegistryError> {
     registry.register::<Resource<Vessel>>()?;
     registry.register::<Resource<Ensure>>()?;
     registry.register::<Resource<terminal_session::TerminalSession>>()?;
+    Ok(registry)
+}
+
+/// PROPOSAL, for the owner's schema look-over only (#3108): TerminalSession with the records its
+/// launches would need on the engine ([`terminal_facts`]). No store opens this registry.
+pub fn terminal_proposal_registry() -> Result<KindRegistry, RegistryError> {
+    let mut registry = KindRegistry::new();
+    registry.register::<Resource<terminal_session::TerminalSession>>()?;
+    registry.register::<terminal_facts::TerminalLaunchFacts>()?;
+    registry.register::<terminal_facts::EnvironmentHealth>()?;
+    registry.register::<terminal_facts::TerminalDrafts>()?;
     Ok(registry)
 }
 
