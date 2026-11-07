@@ -6,6 +6,8 @@ pub use observation_error::ObservationError;
 pub mod execution_context;
 mod git_config_guard;
 pub mod host_environment;
+mod lazy_http;
+pub use lazy_http::LazyHttpClient;
 pub mod ssh_runner;
 pub use rigging_http_client::http_execute;
 pub use rigging_http_client::{HttpClient, ReqwestHttpClient};

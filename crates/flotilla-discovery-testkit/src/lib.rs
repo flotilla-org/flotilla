@@ -444,9 +444,10 @@ impl flotilla_discovery::observation_credentials::ObservationCredentialProbe for
 }
 
 fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> flotilla_discovery::DiscoveryRuntime {
-    // One client for the runtime and its factories: each client build loads the TLS root store
-    // (~20ms), and tests build many daemons.
-    let http: Arc<dyn flotilla_provider_runtime::HttpClient> = Arc::new(flotilla_provider_runtime::ReqwestHttpClient::new());
+    // One client for the runtime and its factories, built on its first request: a build loads the
+    // TLS root store (~20ms on Linux, seconds the first time in a process on macOS), and most test
+    // daemons send no request at all.
+    let http: Arc<dyn flotilla_provider_runtime::HttpClient> = Arc::new(flotilla_provider_runtime::LazyHttpClient::default());
     DiscoveryRuntime::builder()
         .http(Arc::clone(&http))
         .observation_credentials(flotilla_discovery::observation_credentials::ObservationCredentials::new(Arc::new(
