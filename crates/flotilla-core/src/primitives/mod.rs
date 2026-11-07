@@ -527,22 +527,23 @@ impl MessagePrimitives {
 
     /// Old-store records the views and conversions read, through their port.
     pub async fn records(&self, namespace: &str) -> Result<Arc<OldStoreRecords>, ResourceError> {
-        Ok(self.read_records(namespace, false).await?.0)
+        Ok(self.read_records(namespace, false).await?.records)
     }
 
-    /// The records and the world time they were read at. A read held from
-    /// before a convoy or session was written does not name it; `reread`
-    /// reads again regardless of the held read's age.
-    async fn read_records(&self, namespace: &str, reread: bool) -> Result<(Arc<OldStoreRecords>, Timestamp), ResourceError> {
+    /// The held read of the records, or, when `reread` or the held one is a
+    /// second old, a read made now. A read made to judge a miss again is
+    /// marked `rechecked`.
+    async fn read_records(&self, namespace: &str, reread: bool) -> Result<RecordsRead, ResourceError> {
         const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(1);
         let mut cache = self.records.lock().await;
         if let Some(read) = cache.get(namespace).filter(|read| !reread && read.at.elapsed() < FRESH_FOR) {
-            return Ok((Arc::clone(&read.records), read.world_at));
+            return Ok(read.clone());
         }
         let world_at = self.world.now();
         let records = Arc::new(OldStoreRecords::load(&self.backend, namespace).await?);
-        cache.insert(namespace.to_owned(), RecordsRead { at: std::time::Instant::now(), world_at, records: Arc::clone(&records) });
-        Ok((records, world_at))
+        let read = RecordsRead { at: std::time::Instant::now(), world_at, rechecked: reread, records };
+        cache.insert(namespace.to_owned(), read.clone());
+        Ok(read)
     }
 
     /// The consumer identity of a crew session's record at this home.
@@ -1295,19 +1296,20 @@ impl MessagePrimitives {
         Ok(Some(ReadResourceObject { object, provenance: self.provenance(&home) }))
     }
 
-    /// A message in the old shape. Records read before the message last
-    /// changed may predate the convoy or session it names, so a miss on such
-    /// a read is judged again on records read now.
+    /// A message in the old shape. A held read of the records may predate the
+    /// convoy or session the message names, so a miss is judged again on
+    /// records read now: once per held read, or again when the message
+    /// changed after the read it missed on.
     async fn view_of(
         &self,
         resource: &Resource<Message>,
         namespace: &str,
         roles: &FleetRoles,
     ) -> Result<Result<ResourceObject<OldMessage>, String>, ResourceError> {
-        let (records, read_at) = self.read_records(namespace, false).await?;
-        match old_view(resource, namespace, roles, &*records) {
-            Err(_) if resource.since() >= read_at => {
-                Ok(old_view(resource, namespace, roles, &*self.read_records(namespace, true).await?.0))
+        let held = self.read_records(namespace, false).await?;
+        match old_view(resource, namespace, roles, &*held.records) {
+            Err(_) if !held.rechecked || resource.since() > held.world_at => {
+                Ok(old_view(resource, namespace, roles, &*self.read_records(namespace, true).await?.records))
             }
             view => Ok(view),
         }
@@ -1435,10 +1437,13 @@ impl flotilla_messaging::CharterNotices for EngineCharterNotices {
     }
 }
 
-/// One read of a namespace's old-store records: when, by the clock and by the world's time.
+/// One read of a namespace's old-store records: when, by the clock and by the world's time, and
+/// whether it was made to judge a miss again.
+#[derive(Clone)]
 struct RecordsRead {
     at: std::time::Instant,
     world_at: Timestamp,
+    rechecked: bool,
     records: Arc<OldStoreRecords>,
 }
 
