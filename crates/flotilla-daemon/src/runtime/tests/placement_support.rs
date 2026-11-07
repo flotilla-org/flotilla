@@ -27,30 +27,40 @@ pub(super) async fn bridge_runtime_resource_stores(first: &InProcessDaemon, seco
     replicate_local_kind::<Convoy>(first, second).await;
     replicate_local_kind::<Vessel>(first, second).await;
     replicate_local_kind::<TerminalSession>(first, second).await;
-    follow_engine_home(first, second);
+    follow_engine_home(first, second).await;
 
     replicate_local_kind::<Convoy>(second, first).await;
     replicate_local_kind::<Vessel>(second, first).await;
     replicate_local_kind::<TerminalSession>(second, first).await;
-    follow_engine_home(second, first);
+    follow_engine_home(second, first).await;
 }
 
 /// One round of `from`'s engine home after what `to` holds of it, as a peer's follower receives
-/// it: the engine Convoys, clones and checkouts `from` decided reach `to`.
-fn follow_engine_home(from: &InProcessDaemon, to: &InProcessDaemon) {
+/// it: the engine Convoys, clones and checkouts `from` decided reach `to`. As a production round,
+/// it runs on a blocking thread, since it reads and writes the stores, and is served only once
+/// the home's log has passed the follower's cursor; the bridge runs every few milliseconds beside
+/// both daemons' controllers on the test's one runtime thread.
+async fn follow_engine_home(from: &InProcessDaemon, to: &InProcessDaemon) {
     let (Ok(from), Ok(to)) = (from.decided_store(), to.decided_store()) else { return };
-    let home = from.home().to_owned();
-    let after = to.last_sequence(&home).expect("the follower's cursor");
-    let mut frames = Vec::new();
-    from.serve(Some(after), flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()), |frame| {
-        frames.push(frame.to_vec());
-        Ok(())
+    tokio::task::spawn_blocking(move || {
+        let home = from.home().to_owned();
+        let after = to.last_sequence(&home).expect("the follower's cursor");
+        if after >= from.last_sequence(&home).expect("the home's last sequence") {
+            return;
+        }
+        let mut frames = Vec::new();
+        from.serve(Some(after), flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()), |frame| {
+            frames.push(frame.to_vec());
+            Ok(())
+        })
+        .expect("serve the engine home");
+        to.with_store(|store| {
+            flotilla_schema_sqlite::stream::Follower::new(store).receive(&home, |sink| frames.iter().try_for_each(|frame| sink(frame)))
+        })
+        .expect("follow the engine home");
     })
-    .expect("serve the engine home");
-    to.with_store(|store| {
-        flotilla_schema_sqlite::stream::Follower::new(store).receive(&home, |sink| frames.iter().try_for_each(|frame| sink(frame)))
-    })
-    .expect("follow the engine home");
+    .await
+    .expect("the engine home's round finishes");
 }
 
 pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) {
@@ -258,9 +268,7 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         .await
         .expect("record remote placement");
 
-    // Two daemons, each with its own controllers and engine, share the test threads: under a
-    // full parallel run the remote checkout takes longer than ten seconds to realise.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let running = convoys.get("remote-placement").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
             status.phase == ConvoyPhase::Active && status.work.get("work").is_some_and(|work| work.phase == WorkPhase::Running)
