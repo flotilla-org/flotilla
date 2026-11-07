@@ -103,6 +103,42 @@ fn address_print_then_parse_is_identity(tc: hegel::TestCase) {
     assert_eq!(resolve(&text, &BuiltinForges).as_ref(), Ok(&address));
 }
 
+// #4199: an agent session is a subject of its own, under the role it acts for
+// (a fleet, project or convoy role). Its canonical text is the role's followed
+// by `/session:<id>`, it parses back exactly, and a session under anything but
+// a role is refused.
+#[hegel::test(test_cases = 300)]
+fn session_print_then_parse_is_identity(tc: hegel::TestCase) {
+    let owners = [Kind::Fleet, Kind::Project, Kind::Convoy];
+    let owner = owners[draw_index(&tc, owners.len())];
+    let mut role = Address::root(owner, &value(&tc, 1)).expect("owner");
+    if owner == Kind::Project && tc.draw(gs::booleans()) {
+        role = role.child(Kind::Convoy, &value(&tc, 1)).expect("convoy");
+    }
+    let role = role.child(Kind::Role, &value(&tc, 1)).expect("role");
+    let id = value(&tc, 1);
+    let session = role.child(Kind::Session, &id).expect("a session follows a role");
+    let text = session.to_string();
+    assert!(text.starts_with(&format!("{role}/session:")), "{text}");
+    let parsed: Address = text.parse().unwrap_or_else(|error| panic!("{text} must parse: {error}"));
+    assert_eq!(parsed, session);
+    assert_eq!((parsed.kind(), parsed.name(), parsed.parent()), (Kind::Session, id.as_str(), Some(role.clone())));
+    assert_eq!(resolve(&text, &BuiltinForges).as_ref(), Ok(&session));
+    let elsewhere = role.parent().expect("a role has a parent");
+    assert!(elsewhere.child(Kind::Session, &id).is_err(), "a session under {elsewhere} is refused");
+    assert!(format!("{elsewhere}/session:x").parse::<Address>().is_err());
+    assert!(Address::root(Kind::Session, &id).is_err() && "session:x".parse::<Address>().is_err());
+}
+
+#[test]
+fn session_spelling_is_the_owner_approved_shape() {
+    let text = "project:flotilla/convoy:fix-3774/role:coder/session:9f2c";
+    let session: Address = text.parse().expect("session address");
+    assert_eq!((session.kind(), session.name(), session.get(Kind::Role)), (Kind::Session, "9f2c", Some("coder")));
+    assert_eq!(session.as_str(), text);
+    assert_eq!("session".parse::<Kind>(), Ok(Kind::Session));
+}
+
 // ADR 0066 §4: one address has exactly one spelling. Lowercasing an escape or
 // escaping a bare character yields text the strict parser refuses.
 #[hegel::test(test_cases = 200)]
@@ -593,4 +629,81 @@ fn fleet_shape_and_short_input() {
         assert!(invalid.parse::<Address>().is_err(), "{invalid}");
     }
     assert_eq!(record_name(&Address::fleet("lab").expect("fleet")), None);
+}
+
+/// `address` cut after its first `at` segments: the head, and the tail when the tail is an
+/// address of its own (its first kind may start one). Canonical values hold no bare `/`.
+fn cut(address: &Address, at: usize) -> (Address, Option<Address>) {
+    let parts: Vec<&str> = address.as_str().split('/').collect();
+    let head = parts[..at].join("/").parse().expect("a head of an address is one");
+    (head, parts[at..].join("/").parse().ok())
+}
+
+/// `address` with its last segment's value changed, so it names a sibling.
+fn sibling(address: &Address) -> Address {
+    let value = format!("{}x", address.name());
+    match address.parent() {
+        Some(parent) => parent.child(address.kind(), &value),
+        None => Address::root(address.kind(), &value),
+    }
+    .expect("a longer value of the same kind is one")
+}
+
+// #4272: a client completes a partial address under its context. Cutting any address into a
+// head and a tail that is an address of its own, the tail completes under the head (or under any
+// context below the head) back to the whole address. With no context, the one candidate ending
+// in the tail is taken; a second candidate under a sibling head makes it ambiguous, listing both.
+// A tail that starts with a kind nothing contains (a project, a forge) is whole already and is
+// left as it is. Covers every shape `address` walks, cut at every depth.
+#[hegel::test(test_cases = 300)]
+fn a_tail_completes_under_its_head(tc: hegel::TestCase) {
+    let whole = address(&tc);
+    let depth = whole.segments().len();
+    if depth < 2 {
+        return;
+    }
+    let at = tc.draw(gs::integers::<usize>().min_value(1).max_value(depth - 1));
+    let (head, Some(tail)) = cut(&whole, at) else { return };
+    let contained = Kind::ALL.iter().any(|parent| tail.segments()[0].kind().may_follow(Some(*parent)));
+    if !contained {
+        for context in [Some(&head), None] {
+            assert_eq!(complete(&tail, context, std::slice::from_ref(&whole)), Ok(tail.clone()), "{tail} is whole");
+        }
+        return;
+    }
+    assert_eq!(complete(&tail, Some(&head), &[]), Ok(whole.clone()), "{tail} under {head}");
+    // A context deeper than the head places the tail at the head, its deepest ancestor that fits,
+    // when the tail's kind cannot follow the deeper segment.
+    let deeper = Kind::ALL.into_iter().filter(|kind| *kind != Kind::Repo && *kind != Kind::Artifact && kind.may_follow(Some(head.kind())));
+    for kind in deeper.filter(|kind| !tail.segments()[0].kind().may_follow(Some(*kind))) {
+        let Ok(context) = head.child(kind, "context") else { continue };
+        assert_eq!(complete(&tail, Some(&context), &[]), Ok(whole.clone()), "{tail} under {context}");
+    }
+    let other: Address = format!("{}/{tail}", sibling(&head)).parse().expect("the tail fits under a sibling head");
+    assert_eq!(complete(&tail, None, std::slice::from_ref(&whole)), Ok(whole.clone()));
+    assert_eq!(complete(&tail, None, &[]), Ok(tail.clone()), "no match leaves the tail for the exact lookup");
+    let ambiguous = complete(&tail, None, &[other.clone(), whole.clone()]).unwrap_err();
+    let CompletionError::Ambiguous { matches, .. } = ambiguous;
+    assert_eq!(matches.into_iter().collect::<std::collections::BTreeSet<_>>(), [whole, other].into_iter().collect());
+}
+
+// #4272 done-when: in a flotilla checkout `convoy:lander` is flotilla's lander; inside a vessel
+// (context `project:flotilla/convoy:c/role:coder`) a convoy goes under the vessel's project, so
+// the crew's own convoy is named whole; a context that holds no project places nothing, and with
+// `lander` in two projects the error lists both.
+#[test]
+fn convoy_addresses_complete_from_a_checkout_or_a_vessel() {
+    let parse = |text: &str| text.parse::<Address>().unwrap();
+    let lander = parse("convoy:lander");
+    let candidates = [parse("project:flotilla/convoy:lander"), parse("project:other/convoy:lander"), parse("project:flotilla/convoy:c")];
+    assert_eq!(complete(&lander, Some(&parse("project:flotilla")), &candidates), Ok(candidates[0].clone()));
+    let vessel = parse("project:flotilla/convoy:c/role:coder");
+    assert_eq!(complete(&parse("convoy:c"), Some(&vessel), &candidates), Ok(candidates[2].clone()));
+    assert_eq!(complete(&lander, Some(&vessel), &candidates), Ok(candidates[0].clone()));
+    let unplaced = complete(&lander, Some(&parse("convoy:c/role:coder")), &candidates).unwrap_err();
+    assert_eq!(
+        unplaced.to_string(),
+        "`convoy:lander` matches several addresses; name one: project:flotilla/convoy:lander, project:other/convoy:lander"
+    );
+    assert_eq!(complete(&parse("project:other/convoy:lander"), Some(&vessel), &candidates), Ok(candidates[1].clone()));
 }

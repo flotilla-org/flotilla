@@ -53,8 +53,6 @@ members = [
     "crates/flotilla-terminal",
     "crates/flotilla-protocol",
     "crates/flotilla-protocol-testkit",
-    "crates/flotilla-relay",
-    "crates/flotilla-relay-protocol",
     "crates/flotilla-replication",
     "crates/flotilla-replay-testkit",
     "crates/flotilla-resources",
@@ -67,6 +65,7 @@ members = [
     "crates/flotilla-inbox-testkit",
     "crates/flotilla-quint-testkit",
     "crates/flotilla-state-machines",
+    "crates/flotilla-verbs",
     "crates/flotilla-store",
     "crates/flotilla-store-memory",
     "crates/flotilla-store-sqlite",
@@ -103,6 +102,10 @@ rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "3
 rigging-http-wire = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
 # The condition language (#4108).
 rigging-condition = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+# The webhook relay's wire types (flotilla-org/flotilla.work#1), at rigging main. The crate
+# depends on no other rigging crate; the pins above stay at drydock's rev so drydock and
+# flotilla share one copy of each, and all move to one rev when drydock next bumps rigging.
+rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", rev = "61018dd937661525bcbba5dd7e57ee6a1c887443" }
 binnacle-cli = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d", features = ["described", "clap"] }
 binnacle-core = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
 binnacle-described = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
@@ -145,8 +148,6 @@ edition = "2021"
 license.workspace = true
 
 [features]
-default = ["tui"]
-tui = ["dep:flotilla-tui", "dep:ratatui"]
 aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-provider"]
 
 # New external crates also belong in clippy.toml's absolute-paths-allowed-crates.
@@ -171,9 +172,7 @@ flotilla-provisioning = { path = "crates/flotilla-provisioning" }
 flotilla-manifest = { path = "crates/flotilla-manifest" }
 flotilla-protocol = { path = "crates/flotilla-protocol" }
 flotilla-resources = { path = "crates/flotilla-resources" }
-flotilla-tui = { path = "crates/flotilla-tui", optional = true }
 flotilla-cli = { path = "crates/flotilla-cli" }
-ratatui = { version = "0.30", optional = true }
 tokio = { workspace = true }
 color-eyre = { workspace = true }
 clap = { version = "4", features = ["derive", "string"] }
@@ -201,11 +200,6 @@ flotilla-core = { path = "crates/flotilla-core" }
 flotilla-test-support = { path = "crates/flotilla-test-support" }
 hegeltest = { workspace = true }
 tempfile = { workspace = true }
-
-[[example]]
-name = "glyph_showcase"
-test = false
-required-features = ["tui"]
 
 [workspace.lints.clippy]
 absolute_paths = "warn"

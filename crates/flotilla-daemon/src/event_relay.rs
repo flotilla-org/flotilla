@@ -1,19 +1,33 @@
-//! Outbound consumer of ADR 0041 mailboxes. Transport is kept behind a small
-//! session seam so the state machine can be exercised without a network socket.
+//! Outbound consumer of the webhook relay's delivery stream. Each GitHub
+//! delivery's subjects are change hints; the stream is read without bodies.
+//! Transport is kept behind a small session seam so the state machine can be
+//! exercised without a network socket.
 use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use flotilla_address::Address;
+use flotilla_address::{resolve, Address, BuiltinForges, Error as AddressError, Kind, GITHUB_FORGE_ID};
 use flotilla_config::RelayConfig;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_relay_protocol::{parse_hint_subject, ConsumerFrame, StreamFrame};
 use futures::{SinkExt, StreamExt};
+use rigging_relay_protocol::{ConsumerFrame, StreamFrame};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
 };
 use tracing::warn;
+
+/// Parses a relay subject to its address. Hints name only public GitHub change
+/// requests and issues, spelled `<cr|issue>/github.com/<owner>/<repo>/<number>`
+/// by the GitHub source's configuration; anything else is refused. The canonical
+/// address text is accepted too.
+fn parse_hint_subject(subject: &str) -> Result<Address, AddressError> {
+    let address = resolve(subject, &BuiltinForges)?;
+    match address.kind() {
+        Kind::ChangeRequest | Kind::Issue if address.get(Kind::Forge) == Some(GITHUB_FORGE_ID) => Ok(address),
+        _ => Err(AddressError::Unrecognised(subject.to_string())),
+    }
+}
 
 #[async_trait]
 trait RelaySession: Send {
@@ -149,11 +163,11 @@ impl RelayClient {
 
     async fn process(&self, frame: StreamFrame, cursor: &mut u64, session: &mut dyn RelaySession) -> Result<(), String> {
         match frame {
-            StreamFrame::Hint { delivery } => {
+            StreamFrame::Delivery(delivery) => {
                 if delivery.cursor <= *cursor {
                     return Ok(());
                 }
-                if let Ok(subject) = parse_hint_subject(&delivery.hint.subject) {
+                for subject in delivery.subjects.iter().filter_map(|subject| parse_hint_subject(subject).ok()) {
                     if let Err(error) = self.target.hint(&subject).await {
                         warn!(%error, subject = %subject, "relay hint refresh failed; polling will retry");
                     }
@@ -205,7 +219,7 @@ impl HttpRelayConnector {
             .push("i")
             .push(&self.install_id)
             .push("stream");
-        url.query_pairs_mut().append_pair("cursor", &cursor.to_string());
+        url.query_pairs_mut().append_pair("cursor", &cursor.to_string()).append_pair("bodies", "false");
         Ok(url)
     }
 
@@ -294,7 +308,12 @@ impl RelaySession for LongPollSession {
         if let Some(frame) = self.pending.pop_front() {
             return Ok(frame);
         }
-        self.url.query_pairs_mut().clear().append_pair("cursor", &self.cursor.to_string()).append_pair("wait", "20");
+        self.url
+            .query_pairs_mut()
+            .clear()
+            .append_pair("cursor", &self.cursor.to_string())
+            .append_pair("bodies", "false")
+            .append_pair("wait", "20");
         let response = self
             .client
             .get(self.url.clone())
@@ -337,14 +356,14 @@ pub(crate) fn spawn(daemon: Arc<InProcessDaemon>, config: RelayConfig, state_dir
 #[cfg(test)]
 mod tests {
     // HTTP audit (#1512): relay long-poll GET/ack POST and WebSocket upgrade
-    // implement Flotilla's own ConsumerFrame/StreamFrame protocol, not an external
+    // implement the relay's own ConsumerFrame/StreamFrame protocol, not an external
     // service with separately documented header requirements. The in-memory relay
     // scenarios below cover that protocol; there is no live replay fixture or
     // external-service stand-in for this owned boundary. HTTP transport coverage
     // remains separate from these lifecycle scenarios.
     use std::{collections::HashSet, sync::Mutex};
 
-    use flotilla_relay_protocol::{Delivery, Hint};
+    use rigging_relay_protocol::Delivery;
 
     fn github_cr(number: u64) -> Address {
         Address::change_request(&flotilla_address::Forge::github(), "flotilla-org/flotilla", number).expect("change request")
@@ -407,7 +426,13 @@ mod tests {
     fn hint(cursor: u64, subject: &str) -> Delivery {
         Delivery {
             cursor,
-            hint: Hint { source: "github".into(), subject: subject.into(), kind: "pull_request".into(), delivery_id: cursor.to_string() },
+            source: "github".into(),
+            event: "pull_request".into(),
+            delivery_id: cursor.to_string(),
+            received_at: "2026-11-05T18:00:00.000Z".into(),
+            subjects: vec![subject.into()],
+            fields: Default::default(),
+            body: None,
         }
     }
 
@@ -422,7 +447,7 @@ mod tests {
                     .iter()
                     .filter(|delivery| delivery.cursor > cursor)
                     .cloned()
-                    .map(|delivery| StreamFrame::Hint { delivery })
+                    .map(StreamFrame::Delivery)
                     .collect::<VecDeque<_>>();
                 if frames.is_empty() {
                     frames.push_back(StreamFrame::Ready { cursor });
@@ -510,5 +535,34 @@ mod tests {
         }
         assert_eq!(*target.refreshed.lock().expect("refreshes"), vec![healthy]);
         assert_eq!(*acks.lock().expect("acks"), vec![1, 2]);
+    }
+
+    // GitHub owners and repositories are case-insensitive, so every casing of
+    // one subject has one address.
+    #[test]
+    fn github_subjects_parse_to_one_address_per_subject() {
+        assert_eq!(
+            parse_hint_subject("cr/github.com/Codertocat/Hello-World/2"),
+            parse_hint_subject("cr/github.com/codertocat/hello-world/2")
+        );
+        assert_eq!(
+            parse_hint_subject("forge:github/repo:codertocat%2Fhello-world/cr:2"),
+            parse_hint_subject("cr/github.com/codertocat/hello-world/2"),
+            "canonical text is the same subject"
+        );
+        assert_eq!(
+            parse_hint_subject("issue/github.com/codertocat/hello-world/1"),
+            Address::issue(&flotilla_address::Forge::github(), "codertocat/hello-world", 1)
+        );
+    }
+
+    #[test]
+    fn malformed_and_non_github_subjects_are_refused() {
+        for invalid in ["", "cr", "cr/github.com", "cr/github.com/a/b/x", "pr/github.com/a/b/1", "cr//a/b/1", "cr/github.com/a/b/007"] {
+            assert!(parse_hint_subject(invalid).is_err(), "{invalid} should not parse");
+        }
+        assert!(parse_hint_subject("forge:lab/repo:a%2Fb/cr:1").is_err(), "hints name public GitHub only");
+        assert!(parse_hint_subject("convoy:demo").is_err());
+        assert!(parse_hint_subject("sandbox/sandbox123").is_err(), "other sources' subjects are not hints");
     }
 }

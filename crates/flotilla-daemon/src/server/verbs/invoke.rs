@@ -6,12 +6,15 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use flotilla_address::Address;
-use flotilla_protocol::verbs::{Invocation, Invoked, Outcome};
-use flotilla_schema::ParamType;
+use flotilla_protocol::{
+    verbs::{Invocation, Invoked, Outcome},
+    CommandCaller,
+};
+use flotilla_verbs::{Call, ParamType, Params, Picks, Subject};
 use serde_json::{Map, Value};
-
-use super::catalog::{Catalog, Entry, Params, Picks, Subject, Subjects};
 use tracing::Instrument;
+
+use super::catalog::{Catalog, Entry, Subjects};
 
 /// Why an invocation was refused as a whole, before any subject ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,10 +29,10 @@ pub(crate) enum Refusal {
 
 /// Whether a caller may run a verb on a subject (#4182 ruling 6): `Err` carries the reason a
 /// `refused` outcome gives.
-pub(crate) type Policy = fn(caller: &str, entry: &Entry, subject: &Address) -> Result<(), String>;
+pub(crate) type Policy = fn(caller: &CommandCaller, entry: &Entry, subject: &Address) -> Result<(), String>;
 
 /// The policy until ruling 6 decides per caller: everything is allowed.
-pub(crate) fn allow_all(_caller: &str, _entry: &Entry, _subject: &Address) -> Result<(), String> {
+pub(crate) fn allow_all(_caller: &CommandCaller, _entry: &Entry, _subject: &Address) -> Result<(), String> {
     Ok(())
 }
 
@@ -56,14 +59,22 @@ impl Verbs {
     /// outcome or the request's refusal. The verb's own spans nest under it. A `done` outcome's
     /// `result` is the verb's answer to the caller, not part of the record, so the span leaves it
     /// out; every field taken from the request is bounded to [`FIELD_LIMIT`], since a request
-    /// refused for its size is still traced. Subjects are read in `namespace`.
-    pub(crate) async fn invoke(&self, caller: &str, namespace: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
+    /// refused for its size is still traced. Subjects are read in `namespace`, and the verb is
+    /// handed the caller the span names.
+    pub(crate) async fn invoke(
+        &self,
+        caller: &CommandCaller,
+        namespace: &str,
+        name: &str,
+        request: Invocation,
+    ) -> Result<Invoked, Refusal> {
         let subjects = bounded(serde_json::to_string(&request.subjects).unwrap_or_default());
         let params = bounded(serde_json::to_string(&request.params).unwrap_or_default());
         let (name_field, id_field) = (bounded(name.to_owned()), bounded(request.invocation.clone()));
+        let caller_field = caller.to_string();
         let span = tracing::info_span!(
             "verb.invocation",
-            verb.caller = caller,
+            verb.caller = caller_field,
             verb.name = name_field,
             verb.invocation = id_field,
             verb.subjects = subjects,
@@ -87,7 +98,7 @@ impl Verbs {
         invoked
     }
 
-    async fn invoke_inner(&self, caller: &str, namespace: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
+    async fn invoke_inner(&self, caller: &CommandCaller, namespace: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
         let entry = self.catalog.get(name).ok_or_else(|| Refusal::UnknownVerb(name.to_owned()))?;
         if let Some(broken) = &entry.broken {
             return Err(Refusal::Conflict(format!("verb `{name}` is broken: {broken}")));
@@ -132,7 +143,7 @@ impl Verbs {
 
     async fn run(
         &self,
-        caller: &str,
+        caller: &CommandCaller,
         namespace: &str,
         entry: &Entry,
         addresses: &[Address],
@@ -152,7 +163,7 @@ impl Verbs {
         if entry.picks() == Picks::Set {
             if outcomes.is_empty() {
                 // `ready` is not empty: the request names at least one subject, and none failed.
-                let ran = entry.handler.run(&ready, params, invocation).await;
+                let ran = entry.handler.run(Call { caller, subjects: &ready, invocation }, params).await;
                 for subject in &ready {
                     outcomes.insert(subject.address.to_string(), outcome(subject, ran.clone()));
                 }
@@ -164,7 +175,7 @@ impl Verbs {
             }
         } else {
             for subject in ready {
-                let ran = entry.handler.run(std::slice::from_ref(&subject), params, invocation).await;
+                let ran = entry.handler.run(Call { caller, subjects: std::slice::from_ref(&subject), invocation }, params).await;
                 outcomes.insert(subject.address.to_string(), outcome(&subject, ran));
             }
         }
@@ -172,7 +183,7 @@ impl Verbs {
     }
 
     /// The subject's current row, once it exists, policy allows the caller and `when` holds.
-    async fn check(&self, caller: &str, namespace: &str, entry: &Entry, address: &Address) -> Result<Subject, Box<Outcome>> {
+    async fn check(&self, caller: &CommandCaller, namespace: &str, entry: &Entry, address: &Address) -> Result<Subject, Box<Outcome>> {
         let subject = address.to_string();
         let row = match self.subjects.row(namespace, address).await {
             Ok(Some(row)) => row,

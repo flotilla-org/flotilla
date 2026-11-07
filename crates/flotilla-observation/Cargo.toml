@@ -37,7 +37,6 @@ http = { workspace = true }
 bytes = { workspace = true }
 flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
-flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 tokio = { workspace = true, features = ["test-util"] }
 hegeltest = { workspace = true }
 

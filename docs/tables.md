@@ -53,7 +53,7 @@ Parameters apply to the rows route. Each is validated against the table's descri
 
 - `where=<condition>`, repeatable; every condition must hold. A condition is an expression in the condition language ([Conditions](#conditions)), URL-encoded, such as `where=inbox.under("project:flotilla/convoy:fix-3774")`.
 - `sort=a,-b`: comma-separated column names, `-` for descending. Columns must be `sortable`. The table's key columns are appended in ascending order, so the order is total. Null sorts before every value ascending, and after every value descending.
-- `columns=a,b`: the columns to return. Key columns are always included, and a `reference` column brings its `.kind` and `.home` companions.
+- `columns=a,b`: the columns to return. Key columns and the [subject](#subject-and-address-cells) field are always included, and a `reference` column brings its `.kind` and `.home` companions.
 - `limit`: rows per page; 200 when absent, otherwise 1 to 10000.
 - `offset`: rows to skip (default 0).
 - `cursor`: the `cursor` of the previous `rows` message when it was not null. It is opaque, and bound to the table, `namespace`, `sort` and the canonical text of `where` of the query that produced it, so another spelling of the same conditions continues it; a cursor used with a different query, or one issued before conditions took this language, yields a `resync` message instead of rows. Paging is keyset: rows strictly after the cursor's sort values are returned, so inserts and deletes between pages do not shift it.
@@ -133,7 +133,8 @@ Order: `[resync]` (bad cursor only), `table`, `[count]`, one or more `rows`, `sy
 {
   "fields": [ { "name": "…", "type": "…", "constraints": {"required": true}, … } ],
   "primaryKey": ["…"],
-  "foreignKeys": [ { "fields": ["…"], "reference": {"resource": "…", "fields": ["…"]} } ]
+  "foreignKeys": [ { "fields": ["…"], "reference": {"resource": "…", "fields": ["…"]} } ],
+  "subject": {"kind": "convoy", "field": "address"}
 }
 ```
 
@@ -146,6 +147,16 @@ Each field has:
 - `constraints`: the Frictionless constraints below.
 - `format`: `binary` for `blob` columns (base64 strings in rows).
 - every `properties` entry of the column, merged into the field.
+
+### Subject and address cells
+
+`subject`, when present, says what each row is about: `kind` is the ADR 0066 address kind of the row's subject, and `field` names the field holding its canonical address. A client opens a row (Enter) by opening that address. A table whose rows are no one kind's subjects has no `subject`.
+
+- A resource table's subject is derived from its key. `convoys` rows are convoys: their `address` field is `project:<project>/convoy:<record name>`, or `convoy:<record name>` for a convoy without a project, the convoy its roles' inboxes sit under, taking the project from the convoy's `flotilla.work/project` label. Each row's address names that convoy wherever a convoy address is taken. Other resource kinds have no subject yet.
+- A described table declares its subject with `Layout::subject`, naming one of its address fields.
+- The subject field is always returned, as key columns are, whatever `columns` asks for.
+
+Every field of type `address` can be opened: a client opens the cell's address, by the handler it has for the address's kind, so a message row's `sender` and `inbox` open those roles. An agent session's address is `…/role:<role>/session:<id>`; a terminal client opens it by attaching.
 
 ### Field types
 
@@ -225,7 +236,7 @@ whereOperators
 
 `GET /tables` is the authority. The tables are:
 
-- Resource kinds: one table each, named by the kind's plural, with the shared columns `metadata.*`, `status.phase`, `status.conditions`, `spec` and `status`.
+- Resource kinds: one table each, named by the kind's plural, with the shared columns `metadata.*`, `status.phase`, `status.conditions`, `spec` and `status`, and `address` where the kind's rows are subjects (`convoys`).
 - Named queries: a root table per query family (`convoy_row`, `independent_row`, `issue_row`, `checkout_row`, `awareness_node`, `standing_role_row`, `project_repositories_row`, `dispatch_queue_row`) and a child table per nested list, described by the row type. A child row carries its parent's key ahead of its own (`pos` for a list, `key` for a map). The listing entry names the family in `query`. The rows are the aggregator's result set, the same content the framed protocol's `SubscribeQueries` delivers, and `sequence` is the result set's sequence. A result set's sequence restarts with the daemon, and an issues query's also restarts each time it is materialised again: when its last subscriber has left and another subscribes. `awareness_node` sequences follow the ready-issue materialisations they read. So `incarnation` names the daemon run and, for `issue_row` and `awareness_node` tables, those materialisations. Listed only when the daemon serves them.
 - Engine kinds: a root table per kind, a table per nested collection, and `<root>.log`, the kind's event log projection with the columns `home`, `sequence`, `name`, `cause`, `edge`, `from`, `to`, `at`. `cause` (`Create`, `Edit`, `Edge`, `Delete`, `Expunge`), `edge` (the kind's edge names) and `from` and `to` (its state's labels) are enum columns.
 

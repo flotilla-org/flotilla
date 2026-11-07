@@ -4,7 +4,7 @@
 //! which is the verb's whole signature: there is no separate hand-written description.
 //!
 //! ```
-//! use flotilla_schema::{VerbEffect, ParamType, Verb};
+//! use flotilla_verbs::{Kind, ParamType, Verb, VerbEffect};
 //!
 //! #[derive(Verb)]
 //! #[verb(name = "convoy.abandon", subject = "convoy", effect = "destructive", invocation)]
@@ -17,7 +17,7 @@
 //! }
 //!
 //! let declaration = Abandon::declaration();
-//! assert_eq!((declaration.name, declaration.subject), ("convoy.abandon", flotilla_address::Kind::Convoy));
+//! assert_eq!((declaration.name, declaration.subject), ("convoy.abandon", Kind::Convoy));
 //! assert_eq!(declaration.effect, VerbEffect::Destructive);
 //! assert!(declaration.invocation && !declaration.idempotent);
 //! assert_eq!(declaration.result, None);

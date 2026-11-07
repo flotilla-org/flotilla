@@ -18,7 +18,6 @@ use flotilla_observation::sources::{
 use flotilla_protocol::PlacementDecision;
 use flotilla_resources::address::{remote_change_request_subject, same_subject};
 use flotilla_resources::lifecycle_reads::LifecycleReads;
-use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 #[cfg(test)]
 use flotilla_resources::{CapabilityNeed, ProjectSpec, Resource};
 use repository_discovery::discover_repository_change_request_with;
@@ -2390,8 +2389,7 @@ impl InProcessDaemon {
 
     pub async fn refresh_change_request_hint(&self, hint: &flotilla_address::Address) -> Result<(), String> {
         self.crew.refresh_change_request_hint(hint).await?;
-        let Some(hint_text) = flotilla_relay_protocol::hint_subject(hint).filter(|_| hint.kind() == flotilla_address::Kind::ChangeRequest)
-        else {
+        let Some(hint_text) = github_change_request_text(hint) else {
             return Ok(());
         };
         // Transitional (#3359): convoy subjects are still the protocol
@@ -2773,14 +2771,15 @@ impl InProcessDaemon {
         let candidates = rows.into_iter().filter(|row| row.resource.namespace == namespace).collect::<Vec<_>>();
         let identities = candidates
             .iter()
-            .map(|row| ConvoyAddressIdentity {
-                record_name: &row.resource.name,
+            .map(|row| flotilla_store::ConvoyIdentity {
+                record: &row.resource.name,
                 role: row.address_role.as_deref(),
                 project: row.project_ref.as_deref(),
                 terminal: row.phase.is_terminal(),
             })
             .collect::<Vec<_>>();
-        let selected = resolve_convoy_candidate_indices(&identities, name)?;
+        // Routing selects as the executor's lookup does (#4272), so both choose the same record.
+        let selected = flotilla_store::ConvoyName::parse(name).select_indices(&identities)?;
         let record_name = selected.first().map(|index| candidates[*index].resource.name.clone()).unwrap_or_else(|| name.to_string());
         let mut hosts = selected.into_iter().filter_map(|index| candidates[index].resource.host.clone()).collect::<Vec<_>>();
         hosts.sort();
@@ -3447,6 +3446,15 @@ impl InProcessDaemon {
 
 /// Non-trait methods that are called directly on the concrete `InProcessDaemon`
 /// type by the daemon server peer-overlay code and by the `execute()` implementation.
+/// The `cr/github.com/<owner>/<repo>/<number>` text of a public GitHub change request.
+fn github_change_request_text(address: &flotilla_address::Address) -> Option<String> {
+    use flotilla_address::Kind;
+    if address.kind() != Kind::ChangeRequest || address.get(Kind::Forge) != Some(flotilla_address::GITHUB_FORGE_ID) {
+        return None;
+    }
+    Some(format!("cr/github.com/{}/{}", address.get(Kind::Repo)?, address.number()?))
+}
+
 fn repository_identity_display(spec: &RepositorySpec) -> String {
     match spec.identity() {
         flotilla_resources::RepositoryIdentity::Forge { forge_ref, owner, repo_name } => format!("{forge_ref}/{owner}/{repo_name}"),

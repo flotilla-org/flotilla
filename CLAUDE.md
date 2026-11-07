@@ -59,7 +59,7 @@ CI uses nextest plus doctests and `ci/affected/selection.py` for PR test selecti
 
 Desk and crew vessel builds keep Cargo incrementals enabled. CI builds set `CARGO_INCREMENTAL=0`. Each fleet host runs an mtime-based `cargo-sweep --time 3` daily, while `scripts/prune-target.sh` remains a size-cap backstop. See [docs/development.md](docs/development.md) for installation, scope, logs, and thresholds.
 
-**Stable toolchain:** `rust-toolchain.toml` is the single compiler pin (currently Rust 1.99.0). Rustup selects it automatically and installs rustfmt, Clippy, llvm-tools, and the Relay Workers WebAssembly target. CI installs that pin and runs `ci/toolchain/assert.sh` to reject a mismatched compiler. Coverage uses stable with line coverage only. Release candidates and the crew image read the same file.
+**Stable toolchain:** `rust-toolchain.toml` is the single compiler pin (currently Rust 1.99.0). Rustup selects it automatically and installs rustfmt, Clippy and llvm-tools. CI installs that pin and runs `ci/toolchain/assert.sh` to reject a mismatched compiler. Coverage uses stable with line coverage only. Release candidates and the crew image read the same file.
 
 **Formatting:** `cargo fmt` uses the same stable pin; no nightly toolchain is required.
 
@@ -78,8 +78,7 @@ Core and daemon unit tests compile shared adapter sources only under `cfg(test)`
 integration tests import the testkit crates directly. Native libraries share `flotilla-build-features`' feature-only dependency
 selections on stable Cargo; `ci/build-graph/check.py` checks build and test selections separately for every workspace package,
 rejects production testkit dependencies and production `test-util`, and runs in workspace CI. Keep its anchors aligned when
-adding dependencies. The build-graph check resolves the full Cargo graph to enforce the boundary on external Rigging crates; its first run may fetch the pinned Git sources. Optional TLS providers and sandbox skips remain opt-in. The Relay Workers WebAssembly target does not
-depend on the native feature selections.
+adding dependencies. The build-graph check resolves the full Cargo graph to enforce the boundary on external Rigging crates; its first run may fetch the pinned Git sources. Optional TLS providers and sandbox skips remain opt-in.
 Workspace tests require Python 3.9+ and Cargo on PATH (`python` on Windows, `python3` elsewhere) for this guard.
 
 `flotilla-store-testkit`, `flotilla-crew` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.
@@ -165,7 +164,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-cli` | Shared CLI parsing/output, image-check client, PM connector and foreground terminal attachment; no dashboard renderer |
 | `flotilla-vessel` (in `flotilla-cli`) | Pushed CLI for domain commands, artifacts and hooks; no daemon or TUI. Drydock owns the resident agent |
 | `flotilla-table` | The `flotilla-table` sibling binary (#4249): described tables through binnacle, inline or printed; `flotilla table` hands off to it |
-| `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap and event loop; selected by the root default-on `tui` feature |
+| `flotilla-tui` | The `flotilla-tui` sibling binary (#4263): UI rendering (widget tree), input handling, binding table, keymap and event loop; `flotilla` with no subcommand and `flotilla view` hand off to it |
 | `flotilla-daemon` | Runtime supervision, socket server and the one HTTP router (ADR 0065) on every listener, replication composition and routed transport, peer networking, multi-host command routing |
 | `flotilla-address` | ADR 0066 addresses: typed `kind:value` segments, canonical encoding, forge-kind normalisation, lenient input through a Forge lookup, `record_name`, references and the condition/template grammar; no flotilla dependencies |
 | `flotilla-cbor` | The ADR 0063 CBOR profile over `cbor2`: deterministic writers, safe readers, limits, framing and the conformance corpus; no flotilla dependencies; moving to the shared [rigging](https://github.com/flotilla-org/rigging) repo, where sibling projects take it from (ADR 0068) |
@@ -183,8 +182,9 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-store-sqlite` | SQLite persistence, schema, transactions and decode quarantine |
 | `flotilla-store-http` | Kubernetes-isomorphic HTTP storage client |
 | `flotilla-store-testkit` | Shared backend contracts, fixtures and per-request read counters |
-| `flotilla-schema-derive` | `Stored` generates codecs, descriptors and edge handles; `Describe` generates descriptions only. Shape attributes (`child`, `flatten`, `intern`, `code`) are separate from storage policies (#3320, ADR 0067) |
+| `flotilla-schema-derive` | `Stored` generates codecs, descriptors and edge handles; `Describe` generates descriptions only; `Verb` generates a native verb's declaration into `flotilla_verbs`. Shape attributes (`child`, `flatten`, `intern`, `code`) are separate from storage policies (#3320, ADR 0067) |
 | `flotilla-schema` | Backend-neutral `TableSet` descriptions and `Describe` traits for stored kinds and query rows, declared indexes, logical rows codec, the append-only `Records` type, the `EdgeEvent` edge event and inline CBOR documents, typed edge handles and the `Edge` builder, typed index queries (`IndexQuery`), log entries (`Event`, with named field-level `Effect`s) and write origins, timestamps, the kind-code registry and the schema review view (`render_view`); re-exports the derive |
+| `flotilla-verbs` | Native verbs (#4267): `VerbDeclaration`, `VerbEffect` and `ParamType` (declared by `#[derive(Verb)]` from `flotilla-schema-derive`), the `NativeVerb` handler (handed the resolved caller), `Subject`, `Presentation`, `Picks` and the `VerbRegistry` each declaring crate's `register_verbs` fills from the composition root. The daemon serves the catalog, the `verbs` table, invocation and the route, and declares no verbs |
 | `flotilla-schema-sqlite` | SQLite DDL rendering (`DdlMode`), SQL extension traits and the Rusqlite runtime for derived kinds: shared tables (`strings`, `resource_identity`, `objects`, `home_sequence`, `log`), per-kind statements, interning, owner-checked writes (creation, spec edits, `apply_edge`, delete and expunge), the per-home event log with one lowering for local writes and `apply` of other homes' events, snapshot restore, reads of entries about a master, keyset-paged index queries and the startup scan |
 | `flotilla-replication` | Store-to-store replication over `dyn Store`: list/watch/resume, origin filtering, digest scheduling; host ports for stores, identity, health and peer sources |
 | `flotilla-review-bundle-object-store` | Object-store/S3 byte adapter for the review-bundle port |

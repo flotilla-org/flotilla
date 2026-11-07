@@ -580,7 +580,7 @@ mod tests {
             Arc::new(CountingSource(calls.clone())),
             IssueRefreshCadence::default(),
         );
-        let hint = flotilla_relay_protocol::parse_hint_subject("issue/github.com/flotilla-org/flotilla/2052").expect("hint");
+        let hint = flotilla_address::Address::issue(&flotilla_address::Forge::github(), "flotilla-org/flotilla", 2052).expect("hint");
         refresher.refresh_hint(&hint).await.expect("no demand");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let demand = uuid::Uuid::new_v4();
@@ -633,7 +633,7 @@ mod tests {
             IssueRefresher::new(backend.clone(), "reader".into(), Arc::new(CountingSource(calls.clone())), IssueRefreshCadence::default());
         let demand = uuid::Uuid::new_v4();
         refresher.demand(demand, subject, None).await.expect("demand");
-        let hint = flotilla_relay_protocol::parse_hint_subject("issue/github.com/flotilla-org/flotilla/2052").expect("hint");
+        let hint = flotilla_address::Address::issue(&flotilla_address::Forge::github(), "flotilla-org/flotilla", 2052).expect("hint");
         refresher.refresh_hint(&hint).await.expect("foreign hint");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         refresher.release(demand).await;

@@ -103,6 +103,36 @@ fi
 SH
 }
 
+# The first generation shipping a sibling (#4261); generation one predates them.
+sibling_generation="$generation_two"
+
+# `flotilla table` as the real CLI does it: flotilla-table beside the resolved binary, never PATH,
+# told this build; the fake sibling refuses another parent build, as flotilla-table does.
+add_sibling_fixture() {
+  local bin="$1" generation="$2" build
+  build="${generation#*-f}"
+  build="${build%%-c*}"
+  cat >>"$bin/flotilla" <<EOF
+if [[ "\${1:-}" == table ]]; then
+  sibling="\$(dirname "\$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "\$0")")/flotilla-table"
+  [[ -x "\$sibling" ]] || { printf '%s is not beside flotilla\\n' "\$sibling" >&2; exit 1; }
+  shift
+  FLOTILLA_PARENT_BUILD=$build exec "\$sibling" "\$@"
+fi
+EOF
+  [[ "$generation" == "$sibling_generation" ]] || return 0
+  cat >"$bin/flotilla-table" <<EOF
+#!/usr/bin/env bash
+build="\${FAKE_SIBLING_BUILD:-$build}"
+if [[ -n "\${FLOTILLA_PARENT_BUILD:-}" && "\$FLOTILLA_PARENT_BUILD" != "\$build" ]]; then
+  printf 'flotilla is build %s but flotilla-table beside it is build %s\\n' "\$FLOTILLA_PARENT_BUILD" "\$build" >&2
+  exit 1
+fi
+[[ "\${1:-}" != --version ]] || printf 'flotilla-table 0.1.0 (wire=%s)\\n' "\$build"
+EOF
+  chmod 0755 "$bin/flotilla-table"
+}
+
 make_generation() {
   local generation="$1"
   local protocol="$2"
@@ -126,7 +156,10 @@ if [[ "\${1:-}" == --socket && "\${3:-}" == resource && "\${4:-}" == validate &&
 fi
 EOF
     fi
-    if [[ "$name" == flotilla ]]; then add_post_install_fixture "$bundle/bin/$name" "$generation"; fi
+    if [[ "$name" == flotilla ]]; then
+      add_post_install_fixture "$bundle/bin/$name" "$generation"
+      add_sibling_fixture "$bundle/bin" "$generation"
+    fi
     printf 'printf "%s from %s\\n"\n' "$name" "$generation" >>"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
@@ -192,7 +225,10 @@ if [[ "${1:-}" == --socket && "${3:-}" == resource && "${4:-}" == validate ]]; t
 fi
 SH
     fi
-    if [[ "$name" == flotilla ]]; then add_post_install_fixture "$bundle/bin/$name" "$generation"; fi
+    if [[ "$name" == flotilla ]]; then
+      add_post_install_fixture "$bundle/bin/$name" "$generation"
+      add_sibling_fixture "$bundle/bin" "$generation"
+    fi
     printf 'printf "%s signed for %s\\n"\n' "$name" "$generation" >>"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
@@ -760,6 +796,9 @@ expected_post_install="$test_root/home/.local/opt/flotilla-fleet/releases/$gener
 grep -Fq "$expected_post_install|--socket $test_root/home/.config/flotilla/run/flotilla.sock --json fleet post-install --cleat-bin $test_root/home/.local/opt/flotilla-fleet/releases/$generation_two/bin/cleat --generation $generation_two --diagnostics-dir $test_root/home/.local/opt/flotilla-fleet/diagnostics" "$test_root/post-install.log" \
   || fail 'roll did not invoke the incoming post-install binary with its cleat and diagnostics paths'
 grep -Fq 'post-install fixture report' "$test_root/latest.out" || fail 'post-install report was swallowed'
+# The managed launcher's `flotilla table` finds the generation's sibling and its build check passes.
+grep -Fxq 'fleet-install: flotilla table runs flotilla-table of build 222222222222' "$test_root/latest.out" \
+  || fail 'roll did not check the generation sibling through the launcher'
 # Post-install failure cannot undo the confirmed incoming generation.
 if POST_INSTALL_EXIT=7 run_installer "$generation_two" >"$test_root/post-install-failed.out" 2>&1; then
   fail 'post-install failure was swallowed'
@@ -767,10 +806,20 @@ fi
 grep -Fq 'post-install fixture report' "$test_root/post-install-failed.out" || fail 'failed post-install report was swallowed'
 grep -Fq 'remains active' "$test_root/post-install-failed.out" || fail 'post-install failure omitted recovery state'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_two" || fail 'post-install failure rolled back'
+# A sibling of another build is refused by name and leaves the healthy generation active.
+if FAKE_SIBLING_BUILD=000000000000 run_installer "$generation_two" >"$test_root/sibling-build.out" 2>&1; then
+  fail 'a sibling of another build passed the install check'
+fi
+grep -Fq 'flotilla is build 222222222222 but flotilla-table beside it is build 000000000000' "$test_root/sibling-build.out" \
+  || fail 'sibling build refusal was not reported'
+grep -Fq "generation $generation_two remains active" "$test_root/sibling-build.out" || fail 'sibling refusal omitted recovery state'
 
 run_installer rollback >"$test_root/rollback.out"
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'rollback did not restore previous generation'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" = "$generation_two" || fail 'rollback did not retain displaced generation'
+# The previous generation's siblings come back with it: generation one predates them.
+test ! -e "$test_root/home/.local/opt/flotilla-fleet/current/bin/flotilla-table" || fail 'rollback kept the newer sibling'
+if grep -Fq 'runs flotilla-' "$test_root/rollback.out"; then fail 'rollback checked a sibling the previous generation lacks'; fi
 
 roll_log="$test_root/home/.config/flotilla/fleet-rolls.log"
 current_link="$test_root/home/.local/opt/flotilla-fleet/current"
@@ -872,6 +921,12 @@ assert_darwin_tcc_payload() {
   for relative in bin/flotilla bin/flotillad bin/cleat lib/libghostty-vt.dylib; do
     test -f "$stable/$relative" && test ! -L "$stable/$relative" || fail "TCC payload is not a regular copy: $relative"
     cmp "$stable/$relative" "$release/$relative" || fail "TCC payload differs from selected generation: $relative"
+  done
+  for relative in "$release"/bin/flotilla-* "$stable"/bin/flotilla-*; do
+    [[ -e "$relative" ]] || continue
+    relative="bin/${relative##*/}"
+    cmp "$stable/$relative" "$release/$relative" || fail "TCC siblings differ from selected generation: $relative"
+    test -x "$stable/$relative" || fail "TCC sibling lost executable mode: $relative"
   done
   for relative in flotilla flotillad cleat; do
     test -x "$stable/bin/$relative" || fail "TCC binary lost executable mode: $relative"
@@ -1071,9 +1126,11 @@ test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$g
   || fail 'signed Darwin generation was not selected'
 test -f "$darwin_home/.local/opt/flotilla-fleet/releases/$generation_two/lib/libghostty-vt.dylib" \
   || fail 'signed Darwin dynamic library was not installed'
-test "$(grep -c -- '--verify' "$test_root/codesign.log")" = 8 \
+# flotilla, flotillad, cleat, the library and the flotilla-table sibling, each before and after handoff.
+test "$(grep -c -- '--verify' "$test_root/codesign.log")" = 10 \
   || fail 'Darwin upgrade did not verify every Mach-O payload before and after handoff'
-test "$(grep -c -- '--entitlements' "$test_root/codesign.log")" = 8 \
+grep -Fq -- "/bin/flotilla-table" "$test_root/codesign.log" || fail 'Darwin upgrade did not verify the sibling signature'
+test "$(grep -c -- '--entitlements' "$test_root/codesign.log")" = 10 \
   || fail 'Darwin upgrade did not verify every Mach-O entitlement set before and after handoff'
 launch_agent="$darwin_home/Library/LaunchAgents/work.flotilla.flotillad.plist"
 python3 "$repo_root/scripts/fleet_install_test_support.py" assert-launchd "$launch_agent" "$darwin_home" || fail 'Darwin launchd agent content is incorrect'
@@ -1100,6 +1157,9 @@ test "$(grep -Ec '^kickstart -k gui/[0-9]+/work\.flotilla\.flotillad\|' "$test_r
 : >"$test_root/launchctl.log"
 LAUNCHD_AGENT_DISABLED=true run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-dev-mode-install.out"
 assert_darwin_tcc_payload "$generation_two"
+test -x "$darwin_home/.local/opt/flotilla-fleet/tcc/bin/flotilla-table" || fail 'Darwin install did not place the sibling beside the stable CLI'
+grep -Fxq 'fleet-install: flotilla table runs flotilla-table of build 222222222222' "$test_root/darwin-dev-mode-install.out" \
+  || fail 'Darwin install did not check the sibling through the stable launcher'
 grep -Fq 'preserving flotillad dev mode' "$test_root/darwin-dev-mode-install.out" \
   || fail 'Darwin install did not report preserved dev mode'
 if grep -Eq '^(enable|bootstrap|kickstart) ' "$test_root/launchctl.log"; then
@@ -1110,6 +1170,7 @@ darwin_previous_target="releases/$generation_one"
 : >"$test_root/launchctl.log"
 run_darwin_installer "$darwin_home" rollback >"$test_root/darwin-rollback.out"
 assert_darwin_tcc_payload "$generation_one"
+test ! -e "$darwin_home/.local/opt/flotilla-fleet/tcc/bin/flotilla-table" || fail 'Darwin rollback kept the newer sibling'
 grep -Eq "^bootstrap gui/[0-9]+ $launch_agent\\|$darwin_previous_target$" "$test_root/launchctl.log" \
   || fail 'Darwin rollback did not bootstrap after selecting the previous generation'
 grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.flotillad\\|$darwin_previous_target$" "$test_root/launchctl.log" \

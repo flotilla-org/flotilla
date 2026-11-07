@@ -1,21 +1,22 @@
 //! The catalog's load check, and invocations' per-subject checks, `set` runs and parameters.
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_address::{Address, Kind};
 use flotilla_protocol::{
     table::Row,
     verbs::{Invocation, Invoked, Status},
+    CommandCaller, PrincipalRef,
 };
-use flotilla_resources::{Convoy, ConvoySpec, InputMeta, PROJECT_LABEL, ROLE_LABEL};
-use flotilla_schema::{Table, Verb};
+use flotilla_schema::Table;
+use flotilla_verbs::{Call, NativeVerb, Picks, Presentation, Verb, VerbRegistry};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    catalog::{Catalog, Entry, Handler, NativeVerb, Picks, Presentation, Subject, Subjects},
-    convoy::ResourceSubjects,
+    catalog::{Catalog, Entry, Subjects},
     invoke::{allow_all, Policy, Refusal, Verbs},
+    subjects::ResourceSubjects,
 };
 use crate::server::tables;
 
@@ -41,15 +42,15 @@ struct Retry {
 /// A verb that does nothing, over parameters `P`.
 struct Inert<P>(PhantomData<P>);
 
-fn inert<P: Verb + DeserializeOwned + Send + Sync + 'static>() -> Arc<dyn Handler> {
-    Arc::new(Inert::<P>(PhantomData))
+fn inert<P: Verb + DeserializeOwned + Send + Sync + 'static>() -> Inert<P> {
+    Inert::<P>(PhantomData)
 }
 
 #[async_trait]
 impl<P: Verb + DeserializeOwned + Send + Sync + 'static> NativeVerb for Inert<P> {
     type Params = P;
 
-    async fn run(&self, _subjects: &[Subject], _params: &P, _invocation: &str) -> Result<Option<Value>, String> {
+    async fn run(&self, _call: Call<'_>, _params: &P) -> Result<Option<Value>, String> {
         Ok(None)
     }
 }
@@ -77,13 +78,12 @@ fn broken(catalog: &Catalog, name: &str) -> Option<String> {
 // its parameter.
 #[test]
 fn the_load_check_lists_broken_verbs_with_their_reasons() {
-    let natives = vec![inert::<Wipe>(), inert::<PeekVessel>(), inert::<Retry>()];
-    let presentations = vec![Presentation {
-        verb: "convoy.wipe",
-        when: vec![".status.nothing == x", "status.phase", ".status.phase != Landed"],
-        ..Presentation::default()
-    }];
-    let catalog = Catalog::new(natives, presentations, &Convoys);
+    let mut registry = VerbRegistry::new();
+    let when = vec![".status.nothing == x", "status.phase", ".status.phase != Landed"];
+    registry.register(inert::<Wipe>(), Presentation { when, ..Presentation::default() }).unwrap();
+    registry.register(inert::<PeekVessel>(), Presentation::default()).unwrap();
+    registry.register(inert::<Retry>(), Presentation::default()).unwrap();
+    let catalog = Catalog::new(registry, &Convoys);
     let wipe = broken(&catalog, "convoy.wipe").expect("broken");
     assert!(wipe.contains("`status.nothing` is not a column of `convoys`"), "{wipe}");
     assert!(wipe.contains("condition `status.phase`"), "{wipe}");
@@ -102,16 +102,13 @@ fn the_load_check_lists_broken_verbs_with_their_reasons() {
     assert_eq!((&style["type"], &style["default"], &style["options"]), (&"enum".into(), &"c".into(), &json!(["a", "b"])));
 }
 
-// Behaviour (#4197 done-when): the built-in verbs pass the load check, and every built-in
-// presentation names a native verb.
-#[test]
-fn the_built_in_verbs_are_not_broken() {
-    let natives = super::natives(None);
-    let names: Vec<_> = natives.iter().map(|native| native.declaration().name).collect();
-    for presentation in super::presentations() {
-        assert!(names.contains(&presentation.verb), "{} names no native verb", presentation.verb);
-    }
-    let catalog = Catalog::new(natives, super::presentations(), &Convoys);
+// Behaviour (#4197 done-when, #4267): the verbs the composition root registers pass the load
+// check against the tables the resource store serves, which name each kind's subject rows.
+#[tokio::test]
+async fn the_registered_verbs_are_not_broken() {
+    let (_dir, daemon) = super::super::tests::empty_daemon().await;
+    let registry = crate::runtime::verb_registry(Some(Arc::clone(&daemon))).expect("each verb registered once");
+    let catalog = Catalog::new(registry, &ResourceSubjects::new(daemon.resource_backend()));
     for entry in catalog.entries() {
         assert_eq!(entry.broken, None, "{}", entry.declaration.name);
     }
@@ -142,16 +139,16 @@ struct Tag {
 /// Answers with the subjects it ran over and the parameters it was given.
 struct Echo<P>(PhantomData<P>);
 
-fn echo<P: Verb + DeserializeOwned + Serialize + Send + Sync + 'static>() -> Arc<dyn Handler> {
-    Arc::new(Echo::<P>(PhantomData))
+fn echo<P: Verb + DeserializeOwned + Serialize + Send + Sync + 'static>() -> Echo<P> {
+    Echo::<P>(PhantomData)
 }
 
 #[async_trait]
 impl<P: Verb + DeserializeOwned + Serialize + Send + Sync + 'static> NativeVerb for Echo<P> {
     type Params = P;
 
-    async fn run(&self, subjects: &[Subject], params: &P, _invocation: &str) -> Result<Option<Value>, String> {
-        let subjects: Vec<_> = subjects.iter().map(|subject| subject.address.to_string()).collect();
+    async fn run(&self, call: Call<'_>, params: &P) -> Result<Option<Value>, String> {
+        let subjects: Vec<_> = call.subjects.iter().map(|subject| subject.address.to_string()).collect();
         Ok(Some(json!({"subjects": subjects, "params": params})))
     }
 }
@@ -180,7 +177,7 @@ impl Subjects for Rows {
 }
 
 /// Refuses every caller on `OTHER`.
-fn not_other(_caller: &str, _entry: &Entry, subject: &Address) -> Result<(), String> {
+fn not_other(_caller: &CommandCaller, _entry: &Entry, subject: &Address) -> Result<(), String> {
     if subject.as_str() == OTHER {
         Err("not on other".into())
     } else {
@@ -189,12 +186,11 @@ fn not_other(_caller: &str, _entry: &Entry, subject: &Address) -> Result<(), Str
 }
 
 fn verbs(policy: Policy) -> Verbs {
-    let natives = vec![echo::<Group>(), echo::<Tag>()];
-    let presentations = vec![
-        Presentation { verb: "convoy.group", picks: Picks::Set, when: vec![".status.phase != Landed"], ..Presentation::default() },
-        Presentation { verb: "convoy.tag", picks: Picks::Each, ..Presentation::default() },
-    ];
-    let catalog = Catalog::new(natives, presentations, &Rows);
+    let mut registry = VerbRegistry::new();
+    let group = Presentation { picks: Picks::Set, when: vec![".status.phase != Landed"], ..Presentation::default() };
+    registry.register(echo::<Group>(), group).unwrap();
+    registry.register(echo::<Tag>(), Presentation { picks: Picks::Each, ..Presentation::default() }).unwrap();
+    let catalog = Catalog::new(registry, &Rows);
     for entry in catalog.entries() {
         assert_eq!(entry.broken, None, "{}", entry.declaration.name);
     }
@@ -205,7 +201,7 @@ async fn call(verbs: &Verbs, verb: &str, subjects: &[&str], params: Value) -> Re
     let params = params.as_object().cloned().unwrap_or_default();
     verbs
         .invoke(
-            "bearer",
+            &CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace("default"), process: None, crew: None },
             "default",
             verb,
             Invocation { invocation: "id".into(), subjects: subjects.iter().map(|s| (*s).to_owned()).collect(), params },
@@ -294,38 +290,4 @@ async fn parameter_values_must_fit_their_declared_types() {
     }
     let refused = call(&verbs, "convoy.tag", &[RUNNING], json!({"count": "1"})).await;
     assert_eq!(refused.unwrap_err(), Refusal::Invalid("parameters: invalid type: string \"1\", expected i64".into()));
-}
-
-// Behaviour (#4234): a convoy address resolves as the CLI's `convoy explain` resolves it: a
-// record name names its convoy, and a role names the convoy holding it, within a project or in
-// any project.
-#[tokio::test]
-async fn a_convoy_address_names_a_record_or_a_role() {
-    let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let convoys = backend.clone().using::<Convoy>("ns");
-    let convoy = |record: &str, role: &str, project: Option<&str>| {
-        let mut labels = BTreeMap::from([(ROLE_LABEL.to_owned(), role.to_owned())]);
-        labels.extend(project.map(|project| (PROJECT_LABEL.to_owned(), project.to_owned())));
-        let spec = ConvoySpec::builder()
-            .workflow_ref("workflow".into())
-            .maybe_project_ref(project.map(str::to_owned))
-            .role(role.to_owned())
-            .build();
-        (InputMeta::builder().name(record.into()).labels(labels).build(), spec)
-    };
-    for (meta, spec) in [convoy("convoy-0123", "reviewer", Some("flotilla")), convoy("convoy-0456", "lander", None)] {
-        convoys.create(&meta, &spec).await.unwrap();
-    }
-    let subjects = ResourceSubjects::new(backend);
-    for (address, record) in [
-        ("convoy:convoy-0123", "convoy-0123"),
-        ("project:flotilla/convoy:reviewer", "convoy-0123"),
-        ("convoy:reviewer", "convoy-0123"),
-        ("convoy:lander", "convoy-0456"),
-    ] {
-        let row = subjects.row("ns", &address.parse::<Address>().unwrap()).await.unwrap();
-        assert_eq!(row.as_ref().and_then(|row| row["metadata.name"].as_str()), Some(record), "{address}");
-    }
-    let missing = subjects.row("ns", &"project:other/convoy:reviewer".parse::<Address>().unwrap()).await;
-    assert_eq!(missing.unwrap_err(), "no convoy matches `reviewer@other`");
 }

@@ -130,7 +130,8 @@ elif '--display' in args:
                            LAB_DARWIN_SIGN_CODESIGN=str(tool), SIGN_TEST_LOG=str(log),
                            SIGN_TEST_ENTITLEMENTS=str(entitlements), RCODESIGN_SIGN_SIGNER='keychain')
         stage = self.root / 'stage'
-        for relative in (*self.signer.REQUIRED_BINARIES, 'lib/test.dylib'):
+        # A sibling (#4249) is signed like `flotilla`; a Linux guest tool sharing its prefix is not one.
+        for relative in (*self.signer.REQUIRED_BINARIES, 'bin/flotilla-table', 'lib/test.dylib'):
             path = stage / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'unsigned')
@@ -139,7 +140,8 @@ elif '--display' in args:
             signer = load('lab-darwin-sign')
             records = signer.sign_payloads(stage, 'Test Identity', 'TESTTEAM', entitlements, expected, cert, self.key)
         commands = [json.loads(line) for line in log.read_text().splitlines()]
-        self.assertEqual(len(records), 4)
+        self.assertEqual(sorted(record['path'] for record in records),
+                         sorted([*self.signer.REQUIRED_BINARIES, 'bin/flotilla-table', 'lib/test.dylib']))
         for offset, record in enumerate(records):
             path = str(stage / record['path'])
             self.assertEqual(commands[offset * 4], [

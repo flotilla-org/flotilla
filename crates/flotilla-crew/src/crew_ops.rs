@@ -102,7 +102,7 @@ fn lost_vessel_refusal(vessel: &str, reason: &str, backing_gone: bool) -> String
     }
 }
 
-pub use flotilla_store::resolve_local_convoy_name;
+pub use flotilla_store::resolve_convoy_record;
 
 /// The sender's awaiting-reply record kind for a send (#3587 layer 7): none
 /// for a send expecting nothing, a stall for a stalled crew's supervision,

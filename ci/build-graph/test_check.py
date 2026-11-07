@@ -7,14 +7,14 @@ import unittest
 from unittest.mock import patch
 
 from check import (AGENT_CONNECTOR, AGENT_CONNECTOR_FORBIDDEN, CAPABILITY_CRATES, C_FREE_BASE, DISCOVERY_FORBIDDEN, DRYDOCK_COMPOSITION, DRYDOCK_IMPLEMENTATION, RESOURCE_EXEMPTIONS, SCHEMA_CRATES, STATE_MACHINES, c_free_violations,
-                   vessel_graph_violations, feature_differences, is_testkit, layer, main, tree_features, violations)
+                   vessel_graph_violations, operator_graph_violations, feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
-# Explicit finite generator: the eight names are fixed by the amended contract,
+# Explicit finite generator: the seven names are fixed by the amended contract,
 # independent of the implementation's policy set (which might regress).
 BASE_CRATES = (
     "flotilla-protocol", "flotilla-transport", "flotilla-paths",
-    "flotilla-daemon-api", "flotilla-relay-protocol",
+    "flotilla-daemon-api",
     "flotilla-resources", "flotilla-client", "flotilla-config",
 )
 
@@ -86,6 +86,17 @@ class BuildGraphContract(unittest.TestCase):
                 self.assertEqual(vessel_graph_violations({f"{dependency} v1.0": set()}),
                                  [f"vessel CLI: must not depend on {dependency}"])
         self.assertEqual(vessel_graph_violations({"flotilla-cli v0.1": set(), "flotilla-agent v0.1": set()}), [])
+
+    def test_operator_cli_excludes_dashboard_and_terminal_dependencies(self):
+        # #4263: every renderer and terminal-driver entry point is refused, even transitively.
+        for dependency in ("flotilla-tui", "ratatui", "ratatui-core", "ratatui-widgets", "ratatui-crossterm", "tui-input",
+                           "catppuccin", "crokey", "crossterm"):
+            with self.subTest(dependency=dependency):
+                self.assertEqual(operator_graph_violations({f"{dependency} v1.0": set()}),
+                                 [f"flotilla: must not depend on {dependency}; the dashboard is the flotilla-tui sibling"])
+        # The operator CLI still composes core and the daemon.
+        self.assertEqual(operator_graph_violations({"flotilla-cli v0.1": set(), "flotilla-core v0.1": set(),
+                                                    "flotilla-daemon v0.1": set(), "comfy-table v7": set()}), [])
 
     def test_state_machines_are_c_free_and_self_contained(self):
         # ADR 0064 / #3319: the engine is base-tier and may be a dev-dependency of anything.
@@ -1028,7 +1039,7 @@ class LayerContract(unittest.TestCase):
 
     def test_resources_exemptions_remain_native(self):
         self.assertTrue(RESOURCE_EXEMPTIONS.isdisjoint(C_FREE_BASE))
-        # Manifest and TUI keep TLS and the executable still reaches store through core;
+        # Manifest and the TUI sibling keep TLS and the executable still reaches store through core;
         # these production graphs retain native feature checks.
         for name in ("flotilla-manifest", "flotilla-tui", "flotilla"):
             self.assertIn(name, RESOURCE_EXEMPTIONS)

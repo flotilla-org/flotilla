@@ -273,24 +273,6 @@ jobs:
           cargo --config 'profile.dev.package."*".debug=0' check --target x86_64-pc-windows-gnu -p flotilla-client -p flotilla-transport --all-targets --locked
           cargo --config 'profile.dev.package."*".debug=0' check --target x86_64-pc-windows-gnu -p flotilla-resources -p flotilla-protocol -p flotilla-paths -p flotilla-daemon-api --lib --locked
 
-  relay-wasm:
-    name: Relay Workers target
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Set up pinned Rust
-        id: rust-pin
-        uses: ./ci/toolchain/action
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          shared-key: "relay-wasm"
-      - run: cargo --config 'profile.dev.package."*".debug=0' build -p flotilla-relay --target wasm32-unknown-unknown --locked
-      - run: cargo --config 'profile.dev.package."*".debug=0' clippy -p flotilla-relay --target wasm32-unknown-unknown --locked -- -D warnings
-
   test:
     name: Test
     runs-on: ubuntu-latest
