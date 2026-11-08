@@ -250,14 +250,16 @@ mod agent_sessions {
             .collect()
     }
 
-    /// Keyed reads of the decided store's AgentSessions, with whether each one's home is current.
+    /// Keyed reads of the decided store's AgentSessions, with whether each one's home is current
+    /// by the daemon's clock.
     pub struct DecidedAgentSessions {
         service: Arc<Service>,
+        clock: Arc<dyn flotilla_resources::Clock>,
     }
 
     impl DecidedAgentSessions {
-        pub fn new(service: Arc<Service>) -> Self {
-            Self { service }
+        pub fn new(service: Arc<Service>, clock: Arc<dyn flotilla_resources::Clock>) -> Self {
+            Self { service, clock }
         }
     }
 
@@ -271,7 +273,7 @@ mod agent_sessions {
                 .map_err(|error| format!("AgentSession/{name}: {error}"))?;
             let current = home == own || {
                 let heard = self.service.watermark(home).map_err(|error| error.to_string())?.applied_through.to_datetime();
-                home_current(heard.filter(|at| *at > DateTime::<Utc>::UNIX_EPOCH), Utc::now())
+                home_current(heard.filter(|at| *at > DateTime::<Utc>::UNIX_EPOCH), self.clock.now())
             };
             Ok(reading.map(|reading| AgentActivityView { reading, current }))
         }

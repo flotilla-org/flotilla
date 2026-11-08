@@ -145,6 +145,43 @@ async fn a_crew_members_row_shows_its_agent_session_at_another_home() {
     assert_eq!(reading(&elsewhere), Some(at_home));
 }
 
+// Once the peering drops, another home's crew reading goes stale here at the moment it stops
+// being current: HOME_HEARD_WITHIN after this daemon last heard from that home. Nothing else
+// happens then, so the row changing shows the reader's one deadline wake. The daemons' clock
+// follows tokio's paused time, so the clock and the deadline sleep move together.
+#[tokio::test(start_paused = true)]
+async fn a_crew_members_row_goes_stale_at_its_deadline_once_its_home_is_unheard() {
+    use flotilla_resources::{agent_activity::HOME_HEARD_WITHIN, Clock as _};
+    let clock = std::sync::Arc::new(flotilla_store_testkit::PausedClock::start());
+    let (a, b) = tokio::join!(
+        TestDaemon::builder().clock(clock.clone()).agent("stall_rate = 1.0").settings("host_name = \"agents-a\"\n").start(),
+        TestDaemon::builder().clock(clock.clone()).agent("stall_rate = 1.0").settings("host_name = \"agents-b\"\n").start()
+    );
+    let convoy = a.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let reading = |set: &ResultSet| -> Option<AgentSessionReading> {
+        let row = set.rows.as_convoys()?.iter().find(|row| row.resource.name == convoy)?;
+        row.vessels.iter().flat_map(|vessel| &vessel.crew).find_map(|crew| crew.agent_session.clone())
+    };
+    let idle = |set: &ResultSet| reading(set).is_some_and(|reading| reading.activity == Some(AgentActivity::Idle));
+    let at_home = reading(&a.wait_query(QueryId::Convoys { scope: None }, idle).await).expect("reading at its home");
+    let peering = TestDaemon::peer(&a, &b).await;
+    b.wait_query(QueryId::Convoys { scope: None }, |set| reading(set).is_some_and(|reading| reading == at_home)).await;
+
+    drop(peering);
+    // The last keepalive it heard came at most one held round before the drop.
+    let dropped = clock.now();
+    let stale = b
+        .wait_query(QueryId::Convoys { scope: None }, |set| reading(set).is_some_and(|reading| reading.stale))
+        .within(std::time::Duration::from_secs(300))
+        .await;
+    let stale_after = clock.now() - dropped;
+    assert!(
+        stale_after <= HOME_HEARD_WITHIN && stale_after > HOME_HEARD_WITHIN - chrono::Duration::seconds(15),
+        "stale {stale_after} after the drop"
+    );
+    assert_eq!(reading(&stale).map(|reading| AgentSessionReading { stale: false, ..reading }), Some(at_home), "only its freshness changed");
+}
+
 // A restarted daemon finds its running vessels again: the vendor's backings and
 // the crew's process survive, and the convoy lands with nothing provisioned or
 // launched twice.

@@ -562,7 +562,7 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
     };
     // Crew attention reads the agent from its AgentSession (#3108): the screen read that
     // recorded it is what a reader of the running session sees.
-    let reads = flotilla_core::in_process::DecidedAgentSessions::new(Arc::clone(&service));
+    let reads = flotilla_core::in_process::DecidedAgentSessions::new(Arc::clone(&service), Arc::new(flotilla_resources::SystemClock));
     let crew_attention = |observation: &flotilla_crew::reconcilers::terminal_session::TerminalObservation| {
         use flotilla_resources::agent_activity::AgentSessionReads as _;
         let status = flotilla_resources::TerminalSessionStatus {

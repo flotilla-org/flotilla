@@ -1389,7 +1389,10 @@ async fn open_provisioning_lifecycles(
             .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>)
             .with_clones(clones as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
             .with_checkouts(Arc::clone(&lifecycles.checkout_records) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
-            .with_agent_sessions(Arc::new(flotilla_core::in_process::DecidedAgentSessions::new(daemon.decided_store()?))),
+            .with_agent_sessions(Arc::new(flotilla_core::in_process::DecidedAgentSessions::new(
+                daemon.decided_store()?,
+                daemon.clock_for_scenarios(),
+            ))),
     ))?;
     // Cached checkout providers end with the checkout launches they belong to.
     daemon.follow_checkout_provider_lifetimes()?;

@@ -593,7 +593,9 @@ impl<'a, T: 'a> Wait<'a, T> {
         Self { run: Box::new(move |deadline| Box::pin(run(deadline))), within }
     }
 
-    fn within(mut self, within: Duration) -> Self {
+    /// Waits up to `within` instead: for a scenario whose deadline lies beyond the usual wait,
+    /// under paused time.
+    pub fn within(mut self, within: Duration) -> Self {
         self.within = within;
         self
     }

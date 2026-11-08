@@ -7,7 +7,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use flotilla_engine_store::{archive::BUNDLE_MEDIA_TYPE, MessageLog};
 use flotilla_provider_runtime::{ChannelLabel, HttpClient};
 use flotilla_resources::{Clock, HostCondition};
@@ -157,18 +156,6 @@ impl HttpClient for S3StandIn {
     }
 }
 
-/// Wall time that moves only with `tokio::time::advance`.
-struct PausedClock {
-    origin: DateTime<Utc>,
-    started: tokio::time::Instant,
-}
-
-impl Clock for PausedClock {
-    fn now(&self) -> DateTime<Utc> {
-        self.origin + chrono::Duration::from_std(self.started.elapsed()).expect("paused time fits")
-    }
-}
-
 fn inbox() -> Address {
     "project:fleet/role:infra".parse().expect("inbox")
 }
@@ -194,7 +181,7 @@ impl Harness {
         let registry = crate::runtime::decided_registry().expect("registry");
         let store =
             Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("SQLite"), HOME, registry).expect("store")));
-        let clock: Arc<dyn Clock> = Arc::new(PausedClock { origin: Utc::now(), started: tokio::time::Instant::now() });
+        let clock: Arc<dyn Clock> = Arc::new(flotilla_store_testkit::PausedClock::start());
         let now = Timestamp::from_datetime(&clock.now());
         let name = Address::message(&inbox(), "notice").expect("address").as_str().to_owned();
         let mut messages = Home::<Message, MessageLog>::with_log(HOME, MessageLog::new(Arc::clone(&store))).expect("home");

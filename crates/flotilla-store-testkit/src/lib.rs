@@ -1,7 +1,7 @@
 mod support;
 pub use support::*;
 mod clock;
-pub use clock::VirtualClock;
+pub use clock::{PausedClock, VirtualClock};
 pub mod fixtures;
 mod read_counts;
 pub use read_counts::{

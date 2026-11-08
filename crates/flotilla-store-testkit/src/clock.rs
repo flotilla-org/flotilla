@@ -28,3 +28,25 @@ impl Clock for VirtualClock {
         *self.now.lock().expect("virtual clock lock poisoned")
     }
 }
+
+/// Wall time that moves with tokio's time: its start plus the time elapsed since, so under paused
+/// time it moves only as tokio's does, and a deadline sleep computed from it wakes when the clock
+/// reaches the deadline.
+#[derive(Debug)]
+pub struct PausedClock {
+    origin: DateTime<Utc>,
+    started: tokio::time::Instant,
+}
+
+impl PausedClock {
+    /// Starts at the wall time now.
+    pub fn start() -> Self {
+        Self { origin: Utc::now(), started: tokio::time::Instant::now() }
+    }
+}
+
+impl Clock for PausedClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.origin + Duration::from_std(self.started.elapsed()).expect("paused time fits")
+    }
+}
