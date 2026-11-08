@@ -13,7 +13,6 @@ use flotilla_agent::adapter::{
 };
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_ai_utility::{AiUtility, ConvoyNames};
-use flotilla_change_request::branch_lookup_observer::BranchLookupObserver;
 use flotilla_change_request::observation::{ChangeRequestKey, ChangeRequestObservationSource};
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_charter::ops_entry::{ENSURED_FROM_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION};
@@ -120,8 +119,10 @@ pub struct ConvoyAdmission {
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
     repository_change_requests: Arc<RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>>,
     change_request_port: Arc<dyn ChangeRequestQueryPort>,
+    /// The change requests the forge observers' branch probes recorded (#3108), installed with the
+    /// engine.
     #[builder(default)]
-    branch_lookup_observer: BranchLookupObserver,
+    change_request_branches: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>>,
     issue_port: Arc<dyn IssueQueryPort>,
     change_request_observation_source: Arc<ProviderChangeRequestObservationSource>,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
@@ -417,7 +418,6 @@ impl ConvoyAdmission {
                 }
             }
         };
-        let context = self.reads(reads.clone());
         let bound = match binding {
             Some(binding) => Some(
                 self.resolve_bound_convoy_change_request_from_inventory(
@@ -443,16 +443,7 @@ impl ConvoyAdmission {
                 // reuse its lookup for discovery just as for the primary row.
                 bound.as_ref().expect("binding has a lookup").clone().map_err(ObservationError::Failed)
             } else {
-                let (candidates, setup_failures) = context.repository_change_request_candidates(std::slice::from_ref(key)).await;
-                if let Some((repository, _, provider)) = candidates.into_iter().next() {
-                    self.branch_lookup_observer.find(&repository.to_string(), &provider, branch).await.map(|found| {
-                        found.map(|(id, request)| ConvoyChangeRequest { id, status: request.status, repository_key: repository })
-                    })
-                } else {
-                    // Setup reports repository-read, forge-identity, or provider-discovery
-                    // failures. The generic text defends against an empty diagnostic set.
-                    Err(ObservationError::Failed(setup_failures.into_iter().next().unwrap_or_else(|| "no repository provider".into())))
-                }
+                self.recorded_branch_change_request(&reads, &namespace, key, branch).await.map_err(ObservationError::Failed)
             };
             match &result {
                 Ok(Some(request)) if primary.is_none() => primary = Some(request.clone()),
@@ -472,6 +463,44 @@ impl ConvoyAdmission {
             error.map_or(Ok(None), |error| Err(error.to_string()))
         };
         flotilla_observation::convoy_branch_refresh::ConvoyBranchRefresh { primary, repositories: results }
+    }
+
+    /// Installs the forge observers' branch records with the engine (#3108).
+    pub fn install_change_request_branches(
+        &self,
+        branches: Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>,
+    ) -> Result<(), String> {
+        self.change_request_branches.set(branches).map_err(|_| "the change request branch records are already installed".to_owned())
+    }
+
+    /// The newest change request the forge observers recorded merging from `branch` of repository
+    /// `key`'s own repository (#3108). Their branch probes look the branch up on the forge; this
+    /// reads only their records, from every home.
+    async fn recorded_branch_change_request(
+        &self,
+        reads: &ResourceBackend,
+        namespace: &str,
+        key: &RepositoryKey,
+        branch: &str,
+    ) -> Result<Option<ConvoyChangeRequest>, String> {
+        let branches = self.change_request_branches.get().ok_or("the change request branch records are not installed")?;
+        let repository =
+            reads.including_replicas::<Repository>(namespace).get(&key.to_string()).await.map_err(|error| error.to_string())?;
+        let forges = reads.definitions::<Forge>(namespace).list().await.map_err(|error| error.to_string())?;
+        let forges = forges.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
+        let address = repository
+            .object
+            .spec
+            .remotes()
+            .iter()
+            .find_map(|remote| flotilla_resources::address::repository_address(remote, &forges).ok())
+            .ok_or_else(|| format!("repository {key} has no remote a Forge names"))?;
+        let (service, scope) =
+            flotilla_resources::address::stored_service_scope(&address).ok_or_else(|| format!("{address} names no forge repository"))?;
+        let found = branches.on_branch(&service, &scope, branch).await?;
+        Ok(found.into_iter().filter_map(|copy| Some((copy.number, copy.state?))).max_by_key(|(number, _)| *number).map(
+            |(number, state)| ConvoyChangeRequest { id: number.to_string(), status: protocol_status(state), repository_key: key.clone() },
+        ))
     }
 
     #[doc(hidden)]
@@ -562,15 +591,19 @@ impl ConvoyAdmission {
                 Err(error) => return Err(error.to_string()),
             };
             let Some(state) = observation.object.status.as_ref().and_then(|status| status.state.value) else { continue };
-            let status = match state {
-                ObservedChangeRequestState::Open => flotilla_protocol::ChangeRequestStatus::Open,
-                ObservedChangeRequestState::Draft => flotilla_protocol::ChangeRequestStatus::Draft,
-                ObservedChangeRequestState::Merged => flotilla_protocol::ChangeRequestStatus::Merged,
-                ObservedChangeRequestState::Closed => flotilla_protocol::ChangeRequestStatus::Closed,
-            };
+            let status = protocol_status(state);
             return Ok(Some(ConvoyChangeRequest { id: change_request_id.to_string(), status, repository_key: repository_key.clone() }));
         }
         Ok(None)
+    }
+}
+
+fn protocol_status(state: ObservedChangeRequestState) -> flotilla_protocol::ChangeRequestStatus {
+    match state {
+        ObservedChangeRequestState::Open => flotilla_protocol::ChangeRequestStatus::Open,
+        ObservedChangeRequestState::Draft => flotilla_protocol::ChangeRequestStatus::Draft,
+        ObservedChangeRequestState::Merged => flotilla_protocol::ChangeRequestStatus::Merged,
+        ObservedChangeRequestState::Closed => flotilla_protocol::ChangeRequestStatus::Closed,
     }
 }
 

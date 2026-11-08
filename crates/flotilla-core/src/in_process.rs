@@ -729,6 +729,8 @@ pub struct InProcessDaemon {
     change_stream_rounds: change_stream::Rounds,
     decided_store: std::sync::Mutex<Option<Arc<flotilla_schema_sqlite::stream::Service>>>,
     change_request_branches: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>>,
+    /// The forge observations' records (ChangeRequest and Issue), whose changes wake the aggregator.
+    observation_records: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::EngineRecords>>,
     /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4), installed with
     /// the decided store's provisioning homes; none before, and none with the switch off.
     lifecycle_reads: Arc<flotilla_projections::ports::LateLifecycleReads>,
@@ -1447,6 +1449,7 @@ impl InProcessDaemon {
             surfaces: Surfaces::default(),
             decided_store: Default::default(),
             change_request_branches: Default::default(),
+            observation_records: Default::default(),
             change_stream_rounds: Default::default(),
             lifecycle_reads: Arc::clone(&lifecycle_reads),
             accounts,
@@ -1476,10 +1479,12 @@ impl InProcessDaemon {
             Arc::clone(&daemon.provisioning_namespace),
         )))?;
         daemon.install_observation_records(engine.observations, engine.observation_failures)?;
+        daemon.admission.install_change_request_branches(Arc::clone(&engine.change_request_branches))?;
         daemon
             .change_request_branches
             .set(engine.change_request_branches)
             .map_err(|_| "the change request branches are already installed".to_owned())?;
+        daemon.change_request_observer.install_branch_probe(Arc::new(ForgeBranchProbe(Arc::downgrade(&daemon))))?;
         daemon.install_account_records(engine.accounts)?;
         daemon.install_manifest_roots(engine.manifest_roots)?;
         crew.set_checkout_inspector(Arc::new(CheckoutInspector(Arc::downgrade(&daemon))));
@@ -2337,7 +2342,8 @@ impl InProcessDaemon {
         records: Arc<dyn flotilla_resources::engine_records::EngineRecords>,
         failures: Arc<dyn flotilla_resources::engine_records::ObservationFailures>,
     ) -> Result<(), String> {
-        self.resource_backend().install_engine_records(records);
+        self.resource_backend().install_engine_records(Arc::clone(&records));
+        self.observation_records.set(records).map_err(|_| "the observation records are already installed".to_owned())?;
         self.change_request_observer.engine().install(Arc::clone(&failures))?;
         self.issue_observer.engine().install(failures)?;
         let (change_requests, issues) = (self.change_request_observer.clone(), self.issue_observer.clone());
@@ -6328,6 +6334,18 @@ impl ProjectOperations for InProcessDaemon {
         }
     }
 }
+/// The forge observer's branch probe (#3108): this daemon's lookup of a branch with its
+/// repository's change request provider, recorded on the change requests' records.
+struct ForgeBranchProbe(Weak<InProcessDaemon>);
+
+#[async_trait]
+impl flotilla_observation::change_request_observer::BranchProbe for ForgeBranchProbe {
+    async fn probe(&self, repository: &flotilla_address::Address, branch: &str) -> Result<(), String> {
+        let daemon = self.0.upgrade().ok_or("branch probe daemon unavailable")?;
+        daemon.observe_change_request_branch(repository, branch).await
+    }
+}
+
 struct CheckoutInspector(Weak<InProcessDaemon>);
 
 #[async_trait]

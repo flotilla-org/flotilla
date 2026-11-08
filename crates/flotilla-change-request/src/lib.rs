@@ -1,5 +1,4 @@
 //! Forge-neutral change-request trackers, observation sources and branch lookup.
-pub mod branch_lookup_observer;
 pub mod observation;
 
 use std::collections::{BTreeMap, HashMap};

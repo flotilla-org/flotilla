@@ -27,127 +27,87 @@ use crate::in_process::InProcessDaemon;
 
 use crate::testkits::discovery::fake_discovery_with_runner;
 
-// #2585: the real convoy resolver shares proven branch absence across callers
-// while preserving ordered repository selection and refreshing after five minutes.
-#[tokio::test(start_paused = true)]
-async fn convoy_resolver_reuses_absence_observations() {
-    let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
-    for _ in 0..3 {
-        assert!(fixture.daemon.resolve_convoy_change_request(&fixture.keys, "feature/wanted", None).await.expect("absence").is_none());
-        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
-    }
-    assert!(fixture.daemon.resolve_convoy_change_request(&fixture.keys, "feature/other", None).await.expect("another branch").is_none());
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 4);
-    tokio::time::advance(Duration::from_secs(300)).await;
-    assert!(fixture.daemon.resolve_convoy_change_request(&fixture.keys, "feature/wanted", None).await.expect("expired absence").is_none());
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 6);
-}
-
-// #2541: both REST lookup paths choose classified limits over ordinary text,
-// preserve ordinary diagnostics, and retain successful/ambiguous repo selection.
+// #2541: the REST ID lookup chooses classified limits over ordinary text,
+// preserves ordinary diagnostics, and retains successful/ambiguous repo selection.
 // This finite matrix exhausts ordinary, absent, primary (with/without deadline),
-// secondary, missing-base and successful reads; multiple limits retain the first
-// branch failure and all ID diagnostics, preserving the existing lookup policy.
+// secondary, missing-base and successful reads; multiple limits retain all ID
+// diagnostics. A branch lookup no longer reaches the forge here: the forge
+// observer's branch probe does, and resolution reads its records (#3108).
 #[tokio::test]
 async fn rest_admission_lookup_selection_matrix() {
     use RestAdmissionReply::*;
     use RestAdmissionSelection::{Ambiguous, Failure, Found};
     let cases = [
-        ([Ordinary, Limited], Failure(Limited), Failure(Limited)),
-        ([Limited, Ordinary], Failure(Limited), Failure(Limited)),
-        ([Ordinary, NoDeadline], Failure(NoDeadline), Failure(NoDeadline)),
-        ([Ordinary, Secondary], Failure(Secondary), Failure(Secondary)),
-        ([Limited, Secondary], Failure(Limited), Failure(Limited)),
-        ([Secondary, Limited], Failure(Secondary), Failure(Secondary)),
-        ([Ordinary, Ordinary], Failure(Ordinary), Failure(Ordinary)),
-        ([Absent, Ordinary], Failure(Ordinary), Failure(Ordinary)),
-        ([Absent, Absent], Failure(Absent), RestAdmissionSelection::Absent),
-        ([MissingBase, Ordinary], Failure(MissingBase), Found(0)),
-        ([Limited, Success], Found(1), Found(1)),
-        ([Success, Limited], Found(0), Found(0)),
-        ([Success, Success], Ambiguous, Found(0)),
+        ([Ordinary, Limited], Failure(Limited)),
+        ([Limited, Ordinary], Failure(Limited)),
+        ([Ordinary, NoDeadline], Failure(NoDeadline)),
+        ([Ordinary, Secondary], Failure(Secondary)),
+        ([Limited, Secondary], Failure(Limited)),
+        ([Secondary, Limited], Failure(Secondary)),
+        ([Ordinary, Ordinary], Failure(Ordinary)),
+        ([Absent, Ordinary], Failure(Ordinary)),
+        ([Absent, Absent], Failure(Absent)),
+        ([MissingBase, Ordinary], Failure(MissingBase)),
+        ([Limited, Success], Found(1)),
+        ([Success, Limited], Found(0)),
+        ([Success, Success], Ambiguous),
     ];
-    for (outcomes, id_selection, branch_selection) in cases {
-        for (lookup, expected) in [(RestAdmissionLookup::Id, id_selection), (RestAdmissionLookup::Branch, branch_selection)] {
-            let fixture = rest_admission_fixture(outcomes, lookup).await;
-            let result = match lookup {
-                RestAdmissionLookup::Branch => fixture
-                    .daemon
-                    .resolve_convoy_change_request(&fixture.keys, "feature/wanted", None)
-                    .await
-                    .map(|found| found.map(|found| found.repository_key)),
-                RestAdmissionLookup::Id => {
-                    fixture.daemon.admission.resolve_convoy_change_request_admission(&fixture.keys, "7").await.map(|found| {
-                        assert_eq!(found.branch, "feature/wanted");
-                        assert_eq!(found.base_ref, "main");
-                        Some(found.binding.repository_ref)
-                    })
-                }
-            };
-            match expected {
-                Found(index) => assert_eq!(result.expect("successful lookup"), Some(fixture.keys[index].clone())),
-                RestAdmissionSelection::Absent => assert!(result.expect("no matching request").is_none()),
-                Ambiguous => assert_eq!(
-                    result.expect_err("ambiguous lookup"),
-                    "change request 7 is ambiguous across 2 consulted repositories [team/repo0, team/repo1]"
-                ),
-                Failure(reply) => {
-                    let error = result.expect_err("lookup refused");
-                    match reply {
-                        Limited | NoDeadline | Secondary => {
-                            assert!(error.contains("budget=REST core"), "{outcomes:?}: {error}");
-                            let kind = if reply == Secondary { "kind=secondary" } else { "kind=primary" };
-                            assert!(error.contains(kind), "{error}");
-                            if reply == NoDeadline {
-                                assert!(error.contains("retry_at=unavailable"), "{error}");
-                            }
-                            if reply == Limited {
-                                assert!(error.contains("retry_source=x-ratelimit-reset, retry_at=2030-01-01T00:00:00+00:00"), "{error}");
-                            }
-                            match lookup {
-                                RestAdmissionLookup::Id => {
-                                    for (index, outcome) in outcomes.iter().enumerate() {
-                                        assert!(error.contains(&format!("repository team/repo{index}:")), "{error}");
-                                        if *outcome == Ordinary {
-                                            assert!(
-                                                error.contains(&format!(
-                                                    "repository team/repo{index}: rate limited diagnostics unavailable"
-                                                )),
-                                                "{error}"
-                                            );
-                                        }
-                                    }
-                                }
-                                RestAdmissionLookup::Branch => {
-                                    assert!(!error.contains("diagnostics unavailable"), "{error}");
-                                    assert!(!error.contains(if reply == Secondary { "kind=primary" } else { "kind=secondary" }), "{error}");
-                                }
+    for (outcomes, expected) in cases {
+        let fixture = rest_admission_fixture(outcomes, RestAdmissionLookup::Id).await;
+        let result = fixture.daemon.admission.resolve_convoy_change_request_admission(&fixture.keys, "7").await.map(|found| {
+            assert_eq!(found.branch, "feature/wanted");
+            assert_eq!(found.base_ref, "main");
+            Some(found.binding.repository_ref)
+        });
+        match expected {
+            Found(index) => assert_eq!(result.expect("successful lookup"), Some(fixture.keys[index].clone())),
+            Ambiguous => assert_eq!(
+                result.expect_err("ambiguous lookup"),
+                "change request 7 is ambiguous across 2 consulted repositories [team/repo0, team/repo1]"
+            ),
+            Failure(reply) => {
+                let error = result.expect_err("lookup refused");
+                match reply {
+                    Limited | NoDeadline | Secondary => {
+                        assert!(error.contains("budget=REST core"), "{outcomes:?}: {error}");
+                        let kind = if reply == Secondary { "kind=secondary" } else { "kind=primary" };
+                        assert!(error.contains(kind), "{error}");
+                        if reply == NoDeadline {
+                            assert!(error.contains("retry_at=unavailable"), "{error}");
+                        }
+                        if reply == Limited {
+                            assert!(error.contains("retry_source=x-ratelimit-reset, retry_at=2030-01-01T00:00:00+00:00"), "{error}");
+                        }
+                        for (index, outcome) in outcomes.iter().enumerate() {
+                            assert!(error.contains(&format!("repository team/repo{index}:")), "{error}");
+                            if *outcome == Ordinary {
+                                assert!(
+                                    error.contains(&format!("repository team/repo{index}: rate limited diagnostics unavailable")),
+                                    "{error}"
+                                );
                             }
                         }
-                        Ordinary => {
-                            match lookup {
-                                RestAdmissionLookup::Branch => assert_eq!(error, "rate limited diagnostics unavailable"),
-                                RestAdmissionLookup::Id => {
-                                    let diagnostics = outcomes
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(index, outcome)| {
-                                            let message =
-                                                if *outcome == Absent { "gh: Not Found" } else { "rate limited diagnostics unavailable" };
-                                            format!("repository team/repo{index}: {message}")
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("; ");
-                                    assert_eq!(error, format!("change request 7 was not found in consulted repositories [team/repo0, team/repo1]: {diagnostics}"));
-                                }
-                            }
-                        }
-                        MissingBase => {
-                            assert!(error.contains("repository team/repo0: change request 7 did not report a base ref"), "{error}")
-                        }
-                        Absent => assert!(error.contains("repository team/repo0: gh: Not Found"), "{error}"),
-                        Success => panic!("success is not a refusal"),
                     }
+                    Ordinary => {
+                        let diagnostics = outcomes
+                            .iter()
+                            .enumerate()
+                            .map(|(index, outcome)| {
+                                let message = if *outcome == Absent { "gh: Not Found" } else { "rate limited diagnostics unavailable" };
+                                format!("repository team/repo{index}: {message}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        assert_eq!(
+                            error,
+                            format!("change request 7 was not found in consulted repositories [team/repo0, team/repo1]: {diagnostics}")
+                        );
+                    }
+                    MissingBase => {
+                        assert!(error.contains("repository team/repo0: change request 7 did not report a base ref"), "{error}")
+                    }
+                    Absent => assert!(error.contains("repository team/repo0: gh: Not Found"), "{error}"),
+                    Success => panic!("success is not a refusal"),
                 }
             }
         }

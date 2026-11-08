@@ -75,7 +75,6 @@ const CHANGE_REQUEST_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60
 /// A lookup that runs longer fails, so a hung resolver cannot hold a convoy's
 /// refresh slot; matches the forge observation load timeout.
 const CHANGE_REQUEST_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const CHANGE_REQUEST_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const CHANGE_REQUEST_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(bon::Builder)]
@@ -169,6 +168,12 @@ pub trait ConvoyChangeRequestResolver: Send + Sync {
         _resolution: ConvoyBranchRefresh,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    /// A tick whenever any home's change request records change: the forge observers' writes,
+    /// including what their branch probes find (#3108). None when there are none to follow.
+    async fn change_request_changes(&self) -> Option<futures::stream::BoxStream<'static, ()>> {
+        None
     }
 }
 
@@ -611,9 +616,12 @@ impl Aggregator {
         // So are clones: a checkout's readiness reads its clone launch.
         let mut clone_changes = self.lifecycle_reads.clones().ok().map(|clones| clones.changes());
         let mut attention_changes = self.attention_port.as_ref().and_then(|port| port.changes());
-        let mut change_request_sweep =
-            tokio::time::interval_at(Instant::now() + CHANGE_REQUEST_SWEEP_INTERVAL, CHANGE_REQUEST_SWEEP_INTERVAL);
-        change_request_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // What the forge observers find, their branch probes' finds among it, is on the change
+        // request records: a convoy with no change request looks again when they change (#3108).
+        let mut change_request_changes = match &self.change_request_resolver {
+            Some(resolver) => resolver.change_request_changes().await,
+            None => None,
+        };
 
         loop {
             let escalation_delay = self.next_escalation_delay(self.clock.now());
@@ -668,6 +676,12 @@ impl Aggregator {
                     None => futures::future::pending().await,
                 }
             };
+            let change_request_change = async {
+                match change_request_changes.as_mut() {
+                    Some(changes) => changes.next().await,
+                    None => futures::future::pending().await,
+                }
+            };
             let agent_session_update = async {
                 match agent_session_updates.as_mut() {
                     Some(updates) => updates.next().await,
@@ -699,9 +713,13 @@ impl Aggregator {
                     self.flush_local_projection().await;
                     tokio::task::yield_now().await;
                 }
-                _ = change_request_sweep.tick() => {
-                    self.sweep_active_change_request_subjects();
-                }
+                change = change_request_change => match change {
+                    Some(()) => self.recheck_unproduced_change_requests(),
+                    None => {
+                        tracing::warn!("the change request records' follow ended; convoys without a change request are not looked up again");
+                        change_request_changes = None;
+                    }
+                },
                 () = &mut escalation => {
                     if self.rebuild_salience_projection().await {
                         self.emit_awareness_result_sets().await;
@@ -1373,7 +1391,14 @@ impl Aggregator {
                 .is_some_and(|source| source.contains_key(&(reference.namespace.clone(), reference.name.clone(), None)))
     }
 
-    fn next_change_request_refresh(&self, reference: &ResourceRef, now: Instant) -> Instant {
+    /// When convoy `reference`'s next lookup may run. A lookup by branch reads only the forge
+    /// observers' records, so it runs at once. Only a lookup of a bound change request can still
+    /// reach the forge, when its record is missing (#3108), so only that one keeps the minimum
+    /// interval and the failure backoff.
+    fn next_change_request_refresh(&self, reference: &ResourceRef, bound: bool, now: Instant) -> Instant {
+        if !bound {
+            return now;
+        }
         let failures = self.change_request_refresh_failures.get(reference).copied().unwrap_or(0).min(3);
         let interval = std::cmp::min(CHANGE_REQUEST_MIN_REFRESH_INTERVAL * (1 << failures), CHANGE_REQUEST_MAX_RETRY_INTERVAL);
         match self.change_request_refresh_started.get(reference).copied() {
@@ -1413,7 +1438,7 @@ impl Aggregator {
         let Some(resolver) = self.change_request_resolver.clone() else {
             return;
         };
-        let refresh_at = self.next_change_request_refresh(&reference, Instant::now());
+        let refresh_at = self.next_change_request_refresh(&reference, binding.is_some(), Instant::now());
         self.change_request_refresh_started.insert(reference.clone(), refresh_at);
         let refresh_tx = self.change_request_refresh_queue.tx.clone();
         let task_reference = reference.clone();
@@ -1461,15 +1486,19 @@ impl Aggregator {
         if failed {
             *self.change_request_refresh_failures.entry(reference.clone()).or_default() += 1;
         }
-        if failed || retrigger {
-            if let Some(convoy) = self.effective_convoys().get(&reference) {
+        if let Some(convoy) = self.effective_convoys().get(&reference) {
+            // A failed lookup by branch read only records: the next change to them looks again,
+            // rather than a retry. A bound lookup retries under its backoff.
+            if retrigger || (failed && convoy.spec.change_request.is_some()) {
                 self.schedule_change_request_refresh(convoy);
             }
         }
         self.rebuild_local_projection().await;
     }
 
-    fn sweep_active_change_request_subjects(&mut self) {
+    /// Looks up again the change request of each active home convoy that produces none yet, as
+    /// the change request records change: what a forge observer's branch probe found is read then.
+    fn recheck_unproduced_change_requests(&mut self) {
         let convoys = self.effective_convoys().into_iter().filter(|(reference, convoy)| {
             self.is_home_convoy(reference)
                 && convoy.status.as_ref().is_some_and(|status| status.phase == ResourceConvoyPhase::Active)
@@ -1515,7 +1544,7 @@ impl Aggregator {
             // scan indefinitely (#3206). One not yet started will read the
             // triggering change; one already running may not, so it looks again
             // once its result is applied. The kept lookup captured the convoy's
-            // branch, repositories and binding: this pass serves sweeps and
+            // branch, repositories and binding: this pass serves rechecks and
             // repository triggers only; spec changes go through
             // `schedule_change_request_refresh`, which replaces the task.
             if self.change_request_refresh_tasks.contains_key(&reference) {
@@ -1549,7 +1578,11 @@ impl Aggregator {
         };
         for ((repositories, branch, _), ChangeRequestRefreshGroup { binding, targets }) in lookups {
             let now = Instant::now();
-            let refresh_at = targets.iter().map(|(reference, _)| self.next_change_request_refresh(reference, now)).max().unwrap_or(now);
+            let refresh_at = targets
+                .iter()
+                .map(|(reference, _)| self.next_change_request_refresh(reference, binding.is_some(), now))
+                .max()
+                .unwrap_or(now);
             for (reference, _) in &targets {
                 self.change_request_refresh_started.insert(reference.clone(), refresh_at);
             }
@@ -5191,6 +5224,13 @@ mod tests {
             .expect("create branch-backed convoy")
     }
 
+    /// `convoy` bound to change request 2301 of its repository.
+    fn bound(mut convoy: ResourceObject<Convoy>) -> ResourceObject<Convoy> {
+        convoy.spec.change_request =
+            Some(BoundChangeRequest { id: "2301".into(), repository_ref: RepositoryKey("repo_flotilla".into()), title: "Bound".into() });
+        convoy
+    }
+
     pub(super) async fn convoy_with_vessel(name: &str) -> ResourceObject<Convoy> {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let resolver = backend.using::<Convoy>("flotilla");
@@ -6210,8 +6250,9 @@ mod tests {
         });
         let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
             .with_change_request_resolver(Arc::clone(&resolver));
-        let convoy_a = convoy_with_branch("convoy-a").await;
-        let mut convoy_b = convoy_with_branch("convoy-b").await;
+        // Only a bound lookup can still reach the forge, so only it keeps the minimum interval.
+        let convoy_a = bound(convoy_with_branch("convoy-a").await);
+        let mut convoy_b = bound(convoy_with_branch("convoy-b").await);
         convoy_b.spec.r#ref = Some("feat/other".into());
         for convoy in [&convoy_a, &convoy_b] {
             aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
@@ -6323,13 +6364,14 @@ mod tests {
     }
 
     // Behaviour: a resolver that never answers fails its lookup after the
-    // lookup timeout, so the convoy's refresh slot is released and retried.
+    // lookup timeout, so the convoy's refresh slot is released and retried. A
+    // bound lookup is the one that can still reach the forge and retries.
     #[tokio::test(start_paused = true)]
     async fn a_hung_lookup_fails_at_the_timeout() {
         let (event_tx, _) = broadcast::channel(8);
         let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
             .with_change_request_resolver(Arc::new(BlockingChangeRequestResolver));
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(bound(convoy_with_branch("convoy-a").await))).await;
         let reference = aggregator.convoy_ref("flotilla", "convoy-a");
         // Let the lookup start, so its timeout is running, then pass it.
         for _ in 0..4 {
@@ -6339,6 +6381,38 @@ mod tests {
         apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(aggregator.change_request_refresh_failures.get(&reference), Some(&1));
         assert!(aggregator.change_request_refresh_tasks.contains_key(&reference), "the failed lookup is retried");
+    }
+
+    // Behaviour (#3108): a lookup by branch reads only the forge observers' records. One that fails
+    // is not retried by itself and does not wait an interval; the next change to the records looks
+    // again at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_branch_lookup_waits_for_the_records_to_change() {
+        let (event_tx, _) = broadcast::channel(8);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::from([
+                Err("records unreadable".to_string()),
+                Ok(Some(ConvoyChangeRequest {
+                    id: "2301".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    repository_key: RepositoryKey("repo_flotilla".into()),
+                })),
+            ])),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .with_change_request_resolver(Arc::clone(&resolver));
+        let mut convoy = convoy_with_branch("convoy-a").await;
+        convoy.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() });
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        let reference = aggregator.convoy_ref("flotilla", "convoy-a");
+        apply_next_change_request_resolution(&mut aggregator).await;
+        assert!(!aggregator.change_request_refresh_tasks.contains_key(&reference), "no retry of its own");
+        aggregator.recheck_unproduced_change_requests();
+        apply_next_change_request_resolution(&mut aggregator).await;
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(aggregator.convoy_change_requests[&reference].id, "2301");
     }
 
     // Behaviour (#3206): repository change-request churn does not defer a
@@ -6429,7 +6503,8 @@ mod tests {
         });
         let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
             .with_change_request_resolver(Arc::clone(&resolver));
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
+        // Only a bound lookup can still reach the forge, so only it retries under the backoff.
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(bound(convoy_with_branch("convoy-a").await))).await;
         apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
@@ -6442,7 +6517,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn active_home_sweep_rechecks_a_convoy_with_no_subject() {
+    async fn a_change_request_record_change_rechecks_an_active_convoy_with_no_subject() {
         let (event_tx, _) = broadcast::channel(8);
         let resolver = Arc::new(ScriptedChangeRequestResolver {
             results: Mutex::new(VecDeque::from([
@@ -6463,11 +6538,74 @@ mod tests {
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
         apply_next_change_request_resolution(&mut aggregator).await;
 
-        aggregator.sweep_active_change_request_subjects();
+        aggregator.recheck_unproduced_change_requests();
         tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
         apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
         assert_eq!(aggregator.convoy_change_requests[&aggregator.convoy_ref("flotilla", "convoy-a")].id, "2301");
+    }
+
+    /// Counts lookups, finds nothing, and ticks its record changes when the test sends.
+    struct TickingChangeRequestResolver {
+        calls: AtomicUsize,
+        changes: Mutex<Option<futures::channel::mpsc::UnboundedReceiver<()>>>,
+    }
+
+    #[async_trait]
+    impl ConvoyChangeRequestResolver for TickingChangeRequestResolver {
+        async fn refresh_branch(
+            &self,
+            repositories: &[RepositoryKey],
+            _branch: &str,
+            _binding: Option<&BoundChangeRequest>,
+        ) -> ConvoyBranchRefresh {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ConvoyBranchRefresh { primary: Ok(None), repositories: repositories.iter().map(|key| (key.clone(), Ok(None))).collect() }
+        }
+
+        async fn change_request_changes(&self) -> Option<BoxStream<'static, ()>> {
+            self.changes.lock().await.take().map(StreamExt::boxed)
+        }
+    }
+
+    // No timer looks a convoy's change request up again (#3108): an active convoy that produces
+    // none is looked up again when the change request records change, as a forge observer's
+    // branch probe writes them.
+    #[tokio::test(start_paused = true)]
+    async fn a_convoy_without_a_change_request_is_looked_up_again_when_the_records_change() {
+        let durable = ResourceBackend::new(InMemoryBackend::default());
+        let observed = ResourceBackend::new(InMemoryBackend::observed());
+        let template = convoy_with_branch("convoy-a").await;
+        let convoys = durable.using::<Convoy>("flotilla");
+        let created = convoys.create(&InputMeta::builder().name("convoy-a".to_string()).build(), &template.spec).await.expect("convoy");
+        convoys
+            .update_status(
+                "convoy-a",
+                &created.metadata.resource_version,
+                &ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() },
+            )
+            .await
+            .expect("active");
+        let (ticks, changes) = futures::channel::mpsc::unbounded();
+        let resolver = Arc::new(TickingChangeRequestResolver { calls: AtomicUsize::new(0), changes: Mutex::new(Some(changes)) });
+        let (tx, _rx) = broadcast::channel(4096);
+        let aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), tx)
+            .with_change_request_resolver(Arc::clone(&resolver));
+        let task = tokio::spawn(aggregator.run(resource_resolvers(&durable, &observed)));
+        let looked_up = |count: usize| {
+            let resolver = Arc::clone(&resolver);
+            async move {
+                while resolver.calls.load(Ordering::SeqCst) < count {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        };
+        timeout(Duration::from_secs(60), looked_up(1)).await.expect("the convoy's first lookup");
+        tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1, "nothing looks again while the records are unchanged");
+        ticks.unbounded_send(()).expect("tick");
+        timeout(CHANGE_REQUEST_MIN_REFRESH_INTERVAL + Duration::from_secs(60), looked_up(2)).await.expect("looked up again");
+        task.abort();
     }
 
     // RepoDelta invalidation re-resolves convoy PR state through the resource-backed resolver.

@@ -37,7 +37,6 @@ pub(super) enum RestAdmissionLookup {
 
 pub(super) enum RestAdmissionSelection {
     Failure(RestAdmissionReply),
-    Absent,
     Found(usize),
     Ambiguous,
 }

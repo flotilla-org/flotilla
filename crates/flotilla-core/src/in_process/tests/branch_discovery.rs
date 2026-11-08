@@ -177,12 +177,7 @@ async fn branch_lookup_for_validation_does_not_reuse_cached_absence() {
         });
         fixture.daemon.admission.repository_change_requests().write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
             observed.clone();
-        assert!(fixture
-            .daemon
-            .resolve_convoy_change_request(std::slice::from_ref(&fixture.keys[0]), "reused", None)
-            .await
-            .expect("absence")
-            .is_none());
+        assert!(observed.find_change_request_by_branch("reused").await.expect("absence").is_none());
         provider
             .add_change_requests(vec![(
                 "7".into(),

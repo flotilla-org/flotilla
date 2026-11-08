@@ -40,6 +40,16 @@ impl ConvoyChangeRequestResolver for InProcessDaemon {
     ) -> Result<(), String> {
         self.discover_convoy_branch_subjects_with_resolution(namespace, convoy, branch, Some(&resolution)).await
     }
+
+    async fn change_request_changes(&self) -> Option<futures::stream::BoxStream<'static, ()>> {
+        match self.observation_records.get()?.changes().await {
+            Ok(changes) => Some(changes),
+            Err(error) => {
+                tracing::warn!(%error, "follow the change request records; convoys without a change request are not looked up again");
+                None
+            }
+        }
+    }
 }
 
 #[async_trait]

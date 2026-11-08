@@ -10,9 +10,10 @@ use flotilla_resources::{
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::{claim_crew, stall_test_daemon, stall_workflow_snapshot, test_meta};
 
-// #2202: row publication and subject discovery reuse every branch lookup,
-// including misses/errors. Each repository is queried once per refresh, even
-// when a duplicate key is supplied; successes persist despite another failure.
+// #2202, #3108: the forge observer's branch probe is the only forge read. Each
+// repository's probe records what it finds; a failed probe records nothing.
+// Row publication and subject discovery then read those records, once per
+// repository even when a duplicate key is supplied, and never reach the forge.
 #[hegel::test]
 fn convoy_branch_refresh_reuses_repository_results(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -59,26 +60,32 @@ fn convoy_branch_refresh_reuses_repository_results(tc: hegel::TestCase) {
             if !empty && duplicate {
                 keys.push(keys[0].clone());
             }
+            for (key, outcome) in fixture.keys.iter().zip(outcomes) {
+                let (repository, _) = fixture.daemon.repository_address_of("flotilla", key).await.expect("repository address");
+                let probed = fixture.daemon.observe_change_request_branch(&repository, "feature/wanted").await;
+                let failed = matches!(outcome, RestAdmissionReply::Ordinary | RestAdmissionReply::Limited);
+                assert_eq!(probed.is_err(), failed, "{outcome:?}: {probed:?}");
+            }
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 2, "one probe per repository");
             let refresh = fixture.daemon.refresh_convoy_branch(&keys, "feature/wanted", None).await;
-            let discovery = fixture
+            fixture
                 .daemon
                 .discover_convoy_branch_subjects_with_resolution("flotilla", "refresh-reuse", "feature/wanted", Some(&refresh))
-                .await;
-            let expected_count = if empty { 0 } else { 2 };
-            assert_eq!(fixture.calls.load(Ordering::SeqCst), expected_count);
-            assert_eq!(refresh.repositories.len(), expected_count);
+                .await
+                .expect("discovery reads only records");
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 2, "neither the refresh nor discovery reads the forge");
+            assert_eq!(refresh.repositories.len(), if empty { 0 } else { 2 });
             let expected_found = if empty { 0 } else { outcomes.iter().filter(|reply| **reply == RestAdmissionReply::Success).count() };
             let convoy = convoys.get("refresh-reuse").await.expect("convoy");
             let status = convoy.status.unwrap_or_default();
             assert_eq!(status.subjects.len(), expected_found);
-            let failed = !empty && outcomes.iter().any(|reply| matches!(reply, RestAdmissionReply::Ordinary | RestAdmissionReply::Limited));
-            assert_eq!(discovery.is_err(), failed);
-            assert_eq!(status.branch_subject_scan_error.is_some(), failed);
+            assert!(status.branch_subject_scan_error.is_none());
+            let primary = refresh.primary.expect("records read");
             if expected_found > 0 {
                 let expected_index = outcomes.iter().position(|reply| *reply == RestAdmissionReply::Success).expect("match");
-                assert_eq!(refresh.primary.expect("primary success").expect("match").repository_key, fixture.keys[expected_index]);
+                assert_eq!(primary.expect("match").repository_key, fixture.keys[expected_index]);
             } else {
-                assert_eq!(refresh.primary.is_err(), failed);
+                assert!(primary.is_none());
             }
         }
     });

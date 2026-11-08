@@ -350,7 +350,6 @@ mod tests {
     use flotilla_replay_testkit::Masks;
 
     use crate::change_request::testing::fixture_path;
-    use flotilla_change_request::branch_lookup_observer::BranchLookupObserver;
 
     // HTTP boundary fault injection: every request must first pass the strict fake.
     struct ThrottledForge {
@@ -818,12 +817,11 @@ mod tests {
         assert_no_refusals(&fake);
     }
 
-    // HTTP boundary: an observer reuses only proven absence, then checks again
-    // at the freshness boundary so a newly created PR can be found. A fork's PR
-    // from a branch of the same name is not the repository's branch and is never
-    // found (#3108, ruled).
-    #[tokio::test(start_paused = true)]
-    async fn observer_repeated_absent_scans_are_bounded_and_expire() {
+    // HTTP boundary: absence is proven only by a complete scan, and a newly
+    // created PR is found by the next lookup. A fork's PR from a branch of the
+    // same name is not the repository's branch and is never found (#3108, ruled).
+    #[tokio::test]
+    async fn branch_lookup_scans_completely_and_finds_only_the_own_branch() {
         let other = serde_json::json!([{"number": 1, "title": "Other", "head": {"ref": "other"}, "state": "open"}]);
         let found = serde_json::json!([
             {"number": 7, "title": "Fork PR", "head": {"ref": "feature/wanted", "repo": {"full_name": "fork/repo"}}, "state": "open"},
@@ -840,116 +838,21 @@ mod tests {
             urls: Mutex::new(Vec::new()),
         });
         let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
-        let observer = BranchLookupObserver::default();
-        for _ in 0..4 {
-            assert!(observer.find("team/repo", &provider, "feature/wanted").await.expect("proven absence").is_none());
-            assert_eq!(http.urls.lock().expect("urls").len(), 3, "repeat scans reuse the complete scan");
-        }
-        tokio::time::advance(tokio::time::Duration::from_secs(299)).await;
-        assert!(observer.find("team/repo", &provider, "feature/wanted").await.expect("fresh absence").is_none());
-        assert_eq!(http.urls.lock().expect("urls").len(), 3);
-        tokio::time::advance(tokio::time::Duration::from_secs(1)).await;
+        assert!(provider.find_change_request_by_branch("feature/wanted").await.expect("proven absence").is_none());
+        assert_eq!(http.urls.lock().expect("urls").len(), 3, "absence takes a complete scan");
         for expected_calls in [4, 5] {
-            let (id, request) = observer.find("team/repo", &provider, "feature/wanted").await.expect("fresh lookup").expect("own head");
+            let (id, request) = provider.find_change_request_by_branch("feature/wanted").await.expect("fresh lookup").expect("own head");
             assert_eq!(id, "8", "the fork's PR from a same-named branch is not found");
             assert_eq!(request.status, ChangeRequestStatus::Merged);
-            assert_eq!(http.urls.lock().expect("urls").len(), expected_calls, "positive observations are read fresh");
+            assert_eq!(http.urls.lock().expect("urls").len(), expected_calls);
         }
-    }
-
-    // #2585: absence observations are isolated by repository and exact branch.
-    // Generate repeated/interleaved keys, including empty, slash, percent and
-    // Unicode names. The network boundary returns complete empty listings.
-    #[hegel::test]
-    fn observer_absence_keys_do_not_leak(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(20));
-        let keys = (0..steps)
-            .map(|_| {
-                (tc.draw(gs::integers::<usize>().min_value(0).max_value(1)), tc.draw(gs::integers::<usize>().min_value(0).max_value(4)))
-            })
-            .collect::<Vec<_>>();
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        runtime.block_on(async {
-            let http = Arc::new(MockHttp {
-                responses: Mutex::new((0..steps).map(|_| json_response(&serde_json::json!([]))).collect()),
-                urls: Mutex::new(Vec::new()),
-            });
-            let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
-            let observer = BranchLookupObserver::default();
-            let mut seen = std::collections::HashSet::new();
-            for (repository, branch) in keys {
-                let repo = ["team/repo", "team/other"][repository];
-                let name = ["", "feature/wanted", "feature%2Fwanted", "wanted", "修正"][branch];
-                assert!(observer.find(repo, &provider, name).await.expect("absence").is_none());
-                seen.insert((repository, branch));
-                assert_eq!(http.urls.lock().expect("urls").len(), seen.len(), "each distinct key scans once");
-            }
-        });
-    }
-
-    // #2585: bounded observer memory evicts the earliest-expiring observation,
-    // causing a fresh scan instead of making eviction look like a permanent miss.
-    #[tokio::test(start_paused = true)]
-    async fn observer_absence_capacity_evicts_oldest() {
-        let http = Arc::new(MockHttp {
-            responses: Mutex::new((0..1027).map(|_| json_response(&serde_json::json!([]))).collect()),
-            urls: Mutex::new(Vec::new()),
-        });
-        let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
-        let observer = BranchLookupObserver::default();
-        for index in 0..1024 {
-            assert!(observer.find("team/repo", &provider, &format!("branch-{index}")).await.expect("absence").is_none());
-            tokio::time::advance(tokio::time::Duration::from_millis(1)).await;
-        }
-        assert!(observer.find("team/repo", &provider, "branch-0").await.expect("at capacity").is_none());
-        assert_eq!(http.urls.lock().expect("urls").len(), 1024);
-        // Replacing the provider for an existing key must not evict another key.
-        let replacement: Arc<dyn ChangeRequestTracker> = Arc::new(self::provider(http.clone()));
-        assert!(observer.find("team/repo", &replacement, "branch-1023").await.expect("replace existing key").is_none());
-        assert!(observer.find("team/repo", &provider, "branch-0").await.expect("unrelated key survives").is_none());
-        assert_eq!(http.urls.lock().expect("urls").len(), 1025);
-        assert!(observer.find("team/repo", &provider, "branch-1024").await.expect("overflow").is_none());
-        assert!(observer.find("team/repo", &provider, "branch-0").await.expect("evicted branch").is_none());
-        assert_eq!(http.urls.lock().expect("urls").len(), 1027);
-    }
-
-    // HTTP boundary: a bounded failure is never absence, and replacement
-    // providers (changed forge/credentials) do not inherit a previous absence.
-    #[tokio::test]
-    async fn observer_does_not_cache_failures_or_cross_provider_identity() {
-        let other = serde_json::json!([{"number": 1, "title": "Other", "head": {"ref": "other"}, "state": "open"}]);
-        let http = Arc::new(MockHttp {
-            responses: Mutex::new(
-                (0..100).map(|_| json_response(&other)).chain([error_response(403), json_response(&serde_json::json!([]))]).collect(),
-            ),
-            urls: Mutex::new(Vec::new()),
-        });
-        let first: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
-        let observer = BranchLookupObserver::default();
-        assert!(observer
-            .find("team/repo", &first, "wanted")
-            .await
-            .expect_err("budget is not absence")
-            .to_string()
-            .contains("exceeded 100 pages"));
-        assert!(observer.find("team/repo", &first, "wanted").await.expect_err("HTTP failure is not absence").to_string().contains("403"));
-        assert!(observer.find("team/repo", &first, "wanted").await.expect("retry complete scan").is_none());
-        assert_eq!(http.urls.lock().expect("urls").len(), 102);
-        let replacement_http = Arc::new(MockHttp {
-            responses: Mutex::new(VecDeque::from([json_response(&serde_json::json!([]))])),
-            urls: Mutex::new(Vec::new()),
-        });
-        let replacement: Arc<dyn ChangeRequestTracker> = Arc::new(provider(replacement_http.clone()));
-        assert!(observer.find("team/repo", &replacement, "wanted").await.expect("new provider").is_none());
-        assert_eq!(replacement_http.urls.lock().expect("urls").len(), 1);
     }
 
     // Contract (recorded world: robert/ghostty-ops with pull request 1 merged
     // and its branch deleted, pull request 2 merged from drop-retired-stance):
     // head filtering supports an exact branch name, but cannot reproduce
     // lookup by a deleted head's synthetic head.ref, which only an unfiltered
-    // scan finds. A repeated absent lookup reuses the proven absence.
+    // scan finds. An absent branch is proven by a complete scan.
     async fn contract_lab_head_filter_capability(provider: ForgejoChangeRequestProvider) {
         for (head, expected) in [
             ("drop-retired-stance", &["2"][..]),
@@ -977,11 +880,7 @@ mod tests {
         assert_eq!(id, "1");
         assert_eq!(request.branch, "refs/pull/1/head");
         assert_eq!(request.status, ChangeRequestStatus::Merged);
-        let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider);
-        let observer = BranchLookupObserver::default();
-        for _ in 0..3 {
-            assert!(observer.find("robert/ghostty-ops", &provider, "flotilla-2585-definitely-absent").await.expect("absence").is_none());
-        }
+        assert!(provider.find_change_request_by_branch("flotilla-2585-definitely-absent").await.expect("absence").is_none());
     }
 
     // Live-recorded evidence for the head-filter contract.

@@ -108,6 +108,16 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         .await
         .expect("credential");
     daemon.set_provisioning_namespace("flotilla".to_string()).await;
+    // The forge observer's branch probe looks the branch up with the forge-aware provider and its
+    // credential and records what it finds; resolution reads those records (#3108).
+    let probe = |url: &'static str| {
+        let (daemon, forge) = (&daemon, &forge);
+        async move {
+            let address = flotilla_resources::address::repository_address(url, std::slice::from_ref(forge)).expect("address");
+            daemon.observe_change_request_branch(&address, "governor").await.expect("branch probe");
+        }
+    };
+    probe("https://forgejo.lab.flotilla.work/robert/ghostty-ops").await;
     let resolved =
         daemon.resolve_convoy_change_request(std::slice::from_ref(&repository_key), "governor", None).await.expect("resolve Forgejo PR");
     assert_eq!(
@@ -138,6 +148,7 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         .create(&test_meta(&second_key.to_string()), &second_repository)
         .await
         .expect("second repository");
+    probe(second_url).await;
     let convoy_spec = ConvoySpec::builder()
         .workflow_ref("workflow".to_string())
         .repositories(vec![

@@ -13,7 +13,7 @@ use flotilla_resources::{
     address::{stored_spelling_names, subject_address},
     convoy_subject_rows, merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestSpec,
     ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks,
-    ResourceError, ResourceProvenance,
+    ResourceError, ResourceObject, ResourceProvenance,
 };
 use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend, StoreQuery};
 
@@ -31,6 +31,10 @@ use tokio::{
 };
 
 const RETAINED_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// How often a live convoy's branch is looked up on its forge while the convoy produces no change
+/// request: the forge observer's edge probe (#3108). The webhook relay's change request hints are
+/// to replace this cadence.
+const BRANCH_PROBE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const HISTORY_REFRESH_INTERVAL_SECS: i64 = 60 * 60;
 
 // Deadline arithmetic on the judge path must remain total even for a cadence
@@ -56,6 +60,13 @@ impl Default for ChangeRequestRefreshCadence {
             stale_after: Duration::from_secs(180),
         }
     }
+}
+
+/// Looks `branch` of `repository` up on its forge and records the change requests found on their
+/// records (#3108). Finding none records nothing; an error is a lookup that did not complete.
+#[async_trait::async_trait]
+pub trait BranchProbe: Send + Sync {
+    async fn probe(&self, repository: &Address, branch: &str) -> Result<(), String>;
 }
 
 struct ActiveRefresh {
@@ -84,6 +95,13 @@ struct ChangeRequestRefresherInner {
     relay_wake: Notify,
     grace_schedule_reads: std::sync::atomic::AtomicUsize,
     engine: EngineObservers,
+    branch_probe: std::sync::OnceLock<Arc<dyn BranchProbe>>,
+    /// The convoy branches this observer looks up, each with when its next lookup is due.
+    branch_schedule: std::sync::Mutex<HashMap<(Address, String), tokio::time::Instant>>,
+    /// Wakes the branch scheduler when a branch is added.
+    branch_wake: Arc<Notify>,
+    /// The one task that runs the branch lookups as they fall due; it ends with the observer.
+    branch_scheduler: std::sync::OnceLock<tokio_util::task::AbortOnDropHandle<()>>,
 }
 
 impl ChangeRequestRefresher {
@@ -108,8 +126,20 @@ impl ChangeRequestRefresher {
                 relay_wake: Notify::new(),
                 grace_schedule_reads: Default::default(),
                 engine: EngineObservers::default(),
+                branch_probe: std::sync::OnceLock::new(),
+                branch_schedule: std::sync::Mutex::new(HashMap::new()),
+                branch_wake: Arc::new(Notify::new()),
+                branch_scheduler: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Installs the forge lookup the branch probes use, once the daemon that serves it is composed.
+    pub fn install_branch_probe(&self, probe: Arc<dyn BranchProbe>) -> Result<(), String> {
+        self.inner.branch_probe.set(probe).map_err(|_| "the branch probe is already installed".to_owned())?;
+        let scheduler = tokio::spawn(run_branch_probes(Arc::downgrade(&self.inner), Arc::clone(&self.inner.branch_wake)));
+        let _ = self.inner.branch_scheduler.set(tokio_util::task::AbortOnDropHandle::new(scheduler));
+        Ok(())
     }
 
     /// Convoys are durable observation demand, including those homed on peers.
@@ -192,6 +222,11 @@ impl ChangeRequestRefresher {
         let forges = self.forges(namespace).await?;
         let mut wanted = HashSet::new();
         let mut owners = HashMap::new();
+        let mut branches = HashSet::new();
+        for copy in &convoys.items {
+            branches.extend(unproduced_branches(&copy.object, &forges));
+        }
+        self.reconcile_branch_probes(namespace, branches).await?;
         for copy in convoys.items {
             for row in convoy_subject_rows(&copy.object, &ReferenceContext::default()) {
                 if row.subject.kind != ConvoySubjectKind::ChangeRequest {
@@ -243,6 +278,44 @@ impl ChangeRequestRefresher {
         }
         // Complete independent demand updates before retrying failed cleanup.
         cleanup_result
+    }
+
+    /// Schedules each wanted branch whose repository this observer observes, a new one due at once,
+    /// and drops the branches no longer wanted.
+    async fn reconcile_branch_probes(&self, namespace: &str, wanted: HashSet<(Address, String)>) -> Result<(), String> {
+        if self.inner.branch_probe.get().is_none() {
+            return Ok(());
+        }
+        let mut owned = HashSet::new();
+        let mut owners = HashMap::new();
+        for (repository, branch) in wanted {
+            let Some((service, scope)) = flotilla_resources::address::stored_service_scope(&repository) else { continue };
+            let source = IssueSource { service, scope };
+            let observes = match owners.get(&source) {
+                Some(observes) => *observes,
+                None => {
+                    let observes = crate::forge_observation::owns_source(&self.inner.backend, namespace, &source).await?;
+                    owners.insert(source, observes);
+                    observes
+                }
+            };
+            if observes {
+                owned.insert((repository, branch));
+            }
+        }
+        let mut schedule = self.inner.branch_schedule.lock().expect("branch schedule");
+        schedule.retain(|key, _| owned.contains(key));
+        let mut added = false;
+        for key in owned {
+            if let Entry::Vacant(entry) = schedule.entry(key) {
+                entry.insert(tokio::time::Instant::now());
+                added = true;
+            }
+        }
+        if added {
+            self.inner.branch_wake.notify_one();
+        }
+        Ok(())
     }
 
     /// Release only explicit unlink assertions. Missing convoys retain history.
@@ -1163,6 +1236,75 @@ impl ChangeRequestRefresher {
 }
 
 /// The stored `(service, scope)` source that declares the subject's owner.
+/// The branch of each repository of an active convoy that produces no change request yet: the
+/// branches whose change requests nothing else looks for.
+fn unproduced_branches(convoy: &ResourceObject<Convoy>, forges: &[ForgeSpec]) -> Vec<(Address, String)> {
+    let Some(branch) = convoy.spec.r#ref.as_ref() else { return Vec::new() };
+    let active_without_change_request = convoy.status.as_ref().is_some_and(|status| {
+        status.phase == flotilla_resources::ConvoyPhase::Active
+            && !status
+                .subjects
+                .iter()
+                .any(|entry| entry.subject.kind == ConvoySubjectKind::ChangeRequest && entry.relationship == Relationship::Produces)
+    });
+    if !active_without_change_request {
+        return Vec::new();
+    }
+    convoy
+        .spec
+        .repositories
+        .iter()
+        .filter_map(|repository| flotilla_resources::address::repository_address(&repository.url, forges).ok())
+        .map(|repository| (repository, branch.clone()))
+        .collect()
+}
+
+/// The branch scheduler: sleeps to the earliest due lookup, or until a branch is added, and looks
+/// up each due branch in turn. A branch dropped meanwhile is not scheduled again.
+async fn run_branch_probes(inner: Weak<ChangeRequestRefresherInner>, wake: Arc<Notify>) {
+    loop {
+        let next = {
+            let Some(inner) = inner.upgrade() else { return };
+            let schedule = inner.branch_schedule.lock().expect("branch schedule");
+            schedule.values().min().copied()
+        };
+        match next {
+            Some(at) if at > tokio::time::Instant::now() => {
+                tokio::select! {
+                    () = tokio::time::sleep_until(at) => {}
+                    () = wake.notified() => continue,
+                }
+            }
+            Some(_) => {}
+            None => {
+                wake.notified().await;
+                continue;
+            }
+        }
+        let Some(inner) = inner.upgrade() else { return };
+        let Some(probe) = inner.branch_probe.get().cloned() else { return };
+        let now = tokio::time::Instant::now();
+        let due = inner
+            .branch_schedule
+            .lock()
+            .expect("branch schedule")
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in due {
+            let (repository, branch) = &key;
+            match probe.probe(repository, branch).await {
+                Ok(()) => tracing::debug!(%repository, %branch, "convoy branch looked up"),
+                Err(error) => tracing::warn!(%repository, %branch, %error, "convoy branch lookup failed"),
+            }
+            if let Some(at) = inner.branch_schedule.lock().expect("branch schedule").get_mut(&key) {
+                *at = tokio::time::Instant::now() + BRANCH_PROBE_INTERVAL;
+            }
+        }
+    }
+}
+
 fn stored_source(subject: &ChangeRequestKey) -> IssueSource {
     let (service, scope) = subject.stored_service_scope();
     IssueSource { service, scope }
@@ -1242,6 +1384,85 @@ mod tests {
     }
 
     struct UnavailableSource;
+
+    struct RecordingProbe(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl BranchProbe for RecordingProbe {
+        async fn probe(&self, repository: &Address, branch: &str) -> Result<(), String> {
+            self.0.lock().expect("probes").push((repository.to_string(), branch.to_owned()));
+            Ok(())
+        }
+    }
+
+    // The forge observer's branch probe (#3108): an active convoy that produces no change request
+    // has its branch looked up at once and again at each probe interval. A convoy that is not
+    // active is not probed, and once the convoy produces a change request its probe stops.
+    #[tokio::test(start_paused = true)]
+    async fn an_active_convoy_without_a_change_request_has_its_branch_probed() {
+        use flotilla_resources::{ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, SubjectDiscoverySource};
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let refresher = ChangeRequestRefresher::new(
+            "kiwi".into(),
+            backend.clone(),
+            "node".into(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let probe = Arc::new(RecordingProbe(Default::default()));
+        refresher.install_branch_probe(probe.clone()).expect("probe");
+        let probes = || probe.0.lock().expect("probes").clone();
+        let settle = || async {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+        };
+        let convoys = backend.using::<Convoy>("ops");
+        for (name, phase) in [("active", ConvoyPhase::Active), ("pending", ConvoyPhase::Pending)] {
+            let repository = ConvoyRepositorySpec {
+                url: format!("https://github.com/org/{name}"),
+                repo_ref: flotilla_protocol::RepositoryKey(name.into()),
+                source_ref: "main".into(),
+                target_ref: "main".into(),
+                workspace_slug: name.into(),
+                subpaths: Vec::new(),
+            };
+            let spec = ConvoySpec::builder()
+                .workflow_ref("dev".into())
+                .role("coder".into())
+                .r#ref("feature/work".into())
+                .repositories(vec![repository])
+                .build();
+            let convoy = convoys.create(&InputMeta::builder().name(name.into()).build(), &spec).await.expect("convoy");
+            let status = ConvoyStatus { phase, ..Default::default() };
+            convoys.update_status(name, &convoy.metadata.resource_version, &status).await.expect("status");
+        }
+
+        refresher.reconcile_convoy_demands("ops", &mut HashMap::new()).await.expect("reconcile");
+        settle().await;
+        let looked_up = |count: usize| vec![("forge:github/repo:org%2Factive".to_owned(), "feature/work".to_owned()); count];
+        assert_eq!(probes(), looked_up(1), "only the active convoy's branch, at once");
+        tokio::time::advance(BRANCH_PROBE_INTERVAL).await;
+        settle().await;
+        assert_eq!(probes(), looked_up(2), "and again at the probe interval");
+
+        let convoy = convoys.get("active").await.expect("convoy");
+        let mut status = convoy.status.clone().expect("status");
+        let produced = flotilla_protocol::Subject {
+            kind: ConvoySubjectKind::ChangeRequest,
+            source: IssueSource { service: "github.com".into(), scope: "org/active".into() },
+            id: "7".into(),
+        };
+        status.discover_subject(produced, Relationship::Produces, SubjectDiscoverySource::Branch, Utc::now());
+        convoys.update_status("active", &convoy.metadata.resource_version, &status).await.expect("produces");
+        refresher.reconcile_convoy_demands("ops", &mut HashMap::new()).await.expect("reconcile");
+        tokio::time::advance(BRANCH_PROBE_INTERVAL * 2).await;
+        settle().await;
+        assert_eq!(probes(), looked_up(2), "a convoy that produces a change request is not probed");
+        for (_, refresh) in refresher.inner.active.lock().await.drain() {
+            refresh.task.abort();
+        }
+    }
 
     #[async_trait]
     impl ChangeRequestObservationSource for UnavailableSource {
