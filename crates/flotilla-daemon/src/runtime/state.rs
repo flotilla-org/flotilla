@@ -75,6 +75,8 @@ pub(super) struct ControllerRuntimeState {
     pub(super) local_backing_observed: AtomicBool,
     pub(super) clone_flights: Arc<CloneFlights>,
     pub(super) terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
+    /// Composer drafts set aside for machinery turns, held only in memory.
+    pub(super) composer_drafts: Arc<flotilla_terminal::drafts::ComposerDrafts>,
     /// Serialises a launch's delivery of a binding with the provision controller's withdrawal of
     /// it at this place (#3910 review), keyed by binding.
     pub(super) account_deliveries: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -327,6 +329,7 @@ impl ControllerRuntimeState {
             local_backing_observed: AtomicBool::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
+            composer_drafts: Arc::default(),
             account_deliveries: StdMutex::new(HashMap::new()),
             exit_receipts: ExitReceiptObserver::default(),
             archive_catalog_lock: Mutex::new(()),

@@ -1,4 +1,5 @@
 pub mod cleat;
+pub mod drafts;
 pub mod environment;
 pub mod generation;
 pub mod passthrough;
@@ -230,6 +231,12 @@ pub trait TerminalPool: Send + Sync {
     /// Callers persist authorization and intent first; an error may have written input.
     async fn operator_deliver(&self, _session_name: &str, _text: &str) -> Result<(), String> {
         Err("terminal pool does not support operator-authorized delivery".into())
+    }
+
+    /// Type text into the composer without submitting it, refused while the
+    /// controller is active. Restores a draft cleared for a machinery turn.
+    async fn type_without_submit(&self, _session_name: &str, _text: &str) -> Result<(), String> {
+        Err("terminal pool does not support input without submit".into())
     }
 }
 

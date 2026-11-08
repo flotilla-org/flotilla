@@ -413,9 +413,6 @@ pub struct TerminalSessionStatus {
     /// roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_unreachable: Option<String>,
-    /// Drafts saved before guarded composer clearing (#3961). Retained across restart.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub stashed_drafts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -768,20 +765,13 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
         match self {
             Self::HoldTurnDelivery { hold } => status.turn_delivery_hold = Some(hold.clone()),
             Self::MarkStarting => {
-                let stashed_drafts = std::mem::take(&mut status.stashed_drafts);
                 let completion_pending = status.completion_pending.take();
                 let turn_delivery_hold = status.turn_delivery_hold.take();
                 let mut retired_launches = std::mem::take(&mut status.retired_launches);
                 if let Some(crew) = status.crew.take() {
                     retired_launches.insert(crew.id);
                 }
-                *status = TerminalSessionStatus {
-                    completion_pending,
-                    turn_delivery_hold,
-                    retired_launches,
-                    stashed_drafts,
-                    ..Default::default()
-                };
+                *status = TerminalSessionStatus { completion_pending, turn_delivery_hold, retired_launches, ..Default::default() };
             }
             Self::ClearRetiredLaunches => status.retired_launches.clear(),
             Self::ObserveCleatEndpoint { endpoint } => status.cleat_endpoint = endpoint.clone(),
@@ -1374,13 +1364,10 @@ mod tests {
             reason: "episode limit".into(),
             raised_at: chrono::DateTime::<Utc>::UNIX_EPOCH,
         };
-        // Cover both empty and nonempty saved drafts across repeated lifecycle resets.
-        let drafts = if tc.draw(gs::booleans()) { vec!["draft\nwith 'quotes' and \\".to_string()] } else { Vec::new() };
-        let mut status = TerminalSessionStatus { stashed_drafts: drafts.clone(), ..Default::default() };
+        let mut status = TerminalSessionStatus::default();
         TerminalSessionStatusPatch::HoldTurnDelivery { hold: hold.clone() }.apply(&mut status);
         for _ in 0..restarts {
             TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
-            assert_eq!(status.stashed_drafts, drafts, "saved drafts survive restarting the child");
             TerminalSessionStatusPatch::MarkRunning {
                 configured_limits: None,
                 session_id: "session".into(),
@@ -1408,7 +1395,14 @@ mod tests {
         };
         continuation.apply(&mut status);
         assert!(status.turn_delivery_hold.is_none());
-        assert_eq!(status.stashed_drafts, drafts, "delivering a continuation does not discard saved text");
+    }
+
+    // Composer drafts are held in memory now; a stored status that saved some still decodes.
+    #[test]
+    fn status_with_retired_stashed_drafts_still_decodes() {
+        let status: TerminalSessionStatus =
+            serde_json::from_value(serde_json::json!({ "phase": "Running", "stashed_drafts": ["half a thought"] })).expect("decodes");
+        assert_eq!(status.phase, TerminalSessionPhase::Running);
     }
 
     #[test]

@@ -408,6 +408,16 @@ impl CommandRunner for ControllerCleatRunner {
                 *self.probe.draft.lock().unwrap() = None;
                 String::new()
             }
+            "send" if args.contains(&"--no-enter") => {
+                // A restored draft: typed behind the controller fence, never submitted.
+                assert!(!args.contains(&"--submit"));
+                assert!(args.windows(2).any(|pair| pair == ["--controller-idle", "2s"]));
+                if !quiet {
+                    return refusal("controller-active: recent input (controller.cause=quiet-time)");
+                }
+                self.probe.draft.lock().unwrap().get_or_insert_default().push_str(args.last().unwrap());
+                String::new()
+            }
             "send" => {
                 self.probe.submission_attempts.fetch_add(1, Ordering::SeqCst);
                 if !quiet {

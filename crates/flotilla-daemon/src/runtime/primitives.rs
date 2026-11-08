@@ -599,6 +599,7 @@ impl MessageDelivery {
         let primary_span = trace_spans.first().cloned().unwrap_or_else(tracing::Span::none);
         // A finished turn wakes a pass to record its receipts.
         let finished = FinishedTurn(Arc::clone(&self.wake));
+        let drafts = Arc::clone(&self.state.composer_drafts);
         let task = tokio::spawn(
             async move {
                 let _finished = finished;
@@ -611,7 +612,7 @@ impl MessageDelivery {
                 if teardown.is_cancelled() {
                     return Ok(TerminalDeliveryOutcome::Deferred("teardown stopped the turn before it was typed; no input sent"));
                 }
-                submit_and_confirm(&*pool, adapter.as_deref(), &session, &typed).await
+                submit_and_confirm(&*pool, &drafts, adapter.as_deref(), &session, &typed).await
             }
             .instrument(primary_span),
         );

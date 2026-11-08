@@ -33,7 +33,7 @@ use flotilla_resources::{
 };
 use flotilla_state_machines::machines::agent_session::Activity;
 use flotilla_store::ResourceBackend;
-use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize, TerminalSubmission};
+use flotilla_terminal::{drafts::ComposerDrafts, ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize, TerminalSubmission};
 use flotilla_vcs::vcs::CheckoutVcsResolver as _;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -233,6 +233,7 @@ pub(super) async fn session_busy_after_delivery_grace(
 
 pub(super) async fn deliver_and_confirm(
     pool: &dyn TerminalPool,
+    drafts: &ComposerDrafts,
     adapter: Option<&dyn AgentAdapter>,
     session_id: &str,
     message: &str,
@@ -240,16 +241,18 @@ pub(super) async fn deliver_and_confirm(
 ) -> Result<TerminalDeliveryOutcome, String> {
     // All writes are gated atomically by cleat, including startup deliveries.
     // Adapter observations remain acceptance evidence only.
-    submit_and_confirm(pool, adapter, session_id, message).await
+    submit_and_confirm(pool, drafts, adapter, session_id, message).await
 }
 
 pub(super) async fn submit_and_confirm(
     pool: &dyn TerminalPool,
+    drafts: &ComposerDrafts,
     adapter: Option<&dyn AgentAdapter>,
     session_id: &str,
     message: &str,
 ) -> Result<TerminalDeliveryOutcome, String> {
-    let submission = pool.guarded_deliver(session_id, message).await;
+    // An abandoned draft is set aside in memory and typed back after the turn.
+    let submission = drafts.guarded_deliver(pool, session_id, message).await;
     match submission {
         Ok(TerminalSubmission::Submitted) => {}
         Ok(TerminalSubmission::Refused(reason)) => {
@@ -260,6 +263,8 @@ pub(super) async fn submit_and_confirm(
                 Some("not-matched") => "cleat composer selector did not match; no input sent",
                 Some("role-absent") => "cleat composer role is absent; no input sent",
                 Some("unsupported") => "cleat composer recognizer is unsupported; no input sent",
+                Some("draft-changed") => "composer changed before guarded clear; no input sent",
+                Some("draft-unavailable") => "composer preparation unavailable; no input sent",
                 _ => "cleat controller is active; no input sent",
             };
             return Ok(TerminalDeliveryOutcome::Deferred(reason));
@@ -837,10 +842,10 @@ impl TerminalRuntime for TerminalControllerRuntime {
         if deliveries.contains_key(session_id) {
             return Ok(TerminalDeliveryOutcome::Pending);
         }
-        let task =
-            tokio::spawn(
-                async move { deliver_and_confirm(&*pool, adapter.as_deref(), &session_id_owned, &message_owned, readiness).await },
-            );
+        let drafts = Arc::clone(&self.state.composer_drafts);
+        let task = tokio::spawn(async move {
+            deliver_and_confirm(&*pool, &drafts, adapter.as_deref(), &session_id_owned, &message_owned, readiness).await
+        });
         deliveries.insert(
             session_id.to_string(),
             PendingTerminalDelivery { message_batch: None, message: message.to_string(), task, engine_turn: None },

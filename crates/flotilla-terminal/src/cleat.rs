@@ -543,6 +543,13 @@ impl TerminalPool for CleatTerminalPool {
         run!(self.runner, &self.binary, &["send", "--submit", "--", session_name, text], Path::new("/"))?;
         Ok(())
     }
+
+    async fn type_without_submit(&self, session_name: &str, text: &str) -> Result<(), String> {
+        // Cleat's CLI paste-encodes only with --submit, so the text is written
+        // as typed bytes; the controller fence keeps it off a person's input.
+        run!(self.runner, &self.binary, &["send", "--no-enter", "--controller-idle", "2s", "--", session_name, text], Path::new("/"))?;
+        Ok(())
+    }
 }
 
 pub mod turnover;
@@ -1036,6 +1043,39 @@ mod tests {
         let calls = logical_calls(&runner);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, vec!["send", "--submit", "--", "agent", "--payload"]);
+    }
+
+    // A restored draft is typed behind the controller fence and never submitted.
+    #[tokio::test]
+    async fn typing_without_submit_sends_no_enter_behind_the_controller_fence() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
+        test_pool(runner.clone(), "cleat").type_without_submit("agent", "--half a thought").await.unwrap();
+        let calls = logical_calls(&runner);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, vec!["send", "--no-enter", "--controller-idle", "2s", "--", "agent", "--half a thought"]);
+    }
+
+    // The production host wrapper forwards every delivery operation to cleat,
+    // rather than answering with the trait's no-draft, no-endpoint defaults.
+    #[tokio::test]
+    async fn shared_pool_forwards_draft_and_delivery_operations() {
+        let inspection = r#"{"last_controller_input_at":0,"recognizer":{"observation":{"roles":[{"role":"composer","value":"draft"}]}}}"#;
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(inspection.to_string()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok(String::new()),
+        ]));
+        let pool =
+            crate::scan_cache::SharedTerminalPool::new(Arc::new(test_pool(runner.clone(), "cleat")), std::time::Duration::from_secs(1));
+        assert_eq!(pool.abandoned_draft("agent").await.unwrap().as_deref(), Some("draft"));
+        assert!(pool.clear_draft("agent", "draft").await.unwrap());
+        assert_eq!(pool.guarded_deliver("agent", "turn").await.unwrap(), TerminalSubmission::Submitted);
+        pool.operator_deliver("agent", "turn").await.unwrap();
+        pool.type_without_submit("agent", "draft").await.unwrap();
+        let verbs: Vec<_> = logical_calls(&runner).into_iter().map(|call| call.1[..2].join(" ")).collect();
+        assert_eq!(verbs, ["inspect agent", "clear-composer agent", "send --submit", "send --submit", "send --no-enter"]);
     }
 
     // Only explicit pre-write controller refusals establish a safe retry;

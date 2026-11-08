@@ -1,4 +1,5 @@
 use super::*;
+use flotilla_terminal::drafts::ComposerDrafts;
 
 #[tokio::test]
 async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_homes() {
@@ -161,10 +162,16 @@ async fn hookless_submission_needing_permission_is_confirmed_without_retry() {
         &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
         Arc::new(DiscoveryMockRunner::builder().build()),
     );
-    let outcome =
-        deliver_and_confirm(&pool, adapters.get("codex").map(|a| &**a), "agent", "review wake", TerminalDeliveryReadiness::TurnBoundary)
-            .await
-            .expect("submit");
+    let outcome = deliver_and_confirm(
+        &pool,
+        &ComposerDrafts::default(),
+        adapters.get("codex").map(|a| &**a),
+        "agent",
+        "review wake",
+        TerminalDeliveryReadiness::TurnBoundary,
+    )
+    .await
+    .expect("submit");
     assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
     assert_eq!(pool.inner.delivered.lock().await.len(), 1);
 }
@@ -189,7 +196,15 @@ async fn hookless_submission_waits_for_delayed_working_evidence_with_composer_vi
     let adapter = adapters.get("codex").expect("adapter").clone();
     let submit_pool = pool.clone();
     let submit = tokio::spawn(async move {
-        deliver_and_confirm(&*submit_pool, Some(&*adapter), "agent", "review wake", TerminalDeliveryReadiness::TurnBoundary).await
+        deliver_and_confirm(
+            &*submit_pool,
+            &ComposerDrafts::default(),
+            Some(&*adapter),
+            "agent",
+            "review wake",
+            TerminalDeliveryReadiness::TurnBoundary,
+        )
+        .await
     });
     tokio::task::yield_now().await;
     assert_eq!(pool.inner.delivered.lock().await.len(), 1);
@@ -228,6 +243,7 @@ fn flickering_codex_confirmation_never_resends(tc: hegel::TestCase) {
         );
         let outcome = deliver_and_confirm(
             &pool,
+            &ComposerDrafts::default(),
             adapters.get("codex").map(|adapter| &**adapter),
             "agent",
             "wake",
@@ -246,7 +262,9 @@ async fn accepted_but_unconfirmed_delivery_is_never_retyped() {
     let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
 
     let outcome =
-        deliver_and_confirm(&pool, None, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup).await.expect("delivery outcome");
+        deliver_and_confirm(&pool, &ComposerDrafts::default(), None, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup)
+            .await
+            .expect("delivery outcome");
 
     assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);

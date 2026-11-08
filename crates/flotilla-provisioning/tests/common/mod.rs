@@ -372,7 +372,6 @@ pub async fn create_stopped_terminal(
                 completion_pending: None,
                 degraded: None,
                 daemon_unreachable: None,
-                stashed_drafts: Vec::new(),
             },
         )
         .await

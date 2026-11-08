@@ -2,8 +2,9 @@
 //! never retyped, until the crew's own record confirms the agent took it up: its AgentSession began
 //! working after the submission, or this daemon saw a prompt submitted or a tool called after it,
 //! or, for a notify-only Codex crew, the turn's end. A session's pending messages go in one turn;
-//! an operator's turn supersedes held system turns; cleat's refusal leaves the turn queued; and
-//! delivery passes run on events, never on a timer.
+//! an operator's turn supersedes held system turns; cleat's refusal leaves the turn queued; an
+//! abandoned composer draft is set aside in memory and typed back after the turn; and delivery
+//! passes run on events, never on a timer.
 
 use flotilla_core::primitives::MessagePrimitives;
 use flotilla_resources::{MessagePhase, MessageRelation, MessageSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
@@ -310,14 +311,19 @@ async fn codex_hook(daemon: &Arc<InProcessDaemon>, store: &flotilla_agent::Share
 
 // Cleat refuses the guarded write while the operator's controller is attached or typing: no input
 // is sent and the turn stays queued. Once the controller detaches, a later pass types it once,
-// with no relaunch, restart or composer clearing.
+// with no relaunch or restart. A draft the person abandoned in the composer is held in memory,
+// cleared under the guard, and typed back unsubmitted after the turn.
 #[tokio::test(start_paused = true)]
 async fn a_turn_cleat_refuses_for_controller_input_is_typed_once_the_controller_is_idle() {
-    for attached in [false, true] {
+    const DRAFT: &str = "--half a thought\nwith 'quotes' and \\";
+    for (attached, abandoned) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut probe = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
         probe.working_after_delivery = true;
         probe.recent_controller_input.store(true, Ordering::SeqCst);
         probe.controller_attached.store(attached, Ordering::SeqCst);
+        if abandoned {
+            *probe.draft.lock().expect("composer") = Some(DRAFT.into());
+        }
         probe.screens = vec!["› Ask Codex to do anything".into()];
         let probe = Arc::new(probe);
         let runner = Arc::new(ControllerCleatRunner { probe: probe.clone(), recognizer_installed: AtomicBool::new(false) });
@@ -343,7 +349,9 @@ async fn a_turn_cleat_refuses_for_controller_input_is_typed_once_the_controller_
         assert!(crew.delivered("queued-turn").await, "attached={attached}: typed once the controller is idle");
         assert_eq!(probe.inputs.lock().expect("typed inputs").len(), 1);
         assert_eq!(probe.lifecycle_changes.load(Ordering::SeqCst), 0, "no child launch or termination");
-        assert_eq!(probe.retries.load(Ordering::SeqCst), 0, "no composer clearing or harness restart");
+        assert_eq!(probe.retries.load(Ordering::SeqCst), 0, "no harness restart");
+        assert_eq!(probe.draft.lock().expect("composer").as_deref(), abandoned.then_some(DRAFT), "the draft is typed back");
+        assert!(crew.state.composer_drafts.held("agent").is_empty(), "nothing left held in memory");
         let sessions = crew.daemon.resource_backend().using::<TerminalSession>(NAMESPACE);
         assert_eq!(sessions.get("agent").await.expect("session").status.expect("status").crew.expect("crew").id, "turn-crew");
     }

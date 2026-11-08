@@ -1,7 +1,8 @@
-use crate::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSize};
+use crate::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSize, TerminalSubmission};
 use async_trait::async_trait;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::commands::AttachMode;
+use flotilla_protocol::result_set::CleatEndpoint;
 use flotilla_provider_runtime::scan_cache::SharedScan;
 use std::{sync::Arc, time::Duration};
 
@@ -122,7 +123,43 @@ impl TerminalPool for SharedTerminalPool {
         result
     }
 
+    async fn retain_recovered_recording(&self, session_id: &str) -> Result<(), String> {
+        self.inner.retain_recovered_recording(session_id).await
+    }
+
+    async fn cleat_endpoint(&self, session_id: &str) -> Result<Option<CleatEndpoint>, String> {
+        self.inner.cleat_endpoint(session_id).await
+    }
+
+    async fn ensure_recognizer(&self, session: &str, harness: &str) -> Result<(), String> {
+        self.inner.ensure_recognizer(session, harness).await
+    }
+
+    async fn abandoned_draft(&self, session: &str) -> Result<Option<String>, String> {
+        self.inner.abandoned_draft(session).await
+    }
+
+    async fn clear_draft(&self, session: &str, draft: &str) -> Result<bool, String> {
+        self.inner.clear_draft(session, draft).await
+    }
+
+    async fn capture_screen(&self, session_name: &str) -> Result<Option<String>, String> {
+        self.inner.capture_screen(session_name).await
+    }
+
     async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
         self.inner.deliver(session_name, text).await
+    }
+
+    async fn guarded_deliver(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
+        self.inner.guarded_deliver(session_name, text).await
+    }
+
+    async fn operator_deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
+        self.inner.operator_deliver(session_name, text).await
+    }
+
+    async fn type_without_submit(&self, session_name: &str, text: &str) -> Result<(), String> {
+        self.inner.type_without_submit(session_name, text).await
     }
 }
