@@ -83,9 +83,9 @@ use flotilla_resources::{
     Demand, EnvironmentSpec, Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host,
     HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, InputMeta, LifecycleAuthority, ModelProbeState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementStatus, Project, Repository, RepositoryKey, RepositorySpec,
-    RepositoryTrust, Resource, ResourceError, ResourceList, Selector, StatusPatch, TerminalAttentionSource, TerminalAttentionState,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
-    Vessel, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
+    RepositoryTrust, Resource, ResourceError, Selector, StatusPatch, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel,
+    VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
     ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
 };
 use flotilla_store::{
