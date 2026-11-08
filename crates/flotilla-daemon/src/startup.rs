@@ -82,9 +82,6 @@ pub(crate) async fn retry_phase<T, E: std::fmt::Display, F: Future<Output = Resu
 }
 
 #[cfg(test)]
-pub(crate) mod busy_store;
-
-#[cfg(test)]
 mod tests {
     use std::time::Duration;
 
