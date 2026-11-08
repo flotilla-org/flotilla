@@ -218,3 +218,37 @@ async fn on_the_engine_one_root_revision_is_one_change() {
     assert_eq!(next.items[0].revision.as_deref(), Some("r2"));
     assert_manifest(&forges.get("lab").await.expect("get"), "r2");
 }
+
+// Behaviour (#3108 item B): every watcher of the definitions on a daemon is woken by one shared
+// follower. Each watcher gets the tick for a write after it subscribed, and once every watcher has
+// gone a new one is still woken.
+#[tokio::test]
+async fn watchers_of_the_definitions_share_one_follower_and_each_hears_a_write() {
+    use flotilla_resources::engine_records::EngineRecords;
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::definition::register(&mut kinds).expect("register");
+    flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
+    flotilla_provisioning::stored::repository::register(&mut kinds).expect("register repositories");
+    flotilla_provisioning::stored::project::register(&mut kinds).expect("register projects");
+    let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
+    let records = Arc::new(EngineDefinitions::open(service, Arc::new(SystemClock) as Arc<dyn Clock>).expect("open"));
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.install_engine_records(Arc::clone(&records) as Arc<dyn EngineRecords>);
+    let forges = backend.definitions::<Forge>(NS);
+    async fn tick(stream: &mut futures::stream::BoxStream<'static, ()>) {
+        tokio::time::timeout(Duration::from_secs(10), stream.next()).await.expect("a tick").expect("the stream stays open")
+    }
+
+    let mut first = records.changes().await.expect("first watcher");
+    let mut second = records.changes().await.expect("second watcher");
+    forges.apply(&meta("lab", &DefinitionOrigin::Operator), &forge("lab")).await.expect("apply");
+    tick(&mut first).await;
+    tick(&mut second).await;
+
+    drop((first, second));
+    let mut later = records.changes().await.expect("a watcher after the others went");
+    forges.apply(&meta("lab2", &DefinitionOrigin::Operator), &forge("lab2")).await.expect("apply");
+    tick(&mut later).await;
+}

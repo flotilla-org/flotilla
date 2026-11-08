@@ -142,3 +142,71 @@ impl CommitsSeen {
         self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
+
+/// One follower of some kinds shared by every watcher of them on this store: each watcher gets a
+/// tick for each pass that found the kinds changed, from the moment it subscribed, and reads the
+/// records again on it. Ticks a watcher has not yet taken fold into one. The follower runs while
+/// any watcher holds its stream, and starts again for the next one after the last has gone.
+pub struct SharedChanges {
+    service: Arc<Service>,
+    kinds: Vec<KindCode>,
+    what: &'static str,
+    running: Running,
+}
+
+/// The shared follower's sender while it runs; it clears this itself, under the lock, as it stops.
+type Running = Arc<std::sync::Mutex<Option<tokio::sync::watch::Sender<u64>>>>;
+
+impl std::fmt::Debug for SharedChanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedChanges").field("kinds", &self.kinds).field("what", &self.what).finish()
+    }
+}
+
+impl SharedChanges {
+    /// Shares changes to `kinds`, naming them `what` in the warning a failed pass logs.
+    pub fn new(service: Arc<Service>, kinds: impl IntoIterator<Item = KindCode>, what: &'static str) -> Self {
+        Self { service, kinds: kinds.into_iter().collect(), what, running: Running::default() }
+    }
+
+    /// A tick for each pass that finds the kinds changed after this call.
+    pub fn subscribe(&self) -> Result<futures::stream::BoxStream<'static, ()>, StoreError> {
+        let mut running = self.running.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let receiver = match running.as_ref() {
+            Some(sender) => sender.subscribe(),
+            None => {
+                // Started before it is shared: a commit from here on wakes its first pass.
+                let watch = EngineWatch::start(Arc::clone(&self.service), self.kinds.iter().copied())?;
+                let (sender, receiver) = tokio::sync::watch::channel(0u64);
+                tokio::spawn(follow(watch, sender.clone(), Arc::clone(&self.running), self.what));
+                *running = Some(sender);
+                receiver
+            }
+        };
+        Ok(Box::pin(futures::stream::unfold(receiver, |mut receiver| async move {
+            receiver.changed().await.ok()?;
+            Some(((), receiver))
+        })))
+    }
+}
+
+async fn follow(mut watch: EngineWatch, sender: tokio::sync::watch::Sender<u64>, running: Running, what: &'static str) {
+    loop {
+        tokio::select! {
+            () = sender.closed() => {
+                // A watcher subscribing as the last one went keeps it running.
+                let mut running = running.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if sender.receiver_count() == 0 {
+                    *running = None;
+                    return;
+                }
+            }
+            // A pass that fails is tried again at the next commit; the watchers see no tick.
+            found = watch.next(|_, followed| Ok(!followed.is_empty())) => match found {
+                Ok(true) => sender.send_modify(|passes| *passes += 1),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%error, what, "change stream could not read the log; retrying"),
+            },
+        }
+    }
+}

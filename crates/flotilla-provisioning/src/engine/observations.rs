@@ -32,7 +32,7 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 
 use super::watch::CommitsSeen;
-use super::watch::EngineWatch;
+use super::watch::SharedChanges;
 use crate::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
 
 const CHANGE_REQUEST: &str = "ChangeRequest";
@@ -230,6 +230,8 @@ pub struct EngineObservations {
     resident: Mutex<Resident>,
     /// Whether the store has committed since the resident map was last brought up to it.
     commits: CommitsSeen,
+    // One follower for every watcher of these records on this daemon.
+    changes: SharedChanges,
     clock: Arc<dyn flotilla_resources::Clock>,
     /// Which sources this home observes; a port with none, standing alone, observes all.
     observers: Option<Arc<dyn SourceObservers>>,
@@ -249,6 +251,7 @@ impl EngineObservations {
         let follower = Follower::new([CHANGE_REQUEST_CODE, ISSUE_CODE]);
         let resident = Resident { follower, records: Records::new(), warned: Default::default() };
         let opened = Self {
+            changes: SharedChanges::new(Arc::clone(&service), [CHANGE_REQUEST_CODE, ISSUE_CODE], "forge observations"),
             commits: CommitsSeen::follow(&service, [CHANGE_REQUEST_CODE, ISSUE_CODE]),
             service,
             home,
@@ -541,18 +544,7 @@ impl EngineRecords for EngineObservations {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let watch = EngineWatch::start(Arc::clone(&self.service), [CHANGE_REQUEST_CODE, ISSUE_CODE]).map_err(|error| error.to_string())?;
-        let stream = futures::stream::unfold(watch, |mut watch| async move {
-            loop {
-                // A pass that fails is tried again at the next commit; the watcher sees no tick.
-                match watch.next(|_, followed| Ok(!followed.is_empty())).await {
-                    Ok(true) => return Some(((), watch)),
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(%error, "observation change stream could not read the log; retrying"),
-                }
-            }
-        });
-        Ok(Box::pin(stream))
+        self.changes.subscribe().map_err(|error| error.to_string())
     }
 }
 

@@ -34,7 +34,7 @@ use serde_json::Value;
 
 use super::provenance;
 use super::watch::CommitsSeen;
-use super::watch::EngineWatch;
+use super::watch::SharedChanges;
 use crate::stored::definition::{
     CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition, ForgeDefinition,
     ImageLayerDefinition, WorkflowTemplateDefinition,
@@ -295,6 +295,8 @@ pub struct EngineDefinitions {
     resident: Mutex<Resident>,
     /// Whether the store has committed since the resident map was last brought up to it.
     commits: CommitsSeen,
+    // One follower for every watcher of these records on this daemon.
+    changes: SharedChanges,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -311,6 +313,7 @@ impl EngineDefinitions {
         let home = log.home().to_owned();
         let follower = Follower::new(followed());
         let opened = Self {
+            changes: SharedChanges::new(Arc::clone(&service), followed(), "definitions"),
             commits: CommitsSeen::follow(&service, followed()),
             service,
             home,
@@ -492,18 +495,7 @@ impl EngineRecords for EngineDefinitions {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let watch = EngineWatch::start(Arc::clone(&self.service), followed()).map_err(|error| error.to_string())?;
-        let stream = futures::stream::unfold(watch, |mut watch| async move {
-            loop {
-                // A pass that fails is tried again at the next commit; the watcher sees no tick.
-                match watch.next(|_, followed| Ok(!followed.is_empty())).await {
-                    Ok(true) => return Some(((), watch)),
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(%error, "definition change stream could not read the log; retrying"),
-                }
-            }
-        });
-        Ok(Box::pin(stream))
+        self.changes.subscribe().map_err(|error| error.to_string())
     }
 }
 

@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use super::provenance;
 use super::watch::CommitsSeen;
-use super::watch::EngineWatch;
+use super::watch::SharedChanges;
 use crate::stored::manifest_root::ManifestRoot;
 use crate::stored::project::{ProjectDefinition, ProjectOpsRecord};
 
@@ -211,6 +211,8 @@ pub struct EngineProjects {
     resident: Mutex<Resident>,
     /// Whether the store has committed since the resident map was last brought up to it.
     commits: CommitsSeen,
+    // One follower for every watcher of these records on this daemon.
+    changes: SharedChanges,
     /// This home's dispatch judgements, by Project name.
     judged: Mutex<BTreeMap<String, Judged>>,
     /// Held across each write, so this home's writes of one Project (its definition and its
@@ -233,6 +235,7 @@ impl EngineProjects {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
         let opened = Self {
+            changes: SharedChanges::new(Arc::clone(&service), [PROJECT, OPS, ROOT], "projects"),
             commits: CommitsSeen::follow(&service, [PROJECT, OPS, ROOT]),
             service,
             home,
@@ -500,34 +503,15 @@ impl EngineRecords for EngineProjects {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let watch = EngineWatch::start(Arc::clone(&self.service), [PROJECT, OPS, ROOT]).map_err(|error| error.to_string())?;
+        let logged = self.changes.subscribe().map_err(|error| error.to_string())?;
         let mut judged = self.judged_changes.subscribe();
         judged.mark_unchanged();
         // The port is gone once its sender is; the log alone ticks from then on.
-        let stream = futures::stream::unfold((watch, Some(judged)), |(mut watch, mut judged)| async move {
-            loop {
-                match judged.as_mut() {
-                    Some(receiver) => tokio::select! {
-                        changed = receiver.changed() => {
-                            if changed.is_ok() {
-                                return Some(((), (watch, judged)));
-                            }
-                            judged = None;
-                            continue;
-                        }
-                        () = watch.woken() => {}
-                    },
-                    None => watch.woken().await,
-                }
-                // A pass that fails is tried again at the next commit.
-                match watch.pass(|_, followed| Ok(!followed.is_empty())).await {
-                    Ok(true) => return Some(((), (watch, judged))),
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(%error, "project change stream could not read the log; retrying"),
-                }
-            }
+        let judged = futures::stream::unfold(judged, |mut judged| async move {
+            judged.changed().await.ok()?;
+            Some(((), judged))
         });
-        Ok(Box::pin(stream))
+        Ok(Box::pin(futures::stream::select(logged, judged)))
     }
 }
 
