@@ -33,7 +33,6 @@ fn heartbeat(at: DateTime<Utc>, rss: u64) -> HostStatusPatch {
         daemon_rss_bytes: Some(rss),
         admission_free_space_floor_bytes: None,
         agent_adapter_baseline: None,
-        resource_store: None,
         // Restamped on every heartbeat, as the daemon's gathered conditions are.
         conditions: vec![HostCondition::builder()
             .condition_type("ImageBuild/b1")

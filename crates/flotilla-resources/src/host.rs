@@ -653,8 +653,6 @@ pub enum HostStatusPatch {
         daemon_rss_bytes: Option<u64>,
         admission_free_space_floor_bytes: Option<u64>,
         agent_adapter_baseline: Option<BTreeSet<String>>,
-        // Keep the in-process patch enum small; HostStatus stores the unboxed value.
-        resource_store: Option<Box<ResourceStoreDiagnostics>>,
         conditions: Vec<HostCondition>,
         /// Periodic observations folded into the heartbeat's write (#3154).
         folded: Box<FoldedHostObservations>,
@@ -702,7 +700,6 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 daemon_rss_bytes,
                 admission_free_space_floor_bytes,
                 agent_adapter_baseline,
-                resource_store,
                 conditions,
                 folded,
             } => {
@@ -741,7 +738,6 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 status.daemon_rss_bytes = *daemon_rss_bytes;
                 status.admission_free_space_floor_bytes = *admission_free_space_floor_bytes;
                 status.agent_adapter_baseline.clone_from(agent_adapter_baseline);
-                status.resource_store = resource_store.as_deref().cloned();
                 if let Some(blob_sync) = &folded.blob_sync {
                     status.blob_sync = Some(blob_sync.clone());
                 }

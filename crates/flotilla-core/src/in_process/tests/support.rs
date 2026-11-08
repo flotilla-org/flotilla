@@ -621,7 +621,6 @@ pub(super) async fn create_docker_placement<'a>(
             .collect(),
             heartbeat_at: Some(Utc::now()),
             ready: true,
-            resource_store: None,
             disk_free_bytes: Some(PLACEMENT_DISK_FREE_BYTES),
             admission_free_space_floor_bytes: Some(PLACEMENT_FREE_SPACE_FLOOR_BYTES),
             fulfilment_facts: BTreeMap::from([(

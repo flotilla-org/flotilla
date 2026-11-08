@@ -487,17 +487,6 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
         runtime_health.report_capability_regression(condition);
     }
     let summary = daemon.local_host_description().await;
-    let resource_store = backend.diagnostics().await.map_err(|err| err.to_string())?;
-    if let Some(diagnostics) = resource_store.as_ref().filter(|diagnostics| !diagnostics.warnings.is_empty()) {
-        warn!(
-            event_count = diagnostics.event_count,
-            object_count = diagnostics.object_count,
-            resource_stream_count = diagnostics.resource_stream_count,
-            max_retained_events = diagnostics.max_retained_events,
-            warnings = ?diagnostics.warnings,
-            "resource event log tripwire triggered",
-        );
-    }
     let (held_credentials, credential_expiry) = match credential_store {
         Some(store) => (store.held_credentials().await?, store.credential_expiry().await),
         None => (BTreeSet::new(), BTreeMap::new()),
@@ -540,12 +529,6 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
 
     conditions.extend(file_descriptor_pressure_condition());
     conditions.extend(daemon.generation_conditions().await);
-    if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
-        conditions.push(condition);
-    }
-    if let Some(condition) = resource_field_ownership_condition(resource_store.as_ref()) {
-        conditions.push(condition);
-    }
     if let Some(condition) = resource_authorship_collision_condition(daemon, namespace).await? {
         conditions.push(condition);
     }
@@ -574,7 +557,6 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
             agent_adapter_baseline: Some(adapter_assessment.baseline),
             heartbeat_at: daemon.clock().now(),
             ready,
-            resource_store: resource_store.map(Box::new),
             daemon_rss_bytes: flotilla_projections::host_summary::daemon_rss_bytes(),
             daemon_generation: health.generation.clone(),
             protocol_fingerprint: Some(flotilla_protocol::PROTOCOL_FINGERPRINT.to_string()),
@@ -753,126 +735,6 @@ pub(super) async fn resource_replication_content_condition(
             .blocks_forge_observation(false)
             .build(),
     ))
-}
-
-pub(super) fn resource_decode_quarantine_condition(
-    diagnostics: Option<&flotilla_resources::ResourceStoreDiagnostics>,
-) -> Option<HostCondition> {
-    let diagnostics = diagnostics?;
-    let object_quarantines = &diagnostics.decode_quarantines;
-    let event_quarantines = &diagnostics.event_decode_quarantines;
-    if object_quarantines.is_empty() && event_quarantines.is_empty() {
-        return None;
-    }
-    // Extend this list when source_owner gains another stored election input
-    // or forge observation gains another stored kind; keep its scope test aligned.
-    let forge_kinds = [
-        Host::API_PATHS.kind,
-        Forge::API_PATHS.kind,
-        flotilla_resources::Project::API_PATHS.kind,
-        flotilla_resources::Repository::API_PATHS.kind,
-        flotilla_resources::Issue::API_PATHS.kind,
-        flotilla_resources::ChangeRequest::API_PATHS.kind,
-    ];
-    let observation_corruption = object_quarantines
-        .iter()
-        .map(|record| record.kind.as_str())
-        .chain(event_quarantines.iter().map(|record| record.kind.as_str()))
-        .any(|kind| forge_kinds.contains(&kind));
-    let identities = object_quarantines
-        .iter()
-        .map(|quarantine| format!("{}/{}: {}", quarantine.kind, quarantine.name, quarantine.error))
-        .chain(
-            event_quarantines
-                .iter()
-                .map(|quarantine| format!("{}/{}@{}: {}", quarantine.kind, quarantine.name, quarantine.event_version, quarantine.error)),
-        )
-        .collect::<Vec<_>>()
-        .join("; ");
-    let (reason, message) = if event_quarantines.is_empty() {
-        (
-            "StoredObjectDecodeFailed",
-            format!(
-                "{} stored resource object{} quarantined after typed decode failure{}: {identities}",
-                object_quarantines.len(),
-                if object_quarantines.len() == 1 { "" } else { "s" },
-                if object_quarantines.len() == 1 { "" } else { "s" },
-            ),
-        )
-    } else if object_quarantines.is_empty() {
-        (
-            "StoredEventDecodeFailed",
-            format!(
-                "{} stored resource event{} quarantined after typed decode failure{}: {identities}",
-                event_quarantines.len(),
-                if event_quarantines.len() == 1 { "" } else { "s" },
-                if event_quarantines.len() == 1 { "" } else { "s" },
-            ),
-        )
-    } else {
-        (
-            "StoredResourceDecodeFailed",
-            format!(
-                "{} stored resource object{} and {} event{} quarantined after typed decode failures: {identities}",
-                object_quarantines.len(),
-                if object_quarantines.len() == 1 { "" } else { "s" },
-                event_quarantines.len(),
-                if event_quarantines.len() == 1 { "" } else { "s" },
-            ),
-        )
-    };
-    Some(
-        HostCondition::builder()
-            .condition_type("ResourceStore/DecodeQuarantine")
-            .value(ConditionValue::False)
-            .reason(reason)
-            .message(message)
-            .observed_at(Utc::now())
-            // Only corrupt forge inputs/results disable observation; unrelated actuator records do not.
-            .blocks_forge_observation(observation_corruption)
-            .build(),
-    )
-}
-
-pub(super) fn resource_field_ownership_condition(
-    diagnostics: Option<&flotilla_resources::ResourceStoreDiagnostics>,
-) -> Option<HostCondition> {
-    let violations = &diagnostics?.field_ownership_violations;
-    if violations.is_empty() {
-        return None;
-    }
-    let details = violations
-        .iter()
-        .map(|violation| {
-            format!(
-                "{}/{}/{} {:?} attempted {}={} ({})",
-                violation.kind,
-                violation.namespace,
-                violation.name,
-                violation.writer.role,
-                violation.field,
-                violation.attempted_value,
-                violation.rule
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Some(
-        HostCondition::builder()
-            .condition_type("ResourceStore/FieldOwnership")
-            .value(ConditionValue::False)
-            .reason("FieldOwnershipViolation")
-            .message(format!(
-                "{} field ownership violation{} recorded: {details}",
-                violations.len(),
-                if violations.len() == 1 { "" } else { "s" }
-            ))
-            .observed_at(Utc::now())
-            .blocks_readiness(false)
-            // Historical rejected writes do not disable current forge reads.
-            .blocks_forge_observation(false)
-            .build(),
-    )
 }
 
 pub(super) fn host_capabilities(

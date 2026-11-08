@@ -90,7 +90,7 @@ use flotilla_resources::{
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
-    delete_resource_kind, watch_resource_kind_including_replicas, ResourceBackend,
+    watch_resource_kind_including_replicas, ResourceBackend,
 };
 use flotilla_terminal::{
     ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession as ProviderTerminalSession, TerminalSessionLiveness, TerminalSessionTag,

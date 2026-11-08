@@ -2710,7 +2710,6 @@ async fn create_test_host_direct_kind_heard(
             ready: true,
             disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
             admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
-            resource_store: None,
             ..HostStatus::default()
         },
         at,

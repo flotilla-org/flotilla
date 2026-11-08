@@ -29,7 +29,6 @@ fn host_status_patch_updates_heartbeat_snapshot() {
         daemon_rss_bytes: Some(123 * 1024 * 1024),
         admission_free_space_floor_bytes: None,
         agent_adapter_baseline: None,
-        resource_store: None,
         conditions: Vec::new(),
         folded: Default::default(),
     }
@@ -108,7 +107,6 @@ async fn heartbeat_patch_preserves_independent_status_after_another_writer_updat
         daemon_rss_bytes: None,
         admission_free_space_floor_bytes: None,
         agent_adapter_baseline: Some(["codex".to_string()].into()),
-        resource_store: None,
         conditions: vec![heartbeat_condition.clone()],
         folded: Default::default(),
     };
@@ -454,7 +452,6 @@ fn heartbeat_description_has_one_availability_authority(tc: hegel::TestCase) {
         daemon_rss_bytes: Some(u64::MAX),
         admission_free_space_floor_bytes: None,
         agent_adapter_baseline: None,
-        resource_store: None,
         conditions: vec![],
         folded: Default::default(),
     };

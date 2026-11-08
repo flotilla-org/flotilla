@@ -721,50 +721,10 @@ async fn issue_budget_backoff_surfaces_a_nonblocking_host_condition() {
     assert!(condition.message.contains(&reset));
 }
 
-#[test]
-fn fleet_diagnosis_surfaces_event_decode_quarantines() {
-    let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
-    diagnostics.event_decode_quarantines.push(
-        flotilla_resources::ResourceEventDecodeQuarantine::builder()
-            .kind("CredentialSpec".to_string())
-            .namespace("flotilla".to_string())
-            .name("forgejo-token".to_string())
-            .event_version(17)
-            .error("missing field `username`".to_string())
-            .quarantined_at(Utc::now())
-            .build(),
-    );
-
-    let condition = resource_decode_quarantine_condition(Some(&diagnostics)).expect("quarantine should degrade fleet health");
-    assert_eq!(condition.condition_type, "ResourceStore/DecodeQuarantine");
-    assert_eq!(condition.reason, "StoredEventDecodeFailed");
-    assert!(condition.message.contains("CredentialSpec/forgejo-token@17"), "unexpected diagnosis: {}", condition.message);
-    assert!(condition.message.contains("missing field `username`"), "unexpected diagnosis: {}", condition.message);
-}
-
-#[test]
-fn field_ownership_violation_degrades_without_blocking_admission() {
-    let now = Utc::now();
-    let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
-    diagnostics.field_ownership_violations.push(
-        flotilla_resources::FieldOwnershipViolation::builder()
-            .kind("PlacementPolicy".to_string())
-            .namespace("flotilla".to_string())
-            .name("docker".to_string())
-            .writer(flotilla_resources::WriterIdentity::operator())
-            .field("spec.docker_per_vessel.host_ref".to_string())
-            .attempted_value(serde_json::json!("other-host"))
-            .rule("spec.docker_per_vessel.host_ref is owned by ReconcileLoop".to_string())
-            .observed_at(now)
-            .build(),
-    );
-    let condition = resource_field_ownership_condition(Some(&diagnostics)).expect("violation must be diagnosed");
-    assert_eq!(condition.value, ConditionValue::False);
-    assert!(!condition.blocks_readiness(), "historical rejected writes must not block admission");
-}
-
+// Undecodable old-store records never stop a daemon from booting and serving. Store
+// diagnostics are not host health (#3108): they are not read into the Host's conditions.
 #[tokio::test]
-async fn daemon_boot_quarantines_every_undecodable_replicated_kind_and_reports_them() {
+async fn daemon_boots_and_serves_over_undecodable_old_store_records() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"boot-quarantine-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
@@ -796,79 +756,7 @@ async fn daemon_boot_quarantines_every_undecodable_replicated_kind_and_reports_t
     .expect("daemon should boot with undecodable stored resources");
 
     daemon.list_projects_internal().await.expect("daemon should serve project queries");
-    let health = daemon.fleet_health_internal().await.expect("daemon should serve fleet health");
-    let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
-    let diagnosis = local.degraded_conditions.join("; ");
-    // Project, the credential definitions and Host are the decided store's kinds: the daemon
-    // never reads their old-store rows, so only the old store's own kinds are quarantined.
-    for identity in ["Convoy/poisoned-convoy", "Vessel/poisoned-vessel", "TerminalSession/poisoned-terminal-session"] {
-        assert!(diagnosis.contains(identity), "fleet diagnosis should name {identity}: {diagnosis}");
-    }
-
-    runtime.shutdown();
-}
-
-#[tokio::test]
-async fn deleting_the_last_quarantined_object_recovers_host_readiness_without_restart() {
-    let temp = TempDir::new().expect("tempdir");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"quarantine-recovery-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(temp.path()));
-    let sqlite_path = config.state_dir().join("resources.sqlite");
-    drop(SqliteBackend::open(&sqlite_path).expect("initialize sqlite store"));
-    let connection = rusqlite::Connection::open(&sqlite_path).expect("open raw sqlite store");
-    insert_undecodable_resource::<ConvoyEnsure>(&connection, "governor");
-    drop(connection);
-
-    let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
-    let runtime = DaemonRuntime::start_with_options(
-        Arc::clone(&daemon),
-        config,
-        None,
-        RuntimeOptions {
-            heartbeat_interval: Duration::from_millis(10),
-            controller_resync_interval: Duration::from_secs(300),
-            start_controllers: false,
-            ..RuntimeOptions::default()
-        },
-    )
-    .await
-    .expect("daemon should boot with an undecodable stored resource");
-
-    let health = daemon.fleet_health_internal().await.expect("daemon should serve fleet health");
-    let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
-    assert!(
-        local.degraded_conditions.iter().any(|condition| condition.contains("ConvoyEnsure/governor")),
-        "fleet diagnosis should identify the quarantined resource: {:?}",
-        local.degraded_conditions
-    );
-    let hosts = daemon.resource_backend().using::<Host>(NAMESPACE).list().await.expect("local host resource should exist");
-    let [host] = hosts.items.as_slice() else { panic!("expected exactly one local host resource, got {:?}", hosts.items) };
-    let host_id = host.metadata.name.clone();
-    assert!(
-        !host.status.as_ref().expect("startup heartbeat should publish host status").ready,
-        "decode quarantine should degrade readiness"
-    );
-
-    delete_resource_kind(&daemon.resource_backend(), NAMESPACE, ConvoyEnsure::API_PATHS.kind, "governor")
-        .await
-        .expect("operator delete should resolve the quarantined identity");
-
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let host = daemon
-                .resource_backend()
-                .using::<Host>(NAMESPACE)
-                .get(&host_id)
-                .await
-                .expect("local host resource should remain available");
-            if host.status.is_some_and(|status| status.ready) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("host readiness should recover after the final quarantine is deleted");
+    daemon.fleet_health_internal().await.expect("daemon should serve fleet health");
 
     runtime.shutdown();
 }
@@ -957,39 +845,4 @@ async fn capability_regression_keeps_live_forge_observer() {
         flotilla_observation::forge_observation::source_owner(&backend, NAMESPACE, &source).await.unwrap_err(),
         flotilla_observation::forge_observation::NO_READY_FORGE_OBSERVER
     );
-}
-
-// Quarantine of an unrelated actuator is admission-only; corrupt observation
-// inputs/results withdraw the forge reader. Exercise objects and event records.
-#[hegel::test]
-fn quarantine_withdraws_only_for_observation_records(tc: hegel::TestCase) {
-    let kind = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(6));
-    let event = tc.draw(hegel::generators::booleans());
-    let kinds = ["Convoy", "Host", "Forge", "Project", "Repository", "Issue", "ChangeRequest"];
-    let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
-    if event {
-        diagnostics.event_decode_quarantines.push(
-            flotilla_resources::ResourceEventDecodeQuarantine::builder()
-                .kind(kinds[kind].to_string())
-                .namespace("flotilla".to_string())
-                .name("bad".to_string())
-                .event_version(1)
-                .error("decode failed".to_string())
-                .quarantined_at(Utc::now())
-                .build(),
-        );
-    } else {
-        diagnostics.decode_quarantines.push(
-            flotilla_resources::ResourceDecodeQuarantine::builder()
-                .kind(kinds[kind].to_string())
-                .namespace("flotilla".to_string())
-                .name("bad".to_string())
-                .error("decode failed".to_string())
-                .quarantined_at(Utc::now())
-                .build(),
-        );
-    }
-    let condition = resource_decode_quarantine_condition(Some(&diagnostics)).expect("quarantine condition");
-    assert!(condition.blocks_readiness());
-    assert_eq!(condition.blocks_forge_observation(), kind != 0);
 }
