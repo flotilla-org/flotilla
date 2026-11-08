@@ -1,9 +1,8 @@
-//! Acceptance policy shared by legacy terminal inputs and durable Message batches.
-//! A possible write is never retried: fresh receiver evidence settles it, or an
-//! operator explicitly closes the held intent. Time alone is not receipt evidence.
+//! Acceptance policy for terminal inputs and engine turns.
+//! A possible write is held and never retyped while held; fresh receiver
+//! evidence settles it. Time alone is not receipt evidence.
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use flotilla_protocol::{PrincipalRef, ResourceRef};
 
 use crate::{api_version, DemandKind, DemandSpec, InputMeta, OwnerReference, Resource, ResourceObject, TerminalSession};
@@ -18,20 +17,6 @@ pub fn delivery_retry_delay(failures: u32) -> Duration {
 
 pub fn delivery_retry_exhausted(failures: u32) -> bool {
     failures >= DELIVERY_MAX_ATTEMPTS
-}
-
-pub fn delivery_retry_backoff() -> crate::RetryBackoff {
-    crate::RetryBackoff { initial: delivery_retry_delay(1), maximum: delivery_retry_delay(3) }
-}
-
-/// Callers establish freshness and original session identity before consulting
-/// this policy. Screen redraws alone never prove acceptance.
-pub fn delivery_acceptance_evidence(tool_activity: bool, hook_working: bool, fresh_working: bool, stable_working: bool) -> bool {
-    tool_activity || hook_working || (fresh_working && stable_working)
-}
-
-pub fn delivery_hold_overdue(started_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    now.signed_duration_since(started_at) >= DELIVERY_HOLD_FOR
 }
 
 /// Names the held batch, why it is held and the command that clears it, so

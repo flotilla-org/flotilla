@@ -501,7 +501,6 @@ struct ResumeSession {
 struct ResumeDelivery {
     session: flotilla_resources::ReadResourceObject<ResourceTerminalSession>,
     session_launch: Option<String>,
-    receiver: String,
     resume_intent: flotilla_resources::MessageSpec,
     message_name: String,
     reopened: ResourceObject<ResourceConvoy>,
@@ -525,17 +524,8 @@ impl MessageAttribution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyResumeOutcome {
     Informational,
-    Delivered {
-        displaced: Option<String>,
-    },
-    Queued {
-        displaced: Option<String>,
-    },
-    /// Queued with a held Message batch ahead of it for the same crew (#3455).
-    QueuedBehindHold {
-        displaced: Option<String>,
-        held: String,
-    },
+    Delivered { displaced: Option<String> },
+    Queued { displaced: Option<String> },
 }
 
 type ConvoyMessageKey = (String, String);
@@ -2845,7 +2835,7 @@ impl CrewService {
             .await
             .map_err(|error| error.to_string())?;
         }
-        Ok(self.queued_resume(namespace, &receiver, displaced).await)
+        Ok(ConvoyResumeOutcome::Queued { displaced })
     }
 
     /// Reopens the selected crew member's work for a resume released now, superseding its pending
@@ -2917,7 +2907,7 @@ impl CrewService {
         if reopened.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             return Err(terminal_convoy_refusal(name, "became terminal"));
         }
-        Ok(ResumeDelivery { session, session_launch, receiver, resume_intent, message_name, reopened, displaced })
+        Ok(ResumeDelivery { session, session_launch, resume_intent, message_name, reopened, displaced })
     }
 
     /// Publishes a reopened resume: from the session's home for a replica session, after
@@ -2931,7 +2921,7 @@ impl CrewService {
         intent: ResumeIntent,
         delivery: ResumeDelivery,
     ) -> Result<ConvoyResumeOutcome, String> {
-        let ResumeDelivery { session, session_launch, receiver, resume_intent, message_name, reopened, displaced } = delivery;
+        let ResumeDelivery { session, session_launch, resume_intent, message_name, reopened, displaced } = delivery;
         let (vessel, role, convoys, status) = (&selected.vessel, &selected.role, &selected.convoys, selected.status());
         if intent == ResumeIntent::Reminder && reopened.status.as_ref().is_some_and(|status| status.crew_claim_is_settled(vessel, role)) {
             // The claim guard made the patch a no-op; only the message is published.
@@ -2944,7 +2934,7 @@ impl CrewService {
                     .restore_crew_work_after_delivery_failure(convoys, name, &reopened.metadata.resource_version, status, error)
                     .await);
             }
-            return Ok(self.queued_resume(namespace, &receiver, displaced).await);
+            return Ok(ConvoyResumeOutcome::Queued { displaced });
         }
         let session = session.object;
         self.reconcile_or_restore_crew_work(namespace, &session.spec.env_ref, convoys, name, status.clone(), &reopened).await?;
@@ -2961,35 +2951,7 @@ impl CrewService {
                 .restore_crew_work_after_delivery_failure(convoys, name, &reopened.metadata.resource_version, status, error)
                 .await);
         }
-        Ok(self.queued_resume(namespace, &receiver, displaced).await)
-    }
-
-    /// A queued resume says when a held batch is ahead of it: an operator or
-    /// supervisor brief supersedes held system turns at delivery, and waits
-    /// behind any other held batch until an operator clears it (#3455).
-    async fn queued_resume(&self, namespace: &str, receiver: &str, displaced: Option<String>) -> ConvoyResumeOutcome {
-        let open = match self.open_messages_to(namespace, receiver).await {
-            Ok(open) => open.into_iter().map(|message| message.object).collect::<Vec<_>>(),
-            Err(error) => {
-                tracing::warn!(%receiver, %error, "could not read held batches for a queued resume");
-                return ConvoyResumeOutcome::Queued { displaced };
-            }
-        };
-        let notes = flotilla_resources::HeldMessageBatch::collect(&open)
-            .into_iter()
-            .map(|batch| {
-                if batch.system_only {
-                    format!("it supersedes held system turns at delivery ({})", batch.describe(namespace))
-                } else {
-                    format!("it waits behind a held batch: {}", batch.describe(namespace))
-                }
-            })
-            .collect::<Vec<_>>();
-        if notes.is_empty() {
-            ConvoyResumeOutcome::Queued { displaced }
-        } else {
-            ConvoyResumeOutcome::QueuedBehindHold { displaced, held: notes.join("; ") }
-        }
+        Ok(ConvoyResumeOutcome::Queued { displaced })
     }
 
     pub async fn withdraw_pending_brief(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {

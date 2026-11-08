@@ -117,12 +117,6 @@ impl CrewActions<'_> {
                                 .await;
                             CommandValue::ConvoyBriefQueued { displaced }
                         }
-                        Ok(ConvoyResumeOutcome::QueuedBehindHold { displaced, held }) => {
-                            self.crew
-                                .record_lifecycle_mutation_best_effort(&namespace, &record_name, mutation_action, caller.as_ref(), false)
-                                .await;
-                            CommandValue::ConvoyBriefHeld { displaced, held }
-                        }
                         Err(message) => CommandValue::Error { message },
                     }
                 }
@@ -470,44 +464,5 @@ impl CrewActions<'_> {
             return Ok(id);
         }
         Err("ConvoyPromiseVerdict action selected the wrong handler".to_string())
-    }
-}
-
-impl CrewActions<'_> {
-    pub async fn execute_action_message_deliver_batch(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let CommandAction::MessageDeliverBatch { namespace, name, reason } = &command.action {
-            let identity = self.events.start(id, command.description().to_string());
-            let result = if self.crew.message_primitives().is_some() {
-                CommandValue::Error { message: "engine delivery does not hold submission batches".into() }
-            } else {
-                match self.crew.message_inbox(namespace).await.deliver_held_batch(name, reason).await {
-                    Ok(()) => CommandValue::Ok,
-                    Err(error) => CommandValue::Error { message: error.to_string() },
-                }
-            };
-            self.events.finish(id, identity, result);
-            return Ok(id);
-        }
-        Err("MessageDeliverBatch action selected the wrong handler".into())
-    }
-
-    pub async fn execute_action_message_fail_batch(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let CommandAction::MessageFailBatch { namespace, name, reason } = &command.action {
-            let empty_identity = self.events.start(id, command.description().to_string());
-            if self.crew.message_primitives().is_some() {
-                // The engine path submits no batches; a message it cannot deliver drops as undeliverable.
-                let result =
-                    CommandValue::Error { message: format!("Message `{name}` is on the engine path, which holds no submission batches") };
-                self.events.finish(id, empty_identity, result);
-                return Ok(id);
-            }
-            let result = match self.crew.message_inbox(namespace).await.fail_batch(name, reason, self.clock.now()).await {
-                Ok(()) => CommandValue::Ok,
-                Err(error) => CommandValue::Error { message: error.to_string() },
-            };
-            self.events.finish(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("MessageFailBatch action selected the wrong handler".into())
     }
 }

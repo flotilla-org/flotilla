@@ -12,7 +12,7 @@ use crate::{
 
 /// A pre-write refusal that cannot recover before the agent activation ends.
 pub const CONTROLLER_FENCE_UNVERIFIABLE_REASON: &str = "ControllerFenceUnverifiable";
-pub const CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE: &str = "ControllerFenceUnverifiable: no message input was sent; guarded delivery will be rechecked; inspect the held batch and use `flotilla resource deliver-message-batch` to authorize delivery in the same session";
+pub const CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE: &str = "ControllerFenceUnverifiable: no message input was sent because cleat could not verify the controller fence; the turn stays queued and is not retried; resuming the session clears this and delivery resumes";
 
 /// An ambiguous write whose confirmation deadline elapsed; never retried.
 /// Later consumption evidence can still acknowledge the held message.

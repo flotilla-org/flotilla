@@ -10,10 +10,6 @@ use std::{
 };
 
 use chrono::Utc;
-use flotilla_agent_connector::{
-    AgentTransport, Delivery, DeliveryTarget, SubmissionRef, TransportId, TransportObservation, TransportOutcome, TransportRouter,
-    KEYSTROKE,
-};
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_crew::leaf_engine::CrewTurnIntent;
@@ -26,8 +22,8 @@ use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
     EnvironmentSpec, ExitDeclaration, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta,
-    Message, MessageExpectation, MessagePhase, Resource, Selector, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    Message, MessageExpectation, Resource, Selector, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus,
+    Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 use flotilla_store::{controller::Reconciler, ResourceBackend};
 use futures::StreamExt;
@@ -54,26 +50,6 @@ enum ClosedWatch {
 async fn remote_turn_delivery_recovers_after_either_watch_closes() {
     for input in [ClosedWatch::Convoy, ClosedWatch::TerminalSession] {
         remote_turn_scenario(Some(input)).await;
-    }
-}
-
-// Fake only the transport receipt; stores, producer publication and cross-host
-// mutation dispatch remain real. Pool framing is covered by runtime scenarios.
-struct AcceptedMessageTransport(AtomicUsize);
-#[async_trait::async_trait]
-impl AgentTransport for AcceptedMessageTransport {
-    fn id(&self) -> TransportId {
-        KEYSTROKE.into()
-    }
-    async fn observe(&self, _: &DeliveryTarget, _: Option<&SubmissionRef>) -> Result<TransportObservation, String> {
-        Ok(TransportObservation { ready: true, ..Default::default() })
-    }
-    async fn submit(&self, _: &Delivery) -> TransportOutcome {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        TransportOutcome::Accepted { evidence: "receiver transport receipt".into() }
-    }
-    async fn poll(&self, _: &Delivery) -> TransportOutcome {
-        panic!("a confirmed submission must not be polled")
     }
 }
 
@@ -332,14 +308,4 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         sessions.get(&session_meta.name).await.expect("terminal after admission").spec.source,
         TerminalSessionSource::Agent { message: None, .. }
     ));
-    let transport = Arc::new(AcceptedMessageTransport(AtomicUsize::new(0)));
-    let router = TransportRouter::new().with_transport(transport.clone());
-    placement_daemon.message_inbox("flotilla").await.reconcile_delivery(&router, Utc::now()).await.expect("receiver delivery");
-    let delivered = placement.using::<Message>("flotilla").get(&nudge.metadata.name).await.expect("durable nudge receipt");
-    assert_eq!(delivered.status.as_ref().expect("delivery status").phase, MessagePhase::Delivered);
-    assert_eq!(
-        delivered.status.as_ref().expect("delivery status").resolved_receiver.as_ref().expect("receiver receipt").crew_id,
-        "receiver-crew"
-    );
-    assert_eq!(transport.0.load(Ordering::SeqCst), 1);
 }

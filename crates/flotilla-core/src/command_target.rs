@@ -106,8 +106,6 @@ impl InProcessDaemon {
             | A::ResourceManifestResolve { .. }
             | A::ConvoyEnsureRoll { .. }
             | A::ResourceReconcileNow { .. }
-            | A::MessageDeliverBatch { .. }
-            | A::MessageFailBatch { .. }
             | A::PersonAcknowledge { .. }
             | A::PersonAnswer { .. }
             | A::ResourceStatusPatch { .. }

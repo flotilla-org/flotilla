@@ -22,7 +22,15 @@ async fn primitives(dir: &tempfile::TempDir) -> MessagePrimitives {
 }
 
 async fn primitives_at(dir: &tempfile::TempDir, clock: Arc<dyn flotilla_resources::Clock>) -> MessagePrimitives {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    primitives_over(dir, ResourceBackend::new(InMemoryBackend::default()), clock).await
+}
+
+/// The Message path over `backend`, whose records the conditions read.
+async fn primitives_over(
+    dir: &tempfile::TempDir,
+    backend: ResourceBackend,
+    clock: Arc<dyn flotilla_resources::Clock>,
+) -> MessagePrimitives {
     backend
         .clone()
         .using::<Project>(NAMESPACE)
@@ -165,6 +173,80 @@ async fn the_sweep_reconciles_receipts_and_settles_replies_from_open_messages_on
     assert!(matches!(engine_message(&primitives, &record).state(), MessageState::Settled { .. }));
     let (answer_id, _) = primitives.locate(&answer_name).expect("locate").expect("answer");
     assert_eq!(open.open().collect::<Vec<_>>(), [answer_id.as_str()], "only open messages are swept again");
+}
+
+// Behaviour (#3317): the sweep settles a message whose outcome condition holds, leaves one whose
+// condition does not, and withdraws a pending message once its delivery condition is observed false,
+// naming the condition as the authority.
+#[tokio::test]
+async fn the_sweep_settles_held_outcomes_and_withdraws_on_a_false_delivery_condition() {
+    use flotilla_core::primitives::sweep::OpenMessages;
+    use flotilla_resources::{Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus};
+    use flotilla_state_machines::machines::message::DropReason;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = backend.using::<Convoy>(NAMESPACE);
+    let convoy = convoys
+        .create(&InputMeta::builder().name("demo".to_string()).build(), &ConvoySpec::builder().workflow_ref("w".into()).build())
+        .await
+        .expect("convoy");
+    convoys
+        .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() })
+        .await
+        .expect("active convoy");
+    let primitives = primitives_over(&dir, backend, Arc::new(SystemClock)).await;
+    let leaf = |text: &str| text.parse::<flotilla_protocol::Leaf>().expect("condition");
+    let send = |key: &str, edit: &dyn Fn(&mut MessageSpec)| {
+        let mut spec = intent("system:turn-rules", CREW);
+        edit(&mut spec);
+        (flotilla_resources::message_record_name(CREW, "system:turn-rules", key), spec)
+    };
+    let (met, met_spec) = send("met", &|spec| {
+        spec.expectation = flotilla_resources::MessageExpectation::Outcome { condition: leaf("convoy/demo .status.phase == Active") }
+    });
+    let (unmet, unmet_spec) = send("unmet", &|spec| {
+        spec.expectation = flotilla_resources::MessageExpectation::Outcome { condition: leaf("convoy/demo .status.phase == Completed") }
+    });
+    let (moot, moot_spec) = send("moot", &|spec| spec.delivery_condition = Some(leaf("convoy/demo .status.phase == Completed")));
+    for (name, spec) in [(&met, &met_spec), (&unmet, &unmet_spec), (&moot, &moot_spec)] {
+        primitives.admit(NAMESPACE, name, spec).await.expect("admitted");
+    }
+    let mut open = OpenMessages::default();
+    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
+    let report = primitives.sweep(NAMESPACE, now, &mut open).await.expect("sweep");
+    assert_eq!((report.outcomes, report.withdrawn), (1, 1));
+    assert!(matches!(engine_message(&primitives, &met).state(), MessageState::Settled { .. }), "the outcome holds");
+    assert_eq!(*engine_message(&primitives, &unmet).state(), MessageState::Pending, "the outcome does not hold yet");
+    let moot = engine_message(&primitives, &moot);
+    let Some(DropReason::Withdrawn { by, authority }) = moot.state().drop_reason() else { panic!("withdrawn: {:?}", moot.state()) };
+    assert_eq!(by.as_str(), "fleet:lab/role:turn-rules");
+    assert!(authority.as_str().contains("demo"), "the condition is the authority: {authority}");
+}
+
+// Behaviour (#3108): the sweep's next wake is the earliest of several open messages' deadlines, and
+// once that message expires, the next earliest.
+#[tokio::test]
+async fn the_sweep_wakes_at_the_earliest_of_several_deadlines() {
+    use flotilla_core::primitives::sweep::OpenMessages;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let start = chrono::Utc::now();
+    // The expiry gate reads the store's clock: it moves with the sweep.
+    let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(start));
+    let primitives = primitives_at(&dir, Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>).await;
+    for (key, seconds) in [("late", 30), ("first", 10), ("second", 20)] {
+        let mut spec = intent("system:nudge", CREW);
+        spec.deadline = Some(start + chrono::Duration::seconds(seconds));
+        let record = flotilla_resources::message_record_name(CREW, "system:nudge", key);
+        primitives.admit(NAMESPACE, &record, &spec).await.expect("admitted");
+    }
+    let at = |seconds: i64| flotilla_schema::Timestamp::from_datetime(&(start + chrono::Duration::seconds(seconds)));
+    let mut open = OpenMessages::default();
+    let report = primitives.sweep(NAMESPACE, at(0), &mut open).await.expect("sweep");
+    assert_eq!(report.next_due, Some(at(10).saturating_add(1)), "just past the earliest deadline");
+    clock.set(start + chrono::Duration::seconds(10) + chrono::Duration::microseconds(1));
+    let report = primitives.sweep(NAMESPACE, at(10).saturating_add(1), &mut open).await.expect("sweep at the first deadline");
+    assert_eq!(report.expired, 1);
+    assert_eq!(report.next_due, Some(at(20).saturating_add(1)), "then the next earliest");
 }
 
 // Behaviour (#3317): an index that meets a home for the first time (a

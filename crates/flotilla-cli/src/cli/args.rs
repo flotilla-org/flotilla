@@ -631,10 +631,6 @@ pub enum ResourceSubCommand {
     ReconcileNow(ResourceReconcileNowArgs),
     /// Replace the status subresource after typed validation
     PatchStatus(ResourceStatusPatchArgs),
-    /// Authorize one more delivery attempt in the existing session (may repeat uncertain input)
-    DeliverMessageBatch(MessageFailBatchArgs),
-    /// Close a held or exhausted Message batch, preserving its submission audit.
-    FailMessageBatch(MessageFailBatchArgs),
     /// Get one resource by name
     Get(ResourceGetArgs),
     /// Explain the charter source and applied revision that authored a record
@@ -779,19 +775,6 @@ pub struct ResourceApplyArgs {
     #[arg(long, default_value = "flotilla")]
     pub namespace: String,
     /// Route the mutation to a peer host
-    #[arg(long)]
-    pub host: Option<String>,
-}
-
-#[derive(clap::Args)]
-pub struct MessageFailBatchArgs {
-    /// A member of the held batch
-    pub name: String,
-    /// Operator explanation retained in every member's status; do not include secrets
-    #[arg(long)]
-    pub reason: String,
-    #[arg(long, default_value = "flotilla")]
-    pub namespace: String,
     #[arg(long)]
     pub host: Option<String>,
 }
@@ -987,28 +970,6 @@ mod tests {
         assert!(matches!(parsed.command, Some(SubCommand::Resource {
             command: ResourceSubCommand::Apply(ResourceApplyArgs { file, .. })
         }) if file == Path::new("/path/to/restore-0.json")));
-    }
-
-    // Glue: explicit operator intent requires a reason and identifies a member.
-    #[test]
-    fn fail_message_batch_cli_requires_an_operator_reason() {
-        let parsed = Cli::try_parse_from(["flotilla", "resource", "fail-message-batch", "held", "--reason", "cancel after inspection"])
-            .expect("operator command");
-        assert!(
-            matches!(parsed.command, Some(SubCommand::Resource { command: ResourceSubCommand::FailMessageBatch(args) }) if args.name == "held" && args.reason == "cancel after inspection")
-        );
-        assert!(Cli::try_parse_from(["flotilla", "resource", "fail-message-batch", "held"]).is_err());
-    }
-
-    // Glue: explicit retry has its own verb and requires an auditable reason.
-    #[test]
-    fn deliver_message_batch_cli_requires_an_operator_reason() {
-        let parsed = Cli::try_parse_from(["flotilla", "resource", "deliver-message-batch", "held", "--reason", "checked composer"])
-            .expect("operator delivery command");
-        assert!(
-            matches!(parsed.command, Some(SubCommand::Resource { command: ResourceSubCommand::DeliverMessageBatch(args) }) if args.name == "held" && args.reason == "checked composer")
-        );
-        assert!(Cli::try_parse_from(["flotilla", "resource", "deliver-message-batch", "held"]).is_err());
     }
 
     #[test]

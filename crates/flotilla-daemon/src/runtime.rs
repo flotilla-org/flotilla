@@ -9,7 +9,6 @@ mod discovery;
 mod docker;
 mod environments;
 mod health;
-mod message;
 mod ports;
 mod primitives;
 mod provider_path;
@@ -58,7 +57,6 @@ use self::discovery::{
 use self::docker::DockerControllerRuntime;
 use self::environments::reconcile_provisioned_environments;
 use self::health::{apply_host_heartbeat_with_credentials, spawn_projection_parity_task, DaemonHealthIdentity, RuntimeHealth};
-use self::message::MessageController;
 use self::ports::{
     ChainedForgeDefaultBranchResolver, DaemonConvoyTeardownRuntime, GhForgeDefaultBranchResolver, RoutingCheckoutRuntime,
     RoutingCloneRuntime, RuntimeOperatorReconciler,
@@ -70,9 +68,9 @@ use self::tasks::{
     spawn_convoy_ensure_reconciler_task, spawn_dispatch_reconciler_task, spawn_environment_orphan_sweep_task, spawn_event_expiry_task,
     spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task, spawn_liveness_watchdog_task,
     spawn_local_fulfilment_probe_task, spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task,
-    spawn_provisioned_environment_reconciliation_task, spawn_resource_controller, spawn_sleep_inhibitor_task,
-    spawn_ssh_fulfilment_probe_task, spawn_startup_restoration, spawn_vessel_placement_projector, supervise_controller,
-    CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart, LIVENESS_WATCHDOG_INTERVAL, MANIFEST_RECONCILE_INTERVAL,
+    spawn_provisioned_environment_reconciliation_task, spawn_sleep_inhibitor_task, spawn_ssh_fulfilment_probe_task,
+    spawn_startup_restoration, spawn_vessel_placement_projector, supervise_controller, CheckoutArchiveRoot, CheckoutArchiveSweep,
+    PeriodicTaskStart, LIVENESS_WATCHDOG_INTERVAL, MANIFEST_RECONCILE_INTERVAL,
 };
 use self::terminal::TerminalControllerRuntime;
 use crate::server::environment_sockets::EnvironmentSocketService;
@@ -1050,27 +1048,15 @@ fn spawn_controller_loops(
             .await;
         }));
     }
-    // The old Message controller runs only while Message is in the old store
-    // (#3317); on the engine path its delivery adapter delivers, with the other controllers.
-    if let Some(primitives) = state.daemon.message_primitives() {
-        let delivery =
-            self::primitives::MessageDelivery::new(Arc::clone(&state), primitives, namespace_string.clone(), runtime_health.clone());
-        controllers.push(tokio::spawn(delivery.run()));
-    } else {
-        controllers.push({
-            let state = Arc::clone(&state);
-            spawn_resource_controller::<flotilla_resources::Message, _, _>(
-                backend.clone(),
-                namespace_string.clone(),
-                supervision.clone(),
-                runtime_health.clone(),
-                move |_backend, namespace| {
-                    let controller = MessageController { state: Arc::clone(&state), namespace };
-                    let metrics = state.controller_metrics.for_kind("Message");
-                    async move { controller.run(metrics).await }
-                },
-            )
-        });
+    // Message delivery is the engine path's adapter (#3317, #3108); the runtime opens that path at
+    // startup, before any controller runs.
+    match state.daemon.message_primitives() {
+        Some(primitives) => {
+            let delivery =
+                self::primitives::MessageDelivery::new(Arc::clone(&state), primitives, namespace_string.clone(), runtime_health.clone());
+            controllers.push(tokio::spawn(delivery.run(state.controller_metrics.for_kind("Message"))));
+        }
+        None => tracing::warn!(namespace = %namespace_string, "the Message path is not open; nothing delivers messages"),
     }
     // #3907, #3929: bindings per convoy on its home, provisions per place.
     controllers.push(controller!(Convoy, "AccountBinding", {

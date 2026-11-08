@@ -474,7 +474,8 @@ async fn resource_controller_restart_budget_exhaustion_recovers() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let (recovered, recovery) = tokio::sync::oneshot::channel();
     let signal = Arc::new(StdMutex::new(Some(recovered)));
-    let task = spawn_resource_controller::<Checkout, _, _>(
+    let task = spawn_named_controller(
+        Checkout::API_PATHS.kind,
         ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
         NAMESPACE.to_string(),
         ControllerSupervision {

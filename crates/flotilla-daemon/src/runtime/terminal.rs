@@ -243,31 +243,6 @@ pub(super) async fn deliver_and_confirm(
     submit_and_confirm(pool, adapter, session_id, message).await
 }
 
-/// Revalidate batch freshness immediately before the atomic guarded write.
-pub(super) async fn deliver_guarded_and_confirm(
-    pool: &dyn TerminalPool,
-    adapter: Option<&dyn AgentAdapter>,
-    session: &str,
-    text: &str,
-    inbox: &flotilla_messaging::MessageInbox,
-    members: &[String],
-) -> Result<TerminalDeliveryOutcome, String> {
-    // Cleat is the only write gate. No adapter classifier or hold deadline may
-    // turn a known-unsent queued message into an operator-only hold.
-    match inbox.validate_delivery_members(members, Utc::now()).await {
-        Ok(true) => {}
-        Ok(false) => {
-            info!(%session, "batch member superseded before input; reforming the unsent batch");
-            return Ok(TerminalDeliveryOutcome::BatchSuperseded);
-        }
-        Err(error) => {
-            info!(%session, %error, "turn condition not yet observable; no input sent");
-            return Ok(TerminalDeliveryOutcome::Deferred("turn condition not yet observable"));
-        }
-    }
-    submit_and_confirm(pool, adapter, session, text).await
-}
-
 pub(super) async fn submit_and_confirm(
     pool: &dyn TerminalPool,
     adapter: Option<&dyn AgentAdapter>,

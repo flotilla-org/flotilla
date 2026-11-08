@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,7 +8,7 @@ use flotilla_resources::{
     CrewWorkPhase, InputMeta, ResourceObject, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use super::fixture;
 use flotilla_resources::CREDENTIAL_REFS_ANNOTATION;
@@ -179,74 +178,15 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     assert!(messages.iter().any(|message| Some(&message.metadata.name) == latest.spec.supersedes.as_ref()));
     assert_eq!(latest.spec.sender, "system:capabilities");
     assert_eq!(latest.spec.body, crate::crew_capabilities::card_delta(&first, &card));
-    // Terminal transport is the I/O boundary. A busy holder gets no input;
-    // after its turn boundary only the latest card is submitted, once.
-    struct Transport {
-        working: AtomicBool,
-        submitted: Mutex<Vec<flotilla_agent_connector::Delivery>>,
-    }
-    #[async_trait]
-    impl flotilla_agent_connector::AgentTransport for Transport {
-        fn id(&self) -> flotilla_agent_connector::TransportId {
-            flotilla_agent_connector::KEYSTROKE.into()
-        }
-        async fn observe(
-            &self,
-            _: &flotilla_agent_connector::DeliveryTarget,
-            _: Option<&flotilla_agent_connector::SubmissionRef>,
-        ) -> Result<flotilla_agent_connector::TransportObservation, String> {
-            let working = self.working.load(Ordering::SeqCst);
-            Ok(flotilla_agent_connector::TransportObservation {
-                ready: !working,
-                working,
-                evidence: Some("terminal boundary".into()),
-                ..Default::default()
-            })
-        }
-        async fn submit(&self, batch: &flotilla_agent_connector::Delivery) -> flotilla_agent_connector::TransportOutcome {
-            self.submitted.lock().await.push(batch.clone());
-            flotilla_agent_connector::TransportOutcome::Accepted { evidence: "accepted".into() }
-        }
-        async fn poll(&self, _: &flotilla_agent_connector::Delivery) -> flotilla_agent_connector::TransportOutcome {
-            flotilla_agent_connector::TransportOutcome::Accepted { evidence: "accepted".into() }
-        }
-    }
-    let session = sessions.get("session").await.expect("session");
-    sessions
-        .update_status(
-            "session",
-            &session.metadata.resource_version,
-            &flotilla_resources::TerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                session_id: Some("terminal".into()),
-                crew: Some(
-                    flotilla_resources::CrewSessionStatus::builder()
-                        .id("crew-id".into())
-                        .adapter("codex".into())
-                        .stance("trusted".into())
-                        .build(),
-                ),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("running holder");
-    let transport = Arc::new(Transport { working: AtomicBool::new(true), submitted: Mutex::new(Vec::new()) });
-    let router = flotilla_agent_connector::TransportRouter::new().with_transport(transport.clone());
-    let inbox = flotilla_messaging::MessageInbox::new(backend, "flotilla");
-    inbox.reconcile_delivery(&router, Utc::now()).await.expect("busy holder");
-    assert!(transport.submitted.lock().await.is_empty());
-    transport.working.store(false, Ordering::SeqCst);
-    inbox.reconcile_delivery(&router, Utc::now()).await.expect("turn boundary");
-    inbox.reconcile_delivery(&router, Utc::now()).await.expect("idempotent receipt");
-    let submitted = transport.submitted.lock().await;
-    assert_eq!(submitted.len(), 1);
-    // The latest revision is traceable through the submission and stored subject, not a JSON header (#2923).
-    assert_eq!(submitted[0].submission.members, vec![latest.metadata.name.clone()]);
+    // The latest revision is traceable through the stored subject, not a JSON header (#2923), and
+    // its turn text names it.
     assert!(
         matches!(&latest.spec.subject, Some(flotilla_resources::MessageReference::ControlRecord { revision, .. }) if revision == "capabilities@5")
     );
-    assert_eq!(submitted[0].text, format!("[from flotilla (system) · capabilities · re TerminalSession session]\n\n{}", latest.spec.body));
+    assert_eq!(
+        flotilla_messaging::frame_message(&latest.spec),
+        format!("[from flotilla (system) · capabilities · re TerminalSession session]\n\n{}", latest.spec.body)
+    );
 }
 
 // Handoffs route to the addressed vessel, preserve typed carries, and admit once per command.

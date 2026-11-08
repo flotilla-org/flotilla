@@ -3662,10 +3662,10 @@ mod tests {
         assert_eq!(result_set.rows.as_convoys().expect("convoy rows")[0].vessels[0].surface_state, SurfaceState::Working);
     }
 
-    // #3455: a held message batch for a crew names itself at the top of the
-    // convoy's attention instead of a generic "needs you", and clears with it.
+    // #3455: an open attention about a crew's role names itself at the top of
+    // the convoy's attention instead of a generic "needs you", and clears with it.
     #[tokio::test]
-    async fn held_message_batch_names_itself_in_convoy_attention() {
+    async fn an_open_crew_attention_names_itself_in_convoy_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let attentions = Arc::new(SetAttentions::default());
@@ -3681,9 +3681,7 @@ mod tests {
         let mut other = session_object("terminal-convoy-b-implement").await;
         other.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-b".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        let description = "message batch `message-0` is held for flotilla/convoy-a/implement/coder (1 message: message-0): delivery held: \
-            terminal was not ready before submission; attempt 3/3; clear it with \
-            `flotilla resource fail-message-batch message-0 --namespace flotilla --reason '<why>'`";
+        let description = "a turn rule for flotilla/convoy-a/implement/coder needs a person to rule on it";
         let held = |convoy: &str| {
             open_attention(Sender::TurnRules, AttentionSubject::ConvoyRole { convoy: convoy.into(), role: "coder".into() }, description)
         };

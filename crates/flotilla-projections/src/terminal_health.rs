@@ -97,7 +97,7 @@ mod tests {
     // A known-unsent permanent fence has its own condition and actionable crew
     // attention. Ordinary observations and expiry cannot turn it into a receipt.
     #[test]
-    fn unverifiable_fence_explains_same_session_delivery_and_survives_observations() {
+    fn unverifiable_fence_explains_resume_recovery_and_survives_observations() {
         let now = chrono::Utc::now();
         let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
         TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
@@ -110,8 +110,8 @@ mod tests {
         TerminalSessionStatusPatch::MarkDeliveryExpired.apply(&mut status);
         let explained = condition(&status).expect("condition");
         assert!(matches!(explained, ExplainedTerminalCondition::ControllerFenceUnverifiable { .. }));
-        assert!(explained.to_string().contains("flotilla resource deliver-message-batch"));
-        assert!(explained.to_string().contains("same session"));
+        assert!(explained.to_string().contains("no message input was sent"));
+        assert!(explained.to_string().contains("resuming the session clears this"));
         assert!(!explained.to_string().contains("unconfirmed"));
         assert_eq!(
             flotilla_resources::crew_attention(Some(&status), None),

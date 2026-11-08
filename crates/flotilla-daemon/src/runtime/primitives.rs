@@ -128,8 +128,9 @@ impl MessageDelivery {
         }
     }
 
-    /// Runs a pass at once, then at each event and at the next deadline.
-    pub(super) async fn run(mut self) {
+    /// Runs a pass at once, then at each event and at the next deadline. Each pass is counted in
+    /// `metrics`, as a controller's reconcile is, for load drivers (#3206).
+    pub(super) async fn run(mut self, metrics: Arc<flotilla_store::load_metrics::ControllerLoadMetrics>) {
         let wake = Arc::clone(&self.wake);
         let listener: Arc<flotilla_schema_sqlite::stream::CommitListener> = {
             let wake = Arc::clone(&wake);
@@ -173,12 +174,22 @@ impl MessageDelivery {
         watch!(flotilla_resources::Vessel);
         let mut failures = 0_u32;
         loop {
-            let next = match self.pass().await {
+            metrics.wakes.increment();
+            metrics.queue_peak.observe(1);
+            let started = tokio::time::Instant::now();
+            let result = {
+                let _busy = metrics.busy();
+                self.pass().await
+            };
+            // Failed passes too, as the object controllers' histogram counts them.
+            metrics.reconcile.record(started.elapsed());
+            let next = match result {
                 Ok(next) => {
                     failures = 0;
                     next
                 }
                 Err(error) => {
+                    metrics.failures.increment();
                     failures = failures.saturating_add(1);
                     warn!(namespace = %self.namespace, %error, failures, "engine message delivery pass failed");
                     (failures <= RETRY_LIMIT).then(|| RETRY.delay(failures))
@@ -191,7 +202,7 @@ impl MessageDelivery {
                         Some(wait) => tokio::time::sleep(wait).await,
                         None => std::future::pending().await,
                     }
-                } => {}
+                } => { metrics.requeues.increment(); }
                 Some(_) = watches.join_next(), if !watches.is_empty() => {}
             }
         }

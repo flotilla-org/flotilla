@@ -301,23 +301,8 @@ pub(super) async fn supervise_controller<F, Fut>(
     }
 }
 
-pub(super) fn spawn_resource_controller<T, F, Fut>(
-    backend: ResourceBackend,
-    namespace: String,
-    supervision: ControllerSupervision,
-    runtime_health: RuntimeHealth,
-    make_run: F,
-) -> JoinHandle<()>
-where
-    T: Resource,
-    F: FnMut(ResourceBackend, String) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<(), ResourceError>> + Send + 'static,
-{
-    spawn_named_controller(T::API_PATHS.kind, backend, namespace, supervision, runtime_health, make_run)
-}
-
-/// As [`spawn_resource_controller`], supervised under `name`: a second controller of one
-/// primary kind (the account bindings' over Convoy) keeps its own supervision and health.
+/// A controller supervised under `name`: a second controller of one primary kind (the account
+/// bindings' over Convoy) keeps its own supervision and health.
 pub(super) fn spawn_named_controller<F, Fut>(
     name: &'static str,
     backend: ResourceBackend,

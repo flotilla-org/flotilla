@@ -5071,9 +5071,6 @@ impl InProcessDaemon {
             }
         }
         let target = match action {
-            CommandAction::MessageDeliverBatch { namespace, name, .. } | CommandAction::MessageFailBatch { namespace, name, .. } => {
-                Some((namespace.as_str(), "Message", name.as_str()))
-            }
             CommandAction::ConvoyEnsureRoll { namespace, name } => Some((namespace.as_str(), "ConvoyEnsure", name.as_str())),
             CommandAction::ResourceDelete { namespace, kind, name, replica_origin: None }
             | CommandAction::ResourceStatusPatch { namespace, kind, name, .. }
@@ -5642,8 +5639,6 @@ impl InProcessDaemon {
             CommandAction::ResourceReconcileNow { .. } => {
                 return boxed_action!(executor.execute_action_resource_reconcile_now(id, &command))
             }
-            CommandAction::MessageDeliverBatch { .. } => return boxed_action!(crew.execute_action_message_deliver_batch(id, &command)),
-            CommandAction::MessageFailBatch { .. } => return boxed_action!(crew.execute_action_message_fail_batch(id, &command)),
             CommandAction::PersonInbox { .. } | CommandAction::PersonAcknowledge { .. } | CommandAction::PersonAnswer { .. } => {
                 return boxed_action!(self.execute_action_person(id, &command))
             }

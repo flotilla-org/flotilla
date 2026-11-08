@@ -109,44 +109,8 @@ async fn topic_contacts_in_snapshot(
     topic_candidates(backend, namespace, routing, ReceiverPresence::Current(receivers)).await
 }
 
-// A deliberately broad preload set: presence and sender exclusion need holder
-// evidence. These addresses must never be used as the final routing result.
-pub(crate) async fn topic_receiver_addresses(
-    backend: &ResourceBackend,
-    namespace: &str,
-    addresses: &[&str],
-) -> Result<Vec<String>, ResourceError> {
-    if addresses.is_empty() {
-        return Ok(Vec::new());
-    }
-    let hierarchy = ProjectHierarchy::load_for_inspection(backend, namespace).await?;
-    let projects = backend.definitions::<Project>(namespace).list().await?;
-    let mut candidates = BTreeSet::new();
-    for address in addresses {
-        // Message::validate_spec rejects malformed topics at admission. Keep
-        // the resolver's error if corrupt stored data bypasses that boundary.
-        let (project, topic) = parse_topic_address(address).ok_or_else(|| ResourceError::invalid("invalid topic address"))?;
-        let reach = if topic == "supervision" { TopicReach::Ancestors } else { TopicReach::SubtreeSubscriptions };
-        candidates.extend(
-            topic_candidates_from_declarations(
-                backend,
-                namespace,
-                TopicRouting::builder().project(project).topic(topic).reach(reach).build(),
-                ReceiverPresence::Candidates,
-                &hierarchy,
-                &projects,
-            )
-            .await?
-            .into_iter()
-            .map(|contact| contact.address),
-        );
-    }
-    Ok(candidates.into_iter().collect())
-}
-
 #[derive(Clone, Copy)]
 enum ReceiverPresence<'a> {
-    Candidates,
     Current(&'a MessageReceiverSnapshot),
 }
 

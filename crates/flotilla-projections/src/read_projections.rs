@@ -1669,7 +1669,7 @@ impl ReadProjections<'_> {
             .collect::<Vec<_>>();
         artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));
 
-        let (messages, held) = message_evidence(self.backend, namespace, receivers.as_ref(), Some(&convoy), &receiver_aliases).await?;
+        let messages = message_views(self.backend, namespace, receivers.as_ref(), Some(&convoy), &receiver_aliases).await?;
         let mut warnings: Vec<_> = convoy.spec.issues.iter().flat_map(|issue| issue.placement_needs().1).collect();
         let mut host_names = selected_vessels
             .values()
@@ -1748,17 +1748,6 @@ impl ReadProjections<'_> {
                 .map(|cascade| serde_json::to_value(cascade).expect("serialize cascade")),
 
             messages,
-            held_deliveries: held
-                .into_iter()
-                .map(|batch| flotilla_protocol::commands::ExplainedHeldDelivery {
-                    description: batch.describe(namespace),
-                    clear_command: batch.clear_command(namespace),
-                    batch: batch.batch,
-                    receiver: batch.receiver,
-                    members: batch.members,
-                    reason: batch.reason,
-                })
-                .collect(),
             environment_observations: convoy.status.as_ref().map(|status| status.environment_observations.clone()).unwrap_or_default(),
             skills: convoy
                 .status
@@ -2090,18 +2079,6 @@ pub async fn convoy_receiver_evidence(
     Ok((receivers, project, aliases))
 }
 
-/// Select the active inbox and receiver candidates before decoding; resolve
-/// their holders purely against the request's shared evidence.
-pub async fn message_views(
-    backend: &flotilla_store::ResourceBackend,
-    namespace: &str,
-    receivers: &dyn MessageReceiverRead,
-    convoy: Option<&flotilla_resources::ResourceObject<ResourceConvoy>>,
-    aliases: &BTreeSet<String>,
-) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
-    Ok(message_evidence(backend, namespace, receivers, convoy, aliases).await?.0)
-}
-
 /// What the access layer delivered for a convoy's crews (#3964): per access and place, the
 /// home, each need's mechanism and digest, and a failed delivery's retry.
 pub async fn access_delivery_evidence(
@@ -2237,14 +2214,15 @@ pub async fn account_binding_evidence(
     Ok(explained)
 }
 
-/// [`message_views`], with the held batches among the same Messages (#3455).
-pub async fn message_evidence(
+/// Select the active inbox and receiver candidates before decoding; resolve
+/// their holders purely against the request's shared evidence.
+pub async fn message_views(
     backend: &flotilla_store::ResourceBackend,
     namespace: &str,
     receivers: &dyn MessageReceiverRead,
     convoy: Option<&flotilla_resources::ResourceObject<ResourceConvoy>>,
     aliases: &BTreeSet<String>,
-) -> Result<(Vec<flotilla_protocol::query::CrewMessageView>, Vec<flotilla_resources::HeldMessageBatch>), String> {
+) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
     let any_of = convoy
         .map(|convoy| {
             vec![
@@ -2303,7 +2281,6 @@ pub async fn message_evidence(
         (record.object.metadata.creation_timestamp, record.object.status.as_ref().and_then(|status| status.accepted_sequence))
     });
     let mut views = Vec::new();
-    let mut shown = Vec::new();
     for source in records {
         let message = source.object;
         // A diagnostic view shows an unresolvable receiver beside the Message
@@ -2332,7 +2309,6 @@ pub async fn message_evidence(
                 continue;
             }
         }
-        shown.push(message.clone());
         let status = message.status.unwrap_or_default();
         let receiver = status.resolved_receiver.as_ref();
         views.push(flotilla_protocol::query::CrewMessageView {
@@ -2351,7 +2327,7 @@ pub async fn message_evidence(
             session: receiver.map(|receiver| receiver.session.clone()),
         });
     }
-    Ok((views, flotilla_resources::HeldMessageBatch::collect(&shown)))
+    Ok(views)
 }
 
 /// The record name a change-request record's spec addresses, resolving a

@@ -24,7 +24,6 @@ flotilla-schema = { path = "../flotilla-schema" }
 rigging-condition = { workspace = true }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-messaging = { path = "../flotilla-messaging" }
-flotilla-agent-connector = { path = "../flotilla-agent-connector" }
 flotilla-executor = { path = "../flotilla-executor" }
 flotilla-config = { path = "../flotilla-config" }
 flotilla-environment = { path = "../flotilla-environment" }
