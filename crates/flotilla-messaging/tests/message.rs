@@ -1602,12 +1602,12 @@ async fn project_role_expectations_accept_replies_from_the_recorded_qualified_cr
     );
 }
 
-// Idle prompt redraws cannot acknowledge input. Changed output paired with fresh
-// Working acknowledges the original batch without waiting for screen debounce.
+// Idle prompt redraws cannot acknowledge input, and neither can changed output
+// (#3108): fresh Working acknowledges the original batch once it holds through
+// the screen debounce.
 #[tokio::test]
-async fn changed_output_requires_fresh_working_to_resolve_message_hold() {
+async fn fresh_working_resolves_message_hold_only_after_the_debounce() {
     struct ScreenTransport {
-        changed: std::sync::atomic::AtomicBool,
         working: std::sync::atomic::AtomicBool,
         inputs: std::sync::atomic::AtomicUsize,
     }
@@ -1617,12 +1617,7 @@ async fn changed_output_requires_fresh_working_to_resolve_message_hold() {
             KEYSTROKE.into()
         }
         async fn observe(&self, _: &DeliveryTarget, _: Option<&SubmissionRef>) -> Result<TransportObservation, String> {
-            Ok(TransportObservation {
-                ready: true,
-                working: self.working.load(std::sync::atomic::Ordering::SeqCst),
-                output_digest: Some(if self.changed.load(std::sync::atomic::Ordering::SeqCst) { "redraw" } else { "before" }.into()),
-                ..Default::default()
-            })
+            Ok(TransportObservation { ready: true, working: self.working.load(std::sync::atomic::Ordering::SeqCst), ..Default::default() })
         }
         async fn submit(&self, _: &Delivery) -> TransportOutcome {
             self.inputs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1632,25 +1627,31 @@ async fn changed_output_requires_fresh_working_to_resolve_message_hold() {
             TransportOutcome::Pending
         }
     }
+    let phases = |backend: ResourceBackend| async move {
+        backend
+            .using::<Message>("flotilla")
+            .list()
+            .await
+            .expect("messages")
+            .items
+            .into_iter()
+            .map(|message| message.status.expect("status").phase)
+            .collect::<Vec<_>>()
+    };
     let (backend, inbox) = delivery_inbox().await;
-    let transport = Arc::new(ScreenTransport { changed: Default::default(), working: Default::default(), inputs: Default::default() });
+    let transport = Arc::new(ScreenTransport { working: Default::default(), inputs: Default::default() });
     inbox.reconcile_delivery(&router(&transport), at(20)).await.expect("record held input");
-    transport.changed.store(true, std::sync::atomic::Ordering::SeqCst);
     inbox.reconcile_delivery(&router(&transport), at(21)).await.expect("idle redraw");
-    assert!(backend.using::<Message>("flotilla").list().await.expect("held audit").items.iter().all(|message| message
-        .status
-        .as_ref()
-        .expect("status")
-        .phase
-        == MessagePhase::Deliverable));
+    assert!(phases(backend.clone()).await.iter().all(|phase| *phase == MessagePhase::Deliverable));
     transport.working.store(true, std::sync::atomic::Ordering::SeqCst);
-    inbox.reconcile_delivery(&router(&transport), at(22)).await.expect("fresh Working with changed output");
-    assert!(backend.using::<Message>("flotilla").list().await.expect("receipts").items.iter().all(|message| message
-        .status
-        .as_ref()
-        .expect("status")
-        .phase
-        == MessagePhase::Delivered));
+    inbox.reconcile_delivery(&router(&transport), at(22)).await.expect("fresh Working");
+    assert!(
+        phases(backend.clone()).await.iter().all(|phase| *phase == MessagePhase::Deliverable),
+        "Working must hold through the debounce"
+    );
+    let settled = at(22) + flotilla_resources::delivery_hold::DELIVERY_WORKING_DEBOUNCE_FOR;
+    inbox.reconcile_delivery(&router(&transport), settled).await.expect("Working held through the debounce");
+    assert!(phases(backend.clone()).await.iter().all(|phase| *phase == MessagePhase::Delivered));
     assert_eq!(transport.inputs.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
@@ -2640,8 +2641,13 @@ async fn missing_condition_receipt_waits_without_charging_an_attempt() {
     assert!(messages.get("legacy").await.unwrap().status.unwrap().retry.is_none());
     let terminals = backend.using::<TerminalSession>("flotilla");
     let holder = terminals.get("terminal").await.unwrap();
+    // The holder's next observation is recorded.
     let mut status = holder.status.unwrap();
-    status.last_output_activity_at = Some(at(10001));
+    status.attention = Some(flotilla_resources::TerminalAttention {
+        state: flotilla_resources::TerminalAttentionState::Idle,
+        as_of: at(10001),
+        source: flotilla_resources::TerminalAttentionSource::Screen,
+    });
     terminals.update_status("terminal", &holder.metadata.resource_version, &status).await.unwrap();
     let recovered = named(KEYSTROKE, TransportOutcome::Accepted { evidence: "condition observable on next observation".into() });
     inbox.reconcile_delivery(&router(&recovered), at(10001)).await.unwrap();

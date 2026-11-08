@@ -198,8 +198,6 @@ pub(super) async fn refresh_message_test_attention_at(
             obstruction: None,
             attention: observation.attention,
             occupancy: observation.occupancy,
-            output_digest: observation.output_digest,
-            observed_at: now,
         },
     )
     .await
@@ -288,8 +286,6 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool) {
                 obstruction: None,
                 attention: observation.attention,
                 occupancy: observation.occupancy,
-                output_digest: observation.output_digest,
-                observed_at: Utc::now(),
             },
         )
         .await
@@ -427,14 +423,11 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool) {
     }
     pool.observations.store(1000, Ordering::SeqCst);
     refresh_attention(&runtime, &backend).await;
-    inbox
-        .reconcile_delivery(&keystroke_router(&runtime.state), now + chrono::Duration::seconds(2))
-        .await
-        .expect("cross-host Message fixture operation succeeds");
-    inbox
-        .reconcile_delivery(&keystroke_router(&runtime.state), now + chrono::Duration::seconds(4))
-        .await
-        .expect("cross-host Message fixture operation succeeds");
+    // The holder works on through the screen debounce: new output alone is not evidence (#3108).
+    let settled = now + chrono::Duration::seconds(2) + flotilla_resources::delivery_hold::DELIVERY_WORKING_DEBOUNCE_FOR;
+    for at in [now + chrono::Duration::seconds(2), settled, settled + chrono::Duration::seconds(2)] {
+        inbox.reconcile_delivery(&keystroke_router(&runtime.state), at).await.expect("cross-host Message fixture operation succeeds");
+    }
     for message in backend.using::<Message>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds").items {
         let status = message.status.expect("cross-host Message fixture operation succeeds");
         // A receipt fulfills a Message with no reply expectation; the

@@ -72,6 +72,18 @@ impl EnvironmentFixture {
         self
     }
 
+    /// Readings that serve this fixture's environments and `agent_sessions`.
+    pub fn reads_with_agent_sessions(
+        &self,
+        agent_sessions: Arc<dyn flotilla_resources::agent_activity::AgentSessionReads>,
+    ) -> Arc<dyn LifecycleReads> {
+        Arc::new(
+            LifecycleReadPort::new(StoreReads::new(Arc::clone(&self.store)), self.home.clone())
+                .with_environments(Arc::clone(&self.environments) as Arc<dyn EnvironmentRecords>)
+                .with_agent_sessions(agent_sessions),
+        )
+    }
+
     /// Requests `name` with `spec`, held for `vessel`.
     pub fn request(&self, name: &str, spec: &EnvironmentSpec, vessel: Option<&str>) {
         self.environments.request(name, spec, vessel).expect("environment requested");

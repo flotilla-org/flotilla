@@ -773,6 +773,9 @@ pub struct InProcessDaemon {
     leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics,
     /// The `[primitives]` Message path, installed once at composition.
     message_path: crate::primitives::MessagePath,
+    /// What this daemon has seen of its crews' progress beside their AgentSessions: in memory
+    /// only, for its stall check and delivery confirmation (#3108).
+    crew_progress: Arc<flotilla_resources::agent_activity::ProgressFacts>,
     /// The same path, as crew code reaches it: through its EngineMessages port.
     crew_message_path: flotilla_crew::ports::MessagePath,
     /// The `[primitives]` Convoy path (#3587 layer 6), as crew code and the
@@ -1432,6 +1435,7 @@ impl InProcessDaemon {
             leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics(leaf_subscriptions),
             message_receivers: projection_ports::MessageReceivers(Arc::clone(&message_path)),
             message_path,
+            crew_progress: Arc::new(flotilla_resources::agent_activity::ProgressFacts::new(clock.now())),
             crew_message_path,
             convoy_engine_path,
             vessel_seats_path,
@@ -2294,8 +2298,17 @@ impl InProcessDaemon {
         Ok(())
     }
 
-    /// Installs the engine's provisioning readings during composition (#3629 layer 4).
+    /// Installs the engine's provisioning readings during composition (#3629 layer 4). Their
+    /// AgentSessions are this daemon's own, read from its decided store with what it has seen
+    /// of its crews' progress (#3108).
     pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_projections::ports::LifecycleReads>) -> Result<(), String> {
+        let reads: Arc<dyn flotilla_projections::ports::LifecycleReads> = match self.decided_store() {
+            Ok(service) => Arc::new(projection_ports::WithAgentSessions {
+                reads,
+                agent_sessions: DecidedAgentSessions::new(service, Arc::clone(&self.clock), Arc::clone(&self.crew_progress)),
+            }),
+            Err(_) => reads,
+        };
         self.lifecycle_reads.install(Arc::clone(&reads))?;
         self.resource_backend.install_terminal_readings(reads);
         Ok(())
@@ -2384,6 +2397,11 @@ impl InProcessDaemon {
     /// The `[primitives]` Convoy path: empty until the switch's primitives are installed.
     pub fn convoy_engine_path(&self) -> flotilla_resources::convoy::engine::EngineConvoyPath {
         Arc::clone(&self.convoy_engine_path)
+    }
+
+    /// What this daemon has seen of its crews' progress beside their AgentSessions.
+    pub fn crew_progress(&self) -> Arc<flotilla_resources::agent_activity::ProgressFacts> {
+        Arc::clone(&self.crew_progress)
     }
 
     /// The `[primitives]` Message path, when the switch is on.

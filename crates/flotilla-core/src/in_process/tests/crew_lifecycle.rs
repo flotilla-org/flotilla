@@ -14,8 +14,11 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
+use flotilla_state_machines::machines::agent_session::Activity;
+
 use super::support::{
-    claim_crew, resume_staging_fixture, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
+    agent_sessions, claim_crew, engine_at, resume_staging_fixture, stall_test_daemon, stall_test_session, stall_workflow_snapshot,
+    test_meta, wait_for_stall,
 };
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
@@ -149,7 +152,10 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
         )
         .await
         .expect("session");
-    let mut idle = sessions
+    // The screen read Idle six seconds ago: quiet from a second ago, after the screen debounce,
+    // so the three-second grace runs out two seconds from now.
+    let idle_at = Utc::now() - chrono::Duration::seconds(6);
+    let idle = sessions
         .update_status(
             "idle-session",
             &session.metadata.resource_version,
@@ -157,7 +163,7 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
                 phase: ResourceTerminalSessionPhase::Running,
                 attention: Some(TerminalAttention {
                     state: TerminalAttentionState::Idle,
-                    as_of: Utc::now() - chrono::Duration::seconds(3),
+                    as_of: idle_at,
                     source: TerminalAttentionSource::Screen,
                 }),
                 ..Default::default()
@@ -165,11 +171,10 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
         )
         .await
         .expect("idle attention");
+    let agents = agent_sessions(&daemon);
+    agents.observe_screen("idle-session", Activity::Idle, engine_at(idle_at)).expect("idle activity");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(convoys.get("idle-crew").await.expect("convoy").status.expect("status").stalled.is_none());
-    let mut refreshed = idle.status.clone().expect("session status");
-    refreshed.attention.as_mut().expect("attention").as_of = Utc::now();
-    idle = sessions.update_status("idle-session", &idle.metadata.resource_version, &refreshed).await.expect("refreshed idle attention");
     let status = wait_for_stall(&backend, "idle-crew", true).await;
     let stalled = status.stalled.expect("stalled");
     assert!(matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { ref role, .. }) if role == "coder"));
@@ -205,6 +210,7 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     working.attention =
         Some(TerminalAttention { state: TerminalAttentionState::Working, as_of: Utc::now(), source: TerminalAttentionSource::Screen });
     sessions.update_status("idle-session", &idle.metadata.resource_version, &working).await.expect("working attention");
+    agents.observe_screen("idle-session", Activity::Working, engine_at(Utc::now())).expect("working activity");
     assert!(wait_for_stall(&backend, "idle-crew", false).await.stalled.is_none());
     watch.abort();
 }

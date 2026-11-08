@@ -9,7 +9,7 @@ use flotilla_agent_connector::{
     KEYSTROKE,
 };
 use flotilla_crew::reconcilers::terminal_session::{TerminalDeliveryFailure, TerminalDeliveryOutcome};
-use flotilla_resources::{Resource, ResourceError, ResourceObject, TerminalAttentionSource, TerminalAttentionState, TerminalSession};
+use flotilla_resources::{Resource, ResourceError, ResourceObject, TerminalAttentionState, TerminalSession};
 use flotilla_store::ResourceBackend;
 use futures::StreamExt;
 
@@ -174,29 +174,25 @@ impl AgentTransport for TerminalControllerRuntime {
             status.session_id.as_deref() == Some(submission.session.as_str())
                 && status.crew.as_ref().map(|crew| crew.id.as_str()) == Some(submission.crew_id.as_str())
         });
+        // The agent's own record, and what this daemon saw of its progress, confirm a turn (#3108).
+        let agent = match self.state.daemon.lifecycle_reads().agent_sessions().and_then(|reads| reads.read(&current.metadata.name, None)) {
+            Ok(agent) => agent,
+            Err(error) => {
+                tracing::debug!(%session, %error, "turn confirmation has no AgentSession");
+                None
+            }
+        };
         let evidence = submission.and_then(|submission| {
             if !same_receiver {
                 return None;
             }
-            if status.codex_completed_after(submission.started_at, now) {
+            if status.codex_completed_after(agent.as_ref(), submission.started_at) {
                 return Some("fresh Codex turn completion after submission".into());
             }
-            if flotilla_resources::delivery_hold::delivery_acceptance_evidence(
-                status.last_tool_activity_at.is_some_and(|at| at > submission.started_at)
-                    || status.last_hook_working_at.is_some_and(|at| at > submission.started_at),
-                attention.is_some_and(|attention| {
-                    attention.state == TerminalAttentionState::Working
-                        && attention.as_of > submission.started_at
-                        && attention.source == TerminalAttentionSource::Hook
-                }),
-                false,
-                false,
-                false,
-            ) {
-                Some("fresh agent tool activity after submission".into())
-            } else {
-                None
-            }
+            agent
+                .as_ref()
+                .is_some_and(|agent| agent.took_up_after(submission.started_at))
+                .then(|| "the agent took up the turn after submission".into())
         });
         let other_delivery = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").contains_key(session);
         let evidence = if other_delivery { None } else { evidence };
@@ -209,7 +205,6 @@ impl AgentTransport for TerminalControllerRuntime {
                         && submission.is_some_and(|submission| attention.as_of > submission.started_at)
                 }),
             evidence,
-            output_digest: status.last_output_digest.clone(),
             // #3460: name an idle agent that cannot take a turn, and its recovery.
             waiting_reason: Some(match status.idle_obstruction() {
                 Some(obstruction) => format!("waiting on the holder: {}", obstruction.describe(session)),

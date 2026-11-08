@@ -4,34 +4,52 @@ use flotilla_store_memory::InMemoryBackend;
 
 use super::*;
 
-// #2560: the inactivity bound follows the newest tool/hook evidence, not
-// total turn age or refreshed screen timestamps. Generated ages straddle
-// the exact boundary, including future evidence and absent tool/hooks.
+// #2560, #3108: the inactivity bound follows the newest tool or output this daemon saw, never
+// earlier than it began watching, not total turn age or hooks. Generated ages straddle the exact
+// boundary, including future evidence, absent evidence and a restart; another home's turn, whose
+// progress is not seen here, is not bounded here.
 #[hegel::test]
 fn turn_inactivity_tracks_meaningful_evidence(tc: hegel::TestCase) {
+    use flotilla_protocol::{AgentActivity, AgentSessionReading};
+    use flotilla_resources::agent_activity::{AgentActivityView, CrewProgress};
     use hegel::generators as gs;
     let age = tc.draw(gs::integers::<i64>().min_value(-1).max_value(1801));
     let evidence_age = tc.draw(gs::integers::<i64>().min_value(-1).max_value(1801));
+    let restart_age = tc.draw(gs::integers::<i64>().min_value(-1).max_value(1801));
     let tool = tc.draw(gs::booleans());
-    let hook = tc.draw(gs::booleans());
     let output = tc.draw(gs::booleans());
+    let hook = tc.draw(gs::booleans());
+    let restarted = tc.draw(gs::booleans());
     let now = Utc::now();
     let start = now - chrono::Duration::seconds(age);
     let evidence = now - chrono::Duration::seconds(evidence_age);
-    let obligation = NudgeObligation::builder()
-        .maker(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() })
-        .leaves(Vec::new())
-        .working_since(start)
-        .maybe_last_hook_at(hook.then_some(evidence))
-        .build();
-    let status = flotilla_resources::TerminalSessionStatus {
-        last_tool_activity_at: tool.then_some(evidence),
-        last_output_activity_at: output.then_some(evidence),
-        attention: Some(TerminalAttention { state: TerminalAttentionState::Working, source: TerminalAttentionSource::Screen, as_of: now }),
-        ..Default::default()
+    let watched_from = if restarted { now - chrono::Duration::seconds(restart_age) } else { DateTime::<Utc>::UNIX_EPOCH };
+    let obligation =
+        NudgeObligation::builder().maker(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() }).leaves(Vec::new()).build();
+    let mut agent = AgentActivityView {
+        reading: AgentSessionReading {
+            ended: None,
+            activity: Some(AgentActivity::Working),
+            activity_since: Some(start),
+            activity_cause: Some(flotilla_resources::agent_activity::SCREEN_CAUSE.into()),
+            stale: false,
+        },
+        current: true,
+        progress: Some(CrewProgress {
+            watched_from,
+            tool_at: tool.then_some(evidence),
+            output_at: output.then_some(evidence),
+            prompt_submit_at: None,
+            hook_at: hook.then_some(evidence),
+        }),
     };
-    let quiet_age = if tool || hook || output { age.min(evidence_age) } else { age };
-    assert_eq!(turn_inactivity_reason(&status, &obligation, now).is_some(), quiet_age >= 900);
+    let mut quiet_age = if tool || output { age.min(evidence_age) } else { age };
+    if restarted {
+        quiet_age = quiet_age.min(restart_age);
+    }
+    assert_eq!(turn_inactivity_reason(&agent, &obligation, now).is_some(), quiet_age >= 900);
+    agent.progress = None;
+    assert!(turn_inactivity_reason(&agent, &obligation, now).is_none(), "another home's turn is not bounded here");
 }
 
 // #2634: a hook-capable crew with no hook after the first-turn grace gets
@@ -102,7 +120,6 @@ fn missing_turn_hook_is_visible_and_recovers(tc: hegel::TestCase) {
             observe_actor_source(&backend, &wake, TerminalAttentionState::Idle, TerminalAttentionSource::Hook, hook_at).await;
             let status = convoys.get("stalled-work").await.expect("convoy").status.expect("status");
             assert_eq!(status.attention, other_attention.then_some(other));
-            assert_eq!(status.nudge_obligations[0].last_hook_at, Some(hook_at));
             observe_actor(&backend, &wake, TerminalAttentionState::Working, hook_at + chrono::Duration::seconds(120)).await;
             assert!(convoys
                 .get("stalled-work")
@@ -256,7 +273,7 @@ async fn stored_refusals_do_not_change_nudges_after_restore() {
         assert!(restored.crew_work["work"]["coder"].completion_refusal.is_some());
         convoys.update_status("stalled-work", &convoy.metadata.resource_version, &restored).await.expect("persist refusal");
         let start = Utc::now();
-        for second in [0, 60, 120, 180] {
+        for second in [0, 60, 120, 185] {
             observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
         }
         let requests = delivery.requests.lock().expect("deliveries");
@@ -298,7 +315,7 @@ async fn declared_stall_nudges_preserve_the_changed_evidence_guidance() {
         status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("actor").phase = phase;
         convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.expect("declared crew phase");
         let start = Utc::now();
-        for second in [0, 60, 120, 180] {
+        for second in [0, 60, 120, 185] {
             observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
         }
         let requests = delivery.requests.lock().expect("durable nudge admissions");
@@ -311,31 +328,36 @@ async fn declared_stall_nudges_preserve_the_changed_evidence_guidance() {
     }
 }
 
+// #3108: the reply to a nudge is a turn; once it ends, the quiet clock counts from its Stop,
+// and continued idle gets the second, backed-off nudge without a replenished budget.
 #[tokio::test]
-async fn nudge_reply_preserves_idle_clock_and_allows_second_nudge_after_backoff() {
+async fn nudge_reply_restarts_idle_clock_and_allows_second_nudge_after_backoff() {
     let (backend, wake, delivery) = idle_nudge_scenario().await;
     let start = Utc::now();
-    for second in [0, 60, 120, 180] {
+    for second in [0, 60, 120, 185] {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
-    observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(181)).await;
+    observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(186)).await;
     for second in [240, 300] {
         observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(second)).await;
     }
     observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(359)).await;
-    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-    assert_eq!(convoy.status.expect("status").nudge_obligations[0].quiet_since, Some(start), "echo does not restart the idle clock");
-    assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
-    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(360)).await;
+    for second in [360, 420, 480, 538] {
+        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+    }
+    assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "the reply's Stop restarts the quiet clock");
+    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(539)).await;
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2, "continued idle gets the second backed-off nudge");
+    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+    assert_eq!(convoy.status.expect("status").nudge_obligations[0].history.len(), 2, "a reply does not replenish the budget");
 }
 
 #[tokio::test]
 async fn actual_tool_work_after_nudge_cancels_idle_without_replenishing_budget() {
     let (backend, wake, delivery) = idle_nudge_scenario().await;
     let start = Utc::now();
-    for second in [0, 60, 120, 180] {
+    for second in [0, 60, 120, 185] {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(181)).await;
@@ -347,8 +369,6 @@ async fn actual_tool_work_after_nudge_cancels_idle_without_replenishing_budget()
     observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(359)).await;
     observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(360)).await;
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "real work requires a new continuous idle grace");
-    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-    assert_eq!(convoy.status.expect("status").nudge_obligations[0].quiet_since, Some(start + chrono::Duration::seconds(359)));
     for second in [420, 480, 539] {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
@@ -361,43 +381,44 @@ async fn actual_tool_work_after_nudge_cancels_idle_without_replenishing_budget()
 async fn genuine_idle_has_obligation_budget_backoff_and_operator_escalation() {
     let (backend, wake, delivery) = idle_nudge_scenario().await;
     let start = Utc::now();
-    for second in [0, 60, 120, 179] {
+    // A screen read of idle stands 5 seconds before it counts as quiet.
+    for second in [0, 60, 120, 184] {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert!(delivery.requests.lock().expect("deliveries").is_empty());
-    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(180)).await;
+    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(185)).await;
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
     // #2592: even mechanical nudges identify the crew and convoy they concern.
     assert!(delivery.requests.lock().expect("deliveries")[0]
         .brief
         .contains("coder@work in graphql-budget@wheelhouse (resource ref: stalled-work)"));
     // A brief working flicker cannot replenish the unmet claim's budget.
-    observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(181)).await;
-    for second in [182, 240, 300, 359] {
+    observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(186)).await;
+    for second in [187, 240, 300, 359] {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
-    for second in [362, 420, 480, 540, 600, 659] {
+    for second in [372, 420, 480, 540, 600, 659] {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2);
     let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
     assert_eq!(convoy.status.expect("status").stalled.expect("stall").rung, StallRung::Nudge);
-    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(722)).await;
+    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(732)).await;
     let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
     assert_eq!(convoy.status.expect("status").stalled.expect("stall").rung, StallRung::Operator);
-    observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(723)).await;
-    for second in [724, 780, 840, 900, 960, 1020] {
+    observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(733)).await;
+    for second in [734, 780, 840, 900, 960, 1020] {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2, "working does not reset an obligation budget");
 }
 
 #[tokio::test]
-async fn operator_message_echo_preserves_clock_without_replenishing_budget() {
+async fn operator_message_reply_restarts_clock_without_replenishing_budget() {
     let (backend, wake, delivery) = idle_nudge_scenario().await;
     let start = Utc::now();
-    for second in [0, 60, 120, 180] {
+    for second in [0, 60, 120, 185] {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
@@ -427,20 +448,34 @@ async fn operator_message_echo_preserves_clock_without_replenishing_budget() {
     wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), start + chrono::Duration::seconds(421))
         .await
         .expect("delivery grace");
-    for second in [480, 540, 600] {
-        let session = sessions.get("resumed-coder").await.expect("session");
-        let mut status = session.status.expect("status");
-        status.attention = Some(TerminalAttention {
-            state: TerminalAttentionState::Idle,
-            source: TerminalAttentionSource::Hook,
-            as_of: start + chrono::Duration::seconds(second),
-        });
-        sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("response Stop");
-        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-        wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), start + chrono::Duration::seconds(second))
-            .await
-            .expect("response grace");
+    // The guidance is a turn: the agent works on it, then stops at 480. Quiet counts from there.
+    observe_actor_source(
+        &backend,
+        &wake,
+        TerminalAttentionState::Working,
+        TerminalAttentionSource::Hook,
+        start + chrono::Duration::seconds(425),
+    )
+    .await;
+    for second in [480, 540, 600, 659] {
+        observe_actor_source(
+            &backend,
+            &wake,
+            TerminalAttentionState::Idle,
+            TerminalAttentionSource::Hook,
+            start + chrono::Duration::seconds(second),
+        )
+        .await;
     }
+    assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "the reply's Stop restarts the quiet clock");
+    observe_actor_source(
+        &backend,
+        &wake,
+        TerminalAttentionState::Idle,
+        TerminalAttentionSource::Hook,
+        start + chrono::Duration::seconds(660),
+    )
+    .await;
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2, "continued idle can receive the second nudge after owner reply");
     let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
     assert_eq!(convoy.status.expect("status").nudge_obligations[0].history.len(), 2);
@@ -451,7 +486,7 @@ async fn observed_commit_resets_budget_but_refresh_does_not() {
     let (backend, wake, delivery) = idle_nudge_scenario().await;
     // The engine holds the actor's checkout for the convoy, its HEAD inspected.
     let engine = flotilla_provisioning_testkit::CheckoutFixture::default();
-    let wake = ReconcilerWake::new(wake.subscriptions.with_lifecycle_reads(engine.reads.clone()));
+    let wake = ReconcilerWake::new(wake.subscriptions.with_lifecycle_reads(engine.reads_with_agent_sessions(agents())));
     engine.open_convoy("stalled-work");
     let launch = engine.put_ready(
         "actor-checkout",
@@ -497,7 +532,7 @@ async fn observed_commit_resets_budget_but_refresh_does_not() {
         .await
         .expect("checkout association");
     let start = Utc::now();
-    for second in [0, 60, 120, 180] {
+    for second in [0, 60, 120, 185] {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
@@ -587,12 +622,13 @@ async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
             &session.metadata.resource_version,
             &flotilla_resources::TerminalSessionStatus {
                 phase: TerminalSessionPhase::Running,
-                attention: Some(idle_before_delivery),
+                attention: Some(idle_before_delivery.clone()),
                 ..Default::default()
             },
         )
         .await
         .expect("idle before brief delivery");
+    observe_agent("resumed-coder", TerminalAttentionState::Idle, TerminalAttentionSource::Hook, idle_before_delivery.as_of);
     let convoy = convoys.get("stalled-work").await.expect("resumed convoy");
     wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), convoy)])).await.expect("judge before delivery");
     assert!(delivery.requests.lock().expect("nudge requests").is_empty());
@@ -601,23 +637,25 @@ async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
     status.delivered_message_id = Some("resume-brief".into());
     status.attention = None;
     sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("brief delivered");
+    observe_agent("resumed-coder", TerminalAttentionState::Working, TerminalAttentionSource::Hook, Utc::now());
     let convoy = convoys.get("stalled-work").await.expect("resumed convoy");
     wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), convoy)])).await.expect("judge during turn");
     assert!(delivery.requests.lock().expect("nudge requests").is_empty());
     let session = sessions.get("resumed-coder").await.expect("session");
     let mut status = session.status.expect("status");
+    let ended_at = Utc::now();
     status.attention = Some(TerminalAttention {
         state: TerminalAttentionState::Idle,
-        as_of: Utc::now(),
+        as_of: ended_at,
         source: flotilla_resources::TerminalAttentionSource::Hook,
     });
     sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("turn ended");
+    observe_agent("resumed-coder", TerminalAttentionState::Idle, TerminalAttentionSource::Hook, ended_at);
     let convoy = convoys.get("stalled-work").await.expect("resumed convoy");
     wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), convoy)])).await.expect("judge after turn");
     assert!(delivery.requests.lock().expect("nudge requests").is_empty());
     let quiet_at = Utc::now() + chrono::Duration::minutes(3);
-    // Fresh screen confirmations preserve quiet duration; another Stop
-    // would instead restart it because a response just happened.
+    // Fresh screen confirmations preserve quiet duration.
     for second in [120, 60, 0] {
         let observed_at = quiet_at - chrono::Duration::seconds(second);
         let session = sessions.get("resumed-coder").await.expect("session");
@@ -625,6 +663,7 @@ async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
         status.attention =
             Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: observed_at, source: TerminalAttentionSource::Screen });
         sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("quiet confirmation");
+        observe_agent("resumed-coder", TerminalAttentionState::Idle, TerminalAttentionSource::Screen, observed_at);
         let convoy = convoys.get("stalled-work").await.expect("convoy");
         wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), observed_at).await.expect("judge quiet turn");
     }

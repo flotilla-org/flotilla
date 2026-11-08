@@ -333,6 +333,9 @@ impl ReconcilerWake {
         let mut clone_changes = self.subscriptions.inner.lifecycle_reads.clones().ok().map(|clones| clones.changes());
         // So are checkouts: a convoy's rows read the checkouts held for it.
         let mut checkout_changes = self.subscriptions.inner.lifecycle_reads.checkouts().ok().map(|checkouts| checkouts.changes());
+        // A convoy's promises are its engine record's: no old record is written for their edges,
+        // so its rows follow the engine's changes too (#3108).
+        let mut engine_changes = self.subscriptions.inner.convoy_engine.get().map(|engine| engine.changes());
         let mut convoy_objects = views.local_convoys().await?.as_ref().clone();
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
         self.sync_rows(&namespace, &convoy_objects).await?;
@@ -372,6 +375,22 @@ impl ReconcilerWake {
                         Ok(CheckoutChange::Rescanned) | Err(broadcast::error::RecvError::Lagged(_)) => None,
                         Err(broadcast::error::RecvError::Closed) => {
                             checkout_changes = None;
+                            continue;
+                        }
+                    };
+                    self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
+                }
+                change = async {
+                    match engine_changes.as_mut() {
+                        Some(changes) => changes.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let selected = match change {
+                        Ok(name) => Some(HashSet::from([name])),
+                        Err(broadcast::error::RecvError::Lagged(_)) => None,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            engine_changes = None;
                             continue;
                         }
                     };

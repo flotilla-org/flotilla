@@ -349,10 +349,6 @@ pub struct TerminalSessionStatus {
     /// completion fallback and decoder default after the next fleet roll.
     #[serde(default)]
     pub codex_native_hooks: bool,
-    /// Positive native lifecycle evidence retained after Stop replaces Working.
-    /// Decoder default may be removed one fleet roll after #3051 (ADR 0047).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_hook_working_at: Option<DateTime<Utc>>,
 
     /// Configured limits, not usage. Remove the decoder default one fleet roll
     /// after this field lands (ADR 0047).
@@ -397,16 +393,6 @@ pub struct TerminalSessionStatus {
     /// Automatic turn delivery hold. Remove the decoder default one roll after #2758.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_delivery_hold: Option<crate::ConvoyAttention>,
-    /// Actual tool activity survives coalesced Working/Stop observations.
-    /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_tool_activity_at: Option<DateTime<Utc>>,
-    /// Meaningful screen output excludes harness animation. Remove the decoder
-    /// defaults one fleet roll after these fields land (ADR 0047).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_output_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_output_activity_at: Option<DateTime<Utc>>,
     /// Whether the principal currently occupies the terminal's controller
     /// seat. Cleat's attachment state is authoritative for this observation.
     #[serde(default)]
@@ -473,24 +459,16 @@ impl TerminalSessionStatus {
     }
 
     /// N→N+1: notify-only fallback, disabled by the first native lifecycle hook.
-    /// Remove after the next fleet roll. Temporary policy until AgentSession owns receipts.
-    /// Callers also verify the recorded process and crew generation. Screen Idle
-    /// and other harnesses' Idle events do not prove a submitted Codex turn ended.
-    /// Hook timestamps come from the receiving daemon, not the contained crew.
-    /// Future observations (for example after a clock rollback) remain ineligible
-    /// until the daemon clock catches up, and must still satisfy freshness then.
-    pub fn codex_completed_after(&self, submitted_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    /// Remove after the next fleet roll. Whether a Codex crew without native hooks finished a
+    /// turn submitted at `submitted_at`: its AgentSession went Idle after it, as its notify hook
+    /// reported (#3108). Screen Idle and other harnesses' Idle do not prove a submitted Codex
+    /// turn ended, and a launch begun after the submission cannot acknowledge it.
+    pub fn codex_completed_after(&self, agent: Option<&crate::agent_activity::AgentActivityView>, submitted_at: DateTime<Utc>) -> bool {
         !self.codex_native_hooks
             && self.phase == TerminalSessionPhase::Running
             && self.crew.as_ref().is_some_and(|crew| crew.adapter == "codex")
             && self.started_at.is_some_and(|started| submitted_at >= started)
-            && self.attention.as_ref().is_some_and(|attention| {
-                attention.source == TerminalAttentionSource::Hook
-                    && attention.state == TerminalAttentionState::Idle
-                    && attention.as_of > submitted_at
-                    && attention.as_of <= now
-                    && !attention.is_stale_at(now)
-            })
+            && agent.is_some_and(|agent| agent.completed_after(submitted_at))
     }
 
     /// Count the next failed attempt for this message, retaining a saturated
@@ -769,10 +747,6 @@ pub enum TerminalSessionStatusPatch {
     ClearReconcileDegraded,
     ObserveNativeCodexHook {
         attention: TerminalAttention,
-        tool_activity: bool,
-    },
-    ObserveToolActivity {
-        attention: TerminalAttention,
     },
     ObserveAttention {
         attention: TerminalAttention,
@@ -782,8 +756,6 @@ pub enum TerminalSessionStatusPatch {
         /// The screen read behind `attention`, when one was read.
         obstruction: Option<Option<ScreenObstruction>>,
         occupancy: TerminalOccupancy,
-        output_digest: Option<String>,
-        observed_at: DateTime<Utc>,
     },
     MarkCompletionPending {
         pending: CrewCompletionPending,
@@ -948,18 +920,8 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     status.degraded = None;
                 }
             }
-            Self::ObserveNativeCodexHook { attention, tool_activity } => {
+            Self::ObserveNativeCodexHook { attention } => {
                 status.codex_native_hooks = true;
-                if attention.state == TerminalAttentionState::Working {
-                    status.last_hook_working_at = Some(attention.as_of);
-                    if *tool_activity {
-                        status.last_tool_activity_at = Some(attention.as_of);
-                    }
-                }
-                Self::ObserveAttention { attention: attention.clone() }.apply(status);
-            }
-            Self::ObserveToolActivity { attention } => {
-                status.last_tool_activity_at = Some(attention.as_of);
                 Self::ObserveAttention { attention: attention.clone() }.apply(status);
             }
             Self::ObserveAttention { attention } => {
@@ -972,16 +934,10 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     status.degraded = None;
                 }
             }
-            Self::Observe { attention, obstruction, occupancy, output_digest, observed_at } => {
+            Self::Observe { attention, obstruction, occupancy } => {
                 status.occupancy = *occupancy;
                 if let Some(obstruction) = obstruction {
                     status.screen_obstruction = obstruction.clone();
-                }
-                if let Some(digest) = output_digest {
-                    if status.last_output_digest.as_ref() != Some(digest) {
-                        status.last_output_digest = Some(digest.clone());
-                        status.last_output_activity_at = Some(*observed_at);
-                    }
                 }
                 if let Some(attention) = attention {
                     let replace = status.should_record_attention(attention);
@@ -1036,8 +992,6 @@ mod tests {
             attention: Some(unobservable.clone()),
             obstruction,
             occupancy: TerminalOccupancy::Vacant,
-            output_digest: None,
-            observed_at: at,
         };
         let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
         observe(Some(Some(stray.clone()))).apply(&mut status);
@@ -1118,13 +1072,11 @@ mod tests {
                     TerminalSessionStatusPatch::MarkDeliveryExpired
                 }
                 1 => TerminalSessionStatusPatch::ObserveAttention { attention },
-                2 => TerminalSessionStatusPatch::ObserveToolActivity { attention },
+                2 => TerminalSessionStatusPatch::ObserveNativeCodexHook { attention },
                 3 => TerminalSessionStatusPatch::Observe {
                     obstruction: None,
                     attention: Some(attention),
                     occupancy: TerminalOccupancy::Vacant,
-                    output_digest: Some(format!("output-{step}")),
-                    observed_at: at,
                 },
                 _ => TerminalSessionStatusPatch::MarkReconcileDegraded {
                     message: "pool unavailable".into(),
@@ -1161,116 +1113,71 @@ mod tests {
         assert_eq!(written["following"], serde_json::json!([]));
     }
 
-    // #3028: each Codex completion is new evidence, even inside the five-second
-    // debounce window. Only fresh post-submission hooks on a live Codex crew count.
+    // #3028: a notify-only Codex crew's turn is settled by its next hook Idle after the
+    // submission, and nothing else: not a screen Idle, another harness, a stopped or relaunched
+    // receiver, or a crew whose native lifecycle hooks report the turn themselves.
     #[hegel::test]
-    fn codex_completion_keeps_each_timestamp_and_respects_acceptance_boundaries(tc: hegel::TestCase) {
+    fn codex_completion_needs_a_hook_idle_after_the_submission_on_its_launch(tc: hegel::TestCase) {
+        use flotilla_protocol::{AgentActivity, AgentSessionReading};
         use hegel::generators as gs;
+
+        use crate::agent_activity::{AgentActivityView, SCREEN_CAUSE};
         let start = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).single().expect("time");
-        let mut at = start;
-        let mut status = TerminalSessionStatus {
+        let status = TerminalSessionStatus {
             phase: TerminalSessionPhase::Running,
             started_at: Some(start),
             crew: Some(CrewSessionStatus::builder().id("crew".into()).adapter("codex".into()).stance("trusted-implicit".into()).build()),
             ..Default::default()
         };
-        // Generate repeated completion events 1..4ms apart, interleaved with
-        // duplicate hooks and screen Idle observations through both patch paths.
-        for _ in 0..tc.draw(gs::integers::<usize>().min_value(2).max_value(6)) {
-            let submitted_at = at;
-            at += chrono::Duration::milliseconds(tc.draw(gs::integers::<i64>().min_value(1).max_value(4)));
-            let hook = TerminalAttention { state: TerminalAttentionState::Idle, source: TerminalAttentionSource::Hook, as_of: at };
-            let patch = if tc.draw(gs::booleans()) {
-                TerminalSessionStatusPatch::ObserveAttention { attention: hook.clone() }
-            } else {
-                TerminalSessionStatusPatch::Observe {
-                    obstruction: None,
-                    attention: Some(hook.clone()),
-                    occupancy: TerminalOccupancy::Vacant,
-                    output_digest: None,
-                    observed_at: at,
-                }
-            };
-            patch.apply(&mut status);
-            patch.apply(&mut status);
-            assert_eq!(status.attention.as_ref(), Some(&hook), "duplicates preserve the latest completion");
-            assert!(status.codex_completed_after(submitted_at, at), "the next completion settles a hold");
-            assert!(!status.codex_completed_after(at, at), "a completion at submission is not following evidence");
-            assert!(
-                !status.codex_completed_after(submitted_at, at - chrono::Duration::milliseconds(1)),
-                "future hooks are not current evidence"
-            );
-            assert!(!status.codex_completed_after(submitted_at, at + TerminalAttention::FRESH_FOR), "expired hooks do not settle holds");
-            TerminalSessionStatusPatch::ObserveAttention {
-                attention: TerminalAttention {
-                    source: TerminalAttentionSource::Screen,
-                    as_of: at + chrono::Duration::milliseconds(1),
-                    ..hook.clone()
-                },
-            }
-            .apply(&mut status);
-            assert_eq!(status.attention.as_ref(), Some(&hook), "idle screen refreshes cannot erase hook evidence");
-            let mut other = status.clone();
-            other.crew.as_mut().expect("crew").adapter = "claude-code".into();
-            assert!(!other.codex_completed_after(submitted_at, at), "Claude Idle keeps its existing acceptance policy");
-            other.crew = None;
-            assert!(!other.codex_completed_after(submitted_at, at), "unmanaged terminals cannot settle a crew hold");
-            let mut stopped = status.clone();
-            stopped.phase = TerminalSessionPhase::Stopped;
-            assert!(!stopped.codex_completed_after(submitted_at, at), "stopped receivers cannot settle holds");
-            let mut restarted = status.clone();
-            restarted.started_at = Some(at);
-            assert!(!restarted.codex_completed_after(submitted_at, at), "a new launch cannot acknowledge old input");
-            for state in [TerminalAttentionState::Working, TerminalAttentionState::NeedsInput, TerminalAttentionState::Unobservable] {
-                let mut other = status.clone();
-                other.attention.as_mut().expect("attention").state = state;
-                assert!(!other.codex_completed_after(submitted_at, at), "only a completion is completion evidence");
-            }
-            let mut screen = status.clone();
-            screen.attention.as_mut().expect("attention").source = TerminalAttentionSource::Screen;
-            assert!(!screen.codex_completed_after(submitted_at, at), "screen Idle is not a completion");
+        let submitted = start + chrono::Duration::milliseconds(tc.draw(gs::integers::<i64>().min_value(0).max_value(1000)));
+        let since = submitted + chrono::Duration::milliseconds(tc.draw(gs::integers::<i64>().min_value(1).max_value(1000)));
+        let view = |activity, since, cause: &str, current| AgentActivityView {
+            reading: AgentSessionReading {
+                ended: None,
+                activity: Some(activity),
+                activity_since: Some(since),
+                activity_cause: Some(cause.into()),
+                stale: false,
+            },
+            current,
+            progress: None,
+        };
+        let idle = view(AgentActivity::Idle, since, "agent-turn-complete", true);
+        assert!(status.codex_completed_after(Some(&idle), submitted), "a hook Idle after the submission settles it");
+        assert!(!status.codex_completed_after(Some(&view(AgentActivity::Idle, submitted, "agent-turn-complete", true)), submitted));
+        assert!(!status.codex_completed_after(Some(&view(AgentActivity::Idle, since, SCREEN_CAUSE, true)), submitted));
+        assert!(!status.codex_completed_after(Some(&view(AgentActivity::Idle, since, "agent-turn-complete", false)), submitted));
+        assert!(!status.codex_completed_after(None, submitted), "no AgentSession, no completion");
+        for activity in [AgentActivity::Working, AgentActivity::NeedsInput, AgentActivity::Interrupted] {
+            assert!(!status.codex_completed_after(Some(&view(activity, since, "agent-turn-complete", true)), submitted), "{activity:?}");
         }
+        let mut other = status.clone();
+        other.crew.as_mut().expect("crew").adapter = "claude-code".into();
+        assert!(!other.codex_completed_after(Some(&idle), submitted), "Claude Idle keeps its own acceptance policy");
+        let mut stopped = status.clone();
+        stopped.phase = TerminalSessionPhase::Stopped;
+        assert!(!stopped.codex_completed_after(Some(&idle), submitted), "stopped receivers cannot settle holds");
+        let mut restarted = status.clone();
+        restarted.started_at = Some(submitted + chrono::Duration::milliseconds(1));
+        assert!(!restarted.codex_completed_after(Some(&idle), submitted), "a new launch cannot acknowledge old input");
+        let mut native = status.clone();
+        TerminalSessionStatusPatch::ObserveNativeCodexHook {
+            attention: attention(TerminalAttentionState::Idle, TerminalAttentionSource::Hook, 0),
+        }
+        .apply(&mut native);
+        assert!(!native.codex_completed_after(Some(&idle), submitted), "native lifecycle hooks disable the notify shim");
     }
 
-    // Native lifecycle hooks disable the notify-only shim. Positive Working
-    // survives Stop, duplicate observations, and both tool/no-tool turns.
-    #[hegel::test]
-    fn native_codex_requires_working_and_retains_it_after_stop(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let base = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).single().unwrap();
-        let mut status = TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            started_at: Some(base),
-            crew: Some(CrewSessionStatus::builder().id("crew".into()).adapter("codex".into()).stance("work".into()).build()),
-            ..Default::default()
-        };
-        let mut at = base;
-        let idle = TerminalAttention { state: TerminalAttentionState::Idle, source: TerminalAttentionSource::Hook, as_of: at };
-        TerminalSessionStatusPatch::ObserveNativeCodexHook { attention: idle, tool_activity: false }.apply(&mut status);
+    // Native lifecycle hooks mark the session until its next launch.
+    #[test]
+    fn native_codex_hooks_hold_until_the_next_launch() {
+        let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
+        let working = attention(TerminalAttentionState::Working, TerminalAttentionSource::Hook, 1);
+        TerminalSessionStatusPatch::ObserveNativeCodexHook { attention: working.clone() }.apply(&mut status);
         assert!(status.codex_native_hooks);
-        assert!(status.last_hook_working_at.is_none());
-        assert!(!status.codex_completed_after(base - chrono::Duration::milliseconds(1), at));
-        // Generate 1..6 prompt/tool → Stop pairs, including repeated hooks
-        // inside the debounce window. Every step preserves positive evidence.
-        for _ in 0..tc.draw(gs::integers::<usize>().min_value(1).max_value(6)) {
-            at += chrono::Duration::milliseconds(tc.draw(gs::integers::<i64>().min_value(1).max_value(4)));
-            let working = TerminalAttention { state: TerminalAttentionState::Working, source: TerminalAttentionSource::Hook, as_of: at };
-            let patch = TerminalSessionStatusPatch::ObserveNativeCodexHook { attention: working, tool_activity: tc.draw(gs::booleans()) };
-            patch.apply(&mut status);
-            patch.apply(&mut status);
-            assert_eq!(status.last_hook_working_at, Some(at));
-            let idle = TerminalAttention {
-                state: TerminalAttentionState::Idle,
-                source: TerminalAttentionSource::Hook,
-                as_of: at + chrono::Duration::milliseconds(1),
-            };
-            TerminalSessionStatusPatch::ObserveNativeCodexHook { attention: idle, tool_activity: false }.apply(&mut status);
-            assert_eq!(status.last_hook_working_at, Some(at));
-            assert!(!status.codex_completed_after(base, at + chrono::Duration::milliseconds(1)));
-        }
+        assert_eq!(status.attention, Some(working));
         TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
         assert!(!status.codex_native_hooks);
-        assert!(status.last_hook_working_at.is_none());
     }
 
     fn attention(state: TerminalAttentionState, source: TerminalAttentionSource, second: u32) -> TerminalAttention {
@@ -1291,38 +1198,6 @@ mod tests {
         .apply(&mut status);
 
         assert_eq!(status.phase, TerminalSessionPhase::Running);
-        assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Idle);
-    }
-
-    // #2560: repeating an output fingerprint cannot invent progress; changed
-    // fingerprints advance the durable output time, independently of hooks.
-    #[test]
-    fn output_activity_changes_only_with_meaningful_content() {
-        let start = attention(TerminalAttentionState::Working, TerminalAttentionSource::Screen, 0).as_of;
-        let mut status = TerminalSessionStatus::default();
-        for (digest, second, expected) in [("first", 0, 0), ("first", 30, 0), ("second", 60, 60), ("second", 90, 60)] {
-            TerminalSessionStatusPatch::Observe {
-                obstruction: None,
-                attention: None,
-                occupancy: TerminalOccupancy::Vacant,
-                output_digest: Some(digest.into()),
-                observed_at: start + chrono::Duration::seconds(second),
-            }
-            .apply(&mut status);
-            assert_eq!(status.last_output_activity_at, Some(start + chrono::Duration::seconds(expected)));
-        }
-    }
-
-    #[test]
-    fn tool_activity_survives_a_coalesced_idle_observation() {
-        let mut status = TerminalSessionStatus::default();
-        let tool = attention(TerminalAttentionState::Working, TerminalAttentionSource::Hook, 1);
-        TerminalSessionStatusPatch::ObserveToolActivity { attention: tool.clone() }.apply(&mut status);
-        TerminalSessionStatusPatch::ObserveAttention {
-            attention: attention(TerminalAttentionState::Idle, TerminalAttentionSource::Hook, 2),
-        }
-        .apply(&mut status);
-        assert_eq!(status.last_tool_activity_at, Some(tool.as_of));
         assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Idle);
     }
 
@@ -1470,10 +1345,8 @@ mod tests {
                     obstruction: None,
                     attention: Some(attention),
                     occupancy: TerminalOccupancy::Occupied,
-                    output_digest: Some("output".into()),
-                    observed_at,
                 },
-                2 => TerminalSessionStatusPatch::ObserveToolActivity { attention },
+                2 => TerminalSessionStatusPatch::ObserveNativeCodexHook { attention },
                 3 => TerminalSessionStatusPatch::MarkReconcileDegraded {
                     message: "provider outage".into(),
                     consecutive_failures: 5,

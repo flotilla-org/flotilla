@@ -6,7 +6,7 @@ use std::{
 use std::{collections::HashMap, sync::Arc};
 
 use crate::convoy::ConvoyReconciler;
-use crate::no_held_checkouts;
+use crate::{agent_reads, agents, restarted_agent_reads};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_change_request::observation;
@@ -242,7 +242,7 @@ fn supervision_wake_with_limit(backend: &ResourceBackend, limit: u32) -> Reconci
     );
     ReconcilerWake::new(
         LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, limit)
-            .with_lifecycle_reads(no_held_checkouts()),
+            .with_lifecycle_reads(agent_reads()),
     )
 }
 
@@ -418,8 +418,28 @@ async fn observe_actor_source(
     status.phase = TerminalSessionPhase::Running;
     status.attention = Some(TerminalAttention { state, as_of: now, source });
     sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("observe hook");
+    observe_agent("resumed-coder", state, source, now);
     let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
     wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.expect("judge scenario");
+}
+
+/// Records an observation of the agent in session `name` on its AgentSession, as the daemon does
+/// beside the terminal's attention (#3108). An unobservable screen records nothing.
+fn observe_agent(name: &str, state: TerminalAttentionState, source: TerminalAttentionSource, at: DateTime<Utc>) {
+    let activity = match state {
+        TerminalAttentionState::Working => flotilla_protocol::AgentActivity::Working,
+        TerminalAttentionState::Idle => flotilla_protocol::AgentActivity::Idle,
+        TerminalAttentionState::NeedsInput => flotilla_protocol::AgentActivity::NeedsInput,
+        TerminalAttentionState::Unobservable => return,
+    };
+    let cause = match source {
+        TerminalAttentionSource::Screen => flotilla_resources::agent_activity::SCREEN_CAUSE,
+        TerminalAttentionSource::Hook => "hook",
+    };
+    agents().observe(name, activity, cause, at);
+    if source == TerminalAttentionSource::Hook {
+        agents().progress.hook(name, at);
+    }
 }
 
 async fn observe_claude_hook(backend: &ResourceBackend, wake: &ReconcilerWake, event: &str, now: DateTime<Utc>) {
@@ -432,11 +452,7 @@ async fn observe_claude_hook(backend: &ResourceBackend, wake: &ReconcilerWake, e
         other => panic!("unexpected hook: {other:?}"),
     };
     if parsed.event_type == flotilla_protocol::AgentEventType::ToolActive {
-        let sessions = backend.using::<TerminalSession>("flotilla");
-        let session = sessions.get("resumed-coder").await.expect("session");
-        let mut status = session.status.unwrap_or_default();
-        status.last_tool_activity_at = Some(now);
-        sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("actual tool activity");
+        agents().progress.tool("resumed-coder", now);
     }
     observe_actor_source(backend, wake, state, TerminalAttentionSource::Hook, now).await;
 }
@@ -595,6 +611,9 @@ async fn governor_session(backend: &ResourceBackend, governor: Option<TerminalAt
         ..Default::default()
     };
     sessions.update_status("governor-session", &session.metadata.resource_version, &status).await.expect("governor running");
+    if let Some(state) = governor {
+        observe_agent("governor-session", state, TerminalAttentionSource::Hook, now);
+    }
 }
 
 /// A coder beside its convoy's crew supervisor, whose session runs with this
@@ -1193,7 +1212,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                 // explicit merged observation rather than a network refresher.
                 secondaries: Vec::new(),
                 reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-                    .with_lifecycle_reads(no_held_checkouts())
+                    .with_lifecycle_reads(agent_reads())
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(60)),
                 resync_interval: Duration::from_secs(3600),
                 backend: backend.clone(),
@@ -1731,7 +1750,7 @@ fn served_table(
     event_sink: Arc<dyn super::EventSink>,
     change_requests: ChangeRequestRefresher,
 ) -> LeafSubscriptionTable {
-    LeafSubscriptionTable::new(backend, event_sink, change_requests).with_lifecycle_reads(no_held_checkouts())
+    LeafSubscriptionTable::new(backend, event_sink, change_requests).with_lifecycle_reads(agent_reads())
 }
 
 mod change_request_authority;

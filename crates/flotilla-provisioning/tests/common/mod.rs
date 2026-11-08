@@ -351,7 +351,6 @@ pub async fn create_stopped_terminal(
             &created.metadata.resource_version,
             &TerminalSessionStatus {
                 codex_native_hooks: false,
-                last_hook_working_at: None,
                 configured_limits: None,
                 phase: TerminalSessionPhase::Stopped,
                 session_id: Some(format!("session-{}", fixture.name)),
@@ -369,9 +368,6 @@ pub async fn create_stopped_terminal(
                 attention: None,
                 screen_obstruction: None,
                 turn_delivery_hold: None,
-                last_tool_activity_at: None,
-                last_output_digest: None,
-                last_output_activity_at: None,
                 occupancy: Default::default(),
                 completion_pending: None,
                 degraded: None,

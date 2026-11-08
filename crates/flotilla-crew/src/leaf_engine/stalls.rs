@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use flotilla_change_request::observation::ChangeRequestKey;
-use flotilla_protocol::{arg::shell_quote, Leaf, LeafAddress, LeafOperator};
+use flotilla_protocol::{arg::shell_quote, AgentActivity, Leaf, LeafAddress, LeafOperator};
 use flotilla_provider_runtime::ObservationError;
+use flotilla_resources::agent_activity::AgentActivityView;
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, record_name},
@@ -199,26 +200,15 @@ pub(super) const TURN_INACTIVITY_BOUND: chrono::Duration = chrono::Duration::min
 // supervision; queue residence while other reconciliations progress is not.
 const CONVOY_CONTROLLER_PROGRESS_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
-pub(super) fn turn_inactivity_reason(
-    status: &flotilla_resources::TerminalSessionStatus,
-    obligation: &NudgeObligation,
-    now: DateTime<Utc>,
-) -> Option<String> {
-    let since = obligation.working_since?;
-    let hook = status
-        .attention
-        .as_ref()
-        .filter(|attention| attention.source == TerminalAttentionSource::Hook && attention.state != TerminalAttentionState::Unobservable)
-        .map(|attention| attention.as_of);
-    let last_activity =
-        [status.last_tool_activity_at, status.last_output_activity_at, obligation.last_hook_at, hook, obligation.reply_after]
-            .into_iter()
-            .flatten()
-            .fold(since, std::cmp::max);
+pub(super) fn turn_inactivity_reason(agent: &AgentActivityView, obligation: &NudgeObligation, now: DateTime<Utc>) -> Option<String> {
+    let since = agent.working_since()?;
+    // Another home's progress is not seen here, so its turns are not bounded here.
+    let progress = agent.progress?;
+    let last_activity = [Some(progress.latest()), obligation.reply_after].into_iter().flatten().fold(since, std::cmp::max);
     let quiet = now.signed_duration_since(last_activity);
     (quiet >= TURN_INACTIVITY_BOUND).then(|| format!(
-        "turn inactivity bound exceeded: turn began {since}, last tool {:?}, last hook {:?}, last output {:?}, latest attention {:?}; no tool, hook, or output activity for {} seconds; automatic interrupt deferred to supervisor",
-        status.last_tool_activity_at, obligation.last_hook_at.or(hook), status.last_output_activity_at, status.attention.as_ref(), quiet.num_seconds()
+        "turn inactivity bound exceeded: turn began {since}, last tool {:?}, last output {:?}, last prompt {:?}, watched from {}; no tool or output activity for {} seconds; automatic interrupt deferred to supervisor",
+        progress.tool_at, progress.output_at, progress.prompt_submit_at, progress.watched_from, quiet.num_seconds()
     ))
 }
 
@@ -227,7 +217,7 @@ pub(super) const FIRST_HOOK_GRACE: chrono::Duration = chrono::Duration::minutes(
 
 pub(super) fn missing_turn_hook(
     session: &ResourceObject<TerminalSession>,
-    obligations: &[NudgeObligation],
+    agent: Option<&AgentActivityView>,
     now: DateTime<Utc>,
 ) -> Option<String> {
     if !matches!(session.spec.source, TerminalSessionSource::Agent { .. }) {
@@ -240,15 +230,7 @@ pub(super) fn missing_turn_hook(
     }
     let started = status.started_at?;
     let vessel = session.metadata.labels.get(VESSEL_LABEL)?;
-    let hook_seen = status.last_tool_activity_at.is_some_and(|at| at >= started)
-        || status.attention.as_ref().is_some_and(|attention| {
-            attention.source == TerminalAttentionSource::Hook
-                && attention.state != TerminalAttentionState::Unobservable
-                && attention.as_of >= started
-        }) || obligations.iter().any(|obligation| {
-        matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role } if actor_vessel == vessel && role == &session.spec.role)
-            && obligation.last_hook_at.is_some_and(|at| at >= started)
-    });
+    let hook_seen = agent.is_some_and(|agent| agent.hook_seen_since(started));
     (!hook_seen && now.signed_duration_since(started) >= FIRST_HOOK_GRACE).then(|| {
         format!("{} crew {}@{} has delivered no hook since session {} started at {}; check turn hook wiring (Codex notify / Claude managed settings)",
             crew.adapter, session.spec.role, vessel, session.metadata.name, started)
@@ -256,21 +238,35 @@ pub(super) fn missing_turn_hook(
 }
 
 pub(super) fn actor_is_working(
-    status: &flotilla_resources::TerminalSessionStatus,
+    agent: &AgentActivityView,
     obligations: &[NudgeObligation],
     vessel: &str,
     role: &str,
     now: DateTime<Utc>,
 ) -> bool {
-    let working = status
-        .attention
-        .as_ref()
-        .is_some_and(|attention| attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now));
     let silent = obligations.iter().any(|obligation| {
         matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role: actor_role } if actor_vessel == vessel && actor_role == role)
-            && turn_inactivity_reason(status, obligation, now).is_some()
+            && turn_inactivity_reason(agent, obligation, now).is_some()
     });
-    working && !silent
+    agent.working_since().is_some() && !silent
+}
+
+/// Where an agent's recorded activity came from, as stall evidence names it.
+fn activity_source(agent: &AgentActivityView) -> TerminalAttentionSource {
+    if agent.from_screen() {
+        TerminalAttentionSource::Screen
+    } else {
+        TerminalAttentionSource::Hook
+    }
+}
+
+/// The attention state an activity is debounced under.
+fn activity_state(activity: AgentActivity) -> TerminalAttentionState {
+    match activity {
+        AgentActivity::Working => TerminalAttentionState::Working,
+        AgentActivity::NeedsInput => TerminalAttentionState::NeedsInput,
+        AgentActivity::Idle | AgentActivity::Interrupted => TerminalAttentionState::Idle,
+    }
 }
 
 /// Evidence for a Landing convoy whose workflow declares no exit (#4278).
@@ -451,6 +447,25 @@ struct RowsVerdict<'a> {
 }
 
 impl ReconcilerWake {
+    /// A crew session's AgentSession at the home its record came from; none when it cannot be
+    /// read, which judges nothing.
+    fn agent_view(&self, session: &ResourceObject<TerminalSession>) -> Option<AgentActivityView> {
+        self.agent_view_at(
+            &session.metadata.name,
+            session.metadata.annotations.get(flotilla_resources::ORIGIN_ROOT_ANNOTATION).map(String::as_str),
+        )
+    }
+
+    fn agent_view_at(&self, name: &str, origin: Option<&str>) -> Option<AgentActivityView> {
+        match self.subscriptions.inner.lifecycle_reads.agent_sessions().and_then(|reads| reads.read(name, origin)) {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::debug!(session = name, %error, "stall judgement has no AgentSession");
+                None
+            }
+        }
+    }
+
     /// Withdraws records about the convoy or its roles once the stored stall
     /// status no longer names that subject. Failed withdrawals retry next pass.
     async fn end_settled_stalls(
@@ -706,7 +721,7 @@ impl ReconcilerWake {
         let mut obligations = status.nudge_obligations.clone();
         let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing);
         if holding {
-            self.observe_turn_hook_health(tick, convoy, status, &selected_sessions, &obligations).await?;
+            self.observe_turn_hook_health(tick, convoy, status, &selected_sessions).await?;
         }
         if self.clear_working_source_stall(tick, convoy, status, &selected_sessions, &mut obligations).await? {
             return Ok(None);
@@ -747,12 +762,13 @@ impl ReconcilerWake {
         convoy: &ResourceObject<Convoy>,
         status: &ConvoyStatus,
         selected_sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
-        obligations: &[NudgeObligation],
     ) -> Result<(), String> {
         let StallTick { namespace, now, .. } = tick;
         let backend = &self.subscriptions.inner.backend;
-        let mut missing_hooks =
-            selected_sessions.values().filter_map(|session| missing_turn_hook(session, obligations, now)).collect::<Vec<_>>();
+        let mut missing_hooks = selected_sessions
+            .values()
+            .filter_map(|session| missing_turn_hook(session, self.agent_view(session).as_ref(), now))
+            .collect::<Vec<_>>();
         missing_hooks.sort();
         let reason = (!missing_hooks.is_empty()).then(|| missing_hooks.join("\n"));
         let prior = status.attention.as_ref().filter(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE);
@@ -790,15 +806,9 @@ impl ReconcilerWake {
                 let source_working = selected_sessions.values().any(|session| {
                     session.metadata.labels.get(VESSEL_LABEL).is_some_and(|name| name == vessel)
                         && session.metadata.labels.get(ROLE_LABEL).is_some_and(|name| name == role)
-                        && session.status.as_ref().is_some_and(|status| actor_is_working(status, obligations, vessel, role, now))
+                        && self.agent_view(session).is_some_and(|agent| actor_is_working(&agent, obligations, vessel, role, now))
                 });
                 if source_working {
-                    for obligation in obligations.iter_mut() {
-                        if matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role: actor_role } if actor_vessel == vessel && actor_role == role)
-                        {
-                            obligation.quiet_since = None;
-                        }
-                    }
                     if status.nudge_obligations != *obligations {
                         flotilla_store::apply_status_patch(
                             &backend.clone().using::<Convoy>(namespace),
@@ -1021,9 +1031,10 @@ impl ReconcilerWake {
             }
             let changed = progress.iter().any(|(key, value)| obligation.progress.get(key).is_some_and(|prior| prior != value));
             if changed {
+                // Observed progress restarts the quiet clock, as a delivered message does, until
+                // the agent next goes idle.
                 obligation.history.clear();
-                obligation.quiet_since = None;
-                obligation.reply_after = None;
+                obligation.reply_after = Some(now);
                 *progress_changed = true;
             }
             obligation.progress.extend(progress);
@@ -1072,12 +1083,7 @@ impl ReconcilerWake {
                 obligation.message_id = message_id.clone();
                 obligation.delivered_message_id = delivered_id;
             }
-            let tool_activity = session_status.and_then(|status| status.last_tool_activity_at);
-            if tool_activity.is_some_and(|at| obligation.last_tool_activity_at.is_none_or(|previous| at > previous)) {
-                obligation.quiet_since = None;
-                obligation.reply_after = None;
-                obligation.last_tool_activity_at = tool_activity;
-            }
+            let agent = session.and_then(|session| self.agent_view(session));
             let pending_message = messages.iter().any(|message| {
                 message.object.spec.receiver == receiver_address
                     && message.object.status.as_ref().is_none_or(|status| status.phase.is_waiting())
@@ -1087,66 +1093,31 @@ impl ReconcilerWake {
                 }
                 _ => false,
             });
-            if let Some(attention) = session_status.and_then(|status| status.attention.as_ref()) {
-                let echo = obligation.reply_after.is_some();
-                if !echo {
-                    if obligation
-                        .last_attention_at
-                        .is_some_and(|previous| attention.as_of.signed_duration_since(previous) >= TerminalAttention::FRESH_FOR)
-                    {
-                        obligation.quiet_since = None;
-                    }
-                    if attention.source == TerminalAttentionSource::Hook && obligation.last_hook_at != Some(attention.as_of) {
-                        obligation.quiet_since = None;
-                    }
-                    if attention.state != TerminalAttentionState::Idle || attention.is_stale_at(now) {
-                        obligation.quiet_since = None;
-                    }
-                }
-                obligation.last_attention_at = Some(attention.as_of);
-                if attention.source == TerminalAttentionSource::Hook && attention.state != TerminalAttentionState::Unobservable {
-                    obligation.last_hook_at = Some(attention.as_of);
-                    if attention.state == TerminalAttentionState::Idle
-                        && obligation.reply_after.is_some_and(|at| attention.as_of > at)
-                        && !pending_message
-                    {
-                        // Consume exactly this delivered message's response end.
-                        // It neither starts an episode nor restarts its idle clock.
-                        obligation.reply_after = None;
-                    }
-                }
-                if attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(now) && !pending_message {
-                    obligation.quiet_since.get_or_insert(now);
-                }
-            } else if obligation.reply_after.is_none() {
-                obligation.quiet_since = None;
+            // The agent's own record says when it went idle (#3108). A delivered message's reply
+            // is consumed once the agent goes idle after it; until then the quiet clock counts
+            // from the delivery.
+            let idle_since = agent
+                .as_ref()
+                .filter(|agent| matches!(agent.live_activity(), Some(AgentActivity::Idle | AgentActivity::Interrupted)))
+                .and_then(|agent| agent.reading.activity_since);
+            if obligation.reply_after.is_some_and(|after| idle_since.is_some_and(|since| since > after)) && !pending_message {
+                obligation.reply_after = None;
             }
-            match session_status.and_then(|status| status.attention.as_ref()).map(|attention| attention.state) {
-                Some(TerminalAttentionState::Working) => {
-                    obligation.working_since.get_or_insert(now);
-                }
-                Some(TerminalAttentionState::Idle | TerminalAttentionState::NeedsInput) => {
-                    obligation.working_since = None;
-                }
-                _ => {}
-            }
-            let turn_inactivity = session_status.and_then(|status| turn_inactivity_reason(status, obligation, now));
-            let awaiting_reply_observation = obligation.reply_after.is_some_and(|after| {
-                session_status.and_then(|status| status.attention.as_ref()).is_none_or(|attention| attention.as_of <= after)
+            let quiet_since = agent.as_ref().and_then(AgentActivityView::quiet_since).map(|quiet| match obligation.reply_after {
+                Some(after) => quiet.max(after),
+                None => quiet,
             });
+            let turn_inactivity = agent.as_ref().and_then(|agent| turn_inactivity_reason(agent, obligation, now));
             let idle_grace = chrono::Duration::seconds(i64::from(idle_grace_seconds(status, vessel, role)));
             let lost_reason = session
                 .and_then(|session| session.status.as_ref())
                 .filter(|status| status.phase == TerminalSessionPhase::Lost)
                 .and_then(|status| status.message.as_deref());
-            let attention = session
-                .and_then(|session| session.status.as_ref())
-                .filter(|status| status.phase == TerminalSessionPhase::Running)
-                .and_then(|status| status.attention.as_ref());
+            let agent = agent.filter(|_| session_status.is_some_and(|status| status.phase == TerminalSessionPhase::Running));
             let crew_phase = status.crew_work.get(vessel).and_then(|crew| crew.get(role)).map(|work| work.phase);
             let launching = crew_phase == Some(CrewWorkPhase::Pending)
                 && (session.is_none()
-                    || attention.is_some_and(|attention| attention.state == TerminalAttentionState::Idle)
+                    || idle_since.is_some()
                     || session.is_some_and(|session| {
                         session.status.as_ref().is_none_or(|status| status.phase == TerminalSessionPhase::Starting)
                     }));
@@ -1163,13 +1134,10 @@ impl ReconcilerWake {
                 // its teardown. This actor has no remaining work;
                 // other makers (especially failed controllers) still judge.
                 self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
-                obligation.quiet_since = None;
                 Ok(())
             } else if launching {
-                // Pending launch is not a dead session or an ended turn. Keep
-                // both clocks clear so launch latency cannot age evidence.
+                // Pending launch is not a dead session or an ended turn.
                 self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
-                obligation.quiet_since = None;
                 return Ok(RowJudgement::Unknown);
             } else if let Some(reason) = lost_reason {
                 self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
@@ -1177,57 +1145,54 @@ impl ReconcilerWake {
             } else if let Some(reason) = turn_inactivity {
                 Err((reason, StallEvidenceSource::Session))
             } else {
-                match attention {
-                    Some(attention) if attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now) => {
+                match agent.as_ref().map(|agent| (agent, agent.live_activity())) {
+                    Some((agent, _)) if !agent.current => {
+                        self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                        self.report_stale_attention(row, activity_source(agent)).await;
+                        return Ok(RowJudgement::Unknown);
+                    }
+                    Some((_, Some(AgentActivity::Working))) => {
                         self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
                         self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
                         Ok(())
                     }
-                    Some(attention) if attention.is_stale_at(now) => {
-                        self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
-                        self.report_stale_attention(row, attention.source).await;
-                        return Ok(RowJudgement::Unknown);
-                    }
-                    Some(attention) if attention.state == TerminalAttentionState::Unobservable => {
+                    Some((_, None)) => {
                         self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
                         return Ok(RowJudgement::Unknown);
                     }
-                    Some(attention) => {
+                    Some((agent, Some(activity))) => {
                         self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
-                        let source = match attention.source {
+                        let source = activity_source(agent);
+                        let evidence_source = match source {
                             TerminalAttentionSource::Screen => StallEvidenceSource::Screen,
                             TerminalAttentionSource::Hook => StallEvidenceSource::Hook,
                         };
-                        if attention.state == TerminalAttentionState::Idle {
-                            if pending_message
-                                || awaiting_reply_observation
-                                || obligation.quiet_since.is_none_or(|since| now.signed_duration_since(since) < idle_grace)
+                        if activity == AgentActivity::NeedsInput {
+                            let since = agent.reading.activity_since.unwrap_or(now);
+                            let debounce = if source == TerminalAttentionSource::Hook {
+                                chrono::Duration::zero()
+                            } else {
+                                TerminalAttention::DEBOUNCE_FOR
+                            };
+                            if self
+                                .maker_debouncing(
+                                    row.id,
+                                    UnableEvidenceKey::Attention { state: activity_state(activity), source },
+                                    since,
+                                    debounce,
+                                    now,
+                                )
+                                .await
                             {
                                 return Ok(RowJudgement::Unknown);
                             }
-                        } else if self
-                            .maker_debouncing(
-                                row.id,
-                                UnableEvidenceKey::Attention { state: attention.state, source: attention.source },
-                                attention.as_of,
-                                if attention.source == TerminalAttentionSource::Hook {
-                                    chrono::Duration::zero()
-                                } else {
-                                    TerminalAttention::DEBOUNCE_FOR
-                                },
-                                now,
-                            )
-                            .await
-                        {
-                            return Ok(RowJudgement::Unknown);
+                            Err(("NeedsInput".into(), evidence_source))
+                        } else {
+                            if pending_message || quiet_since.is_none_or(|since| now.signed_duration_since(since) < idle_grace) {
+                                return Ok(RowJudgement::Unknown);
+                            }
+                            Err(("idle".into(), evidence_source))
                         }
-                        let evidence = match attention.state {
-                            TerminalAttentionState::Idle => "idle".into(),
-                            TerminalAttentionState::NeedsInput => "NeedsInput".into(),
-                            TerminalAttentionState::Unobservable => unreachable!("handled as unknown"),
-                            TerminalAttentionState::Working => "working".into(),
-                        };
-                        Err((evidence, source))
                     }
                     None => {
                         if session.is_some_and(|session| {
@@ -1265,21 +1230,32 @@ impl ReconcilerWake {
                     && session.metadata.labels.get(VESSEL_LABEL).map(String::as_str) == Some(vessel)
                     && session.metadata.labels.get(ROLE_LABEL).map(String::as_str) == Some(role)
             });
-            let attention = session
+            let running = session
                 .and_then(|source| source.object.status.as_ref())
-                .filter(|status| status.phase == TerminalSessionPhase::Running)
-                .and_then(|status| status.attention.as_ref());
-            match attention {
-                Some(attention) if attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now) => {
+                .is_some_and(|status| status.phase == TerminalSessionPhase::Running);
+            let agent = session.filter(|_| running).and_then(|source| {
+                let origin = match &source.provenance {
+                    flotilla_resources::ResourceProvenance::Local => None,
+                    flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str()),
+                };
+                self.agent_view_at(&source.object.metadata.name, origin)
+            });
+            match agent.as_ref().map(|agent| (agent, agent.live_activity())) {
+                Some((agent, _)) if !agent.current => {
+                    self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                    self.report_stale_attention(row, activity_source(agent)).await;
+                    return RowJudgement::Unknown;
+                }
+                Some((_, Some(AgentActivity::Working))) => {
                     self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
                     Ok(())
                 }
-                Some(attention) if attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(now) => {
+                Some((agent, Some(activity @ (AgentActivity::Idle | AgentActivity::Interrupted)))) => {
                     self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
                     if self
                         .maker_debouncing(
                             row.id,
-                            UnableEvidenceKey::Attention { state: attention.state, source: attention.source },
+                            UnableEvidenceKey::Attention { state: activity_state(activity), source: activity_source(agent) },
                             row.created_at,
                             TerminalAttention::DEBOUNCE_FOR,
                             now,
@@ -1290,22 +1266,14 @@ impl ReconcilerWake {
                     }
                     Err(("supervisor idle".into(), StallEvidenceSource::Session))
                 }
-                Some(attention) if attention.state == TerminalAttentionState::NeedsInput && !attention.is_stale_at(now) => {
+                Some((_, Some(AgentActivity::NeedsInput))) => {
                     self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
                     Err(("supervisor needs input".into(), StallEvidenceSource::Hook))
                 }
-                Some(attention) if attention.is_stale_at(now) => {
-                    self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
-                    self.report_stale_attention(row, attention.source).await;
+                Some((_, None)) => {
                     return RowJudgement::Unknown;
                 }
-                None if session.is_some_and(|source| {
-                    source.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running)
-                }) =>
-                {
-                    return RowJudgement::Unknown;
-                }
-                Some(_) => {
+                None if running => {
                     return RowJudgement::Unknown;
                 }
                 None => {
@@ -1507,10 +1475,9 @@ impl ReconcilerWake {
             });
             let idle_at = session
                 .filter(|session| matches!(session.spec.source, TerminalSessionSource::Agent { .. }))
-                .and_then(|session| session.status.as_ref())
-                .and_then(|status| status.attention.as_ref())
-                .filter(|attention| attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(now))
-                .map(|attention| attention.as_of);
+                .and_then(|session| self.agent_view(session))
+                .filter(|agent| matches!(agent.live_activity(), Some(AgentActivity::Idle | AgentActivity::Interrupted)))
+                .and_then(|agent| agent.reading.activity_since);
             let resume_grace = status
                 .crew_work
                 .get(vessel)

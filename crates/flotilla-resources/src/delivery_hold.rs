@@ -26,14 +26,8 @@ pub fn delivery_retry_backoff() -> crate::RetryBackoff {
 
 /// Callers establish freshness and original session identity before consulting
 /// this policy. Screen redraws alone never prove acceptance.
-pub fn delivery_acceptance_evidence(
-    tool_activity: bool,
-    hook_working: bool,
-    fresh_working: bool,
-    stable_working: bool,
-    changed_output: bool,
-) -> bool {
-    tool_activity || hook_working || (fresh_working && (stable_working || changed_output))
+pub fn delivery_acceptance_evidence(tool_activity: bool, hook_working: bool, fresh_working: bool, stable_working: bool) -> bool {
+    tool_activity || hook_working || (fresh_working && stable_working)
 }
 
 pub fn delivery_hold_overdue(started_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {

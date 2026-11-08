@@ -355,7 +355,7 @@ async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_neve
         as_of: activity_at,
         source: TerminalAttentionSource::Hook,
     });
-    status.last_tool_activity_at = Some(activity_at);
+    runtime.state.daemon.crew_progress().tool(&holder.metadata.name, activity_at);
     let holder = sessions.update_status(ID, &holder.metadata.resource_version, &status).await.expect("unrelated activity");
     let observation =
         AgentTransport::observe(&runtime, &delivery_target(&holder), Some(&batch.submission)).await.expect("pending observation");
@@ -574,6 +574,8 @@ async fn held_pool_delivery_scenario(mode: &str) {
     status.started_at = Some(Utc::now() - chrono::Duration::minutes(20));
     session = sessions.update_status("agent", &session.metadata.resource_version, &status).await.expect("running session");
     engine_environments(&daemon);
+    // Hooks record the crew's AgentSession on the Message path the runtime always opens.
+    super::super::open_message_primitives(&daemon).await.expect("open the Message path");
     let runtime = Arc::new(TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             daemon,
@@ -584,7 +586,8 @@ async fn held_pool_delivery_scenario(mode: &str) {
             profile.host_direct_environment_name(),
         )),
     });
-    let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
+    let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend.clone(), NAMESPACE)
+        .with_lifecycle_reads(runtime.state.daemon.lifecycle_reads());
     assert_eq!(
         runtime.deliver_message("agent", (&spec).into(), "wake", TerminalDeliveryReadiness::Startup).await.expect("begin write"),
         TerminalDeliveryOutcome::Pending
@@ -600,10 +603,8 @@ async fn held_pool_delivery_scenario(mode: &str) {
     };
     reconciler.reconcile(&session, &prepared, Utc::now()).patch.expect("hold").apply(&mut status);
     sessions.update_status("agent", &session.metadata.resource_version, &status).await.expect("persist hold");
-    // The old held path observed a baseline before the upgrade. Preserve
-    // that real observation so changed output has a comparison witness.
+    // The old held path observed the holder before the upgrade.
     refresh_message_test_attention(&runtime, &backend, "agent").await;
-    session = sessions.get("agent").await.expect("legacy held baseline");
     let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
     let intent = flotilla_resources::MessageSpec::builder()
         .sender("system:test".into())
@@ -615,14 +616,14 @@ async fn held_pool_delivery_scenario(mode: &str) {
     let messages = backend.using::<flotilla_resources::Message>(NAMESPACE);
     let record = messages.get("held-turn").await.expect("held message");
     let mut held = record.status.clone().expect("message status");
+    let submitted_at = Utc::now();
     held.submission = Some(
         flotilla_resources::MessageSubmission::builder()
             .batch_id("held-turn".into())
             .crew_id("held-crew".into())
             .session("agent".into())
-            .started_at(Utc::now())
+            .started_at(submitted_at)
             .members(vec!["held-turn".into()])
-            .maybe_output_digest(session.status.as_ref().and_then(|status| status.last_output_digest.clone()))
             .build(),
     );
     messages.update_status("held-turn", &record.metadata.resource_version, &held).await.expect("submission evidence");
@@ -687,6 +688,9 @@ async fn held_pool_delivery_scenario(mode: &str) {
                         .maybe_session_id(parsed.session_id.clone())
                         .maybe_transcript_path(parsed.transcript_path.clone())
                         .native_codex_hook(parsed.native_codex_hook)
+                        .maybe_hook_event(
+                            flotilla_agent::hooks::hook_event_name(&flotilla_protocol::AgentHarness::Codex, event).map(str::to_owned),
+                        )
                         .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: NAMESPACE.into(), session_name: "agent".into() })
                         .build(),
                 },
@@ -696,7 +700,15 @@ async fn held_pool_delivery_scenario(mode: &str) {
             assert!(matches!(*response, flotilla_protocol::ResponseResult::Ok { .. }));
             if mode.starts_with("native") && matches!(event, "session-start" | "subagent-stop" | "stop") {
                 let holder = sessions.get("agent").await.expect("holder");
-                if holder.status.as_ref().unwrap().last_hook_working_at.is_none() {
+                let took_up = runtime
+                    .state
+                    .daemon
+                    .lifecycle_reads()
+                    .agent_sessions()
+                    .and_then(|reads| reads.read("agent", None))
+                    .expect("AgentSession read")
+                    .is_some_and(|agent| agent.took_up_after(submitted_at));
+                if !took_up {
                     inbox.reconcile_delivery(&keystroke_router(&runtime.state), Utc::now()).await.expect("observe held");
                     assert!(
                         !messages.get("held-turn").await.unwrap().status.unwrap().phase.has_delivery_evidence(),
@@ -849,7 +861,8 @@ async fn message_batch_owns_its_task_until_the_receiver_releases_it() {
 }
 
 // #3028: Codex only emits turn-complete (Idle). A following idle hook on
-// the recorded receiver settles a held submission, without a Working hook.
+// the recorded receiver settles a held submission, without a Working hook;
+// the crew's AgentSession carries that Idle and its cause (#3108).
 #[tokio::test]
 async fn codex_idle_hook_confirms_held_submission() {
     use flotilla_agent_connector::AgentTransport;
@@ -862,6 +875,9 @@ async fn codex_idle_hook_confirms_held_submission() {
     let backend = daemon.resource_backend();
     create_credential_test_session(&backend, "codex-held", "hook", "hook-work", "contained-vessel").await;
     engine_environments(&daemon);
+    // The crew's AgentSession, which its hooks record on the Message path the runtime always opens.
+    super::super::open_message_primitives(&daemon).await.expect("open the Message path");
+    let agents = Arc::clone(daemon.message_primitives().expect("Message path").sessions());
     let runtime = TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             daemon,
@@ -915,6 +931,12 @@ async fn codex_idle_hook_confirms_held_submission() {
             as_of: submitted_at + chrono::Duration::seconds(offset),
         });
         sessions.update_status("codex-held", &current.metadata.resource_version, &status).await.expect("hook evidence");
+        // A turn worked before the submission, then Idle at the offset, as its cause reported it.
+        use flotilla_state_machines::machines::agent_session::Activity;
+        let at = |offset: i64| flotilla_schema::Timestamp::from_datetime(&(submitted_at + chrono::Duration::seconds(offset)));
+        agents.observe("codex-held", Activity::Working, "notify".into(), at(-3)).expect("earlier turn");
+        let cause = if source == TerminalAttentionSource::Screen { flotilla_core::primitives::SCREEN_CAUSE } else { "notify" };
+        agents.observe("codex-held", Activity::Idle, cause.into(), at(offset)).expect("turn end");
         // Observe through the pre-update snapshot too: the runtime must consult
         // the durable receiver generation before trusting a newly arriving hook.
         let observed =

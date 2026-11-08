@@ -89,7 +89,6 @@ impl Binding for TerminalSessionBinding {
             | TerminalSessionStatusPatch::MarkReconcileDegraded { .. }
             | TerminalSessionStatusPatch::ClearReconcileDegraded
             | TerminalSessionStatusPatch::ObserveNativeCodexHook { .. }
-            | TerminalSessionStatusPatch::ObserveToolActivity { .. }
             | TerminalSessionStatusPatch::ObserveAttention { .. }
             | TerminalSessionStatusPatch::Observe { .. }
             | TerminalSessionStatusPatch::MarkCompletionPending { .. }

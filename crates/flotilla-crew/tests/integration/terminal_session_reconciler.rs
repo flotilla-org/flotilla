@@ -15,7 +15,9 @@ use flotilla_crew::reconcilers::terminal_session::{
     TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime,
     TerminalRuntimeState, TerminalSessionReconciler,
 };
-use flotilla_provisioning_testkit::{Ending, EnvironmentFixture};
+use flotilla_protocol::AgentActivity;
+use flotilla_provisioning_testkit::{AgentSessionsFixture, Ending, EnvironmentFixture};
+use flotilla_resources::agent_activity::ProgressFacts;
 use flotilla_resources::environment_records::LaunchFacts;
 use flotilla_resources::Actuation;
 use flotilla_resources::Convoy;
@@ -1871,8 +1873,10 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
             .observation_failed(AtomicBool::new(false))
             .build(),
     );
-    let reconciler =
-        TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla").with_lifecycle_reads(environments.reads.clone());
+    // The crew's AgentSession, as its hooks and screen reads record it (#3108).
+    let agents = Arc::new(AgentSessionsFixture::new(chrono::DateTime::<Utc>::UNIX_EPOCH));
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla")
+        .with_lifecycle_reads(environments.reads_with_agent_sessions(agents.clone()));
 
     let pending =
         reconciler.reconcile(&session, &flotilla_crew::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryPending, Utc::now());
@@ -1909,87 +1913,75 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         assert!(status.degraded.is_some());
         flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("persist observation");
 
-        // Evidence must postdate this write. One flickering screen sample,
-        // stale hooks, NeedsInput, and unknown output baselines do not prove consumption.
+        // #3108: the agent took up the held turn when its AgentSession began working after the
+        // hold, from a hook or a screen read, or when a prompt submit or tool call came after it.
+        // Idle, NeedsInput, anything at or before the hold, and the terminal's attention alone
+        // prove nothing.
         let held_at = status.degraded.as_ref().expect("hold").observed_at;
-        for state in [
-            TerminalAttentionState::Idle,
-            TerminalAttentionState::Working,
-            TerminalAttentionState::NeedsInput,
-            TerminalAttentionState::Unobservable,
-        ] {
-            for source in [TerminalAttentionSource::Hook, TerminalAttentionSource::Screen] {
+        let confirms = |observe: &dyn Fn(&AgentSessionsFixture), attention: Option<TerminalAttention>| {
+            let agents = Arc::new(AgentSessionsFixture::new(chrono::DateTime::<Utc>::UNIX_EPOCH));
+            observe(&agents);
+            let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla")
+                .with_lifecycle_reads(environments.reads_with_agent_sessions(agents));
+            let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                obstruction: None,
+                output_digest: None,
+                attention,
+                occupancy: TerminalOccupancy::Vacant,
+            });
+            let mut checked = status.clone();
+            if let Some(patch) = reconciler.reconcile(&flagged, &prepared, held_at + chrono::Duration::seconds(2)).patch {
+                patch.apply(&mut checked);
+            }
+            checked.delivered_message_id.is_some()
+        };
+        for activity in [AgentActivity::Idle, AgentActivity::Working, AgentActivity::NeedsInput, AgentActivity::Interrupted] {
+            for cause in ["hook", flotilla_resources::agent_activity::SCREEN_CAUSE] {
                 for offset in [-1, 0, 1] {
                     let at = held_at + chrono::Duration::seconds(offset);
-                    let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
-                        obstruction: None,
-                        output_digest: None,
-                        attention: Some(TerminalAttention { state, source, as_of: at }),
-                        occupancy: TerminalOccupancy::Vacant,
-                    });
-                    let mut checked = status.clone();
-                    if let Some(patch) = reconciler.reconcile(&flagged, &prepared, held_at + chrono::Duration::seconds(2)).patch {
-                        patch.apply(&mut checked);
-                    }
                     assert_eq!(
-                        checked.delivered_message_id.is_some(),
-                        state == TerminalAttentionState::Working && source == TerminalAttentionSource::Hook && offset > 0
+                        confirms(&|agents| agents.observe("term-a", activity, cause, at), None),
+                        activity == AgentActivity::Working && offset > 0,
+                        "{activity:?} from {cause} at {offset}s"
                     );
                 }
             }
         }
-        // Stable screen evidence crosses the debounce boundary, and output
-        // changes count only with a known baseline. Neither path resends.
-        for elapsed in [4, 5, 6] {
-            let mut screened = flagged.clone();
-            screened.status.as_mut().expect("status").attention = Some(TerminalAttention {
-                state: TerminalAttentionState::Working,
-                source: TerminalAttentionSource::Screen,
-                as_of: held_at + chrono::Duration::seconds(1),
-            });
-            let at = held_at + chrono::Duration::seconds(1 + elapsed);
-            let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
-                obstruction: None,
-                output_digest: None,
-                attention: Some(TerminalAttention {
-                    state: TerminalAttentionState::Working,
-                    source: TerminalAttentionSource::Screen,
-                    as_of: at,
-                }),
-                occupancy: TerminalOccupancy::Vacant,
-            });
-            let mut checked = screened.status.clone().expect("status");
-            if let Some(patch) = reconciler.reconcile(&screened, &prepared, at).patch {
-                patch.apply(&mut checked);
-            }
-            assert_eq!(checked.delivered_message_id.is_some(), elapsed >= 5);
+        for offset in [-1, 0, 1] {
+            let at = held_at + chrono::Duration::seconds(offset);
+            let idle_after = |agents: &AgentSessionsFixture| {
+                agents.observe("term-a", AgentActivity::Idle, "Stop", held_at + chrono::Duration::seconds(2))
+            };
+            assert_eq!(
+                confirms(
+                    &|agents| {
+                        agents.progress.prompt_submit("term-a", at);
+                        idle_after(agents);
+                    },
+                    None
+                ),
+                offset > 0,
+                "prompt submit at {offset}s"
+            );
+            // A tool call proves the turn even once the crew is idle again.
+            assert_eq!(
+                confirms(
+                    &|agents| {
+                        agents.progress.tool("term-a", at);
+                        idle_after(agents);
+                    },
+                    None
+                ),
+                offset > 0,
+                "tool call at {offset}s"
+            );
         }
-        // Idle redraws and unknown attention cannot prove consumption, even
-        // with changed output. Fresh Working plus a known changed baseline can.
-        for state in [None, Some(TerminalAttentionState::Idle), Some(TerminalAttentionState::Working)] {
-            for baseline in [None, Some("old"), Some("new")] {
-                let mut output = flagged.clone();
-                output.status.as_mut().expect("status").last_output_digest = baseline.map(str::to_string);
-                let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
-                    obstruction: None,
-                    output_digest: Some("new".into()),
-                    attention: state.map(|state| TerminalAttention {
-                        state,
-                        source: TerminalAttentionSource::Screen,
-                        as_of: held_at + chrono::Duration::seconds(2),
-                    }),
-                    occupancy: TerminalOccupancy::Vacant,
-                });
-                let mut checked = output.status.clone().expect("status");
-                if let Some(patch) = reconciler.reconcile(&output, &prepared, held_at + chrono::Duration::seconds(2)).patch {
-                    patch.apply(&mut checked);
-                }
-                assert_eq!(
-                    checked.delivered_message_id.is_some(),
-                    baseline == Some("old") && state == Some(TerminalAttentionState::Working)
-                );
-            }
-        }
+        let working = TerminalAttention {
+            state: TerminalAttentionState::Working,
+            source: TerminalAttentionSource::Hook,
+            as_of: held_at + chrono::Duration::seconds(1),
+        };
+        assert!(!confirms(&|_| {}, Some(working)), "the terminal's attention alone is not the agent's record");
         // A held write needs attention immediately, including before expiry.
         for elapsed in [0, 1, 299, 300, 301] {
             let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryPending;
@@ -2000,35 +1992,6 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
             );
         }
 
-        // A post-hold tool hook proves consumption even if the crew has
-        // already returned to Idle by the time the held delivery is revisited.
-        for offset in [-1, 0, 1] {
-            let mut historical = flagged.clone();
-            let mut checked = status.clone();
-            TerminalSessionStatusPatch::ObserveToolActivity {
-                attention: TerminalAttention {
-                    state: TerminalAttentionState::Working,
-                    source: TerminalAttentionSource::Hook,
-                    as_of: held_at + chrono::Duration::seconds(offset),
-                },
-            }
-            .apply(&mut checked);
-            TerminalSessionStatusPatch::ObserveAttention {
-                attention: TerminalAttention {
-                    state: TerminalAttentionState::Idle,
-                    source: TerminalAttentionSource::Hook,
-                    as_of: held_at + chrono::Duration::seconds(2),
-                },
-            }
-            .apply(&mut checked);
-            historical.status = Some(checked.clone());
-            let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryPending;
-            if let Some(patch) = reconciler.reconcile(&historical, &prepared, held_at + chrono::Duration::seconds(3)).patch {
-                patch.apply(&mut checked);
-            }
-            assert_eq!(checked.delivered_message_id.is_some(), offset > 0);
-        }
-
         // Ordinary observer errors remain retryable before the deadline.
         for failure in 1..=3 {
             runtime.pool_failure.store(failure, Ordering::SeqCst);
@@ -2037,6 +2000,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         runtime.pool_failure.store(0, Ordering::SeqCst);
 
         // Positive activity after the ambiguous write acknowledges it without a resend.
+        agents.observe("term-a", AgentActivity::Working, "PreToolUse", Utc::now());
         *runtime.observation.lock().expect("observation mutex") = Some(TerminalObservation {
             obstruction: None,
             output_digest: None,
@@ -2055,6 +2019,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         assert_eq!(runtime.delivered.lock().expect("delivery log").len(), 1);
 
         // Unresolved holds surface a single durable demand, including after restart.
+        agents.observe("term-a", AgentActivity::Idle, "Stop", Utc::now());
         *runtime.observation.lock().expect("observation mutex") = Some(TerminalObservation {
             obstruction: None,
             output_digest: None,
@@ -2082,8 +2047,8 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         outcome.patch.expect("visible timeout").apply(&mut status);
         assert!(status.degraded.as_ref().expect("timeout").message.contains("deadline"));
         flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("persist timeout");
-        let fresh =
-            TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
+        let fresh = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla")
+            .with_lifecycle_reads(environments.reads_with_agent_sessions(agents.clone()));
         let prepared = fresh.prepare(&flagged).await.expect("observe expired hold after restart");
         let outcome = fresh.reconcile(&flagged, &prepared, Utc::now());
         assert!(
@@ -2107,6 +2072,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         assert_eq!(status.attention.as_ref().expect("attention").as_of, refresh_at);
         assert_eq!(status.degraded.as_ref().expect("failure").reason, "DeliveryExpired");
         // Late consumption still resolves an expired hold and clears its demand.
+        agents.observe("term-a", AgentActivity::Working, "PreToolUse", refresh_at);
         let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
             obstruction: None,
             output_digest: None,
@@ -2170,8 +2136,9 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
     assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 3);
 }
 
-// #2560: output progress is persisted even when attention is coalesced;
-// repeating the same output is a no-op and cannot keep a hung turn alive.
+// #2560, #3108: new output is progress each time it is seen, held in memory only: the session's
+// record is never written for it. Repeating the same output is not progress and cannot keep a hung
+// turn alive.
 #[tokio::test]
 async fn meaningful_output_progress_survives_coalesced_attention() {
     let environments = EnvironmentFixture::default();
@@ -2194,11 +2161,11 @@ async fn meaningful_output_progress_survives_coalesced_attention() {
     let start = Utc::now();
     let status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
     sessions.update_status("output-crew", &created.metadata.resource_version, &status).await.expect("running session");
+    let progress = Arc::new(ProgressFacts::new(start));
     let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla")
-        .with_lifecycle_reads(environments.reads.clone());
-    for (digest, second, expected, changed) in
-        [("first", 0, 0, true), ("second", 10, 0, false), ("second", 29, 0, false), ("second", 30, 30, true), ("second", 60, 30, false)]
-    {
+        .with_lifecycle_reads(environments.reads.clone())
+        .with_progress(Arc::clone(&progress));
+    for (digest, second, expected) in [("first", 0, 0), ("second", 10, 10), ("second", 30, 10), ("third", 60, 60)] {
         let session = sessions.get("output-crew").await.expect("session");
         let observation = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
             obstruction: None,
@@ -2207,12 +2174,12 @@ async fn meaningful_output_progress_survives_coalesced_attention() {
             occupancy: TerminalOccupancy::Vacant,
         });
         let result = reconciler.reconcile(&session, &observation, start + chrono::Duration::seconds(second));
-        assert_eq!(result.patch.is_some(), changed);
+        // The first observation records the session's occupancy; output alone writes nothing.
+        assert_eq!(result.patch.is_some(), second == 0, "output alone writes nothing");
         if let Some(patch) = result.patch {
-            flotilla_store::apply_status_patch(&sessions, "output-crew", &patch).await.expect("persist output progress");
+            flotilla_store::apply_status_patch(&sessions, "output-crew", &patch).await.expect("persist occupancy");
         }
-        let status = sessions.get("output-crew").await.expect("session").status.expect("status");
-        assert_eq!(status.last_output_activity_at, Some(start + chrono::Duration::seconds(expected)));
+        assert_eq!(progress.get("output-crew").output_at, Some(start + chrono::Duration::seconds(expected)));
     }
 }
 

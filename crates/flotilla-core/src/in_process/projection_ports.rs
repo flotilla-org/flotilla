@@ -169,6 +169,51 @@ impl flotilla_projections::ports::AgentSessions for InProcessDaemon {
 
 pub use agent_sessions::DecidedAgentSessions;
 
+/// Provisioning readings whose AgentSessions are the daemon's own.
+pub(super) struct WithAgentSessions {
+    pub(super) reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+    pub(super) agent_sessions: DecidedAgentSessions,
+}
+
+impl flotilla_resources::lifecycle_reads::LifecycleReads for WithAgentSessions {
+    fn is_disabled(&self) -> bool {
+        self.reads.is_disabled()
+    }
+
+    fn try_reading(
+        &self,
+        kind: flotilla_resources::lifecycle_reads::ProvisioningKind,
+        name: &str,
+        origin: Option<&str>,
+    ) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
+        self.reads.try_reading(kind, name, origin)
+    }
+
+    fn try_terminal_launch(
+        &self,
+        name: &str,
+        origin: Option<&str>,
+    ) -> Result<Option<flotilla_resources::terminal_launches::TerminalLaunch>, String> {
+        self.reads.try_terminal_launch(name, origin)
+    }
+
+    fn environments(&self) -> Result<&dyn flotilla_resources::environment_records::EnvironmentRecords, String> {
+        self.reads.environments()
+    }
+
+    fn clones(&self) -> Result<&dyn flotilla_resources::clone_records::CloneRecords, String> {
+        self.reads.clones()
+    }
+
+    fn checkouts(&self) -> Result<&dyn flotilla_resources::checkout_records::CheckoutRecords, String> {
+        self.reads.checkouts()
+    }
+
+    fn agent_sessions(&self) -> Result<&dyn flotilla_resources::agent_activity::AgentSessionReads, String> {
+        Ok(&self.agent_sessions)
+    }
+}
+
 mod agent_sessions {
     use std::{collections::BTreeMap, sync::Arc};
 
@@ -177,7 +222,7 @@ mod agent_sessions {
     use flotilla_projections::ports::{AgentSessionFollow, AgentSessionKey, AgentSessionUpdate};
     use flotilla_protocol::{AgentActivity, AgentSessionEnd, AgentSessionReading, NodeId};
     use flotilla_provisioning::engine::watch::EngineWatch;
-    use flotilla_resources::agent_activity::{home_current, AgentActivityView, AgentSessionReads};
+    use flotilla_resources::agent_activity::{home_current, AgentActivityView, AgentSessionReads, ProgressFacts};
     use flotilla_schema::Kind as StoredKind;
     use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
     use flotilla_state_machines::{
@@ -255,11 +300,14 @@ mod agent_sessions {
     pub struct DecidedAgentSessions {
         service: Arc<Service>,
         clock: Arc<dyn flotilla_resources::Clock>,
+        progress: Arc<ProgressFacts>,
     }
 
     impl DecidedAgentSessions {
-        pub fn new(service: Arc<Service>, clock: Arc<dyn flotilla_resources::Clock>) -> Self {
-            Self { service, clock }
+        /// Reads `service`'s AgentSessions, joined with what this daemon has seen of its own
+        /// sessions' progress.
+        pub fn new(service: Arc<Service>, clock: Arc<dyn flotilla_resources::Clock>, progress: Arc<ProgressFacts>) -> Self {
+            Self { service, clock, progress }
         }
     }
 
@@ -275,7 +323,8 @@ mod agent_sessions {
                 let heard = self.service.watermark(home).map_err(|error| error.to_string())?.applied_through.to_datetime();
                 home_current(heard.filter(|at| *at > DateTime::<Utc>::UNIX_EPOCH), self.clock.now())
             };
-            Ok(reading.map(|reading| AgentActivityView { reading, current }))
+            let progress = (home == own).then(|| self.progress.get(name));
+            Ok(reading.map(|reading| AgentActivityView { reading, current, progress }))
         }
     }
 

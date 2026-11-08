@@ -118,9 +118,7 @@ fn fallback_system_sender() -> Address {
         .expect("a valid default namespace")
 }
 
-/// The cause an activity read from the agent's screen records. A hook records
-/// its native event name instead.
-pub const SCREEN_CAUSE: &str = "screen";
+pub use flotilla_resources::agent_activity::SCREEN_CAUSE;
 
 /// How long a hook's activity stands over a screen read that disagrees.
 pub const HOOK_STANDS_FOR: std::time::Duration = std::time::Duration::from_secs(120);

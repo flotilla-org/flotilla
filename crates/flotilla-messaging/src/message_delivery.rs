@@ -970,10 +970,6 @@ impl MessageInbox {
                         false,
                         true,
                         now.signed_duration_since(*since) >= crate::delivery_hold::DELIVERY_WORKING_DEBOUNCE_FOR,
-                        observation
-                            .output_digest
-                            .as_ref()
-                            .is_some_and(|digest| submission.output_digest.as_ref().is_some_and(|previous| previous != digest)),
                     )
                     .then(|| "holder remained Working after input submission".into())
                 } else {
@@ -1062,7 +1058,6 @@ impl MessageInbox {
             .session(session.clone())
             .started_at(now)
             .members(pending.iter().map(|message| message.metadata.name.clone()).collect())
-            .maybe_output_digest(observation.output_digest)
             // Recorded with the intent: the transport that just observed readiness
             // is the one the router tries first, so recovery polls it.
             .transport(planned.0)

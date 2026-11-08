@@ -667,6 +667,19 @@ pub(super) async fn handle_agent_hook(
     }
 
     let Some(terminal) = event.terminal.as_ref() else { return Ok(()) };
+    // What the agent's AgentSession does not record of its progress, this daemon keeps in memory
+    // for its stall check and delivery confirmation (#3108).
+    // A notification that reports no change is not evidence the hooks are wired.
+    if let Some(daemon) = daemon.as_ref().filter(|_| event.event_type != AgentEventType::NoChange) {
+        let (progress, now) = (daemon.crew_progress(), daemon.clock().now());
+        progress.hook(&terminal.session_name, now);
+        if event.event_type == AgentEventType::ToolActive {
+            progress.tool(&terminal.session_name, now);
+        }
+        if event.hook_event.as_deref() == Some("UserPromptSubmit") {
+            progress.prompt_submit(&terminal.session_name, now);
+        }
+    }
     // A turn's end (the Stop hook) inspects the checkouts it worked in (#3108).
     if event.event_type == AgentEventType::Idle && matches!(event.hook_event.as_deref(), Some("Stop" | "agent-turn-complete")) {
         if let Some(daemon) = daemon.as_ref() {
@@ -688,14 +701,7 @@ pub(super) async fn handle_agent_hook(
         AgentEventType::Ended | AgentEventType::NoChange | AgentEventType::Interrupted => return Ok(()),
     };
     if !event.native_codex_hook {
-        return crate::agent_attention::observe_hook_attention(
-            backend,
-            &terminal.namespace,
-            &terminal.session_name,
-            state,
-            event.event_type == AgentEventType::ToolActive,
-        )
-        .await;
+        return crate::agent_attention::observe_hook_attention(backend, &terminal.namespace, &terminal.session_name, state).await;
     }
     let sessions = backend.using::<flotilla_resources::TerminalSession>(&terminal.namespace);
     sessions.get(&terminal.session_name).await.map_err(|error| error.to_string())?;
@@ -708,12 +714,7 @@ pub(super) async fn handle_agent_hook(
         &sessions,
         &terminal.session_name,
         &if event.harness == flotilla_protocol::AgentHarness::Codex {
-            flotilla_resources::TerminalSessionStatusPatch::ObserveNativeCodexHook {
-                attention,
-                tool_activity: event.event_type == AgentEventType::ToolActive,
-            }
-        } else if event.event_type == AgentEventType::ToolActive {
-            flotilla_resources::TerminalSessionStatusPatch::ObserveToolActivity { attention }
+            flotilla_resources::TerminalSessionStatusPatch::ObserveNativeCodexHook { attention }
         } else {
             flotilla_resources::TerminalSessionStatusPatch::ObserveAttention { attention }
         },

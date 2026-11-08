@@ -285,6 +285,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
 async fn idle_crew_nudges_are_bounded_and_credential_staged() {
     use super::support::resume_staging_fixture_with_clock;
     use flotilla_resources::{Clock, StallRung};
+    use flotilla_state_machines::machines::agent_session::Activity;
     use flotilla_store_testkit::VirtualClock;
 
     for limit in [0, 2] {
@@ -310,6 +311,11 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         session_status.attention =
             Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: clock.now(), source: TerminalAttentionSource::Hook });
         sessions.update_status("resume-staging-session", &session.metadata.resource_version, &session_status).await.expect("idle session");
+        let agents = super::support::agent_sessions(&daemon);
+        let hook = |activity, cause: &str, at| {
+            agents.observe("resume-staging-session", activity, cause.into(), super::support::engine_at(at)).expect("hook activity");
+        };
+        hook(Activity::Idle, "Stop", clock.now());
         let expected_rung = if limit == 0 { StallRung::Operator } else { StallRung::Nudge };
         daemon.reconcile_crew_stalls_once("flotilla").await.expect("first stall judgement");
         let first = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
@@ -351,7 +357,10 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
                 // to that turn. Coalescing both writes would erase that ordering.
                 daemon.reconcile_crew_stalls_once("flotilla").await.expect("observe delivered nudge");
                 let session = sessions.get("resume-staging-session").await.expect("session");
+                // The agent takes the nudge and stops again: its next turn ends after the delivery.
+                hook(Activity::Working, "UserPromptSubmit", clock.now());
                 session_status.attention.as_mut().expect("attention").as_of = clock.advance(chrono::Duration::seconds(cooldown_seconds));
+                hook(Activity::Idle, "Stop", clock.now());
                 sessions
                     .update_status("resume-staging-session", &session.metadata.resource_version, &session_status)
                     .await

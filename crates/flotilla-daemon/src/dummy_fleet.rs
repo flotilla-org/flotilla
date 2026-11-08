@@ -73,15 +73,18 @@ impl CrewCommandPort for DaemonCrewPort {
         } else {
             (TerminalAttentionState::Idle, Activity::Idle, DUMMY_IDLE_CAUSE)
         };
-        if let Some(primitives) = self.daemon.upgrade().and_then(|daemon| daemon.message_primitives()) {
-            if let Err(error) =
-                crate::agent_attention::record_agent_activity(&self.backend, &primitives, namespace, session, activity, cause).await
-            {
-                // As for a harness hook: the AgentSession is an additional observer.
-                warn!(%session, %error, "failed to record dummy crew activity");
+        if let Some(daemon) = self.daemon.upgrade() {
+            daemon.crew_progress().hook(session, daemon.clock().now());
+            if let Some(primitives) = daemon.message_primitives() {
+                if let Err(error) =
+                    crate::agent_attention::record_agent_activity(&self.backend, &primitives, namespace, session, activity, cause).await
+                {
+                    // As for a harness hook: the AgentSession is an additional observer.
+                    warn!(%session, %error, "failed to record dummy crew activity");
+                }
             }
         }
-        crate::agent_attention::observe_hook_attention(&self.backend, namespace, session, state, false).await
+        crate::agent_attention::observe_hook_attention(&self.backend, namespace, session, state).await
     }
 }
 

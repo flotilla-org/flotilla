@@ -1413,6 +1413,26 @@ async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
 #[tokio::test]
 async fn managed_hook_turns_update_attention_through_terminal_session() {
     let (_tmp, daemon) = empty_daemon().await;
+    // Hooks record the crew's AgentSession on the Message path the runtime always opens, whose
+    // delivery, and the stall judging after it, wait for a designated fleet.
+    crate::runtime::open_message_primitives(&daemon).await.expect("open the Message path");
+    {
+        use flotilla_resources::{FleetDesignation, FleetDesignationSpec, Project, ProjectSpec, FLEET_DESIGNATION_NAME};
+        let backend = daemon.resource_backend();
+        backend
+            .definitions::<Project>("flotilla")
+            .create(&InputMeta::builder().name("fleet".into()).build(), &ProjectSpec::builder().display_name("Fleet".into()).build())
+            .await
+            .expect("fleet project");
+        backend
+            .definitions::<FleetDesignation>("flotilla")
+            .create(
+                &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
+                &FleetDesignationSpec { fleet: Some("fleet".into()), project: "fleet".into(), image_cache: None },
+            )
+            .await
+            .expect("fleet designation");
+    }
     let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
     for (harness_name, harness, active_event, active_payload, idle_event, idle_payload) in [
         (
@@ -1578,6 +1598,17 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                 }
                 .apply(&mut status);
                 sessions.update_status(&name, &current.metadata.resource_version, &status).await.expect("screen working status");
+                // The terminal runtime records the same screen read on the crew's AgentSession.
+                daemon
+                    .message_primitives()
+                    .expect("Message path")
+                    .sessions()
+                    .observe_screen(
+                        &name,
+                        flotilla_state_machines::machines::agent_session::Activity::Working,
+                        flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()),
+                    )
+                    .expect("screen working activity");
             } else {
                 let parsed = parser.parse_event(event_type, payload.as_bytes()).expect("parse hook");
                 let response = dispatch_request_with_state(
@@ -1590,6 +1621,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                             .harness(harness.clone())
                             .event_type(parsed.event_type)
                             .maybe_session_id(parsed.session_id)
+                            .maybe_hook_event(flotilla_agent::hooks::hook_event_name(&harness, event_type).map(str::to_owned))
                             .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() })
                             .build(),
                     },
@@ -1617,12 +1649,12 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             assert_eq!(attention.source, source);
             daemon.reconcile_crew_stalls_once("flotilla").await.expect("observe actor hook");
             let convoy_status = convoys.get(&convoy_name).await.expect("convoy").status.expect("status");
-            let obligation = convoy_status.nudge_obligations.first().expect("actor obligation");
+            let hook_at = daemon.crew_progress().get(&name).hook_at;
             if source == flotilla_resources::TerminalAttentionSource::Hook {
-                assert_eq!(obligation.last_hook_at, Some(attention.as_of));
+                assert!(hook_at.is_some(), "an attributed hook is seen");
                 assert!(convoy_status.attention.is_none(), "attributed idle hooks clear the no-hook advisory");
             } else {
-                assert!(obligation.last_hook_at.is_none(), "screen evidence must not masquerade as a hook");
+                assert!(hook_at.is_none(), "screen evidence must not masquerade as a hook");
                 assert_eq!(convoy_status.attention.as_ref().map(|a| a.source.as_str()), Some("missing-turn-hook"));
             }
         }

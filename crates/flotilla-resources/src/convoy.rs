@@ -1267,18 +1267,9 @@ pub struct NudgeObligation {
     pub history: Vec<StallNudge>,
     #[builder(default)]
     pub progress: BTreeMap<String, String>,
-    pub quiet_since: Option<DateTime<Utc>>,
-    pub last_hook_at: Option<DateTime<Utc>>,
-    pub last_attention_at: Option<DateTime<Utc>>,
-    /// Beginning of a continuously observed turn; screen redraws are not tool progress.
-    /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_since: Option<DateTime<Utc>>,
     // Stored-data compatibility: defaults may be removed one fleet roll later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_after: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_tool_activity_at: Option<DateTime<Utc>>,
     pub message_id: Option<String>,
     pub delivered_message_id: Option<String>,
 }
@@ -1503,7 +1494,6 @@ fn clear_nudge_budget(status: &mut ConvoyStatus, vessel: &str, role: &str) {
         if matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role: actor_role } if actor_vessel == vessel && actor_role == role)
         {
             obligation.history.clear();
-            obligation.quiet_since = None;
             obligation.reply_after = None;
         }
     }

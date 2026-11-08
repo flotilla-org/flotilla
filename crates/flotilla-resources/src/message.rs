@@ -277,8 +277,6 @@ pub struct MessageSubmission {
     #[builder(default)]
     pub members: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_since: Option<DateTime<Utc>>,
     /// The agent transport the router chose for this batch; polls and
     /// observations go back to it. Absent on submissions recorded before the

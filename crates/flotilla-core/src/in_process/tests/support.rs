@@ -695,6 +695,25 @@ pub(super) async fn stall_test_daemon_with_clock(
     (daemon, backend, temp, task)
 }
 
+/// The daemon's AgentSessions, where its harness hooks and screen reads record a crew's activity
+/// beside the TerminalSession's attention; stall judgement reads them (#3108).
+pub(super) fn agent_sessions(daemon: &InProcessDaemon) -> Arc<crate::primitives::Sessions> {
+    let service = daemon.decided_store().expect("decided store");
+    let primitives = crate::primitives::MessagePrimitives::open(
+        daemon.node_id().as_str(),
+        service,
+        daemon.resource_backend(),
+        daemon.clock_for_scenarios(),
+    )
+    .expect("open the AgentSessions");
+    Arc::clone(primitives.sessions())
+}
+
+/// `at` as the engine records it.
+pub(super) fn engine_at(at: chrono::DateTime<Utc>) -> flotilla_schema::Timestamp {
+    flotilla_schema::Timestamp::from_datetime(&at)
+}
+
 pub(super) async fn wait_for_stall(backend: &ResourceBackend, name: &str, expected: bool) -> ConvoyStatus {
     tokio::time::timeout(std::time::Duration::from_secs(4), async {
         loop {

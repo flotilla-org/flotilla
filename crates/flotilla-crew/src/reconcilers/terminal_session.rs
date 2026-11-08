@@ -1,4 +1,5 @@
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_resources::agent_activity::{AgentActivityView, ProgressFacts};
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
 use flotilla_resources::Actuation;
 use flotilla_terminal::{TerminalPool, TerminalSessionTag};
@@ -189,6 +190,8 @@ pub struct TerminalSessionReconciler<R> {
     demands: TypedResolver<Demand>,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
+    /// Where new terminal output is recorded as crew progress, when this daemon keeps it.
+    progress: Option<Arc<ProgressFacts>>,
 }
 
 impl<R> TerminalSessionReconciler<R> {
@@ -205,6 +208,25 @@ impl<R> TerminalSessionReconciler<R> {
             demands: backend.using::<Demand>(namespace),
             local_host_ref: None,
             additional_host_refs: Default::default(),
+            progress: None,
+        }
+    }
+
+    /// Records each session's new terminal output in `progress` (#3108).
+    pub fn with_progress(mut self, progress: Arc<ProgressFacts>) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// The session's AgentSession at this home, for confirming a held turn; none when it cannot
+    /// be read, which confirms nothing.
+    fn agent_session(&self, name: &str) -> Option<AgentActivityView> {
+        match self.lifecycle_reads.agent_sessions().and_then(|reads| reads.read(name, None)) {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::debug!(session = name, %error, "held turn has no AgentSession to confirm it");
+                None
+            }
         }
     }
 
@@ -385,10 +407,7 @@ pub enum TerminalPrepared {
     Failed(String),
 }
 
-use flotilla_resources::delivery_hold::{
-    delivery_acceptance_evidence, delivery_retry_delay, delivery_retry_exhausted, DELIVERY_HOLD_FOR, DELIVERY_MAX_ATTEMPTS,
-    DELIVERY_WORKING_DEBOUNCE_FOR,
-};
+use flotilla_resources::delivery_hold::{delivery_retry_delay, delivery_retry_exhausted, DELIVERY_HOLD_FOR, DELIVERY_MAX_ATTEMPTS};
 
 fn pending_delivery_hold(session: &ResourceObject<TerminalSession>) -> Option<&flotilla_resources::TerminalSessionDegradedCondition> {
     let status = session.status.as_ref()?;
@@ -758,7 +777,11 @@ where
             matches!(prepared, TerminalPrepared::Attention(_) | TerminalPrepared::MessageDeliveryPending | TerminalPrepared::None)
         });
         let consumed = held.is_some_and(|condition| {
-            held_delivery_consumed(obj.status.as_ref().expect("held status"), prepared, condition.observed_at, now)
+            held_delivery_consumed(
+                obj.status.as_ref().expect("held status"),
+                self.agent_session(&obj.metadata.name).as_ref(),
+                condition.observed_at,
+            )
         });
         let expired = held.is_some_and(|condition| {
             condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
@@ -916,22 +939,16 @@ where
                             "terminal attention decision"
                         );
                     }
-                    let output_changed = observation
-                        .output_digest
-                        .as_ref()
-                        .is_some_and(|digest| current.and_then(|status| status.last_output_digest.as_ref()) != Some(digest))
-                        && current
-                            .and_then(|status| status.last_output_activity_at)
-                            .is_none_or(|at| now.signed_duration_since(at) >= chrono::Duration::seconds(30));
-                    (occupancy_changed || attention_changed || output_changed || obstruction_changed).then_some(
-                        TerminalSessionStatusPatch::Observe {
-                            attention,
-                            obstruction,
-                            occupancy: observation.occupancy,
-                            output_digest: observation.output_digest.clone().filter(|_| output_changed),
-                            observed_at: now,
-                        },
-                    )
+                    // New output is progress, held in memory only (#3108): a restart restarts the
+                    // stall clock, so the first reading after it sets the baseline.
+                    if let (Some(progress), Some(digest)) = (&self.progress, observation.output_digest.as_deref()) {
+                        progress.output(&obj.metadata.name, digest, now);
+                    }
+                    (occupancy_changed || attention_changed || obstruction_changed).then_some(TerminalSessionStatusPatch::Observe {
+                        attention,
+                        obstruction,
+                        occupancy: observation.occupancy,
+                    })
                 }
                 TerminalPrepared::AttentionStale => Some(TerminalSessionStatusPatch::ObserveAttention {
                     attention: TerminalAttention {
@@ -1136,45 +1153,15 @@ fn held_observation<T>(result: Result<T, String>, hold_overdue: bool) -> Result<
     }
 }
 
+/// Whether the agent took up a held turn (#3108): its AgentSession began working after the
+/// hold, or this daemon saw a prompt submitted or a tool called after it; a notify-only Codex
+/// crew's turn also by its next completion.
 fn held_delivery_consumed(
     status: &flotilla_resources::TerminalSessionStatus,
-    prepared: &TerminalPrepared,
+    agent: Option<&AgentActivityView>,
     held_at: DateTime<Utc>,
-    now: DateTime<Utc>,
 ) -> bool {
-    if status.codex_completed_after(held_at, now) {
-        return true;
-    }
-    let working = |attention: &TerminalAttention| {
-        attention.state == TerminalAttentionState::Working && attention.as_of > held_at && !attention.is_stale_at(now)
-    };
-    let stored_hook =
-        status.attention.as_ref().is_some_and(|attention| working(attention) && attention.source == TerminalAttentionSource::Hook);
-    // Tool hooks retain positive evidence after the turn ends and a Stop hook
-    // replaces Working with Idle, including holds recovered after an upgrade.
-    if stored_hook
-        || status.last_tool_activity_at.is_some_and(|at| at > held_at)
-        || status.last_hook_working_at.is_some_and(|at| at > held_at)
-    {
-        return delivery_acceptance_evidence(true, false, false, false, false);
-    }
-    let TerminalPrepared::Attention(observation) = prepared else { return false };
-    // Hooks are authoritative. Screen Working must survive a debounce window,
-    // rather than acknowledging one flickering classifier sample.
-    let observed_working = observation.attention.as_ref().is_some_and(|attention| {
-        working(attention)
-            && (attention.source == TerminalAttentionSource::Hook
-                || status.attention.as_ref().is_some_and(|previous| {
-                    working(previous) && attention.as_of.signed_duration_since(previous.as_of) >= DELIVERY_WORKING_DEBOUNCE_FOR
-                }))
-    });
-    let changed_output = observation
-        .output_digest
-        .as_ref()
-        .is_some_and(|digest| status.last_output_digest.as_ref().is_some_and(|previous| previous != digest));
-    // A digest also changes on idle prompt/status redraws. Only combine it
-    // with fresh Working evidence; otherwise wait for hooks or stable Working.
-    delivery_acceptance_evidence(false, false, observation.attention.as_ref().is_some_and(working), observed_working, changed_output)
+    status.codex_completed_after(agent, held_at) || agent.is_some_and(|agent| agent.took_up_after(held_at))
 }
 
 /// The hold's episode began when its condition was observed; one not yet recorded begins now.

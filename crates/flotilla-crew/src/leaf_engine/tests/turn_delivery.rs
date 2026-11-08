@@ -273,6 +273,47 @@ async fn silent_working_turn_reaches_supervision() {
     assert!(recovered.stalled.is_none(), "tool activity recovers the maker: {:?}", recovered.stalled);
 }
 
+async fn stalled_at(backend: &ResourceBackend, wake: &ReconcilerWake, now: DateTime<Utc>) -> Option<flotilla_resources::StalledCondition> {
+    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+    wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.expect("judge turn");
+    backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy").status.expect("status").stalled
+}
+
+// #3108: a long turn that keeps calling tools is never bounded by its length; the bound counts
+// from its last tool call.
+#[tokio::test]
+async fn long_turn_with_tool_activity_is_bounded_only_by_its_silence() {
+    let (backend, wake, _) = idle_nudge_scenario().await;
+    let start = Utc::now();
+    observe_actor_source(&backend, &wake, TerminalAttentionState::Working, TerminalAttentionSource::Hook, start).await;
+    for minute in (5..=30).step_by(5) {
+        agents().progress.tool("resumed-coder", start + chrono::Duration::minutes(minute));
+        assert!(stalled_at(&backend, &wake, start + chrono::Duration::minutes(minute) + chrono::Duration::seconds(1)).await.is_none());
+    }
+    let last_tool = start + chrono::Duration::minutes(30);
+    assert!(stalled_at(&backend, &wake, last_tool + chrono::Duration::seconds(899)).await.is_none(), "45 minutes in, 14:59 silent");
+    let stall = stalled_at(&backend, &wake, last_tool + chrono::Duration::seconds(900)).await.expect("15 silent minutes stall");
+    assert!(stall.evidence.contains("turn inactivity bound"), "{}", stall.evidence);
+}
+
+// #3108: what the daemon saw of a turn's progress is not stored, so a restarted daemon counts the
+// turn's silence from its own start, not from the turn's.
+#[tokio::test]
+async fn a_restart_starts_the_turn_clock_at_the_restart() {
+    let (backend, wake, _) = idle_nudge_scenario().await;
+    let start = Utc::now();
+    observe_actor_source(&backend, &wake, TerminalAttentionState::Working, TerminalAttentionSource::Hook, start).await;
+    agents().progress.tool("resumed-coder", start + chrono::Duration::minutes(10));
+    let restart = start + chrono::Duration::minutes(20);
+    let wake = ReconcilerWake::new(wake.subscriptions.with_lifecycle_reads(restarted_agent_reads(restart)));
+    assert!(
+        stalled_at(&backend, &wake, restart + chrono::Duration::seconds(899)).await.is_none(),
+        "35 minutes in, 14:59 after the restart"
+    );
+    let stall = stalled_at(&backend, &wake, restart + chrono::Duration::seconds(900)).await.expect("15 minutes after the restart");
+    assert!(stall.evidence.contains("turn inactivity bound"), "{}", stall.evidence);
+}
+
 // Losing observation is not a new turn boundary: stale/Unobservable
 // evidence must not reset a hung turn's bound or masquerade as a real hook.
 #[tokio::test]

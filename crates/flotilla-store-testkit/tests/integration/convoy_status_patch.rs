@@ -1359,7 +1359,6 @@ fn nudge_budget_survives_stall_clear_and_resets_only_for_progress_by_that_actor(
             .maker(LeafMaker::Actor { vessel: "work".into(), role: role.into() })
             .leaves(vec![leaf.clone()])
             .history(vec![StallNudge { at: ts(10), row: leaf }])
-            .quiet_since(ts(10))
             .build()
     };
     let mut status = ConvoyStatus {

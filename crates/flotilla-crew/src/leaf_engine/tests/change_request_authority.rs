@@ -878,7 +878,7 @@ async fn issue_leaf_uses_issue_refresher_staleness() {
         },
     );
     let table = LeafSubscriptionTable::with_issues(backend.clone(), broadcast_test_sink(event_tx), change_requests, issues)
-        .with_lifecycle_reads(no_held_checkouts());
+        .with_lifecycle_reads(agent_reads());
     let connection = uuid::Uuid::new_v4();
     table
         .subscribe_wait(

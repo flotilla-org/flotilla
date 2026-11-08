@@ -1908,7 +1908,7 @@ impl Aggregator {
         let current = Some(&home) == self.agent_session_home.as_ref()
             || agent_activity::home_current(self.agent_session_heard.get(&home).copied(), now);
         let reading = self.agent_sessions.get(&AgentSessionKey { home, name: session.object.metadata.name.clone() })?.clone();
-        Some(AgentActivityView { reading, current })
+        Some(AgentActivityView { reading, current, progress: None })
     }
 
     /// An environment's engine record changed, or any of them may have (`None` or a rescan):

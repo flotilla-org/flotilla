@@ -13,6 +13,8 @@ use flotilla_resources::{
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
 
+use flotilla_state_machines::machines::agent_session::Activity;
+
 use super::support::{resume_staging_fixture, resume_staging_fixture_with_backend, test_meta};
 use crate::in_process::{input_meta_from_resource, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
@@ -406,6 +408,12 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         )
         .await
         .expect("governor idle");
+    // Each hook is recorded on the session's AgentSession too, which stall judgement reads.
+    let agents = super::support::agent_sessions(&daemon);
+    let hook = |session: &str, activity, cause: &str| {
+        agents.observe(session, activity, cause.into(), super::support::engine_at(clock.now())).expect("hook activity");
+    };
+    hook("governor-session", Activity::Idle, "Stop");
     let patch = convoy_external_patches::mark_crew_stalled(
         "resume-staging".to_string(),
         "work".to_string(),
@@ -464,6 +472,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         )
         .await
         .expect("governor working");
+    hook("governor-session", Activity::Working, "UserPromptSubmit");
     let source_session = sessions.get("resume-staging-session").await.expect("source session");
     sessions
         .update_status(
@@ -481,6 +490,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         )
         .await
         .expect("source needs input");
+    hook("resume-staging-session", Activity::NeedsInput, "PermissionRequest");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let status = convoys.get("resume-staging").await.expect("source").status.expect("status");
@@ -513,6 +523,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         )
         .await
         .expect("source resumes work");
+    hook("resume-staging-session", Activity::Working, "PostToolUse");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if convoys.get("resume-staging").await.expect("source").status.expect("status").stalled.is_none() {

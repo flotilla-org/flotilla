@@ -2955,12 +2955,8 @@ async fn create_running_terminal(
             &created.metadata.resource_version,
             &TerminalSessionStatus {
                 codex_native_hooks: false,
-                last_hook_working_at: None,
                 configured_limits: None,
                 turn_delivery_hold: None,
-                last_tool_activity_at: None,
-                last_output_digest: None,
-                last_output_activity_at: None,
                 phase: TerminalSessionPhase::Running,
                 session_id: Some(format!("session-{name}")),
                 cleat_endpoint: None,

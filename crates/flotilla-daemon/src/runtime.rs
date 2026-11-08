@@ -889,11 +889,13 @@ fn spawn_controller_loops(
                 let state = Arc::clone(&state);
                 let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.terminal_sessions));
                 let reads = state.daemon.lifecycle_reads();
+                let progress = state.daemon.crew_progress();
                 (
                     vec![],
                     Engine::<_, TerminalSessionBinding>::new(
                         TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
                             .with_lifecycle_reads(reads)
+                            .with_progress(progress)
                             .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
                             .with_additional_host_refs(additional_host_refs)
                             .with_federated_convoys(&backend, &namespace_string),
@@ -1140,7 +1142,7 @@ pub fn engine_opener(config: &ConfigStore) -> flotilla_core::in_process::EngineO
 
 /// Opens the Message path over the decided store composed with the daemon (#3317). Installed
 /// before peer tasks start, so every peer's log is followed from the first connection.
-async fn open_message_primitives(daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
+pub(crate) async fn open_message_primitives(daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
     let service =
         daemon.decided_store().map_err(|error| format!("[primitives] needs the decided store composed with the daemon: {error}"))?;
     let home = daemon.node_id().as_str().to_owned();
@@ -1388,11 +1390,7 @@ async fn open_provisioning_lifecycles(
         LifecycleReadPort::new(StoreReads::new(store), home)
             .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>)
             .with_clones(clones as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
-            .with_checkouts(Arc::clone(&lifecycles.checkout_records) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
-            .with_agent_sessions(Arc::new(flotilla_core::in_process::DecidedAgentSessions::new(
-                daemon.decided_store()?,
-                daemon.clock_for_scenarios(),
-            ))),
+            .with_checkouts(Arc::clone(&lifecycles.checkout_records) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>),
     ))?;
     // Cached checkout providers end with the checkout launches they belong to.
     daemon.follow_checkout_provider_lifetimes()?;

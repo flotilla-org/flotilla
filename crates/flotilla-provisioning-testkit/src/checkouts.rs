@@ -112,6 +112,18 @@ impl CheckoutFixture {
         self
     }
 
+    /// Readings that serve this fixture's checkouts and `agent_sessions`.
+    pub fn reads_with_agent_sessions(
+        &self,
+        agent_sessions: Arc<dyn flotilla_resources::agent_activity::AgentSessionReads>,
+    ) -> Arc<dyn LifecycleReads> {
+        Arc::new(
+            LifecycleReadPort::new(StoreReads::new(Arc::clone(&self.store)), self.home.clone())
+                .with_checkouts(Arc::clone(&self.checkouts) as Arc<dyn CheckoutRecords>)
+                .with_agent_sessions(agent_sessions),
+        )
+    }
+
     /// Admits engine Convoy `name` here, open, its one obligation the lead's lifetime duty: what a
     /// checkout held for it is requested under.
     pub fn open_convoy(&self, name: &str) {

@@ -76,10 +76,12 @@ struct Holder {
     inboxes: BTreeSet<Address>,
 }
 
-/// A turn being typed: the messages it carries, for the receipts.
+/// A turn being typed, or typed and held: the messages it carries, for the receipts, and when
+/// it was submitted, for the evidence that confirms it.
 struct InFlight {
     consumer: Receiver,
     members: Vec<String>,
+    submitted_at: chrono::DateTime<Utc>,
 }
 
 pub(super) struct MessageDelivery {
@@ -93,6 +95,10 @@ pub(super) struct MessageDelivery {
     /// Messages typed without confirmation, held so a pass never retypes them
     /// before the delivery hold runs out.
     held: TurnHolds,
+    /// The turns those messages were typed in, until the agent's record confirms one (#3108).
+    held_turns: Vec<InFlight>,
+    /// Whether any turn is held: only then does a tool call or prompt submit wake a pass.
+    holding: Arc<std::sync::atomic::AtomicBool>,
     /// This home's open messages, followed incrementally from the log.
     open: OpenMessages,
     /// Wakes a pass: every event source notifies it.
@@ -115,6 +121,8 @@ impl MessageDelivery {
             sessions: BTreeSet::new(),
             inflight: BTreeMap::new(),
             held: TurnHolds::default(),
+            held_turns: Vec::new(),
+            holding: Arc::default(),
             open: OpenMessages::default(),
             wake: Arc::new(tokio::sync::Notify::new()),
         }
@@ -134,6 +142,17 @@ impl MessageDelivery {
         };
         // The store holds the listener weakly; it lives as long as this loop.
         self.primitives.service().on_commit(Arc::downgrade(&listener));
+        // A held turn is confirmed by a tool call or prompt submit, which only this daemon's memory
+        // holds: they wake a pass while a turn is held.
+        let evidence: Arc<flotilla_resources::agent_activity::ProgressListener> = {
+            let (wake, holding) = (Arc::clone(&wake), Arc::clone(&self.holding));
+            Arc::new(move |_: &str| {
+                if holding.load(std::sync::atomic::Ordering::SeqCst) {
+                    wake.notify_one();
+                }
+            })
+        };
+        self.state.daemon.crew_progress().on_turn_evidence(Arc::downgrade(&evidence));
         let backend = self.state.daemon.resource_backend();
         let mut watches = tokio::task::JoinSet::new();
         macro_rules! watch {
@@ -189,6 +208,7 @@ impl MessageDelivery {
         // Receipts first: a turn confirmed before its session's teardown records
         // its receipt before rebind unbinds and ends that session (#3894).
         self.collect_turns().await;
+        self.confirm_held_turns().await;
         let holders = self.holders(now).await?;
         let person = self.primitives.register_person(now).await?;
         let mut consumers: BTreeSet<_> =
@@ -356,26 +376,14 @@ impl MessageDelivery {
                 // transport confirms the turn, then the deliver. A receipt whose deliver is
                 // refused or interrupted stays committed: the message is no longer pending
                 // for this consumer, so it is never retyped, and the sweep records its deliver.
-                Ok(TerminalDeliveryOutcome::Confirmed) => {
-                    let inbox = self.primitives.inbox();
-                    for message in &turn.members {
-                        self.held.release(message);
-                        if let Err(error) = inbox.receive(&turn.consumer, message, Transport::Turn).await {
-                            warn!(%message, %error, "a confirmed turn's receipt was refused");
-                            continue;
-                        }
-                        if let Err(error) =
-                            inbox.deliver(message, Deliver { receiver: turn.consumer.clone(), transport: Transport::Turn }).await
-                        {
-                            warn!(%message, %error, "a confirmed turn's deliver was refused; the sweep reconciles it");
-                        }
-                    }
-                }
-                // Typed, but no stable busy signal followed: held, never retyped, until the hold runs out.
+                Ok(TerminalDeliveryOutcome::Confirmed) => self.record_turn(&turn).await,
+                // Typed, but no stable busy signal followed: held, never retyped, until the agent's
+                // record confirms it or the hold runs out.
                 Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)) => {
                     let until = std::time::Instant::now()
                         + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
-                    self.held.hold(turn.members, until);
+                    self.held.hold(turn.members.iter().cloned(), until);
+                    self.held_turns.push(turn);
                 }
                 Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable)) => {
                     let Some(message_id) = turn.members.first() else {
@@ -400,6 +408,62 @@ impl MessageDelivery {
             }
         }
         self.held.expire(std::time::Instant::now());
+    }
+
+    /// Records a confirmed turn: each message's receipt, then its deliver.
+    async fn record_turn(&mut self, turn: &InFlight) {
+        let inbox = self.primitives.inbox();
+        for message in &turn.members {
+            self.held.release(message);
+            if let Err(error) = inbox.receive(&turn.consumer, message, Transport::Turn).await {
+                warn!(%message, %error, "a confirmed turn's receipt was refused");
+                continue;
+            }
+            if let Err(error) = inbox.deliver(message, Deliver { receiver: turn.consumer.clone(), transport: Transport::Turn }).await {
+                warn!(%message, %error, "a confirmed turn's deliver was refused; the sweep reconciles it");
+            }
+        }
+    }
+
+    /// Confirms held turns the agent took up (#3108): its AgentSession began working after the
+    /// turn was submitted, or this daemon saw a prompt submit or tool call after it, or, for a
+    /// notify-only Codex crew, its next completion. A turn whose hold ran out, or whose messages
+    /// were superseded, is no longer held.
+    async fn confirm_held_turns(&mut self) {
+        for turn in &mut self.held_turns {
+            turn.members.retain(|message| self.held.is_held(message));
+        }
+        self.held_turns.retain(|turn| !turn.members.is_empty());
+        let mut confirmed = Vec::new();
+        for (index, turn) in self.held_turns.iter().enumerate() {
+            let agent = match self.state.daemon.lifecycle_reads().agent_sessions().and_then(|reads| reads.read(&turn.consumer.id, None)) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    debug!(session = %turn.consumer.id, %error, "a held turn has no AgentSession to confirm it");
+                    continue;
+                }
+            };
+            let took_up = agent.as_ref().is_some_and(|agent| agent.took_up_after(turn.submitted_at));
+            let completed = !took_up
+                && match self.state.daemon.resource_backend().using::<TerminalSession>(&self.namespace).get(&turn.consumer.id).await {
+                    Ok(terminal) => {
+                        terminal.status.as_ref().is_some_and(|status| status.codex_completed_after(agent.as_ref(), turn.submitted_at))
+                    }
+                    Err(error) => {
+                        debug!(session = %turn.consumer.id, %error, "a held turn's session could not be read");
+                        false
+                    }
+                };
+            if took_up || completed {
+                confirmed.push(index);
+            }
+        }
+        for index in confirmed.into_iter().rev() {
+            let turn = self.held_turns.remove(index);
+            tracing::info!(session = %turn.consumer.id, messages = ?turn.members, "the agent's record confirms a held turn");
+            self.record_turn(&turn).await;
+        }
+        self.holding.store(!self.held_turns.is_empty(), std::sync::atomic::Ordering::SeqCst);
     }
 
     /// A due operator or supervisor turn supersedes this session's held
@@ -517,6 +581,7 @@ impl MessageDelivery {
         }
         let session = holder.session_id.clone();
         let typed = text.clone();
+        let submitted_at = self.state.daemon.clock().now();
         let stop = tokio_util::sync::CancellationToken::new();
         let teardown = stop.clone();
         let trace_spans: Vec<_> = members.iter().map(|message| flotilla_tracing::queued_span(message, "attempt")).collect();
@@ -548,7 +613,7 @@ impl MessageDelivery {
                 engine_turn: Some(EngineTurn::new(stop)),
             },
         );
-        self.inflight.insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members });
+        self.inflight.insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members, submitted_at });
         Ok(())
     }
 }

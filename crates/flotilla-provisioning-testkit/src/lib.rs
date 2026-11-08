@@ -1,10 +1,12 @@
 //! Real decided-store fixture shared by lifecycle reader contract tests.
+pub mod agent_sessions;
 pub mod checkouts;
 pub mod clones;
 pub mod environments;
 pub mod image_build;
 mod memory_store;
 pub mod other_home;
+pub use agent_sessions::AgentSessionsFixture;
 pub use checkouts::CheckoutFixture;
 pub use clones::CloneFixture;
 pub use environments::EnvironmentFixture;
