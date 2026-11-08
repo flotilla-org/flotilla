@@ -28,8 +28,10 @@ fn store() -> Arc<Mutex<Store>> {
     Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")))
 }
 
-fn checkout(environment: &str, convoy: &str) -> CheckoutRequest {
+fn checkout(name: &str, environment: &str, convoy: &str) -> CheckoutRequest {
     CheckoutRequest {
+        launch_of: name.into(),
+        launch: 0,
         repository: "repo".into(),
         environment: Ref::new(environment.to_owned(), HOME),
         branch: "feature".into(),
@@ -55,14 +57,15 @@ fn views_are_read_by_key_and_index_and_judged_per_key() {
     let checkouts: Arc<dyn Lifecycles<CheckoutKind>> =
         Arc::new(LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("home")));
     let reads = StoreReads::new(Arc::clone(&store));
-    for (name, environment, convoy) in [("a", "env-1", "convoy-1"), ("b", "env-1", "convoy-2"), ("c", "env-2", "convoy-1")] {
-        checkouts.request(name, checkout(environment, convoy), Timestamp(1_000_000)).expect("requested");
-    }
-    assert_eq!(reads.checkout("a", HOME).expect("read").expect("held").judgement, Judgement::InProgress);
-    assert!(reads.checkout("a", "elsewhere").expect("read").is_none(), "keyed by home too");
+    let [a, b, c] =
+        [("a", "env-1", "convoy-1"), ("b", "env-1", "convoy-2"), ("c", "env-2", "convoy-1")].map(|(name, environment, convoy)| {
+            checkouts.request(name, checkout(name, environment, convoy), Timestamp(1_000_000)).expect("requested").name().to_owned()
+        });
+    assert_eq!(reads.checkout(&a, HOME).expect("read").expect("held").judgement, Judgement::InProgress);
+    assert!(reads.checkout(&a, "elsewhere").expect("read").is_none(), "keyed by home too");
 
-    checkouts.step("a", &failure("worktree add failed"), Timestamp(2_000_000)).expect("attempt");
-    match reads.checkout("a", HOME).expect("read").expect("held").judgement {
+    checkouts.step(&a, &failure("worktree add failed"), Timestamp(2_000_000)).expect("attempt");
+    match reads.checkout(&a, HOME).expect("read").expect("held").judgement {
         Judgement::Retrying { failures: 1, next, last } => {
             assert_eq!(next, Timestamp(3_000_000), "Checkout's default policy: one second after the first failure");
             assert_eq!(last.detail, "worktree add failed");
@@ -70,21 +73,21 @@ fn views_are_read_by_key_and_index_and_judged_per_key() {
         other => panic!("{other:?}"),
     }
 
-    checkouts.step("b", &Step::Realised { identity: "/w".into() }, Timestamp(3)).expect("realised");
+    checkouts.step(&b, &Step::Realised { identity: "/w".into() }, Timestamp(3)).expect("realised");
     checkouts
-        .step("b", &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }, Timestamp(4))
+        .step(&b, &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }, Timestamp(4))
         .expect("vanished");
-    checkouts.step("c", &Step::Released, Timestamp(4)).expect("released");
-    assert_eq!(reads.checkout("b", HOME).expect("read").expect("held").judgement, Judgement::Lost { reason: None });
-    assert_eq!(reads.checkout("c", HOME).expect("read").expect("held").judgement, Judgement::Released);
+    checkouts.step(&c, &Step::Released, Timestamp(4)).expect("released");
+    assert_eq!(reads.checkout(&b, HOME).expect("read").expect("held").judgement, Judgement::Lost { reason: None });
+    assert_eq!(reads.checkout(&c, HOME).expect("read").expect("held").judgement, Judgement::Released);
 
     let names = |views: Vec<flotilla_provisioning::engine::reads::View<CheckoutKind>>| {
         let mut names: Vec<String> = views.into_iter().map(|view| view.name).collect();
         names.sort();
         names
     };
-    assert_eq!(names(reads.environment_checkouts("env-1", HOME).expect("index")), ["a", "b"]);
-    assert_eq!(names(reads.held_checkouts(&Holder::convoy("convoy-1")).expect("index")), ["a", "c"]);
+    assert_eq!(names(reads.environment_checkouts("env-1", HOME).expect("index")), [a.clone(), b.clone()]);
+    assert_eq!(names(reads.held_checkouts(&Holder::convoy("convoy-1")).expect("index")), [a.clone(), c.clone()]);
     assert!(reads.held_checkouts(&Holder::vessel("convoy-1")).expect("index").is_empty(), "the holder's kind is part of it");
     assert!(reads.environment_checkouts("env-3", HOME).expect("index").is_empty());
 }
@@ -122,9 +125,9 @@ fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
     let origin = store();
     let checkouts: Arc<dyn Lifecycles<CheckoutKind>> =
         Arc::new(LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&origin))).expect("home")));
-    checkouts.request("a", checkout("env-1", "convoy-1"), Timestamp(1)).expect("requested");
-    checkouts.step("a", &Step::Realised { identity: "/w".into() }, Timestamp(2)).expect("realised");
-    checkouts.step("a", &ending, Timestamp(3)).expect("released");
+    let a = checkouts.request("a", checkout("a", "env-1", "convoy-1"), Timestamp(1)).expect("requested").name().to_owned();
+    checkouts.step(&a, &Step::Realised { identity: "/w".into() }, Timestamp(2)).expect("realised");
+    checkouts.step(&a, &ending, Timestamp(3)).expect("released");
 
     let replica_of = || {
         let mut registry = KindRegistry::new();
@@ -149,7 +152,7 @@ fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
         }
         write.commit().expect("commit");
     }
-    assert_eq!(StoreReads::new(followed).checkout("a", HOME).expect("read").expect("held").judgement, expected);
+    assert_eq!(StoreReads::new(followed).checkout(&a, HOME).expect("read").expect("held").judgement, expected);
 
     let seeded = replica_of();
     {
@@ -159,7 +162,7 @@ fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
             let id = read
                 .resolve(
                     flotilla_state_machines::Resource::<flotilla_state_machines::machines::lifecycle::Lifecycle<CheckoutKind>>::CODE,
-                    "a",
+                    &a,
                     HOME,
                 )
                 .expect("resolve")
@@ -171,7 +174,7 @@ fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
         write.restore(&snapshot).expect("restored");
         write.commit().expect("commit");
     }
-    assert_eq!(StoreReads::new(seeded).checkout("a", HOME).expect("read").expect("held").judgement, expected);
+    assert_eq!(StoreReads::new(seeded).checkout(&a, HOME).expect("read").expect("held").judgement, expected);
 }
 
 // Behaviour (#3719 look-over ruling 4): a vessel finds its environment through the holder index,
@@ -196,17 +199,18 @@ fn a_vessel_finds_its_environment_by_its_holder() {
 }
 
 // Behaviour (#3629 layer 8): a terminal session is read by its record name as its current launch,
-// the latest `#<n>`, and a vessel's sessions through the `terminal_session.by_holder` index.
+// the newest by the `terminal_session.by_launch` index, and a vessel's sessions through the
+// `terminal_session.by_holder` index.
 #[test]
 fn a_session_reads_as_its_current_launch() {
-    use flotilla_provisioning::{
-        engine::launch,
-        stored::terminal_session::{Launch, TerminalSessionKind, TerminalSessionRequest},
-    };
+    use flotilla_provisioning::stored::terminal_session::{Launch, TerminalSessionKind, TerminalSessionRequest};
     let store = store();
     let sessions: Arc<dyn Lifecycles<TerminalSessionKind>> =
         Arc::new(LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("home")));
+    let name = "terminal-vessel-a-coder";
     let request = || TerminalSessionRequest {
+        launch_of: name.into(),
+        launch: 0,
         environment: Ref::new("env-a", HOME),
         holder: Some(Holder::vessel("vessel-a")),
         role: "coder".into(),
@@ -215,31 +219,31 @@ fn a_session_reads_as_its_current_launch() {
         env: Default::default(),
         source: Launch::Tool { command: "bash".into() },
     };
-    let name = "terminal-vessel-a-coder";
-    sessions.request(&launch(name, 1), request(), Timestamp(1)).expect("launch 1");
-    sessions.step(&launch(name, 1), &Step::Realised { identity: "s1".into() }, Timestamp(2)).expect("ran");
-    sessions.step(&launch(name, 1), &Step::Released, Timestamp(3)).expect("stopped");
-    sessions.request(&launch(name, 2), request(), Timestamp(4)).expect("launch 2");
-    sessions.step(&launch(name, 2), &Step::Realised { identity: "s2".into() }, Timestamp(5)).expect("ran again");
+    let first = sessions.request(name, request(), Timestamp(1)).expect("first launch").name().to_owned();
+    sessions.step(&first, &Step::Realised { identity: "s1".into() }, Timestamp(2)).expect("ran");
+    sessions.step(&first, &Step::Released, Timestamp(3)).expect("stopped");
+    let second = sessions.replace_launch(name, &first, request(), Timestamp(4)).expect("second launch");
+    sessions.step(&second, &Step::Realised { identity: "s2".into() }, Timestamp(5)).expect("ran again");
 
     let reads = StoreReads::new(store);
     let current = reads.terminal_session(name, HOME).expect("read").expect("held");
-    assert_eq!(current.name, launch(name, 2));
+    assert_eq!(current.name, second);
     assert_eq!(current.judgement, Judgement::Ready { identity: "s2".into() });
     assert!(reads.terminal_session("terminal-vessel-b-coder", HOME).expect("read").is_none());
     let mut launches: Vec<String> =
         reads.held_sessions(&Holder::vessel("vessel-a")).expect("index").into_iter().map(|view| view.name).collect();
     launches.sort();
-    assert_eq!(launches, [launch(name, 1), launch(name, 2)]);
+    let mut expected = vec![first, second.clone()];
+    expected.sort();
+    assert_eq!(launches, expected);
 
-    // Found however many launches there are (#3748 review): doubling past the latest, halving back.
-    for n in 3..=11 {
-        sessions.request(&launch(name, n), request(), Timestamp(10 + i64::from(n))).expect("launch");
-        assert_eq!(reads.terminal_session(name, HOME).expect("read").expect("held").name, launch(name, n));
+    // Found however many launches there are, numbered with the gaps the home's other writes leave.
+    let mut latest = second;
+    for _ in 0..9 {
+        sessions.step(&latest, &Step::Released, Timestamp(10)).expect("stopped");
+        latest = sessions.replace_launch(name, &latest, request(), Timestamp(11)).expect("launch");
+        assert_eq!(reads.terminal_session(name, HOME).expect("read").expect("held").name, latest);
     }
-    // A missing launch bounds the contiguous-prefix search; a later orphan is not the current launch.
-    sessions.request(&launch(name, 13), request(), Timestamp(23)).expect("orphan launch");
-    assert_eq!(reads.terminal_session(name, HOME).expect("read").expect("held").name, launch(name, 11));
 }
 
 // Behaviour (#3629 layer 8, Vessel): a vessel's lease reads by its name, Ready once realised and

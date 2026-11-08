@@ -41,6 +41,9 @@ pub trait Log<M: Machine> {
     ///
     /// The default preserves existing machines' immutable-spec create behavior.
     /// A specialized adapter must not change fields read by admission or gates.
+    /// A log that gives sequences numbers a launch here, by the sequence the
+    /// create takes ([`Resource::numbered`], [`Machine::launch`]); a log
+    /// wrapping another forwards this call so its inner log can.
     fn create_resource(
         &mut self,
         writer: &str,
@@ -157,6 +160,20 @@ impl<M: Machine> Default for MemoryLog<M> {
 impl<M: Machine> Log<M> for MemoryLog<M> {
     fn create(&mut self, _: &str, _: Timestamp, _: &Resource<M>, _: &[InputRead]) -> Result<Version, LogError> {
         Ok(self.next(Version(0)))
+    }
+
+    /// A launch is numbered by the sequence its create takes ([`Machine::launch`]).
+    fn create_resource(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<M>,
+        reads: &[InputRead],
+    ) -> Result<Resource<M>, LogError> {
+        let version = self.create(writer, at, &resource, reads)?;
+        let mut resource = resource.numbered(version.0);
+        resource.version = version;
+        Ok(resource)
     }
 
     fn edge(&mut self, _: &str, _: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {

@@ -42,6 +42,8 @@ impl Binding for TerminalSessionBinding {
         // A crew session is held for its vessel; a tool has no holder. Queued messages
         // are separate resources, rather than part of the immutable launch request.
         Ok(TerminalSessionRequest {
+            launch_of: obj.metadata.name.clone(),
+            launch: 0,
             environment: Ref::new(spec.env_ref.clone(), home),
             holder: context.map(|context| Holder::vessel(&context.vessel_ref)),
             role: spec.role.clone(),

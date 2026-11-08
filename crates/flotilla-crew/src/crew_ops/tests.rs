@@ -346,11 +346,14 @@ async fn crew_restart_writes_engine_intent_and_refuses_a_stale_predecessor() {
         .terminal_source(ReadResourceObject { object: obj, provenance: ResourceProvenance::Local })
         .await
         .expect("selected predecessor");
-    assert_eq!(replaces.as_deref(), Some("terminal-a#1"));
+    let first = lifecycle.home.newest_launch("terminal-a").expect("first").name().to_owned();
+    assert_eq!(replaces.as_deref(), Some(first.as_str()));
     crew.restart_terminal("flotilla", &selected.object, replaces.as_deref()).await.expect("request next");
     crew.restart_terminal("flotilla", &selected.object, replaces.as_deref()).await.expect("retry same intent");
     let current = lifecycle.reads.try_terminal_launch("terminal-a", None).expect("read").expect("current");
-    assert_eq!(current.name, "terminal-a#2");
+    let next = lifecycle.home.newest_launch("terminal-a").expect("next").name().to_owned();
+    assert_ne!(next, first);
+    assert_eq!(current.name, next);
     lifecycle.finish(&selected.object, Ending::Ready("next-runtime"));
     let version = backend.using::<ResourceTerminalSession>("flotilla").get("terminal-a").await.expect("before").metadata.resource_version;
     assert!(crew
@@ -362,7 +365,7 @@ async fn crew_restart_writes_engine_intent_and_refuses_a_stale_predecessor() {
         backend.using::<ResourceTerminalSession>("flotilla").get("terminal-a").await.expect("after").metadata.resource_version,
         version
     );
-    assert!(lifecycle.home.get("terminal-a#3").is_none());
+    assert_eq!(lifecycle.home.newest_launch("terminal-a").expect("held").name(), next, "no third launch");
     lifecycle.poison();
     assert!(crew.terminal_source(selected).await.expect_err("checked error").contains("poisoned"));
 }

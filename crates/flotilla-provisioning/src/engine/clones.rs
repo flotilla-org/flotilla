@@ -16,15 +16,16 @@ use flotilla_schema_sqlite::{Read, Store};
 use flotilla_state_machines::Resource;
 
 use super::{
-    latest_launch,
     reads::{indexed, keyed, latest, view, ReadError, StoreReads, View},
     EngineError, Lifecycles,
 };
 use crate::stored::clone::{Clone, CloneFacts, CloneKind, CloneRequest};
 
-/// The request `spec` makes at `home`.
-pub fn request_of(spec: &CloneSpec, discovered: bool, home: &str) -> CloneRequest {
+/// The request `spec` makes at `home`, for a launch of clone `clone`.
+pub fn request_of(clone: &str, spec: &CloneSpec, discovered: bool, home: &str) -> CloneRequest {
     CloneRequest {
+        launch_of: clone.to_owned(),
+        launch: 0,
         repository: spec.repo_ref.to_string(),
         url: spec.url.clone(),
         environment: Ref::new(spec.env_ref.clone(), home),
@@ -116,8 +117,7 @@ impl EngineClones {
 
     /// One try at the launch that serves `request` for `clone`.
     fn serve(&self, clone: &str, request: &CloneRequest) -> Result<String, EngineError> {
-        let (latest, held) = latest_launch(clone, |name| self.lifecycles.get(name));
-        match held {
+        match self.lifecycles.newest_launch(clone) {
             Some(held) if held.spec().repository != request.repository || held.spec().environment != request.environment => {
                 Err(EngineError::Failed(format!(
                     "clone {clone} is held for repository {} in environment {}",
@@ -125,9 +125,9 @@ impl EngineClones {
                     held.spec().environment.name
                 )))
             }
-            Some(held) if held.state().live() => Ok(latest),
-            Some(_) => self.lifecycles.replace_launch(clone, &latest, request.clone(), Self::now()),
-            None => self.lifecycles.request(&latest, request.clone(), Self::now()).map(|_| latest),
+            Some(held) if held.state().live() => Ok(held.name().to_owned()),
+            Some(held) => self.lifecycles.replace_launch(clone, held.name(), request.clone(), Self::now()),
+            None => self.lifecycles.request(clone, request.clone(), Self::now()).map(|created| created.name().to_owned()),
         }
     }
 }
@@ -182,13 +182,13 @@ impl CloneRecords for EngineClones {
     fn request(&self, repository: &RepositorySpec, spec: &CloneSpec, discovered: bool) -> Result<String, String> {
         repository.verify_key(&spec.repo_ref)?;
         let clone = &clone_name(repository, &spec.env_ref)?;
-        let request = request_of(spec, discovered, self.home());
+        let request = request_of(clone, spec, discovered, self.home());
         let mut last = None;
         for _ in 0..REQUEST_ATTEMPTS {
             match self.serve(clone, &request) {
                 Ok(launch) => return Ok(launch),
-                // Another requester took the launch name first: read again.
-                Err(error @ (EngineError::Refused(_) | EngineError::Unknown)) => last = Some(error),
+                // Another requester launched it first: read again.
+                Err(error @ (EngineError::Refused(_) | EngineError::Unknown | EngineError::Raced { .. })) => last = Some(error),
                 Err(error) => return Err(format!("request clone {clone}: {error}")),
             }
         }
@@ -196,8 +196,8 @@ impl CloneRecords for EngineClones {
     }
 
     fn renew(&self, clone: &str) -> Result<CloneRenewal, String> {
-        let (latest, held) = latest_launch(clone, |name| self.lifecycles.get(name));
-        let held = held.ok_or_else(|| format!("clone {clone} is not held here"))?;
+        let held = self.lifecycles.newest_launch(clone).ok_or_else(|| format!("clone {clone} is not held here"))?;
+        let latest = held.name().to_owned();
         if held.state().live() {
             let record = self.get(&latest, None)?.ok_or_else(|| format!("clone {latest} is not held here"))?;
             return Ok(CloneRenewal::Live(record));

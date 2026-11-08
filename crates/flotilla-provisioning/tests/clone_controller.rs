@@ -29,7 +29,7 @@ use flotilla_provisioning::{
 };
 use flotilla_provisioning_testkit::environments::EnvironmentFixture;
 use flotilla_resources::{
-    clone_records::{clone_name, launch, CloneRecords, CloneRenewal},
+    clone_records::{clone_name, launched, CloneRecords, CloneRenewal},
     environment_records::LaunchFacts,
     remote_condition_type, CloneSpec, EnvironmentSpec, HostDirectEnvironmentSpec, RepositoryKey, RepositorySpec, SystemClock,
 };
@@ -298,7 +298,7 @@ impl World {
 async fn a_clone_waits_for_its_environment_then_clones_once() {
     let world = World::start(RecordingRuntime::default());
     let launch = world.clones.request(&repository(), &spec(), false).expect("request");
-    assert_eq!(launch, launch_of(1));
+    assert_eq!(launched(&launch), name());
     assert_eq!(world.reading(&launch), Some(LifecycleReading::InProgress));
     world.observe(Some(false), None);
     assert_eq!(world.cloned(), 0, "untried while its environment is not realised");
@@ -306,12 +306,12 @@ async fn a_clone_waits_for_its_environment_then_clones_once() {
     world.until("ready", |world| world.ready(&launch)).await;
     assert_eq!(world.runtime.asked().cloned, vec![(ENVIRONMENT.into(), URL.into(), "/work/widgets".into())]);
     let record = world.clones.get(&name(), None).expect("read").expect("held");
-    assert_eq!((record.name, record.default_branch.as_deref()), (launch_of(1), Some("main")));
+    assert_eq!((record.name, record.default_branch.as_deref()), (launch.clone(), Some("main")));
     assert_eq!(record.reading, LifecycleReading::Ready { identity: "/work/widgets".into() });
     let found = world.clones.of_repository(&repository().key()).expect("index");
-    assert_eq!(found.into_iter().map(|record| record.name).collect::<Vec<_>>(), [launch_of(1)]);
+    assert_eq!(found.into_iter().map(|record| record.name).collect::<Vec<_>>(), std::slice::from_ref(&launch));
     // A request while it is realised is served by it.
-    assert_eq!(world.clones.request(&repository(), &spec(), false).expect("again"), launch_of(1));
+    assert_eq!(world.clones.request(&repository(), &spec(), false).expect("again"), launch);
     assert_eq!(world.cloned(), 1);
 }
 
@@ -339,7 +339,8 @@ async fn a_misconfigured_clone_gives_up_at_once_and_a_new_request_launches_again
     assert!(world.gave_up(&first).is_some_and(|cause| cause.contains("already exists with origin")));
     assert_eq!(world.cloned(), 1);
     let second = world.clones.request(&repository(), &spec(), false).expect("request again");
-    assert_eq!(second, launch_of(2));
+    assert_eq!(launched(&second), name());
+    assert_ne!(second, first);
     world.until("the next launch ready", |world| world.ready(&second)).await;
     assert_eq!(world.cloned(), 2);
     assert!(world.gave_up(&first).is_some(), "the launch that gave up is never revived");
@@ -402,7 +403,8 @@ async fn a_clone_gives_up_after_three_tries_and_is_renewed() {
     world.until("gave up", |world| world.gave_up(&launch).is_some()).await;
     assert_eq!(world.cloned(), 3);
     let Ok(CloneRenewal::Started(next)) = world.clones.renew(&name()) else { panic!("renewal") };
-    assert_eq!(next, launch_of(2));
+    assert_eq!(launched(&next), name());
+    assert_ne!(next, launch);
     world.until("the renewed launch ready", |world| world.ready(&next)).await;
 }
 
@@ -413,8 +415,8 @@ async fn a_clone_is_named_for_its_repository_not_its_transport() {
     let world = World::start(RecordingRuntime::default());
     let alias = CloneSpec { url: "git@forge-alias:o/widgets.git".into(), ..spec() };
     let launch = world.clones.request(&repository(), &alias, false).expect("request");
-    assert_eq!(launch, launch_of(1));
-    assert_eq!(world.clones.request(&repository(), &spec(), false).expect("the other transport"), launch_of(1));
+    assert_eq!(launched(&launch), name());
+    assert_eq!(world.clones.request(&repository(), &spec(), false).expect("the other transport"), launch);
 }
 
 // Behaviour: a request whose spec names another repository than the one it is for is refused,
@@ -426,9 +428,4 @@ async fn a_spec_for_another_repository_is_refused() {
     let refused = world.clones.request(&repository(), &other, false).expect_err("refused");
     assert!(refused.contains("repository key gadgets"), "{refused}");
     assert_eq!(world.clones.get(&name(), None).expect("read"), None);
-}
-
-/// Launch `n` of the clone.
-fn launch_of(n: u32) -> String {
-    launch(&name(), n)
 }

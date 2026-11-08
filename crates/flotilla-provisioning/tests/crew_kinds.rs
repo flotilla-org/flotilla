@@ -84,6 +84,8 @@ fn a_terminal_session_survives_the_codec() {
             LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Failed { reason: "failed".into() } },
         ] {
             let spec = TerminalSessionRequest {
+                launch_of: "s".into(),
+                launch: 4,
                 environment: Ref::<Resource<Environment>>::new("env", "feta"),
                 holder: holder.clone(),
                 role: "coder".into(),

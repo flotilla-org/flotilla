@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use flotilla_resources::TerminalBrief;
-use flotilla_schema::{Frozen, Ref, Stored};
+use flotilla_schema::{Frozen, IndexQuery, Ref, Stored};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
     Resource,
@@ -22,6 +22,18 @@ pub struct TerminalSessionKind;
 impl LifecycleKind for TerminalSessionKind {
     const NAME: &'static str = "TerminalSession";
     type Request = TerminalSessionRequest;
+    fn launch(request: &TerminalSessionRequest) -> Option<(&str, u64)> {
+        Some((&request.launch_of, request.launch))
+    }
+    fn numbered(request: TerminalSessionRequest, launch: u64) -> TerminalSessionRequest {
+        TerminalSessionRequest { launch, ..request }
+    }
+}
+
+impl super::Launches for TerminalSessionKind {
+    fn by_launch(of: &str) -> IndexQuery<TerminalSessionRequest> {
+        TerminalSessionRequest::by_launch(&of.to_owned())
+    }
 }
 
 /// The TerminalSession machine: the shared lifecycle over its request.
@@ -41,9 +53,16 @@ pub type TerminalSession = Lifecycle<TerminalSessionKind>;
     code = "ts",
     state = LifecycleState,
     index(name = "by_environment", eq(environment)),
-    index(name = "by_holder", eq(holder), when(holder is_some))
+    index(name = "by_holder", eq(holder), when(holder is_some)),
+    // A name's launches in launch order: the newest is the last.
+    index(name = "by_launch", eq(launch_of), order(launch))
 )]
 pub struct TerminalSessionRequest {
+    /// The name this is a launch of (`terminal-<vessel>-<role>`), interned (domain `ln`).
+    #[store(intern = "ln")]
+    pub launch_of: String,
+    /// The home sequence the launch's create took; 0 until its log numbers it.
+    pub launch: u64,
     pub environment: Ref<Resource<Environment>>,
     /// The vessel it is held for (`vessel:<name>`), for a crew's session;
     /// none for a standalone tool session (owner's look-over of #3720,

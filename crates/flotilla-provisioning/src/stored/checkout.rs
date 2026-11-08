@@ -1,6 +1,6 @@
 //! Checkout: one writing role's branch, checked out in one environment (ADR 0064 Checkouts).
 
-use flotilla_schema::{Ref, Stored, Timestamp};
+use flotilla_schema::{IndexQuery, Ref, Stored, Timestamp};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
     Resource,
@@ -14,6 +14,18 @@ pub struct CheckoutKind;
 impl LifecycleKind for CheckoutKind {
     const NAME: &'static str = "Checkout";
     type Request = CheckoutRequest;
+    fn launch(request: &CheckoutRequest) -> Option<(&str, u64)> {
+        Some((&request.launch_of, request.launch))
+    }
+    fn numbered(request: CheckoutRequest, launch: u64) -> CheckoutRequest {
+        CheckoutRequest { launch, ..request }
+    }
+}
+
+impl super::Launches for CheckoutKind {
+    fn by_launch(of: &str) -> IndexQuery<CheckoutRequest> {
+        CheckoutRequest::by_launch(&of.to_owned())
+    }
 }
 
 /// The Checkout machine: the shared lifecycle over its request.
@@ -41,9 +53,16 @@ pub type Checkout = Lifecycle<CheckoutKind>;
     index(name = "by_clone", eq(clone), when(clone is_some)),
     index(name = "by_holder", eq(holder), when(holder is_some)),
     // A repository's checkouts, for local checkout resolution.
-    index(name = "by_repository", eq(repository))
+    index(name = "by_repository", eq(repository)),
+    // A name's launches in launch order: the newest is the last.
+    index(name = "by_launch", eq(launch_of), order(launch))
 )]
 pub struct CheckoutRequest {
+    /// The name this is a launch of (`checkout-<vessel>…`), interned (domain `ln`).
+    #[store(intern = "ln")]
+    pub launch_of: String,
+    /// The home sequence the launch's create took; 0 until its log numbers it.
+    pub launch: u64,
     /// The Repository resource's key, interned (domain `rk`).
     #[store(intern = "rk")]
     pub repository: String,

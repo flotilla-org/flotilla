@@ -11,7 +11,7 @@
 use chrono::{DateTime, Utc};
 use flotilla_protocol::LifecycleReading;
 
-pub use crate::clone_records::{launch, launched};
+pub use crate::clone_records::launched;
 use crate::{CheckoutSpec, RepositoryKey};
 
 /// What a refused request says when its holder's engine Convoy is not admitted yet: the request

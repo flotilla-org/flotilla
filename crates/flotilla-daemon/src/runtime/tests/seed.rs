@@ -118,7 +118,7 @@ async fn startup_registration_is_idempotent_and_discovers_existing_clone() {
     );
     // Requested once, through the clone port, however often startup runs.
     let held = environments.reads.clones().expect("clones").get(&clone_name, None).expect("read").expect("discovered clone held");
-    assert_eq!(held.name, flotilla_resources::clone_records::launch(&clone_name, 1));
+    assert_eq!(flotilla_resources::clone_records::launched(&held.name), clone_name);
     assert_eq!(held.spec.url, "git@github.com:flotilla-org/flotilla.git");
     assert!(held.discovered, "startup discovery requests the clone as discovered");
 }

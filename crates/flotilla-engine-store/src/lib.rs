@@ -241,10 +241,20 @@ pub trait ImportTarget {
     /// Whether records homed at `home` are written here.
     fn imports(&self, home: &str) -> bool;
 
-    /// Writes the value `make` builds as `name` at `home`, as part of `change`, reads it back and
-    /// compares; the value written, or the reason it was refused or read back differently. `make`
-    /// is given the version the value is written at: `version` in a rehearsal, which restores, and
-    /// the home sequence its create takes in an import.
+    /// Writes the value `make` builds, under the name it gives, at `home`, as part of `change`,
+    /// reads it back and compares; the name and value written, or the reason it was refused or
+    /// read back differently. `make` is given the version the value is written at: `version` in
+    /// a rehearsal, which restores, and the home sequence its create takes in an import, which
+    /// also numbers a launch ([`flotilla_state_machines::launch_name`]).
+    fn write_named_with<K: Kind + PartialEq>(
+        &mut self,
+        home: &str,
+        change: &NewChange,
+        version: u64,
+        make: impl FnOnce(u64) -> (String, K),
+    ) -> Result<(String, K), String>;
+
+    /// [`Self::write_named_with`] under `name`, whatever the version.
     fn write_with<K: Kind + PartialEq>(
         &mut self,
         home: &str,
@@ -252,7 +262,9 @@ pub trait ImportTarget {
         change: &NewChange,
         version: u64,
         make: impl FnOnce(u64) -> K,
-    ) -> Result<K, String>;
+    ) -> Result<K, String> {
+        self.write_named_with(home, change, version, |version| (name.to_owned(), make(version))).map(|(_, value)| value)
+    }
 
     /// [`Self::write_with`] for a value written whatever its version (version 1 in a rehearsal).
     fn write<K: Kind + PartialEq + Clone>(&mut self, home: &str, name: &str, change: &NewChange, value: &K) -> Result<(), String> {
@@ -314,17 +326,16 @@ impl ImportTarget for Rehearsal {
         home != REHEARSAL_HOME
     }
 
-    fn write_with<K: Kind + PartialEq>(
+    fn write_named_with<K: Kind + PartialEq>(
         &mut self,
         home: &str,
-        name: &str,
         _: &NewChange,
         version: u64,
-        make: impl FnOnce(u64) -> K,
-    ) -> Result<K, String> {
-        let value = make(version);
-        self.restore(home, name, version, &value)?;
-        Ok(value)
+        make: impl FnOnce(u64) -> (String, K),
+    ) -> Result<(String, K), String> {
+        let (name, value) = make(version);
+        self.restore(home, &name, version, &value)?;
+        Ok((name, value))
     }
 
     fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
@@ -363,25 +374,25 @@ impl ImportTarget for Import {
         home == self.store.home()
     }
 
-    fn write_with<K: Kind + PartialEq>(
+    fn write_named_with<K: Kind + PartialEq>(
         &mut self,
         home: &str,
-        name: &str,
         change: &NewChange,
         _: u64,
-        make: impl FnOnce(u64) -> K,
-    ) -> Result<K, String> {
+        make: impl FnOnce(u64) -> (String, K),
+    ) -> Result<(String, K), String> {
         if !self.imports(home) {
             return Err(format!("homed at `{home}`, another home's to import"));
         }
         let mut write = self.store.write().map_err(|error| error.to_string())?;
         let change = write.open_change(change).map_err(|error| error.to_string())?;
         let version = write.last_sequence(home).map_err(|error| error.to_string())? + 1;
-        let value = make(version).with_identity(name, version);
-        write.insert(name, &value, change).map_err(|error| error.to_string())?;
+        let (name, value) = make(version);
+        let value = value.with_identity(&name, version);
+        write.insert(&name, &value, change).map_err(|error| error.to_string())?;
         write.commit().map_err(|error| error.to_string())?;
-        read_back(&mut self.store, home, name, &value)?;
-        Ok(value)
+        read_back(&mut self.store, home, &name, &value)?;
+        Ok((name, value))
     }
 
     fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
@@ -437,13 +448,15 @@ impl StoreLog {
 
     /// Creates `resource` under a change whose items are `items`: the records its requester read
     /// to make it, each at the version read (#4024 ruling 1), such as a Checkout's holder Convoy.
+    /// A launch is numbered by the home sequence its create takes, in this transaction
+    /// ([`Resource::numbered`]); the resource as committed is returned.
     pub fn create_with_items<M>(
         &self,
         writer: &str,
         at: Timestamp,
-        resource: &Resource<M>,
+        resource: Resource<M>,
         items: Vec<ChangeItem>,
-    ) -> Result<Version, LogError>
+    ) -> Result<Resource<M>, LogError>
     where
         M: Machine,
         M::Spec: KindSpec<State = M::State>,
@@ -452,13 +465,28 @@ impl StoreLog {
         EdgePayload<M::Edge>: Cbor,
         M::Edge: Cbor,
     {
-        let change = NewChange::new(writer, at).with_items(items);
+        self.insert_created(&NewChange::new(writer, at).with_items(items), resource)
+    }
+
+    fn insert_created<M>(&self, change: &NewChange, resource: Resource<M>) -> Result<Resource<M>, LogError>
+    where
+        M: Machine,
+        M::Spec: KindSpec<State = M::State>,
+        M::State: StateData + Labelled<Label = Label<M>>,
+        M::Write: StoredWrite<Resource<M>>,
+        EdgePayload<M::Edge>: Cbor,
+        M::Edge: Cbor,
+    {
         let mut store = lock_store(&self.store);
         let mut write = store.write().map_err(refused)?;
-        let change = write.open_change(&change).map_err(refused)?;
-        let stamp = write.insert(resource.name(), resource, change).map_err(refused)?;
+        let change = write.open_change(change).map_err(refused)?;
+        // The insert below takes the next home sequence: the launch's number and its version.
+        let next = write.last_sequence(&self.home).map_err(refused)? + 1;
+        let resource = resource.numbered(next);
+        let stamp = write.insert(resource.name(), &resource, change).map_err(refused)?;
         write.commit().map_err(refused)?;
-        Ok(Version(stamp.version))
+        let (name, spec, state) = (resource.name().to_owned(), resource.spec().clone(), resource.stored_state().clone());
+        Ok(Resource::stored(name, spec, state, Version(stamp.version)))
     }
 }
 
@@ -472,13 +500,22 @@ where
     M::Edge: Cbor,
 {
     fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<M>, reads: &[InputRead]) -> Result<Version, LogError> {
+        if M::launch(resource.spec()).is_some() {
+            return Err(LogError::new("a launch is created through Log::create_resource, which numbers it"));
+        }
         let change = self.change(writer, at, reads);
-        let mut store = lock_store(&self.store);
-        let mut write = store.write().map_err(refused)?;
-        let change = write.open_change(&change).map_err(refused)?;
-        let stamp = write.insert(resource.name(), resource, change).map_err(refused)?;
-        write.commit().map_err(refused)?;
-        Ok(Version(stamp.version))
+        Ok(self.insert_created(&change, resource.clone())?.version())
+    }
+
+    fn create_resource(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<M>,
+        reads: &[InputRead],
+    ) -> Result<Resource<M>, LogError> {
+        let change = self.change(writer, at, reads);
+        self.insert_created(&change, resource)
     }
     fn edge(&mut self, writer: &str, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
         self.edge_with_writes(writer, previous, next, event, &[])

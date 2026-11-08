@@ -36,7 +36,7 @@ use std::{
 use flotilla_engine_store::{open_home, register_crew, StoreLog};
 use flotilla_provisioning::{
     engine::{
-        decide, launch,
+        decide,
         reads::ProvisioningReads,
         terminal_session::TerminalSessionBinding,
         vessel::{PlacementLifecycles, VesselBinding},
@@ -112,6 +112,8 @@ fn convoy(n: usize, home: &str) -> ConvoyId {
 
 fn session(n: usize, which: &str, home: &str) -> TerminalSessionRequest {
     TerminalSessionRequest {
+        launch_of: format!("session-{n}-{which}"),
+        launch: 0,
         environment: StoredRef::new(format!("env-{n}"), home),
         holder: Some(Holder::vessel(&format!("vessel-{n}"))),
         role: which.into(),
@@ -164,7 +166,8 @@ impl Crew {
             .expect("realised");
         for which in ["agent", "tool"] {
             let name = format!("session-{n}-{which}");
-            self.sessions.create(&name, session(n, which, home), &MemoryLifecycleWorld::default(), Timestamp(at)).expect("created");
+            let created = self.sessions.create(&name, session(n, which, home), &MemoryLifecycleWorld::default(), Timestamp(at));
+            let name = created.expect("created").resource.name().to_owned();
             self.sessions
                 .apply(&name, Realise { identity: name.clone(), observed: Ref::new(name.as_str()) }, &realised(&name), Timestamp(at + 1))
                 .expect("realised");
@@ -460,7 +463,7 @@ fn crew_load() {
         started,
         "launch #1 requested and realised, released; launch #2 requested and realised",
     );
-    assert!(objects.iter().all(|obj| launches.get(&launch(&obj.metadata.name, 2)).is_some()));
+    assert!(objects.iter().all(|obj| launches.newest_launch(&obj.metadata.name).is_some()));
 
     // The read ports (#3629 layer 8): a session's current launch by its record name, and a
     // vessel's sessions (which seats it serves) through the index.
@@ -468,7 +471,7 @@ fn crew_load() {
     let started = Instant::now();
     for obj in &objects {
         let view = reads.terminal_session(&obj.metadata.name, "local").expect("read").expect("held");
-        assert_eq!(view.name, launch(&obj.metadata.name, 2), "the current launch");
+        assert_eq!(Some(view.name), launches.newest_launch(&obj.metadata.name).map(|held| held.name().to_owned()), "the current launch");
     }
     eprintln!("{:>40}: {:>8.1} µs/query", "port: a session's current launch", started.elapsed().as_secs_f64() * 1e6 / objects.len() as f64);
     let started = Instant::now();

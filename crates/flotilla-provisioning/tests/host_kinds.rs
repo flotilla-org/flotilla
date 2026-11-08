@@ -467,18 +467,17 @@ impl flotilla_engine_store::ImportTarget for RefusingObservations {
         self.0.imports(home)
     }
 
-    fn write_with<K: flotilla_schema::Kind + PartialEq>(
+    fn write_named_with<K: flotilla_schema::Kind + PartialEq>(
         &mut self,
         home: &str,
-        name: &str,
         change: &flotilla_schema::NewChange,
         version: u64,
-        make: impl FnOnce(u64) -> K,
-    ) -> Result<K, String> {
+        make: impl FnOnce(u64) -> (String, K),
+    ) -> Result<(String, K), String> {
         if K::KIND == "HostObservation" {
             return Err("refused".to_owned());
         }
-        self.0.write_with(home, name, change, version, make)
+        self.0.write_named_with(home, change, version, make)
     }
 
     fn holds<K: flotilla_schema::Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {

@@ -27,8 +27,10 @@ async fn operator_reads_a_ready_clone_and_renews_an_ended_one() {
         local_root: "local".into(),
     };
     assert_eq!(operator.reconcile_now(NAMESPACE, "clone", "source").await.expect("reconciled"), "Clone/source is already ready");
-    assert_eq!(operator.reconcile_now(NAMESPACE, "clone", "failed").await.expect("renewed"), "Clone/failed: launch failed#2 requested");
-    assert_eq!(clones.record("failed").name, "failed#2", "an ended launch is never revived");
+    let said = operator.reconcile_now(NAMESPACE, "clone", "failed").await.expect("renewed");
+    let renewed = clones.record("failed").name;
+    assert_ne!(renewed, failed, "an ended launch is never revived");
+    assert_eq!(said, format!("Clone/failed: launch {renewed} requested"));
     clones.poison();
     assert!(operator.reconcile_now(NAMESPACE, "clone", "source").await.expect_err("read error").contains("poisoned"));
 }

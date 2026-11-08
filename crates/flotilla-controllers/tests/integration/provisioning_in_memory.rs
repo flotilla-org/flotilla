@@ -219,7 +219,8 @@ async fn a_project_gaining_a_member_leaves_a_running_convoys_checkouts_unchanged
     let checkout_launches =
         || engine.checkouts.checkouts.here().expect("checkouts").into_iter().map(|checkout| checkout.name).collect::<Vec<_>>();
     let before = checkout_launches();
-    assert_eq!(before, ["checkout-convoy-a#1"]);
+    assert_eq!(before.len(), 1);
+    assert_eq!(flotilla_resources::checkout_records::launched(&before[0]), "checkout-convoy-a");
 
     let added = RepositorySpec::remote("https://github.com/flotilla-org/binnacle").expect("added repository");
     flotilla_store::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &added.key(), &added)

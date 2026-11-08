@@ -2,7 +2,8 @@
 //! the events the design names, and reads the outcome from the engine's records.
 //!
 //! The scripted actuator keys each environment by its host-direct root. Its records live as
-//! Clone lifecycles at the same home: `input-<key>` is an input, `holder-<key>` ends the holder
+//! ImageBuild lifecycles at the same home (a kind whose resources are not launches, so each is
+//! named as written): `input-<key>` is an input, `holder-<key>` ends the holder
 //! once Gone, `fact-<key>` reports the provider usable while Realised, and a live `served-<key>`
 //! holds its release back.
 
@@ -15,7 +16,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_engine_store::{open_home, open_home_with, StoreLog};
 use flotilla_resources::SystemClock;
-use flotilla_schema::{Frozen, Identity, Kind, KindCode, Ref, Timestamp};
+use flotilla_schema::{Frozen, Identity, Kind, KindCode, Timestamp};
 use flotilla_schema_sqlite::{
     stream::{CommitListener, Service},
     Read, StoreError,
@@ -28,21 +29,21 @@ use tokio::sync::{mpsc, Notify};
 
 use super::{Actuator, Backing, BackingEvent, Controller, Holding, ProviderFailure, Usability};
 use crate::{
-    engine::{launch, LifecycleHome, Lifecycles, Step},
+    engine::{LifecycleHome, Lifecycles, Step},
     stored::{
-        clone::{CloneKind, CloneRequest},
         environment::{EnvironmentKind, EnvironmentRequest, HostDirectRecipe, Recipe},
+        image_build::{Architecture, Delivery, ImageBuildKind, ImageBuildRequest, Reservation},
     },
 };
 
 const HOME: &str = "alpha";
 
-fn clone_code() -> KindCode {
-    <Resource<Lifecycle<CloneKind>> as Kind>::CODE
+fn record_code() -> KindCode {
+    <Resource<Lifecycle<ImageBuildKind>> as Kind>::CODE
 }
 
 fn record(name: &str) -> Identity {
-    Identity { kind: clone_code(), name: name.to_owned(), home: HOME.to_owned() }
+    Identity { kind: record_code(), name: name.to_owned(), home: HOME.to_owned() }
 }
 
 fn key(request: &EnvironmentRequest) -> String {
@@ -58,19 +59,28 @@ fn environment(key: &str) -> EnvironmentRequest {
     }
 }
 
-fn clone_request() -> CloneRequest {
-    CloneRequest {
-        repository: "repo".into(),
-        url: "https://example/repo".into(),
-        environment: Ref::new("env", HOME),
-        path: "/c".into(),
-        discovered: false,
+fn record_request() -> ImageBuildRequest {
+    let layer = flotilla_resources::ImageLayerSpec::builder()
+        .name("base".into())
+        .version("1.0.0".into())
+        .tier(flotilla_resources::ImageLayerTier::Base)
+        .source(flotilla_resources::ImageLayerSource::Stdlib)
+        .from("docker.io/library/ubuntu@sha256:00".into())
+        .fragment("RUN true".into())
+        .probe("true".into())
+        .build();
+    ImageBuildRequest {
+        composition: "sha256:feed".into(),
+        architecture: Architecture::Amd64,
+        layers: Frozen::new(vec![layer]).expect("freeze"),
+        delivery: Delivery::Local,
+        reservation: Reservation { cpu: 2, disk_bytes: 1 << 30 },
     }
 }
 
 fn state_of(read: &mut Read<'_>, name: &str) -> Result<Option<LifecycleState>, StoreError> {
-    let Some(id) = read.resolve(clone_code(), name, HOME)? else { return Ok(None) };
-    Ok(read.load::<Resource<Lifecycle<CloneKind>>>(id)?.map(|loaded| loaded.value.state().clone()))
+    let Some(id) = read.resolve(record_code(), name, HOME)? else { return Ok(None) };
+    Ok(read.load::<Resource<Lifecycle<ImageBuildKind>>>(id)?.map(|loaded| loaded.value.state().clone()))
 }
 
 #[derive(Default)]
@@ -116,7 +126,7 @@ impl Actuator<EnvironmentKind> for Scripted {
     }
 
     fn followed(&self) -> Vec<KindCode> {
-        vec![clone_code()]
+        vec![record_code()]
     }
 
     fn dependencies(&self, request: &EnvironmentRequest) -> Vec<Identity> {
@@ -154,7 +164,7 @@ struct World {
     _directory: tempfile::TempDir,
     service: Arc<Service>,
     environments: Arc<LifecycleHome<EnvironmentKind, StoreLog>>,
-    clones: Arc<LifecycleHome<CloneKind, StoreLog>>,
+    records: Arc<LifecycleHome<ImageBuildKind, StoreLog>>,
     actuator: Arc<Scripted>,
     commits: Arc<Notify>,
     _listener: Arc<CommitListener>,
@@ -168,14 +178,23 @@ impl World {
         let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), HOME, registry).expect("store"));
         let log = || StoreLog::new(service.store());
         let environments = Arc::new(LifecycleHome::new(HOME, open_home(log()).expect("environments")));
-        let clones = Arc::new(LifecycleHome::new(HOME, open_home(log()).expect("clones")));
+        let records = Arc::new(LifecycleHome::new(HOME, open_home(log()).expect("records")));
         let commits = Arc::new(Notify::new());
         let listener: Arc<CommitListener> = {
             let commits = Arc::clone(&commits);
             Arc::new(move |_: &flotilla_schema_sqlite::stream::Committed<'_>| commits.notify_waiters())
         };
         service.on_commit(Arc::downgrade(&listener));
-        Self { _directory: directory, service, environments, clones, actuator: Arc::default(), commits, _listener: listener, backing: None }
+        Self {
+            _directory: directory,
+            service,
+            environments,
+            records,
+            actuator: Arc::default(),
+            commits,
+            _listener: listener,
+            backing: None,
+        }
     }
 
     /// Starts the controller over the records as they are now.
@@ -200,12 +219,12 @@ impl World {
         self.environments.request(name, environment(name), Self::now()).expect("request");
     }
 
-    fn clone_record(&self, name: &str) {
-        self.clones.request(name, clone_request(), Self::now()).expect("clone");
+    fn record(&self, name: &str) {
+        self.records.request(name, record_request(), Self::now()).expect("record");
     }
 
-    fn clone_step(&self, name: &str, step: Step) {
-        self.clones.step(name, &step, Self::now()).expect("clone step");
+    fn record_step(&self, name: &str, step: Step) {
+        self.records.step(name, &step, Self::now()).expect("record step");
     }
 
     fn state(&self, name: &str) -> LifecycleState {
@@ -260,7 +279,7 @@ async fn a_retryable_failure_waits_for_an_input_to_change() {
     world.until("b realised", |world| world.state("b").realised()).await;
     assert_eq!(world.actuator.script().realised.iter().filter(|key| *key == "a").count(), 1, "a is tried once");
 
-    world.clone_record("input-a");
+    world.record("input-a");
     world.until("a realised after its input changed", |world| world.state("a").realised()).await;
     assert_eq!(world.actuator.script().realised.iter().filter(|key| *key == "a").count(), 2);
 }
@@ -282,7 +301,7 @@ async fn the_failure_limit_bounds_retries() {
     let mut world = World::open();
     let failing = (0..10).map(|_| Err(failure("flapping", true))).collect();
     world.actuator.script().realise.insert("a".into(), failing);
-    world.clone_record("input-a");
+    world.record("input-a");
     world.start();
     world.request("a");
     world.until("a tried", |world| failures(&world.state("a")) == Some(1)).await;
@@ -293,7 +312,7 @@ async fn the_failure_limit_bounds_retries() {
         }
         // Each input change is one more chance, until the policy's limit.
         let tried = world.actuator.script().realised.len();
-        world.clone_step("input-a", Step::Attempted(flotilla_state_machines::Outcome::Succeeded));
+        world.record_step("input-a", Step::Attempted(flotilla_state_machines::Outcome::Succeeded));
         world.until("a tried again or gave up", |world| world.actuator.script().realised.len() > tried || gave_up(world)).await;
         world
             .until("the try recorded", |world| {
@@ -344,13 +363,13 @@ async fn retry_times_stop_at_the_failure_limit() {
 async fn an_unusable_provider_waits_for_its_fact() {
     let mut world = World::open();
     world.actuator.script().with_fact.insert("a".into());
-    world.clone_record("fact-a");
+    world.record("fact-a");
     world.start();
     world.request("a");
     world.request("b");
     world.until("b realised", |world| world.state("b").realised()).await;
     assert!(world.actuator.script().realised.iter().all(|key| key != "a"), "a waits while its provider is unusable");
-    world.clone_step("fact-a", Step::Realised { identity: "up".into() });
+    world.record_step("fact-a", Step::Realised { identity: "up".into() });
     world.until("a realised once its provider is usable", |world| world.state("a").realised()).await;
 }
 
@@ -358,11 +377,11 @@ async fn an_unusable_provider_waits_for_its_fact() {
 #[tokio::test]
 async fn a_holder_ending_releases_the_resource() {
     let mut world = World::open();
-    world.clone_record("holder-a");
+    world.record("holder-a");
     world.start();
     world.request("a");
     world.until("a realised", |world| world.state("a").realised()).await;
-    world.clone_step("holder-a", Step::Released);
+    world.record_step("holder-a", Step::Released);
     world.until("a released", |world| world.state("a").gone()).await;
     assert_eq!(world.actuator.script().released, [("a".to_owned(), Some("id-a".to_owned()))]);
 }
@@ -372,19 +391,19 @@ async fn a_holder_ending_releases_the_resource() {
 #[tokio::test]
 async fn a_release_waits_for_what_the_resource_serves() {
     let mut world = World::open();
-    world.clone_record("holder-a");
-    world.clone_record("served-a");
+    world.record("holder-a");
+    world.record("served-a");
     world.start();
     world.request("a");
     world.until("a realised", |world| world.state("a").realised()).await;
-    world.clone_step("holder-a", Step::Released);
+    world.record_step("holder-a", Step::Released);
     // Another resource realised after the holder ended: the controller has passed a.
     world.request("b");
     world.until("b realised", |world| world.state("b").realised()).await;
     assert!(world.state("a").realised(), "a is held while it serves a live record");
     assert!(world.actuator.script().released.is_empty());
-    world.clone_step("served-a", Step::Realised { identity: "served".into() });
-    world.clone_step("served-a", Step::Released);
+    world.record_step("served-a", Step::Realised { identity: "served".into() });
+    world.record_step("served-a", Step::Released);
     world.until("a released once what it serves ended", |world| world.state("a").gone()).await;
     assert_eq!(world.actuator.script().released, [("a".to_owned(), Some("id-a".to_owned()))]);
 }
@@ -433,18 +452,6 @@ async fn a_pushed_failure_ends_the_resource_as_failed() {
     world.until("a failed", |world| world.state("a").gone()).await;
     let LifecycleState::Gone { ending } = world.state("a") else { unreachable!() };
     assert_eq!(ending, flotilla_state_machines::machines::lifecycle::Ending::Failed { reason: "adoption failed".into() });
-}
-
-// A successor launch's request ends its predecessor, written by the controller.
-#[tokio::test]
-async fn a_successor_launch_ends_its_predecessor() {
-    let mut world = World::open();
-    world.start();
-    world.request(&launch("s", 1));
-    world.until("first launch realised", |world| world.state(&launch("s", 1)).realised()).await;
-    world.environments.request(&launch("s", 2), environment("s2"), World::now()).expect("successor");
-    world.until("predecessor gone", |world| world.state(&launch("s", 1)).gone()).await;
-    world.until("successor realised", |world| world.state(&launch("s", 2)).realised()).await;
 }
 
 /// The store's log, refusing every GiveUp: a failure whose giving up was never written, as when

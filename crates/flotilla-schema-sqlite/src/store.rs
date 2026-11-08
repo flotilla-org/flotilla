@@ -472,6 +472,18 @@ impl Read<'_> {
         self.ctx().integer_index_keys(query, home, after, limit)
     }
 
+    /// [`Self::integer_index_keys`] the other way: one home's ids and order values strictly below
+    /// `before`, highest first. `i64::MAX` reads from the top: the first row is the highest.
+    pub fn integer_index_keys_before<K>(
+        &mut self,
+        query: &IndexQuery<K>,
+        home: &str,
+        before: i64,
+        limit: u32,
+    ) -> Result<Vec<(ResourceId, i64)>, StoreError> {
+        self.ctx().integer_index_keys_before(query, home, before, limit)
+    }
+
     /// The startup scan: up to `limit` resources of kind `K` homed at `home` with ids above `after`,
     /// in id order, through `resource_identity_by_home`. The one sanctioned pass over a whole kind;
     /// everything else reads by key or declared index.

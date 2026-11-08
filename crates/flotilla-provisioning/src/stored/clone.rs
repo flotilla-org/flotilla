@@ -1,6 +1,6 @@
 //! Clone: one repository cloned once into one environment, shared by its checkouts.
 
-use flotilla_schema::{Ref, Stored};
+use flotilla_schema::{IndexQuery, Ref, Stored};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
     AttemptPolicy, Resource,
@@ -25,6 +25,18 @@ impl LifecycleKind for CloneKind {
     fn policy() -> AttemptPolicy {
         AttemptPolicy::immediate(3)
     }
+    fn launch(request: &CloneRequest) -> Option<(&str, u64)> {
+        Some((&request.launch_of, request.launch))
+    }
+    fn numbered(request: CloneRequest, launch: u64) -> CloneRequest {
+        CloneRequest { launch, ..request }
+    }
+}
+
+impl super::Launches for CloneKind {
+    fn by_launch(of: &str) -> IndexQuery<CloneRequest> {
+        CloneRequest::by_launch(&of.to_owned())
+    }
 }
 
 /// The Clone machine: the shared lifecycle over its request.
@@ -35,7 +47,8 @@ pub type Clone = Lifecycle<CloneKind>;
 ///
 /// Each launch is named `clone-<key>#<n>`, the key derived from the
 /// repository and environment (`forge_clone_key`), so one clone per pair is
-/// launched again under its own name, never revived.
+/// launched again under its own name, never revived. `n` is the home sequence
+/// its create took ([`super::Launches`]).
 ///
 /// Realised under its path once the repository is observed there. The
 /// default branch it found is its [`CloneFacts`].
@@ -45,9 +58,16 @@ pub type Clone = Lifecycle<CloneKind>;
     code = "cl",
     state = LifecycleState,
     index(name = "by_environment", eq(environment, repository)),
-    index(name = "by_repository", eq(repository))
+    index(name = "by_repository", eq(repository)),
+    // A name's launches in launch order: the newest is the last.
+    index(name = "by_launch", eq(launch_of), order(launch))
 )]
 pub struct CloneRequest {
+    /// The name this is a launch of (`clone-<key>`), interned (domain `ln`).
+    #[store(intern = "ln")]
+    pub launch_of: String,
+    /// The home sequence the launch's create took; 0 until its log numbers it.
+    pub launch: u64,
     /// The Repository resource's key, interned (domain `rk`).
     #[store(intern = "rk")]
     pub repository: String,

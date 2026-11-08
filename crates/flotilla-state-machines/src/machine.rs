@@ -54,6 +54,30 @@ pub trait Machine: Sized + 'static {
     /// Whatever the request names by address that must exist is read through
     /// `admission`, which records each read for the create (#3392 G1).
     fn admit(admission: &mut Admission<'_, Self>, request: Self::Request) -> Result<(Self::Spec, Self::State), Self::Refusal>;
+
+    /// For a machine whose resources are launches of a name (`<of>#<n>`, owner's ruling, #3108):
+    /// the name `spec` is a launch of, and its number, 0 until its create is logged. `None`, the
+    /// default, for a machine whose resources keep the name their creator gives.
+    ///
+    /// A launch's number is the home sequence its create takes, which its log assigns in the
+    /// create's own transaction ([`Machine::numbered`]): unique for all time at its home and
+    /// rising with each launch of one name, with gaps. It is unique and ordered within its home
+    /// only: a name launched at two homes has two series, so anything that names a launch also
+    /// names its home.
+    fn launch(_spec: &Self::Spec) -> Option<(&str, u64)> {
+        None
+    }
+
+    /// `spec` numbered `n`. Its log calls this, in the create's transaction, only for a spec
+    /// [`Machine::launch`] numbers.
+    fn numbered(spec: Self::Spec, _n: u64) -> Self::Spec {
+        spec
+    }
+}
+
+/// The name of launch `n` of `of`: `<of>#<n>`.
+pub fn launch_name(of: &str, n: u64) -> String {
+    format!("{of}#{n}")
 }
 
 /// A write to a resource's records (ADR 0064 "Records"): spec rows that only

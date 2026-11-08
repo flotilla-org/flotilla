@@ -535,16 +535,16 @@ fn ended_across_a_snapshot(write: impl FnOnce(&CheckoutFixture)) -> bool {
         host_ref: "alpha".into(),
         is_main: false,
     });
-    let request = request_of(&spec, Some(&convoy_holder()), "alpha").expect("request");
-    alpha.inputs.stage("found#1", vec![ChangeItem::new(convoy.clone(), Some(read_at.to_string()))]);
-    alpha.lifecycles.request("found#1", request, Timestamp::from_datetime(&chrono::Utc::now())).expect("requested");
+    let request = request_of("found", &spec, Some(&convoy_holder()), "alpha").expect("request");
+    alpha.inputs.stage("found", vec![ChangeItem::new(convoy.clone(), Some(read_at.to_string()))]);
+    let found = alpha.lifecycles.request("found", request, Timestamp::from_datetime(&chrono::Utc::now())).expect("requested");
 
     let store = alpha_service.store();
     let mut store = store.lock().expect("store");
     let mut read = store.read().expect("read");
     let held = read.resolve(convoy.kind, &convoy.name, &convoy.home).expect("resolve").expect("the convoy is held at alpha");
     assert!(read.changes(held, 0, 16).expect("entries").is_empty(), "alpha holds the convoy from a snapshot alone");
-    convoy_holding(&mut read, "found#1", "alpha").expect("judged").ended
+    convoy_holding(&mut read, found.name(), "alpha").expect("judged").ended
 }
 
 fn convoy_holder() -> CheckoutHolder {

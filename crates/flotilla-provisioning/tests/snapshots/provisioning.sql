@@ -68,6 +68,8 @@ FROM "clone_facts";
 CREATE TABLE "checkout" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "repository" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "environment" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
   "branch" TEXT NOT NULL,
@@ -162,6 +164,7 @@ CREATE TABLE "checkout" (
 CREATE INDEX "checkout_by_clone" ON "checkout" ("clone") WHERE "clone" IS NOT NULL;
 CREATE INDEX "checkout_by_environment" ON "checkout" ("environment");
 CREATE INDEX "checkout_by_holder" ON "checkout" ("holder") WHERE "holder" IS NOT NULL;
+CREATE INDEX "checkout_by_launch" ON "checkout" ("launch_of", "launch");
 CREATE INDEX "checkout_by_repository" ON "checkout" ("repository");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ck', 'source', 'ad', 'Adopted'),
@@ -196,6 +199,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "checkout_view" AS SELECT
   "checkout"."id",
   "checkout"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "checkout"."launch_of") AS "launch_of",
+  "checkout"."launch",
   (SELECT "s" FROM "strings" WHERE "id" = "checkout"."repository") AS "repository",
   "checkout"."environment",
   "checkout"."branch",
@@ -221,6 +226,8 @@ FROM "checkout";
 CREATE TABLE "clone" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "repository" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "url" TEXT NOT NULL,
   "environment" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
@@ -300,6 +307,7 @@ CREATE TABLE "clone" (
       END)
 ) STRICT;
 CREATE INDEX "clone_by_environment" ON "clone" ("environment", "repository");
+CREATE INDEX "clone_by_launch" ON "clone" ("launch_of", "launch");
 CREATE INDEX "clone_by_repository" ON "clone" ("repository");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cl', 'state', 'go', 'Gone'),
@@ -331,6 +339,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "clone_view" AS SELECT
   "clone"."id",
   "clone"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "clone"."launch_of") AS "launch_of",
+  "clone"."launch",
   (SELECT "s" FROM "strings" WHERE "id" = "clone"."repository") AS "repository",
   "clone"."url",
   "clone"."environment",

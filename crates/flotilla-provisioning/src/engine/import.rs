@@ -60,8 +60,8 @@ use flotilla_resources::{
 };
 
 use super::{
-    checkouts, clones, environments, image_build::ImageBuildBinding, launch, terminal_session::TerminalSessionBinding,
-    vessel::VesselBinding, Binding,
+    checkouts, clones, environments, image_build::ImageBuildBinding, terminal_session::TerminalSessionBinding, vessel::VesselBinding,
+    Binding,
 };
 use crate::stored::{
     checkout::{CheckoutFacts, CheckoutKind},
@@ -76,7 +76,8 @@ pub trait Imported: Binding {
     fn imported_state(obj: &ResourceObject<Self::Old>) -> Result<LifecycleState, String>;
 }
 
-/// One old record mapped onto the engine, ready to restore at its home.
+/// One old record mapped onto the engine, ready to restore at its home. A launch carries its old
+/// name until [`write_imported`] numbers it.
 pub struct ImportedResource<K: LifecycleKind> {
     /// The old record's name.
     pub record: String,
@@ -104,13 +105,29 @@ pub fn import<B: Imported>(obj: &ResourceObject<B::Old>, home: &str) -> Result<I
     let refuse = |reason: String| ImportRefusal { kind, record: obj.metadata.name.clone(), reason };
     let request = B::request(obj, home).map_err(refuse)?;
     let state = B::imported_state(obj).map_err(refuse)?;
-    let name = if B::LAUNCHES { launch(&obj.metadata.name, 1) } else { obj.metadata.name.clone() };
     let since = Timestamp::from_datetime(&obj.metadata.creation_timestamp);
     Ok(ImportedResource {
         record: obj.metadata.name.clone(),
         home: home.to_owned(),
-        resource: Resource::stored(name, request, State::new(state, since), Version(1)),
+        resource: Resource::stored(obj.metadata.name.clone(), request, State::new(state, since), Version(1)),
     })
+}
+
+/// Writes `imported`'s resource into `target` at its home under `change`, and holds the resource
+/// as written: a launch is numbered as any launch is, by the home sequence its create takes
+/// (version 1 in a rehearsal), so it carries its launch's name (`<old>#<n>`) afterwards.
+pub fn write_imported<K>(target: &mut impl ImportTarget, imported: &mut ImportedResource<K>, change: &NewChange) -> Result<(), String>
+where
+    K: LifecycleKind,
+    Resource<Lifecycle<K>>: Kind + PartialEq + Clone,
+{
+    let resource = imported.resource.clone();
+    let (_, written) = target.write_named_with(&imported.home, change, 1, |version| {
+        let resource = resource.numbered(version);
+        (resource.name().to_owned(), resource)
+    })?;
+    imported.resource = written;
+    Ok(())
 }
 
 /// What a rehearsal found: counts by kind and stored label, and the refusals.
@@ -177,7 +194,9 @@ where
         .enumerate()
         .filter_map(|(index, resource)| {
             let change = NewChange::new(IMPORT_WRITER, resource.resource.since());
-            rehearsal.write(&resource.home, resource.resource.name(), &change, &resource.resource).err().map(|reason| refuse(index, reason))
+            let mut resource =
+                ImportedResource { record: resource.record.clone(), home: resource.home.clone(), resource: resource.resource.clone() };
+            write_imported(&mut rehearsal, &mut resource, &change).err().map(|reason| refuse(index, reason))
         })
         .collect()
 }
@@ -194,13 +213,14 @@ where
         if !target.imports(home) {
             continue;
         }
-        let result =
-            import::<B>(record, home).and_then(|imported| {
-                let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
-                target.write(home, imported.resource.name(), &change, &imported.resource).map(|()| imported).map_err(|reason| {
-                    ImportRefusal { kind: <B::Kind as LifecycleKind>::NAME, record: record.metadata.name.clone(), reason }
-                })
-            });
+        let result = import::<B>(record, home).and_then(|mut imported| {
+            let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+            write_imported(target, &mut imported, &change).map(|()| imported).map_err(|reason| ImportRefusal {
+                kind: <B::Kind as LifecycleKind>::NAME,
+                record: record.metadata.name.clone(),
+                reason,
+            })
+        });
         report.record(&result);
     }
 }
@@ -383,26 +403,34 @@ impl Imported for ImageBuildBinding {
     }
 }
 
-/// Imports old Clone `records` into `target`, each as its clone's first launch (`<name>#1`): the
-/// request the clone port makes, and for a Ready clone the default branch it found, written
-/// beside it as the launch's facts.
-pub fn import_clones(records: &[(ResourceObject<OldClone>, String)], target: &mut impl ImportTarget, report: &mut ImportReport) {
+/// Imports old Clone `records` into `target`, each as its clone's first launch (`<name>#<n>`, n
+/// the home sequence its create takes): the request the clone port makes, and for a Ready clone
+/// the default branch it found, written beside it as the launch's facts. Returns each imported
+/// clone's launch name by its home and old name, for the checkouts made from it.
+pub fn import_clones(
+    records: &[(ResourceObject<OldClone>, String)],
+    target: &mut impl ImportTarget,
+    report: &mut ImportReport,
+) -> BTreeMap<(String, String), String> {
+    let mut launches = BTreeMap::new();
     for (clone, home) in records {
         if !target.imports(home) {
             continue;
         }
         let refuse = |reason: String| ImportRefusal { kind: CloneKind::NAME, record: clone.metadata.name.clone(), reason };
-        let result = import_clone(clone, home).and_then(|imported| {
+        let result = import_clone(clone, home).and_then(|mut imported| {
             let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
-            target.write(home, imported.resource.name(), &change, &imported.resource).map_err(refuse)?;
+            write_imported(target, &mut imported, &change).map_err(refuse)?;
             if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
                 let facts = CloneFacts { default_branch: clone.status.as_ref().and_then(|status| status.default_branch.clone()) };
                 target.write(home, imported.resource.name(), &change, &facts).map_err(refuse)?;
             }
+            launches.insert((home.clone(), clone.metadata.name.clone()), imported.resource.name().to_owned());
             Ok(imported)
         });
         report.record(&result);
     }
+    launches
 }
 
 /// Maps old Clone `obj`, homed at `home`, onto its first launch.
@@ -422,8 +450,8 @@ pub fn import_clone(obj: &ResourceObject<OldClone>, home: &str) -> Result<Import
         record: obj.metadata.name.clone(),
         home: home.to_owned(),
         resource: Resource::stored(
-            launch(&obj.metadata.name, 1),
-            clones::request_of(&obj.spec, false, home),
+            obj.metadata.name.clone(),
+            clones::request_of(&obj.metadata.name, &obj.spec, false, home),
             State::new(state, since),
             Version(1),
         ),
@@ -438,10 +466,12 @@ pub type ImportedHolder = (flotilla_schema::Identity, u64);
 /// convoy label) is created under that convoy's engine Convoy at the version the convoy import
 /// wrote, which `holders` names by the label's old convoy name. Its facts and its inspection come
 /// with it. A checkout whose convoy was not imported, having ended or stayed on the old store,
-/// is not imported: nothing would release it.
+/// is not imported: nothing would release it. `clones` names the launch each clone imported as,
+/// by its home and old name ([`import_clones`]).
 pub fn import_checkouts(
     records: &[(ResourceObject<OldCheckout>, String)],
     holders: &dyn Fn(&str) -> Option<ImportedHolder>,
+    clones: &BTreeMap<(String, String), String>,
     target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) {
@@ -450,12 +480,12 @@ pub fn import_checkouts(
             continue;
         }
         let refuse = |reason: String| ImportRefusal { kind: CheckoutKind::NAME, record: checkout.metadata.name.clone(), reason };
-        let result = import_checkout(checkout, home, holders).and_then(|(imported, holder)| {
+        let result = import_checkout(checkout, home, holders, clones).and_then(|(mut imported, holder)| {
             let mut change = NewChange::new(IMPORT_WRITER, imported.resource.since());
             if let Some((identity, version)) = holder {
                 change.items.push(flotilla_schema::ChangeItem::new(identity, Some(version.to_string())));
             }
-            target.write(home, imported.resource.name(), &change, &imported.resource).map_err(refuse)?;
+            write_imported(target, &mut imported, &change).map_err(refuse)?;
             let status = checkout.status.as_ref();
             if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
                 let facts = CheckoutFacts { degraded: status.and_then(|status| status.degraded.clone()) };
@@ -472,11 +502,12 @@ pub fn import_checkouts(
 }
 
 /// Maps old Checkout `obj`, homed at `home`, onto its first launch, with the holder it is
-/// created under.
+/// created under. The clone a worktree names is the launch it imported as, by `clones`.
 pub fn import_checkout(
     obj: &ResourceObject<OldCheckout>,
     home: &str,
     holders: &dyn Fn(&str) -> Option<ImportedHolder>,
+    clones: &BTreeMap<(String, String), String>,
 ) -> Result<(ImportedResource<CheckoutKind>, Option<ImportedHolder>), ImportRefusal> {
     let refuse = |reason: String| ImportRefusal { kind: CheckoutKind::NAME, record: obj.metadata.name.clone(), reason };
     let holder = match obj.metadata.labels.get(CONVOY_LABEL) {
@@ -501,21 +532,24 @@ pub fn import_checkout(
         // Legacy Gone retained no ending cause; import normalizes it to a release.
         CheckoutPhase::Gone => LifecycleState::Gone { ending: Ending::Released },
     };
-    // A worktree names the clone it was made from; that clone imports as its first launch.
+    // A worktree names the clone it was made from, which imported as a launch of its own. One
+    // whose clone was not imported keeps the clone's name, which reads as its newest launch.
     let mut spec = obj.spec.clone();
     if let flotilla_resources::CheckoutSpec::Worktree(worktree) = &mut spec {
         if launched(&worktree.clone_ref) == worktree.clone_ref {
-            worktree.clone_ref = launch(&worktree.clone_ref, 1);
+            if let Some(launch) = clones.get(&(home.to_owned(), worktree.clone_ref.clone())) {
+                worktree.clone_ref.clone_from(launch);
+            }
         }
     }
     let holder_name = holder.as_ref().map(|(identity, _)| CheckoutHolder::Convoy(identity.name.clone()));
-    let request = checkouts::request_of(&spec, holder_name.as_ref(), home).map_err(refuse)?;
+    let request = checkouts::request_of(&obj.metadata.name, &spec, holder_name.as_ref(), home).map_err(refuse)?;
     let since = Timestamp::from_datetime(&obj.metadata.creation_timestamp);
     Ok((
         ImportedResource {
             record: obj.metadata.name.clone(),
             home: home.to_owned(),
-            resource: Resource::stored(launch(&obj.metadata.name, 1), request, State::new(state, since), Version(1)),
+            resource: Resource::stored(obj.metadata.name.clone(), request, State::new(state, since), Version(1)),
         },
         holder,
     ))

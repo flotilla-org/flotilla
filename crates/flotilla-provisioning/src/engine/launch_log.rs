@@ -94,9 +94,21 @@ where
     F: Kind,
 {
     fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<Lifecycle<K>>, reads: &[InputRead]) -> Result<Version, LogError> {
+        Ok(self.create_resource(writer, at, resource.clone(), reads)?.version())
+    }
+
+    /// The store log creates and numbers it, under the items staged for it by the name it is
+    /// requested under.
+    fn create_resource(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<Lifecycle<K>>,
+        reads: &[InputRead],
+    ) -> Result<Resource<Lifecycle<K>>, LogError> {
         match self.inputs.take(resource.name()) {
             Some(items) => self.inner.create_with_items(writer, at, resource, items),
-            None => self.inner.create(writer, at, resource, reads),
+            None => self.inner.create_resource(writer, at, resource, reads),
         }
     }
 

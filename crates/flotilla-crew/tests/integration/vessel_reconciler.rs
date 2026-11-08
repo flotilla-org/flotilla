@@ -2056,9 +2056,11 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
     let deps = reconciler.prepare(&workspace).await.expect("recovery deps should load");
     let recovery = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
+    use flotilla_provisioning::engine::Lifecycles as _;
+    let launch = lifecycle.home.newest_launch(terminal_name).map(|held| held.name().to_owned());
     assert!(matches!(
         recovery.actuations.as_slice(),
-        [Actuation::RestartTerminalSession { name, replaces }] if name == terminal_name && replaces.as_deref() == engine.then(|| format!("{terminal_name}#1")).as_deref()
+        [Actuation::RestartTerminalSession { name, replaces }] if name == terminal_name && *replaces == engine.then_some(launch).flatten()
     ));
 }
 

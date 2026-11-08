@@ -191,6 +191,26 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
             ));
             assert!(read.integer_index_keys(&query, "missing", 0, limit).unwrap().is_empty());
             assert!(matches!(read.integer_index_keys(&query, home, 0, 0), Err(StoreError::ZeroLimit)));
+            // The upper-bound route walks the same home's keys down from the bound, highest first.
+            let mut before = i64::MAX;
+            let mut down = Vec::new();
+            loop {
+                let page = read.integer_index_keys_before(&query, home, before, limit).expect("keys before");
+                assert!(page.len() <= limit as usize);
+                let Some(&(_, last)) = page.last() else { break };
+                before = last;
+                for (id, seq) in page {
+                    assert_eq!(read.identity(id).unwrap().unwrap().0.home, home);
+                    down.push(seq);
+                }
+            }
+            assert_eq!(down, (1..=12).rev().collect::<Vec<_>>());
+            assert_eq!(read.integer_index_keys_before(&query, home, 7, 1).unwrap()[0].1, 6);
+            assert!(read.integer_index_keys_before(&query, home, 1, 1).unwrap().is_empty());
+            assert!(matches!(
+                read.integer_index_keys_before(&EnsureSpec::by_inbox(&project("inbox")), home, 0, 1),
+                Err(StoreError::IntegerIndex { .. })
+            ));
         }
         snapshots.reverse();
     }

@@ -261,6 +261,12 @@ fn holds<K: Kind>(store: &mut flotilla_schema_sqlite::Store, name: &str, home: &
     read.resolve(K::CODE, name, home).expect("resolve").is_some()
 }
 
+/// Whether `store` holds a launch of `of` at `home`, by the kind's launch index.
+fn holds_launch<K: flotilla_provisioning::stored::Launches>(store: &mut flotilla_schema_sqlite::Store, of: &str, home: &str) -> bool {
+    let mut read = store.read().expect("read");
+    !read.integer_index_keys_before(&K::by_launch(of), home, i64::MAX, 1).expect("launches").is_empty()
+}
+
 #[tokio::test]
 async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -303,12 +309,12 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     let mut store = engine(dir.path());
     assert!(holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut store, "ours", HERE));
     assert!(
-        holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-a#1", HERE),
-        "a clone is imported as its first launch"
+        holds_launch::<flotilla_provisioning::stored::clone::CloneKind>(&mut store, "clone-a", HERE),
+        "a clone is imported as a launch"
     );
     assert!(
-        holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::checkout::Checkout>>(&mut store, "observed-a#1", HERE),
-        "an adopted checkout is imported as its first launch"
+        holds_launch::<flotilla_provisioning::stored::checkout::CheckoutKind>(&mut store, "observed-a", HERE),
+        "an adopted checkout is imported as a launch"
     );
     for name in ["access-delivered", "access-failed"] {
         assert!(holds::<flotilla_resources::AccessDeliverySpec>(&mut store, name, HERE), "{name}");
@@ -316,7 +322,7 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     for home in [HERE, THERE] {
         assert!(!holds::<flotilla_resources::AccessDeliverySpec>(&mut store, "access-theirs", home), "{home}");
         assert!(!holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut store, "theirs", home), "{home}");
-        assert!(!holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-b#1", home));
+        assert!(!holds_launch::<flotilla_provisioning::stored::clone::CloneKind>(&mut store, "clone-b", home));
         assert!(!holds::<flotilla_provisioning::stored::definition::ForgeDefinition>(&mut store, "lab", home), "{home}");
     }
     drop(store);

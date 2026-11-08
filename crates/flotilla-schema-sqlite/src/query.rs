@@ -5,6 +5,7 @@ use rusqlite::{params, params_from_iter, types::Value as SqlValue};
 
 use crate::{
     error::StoreError,
+    sql::IndexSql,
     store::{Ctx, ResourceId},
 };
 
@@ -127,12 +128,35 @@ impl Ctx<'_> {
         after: i64,
         limit: u32,
     ) -> Result<Vec<(ResourceId, i64)>, StoreError> {
+        self.home_integer_keys(query, home, after, limit, |index| index.integer_keys.as_deref())
+    }
+
+    pub(crate) fn integer_index_keys_before<K>(
+        &mut self,
+        query: &IndexQuery<K>,
+        home: &str,
+        before: i64,
+        limit: u32,
+    ) -> Result<Vec<(ResourceId, i64)>, StoreError> {
+        self.home_integer_keys(query, home, before, limit, |index| index.integer_keys_before.as_deref())
+    }
+
+    /// One home's keys of a single-integer-order index beyond the exclusive `bound`, through the
+    /// statement `statement` picks: ascending above it, or descending below it.
+    fn home_integer_keys<K>(
+        &mut self,
+        query: &IndexQuery<K>,
+        home: &str,
+        bound: i64,
+        limit: u32,
+        statement: impl Fn(&IndexSql) -> Option<&str>,
+    ) -> Result<Vec<(ResourceId, i64)>, StoreError> {
         let kind = query.kind();
         let limit = page_limit(limit)?;
         let eq = query.eq()?;
         let index =
             self.sql(kind)?.indexes.get(query.index()).ok_or_else(|| StoreError::UnknownIndex { kind, index: query.index().into() })?;
-        if index.integer_keys.is_none() {
+        if statement(index).is_none() {
             return Err(StoreError::IntegerIndex { kind, index: query.index().into() });
         }
         let columns = index.eq_columns.clone();
@@ -142,11 +166,11 @@ impl Ctx<'_> {
             params.push(param);
         }
         let Some(home) = self.string_id(HOME_DOMAIN, home)? else { return Ok(Vec::new()) };
-        params.extend([SqlValue::Integer(after), SqlValue::Integer(home), SqlValue::Integer(limit)]);
-        let statement = self.sql(kind)?.indexes[query.index()].integer_keys.as_ref().expect("validated integer index");
+        params.extend([SqlValue::Integer(bound), SqlValue::Integer(home), SqlValue::Integer(limit)]);
+        let sql = statement(&self.sql(kind)?.indexes[query.index()]).expect("validated integer index").to_owned();
         Ok(self
             .conn
-            .prepare_cached(statement)?
+            .prepare_cached(&sql)?
             .query_map(params_from_iter(params), |row| Ok((ResourceId(row.get(0)?), row.get(1)?)))?
             .collect::<Result<_, _>>()?)
     }

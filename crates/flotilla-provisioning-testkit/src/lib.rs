@@ -352,11 +352,21 @@ impl TerminalFixture {
                 resource: &Resource<Machine>,
                 reads: &[InputRead],
             ) -> Result<Version, LogError> {
+                self.inner.create(writer, at, resource, reads)
+            }
+            // A launch is created, and numbered, here.
+            fn create_resource(
+                &mut self,
+                writer: &str,
+                at: Timestamp,
+                resource: Resource<Machine>,
+                reads: &[InputRead],
+            ) -> Result<Resource<Machine>, LogError> {
                 if self.create && self.remaining > 0 {
                     self.remaining -= 1;
                     return Err(LogError::new("injected successor create failure"));
                 }
-                self.inner.create(writer, at, resource, reads)
+                self.inner.create_resource(writer, at, resource, reads)
             }
             fn edge(
                 &mut self,

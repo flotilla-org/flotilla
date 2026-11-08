@@ -123,6 +123,9 @@ fn the_enumeration_covers_every_kind_and_index() {
         "index message_pending_by_inbox integer keys",
         "index terminal_session_by_vessel integer keys",
         "index referral_by_session integer keys",
+        "index message_pending_by_inbox integer keys before",
+        "index terminal_session_by_vessel integer keys before",
+        "index referral_by_session integer keys before",
         "index message_deadline first",
         "index convoy_open_by_project first",
         "index ensure_by_inbox after",
@@ -145,7 +148,7 @@ fn the_enumeration_covers_every_kind_and_index() {
     ] {
         assert!(labels.contains(&expected), "missing {expected}");
     }
-    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 17 + 3);
+    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 17 + 2 * 3);
     assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 12);
     assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(

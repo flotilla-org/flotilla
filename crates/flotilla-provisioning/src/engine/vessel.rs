@@ -226,6 +226,10 @@ where
         })
     }
 
+    fn newest_launch(&self, _: &str) -> Option<Resource<Lifecycle<VesselKind>>> {
+        None
+    }
+
     fn replace_launch(&self, _: &str, _: &str, _: VesselSpec, _: Timestamp) -> Result<String, EngineError> {
         Err(EngineError::Failed("a placement has no terminal launches".into()))
     }

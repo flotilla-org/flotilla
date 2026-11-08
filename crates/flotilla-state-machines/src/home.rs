@@ -10,7 +10,11 @@
 //! (teardown, dead letters, follow-up messages) belong to subscribers outside
 //! the engine.
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    ops::Bound::{Excluded, Included},
+};
 
 use flotilla_schema::{EdgeEvent, State, Timestamp};
 
@@ -40,6 +44,14 @@ impl<M: Machine> Resource<M> {
     /// The same resource with another spec: a spec edit, as storage applies one.
     pub fn with_spec(self, spec: M::Spec) -> Self {
         Resource { spec, ..self }
+    }
+
+    /// The same resource numbered `n`, as its log names a launch in the create's transaction
+    /// ([`Machine::launch`]); unchanged for a machine whose resources are not launches.
+    pub fn numbered(self, n: u64) -> Self {
+        let Some((of, _)) = M::launch(&self.spec) else { return self };
+        let name = crate::launch_name(of, n);
+        Resource { name, spec: M::numbered(self.spec, n), ..self }
     }
 
     /// The same resource in another stored state, as storage holds one.
@@ -201,6 +213,9 @@ pub struct Home<M: Machine, L: Log<M> = MemoryLog<M>> {
     writer: String,
     definition: MachineDef<M>,
     resources: BTreeMap<String, Resource<M>>,
+    /// The launches among `resources` by the name each is a launch of and its number
+    /// ([`Machine::launch`]): a name's newest launch is its last.
+    launches: BTreeMap<(String, u64), String>,
     log: L,
 }
 
@@ -218,7 +233,7 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
     pub fn with_log(writer: impl Into<String>, log: L) -> Result<Self, Vec<DefError>> {
         let definition = M::definition();
         definition.validate()?;
-        Ok(Home { writer: writer.into(), definition, resources: BTreeMap::new(), log })
+        Ok(Home { writer: writer.into(), definition, resources: BTreeMap::new(), launches: BTreeMap::new(), log })
     }
 
     /// The log this home writes through: where its resources' history is read.
@@ -248,7 +263,30 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
     /// authoritative for evicted names: the log must enforce source uniqueness
     /// if a caller tries to create that name again.
     pub fn evict(&mut self, name: &str) -> Option<Resource<M>> {
-        self.resources.remove(name)
+        let resource = self.resources.remove(name)?;
+        if let Some((of, n)) = M::launch(&resource.spec) {
+            self.launches.remove(&(of.to_owned(), n));
+        }
+        Some(resource)
+    }
+
+    /// The newest launch of `of` held here, or with `before`, the newest numbered below it: a
+    /// launch's predecessor. Only this home's launches: numbers are ordered within one home.
+    pub fn newest_launch(&self, of: &str, before: Option<u64>) -> Option<&Resource<M>> {
+        let end = match before {
+            Some(n) => Excluded((of.to_owned(), n)),
+            None => Included((of.to_owned(), u64::MAX)),
+        };
+        let (_, name) = self.launches.range((Included((of.to_owned(), 0)), end)).next_back()?;
+        self.resources.get(name)
+    }
+
+    /// Places `resource` under its name, and among the launches when it is one.
+    fn place(&mut self, resource: Resource<M>) -> &Resource<M> {
+        if let Some((of, n)) = M::launch(&resource.spec) {
+            self.launches.insert((of.to_owned(), n), resource.name.clone());
+        }
+        self.resources.entry(resource.name.clone()).or_insert(resource)
     }
 
     pub fn resources(&self) -> impl Iterator<Item = &Resource<M>> {
@@ -278,8 +316,13 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
         }
         let resource = Resource::stored(name.clone(), spec, State::new(state, now), Version(0));
         let reads = admission.into_reads();
+        // A launch's log names it in the create's transaction ([`Machine::launch`]); any other
+        // resource keeps `name`.
         let resource = self.log.create_resource(&self.writer, now, resource, &reads).map_err(WriteError::Log)?;
-        Ok(Created { resource: self.resources.entry(name).or_insert(resource), reads })
+        if resource.name != name && self.resources.contains_key(&resource.name) {
+            return Err(WriteError::Exists(resource.name));
+        }
+        Ok(Created { resource: self.place(resource), reads })
     }
 
     /// Places a resource read from storage at this home, as stored: its spec
@@ -291,7 +334,7 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
         if self.resources.contains_key(&resource.name) {
             return Err(WriteError::Exists(resource.name));
         }
-        Ok(self.resources.entry(resource.name.clone()).or_insert(resource))
+        Ok(self.place(resource))
     }
 
     /// Applies `edge` at `now`, reading `world` through the recording handle.

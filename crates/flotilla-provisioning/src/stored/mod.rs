@@ -39,7 +39,6 @@ pub mod forge_observation;
 pub mod host;
 pub mod image_build;
 pub mod launch_facts;
-pub mod launch_proposal;
 pub mod manifest_root;
 pub mod placement;
 pub mod project;
@@ -49,9 +48,9 @@ pub mod terminal_session;
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Kind, KindRegistry, RegistryError, Stored};
+use flotilla_schema::{IndexQuery, Kind, KindRegistry, RegistryError, Stored};
 use flotilla_state_machines::{
-    machines::{ensure::Ensure, lifecycle::Lifecycle, vessel::Vessel},
+    machines::{ensure::Ensure, lifecycle::LifecycleKind, vessel::Vessel},
     Diagram, Machine, Resource,
 };
 
@@ -74,6 +73,16 @@ impl Holder {
     pub fn vessel(name: &str) -> Holder {
         Holder(format!("vessel:{name}"))
     }
+}
+
+/// A lifecycle kind whose resources are launches of a name (`<of>#<n>`, owner's ruling, #3108):
+/// Clone, Checkout and TerminalSession. `n` is the home sequence the launch's create took, which
+/// its log assigns ([`flotilla_state_machines::Machine::launch`]), so it is unique for all time at
+/// its home and rises with each launch of one name, with gaps. Numbers are ordered within one
+/// home only: a name's newest launch is read at a home, through its `by_launch` index.
+pub trait Launches: LifecycleKind {
+    /// The kind's `by_launch` index for the launches of `of`, in launch order.
+    fn by_launch(of: &str) -> IndexQuery<Self::Request>;
 }
 
 /// One second, in the engine's microseconds: the unit of an `AttemptPolicy`'s delays.
@@ -148,22 +157,13 @@ pub fn crew_registry() -> Result<KindRegistry, RegistryError> {
     Ok(registry)
 }
 
-/// PROPOSAL, for the owner's schema look-over only (#3108): TerminalSession with its launch number
-/// ([`launch_proposal`]) and the record its launches would need on the engine ([`terminal_facts`]).
-/// No store opens this registry.
+/// PROPOSAL, for the owner's schema look-over only (#3108): the record TerminalSession launches
+/// would need on the engine ([`terminal_facts`]), beside TerminalSession. No store opens this
+/// registry.
 pub fn terminal_proposal_registry() -> Result<KindRegistry, RegistryError> {
     let mut registry = KindRegistry::new();
-    registry.register::<Resource<Lifecycle<launch_proposal::TerminalSessionLaunchKind>>>()?;
+    registry.register::<Resource<terminal_session::TerminalSession>>()?;
     registry.register::<terminal_facts::TerminalLaunchFacts>()?;
-    Ok(registry)
-}
-
-/// PROPOSAL, for the owner's schema look-over only (#3108): Clone and Checkout with their launch
-/// numbers ([`launch_proposal`]). No store opens this registry.
-pub fn launch_proposal_registry() -> Result<KindRegistry, RegistryError> {
-    let mut registry = KindRegistry::new();
-    registry.register::<Resource<Lifecycle<launch_proposal::CloneLaunchKind>>>()?;
-    registry.register::<Resource<Lifecycle<launch_proposal::CheckoutLaunchKind>>>()?;
     Ok(registry)
 }
 

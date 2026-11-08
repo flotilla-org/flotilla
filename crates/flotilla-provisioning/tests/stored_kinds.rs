@@ -215,6 +215,8 @@ fn each_kind_survives_the_codec() {
     }
     for state in states() {
         let spec = CloneRequest {
+            launch_of: "repo".into(),
+            launch: 7,
             repository: "repo".into(),
             url: "https://example/repo".into(),
             environment: environment("feta"),
@@ -229,6 +231,8 @@ fn each_kind_survives_the_codec() {
     ] {
         for state in states() {
             let spec = CheckoutRequest {
+                launch_of: "feature".into(),
+                launch: 12,
                 repository: "repo".into(),
                 environment: environment("feta"),
                 branch: "feature".into(),
@@ -322,12 +326,13 @@ fn failures_before_give_up<K: LifecycleKind>(spec: K::Request) -> Option<u32> {
     };
     let world = MemoryLifecycleWorld::default();
     let mut home = Home::<Lifecycle<K>>::new("home").expect("declaration");
-    home.create("r", spec, &world, Timestamp::from_micros(0)).expect("created");
+    // A launch kind's resource is named for its launch.
+    let name = home.create("r", spec, &world, Timestamp::from_micros(0)).expect("created").resource.name().to_owned();
     let cause = Cause::new(CauseCategory::Transient, "unreachable");
     for failures in 1..=64 {
         let at = Timestamp::from_micros(i64::from(failures) * 3_600_000_000);
-        home.apply("r", Attempted { outcome: Outcome::Failed { cause: cause.clone(), retryable: true } }, &world, at).expect("attempt");
-        if home.apply("r", GiveUp { cause: cause.clone() }, &world, at).is_ok() {
+        home.apply(&name, Attempted { outcome: Outcome::Failed { cause: cause.clone(), retryable: true } }, &world, at).expect("attempt");
+        if home.apply(&name, GiveUp { cause: cause.clone() }, &world, at).is_ok() {
             return Some(failures);
         }
     }
@@ -369,11 +374,20 @@ fn policies_give_up_as_the_old_retries_did() {
         Home, Outcome,
     };
     assert_eq!(failures_before_give_up::<ImageBuildKind>(image_build_request()), Some(flotilla_resources::IMAGE_BUILD_MAX_ATTEMPTS));
-    let clone =
-        || CloneRequest { repository: "r".into(), url: "u".into(), environment: environment("feta"), path: "/c".into(), discovered: false };
+    let clone = || CloneRequest {
+        launch_of: "r".into(),
+        launch: 0,
+        repository: "r".into(),
+        url: "u".into(),
+        environment: environment("feta"),
+        path: "/c".into(),
+        discovered: false,
+    };
     assert_eq!(failures_before_give_up::<CloneKind>(clone()), Some(3));
     assert_eq!(failures_before_give_up::<EnvironmentKind>(environment_request()), Some(3));
     let checkout = CheckoutRequest {
+        launch_of: "r".into(),
+        launch: 0,
         repository: "r".into(),
         environment: environment("feta"),
         branch: "b".into(),
@@ -394,12 +408,12 @@ fn policies_give_up_as_the_old_retries_did() {
     home.apply("b", GiveUp { cause: recipe }, &world, Timestamp::from_micros(1)).expect("a recipe failure gives up at once");
 
     let mut clones = Home::<Lifecycle<CloneKind>>::new("home").expect("declaration");
-    clones.create("c", clone(), &world, Timestamp::from_micros(0)).expect("created");
+    let c = clones.create("r", clone(), &world, Timestamp::from_micros(0)).expect("created").resource.name().to_owned();
     let wrong = Cause::new(CauseCategory::Misconfigured, "repository not found");
     clones
-        .apply("c", Attempted { outcome: Outcome::Failed { cause: wrong.clone(), retryable: false } }, &world, Timestamp::from_micros(1))
+        .apply(&c, Attempted { outcome: Outcome::Failed { cause: wrong.clone(), retryable: false } }, &world, Timestamp::from_micros(1))
         .expect("attempt");
-    clones.apply("c", GiveUp { cause: wrong }, &world, Timestamp::from_micros(1)).expect("a clone that cannot succeed gives up at once");
+    clones.apply(&c, GiveUp { cause: wrong }, &world, Timestamp::from_micros(1)).expect("a clone that cannot succeed gives up at once");
     let policy = CloneKind::policy();
     assert_eq!((policy.backoff(1), policy.backoff(2)), (0, 0), "a clone tries again at once; what it waits on wakes it");
 

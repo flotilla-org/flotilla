@@ -39,6 +39,14 @@ pub trait LifecycleKind: 'static {
     fn policy() -> AttemptPolicy {
         DEFAULT_POLICY
     }
+    /// For a kind whose resources are launches of a name: [`Machine::launch`].
+    fn launch(_request: &Self::Request) -> Option<(&str, u64)> {
+        None
+    }
+    /// [`Machine::numbered`].
+    fn numbered(request: Self::Request, _n: u64) -> Self::Request {
+        request
+    }
 }
 
 /// One second, in the engine's microseconds.
@@ -319,6 +327,14 @@ impl<K: LifecycleKind> Machine for Lifecycle<K> {
     type Write = NoRecords;
     type Refusal = LifecycleRefusal;
     type World = dyn LifecycleWorld;
+
+    fn launch(spec: &K::Request) -> Option<(&str, u64)> {
+        K::launch(spec)
+    }
+
+    fn numbered(spec: K::Request, n: u64) -> K::Request {
+        K::numbered(spec, n)
+    }
 
     fn definition() -> MachineDef<Self> {
         use LifecycleLabel::*;

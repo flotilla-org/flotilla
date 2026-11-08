@@ -4,7 +4,7 @@
 use flotilla_protocol::LifecycleReading;
 use flotilla_provisioning_testkit::{checkouts::CheckoutFixture, Ending};
 use flotilla_resources::{
-    checkout_records::{launch, CheckoutHolder, CheckoutRecords, Inspection, Landed},
+    checkout_records::{launched, CheckoutHolder, CheckoutRecords, Inspection, Landed},
     CheckoutSpec, CheckoutWorktreeSpec, ObservedCheckoutSpec, RepositoryKey,
 };
 
@@ -32,17 +32,18 @@ fn a_request_is_served_by_its_live_launch_and_an_ended_one_starts_the_next() {
     let fixture = CheckoutFixture::default();
     fixture.open_convoy("c1");
     let first = fixture.request("co", &worktree("feature"), Some(&convoy("c1")));
-    assert_eq!(first, launch("co", 1));
+    assert_eq!(launched(&first), "co");
     assert_eq!(fixture.record(&first).reading, LifecycleReading::InProgress);
     assert_eq!(fixture.request("co", &worktree("feature"), Some(&convoy("c1"))), first);
     // One name is one checkout: a live launch requested otherwise is refused.
     assert!(fixture.checkouts.request("co", &worktree("other"), Some(&convoy("c1"))).is_err());
     // A launch's own name is no checkout's.
-    assert!(fixture.checkouts.request("co#1", &worktree("feature"), None).is_err());
+    assert!(fixture.checkouts.request(&first, &worktree("feature"), None).is_err());
 
     fixture.finish(&first, Ending::Lost("gone"));
     let second = fixture.request("co", &worktree("feature"), Some(&convoy("c1")));
-    assert_eq!(second, launch("co", 2));
+    assert_eq!(launched(&second), "co");
+    assert_ne!(second, first);
     // The checkout's name reads its latest launch; a launch's name reads that launch.
     assert_eq!(fixture.checkouts.get("co", None).expect("read").expect("held").name, second);
     assert!(fixture.record(&first).ended());
@@ -55,7 +56,7 @@ fn a_realised_checkout_reads_back_with_its_facts_through_each_index() {
     let held = fixture.request("co", &worktree("feature"), Some(&convoy("c1")));
     fixture.ready(&held, Some("objects not shared"));
     fixture.open_convoy("c3");
-    fixture.put_ready("standing", &worktree("standing"), Some(&convoy("c3")));
+    let standing = fixture.put_ready("standing", &worktree("standing"), Some(&convoy("c3")));
 
     let record = fixture.record(&held);
     assert!(record.is_ready());
@@ -71,11 +72,11 @@ fn a_realised_checkout_reads_back_with_its_facts_through_each_index() {
         names
     };
     assert_eq!(names(fixture.checkouts.held(&convoy("c1")).expect("held")), vec![held.clone()]);
-    assert_eq!(names(fixture.checkouts.held(&convoy("c3")).expect("held")), vec!["standing#1".to_owned()]);
+    assert_eq!(names(fixture.checkouts.held(&convoy("c3")).expect("held")), vec![standing.clone()]);
     assert_eq!(names(fixture.checkouts.held(&convoy("c2")).expect("held")), Vec::<String>::new());
-    assert_eq!(names(fixture.checkouts.of_repository(&repository()).expect("of")), vec![held.clone(), "standing#1".into()]);
-    assert_eq!(names(fixture.checkouts.in_environment("host-direct-home", None).expect("in")), vec![held.clone(), "standing#1".into()]);
-    assert_eq!(names(fixture.checkouts.here().expect("here")), vec![held, "standing#1".into()]);
+    assert_eq!(names(fixture.checkouts.of_repository(&repository()).expect("of")), vec![held.clone(), standing.clone()]);
+    assert_eq!(names(fixture.checkouts.in_environment("host-direct-home", None).expect("in")), vec![held.clone(), standing.clone()]);
+    assert_eq!(names(fixture.checkouts.here().expect("here")), vec![held, standing]);
     // Served through the engine's readings.
     assert!(fixture.reads.checkouts().expect("served").get("standing", None).expect("read").is_some());
 }

@@ -105,6 +105,9 @@ pub(crate) struct IndexSql {
     pub after: String,
     /// Home-scoped keys after an exclusive integer order bound; only single integer orders.
     pub integer_keys: Option<String>,
+    /// Home-scoped keys below an exclusive integer order bound, highest first; only single
+    /// integer orders.
+    pub integer_keys_before: Option<String>,
 }
 
 /// Interned columns read back as their strings through `strings`' primary key.
@@ -196,6 +199,9 @@ impl KindSql {
             if let Some(sql) = &index.integer_keys {
                 out.push((format!("index {} integer keys", index.object), sql.clone()));
             }
+            if let Some(sql) = &index.integer_keys_before {
+                out.push((format!("index {} integer keys before", index.object), sql.clone()));
+            }
         }
         out.push((format!("{root} scan"), self.scan.clone()));
         out
@@ -230,31 +236,34 @@ impl IndexSql {
             format!("ORDER BY {} LIMIT ?{params}", by.join(", "))
         };
         let select = format!("SELECT \"id\"{} FROM {table} WHERE", prefixed(&order));
+        let integer =
+            index.order.len() == 1 && root.columns.iter().any(|column| column.name == index.order[0] && column.ty == ColumnType::Integer);
+        // Keys of one home beyond an exclusive bound on the single integer order, walked in
+        // `direction` through the index itself, so the bound and the order are one range search.
+        let home_keys = |first: &[String], bound: &str, direction: &str| {
+            let mut bounds = first.to_vec();
+            bounds.push(format!("{} {bound} ?{next}", order[0]));
+            bounds.push(format!(
+                "EXISTS (SELECT 1 FROM \"resource_identity\" AS ri WHERE ri.\"id\" = {table}.\"id\" AND ri.\"home\" = ?{})",
+                next + 1
+            ));
+            let by = [order[0].as_str(), "\"id\""].map(|column| format!("{column}{direction}")).join(", ");
+            format!(
+                "SELECT \"id\", {} FROM {table} INDEXED BY {} WHERE {} ORDER BY {by} LIMIT ?{}",
+                order[0],
+                quote_ident(&index.object_name()),
+                bounds.join(" AND "),
+                next + 2
+            )
+        };
         IndexSql {
             eq_columns: index
                 .eq
                 .iter()
                 .map(|name| root.columns.iter().find(|column| &column.name == name).expect("validated eq column").clone())
                 .collect(),
-            integer_keys: if index.order.len() == 1
-                && root.columns.iter().any(|column| column.name == index.order[0] && column.ty == ColumnType::Integer)
-            {
-                let mut bounds = first.clone();
-                bounds.push(format!("{} > ?{next}", order[0]));
-                bounds.push(format!(
-                    "EXISTS (SELECT 1 FROM \"resource_identity\" AS ri WHERE ri.\"id\" = {table}.\"id\" AND ri.\"home\" = ?{})",
-                    next + 1
-                ));
-                Some(format!(
-                    "SELECT \"id\", {} FROM {table} INDEXED BY {} WHERE {} {}",
-                    order[0],
-                    quote_ident(&index.object_name()),
-                    bounds.join(" AND "),
-                    limit(next + 2)
-                ))
-            } else {
-                None
-            },
+            integer_keys: integer.then(|| home_keys(&first, ">", "")),
+            integer_keys_before: integer.then(|| home_keys(&first, "<", " DESC")),
             object: index.object_name(),
             order: order.len(),
             first: format!("{select} {} {}", first.join(" AND "), limit(next)),

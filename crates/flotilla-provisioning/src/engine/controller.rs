@@ -48,7 +48,6 @@ use tokio::{sync::mpsc, task::JoinSet};
 use tracing::{debug, warn};
 
 use super::{
-    launch,
     reads::{judge, Judgement},
     watch::EngineWatch,
     EngineError, Lifecycles, Step,
@@ -249,13 +248,6 @@ async fn sleep(wait: Option<std::time::Duration>) {
     }
 }
 
-/// The launch `name` succeeds, if it is a successor launch (`<name>#<n>`, n > 1).
-fn predecessor(name: &str) -> Option<String> {
-    let (base, n) = name.rsplit_once('#')?;
-    let n = n.parse::<u32>().ok().filter(|n| *n > 1)?;
-    Some(launch(base, n - 1))
-}
-
 /// Kind `K`'s controller at this home.
 pub struct Controller<K: LifecycleKind, A: Actuator<K>> {
     lifecycles: Arc<dyn Lifecycles<K>>,
@@ -448,20 +440,24 @@ where
                 continue;
             }
             let state = resource.state();
-            if matches!(state, LifecycleState::Requested { .. }) {
-                if let Some(previous) = predecessor(&name) {
-                    self.end_predecessor(&previous).await;
-                }
+            if matches!(state, LifecycleState::Requested { .. }) && K::launch(resource.spec()).is_some() {
+                self.end_predecessor(&name).await;
             }
             let action = act(state, &judge::<K>(state), &found, trigger, usable_again, self.release_failed.contains(&name));
             self.perform(&name, resource.spec().clone(), action).await;
         }
     }
 
-    /// A successor launch is requested: its predecessor, if still realised, is gone.
-    async fn end_predecessor(&self, previous: &str) {
-        if self.lifecycles.get(previous).is_some_and(|resource| matches!(resource.state(), LifecycleState::Realised { .. })) {
-            self.write(previous, Step::Vanished { cause: VanishCause::lost() }).await;
+    /// A successor launch `name` is requested: its predecessor, if still realised, is gone.
+    async fn end_predecessor(&self, name: &str) {
+        let lifecycles = Arc::clone(&self.lifecycles);
+        let owned = name.to_owned();
+        let at = Timestamp::from_datetime(&self.clock.now());
+        let written = tokio::task::spawn_blocking(move || lifecycles.finish_launch_request(&owned, at))
+            .await
+            .unwrap_or_else(|error| Err(EngineError::Failed(format!("lifecycle write did not finish: {error}"))));
+        if let Err(error) = written {
+            warn!(kind = K::NAME, name, %error, "the predecessor launch was not ended");
         }
     }
 

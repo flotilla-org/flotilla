@@ -106,6 +106,8 @@ impl Sample for ImageBuildKind {
 impl Sample for CloneKind {
     fn request() -> CloneRequest {
         CloneRequest {
+            launch_of: NAME.into(),
+            launch: 0,
             repository: "repo".into(),
             url: "https://example/repo".into(),
             environment: StoredRef::new("env", HOME),
@@ -118,6 +120,8 @@ impl Sample for CloneKind {
 impl Sample for CheckoutKind {
     fn request() -> CheckoutRequest {
         CheckoutRequest {
+            launch_of: NAME.into(),
+            launch: 0,
             repository: "repo".into(),
             environment: StoredRef::new("env", HOME),
             branch: "feature".into(),
@@ -133,6 +137,8 @@ impl Sample for CheckoutKind {
 impl Sample for TerminalSessionKind {
     fn request() -> TerminalSessionRequest {
         TerminalSessionRequest {
+            launch_of: NAME.into(),
+            launch: 0,
             environment: StoredRef::new("env", HOME),
             holder: Some(Holder::vessel("vessel")),
             role: "coder".into(),

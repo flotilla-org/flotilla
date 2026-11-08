@@ -83,13 +83,12 @@ impl CloneFixture {
         launch
     }
 
-    /// Writes launch 1 of a clone named `name` (not named for its repository, as an imported
-    /// clone may be), requested with `spec`, and returns the launch.
+    /// Writes the first launch of a clone named `name` (not named for its repository, as an
+    /// imported clone may be), requested with `spec`, and returns the launch.
     pub fn put_named(&self, name: &str, spec: &CloneSpec) -> String {
-        let launch = flotilla_resources::clone_records::launch(name, 1);
-        let request = flotilla_provisioning::engine::clones::request_of(spec, false, &self.home);
-        self.lifecycles.request(&launch, request, Timestamp::from_datetime(&chrono::Utc::now())).expect("clone requested");
-        launch
+        let request = flotilla_provisioning::engine::clones::request_of(name, spec, false, &self.home);
+        let launch = self.lifecycles.request(name, request, Timestamp::from_datetime(&chrono::Utc::now())).expect("clone requested");
+        launch.name().to_owned()
     }
 
     /// [`Self::put_named`], realised having found `default_branch`.

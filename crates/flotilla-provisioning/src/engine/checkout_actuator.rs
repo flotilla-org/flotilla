@@ -43,7 +43,6 @@ use super::{
     clone_actuator::{classify, environment_host, CloneFailure},
     controller::{Actuator, Backing, Holding, ProviderFailure, Usability},
     environment_actuator::state_of,
-    latest_launch,
     launch_log::StagedFacts,
     reads::StoreReads,
 };
@@ -54,6 +53,7 @@ use crate::{
         clone::{CloneKind, CloneRequest},
         environment::EnvironmentKind,
         host::HostObservation,
+        Launches,
     },
 };
 
@@ -317,29 +317,18 @@ fn removal_events(checkout: &str, home: &str, environment: &str, outcome: &Check
 }
 
 /// The clone launch a checkout is made from, as its request names it: a launch name reads that
-/// launch, and a clone's name, from a checkout made before clones had launches, its latest.
+/// launch, and a clone's name, from a checkout made before clones had launches, its newest at
+/// `home` (its `by_launch` index).
 fn clone_launch(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<(String, LifecycleState, CloneRequest)>, StoreError> {
-    let mut load = |launch: &str| -> Result<Option<Resource<Lifecycle<CloneKind>>>, StoreError> {
-        let Some(id) = read.resolve(CLONE, launch, home)? else { return Ok(None) };
-        Ok(read.load::<Resource<Lifecycle<CloneKind>>>(id)?.map(|loaded| loaded.value))
-    };
-    let (launch, held) = if launched(name) != name {
-        (name.to_owned(), load(name)?)
+    let id = if launched(name) != name {
+        read.resolve(CLONE, name, home)?
     } else {
-        let mut failed = None;
-        let found = latest_launch::<CloneKind>(name, |launch| match load(launch) {
-            Ok(found) => found,
-            Err(error) => {
-                failed.get_or_insert(error);
-                None
-            }
-        });
-        if let Some(error) = failed {
-            return Err(error);
-        }
-        found
+        read.integer_index_keys_before(&CloneKind::by_launch(name), home, i64::MAX, 1)?.first().map(|(id, _)| *id)
     };
-    Ok(held.map(|held| (launch, held.state().clone(), held.spec().clone())))
+    let Some(id) = id else { return Ok(None) };
+    Ok(read
+        .load::<Resource<Lifecycle<CloneKind>>>(id)?
+        .map(|loaded| (loaded.name, loaded.value.state().clone(), loaded.value.spec().clone())))
 }
 
 /// The home sequence of the change that created checkout launch `name` at `home`: its request

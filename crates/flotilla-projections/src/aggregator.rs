@@ -7193,7 +7193,7 @@ mod tests {
             use crate::ports::LifecycleReads as _;
             let reading = self.try_reading(crate::ports::ProvisioningKind::Clone, name, home)?;
             Ok(reading.map(|reading| flotilla_resources::clone_records::CloneRecord {
-                name: flotilla_resources::clone_records::launch(name, 1),
+                name: format!("{name}#1"),
                 home: home.unwrap_or("kiwi").to_owned(),
                 spec: flotilla_resources::CloneSpec::builder()
                     .repo_ref(RepositoryKey("repo".into()))
@@ -7424,7 +7424,8 @@ mod tests {
                 aggregator.terminal_view(&source).expect("view").object.status.expect("status").phase,
                 TerminalSessionPhase::Stopped
             );
-            assert_eq!(fixture.replace(&obj, "terminal-a#1").expect("replacement"), "terminal-a#2");
+            let first = fixture.name(&obj);
+            assert_ne!(fixture.replace(&obj, &first).expect("replacement"), first);
             assert_eq!(
                 aggregator.terminal_view(&source).expect("view").object.status.expect("status").phase,
                 TerminalSessionPhase::Starting

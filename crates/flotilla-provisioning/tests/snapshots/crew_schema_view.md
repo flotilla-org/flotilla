@@ -7,7 +7,7 @@ Kind tables only; the shared tables are in `crew.sql`.
 | `ensure` | root | 15 | – | `ensure_recorded` (state data), `ensure_created` (state data) | `by_inbox` (inbox) |
 | `ensure_recorded` | state data | 2 | – | – | – |
 | `ensure_created` | state data | 2 | – | – | – |
-| `terminal_session` | root | 25 | 8: `source` 6, `ending` 2 | `terminal_session_env` (child) | `by_environment` (environment), `by_holder` (holder) |
+| `terminal_session` | root | 27 | 8: `source` 6, `ending` 2 | `terminal_session_env` (child) | `by_environment` (environment), `by_holder` (holder), `by_launch` (launch_of, launch) |
 | `terminal_session_env` | child | 3 | – | – | – |
 | `vessel` | root | 18 | 2: `ending` 2 | `vessel_shape` (child) | `live_by_host` (host), `by_convoy` (convoy) |
 | `vessel_shape` | child | 3 | – | – | – |
@@ -28,6 +28,7 @@ Interned column domains:
 | `ensure` | `bound` | `rn` |
 | `ensure_recorded` | `value` | `rn` |
 | `ensure_created` | `value` | `rn` |
+| `terminal_session` | `launch_of` | `ln` |
 | `terminal_session` | `holder` | `hl` |
 | `terminal_session` | `role` | `rl` |
 | `terminal_session` | `pool` | `tp` |

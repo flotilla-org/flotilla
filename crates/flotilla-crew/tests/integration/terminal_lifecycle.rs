@@ -123,6 +123,10 @@ impl Fixture {
         }
         outcome
     }
+    /// The newest launch's name, by the launch index.
+    fn newest(&self) -> String {
+        self.lifecycle.home.newest_launch(&self.obj.metadata.name).expect("a launch").name().to_owned()
+    }
     fn reading(&self) -> flotilla_resources::terminal_launches::TerminalLaunch {
         self.lifecycle.reads.try_terminal_launch(&self.obj.metadata.name, None).expect("read").expect("held")
     }
@@ -144,7 +148,7 @@ async fn requested_replacement_survives_status_write_failure_and_refuses_n_plus_
     a.expect("first replacement");
     b.expect("idempotent retry");
     let next = fixture.reading();
-    assert_eq!(next.name, "terminal-a#2");
+    assert_ne!(next.name, first);
     assert_eq!(next.reading, LifecycleReading::InProgress);
     let version = fixture.lifecycle.home.get(&next.name).expect("next").version();
     fixture.replace(&first).await.expect("already requested");
@@ -159,7 +163,7 @@ async fn requested_replacement_survives_status_write_failure_and_refuses_n_plus_
     assert_eq!(fixture.runtime.starts.load(Ordering::SeqCst), 1);
     assert!(fixture.runtime.probes.lock().expect("probes").iter().all(|id| id == "new-1"));
     assert!(fixture.replace(&first).await.expect_err("late predecessor").to_string().contains("no longer latest"));
-    assert!(fixture.lifecycle.home.get("terminal-a#3").is_none());
+    assert_eq!(fixture.newest(), next.name, "no third launch");
     assert_eq!(fixture.reading().reading, LifecycleReading::Ready { identity: "new-1".into() });
 }
 
@@ -168,16 +172,17 @@ async fn requested_replacement_survives_status_write_failure_and_refuses_n_plus_
 async fn temporary_unobservability_revives_without_a_launch_then_absence_requests_replacement() {
     let fixture = Fixture::new(Phase::Running).await;
     fixture.lifecycle.finish(&fixture.obj, Ending::Ready("old"));
+    let first = fixture.newest();
     let controller = fixture.controller();
     *fixture.runtime.live.lock().expect("live") = TerminalLiveness::Unavailable("temporarily unreachable".into());
     assert!(controller.prepare(&fixture.obj).await.err().expect("unavailable").to_string().contains("temporarily unreachable"));
-    assert_eq!(fixture.reading().name, "terminal-a#1");
+    assert_eq!(fixture.reading().name, first);
     *fixture.runtime.live.lock().expect("live") = TerminalLiveness::Lost("missing".into());
     fixture.tick(&controller, true).await;
     assert_eq!(fixture.reading().reading, LifecycleReading::Ready { identity: "old".into() });
     *fixture.runtime.live.lock().expect("live") = TerminalLiveness::Running;
     fixture.tick(&controller, true).await;
-    assert_eq!(fixture.reading().name, "terminal-a#1");
+    assert_eq!(fixture.reading().name, first);
     assert_eq!(fixture.runtime.starts.load(Ordering::SeqCst), 0);
     *fixture.runtime.live.lock().expect("live") = TerminalLiveness::Lost("absent".into());
     fixture.tick(&controller, true).await;
@@ -197,11 +202,11 @@ async fn temporary_unobservability_revives_without_a_launch_then_absence_request
     let raw = fixture.backend.using::<TerminalSession>("flotilla").get("terminal-a").await.expect("observations").status.expect("status");
     assert_eq!(raw.phase, Phase::Starting);
     assert!(raw.session_id.is_none(), "reset old runtime identity after recording intent");
-    assert_eq!(fixture.reading().name, "terminal-a#2");
+    assert_ne!(fixture.reading().name, first);
     assert_eq!(fixture.reading().reading, LifecycleReading::InProgress);
     assert_eq!(
         flotilla_provisioning::engine::reads::judge::<flotilla_provisioning::stored::terminal_session::TerminalSessionKind>(
-            fixture.lifecycle.home.get("terminal-a#1").expect("first").state()
+            fixture.lifecycle.home.get(&first).expect("first").state()
         )
         .reading(),
         LifecycleReading::Lost { reason: None }
@@ -212,18 +217,19 @@ async fn temporary_unobservability_revives_without_a_launch_then_absence_request
 #[tokio::test]
 async fn exhausted_launch_recovers_after_restart_without_copy_or_provider_work() {
     let fixture = Fixture::new(Phase::Starting).await;
+    let first = fixture.newest();
     fixture.lifecycle.exhaust_before_give_up(&fixture.obj, "launch refused");
     let home = fixture.lifecycle.reopen();
     fixture.backend.install_terminal_launches(Arc::new(EngineTerminalLaunches { lifecycles: home.clone() }));
-    let before = home.get("terminal-a#1").expect("durable attempt").version();
+    let before = home.get(&first).expect("durable attempt").version();
     let controller = fixture.controller_with(home.clone());
     assert!(fixture.tick(&controller, false).await.patch.is_none());
     // One write takes two of the home's sequence numbers: its change, then its entry.
-    assert_eq!(home.get("terminal-a#1").expect("gave up").version().0, before.0 + 2, "GiveUp only, no repeated Attempted");
+    assert_eq!(home.get(&first).expect("gave up").version().0, before.0 + 2, "GiveUp only, no repeated Attempted");
     assert_eq!(fixture.reading().reading, LifecycleReading::GaveUp { cause: "launch refused".into() });
     fixture.tick(&controller, false).await;
     assert_eq!(fixture.runtime.starts.load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.reading().name, "terminal-a#1");
+    assert_eq!(fixture.reading().name, first);
     assert_eq!(
         fixture.backend.using::<TerminalSession>("flotilla").get("terminal-a").await.expect("raw").status.expect("status").phase,
         Phase::Starting
@@ -267,13 +273,14 @@ fn phase_and_ending_views_do_not_reuse_old_phase(tc: hegel::TestCase) {
 #[tokio::test]
 async fn engine_failure_does_not_use_the_old_running_phase_or_restart_from_stale_status() {
     let fixture = Fixture::new(Phase::Running).await;
+    let first = fixture.newest();
     fixture.runtime.fail.store(true, Ordering::SeqCst);
     let controller = fixture.controller();
     assert!(fixture.tick(&controller, false).await.patch.is_some());
     assert_eq!(fixture.reading().reading, LifecycleReading::GaveUp { cause: "launch refused".into() });
     assert!(fixture.tick(&controller, false).await.patch.is_none());
     assert_eq!(fixture.runtime.starts.load(Ordering::SeqCst), 1);
-    assert_eq!(fixture.reading().name, "terminal-a#1");
+    assert_eq!(fixture.reading().name, first);
     let (view, _) = flotilla_store::read_terminal_session(fixture.lifecycle.reads.clone(), &fixture.obj, None).await.expect("view");
     assert_eq!(view.status.expect("view status").phase, Phase::Failed);
     assert_eq!(fixture.obj.status.expect("stale observations").phase, Phase::Running);
@@ -318,7 +325,7 @@ async fn terminal_reader_shapes_follow_engine_phase_identity_and_endings() {
     fixture.lifecycle.finish(&fixture.obj, Ending::Ready("engine-session"));
     check(Phase::Running).await;
     let (view, key) = flotilla_store::read_terminal_session(fixture.lifecycle.reads.clone(), &fixture.obj, None).await.expect("view");
-    assert_eq!(key.as_deref(), Some("terminal-a#1"));
+    assert_eq!(key, Some(fixture.newest()));
     assert_eq!(view.status.expect("status").session_id.as_deref(), Some("engine-session"));
     fixture.lifecycle.finish(&fixture.obj, Ending::Failed("engine failure"));
     check(Phase::Failed).await;
@@ -333,22 +340,23 @@ async fn replacement_intent_and_predecessor_ending_recover_from_storage_failures
     for create_failure in [false, true] {
         let fixture = Fixture::new(Phase::Lost).await;
         fixture.lifecycle.finish(&fixture.obj, Ending::Ready("old"));
+        let first = fixture.newest();
         let home = fixture.lifecycle.replacement_write_failures(&fixture.obj, create_failure, if create_failure { 1 } else { 2 });
         fixture.backend.install_terminal_launches(Arc::new(EngineTerminalLaunches { lifecycles: home.clone() }));
-        let error = fixture.replace("terminal-a#1").await.expect_err("injected storage failure");
+        let error = fixture.replace(&first).await.expect_err("injected storage failure");
         assert!(error.to_string().contains("injected"));
         assert_eq!(
             flotilla_provisioning::engine::reads::judge::<flotilla_provisioning::stored::terminal_session::TerminalSessionKind>(
-                home.get("terminal-a#1").expect("predecessor").state()
+                home.get(&first).expect("predecessor").state()
             )
             .reading(),
             LifecycleReading::Ready { identity: "old".into() }
         );
         if create_failure {
-            assert_eq!(fixture.reading().name, "terminal-a#1");
-            fixture.replace("terminal-a#1").await.expect("retry request");
+            assert_eq!(fixture.reading().name, first);
+            fixture.replace(&first).await.expect("retry request");
         } else {
-            assert_eq!(fixture.reading().name, "terminal-a#2");
+            assert_ne!(fixture.reading().name, first);
             assert_eq!(fixture.reading().reading, LifecycleReading::InProgress);
         }
         if !create_failure {
@@ -364,12 +372,12 @@ async fn replacement_intent_and_predecessor_ending_recover_from_storage_failures
         assert_eq!(fixture.reading().reading, LifecycleReading::Ready { identity: "new-1".into() });
         assert_eq!(
             flotilla_provisioning::engine::reads::judge::<flotilla_provisioning::stored::terminal_session::TerminalSessionKind>(
-                home.get("terminal-a#1").expect("predecessor").state()
+                home.get(&first).expect("predecessor").state()
             )
             .reading(),
             LifecycleReading::Lost { reason: None }
         );
-        assert!(home.get("terminal-a#3").is_none());
+        assert_ne!(home.newest_launch("terminal-a").expect("successor").name(), first);
     }
 }
 
@@ -378,6 +386,7 @@ async fn replacement_intent_and_predecessor_ending_recover_from_storage_failures
 async fn in_flight_old_launch_report_cannot_end_the_requested_successor() {
     let fixture = Fixture::new(Phase::Running).await;
     fixture.lifecycle.finish(&fixture.obj, Ending::Ready("old"));
+    let first = fixture.newest();
     *fixture.runtime.live.lock().expect("live") = TerminalLiveness::Stopped;
     let entered = Arc::new(tokio::sync::Notify::new());
     let resume = Arc::new(tokio::sync::Notify::new());
@@ -388,16 +397,17 @@ async fn in_flight_old_launch_report_cannot_end_the_requested_successor() {
         tokio::spawn(async move { controller.prepare(&obj).await })
     };
     tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await.expect("probe entered");
-    fixture.replace("terminal-a#1").await.expect("request while probing");
+    fixture.replace(&first).await.expect("request while probing");
+    let second = fixture.newest();
     resume.notify_one();
     let frame = probe.await.expect("probe task").expect("prepare");
     let outcome = controller.reconcile(&fixture.obj, &frame, fixture.clock.now());
     assert!(outcome.patch.is_none(), "a stale report has no observation write");
     assert!(outcome.actuations.is_empty());
     assert!(outcome.requeue_after.is_some(), "revisit the current launch");
-    assert_eq!(fixture.reading().name, "terminal-a#2");
+    assert_eq!(fixture.reading().name, second);
+    assert_ne!(second, first);
     assert_eq!(fixture.reading().reading, LifecycleReading::InProgress);
-    assert!(fixture.lifecycle.home.get("terminal-a#3").is_none());
 }
 
 // A predecessorless restart is refused without observation changes; normal reconciliation
@@ -408,13 +418,14 @@ async fn unheld_terminal_claims_first_launch_before_runtime_work() {
         let fixture = Fixture::with_initial_launch(phase, false).await;
         let error = fixture.backend.request_terminal_replacement(&fixture.obj, None, fixture.clock.now()).await.unwrap_err();
         assert!(error.to_string().contains("captured engine launch"));
-        assert!(fixture.lifecycle.home.get("terminal-a#1").is_none());
+        assert!(fixture.lifecycle.home.newest_launch("terminal-a").is_none());
         let controller = fixture.controller();
         fixture.tick(&controller, true).await;
-        assert_eq!(fixture.reading().name, "terminal-a#1");
+        let first = fixture.newest();
+        assert_eq!(fixture.reading().name, first);
         assert_eq!(fixture.reading().reading, LifecycleReading::Ready { identity: "new-1".into() });
         assert_eq!(fixture.runtime.starts.load(Ordering::SeqCst), 1);
-        assert!(fixture.lifecycle.home.get("terminal-a#2").is_none());
+        assert_eq!(fixture.newest(), first, "no second launch");
     }
 }
 
@@ -470,7 +481,7 @@ async fn controller_actuation_records_requested_successor_before_resetting_obser
             let raw = sessions.get("terminal-a").await.expect("raw");
             if raw.status.as_ref().is_some_and(|status| status.phase == Phase::Starting) {
                 let launch = fixture.reading();
-                assert_eq!(launch.name, "terminal-a#2");
+                assert_ne!(launch.name, predecessor);
                 assert_eq!(launch.reading, LifecycleReading::InProgress);
                 break;
             }
@@ -481,6 +492,7 @@ async fn controller_actuation_records_requested_successor_before_resetting_obser
     task.abort();
     let _ = task.await;
     observed.expect("controller published reset after request");
+    let successor = fixture.newest();
     fixture.replace(&predecessor).await.expect("retry same intent");
-    assert!(fixture.lifecycle.home.get("terminal-a#3").is_none());
+    assert_eq!(fixture.newest(), successor, "no third launch");
 }

@@ -310,6 +310,8 @@ impl World {
 
     fn checkout(&self, name: &str, environment: &str) {
         let request = CheckoutRequest {
+            launch_of: name.into(),
+            launch: 0,
             repository: "repo".into(),
             environment: Ref::new(environment, HOME),
             branch: "work".into(),
@@ -498,7 +500,8 @@ async fn a_vessel_s_end_releases_its_environment_after_its_checkouts() {
     assert!(world.ready("env-v1"), "held while a checkout is made in it");
     assert!(world.provider.asked().destroyed.is_empty());
 
-    world.checkouts.step("c1", &Step::Released, now()).expect("checkout ended");
+    let c1 = world.checkouts.newest_launch("c1").expect("a launch");
+    world.checkouts.step(c1.name(), &Step::Released, now()).expect("checkout ended");
     world.until("env-v1 released", |world| world.released("env-v1")).await;
     assert_eq!(world.provider.asked().destroyed, [("env-v1".to_owned(), "ctr-env-v1".to_owned())]);
     assert!(world.environments.live().expect("live").iter().all(|record| record.name != "env-v1"));

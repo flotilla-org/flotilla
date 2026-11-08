@@ -45,11 +45,6 @@ impl CloneRecord {
     }
 }
 
-/// Launch `n` of clone `clone`.
-pub fn launch(clone: &str, n: u32) -> String {
-    format!("{clone}#{n}")
-}
-
 /// The clone a launch (`<clone>#<n>`) is of; a name with no launch number is a clone's own.
 pub fn launched(name: &str) -> &str {
     match name.rsplit_once('#') {
@@ -114,7 +109,6 @@ mod tests {
 
     #[test]
     fn a_launch_names_its_clone() {
-        assert_eq!(launch("clone-abc", 3), "clone-abc#3");
         assert_eq!(launched("clone-abc#3"), "clone-abc");
         assert_eq!(launched("clone-abc"), "clone-abc");
         assert_eq!(launched("clone-a#b"), "clone-a#b");

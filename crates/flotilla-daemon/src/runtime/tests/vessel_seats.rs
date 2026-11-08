@@ -1,6 +1,6 @@
 use super::*;
 use flotilla_provisioning::{
-    engine::{launch, reads::StoreReads, LifecycleHome, Lifecycles, Step},
+    engine::{reads::StoreReads, LifecycleHome, Lifecycles, Step},
     stored::{
         self,
         terminal_session::{Launch, TerminalSessionKind, TerminalSessionRequest},
@@ -68,7 +68,9 @@ async fn a_vessels_seats_overlay_the_engines_launches_on_its_labelled_sessions()
         HOME,
         flotilla_state_machines::Home::with_log(HOME, flotilla_engine_store::StoreLog::new(Arc::clone(&store))).expect("home"),
     );
-    let request = |holder: &str| TerminalSessionRequest {
+    let request = |name: &str, holder: &str| TerminalSessionRequest {
+        launch_of: name.into(),
+        launch: 0,
         environment: StoredRef::new("env-a", HOME),
         holder: Some(Holder::vessel(holder)),
         role: "coder".into(),
@@ -77,10 +79,12 @@ async fn a_vessels_seats_overlay_the_engines_launches_on_its_labelled_sessions()
         env: Default::default(),
         source: Launch::Tool { command: "bash".into() },
     };
-    sessions.request(&launch("terminal-vessel-a-coder", 1), request("vessel-a"), Timestamp(1)).expect("launch");
-    sessions.step(&launch("terminal-vessel-a-coder", 1), &Step::Realised { identity: "s1".into() }, Timestamp(2)).expect("ran");
+    let coder = "terminal-vessel-a-coder";
+    let launched = sessions.request(coder, request(coder, "vessel-a"), Timestamp(1)).expect("launch");
+    sessions.step(launched.name(), &Step::Realised { identity: "s1".into() }, Timestamp(2)).expect("ran");
     // A launch whose record is gone.
-    sessions.request(&launch("terminal-vessel-a-gone", 1), request("vessel-a"), Timestamp(3)).expect("launch");
+    let gone = "terminal-vessel-a-gone";
+    sessions.request(gone, request(gone, "vessel-a"), Timestamp(3)).expect("launch");
 
     let seats = EngineVesselSeats { reads: StoreReads::new(store), backend };
     let served: BTreeMap<String, String> = seats

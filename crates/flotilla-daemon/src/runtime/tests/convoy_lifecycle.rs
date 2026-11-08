@@ -887,7 +887,7 @@ async fn daemon_startup_reaps_retained_landed_convoy_orphan() {
     {
         use flotilla_engine_store::{open_home, StoreLog};
         use flotilla_provisioning::{
-            engine::{launch, terminal_session::TerminalSessionBinding, Binding, LifecycleHome, Lifecycles, Step},
+            engine::{terminal_session::TerminalSessionBinding, Binding, LifecycleHome, Lifecycles, Step},
             stored::terminal_session::TerminalSessionKind,
         };
         let store = initial.decided_store().expect("decided store").store();
@@ -897,12 +897,12 @@ async fn daemon_startup_reaps_retained_landed_convoy_orphan() {
             let home = log.home().to_owned();
             let lifecycles: LifecycleHome<TerminalSessionKind, StoreLog> =
                 LifecycleHome::new(&home, open_home(log).expect("terminal session home"));
-            let name = launch("old-orphan", 1);
             let at = flotilla_schema::Timestamp::from_datetime(&Utc::now());
             let request = TerminalSessionBinding::request(&session, &home).expect("launch request");
-            lifecycles.request(&name, request, at).expect("launch requested");
-            lifecycles.finish_launch_request(&name, at).expect("launch request finished");
-            lifecycles.step(&name, &Step::Realised { identity: "old-process".into() }, at).expect("launch realised");
+            let launched = lifecycles.request("old-orphan", request, at).expect("launch requested");
+            let name = launched.name();
+            lifecycles.finish_launch_request(name, at).expect("launch request finished");
+            lifecycles.step(name, &Step::Realised { identity: "old-process".into() }, at).expect("launch realised");
         })
         .await
         .expect("realise the orphan's launch");

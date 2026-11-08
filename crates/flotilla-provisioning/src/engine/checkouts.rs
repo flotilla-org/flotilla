@@ -31,7 +31,6 @@ use flotilla_state_machines::{
 };
 
 use super::{
-    latest_launch,
     launch_log::StagedFacts,
     reads::{indexed, keyed, latest, view, ReadError, StoreReads, View},
     EngineError, Lifecycles,
@@ -71,12 +70,6 @@ fn open_convoy(read: &mut Read<'_>, name: &str) -> Result<Result<(Identity, u64)
     Ok(Err(if ended { format!("convoy {name} has ended") } else { format!("convoy {name} {HOLDER_NOT_OPEN}") }))
 }
 
-/// The launch after `launch` (`<name>#<n + 1>`).
-fn next_launch(name: &str, launch: &str) -> Option<String> {
-    let n = launch.rsplit_once('#')?.1.parse::<u32>().ok()?;
-    Some(super::launch(name, n.checked_add(1)?))
-}
-
 /// The holder a stored `holder` names, if it is a checkout's.
 pub(crate) fn checkout_holder(holder: &Holder) -> Option<CheckoutHolder> {
     let (kind, name) = holder.0.split_once(':')?;
@@ -86,15 +79,17 @@ pub(crate) fn checkout_holder(holder: &Holder) -> Option<CheckoutHolder> {
     }
 }
 
-/// The request `spec` makes at `home`, held for `holder`. An observed spec is a checkout adopted
-/// where it is found, in its host's direct environment.
-pub fn request_of(spec: &CheckoutSpec, holder: Option<&CheckoutHolder>, home: &str) -> Result<CheckoutRequest, String> {
+/// The request `spec` makes at `home` for a launch of checkout `checkout`, held for `holder`. An
+/// observed spec is a checkout adopted where it is found, in its host's direct environment.
+pub fn request_of(checkout: &str, spec: &CheckoutSpec, holder: Option<&CheckoutHolder>, home: &str) -> Result<CheckoutRequest, String> {
     fn local<K>(name: &str, home: &str) -> Ref<K> {
         Ref::new(name.to_owned(), home)
     }
     let holder = holder.map(holder_of);
     let request = match spec {
         CheckoutSpec::Worktree(spec) => CheckoutRequest {
+            launch_of: checkout.to_owned(),
+            launch: 0,
             repository: spec.repo_ref.to_string(),
             environment: local(&spec.env_ref, home),
             branch: spec.r#ref.clone(),
@@ -105,6 +100,8 @@ pub fn request_of(spec: &CheckoutSpec, holder: Option<&CheckoutHolder>, home: &s
             holder,
         },
         CheckoutSpec::FreshClone(spec) => CheckoutRequest {
+            launch_of: checkout.to_owned(),
+            launch: 0,
             repository: spec.repo_ref.to_string(),
             environment: local(&spec.env_ref, home),
             branch: spec.r#ref.clone(),
@@ -115,6 +112,8 @@ pub fn request_of(spec: &CheckoutSpec, holder: Option<&CheckoutHolder>, home: &s
             holder,
         },
         CheckoutSpec::Observed(spec) => CheckoutRequest {
+            launch_of: checkout.to_owned(),
+            launch: 0,
             repository: spec.repo_ref.to_string(),
             environment: local(&host_direct_environment_name(&spec.host_ref), home),
             branch: spec.r#ref.clone(),
@@ -340,27 +339,24 @@ impl EngineCheckouts {
     /// One try at the launch that serves `request` for `checkout`; a launch it creates is created
     /// under `items`.
     fn serve(&self, checkout: &str, request: &CheckoutRequest, items: &[ChangeItem]) -> Result<String, EngineError> {
-        let (latest, held) = latest_launch(checkout, |name| self.lifecycles.get(name));
-        let created = |launch: &str, create: &dyn Fn() -> Result<String, EngineError>| {
+        // The items are staged under the checkout's name, which the create carries until its log
+        // numbers the launch.
+        let created = |create: &dyn Fn() -> Result<String, EngineError>| {
             if !items.is_empty() {
-                self.inputs.stage(launch, items.to_vec());
+                self.inputs.stage(checkout, items.to_vec());
             }
             let created = create();
             // Taken by the create that ran; a create that did not run leaves nothing behind.
-            self.inputs.take(launch);
+            self.inputs.take(checkout);
             created
         };
-        match held {
-            Some(held) if held.state().live() && held.spec() != request => {
-                Err(EngineError::Failed(format!("checkout {checkout} is held for another request ({latest})")))
+        match self.lifecycles.newest_launch(checkout) {
+            Some(held) if held.state().live() && CheckoutRequest { launch: request.launch, ..held.spec().clone() } != *request => {
+                Err(EngineError::Failed(format!("checkout {checkout} is held for another request ({})", held.name())))
             }
-            Some(held) if held.state().live() => Ok(latest),
-            Some(_) => {
-                let next =
-                    next_launch(checkout, &latest).ok_or_else(|| EngineError::Failed(format!("launch {latest} has no successor")))?;
-                created(&next, &|| self.lifecycles.replace_launch(checkout, &latest, request.clone(), Self::now()))
-            }
-            None => created(&latest, &|| self.lifecycles.request(&latest, request.clone(), Self::now()).map(|_| latest.clone())),
+            Some(held) if held.state().live() => Ok(held.name().to_owned()),
+            Some(held) => created(&|| self.lifecycles.replace_launch(checkout, held.name(), request.clone(), Self::now())),
+            None => created(&|| self.lifecycles.request(checkout, request.clone(), Self::now()).map(|launch| launch.name().to_owned())),
         }
     }
 
@@ -438,14 +434,14 @@ impl CheckoutRecords for EngineCheckouts {
         if launched(name) != name {
             return Err(format!("checkout {name} is a launch's name, not a checkout's"));
         }
-        let request = request_of(spec, holder, self.home())?;
+        let request = request_of(name, spec, holder, self.home())?;
         let items = self.holder_items(holder).map_err(|error| format!("request checkout {name}: {error}"))?;
         let mut last = None;
         for _ in 0..REQUEST_ATTEMPTS {
             match self.serve(name, &request, &items) {
                 Ok(launch) => return Ok(launch),
-                // Another requester took the launch name first: read again.
-                Err(error @ (EngineError::Refused(_) | EngineError::Unknown)) => last = Some(error),
+                // Another requester launched it first: read again.
+                Err(error @ (EngineError::Refused(_) | EngineError::Unknown | EngineError::Raced { .. })) => last = Some(error),
                 Err(error) => return Err(format!("request checkout {name}: {error}")),
             }
         }
@@ -723,7 +719,7 @@ mod tests {
     #[test]
     fn an_adopted_checkout_is_its_hosts_and_derives_is_main() {
         for branch in ["main", "feature"] {
-            let request = request_of(&observed(branch), Some(&CheckoutHolder::Convoy("c".into())), "kiwi").expect("request");
+            let request = request_of(branch, &observed(branch), Some(&CheckoutHolder::Convoy("c".into())), "kiwi").expect("request");
             assert_eq!(request.source, Source::Adopted);
             assert_eq!(request.environment.name, "host-direct-kiwi");
             assert_eq!(request.holder, Some(Holder::convoy("c")));

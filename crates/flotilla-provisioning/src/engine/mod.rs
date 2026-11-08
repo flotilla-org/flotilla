@@ -132,6 +132,8 @@ pub enum EngineError {
     Refused(LifecycleRefusal),
     /// The engine holds no resource of that name.
     Unknown,
+    /// Another write took the launch first: `latest` is the name's newest launch now. Read again.
+    Raced { latest: String },
     /// The log or the declaration failed; nothing was written.
     Failed(String),
 }
@@ -141,6 +143,7 @@ impl std::fmt::Display for EngineError {
         match self {
             EngineError::Refused(refusal) => write!(f, "refused: {refusal:?}"),
             EngineError::Unknown => write!(f, "not held by the engine"),
+            EngineError::Raced { latest } => write!(f, "another write launched {latest} first"),
             EngineError::Failed(error) => write!(f, "{error}"),
         }
     }
@@ -168,10 +171,19 @@ pub trait Lifecycles<K: LifecycleKind>: Send + Sync {
     /// This home's live resources (Requested or Realised), as the engine holds them.
     fn live(&self) -> Vec<Resource<Lifecycle<K>>>;
 
-    /// Requests `name`; it starts Requested.
+    /// This home's newest launch of `of`, for a kind whose resources are launches
+    /// ([`crate::stored::Launches`]); none for any other kind.
+    fn newest_launch(&self, of: &str) -> Option<Resource<Lifecycle<K>>>;
+
+    /// Requests `name`; it starts Requested. For a kind whose resources are launches, `name` is
+    /// the name the request is a launch of, its log numbers the launch, and the resource returned
+    /// carries the launch's name; it is refused as [`EngineError::Raced`] once `name` has a launch
+    /// here, whose successor only [`Lifecycles::replace_launch`] requests.
     fn request(&self, name: &str, request: K::Request, at: Timestamp) -> Result<Resource<Lifecycle<K>>, EngineError>;
 
-    /// Requests a successor named by its predecessor, serialized with this home's writes.
+    /// Requests the launch of `name` that succeeds launch `replaces`, serialized with this home's
+    /// writes, and returns its name. A retry after the successor was requested returns that
+    /// successor.
     fn replace_launch(&self, name: &str, replaces: &str, request: K::Request, at: Timestamp) -> Result<String, EngineError>;
 
     /// Finish the predecessor ending implied by a durable successor request before provider work.
@@ -218,27 +230,37 @@ fn evidence(name: &str, step: &Step) -> MemoryLifecycleWorld {
     world
 }
 
+/// Ends launch `name`'s predecessor, the newest launch of its name numbered below it, when it is
+/// still realised: a successor's request authorizes it. A launch with no predecessor, or one
+/// already ended, needs nothing.
 fn finish_predecessor<K: LifecycleKind, L: Log<Lifecycle<K>>>(
     home: &mut Home<Lifecycle<K>, L>,
     name: &str,
     at: Timestamp,
 ) -> Result<(), EngineError> {
-    let Some((old, n)) = name.rsplit_once('#').and_then(|(old, n)| Some((old, n.parse::<u32>().ok()?))) else { return Ok(()) };
-    if n <= 1 {
-        return Ok(());
-    }
-    let previous = launch(old, n - 1);
-    let held = home.get(&previous).ok_or(EngineError::Unknown)?;
-    match held.state() {
+    let held = home.get(name).ok_or(EngineError::Unknown)?;
+    let Some((of, n)) = K::launch(held.spec()) else { return Ok(()) };
+    let Some(previous) = home.newest_launch(of, Some(n)) else { return Ok(()) };
+    let previous_name = previous.name().to_owned();
+    match previous.state() {
         LifecycleState::Realised { .. } => {
             let cause = flotilla_state_machines::machines::lifecycle::VanishCause::lost();
             let step = Step::Vanished { cause: cause.clone() };
-            home.apply(&previous, Vanish { cause, observed: Ref::new(&previous) }, &evidence(&previous, &step), at)?;
+            home.apply(&previous_name, Vanish { cause, observed: Ref::new(&previous_name) }, &evidence(&previous_name, &step), at)?;
             Ok(())
         }
         LifecycleState::Gone { .. } | LifecycleState::GaveUp { .. } => Ok(()),
         LifecycleState::Requested { .. } => Err(EngineError::Failed("predecessor is still requested".into())),
     }
+}
+
+/// The launch numbered just below launch `resource` of its name, at `home`.
+fn predecessor<'h, K: LifecycleKind, L: Log<Lifecycle<K>>>(
+    home: &'h Home<Lifecycle<K>, L>,
+    resource: &Resource<Lifecycle<K>>,
+) -> Option<&'h Resource<Lifecycle<K>>> {
+    let (of, n) = K::launch(resource.spec())?;
+    home.newest_launch(of, Some(n))
 }
 
 impl<K, L> Lifecycles<K> for LifecycleHome<K, L>
@@ -260,36 +282,45 @@ where
         home.resources().filter(|resource| resource.state().live()).cloned().collect()
     }
 
+    fn newest_launch(&self, of: &str) -> Option<Resource<Lifecycle<K>>> {
+        self.home.lock().unwrap_or_else(std::sync::PoisonError::into_inner).newest_launch(of, None).cloned()
+    }
+
     fn request(&self, name: &str, request: K::Request, at: Timestamp) -> Result<Resource<Lifecycle<K>>, EngineError> {
         let mut home = self.home.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        home.create(name, request, &MemoryLifecycleWorld::default(), at)?;
-        Ok(home.get(name).cloned().expect("created"))
+        if let Some((of, _)) = K::launch(&request) {
+            if of != name {
+                return Err(EngineError::Failed(format!("a request for {name} is a launch of {of}")));
+            }
+            if let Some(held) = home.newest_launch(of, None) {
+                return Err(EngineError::Raced { latest: held.name().to_owned() });
+            }
+        }
+        Ok(home.create(name, request, &MemoryLifecycleWorld::default(), at)?.resource.clone())
     }
 
     fn replace_launch(&self, name: &str, replaces: &str, request: K::Request, at: Timestamp) -> Result<String, EngineError> {
         let mut home = self.home.lock().map_err(|_| EngineError::Failed("lifecycle home lock poisoned".into()))?;
-        let (latest, held) = latest_launch(name, |key| home.get(key).cloned());
-        let next = replaces
-            .rsplit_once('#')
-            .filter(|(old, _)| *old == name)
-            .and_then(|(_, n)| n.parse::<u32>().ok())
-            .filter(|n| *n > 0 && launch(name, *n) == replaces)
-            .and_then(|n| n.checked_add(1))
-            .map(|n| launch(name, n))
-            .ok_or_else(|| EngineError::Failed("replacement names an invalid predecessor launch".into()))?;
-        if latest == next && held.as_ref().is_some_and(|resource| matches!(resource.state(), LifecycleState::Requested { .. })) {
-            finish_predecessor(&mut home, &next, at)?;
-            return Ok(next);
+        if K::launch(&request).is_none_or(|(of, _)| of != name) {
+            return Err(EngineError::Failed(format!("a replacement of {replaces} is no launch of {name}")));
         }
-        if latest != replaces {
-            return Err(EngineError::Failed(format!("launch {replaces} is no longer latest ({latest})")));
+        let latest = home.newest_launch(name, None).ok_or(EngineError::Unknown)?;
+        let latest_name = latest.name().to_owned();
+        if latest_name != replaces {
+            // A retry after the successor was requested: it ends its predecessor and serves.
+            let retried = matches!(latest.state(), LifecycleState::Requested { .. })
+                && predecessor(&home, latest).is_some_and(|previous| previous.name() == replaces);
+            if retried {
+                finish_predecessor(&mut home, &latest_name, at)?;
+                return Ok(latest_name);
+            }
+            return Err(EngineError::Failed(format!("launch {replaces} is no longer latest ({latest_name})")));
         }
-        let held = held.ok_or(EngineError::Unknown)?;
-        if matches!(held.state(), LifecycleState::Requested { .. }) {
+        if matches!(latest.state(), LifecycleState::Requested { .. }) {
             return Err(EngineError::Failed("cannot replace a launch that is still requested".into()));
         }
         // Only the durable Requested record authorizes ending its predecessor.
-        home.create(&next, request, &MemoryLifecycleWorld::default(), at)?;
+        let next = home.create(name, request, &MemoryLifecycleWorld::default(), at)?.resource.name().to_owned();
         finish_predecessor(&mut home, &next, at)?;
         Ok(next)
     }
@@ -403,7 +434,8 @@ fn at(now: DateTime<Utc>) -> Timestamp {
 }
 
 /// The engine resource `obj` writes to now, and what the engine holds under that name: the old
-/// object's own name, or for a kind with launches its latest launch (`<name>#1` before any).
+/// object's own name, or for a kind with launches its newest launch (the old name before any,
+/// which the request's log numbers).
 pub fn current<B: Binding>(
     lifecycles: &dyn Lifecycles<B::Kind>,
     obj: &ResourceObject<B::Old>,
@@ -412,40 +444,14 @@ pub fn current<B: Binding>(
     if !B::LAUNCHES {
         return (name.clone(), lifecycles.get(name));
     }
-    latest_launch(name, |key| lifecycles.get(key))
-}
-
-pub(crate) fn latest_launch<K: LifecycleKind>(
-    name: &str,
-    mut get: impl FnMut(&str) -> Option<Resource<Lifecycle<K>>>,
-) -> (String, Option<Resource<Lifecycle<K>>>) {
-    // Launches are numbered from 1 without gaps, so the latest is found by doubling past it and
-    // halving back: O(log launches) reads, not one per launch.
-    let Some(first) = get(&launch(name, 1)) else { return (launch(name, 1), None) };
-    let (mut held, mut found) = ((1, first), 2);
-    let mut absent = loop {
-        match get(&launch(name, found)) {
-            Some(resource) => (held, found) = ((found, resource), found.saturating_mul(2)),
-            None => break found,
-        }
-    };
-    while absent - held.0 > 1 {
-        let mid = held.0 + (absent - held.0) / 2;
-        match get(&launch(name, mid)) {
-            Some(resource) => held = (mid, resource),
-            None => absent = mid,
-        }
+    match lifecycles.newest_launch(name) {
+        Some(held) => (held.name().to_owned(), Some(held)),
+        None => (name.clone(), None),
     }
-    (launch(name, held.0), Some(held.1))
 }
 
-/// Launch `n` of old object `name`.
-pub fn launch(name: &str, n: u32) -> String {
-    format!("{name}#{n}")
-}
-
-/// The old object a launch key (`<old>#<n>`) is of, split at the last `#` like
-/// [`launch`], so an old name holding a `#` of its own is kept whole.
+/// The old object a launch key (`<old>#<n>`) is of, split at the last `#`, so an old name
+/// holding a `#` of its own is kept whole.
 pub fn launched(name: &str) -> &str {
     name.rsplit_once('#').map_or(name, |(old, _)| old)
 }
@@ -497,6 +503,8 @@ fn decide_launch<B: Binding>(
         // Written before the switch: the old path keeps it until the import (layer 9).
         None => return Decision { patch, ended: false },
     };
+    // A launch's request named it: its steps go to that launch.
+    let name = &resource.name().to_owned();
     let mut accepted = true;
     for step in &steps {
         match lifecycles.step(name, step, at(now)) {
@@ -573,12 +581,14 @@ where
         let owned = ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
         let home = Arc::clone(lifecycles);
         let (prepared_launch, terminal) = tokio::task::spawn_blocking(move || {
-            let (name, mut held) = current::<B>(home.as_ref(), &owned);
+            let (mut name, mut held) = current::<B>(home.as_ref(), &owned);
             // The first launch is ordinary intent, not a predecessorless restart. Establish it
             // before the reader runs, so a legacy Stopped/Lost observation cannot strand it.
             if B::LAUNCHES && held.is_none() {
                 let request = B::request(&owned, home.home()).map_err(ResourceError::other)?;
-                held = Some(home.request(&name, request, at(Utc::now())).map_err(|error| ResourceError::other(error.to_string()))?);
+                let launched = home.request(&name, request, at(Utc::now())).map_err(|error| ResourceError::other(error.to_string()))?;
+                name = launched.name().to_owned();
+                held = Some(launched);
             }
             if B::LAUNCHES && held.as_ref().is_some_and(|resource| matches!(resource.state(), LifecycleState::Requested { .. })) {
                 home.finish_launch_request(&name, at(Utc::now()))

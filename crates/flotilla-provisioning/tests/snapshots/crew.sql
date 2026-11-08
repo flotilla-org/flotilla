@@ -159,6 +159,8 @@ FROM "ensure_created";
 CREATE TABLE "terminal_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "environment" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
   "holder" INTEGER REFERENCES "strings" ("id"),
   "role" INTEGER NOT NULL REFERENCES "strings" ("id"),
@@ -264,6 +266,7 @@ CREATE TABLE "terminal_session_env" (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "terminal_session_by_environment" ON "terminal_session" ("environment");
 CREATE INDEX "terminal_session_by_holder" ON "terminal_session" ("holder") WHERE "holder" IS NOT NULL;
+CREATE INDEX "terminal_session_by_launch" ON "terminal_session" ("launch_of", "launch");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ts', 'source', 'ag', 'Agent'),
   ('ts', 'source', 'tl', 'Tool'),
@@ -296,6 +299,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "terminal_session_view" AS SELECT
   "terminal_session"."id",
   "terminal_session"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."launch_of") AS "launch_of",
+  "terminal_session"."launch",
   "terminal_session"."environment",
   (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."holder") AS "holder",
   (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."role") AS "role",

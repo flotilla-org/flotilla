@@ -52,7 +52,8 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
         .into_iter()
         .map(|record| (record.object, record.home))
         .collect();
-    import_clones(&clones, target, report);
+    // The launch each clone imported as, by home and old name, for the worktrees that name it.
+    let clone_launches = import_clones(&clones, target, report);
     let convoys = source.context::<Convoy>("convoys", namespace);
     let aliases: BTreeMap<_, _> = convoys
         .iter()
@@ -77,7 +78,7 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
             *report.dropped.entry(("Checkout", "held for a convoy that was not imported")).or_default() += 1;
             continue;
         }
-        import_checkouts(std::slice::from_ref(&record), &holder, target, report);
+        import_checkouts(std::slice::from_ref(&record), &holder, &clone_launches, target, report);
     }
     records!(TerminalSession, "terminalsessions", "TerminalSession", TerminalSessionBinding);
     let mut vessels: Vec<_> = source

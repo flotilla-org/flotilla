@@ -54,16 +54,16 @@ fn clone_object() -> ResourceObject<OldClone> {
     }
 }
 
-/// Requests clone `clone-a` at `home` and realises it under its path, as the Clone controller
-/// does; with `failing`, after a failed try first.
+/// Requests clone `clone-a` at `home` and realises its launch under its path, as the Clone
+/// controller does; with `failing`, after a failed try first.
 fn realise_clone(home: &dyn Lifecycles<CloneKind>, failing: bool) {
     let obj = clone_object();
-    home.request("clone-a", request_of(&obj.spec, false, HOME), Timestamp(1)).expect("requested");
+    let launch = home.request("clone-a", request_of("clone-a", &obj.spec, false, HOME), Timestamp(1)).expect("requested");
     if failing {
         let failed = Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "network unreachable"), retryable: true };
-        home.step("clone-a", &Step::Attempted(failed), Timestamp(2)).expect("a failed try");
+        home.step(launch.name(), &Step::Attempted(failed), Timestamp(2)).expect("a failed try");
     }
-    home.step("clone-a", &Step::Realised { identity: obj.spec.path.clone() }, Timestamp(3)).expect("realised");
+    home.step(launch.name(), &Step::Realised { identity: obj.spec.path.clone() }, Timestamp(3)).expect("realised");
 }
 
 // Behaviour (#3629 layer 3): a clone's failed try and its realisation are written to the decided
@@ -76,9 +76,9 @@ fn engine_writes_survive_a_reopened_home() {
     realise_clone(home.as_ref(), true);
 
     let reopened = clones(&store);
-    let restored = reopened.get("clone-a").expect("restored from the store");
+    let restored = reopened.newest_launch("clone-a").expect("restored from the store");
     assert_eq!(restored.state(), &LifecycleState::Realised { identity: "/clones/repo".into() });
-    assert_eq!(restored, home.get("clone-a").expect("held"));
+    assert_eq!(restored, home.newest_launch("clone-a").expect("held"));
     let request = restored.spec().clone();
     assert!(reopened.request("clone-a", request, flotilla_schema::Timestamp(9)).is_err(), "one clone per name");
 }
@@ -160,9 +160,9 @@ fn every_kind_survives_a_reopened_home() {
     assert_eq!(restored.spec(), checkouts.lifecycles.get(&launch).expect("held").spec());
     let held = clones(&store);
     realise_clone(held.as_ref(), false);
-    let restored = clones(&store).get("clone-a").expect("restored");
+    let restored = clones(&store).newest_launch("clone-a").expect("restored");
     assert_eq!(restored.state(), &LifecycleState::Realised { identity: "/clones/repo".into() });
-    assert_eq!(restored.spec(), held.get("clone-a").expect("held").spec());
+    assert_eq!(restored.spec(), held.newest_launch("clone-a").expect("held").spec());
 }
 
 // Behaviour (ADR 0047, look-over B): a clone stored before `discovered` existed opens as not
@@ -180,7 +180,7 @@ fn a_clone_stored_before_discovered_reads_as_not_discovered() {
     let mut registry = KindRegistry::new();
     stored::register(&mut registry).expect("registry");
     let reopened = Arc::new(Mutex::new(Store::open(connection, HOME, registry).expect("the old shape opens")));
-    let restored = clones(&reopened).get("clone-a").expect("restored");
+    let restored = clones(&reopened).newest_launch("clone-a").expect("restored");
     assert!(!restored.spec().discovered);
     assert_eq!(restored.state(), &LifecycleState::Realised { identity: "/clones/repo".into() });
 }

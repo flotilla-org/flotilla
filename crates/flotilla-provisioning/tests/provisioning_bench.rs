@@ -136,6 +136,8 @@ fn docker_recipe(n: usize) -> flotilla_provisioning::stored::environment::Docker
 
 fn checkout(n: usize, which: &str, home: &str) -> CheckoutRequest {
     CheckoutRequest {
+        launch_of: format!("checkout-{n}-{which}"),
+        launch: 0,
         repository: repository(n),
         environment: StoredRef::new(format!("env-{n}"), home),
         branch: format!("convoy-{n}-{which}"),
@@ -167,7 +169,7 @@ impl Homes {
     }
 }
 
-/// Creates `name` and realises it under `name`.
+/// Creates `name` (a launch of it, for a launch kind) and realises it under its name.
 fn realised<K: LifecycleKind>(
     home: &mut Home<flotilla_state_machines::machines::lifecycle::Lifecycle<K>, StoreLog>,
     name: &str,
@@ -175,10 +177,10 @@ fn realised<K: LifecycleKind>(
 ) where
     StoreLog: flotilla_state_machines::Log<flotilla_state_machines::machines::lifecycle::Lifecycle<K>>,
 {
+    let name = home.create(name, spec, &MemoryLifecycleWorld::default(), Timestamp(1)).expect("created").resource.name().to_owned();
     let mut world = MemoryLifecycleWorld::default();
-    world.realisations.put(&Ref::new(name), Observed { identity: name.into() });
-    home.create(name, spec, &world, Timestamp(1)).expect("created");
-    home.apply(name, Realise { identity: name.into(), observed: Ref::new(name) }, &world, Timestamp(2)).expect("realised");
+    world.realisations.put(&Ref::new(name.as_str()), Observed { identity: name.clone() });
+    home.apply(&name, Realise { identity: name.clone(), observed: Ref::new(name.as_str()) }, &world, Timestamp(2)).expect("realised");
 }
 
 /// Seeds the image builds, then each convoy's environment, clone and two checkouts, all realised.
@@ -196,6 +198,8 @@ fn seed(homes: &mut Homes, home: &str, convoys: impl Iterator<Item = usize>) {
     for n in convoys {
         realised(&mut homes.environments, &format!("env-{n}"), environment(n, home));
         let clone = CloneRequest {
+            launch_of: format!("clone-{n}"),
+            launch: 0,
             repository: repository(n),
             url: format!("https://example/{}", repository(n)),
             environment: StoredRef::new(format!("env-{n}"), home),
@@ -299,11 +303,20 @@ fn provisioning_load() {
         world.teardowns.put(&Ref::new(name), true);
         world
     };
-    let names: Vec<String> = locals.iter().map(|n| format!("checkout-{n}-c")).collect();
     let started = Instant::now();
-    for (n, name) in locals.iter().zip(&names) {
-        homes.checkouts.create(name, checkout(*n, "c", "local"), &world(name), Timestamp(3)).expect("created");
-    }
+    let names: Vec<String> = locals
+        .iter()
+        .map(|n| {
+            let name = format!("checkout-{n}-c");
+            homes
+                .checkouts
+                .create(&name, checkout(*n, "c", "local"), &world(&name), Timestamp(3))
+                .expect("created")
+                .resource
+                .name()
+                .to_owned()
+        })
+        .collect();
     per_event("checkout create, one transaction", names.len(), started, "the row, its identity and the log entry");
     let failure = Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "worktree add failed"), retryable: true };
     let started = Instant::now();

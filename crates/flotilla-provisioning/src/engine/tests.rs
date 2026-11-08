@@ -256,6 +256,8 @@ async fn without_lifecycles_the_old_reconciler_is_unchanged() {
 fn the_checkout_writer_refuses_a_worktree_without_its_clone() {
     use flotilla_schema::Ref;
     let valid = CheckoutRequest {
+        launch_of: "feature".into(),
+        launch: 0,
         repository: "github.com/org/repo".into(),
         environment: Ref::new("env-a".to_owned(), HOME),
         branch: "feature".into(),
@@ -504,14 +506,14 @@ fn a_crew_session_is_held_for_its_vessel() {
 }
 
 // Behaviour (#3629 Q2, layer 7): each launch of a terminal session is a resource of its own. The
-// first runs as `#1`; stopped, it is released; resumed in place by the old path, the next run is
-// `#2`, and `#1` stays Gone. A lost session stays Realised (unobservable is a judgement); when the
-// old path relaunches it, the lost launch is observed absent and the relaunch is `#3`.
+// first runs; stopped, it is released; resumed in place by the old path, the next run is a second
+// launch, and the first stays Gone. A lost session stays Realised (unobservable is a judgement);
+// when the old path relaunches it, the lost launch is observed absent and the relaunch is a third.
 #[tokio::test]
 async fn each_launch_of_a_session_is_its_own_resource() {
     use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatusPatch};
 
-    use super::{launch, terminal_session::TerminalSessionBinding};
+    use super::terminal_session::TerminalSessionBinding;
     let running = |id: &str| TerminalSessionStatusPatch::MarkRunning {
         configured_limits: None,
         session_id: id.into(),
@@ -541,59 +543,53 @@ async fn each_launch_of_a_session_is_its_own_resource() {
         Some(home.clone()),
     );
     let name = "terminal-vessel-a-coder";
-    let state = |n| home.get(&launch(name, n)).map(|resource| resource.state().clone());
+    let state = |launch: &str| home.get(launch).map(|resource| resource.state().clone());
+    let newest = || home.newest_launch(name).expect("a launch").name().to_owned();
 
     let mut obj = session_object(TerminalSessionPhase::Starting);
     reconcile(&engine, &mut obj).await;
-    assert_eq!(state(1), Some(LifecycleState::Realised { identity: "s1".into() }));
+    let first = newest();
+    assert_eq!(state(&first), Some(LifecycleState::Realised { identity: "s1".into() }));
     reconcile(&engine, &mut obj).await;
     assert_eq!(
-        state(1),
+        state(&first),
         Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }),
         "stopped: released"
     );
     assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(TerminalSessionPhase::Stopped));
     // Ended, and not starting again: the old reconciler is not asked, and nothing is written.
     assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
-    assert_eq!(state(1), Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }));
+    assert_eq!(state(&first), Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }));
 
     // Stale Starting is not restart intent; only an explicit predecessor request creates a launch.
     TerminalSessionStatusPatch::MarkStarting.apply(obj.status.as_mut().expect("status"));
     assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
-    assert!(state(2).is_none());
-    home.replace_launch(
-        name,
-        &launch(name, 1),
-        TerminalSessionBinding::request(&obj, HOME).expect("request"),
-        flotilla_schema::Timestamp(10),
-    )
-    .expect("next requested");
+    assert_eq!(newest(), first);
+    let second = home
+        .replace_launch(name, &first, TerminalSessionBinding::request(&obj, HOME).expect("request"), flotilla_schema::Timestamp(10))
+        .expect("next requested");
     reconcile(&engine, &mut obj).await;
     assert_eq!(
-        state(1),
+        state(&first),
         Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }),
         "never revived"
     );
-    assert_eq!(state(2), Some(LifecycleState::Realised { identity: "s2".into() }));
+    assert_eq!(state(&second), Some(LifecycleState::Realised { identity: "s2".into() }));
 
     reconcile(&engine, &mut obj).await;
     assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(TerminalSessionPhase::Lost));
-    assert_eq!(state(2), Some(LifecycleState::Realised { identity: "s2".into() }), "unobservable stays Realised");
-    home.replace_launch(
-        name,
-        &launch(name, 2),
-        TerminalSessionBinding::request(&obj, HOME).expect("request"),
-        flotilla_schema::Timestamp(20),
-    )
-    .expect("replacement requested");
+    assert_eq!(state(&second), Some(LifecycleState::Realised { identity: "s2".into() }), "unobservable stays Realised");
+    let third = home
+        .replace_launch(name, &second, TerminalSessionBinding::request(&obj, HOME).expect("request"), flotilla_schema::Timestamp(20))
+        .expect("replacement requested");
     reconcile(&engine, &mut obj).await;
     assert_eq!(
-        state(2),
+        state(&second),
         Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost }),
         "relaunched: the lost launch observed absent"
     );
     reconcile(&engine, &mut obj).await;
-    assert_eq!(state(3), Some(LifecycleState::Realised { identity: "s3".into() }));
+    assert_eq!(state(&third), Some(LifecycleState::Realised { identity: "s3".into() }));
 }
 
 // Behaviour (layer 7): a launch that fails before it runs gives up at once; a later start of the
@@ -602,7 +598,7 @@ async fn each_launch_of_a_session_is_its_own_resource() {
 async fn a_failed_launch_gives_up_and_does_not_restart_from_status() {
     use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatusPatch};
 
-    use super::{launch, terminal_session::TerminalSessionBinding};
+    use super::terminal_session::TerminalSessionBinding;
     let home = lifecycles::<TerminalSessionBinding>();
     let failed = TerminalSessionStatusPatch::MarkFailed { message: "cleat refused".into(), stopped_at: None };
     let engine = Engine::<_, TerminalSessionBinding>::new(
@@ -611,17 +607,18 @@ async fn a_failed_launch_gives_up_and_does_not_restart_from_status() {
     );
     let mut obj = session_object(TerminalSessionPhase::Starting);
     assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(failed));
-    assert!(matches!(home.get(&launch("terminal-vessel-a-coder", 1)).expect("held").state(), LifecycleState::GaveUp { .. }));
+    let first = home.newest_launch("terminal-vessel-a-coder").expect("launched");
+    assert!(matches!(first.state(), LifecycleState::GaveUp { .. }));
     // Neither a stale initial phase nor a lost status write is another launch request.
     TerminalSessionStatusPatch::MarkStarting.apply(obj.status.as_mut().expect("status"));
     assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
     assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), 1);
-    assert!(home.get(&launch("terminal-vessel-a-coder", 2)).is_none());
+    assert_eq!(home.newest_launch("terminal-vessel-a-coder").expect("launched").name(), first.name());
 }
 
 // Behaviour (#3629 layer 9): every old phase of each kind maps to a stored state, as the import's
 // table says, and the rehearsal restores each into a temporary store and reads it back unchanged.
-// Lost sessions stay Realised (Q2), each session imports as its launch `#1`, a legacy clone
+// Lost sessions stay Realised (Q2), each session imports as a launch of its own, a legacy clone
 // failure is still wanted, and a build with a retry to come keeps its failed attempts.
 #[test]
 fn every_old_phase_imports_and_rehearses() {
@@ -652,7 +649,8 @@ fn every_old_phase_imports_and_rehearses() {
         report.record(&result);
         let imported = result.expect("imports");
         assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
-        assert_eq!(imported.resource.name(), "terminal-vessel-a-coder#1");
+        // Named for its old record; the store numbers the launch as it writes it.
+        assert_eq!(imported.resource.name(), "terminal-vessel-a-coder");
         imported_sessions.push(imported);
     }
     for imported in imported_sessions {
@@ -751,7 +749,7 @@ fn every_old_phase_imports_and_rehearses() {
     ] {
         let mut obj = worktree(Some("convoy-a"));
         obj.status = Some(CheckoutStatus { phase, path: Some("/work/feature".into()), ..CheckoutStatus::default() });
-        let imported = super::import::import_checkout(&obj, HOME, &imported_convoy).expect("imports").0;
+        let imported = super::import::import_checkout(&obj, HOME, &imported_convoy, &BTreeMap::new()).expect("imports").0;
         if phase == CheckoutPhase::Gone {
             assert_eq!(
                 imported.resource.state(),
@@ -774,7 +772,7 @@ fn the_rehearsal_lists_records_with_no_mapping() {
     let mut report = ImportReport::default();
     let mut orphan = worktree(Some("convoy-gone"));
     orphan.metadata.name = "orphan-a".into();
-    report.record(&import_checkout(&orphan, HOME, &imported_convoy).map(|(imported, _)| imported));
+    report.record(&import_checkout(&orphan, HOME, &imported_convoy, &BTreeMap::new()).map(|(imported, _)| imported));
     let mut nameless = environment_object(true);
     nameless.status = Some(EnvironmentStatus { phase: EnvironmentPhase::Ready, ..Default::default() });
     report.record(&import_environment(&nameless, HOME));
@@ -841,25 +839,26 @@ fn the_import_maps_live_cloud_sandboxes_and_drops_deleted_gone_ones() {
     }
 }
 
-// Behaviour (#3747 review): the latest launch is found however many there are, and a launch key
-// parses at its last `#`, so an old name holding a `#` of its own is kept whole.
+// Behaviour (#3747 review): the latest launch is found by the index however many there are, and
+// a launch key parses at its last `#`, so an old name holding a `#` of its own is kept whole.
 #[test]
 fn the_latest_launch_is_found_and_an_old_name_may_hold_a_hash() {
     use flotilla_resources::TerminalSessionPhase;
 
-    use super::{at, current, launch, launched, terminal_session::TerminalSessionBinding};
+    use super::{at, current, launched, terminal_session::TerminalSessionBinding};
     let home = lifecycles::<TerminalSessionBinding>();
     let mut obj = session_object(TerminalSessionPhase::Starting);
     obj.metadata.name = "odd#5".into();
     let request = TerminalSessionBinding::request(&obj, HOME).expect("request");
-    assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, "odd#5#1");
-    for n in 1..=13 {
-        home.request(&launch("odd#5", n), request.clone(), at(DateTime::UNIX_EPOCH)).expect("request");
-        assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, launch("odd#5", n));
+    assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, "odd#5", "none launched: the record's own name");
+    let mut latest = home.request("odd#5", request.clone(), at(DateTime::UNIX_EPOCH)).expect("request").name().to_owned();
+    for _ in 0..13 {
+        assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, latest);
+        assert_eq!(launched(&latest), "odd#5");
+        home.step(&latest, &Step::Released, at(DateTime::UNIX_EPOCH)).expect("release");
+        latest = home.replace_launch("odd#5", &latest, request.clone(), at(DateTime::UNIX_EPOCH)).expect("next launch");
     }
-    home.step("odd#5#13", &Step::Released, at(DateTime::UNIX_EPOCH)).expect("release");
-    assert_eq!(home.replace_launch("odd#5", "odd#5#13", request, at(DateTime::UNIX_EPOCH)).expect("next launch"), "odd#5#14");
-    assert_eq!(launched("odd#5#13"), "odd#5");
+    assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, latest);
 }
 
 fn vessel_object() -> ResourceObject<flotilla_resources::Vessel> {
@@ -1188,6 +1187,16 @@ fn a_lifecycle_finishes_a_durable_failed_attempt_after_log_errors(tc: hegel::Tes
             self.inner.create(writer, at, resource, reads)
         }
 
+        fn create_resource(
+            &mut self,
+            writer: &str,
+            at: Timestamp,
+            resource: Resource<Machine>,
+            reads: &[InputRead],
+        ) -> Result<Resource<Machine>, LogError> {
+            self.inner.create_resource(writer, at, resource, reads)
+        }
+
         fn edge(
             &mut self,
             writer: &str,
@@ -1215,8 +1224,9 @@ fn a_lifecycle_finishes_a_durable_failed_attempt_after_log_errors(tc: hegel::Tes
     };
     let mut lifecycles = LifecycleHome::new(HOME, new_home());
     let obj = clone_object(Some(ClonePhase::Ready));
-    let name = &obj.metadata.name;
-    lifecycles.request(name, super::clones::request_of(&obj.spec, false, HOME), Timestamp(1)).expect("requested");
+    let of = &obj.metadata.name;
+    let launch = lifecycles.request(of, super::clones::request_of(of, &obj.spec, false, HOME), Timestamp(1)).expect("requested");
+    let name = launch.name();
     let step = Step::Attempted(flotilla_state_machines::Outcome::Failed {
         cause: flotilla_state_machines::Cause::new(flotilla_state_machines::CauseCategory::Refused, message),
         retryable: false,
