@@ -722,8 +722,13 @@ async fn waits_fire_once_and_cancelled_waits_do_not() {
 }
 
 // #3249: a consumer that stops reading is closed with 1013 once its queue of 1,024 frames is full,
-// rather than buffered without bound or slowing the producers; it resumes by cursor.
-#[tokio::test]
+// rather than buffered without bound or slowing the producers; it resumes by cursor. The client
+// stops reading after its subscriptions sync. 30 creates under 200 subscriptions make 6,000 change
+// frames; the creates are paced, so the writer drains each into the 64 KiB transport until it is
+// full and the write blocks, and the rest fill the queue behind it. The client reads again only to
+// find the close. Time is paused: the write limit and the client's wait are virtual, so neither can
+// run out while a loaded test host is slow to get there.
+#[tokio::test(start_paused = true)]
 async fn a_consumer_that_falls_behind_is_closed_with_1013() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let router = router(backend.clone());
@@ -737,6 +742,7 @@ async fn a_consumer_that_falls_behind_is_closed_with_1013() {
     }
     for index in 0..30 {
         create(&backend, &format!("c{index}")).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
     assert_eq!(client.close_code().await, Some(CloseCode::Again));
 }
