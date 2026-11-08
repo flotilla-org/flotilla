@@ -28,6 +28,10 @@ const NAMESPACE: &str = "flotilla";
 const HOME: &str = "home-a";
 
 async fn primitives(dir: &tempfile::TempDir) -> MessagePrimitives {
+    primitives_on(dir, Arc::new(SystemClock)).await
+}
+
+async fn primitives_on(dir: &tempfile::TempDir, clock: Arc<dyn flotilla_resources::Clock>) -> MessagePrimitives {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend
         .clone()
@@ -53,7 +57,7 @@ async fn primitives(dir: &tempfile::TempDir) -> MessagePrimitives {
     let service = Arc::new(
         Service::open(&dir.path().join("decided.sqlite"), HOME, flotilla_engine_store::registry().expect("registry")).expect("store"),
     );
-    MessagePrimitives::open(HOME, service, backend, Arc::new(SystemClock)).expect("primitives")
+    MessagePrimitives::open(HOME, service, backend, clock).expect("primitives")
 }
 
 /// A request for an inspection, from the teardown role to `host`'s inspector.
@@ -108,4 +112,26 @@ async fn a_request_to_an_unbound_inspector_fails() {
     assert_eq!(report.undeliverable, 1);
     assert!(matches!(primitives.request_answer(&message).await.expect("answer"), RequestAnswer::Failed { .. }));
     assert!(matches!(primitives.request_answer("absent").await.expect("answer"), RequestAnswer::Failed { .. }));
+}
+
+// Behaviour (#3108): a sweep names when it next has work no change wakes: just past an open
+// message's unbound threshold, and nothing once the message is dropped.
+#[tokio::test]
+async fn a_sweep_names_when_an_unbound_request_falls_due() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(chrono::Utc::now()));
+    let primitives = primitives_on(&dir, Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>).await;
+    let threshold = 60_000_000;
+    let request = MessageSpec { unbound_after: threshold, ..inspection(&primitives, "home-b").await };
+    let start = Timestamp::from_datetime(&flotilla_resources::Clock::now(&*clock));
+    primitives.inbox().enqueue(request).await.expect("enqueued");
+    let mut open = OpenMessages::default();
+    let early = primitives.sweep(NAMESPACE, start, &mut open).await.expect("sweep");
+    assert_eq!(early.undeliverable, 0);
+    let due = early.next_due.expect("the unbound threshold is due later");
+    assert_eq!(due.0, start.0 + threshold + 1, "just past the threshold");
+    clock.set(due.to_datetime().expect("a time"));
+    let late = primitives.sweep(NAMESPACE, due, &mut open).await.expect("sweep at the due time");
+    assert_eq!(late.undeliverable, 1, "dropped at the time the sweep named");
+    assert_eq!(late.next_due, None);
 }

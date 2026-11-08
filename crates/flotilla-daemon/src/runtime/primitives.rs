@@ -15,6 +15,14 @@
 //!
 //! Mode rules are declared here, never stored (owner ruling, 2026-10-19):
 //! every message is a turn; the backend sends dead letters as Notify.
+//!
+//! A pass runs on events, never on a timer (#3108): a commit to the engine
+//! store of a kind delivery reads, or a home heard from (its watermark gates
+//! expiry); a change to an old-store record routing or conditions read; a
+//! turn finishing; and one deadline wake at the earliest of a held turn's
+//! hold, an open message's deadline or unbound threshold, and an awaiting
+//! reply's deadline. A failed pass retries at a backoff, a finite number of
+//! times, then waits for the next event.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -25,7 +33,7 @@ use std::{
 use chrono::Utc;
 use flotilla_address::Address;
 use flotilla_core::primitives::{
-    sweep::{held_turns_superseded, OpenMessages, SweepReport, TurnHolds},
+    sweep::{held_turns_superseded, OpenMessages, TurnHolds},
     view::old_view,
     MessagePrimitives,
 };
@@ -47,6 +55,12 @@ use super::{
 
 /// Marks a terminal delivery reserved by this adapter in the shared map.
 const ENGINE_BATCH: &str = "engine-message-turn";
+/// The wait before retrying a failed pass, or reopening a failed watch.
+const RETRY: flotilla_resources::RetryBackoff =
+    flotilla_resources::RetryBackoff { initial: Duration::from_secs(1), maximum: Duration::from_secs(60) };
+/// Consecutive failures retried at [`RETRY`]; past it, the next event retries a pass, and a watch
+/// stays closed.
+const RETRY_LIMIT: u32 = 10;
 
 /// The mode rules the delivery adapter passes: none, so every message is a
 /// turn; dead letters are Notify by the backend's own rule.
@@ -81,6 +95,8 @@ pub(super) struct MessageDelivery {
     held: TurnHolds,
     /// This home's open messages, followed incrementally from the log.
     open: OpenMessages,
+    /// Wakes a pass: every event source notifies it.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl MessageDelivery {
@@ -100,25 +116,74 @@ impl MessageDelivery {
             inflight: BTreeMap::new(),
             held: TurnHolds::default(),
             open: OpenMessages::default(),
+            wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    pub(super) async fn run(mut self, interval: Duration) -> Result<(), ResourceError> {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    /// Runs a pass at once, then at each event and at the next deadline.
+    pub(super) async fn run(mut self) {
+        let wake = Arc::clone(&self.wake);
+        let listener: Arc<flotilla_schema_sqlite::stream::CommitListener> = {
+            let wake = Arc::clone(&wake);
+            let kinds = delivery_kinds();
+            Arc::new(move |committed: &flotilla_schema_sqlite::stream::Committed<'_>| {
+                if committed.touches(&kinds) || !committed.heard.is_empty() {
+                    wake.notify_one();
+                }
+            })
+        };
+        // The store holds the listener weakly; it lives as long as this loop.
+        self.primitives.service().on_commit(Arc::downgrade(&listener));
+        let backend = self.state.daemon.resource_backend();
+        let mut watches = tokio::task::JoinSet::new();
+        macro_rules! watch {
+            ($kind:ty) => {
+                watches.spawn(watch_changes::<$kind>(backend.clone(), self.namespace.clone(), Arc::clone(&wake)));
+            };
+        }
+        // Role routing's records (`MessageReceiverSnapshot`, the designation) and the records the
+        // conditions read, as the old store's Message controller followed them.
+        watch!(TerminalSession);
+        watch!(flotilla_resources::Convoy);
+        watch!(flotilla_resources::ConvoyEnsure);
+        watch!(flotilla_resources::FleetDesignation);
+        watch!(flotilla_resources::Project);
+        watch!(flotilla_resources::ChangeRequest);
+        watch!(flotilla_resources::Issue);
+        watch!(flotilla_resources::Artifact);
+        watch!(flotilla_resources::Vessel);
+        let mut failures = 0_u32;
         loop {
-            ticker.tick().await;
-            if let Err(error) = self.pass().await {
-                warn!(namespace = %self.namespace, %error, "engine message delivery pass failed");
+            let next = match self.pass().await {
+                Ok(next) => {
+                    failures = 0;
+                    next
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    warn!(namespace = %self.namespace, %error, failures, "engine message delivery pass failed");
+                    (failures <= RETRY_LIMIT).then(|| RETRY.delay(failures))
+                }
+            };
+            tokio::select! {
+                () = wake.notified() => {}
+                () = async {
+                    match next {
+                        Some(wait) => tokio::time::sleep(wait).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+                Some(_) = watches.join_next(), if !watches.is_empty() => {}
             }
         }
     }
 
-    pub(super) async fn pass(&mut self) -> Result<(), String> {
+    /// One pass; how long until the next deadline it found, if any.
+    pub(super) async fn pass(&mut self) -> Result<Option<Duration>, String> {
         let wait = self.primitives.delivery_wait(&self.namespace).await?;
         self.health.report_delivery_wait(wait.clone());
         if wait.is_some() {
-            return Ok(());
+            return Ok(None);
         }
         let now = Timestamp::from_datetime(&Utc::now());
         // Receipts first: a turn confirmed before its session's teardown records
@@ -136,16 +201,23 @@ impl MessageDelivery {
             }
         }
         let report = self.primitives.sweep(&self.namespace, now, &mut self.open).await?;
-        if report != SweepReport::default() {
+        if report.acted() {
             debug!(namespace = %self.namespace, ?report, "engine message sweep");
         }
         // The senders' records past their deadlines with no reply present (#3587 layer 7).
         let awaiting = Arc::clone(self.primitives.awaiting());
-        let expired = tokio::task::spawn_blocking(move || awaiting.expire_due(now)).await.map_err(|error| error.to_string())??;
+        let (expired, awaiting_next) = tokio::task::spawn_blocking(move || {
+            let expired = awaiting.expire_due(now)?;
+            Ok::<_, String>((expired, awaiting.next_deadline_after(now)?))
+        })
+        .await
+        .map_err(|error| error.to_string())??;
         if !expired.is_empty() {
             debug!(namespace = %self.namespace, ?expired, "awaiting-reply records expired");
         }
-        Ok(())
+        let until = |at: Timestamp| Duration::from_micros(u64::try_from(at.since(now)).unwrap_or(0));
+        let held = self.held.next_expiry().map(|at| at.saturating_duration_since(std::time::Instant::now()));
+        Ok([report.next_due.map(until), awaiting_next.map(until), held].into_iter().flatten().min())
     }
 
     /// This host's checkout inspector (#3108), registered as a service, and its inbox:
@@ -449,8 +521,11 @@ impl MessageDelivery {
         let teardown = stop.clone();
         let trace_spans: Vec<_> = members.iter().map(|message| flotilla_tracing::queued_span(message, "attempt")).collect();
         let primary_span = trace_spans.first().cloned().unwrap_or_else(tracing::Span::none);
+        // A finished turn wakes a pass to record its receipts.
+        let finished = FinishedTurn(Arc::clone(&self.wake));
         let task = tokio::spawn(
             async move {
+                let _finished = finished;
                 // Keep every member's attempt open for the shared transport call.
                 let _trace_spans = trace_spans;
                 for span in &_trace_spans {
@@ -475,5 +550,65 @@ impl MessageDelivery {
         );
         self.inflight.insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members });
         Ok(())
+    }
+}
+
+/// Wakes delivery when a turn's task ends, however it ends.
+struct FinishedTurn(Arc<tokio::sync::Notify>);
+
+impl Drop for FinishedTurn {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+/// The engine kinds whose commits delivery reads: messages, the consumer
+/// records that hold receipts, and the senders' awaiting records.
+fn delivery_kinds() -> BTreeSet<flotilla_schema::KindCode> {
+    use flotilla_schema::Kind;
+    use flotilla_state_machines::{
+        machines::{agent_session::AgentSession, awaiting_reply::AwaitingReply, message::Message, person::Person, service::Service},
+        Resource,
+    };
+    BTreeSet::from([
+        Resource::<Message>::CODE,
+        Resource::<AgentSession>::CODE,
+        Resource::<Person>::CODE,
+        Resource::<Service>::CODE,
+        Resource::<AwaitingReply>::CODE,
+    ])
+}
+
+/// Wakes delivery at each change to `R` in the old store, local or replicated. A watch that
+/// fails is reopened at a backoff, a finite number of times in a row.
+async fn watch_changes<R: flotilla_resources::Resource>(
+    backend: flotilla_store::ResourceBackend,
+    namespace: String,
+    wake: Arc<tokio::sync::Notify>,
+) {
+    use futures::StreamExt;
+    let mut failures = 0_u32;
+    loop {
+        match backend.including_replicas::<R>(&namespace).watch().await {
+            Ok(mut events) => {
+                // A reopened watch may have missed changes: read again.
+                wake.notify_one();
+                while let Some(event) = events.next().await {
+                    if let Err(error) = event {
+                        debug!(kind = R::API_PATHS.kind, %error, "delivery watch failed");
+                        break;
+                    }
+                    failures = 0;
+                    wake.notify_one();
+                }
+            }
+            Err(error) => debug!(kind = R::API_PATHS.kind, %error, "delivery watch did not open"),
+        }
+        failures = failures.saturating_add(1);
+        if failures > RETRY_LIMIT {
+            warn!(kind = R::API_PATHS.kind, failures, "delivery stops watching this kind; other events still wake it");
+            return;
+        }
+        tokio::time::sleep(RETRY.delay(failures)).await;
     }
 }

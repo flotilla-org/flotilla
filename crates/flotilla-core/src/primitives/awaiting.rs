@@ -349,6 +349,32 @@ impl AwaitingReplies {
         Ok(expired)
     }
 
+    /// The earliest deadline after `now` of an open record homed here: when
+    /// [`AwaitingReplies::expire_due`] next has work. One read of the deadline
+    /// index from its start, past the records already due.
+    pub fn next_deadline_after(&self, now: Timestamp) -> Result<Option<Timestamp>, String> {
+        self.service
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let mut after = None;
+                loop {
+                    let page = read.page(&AwaitingReplySpec::deadline(), after.as_ref(), PAGE)?;
+                    for id in page.ids {
+                        let Some(loaded) = read.load::<Resource<AwaitingReply>>(id)? else { continue };
+                        match loaded.value.spec().deadline {
+                            Some(deadline) if deadline > now && loaded.home == self.home_name => return Ok(Some(deadline)),
+                            _ => {}
+                        }
+                    }
+                    after = page.next;
+                    if after.is_none() {
+                        return Ok(None);
+                    }
+                }
+            })
+            .map_err(|error| error.to_string())
+    }
+
     /// The open records about `subject` in this home's replica, every home's:
     /// one read of the `open_by_subject` index.
     pub fn open_about(&self, subject: &Address) -> Result<Vec<Resource<AwaitingReply>>, String> {

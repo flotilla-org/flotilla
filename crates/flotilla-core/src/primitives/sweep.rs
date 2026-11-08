@@ -42,6 +42,23 @@ pub struct SweepReport {
     pub superseded: usize,
     /// Receipts already committed whose `deliver` had not been recorded.
     pub reconciled: usize,
+    /// The earliest time after the sweep's `now` that an open message's
+    /// deadline or unbound threshold passes: when a sweep next has work
+    /// that no change wakes.
+    pub next_due: Option<Timestamp>,
+}
+
+impl SweepReport {
+    /// Whether the sweep settled or dropped anything.
+    pub fn acted(&self) -> bool {
+        self.answered + self.outcomes + self.withdrawn + self.expired + self.undeliverable + self.superseded + self.reconciled > 0
+    }
+
+    fn due_at(&mut self, at: Timestamp, now: Timestamp) {
+        if at > now {
+            self.next_due = Some(self.next_due.map_or(at, |next| next.min(at)));
+        }
+    }
 }
 
 /// What a refresh reads and records to: the store, this home, and the senders' records that a
@@ -249,6 +266,13 @@ impl MessagePrimitives {
             let Some(message) = inbox.get_async(&name).await.map_err(|error| error.to_string())? else { continue };
             let spec = message.spec().clone();
             let state = message.state().clone();
+            if let Some(deadline) = spec.deadline {
+                report.due_at(deadline.saturating_add(1), now);
+            }
+            if state == MessageState::Pending {
+                // Dropped as undeliverable once strictly past the threshold.
+                report.due_at(message.since().saturating_add(spec.unbound_after).saturating_add(1), now);
+            }
             if state == MessageState::Pending {
                 if let Some((receiver, transport)) = self.committed_receipt(&name)? {
                     match inbox.deliver(&name, Deliver { receiver, transport }).await {
@@ -407,6 +431,11 @@ impl TurnHolds {
     /// Releases every hold that has run out by `now`.
     pub fn expire(&mut self, now: std::time::Instant) {
         self.until.retain(|_, until| *until > now);
+    }
+
+    /// When the next hold runs out.
+    pub fn next_expiry(&self) -> Option<std::time::Instant> {
+        self.until.values().min().copied()
     }
 }
 

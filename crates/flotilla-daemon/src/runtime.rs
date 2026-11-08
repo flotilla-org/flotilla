@@ -1053,12 +1053,7 @@ fn spawn_controller_loops(
     if let Some(primitives) = state.daemon.message_primitives() {
         let delivery =
             self::primitives::MessageDelivery::new(Arc::clone(&state), primitives, namespace_string.clone(), runtime_health.clone());
-        let interval = controller_resync_interval.min(Duration::from_secs(1));
-        controllers.push(tokio::spawn(async move {
-            if let Err(error) = delivery.run(interval).await {
-                warn!(%error, "engine message delivery stopped");
-            }
-        }));
+        controllers.push(tokio::spawn(delivery.run()));
     } else {
         controllers.push({
             let state = Arc::clone(&state);
