@@ -4,11 +4,8 @@ Kind tables only; the shared tables are in `terminal_proposal.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
-| `environment_health` | root | 3 | – | – | – |
-| `terminal_drafts` | root | 2 | – | `terminal_drafts_drafts` (records) | – |
-| `terminal_drafts_drafts` | records | 6 | – | – | – |
-| `terminal_launch_facts` | root | 12 | – | – | – |
-| `terminal_session` | root | 25 | 8: `source` 6, `ending` 2 | `terminal_session_env` (child) | `by_environment` (environment), `by_holder` (holder) |
+| `terminal_launch_facts` | root | 8 | – | – | – |
+| `terminal_session` | root | 27 | 8: `source` 6, `ending` 2 | `terminal_session_env` (child) | `by_environment` (environment), `by_holder` (holder), `by_launch` (launch_of, launch) |
 | `terminal_session_env` | child | 3 | – | – | – |
 
 Tables wider than 30 columns:
@@ -22,6 +19,7 @@ Interned column domains:
 | Table | Column | Domain |
 |---|---|---|
 | `terminal_launch_facts` | `agent_adapter` | `ad` |
+| `terminal_session` | `launch_of` | `ln` |
 | `terminal_session` | `holder` | `hl` |
 | `terminal_session` | `role` | `rl` |
 | `terminal_session` | `pool` | `tp` |

@@ -39,6 +39,7 @@ pub mod forge_observation;
 pub mod host;
 pub mod image_build;
 pub mod launch_facts;
+pub mod launch_proposal;
 pub mod manifest_root;
 pub mod placement;
 pub mod project;
@@ -50,7 +51,7 @@ use std::collections::BTreeMap;
 
 use flotilla_schema::{Kind, KindRegistry, RegistryError, Stored};
 use flotilla_state_machines::{
-    machines::{ensure::Ensure, vessel::Vessel},
+    machines::{ensure::Ensure, lifecycle::Lifecycle, vessel::Vessel},
     Diagram, Machine, Resource,
 };
 
@@ -147,14 +148,22 @@ pub fn crew_registry() -> Result<KindRegistry, RegistryError> {
     Ok(registry)
 }
 
-/// PROPOSAL, for the owner's schema look-over only (#3108): TerminalSession with the records its
-/// launches would need on the engine ([`terminal_facts`]). No store opens this registry.
+/// PROPOSAL, for the owner's schema look-over only (#3108): TerminalSession with its launch number
+/// ([`launch_proposal`]) and the record its launches would need on the engine ([`terminal_facts`]).
+/// No store opens this registry.
 pub fn terminal_proposal_registry() -> Result<KindRegistry, RegistryError> {
     let mut registry = KindRegistry::new();
-    registry.register::<Resource<terminal_session::TerminalSession>>()?;
+    registry.register::<Resource<Lifecycle<launch_proposal::TerminalSessionLaunchKind>>>()?;
     registry.register::<terminal_facts::TerminalLaunchFacts>()?;
-    registry.register::<terminal_facts::EnvironmentHealth>()?;
-    registry.register::<terminal_facts::TerminalDrafts>()?;
+    Ok(registry)
+}
+
+/// PROPOSAL, for the owner's schema look-over only (#3108): Clone and Checkout with their launch
+/// numbers ([`launch_proposal`]). No store opens this registry.
+pub fn launch_proposal_registry() -> Result<KindRegistry, RegistryError> {
+    let mut registry = KindRegistry::new();
+    registry.register::<Resource<Lifecycle<launch_proposal::CloneLaunchKind>>>()?;
+    registry.register::<Resource<Lifecycle<launch_proposal::CheckoutLaunchKind>>>()?;
     Ok(registry)
 }
 

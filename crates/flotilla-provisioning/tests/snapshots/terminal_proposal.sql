@@ -55,55 +55,15 @@ CREATE TABLE snapshot_cause (
 CREATE TABLE codes (
   kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
   PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
-CREATE TABLE "environment_health" (
-  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
-  "version" INTEGER NOT NULL,
-  "usable" INTEGER NOT NULL CHECK ("usable" IN (0, 1))
-) STRICT;
-CREATE VIEW "environment_health_view" AS SELECT
-  "environment_health"."id",
-  "environment_health"."version",
-  "environment_health"."usable"
-FROM "environment_health";
-CREATE TABLE "terminal_drafts" (
-  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
-  "version" INTEGER NOT NULL
-) STRICT;
-CREATE TABLE "terminal_drafts_drafts" (
-  "terminal_drafts" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "text" TEXT NOT NULL,
-  "message" TEXT,
-  "stashed_at" INTEGER NOT NULL,
-  PRIMARY KEY ("terminal_drafts", "pos"),
-  FOREIGN KEY ("terminal_drafts") REFERENCES "terminal_drafts" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE VIEW "terminal_drafts_view" AS SELECT
-  "terminal_drafts"."id",
-  "terminal_drafts"."version"
-FROM "terminal_drafts";
-CREATE VIEW "terminal_drafts_drafts_view" AS SELECT
-  "terminal_drafts_drafts"."terminal_drafts",
-  "terminal_drafts_drafts"."pos",
-  "terminal_drafts_drafts"."version",
-  "terminal_drafts_drafts"."text",
-  "terminal_drafts_drafts"."message",
-  "terminal_drafts_drafts"."stashed_at"
-FROM "terminal_drafts_drafts";
 CREATE TABLE "terminal_launch_facts" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "launch_command" TEXT NOT NULL,
   "endpoint_runtime_root" TEXT,
   "endpoint_daemon" TEXT,
   "agent_adapter" INTEGER REFERENCES "strings" ("id"),
   "agent_model" TEXT,
   "agent_stance" TEXT,
-  "configured_limits_cpus" INTEGER,
-  "configured_limits_cpu_shares" INTEGER,
-  "configured_limits_build_jobs" INTEGER,
-  "configured_limits_linker_threads" INTEGER,
+  "build_jobs" INTEGER,
   CHECK (CASE WHEN "endpoint_runtime_root" IS NOT NULL
       THEN "endpoint_daemon" IS NOT NULL
       ELSE "endpoint_daemon" IS NULL
@@ -117,20 +77,18 @@ CREATE TABLE "terminal_launch_facts" (
 CREATE VIEW "terminal_launch_facts_view" AS SELECT
   "terminal_launch_facts"."id",
   "terminal_launch_facts"."version",
-  "terminal_launch_facts"."launch_command",
   "terminal_launch_facts"."endpoint_runtime_root",
   "terminal_launch_facts"."endpoint_daemon",
   (SELECT "s" FROM "strings" WHERE "id" = "terminal_launch_facts"."agent_adapter") AS "agent_adapter",
   "terminal_launch_facts"."agent_model",
   "terminal_launch_facts"."agent_stance",
-  "terminal_launch_facts"."configured_limits_cpus",
-  "terminal_launch_facts"."configured_limits_cpu_shares",
-  "terminal_launch_facts"."configured_limits_build_jobs",
-  "terminal_launch_facts"."configured_limits_linker_threads"
+  "terminal_launch_facts"."build_jobs"
 FROM "terminal_launch_facts";
 CREATE TABLE "terminal_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "environment" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
   "holder" INTEGER REFERENCES "strings" ("id"),
   "role" INTEGER NOT NULL REFERENCES "strings" ("id"),
@@ -236,6 +194,7 @@ CREATE TABLE "terminal_session_env" (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "terminal_session_by_environment" ON "terminal_session" ("environment");
 CREATE INDEX "terminal_session_by_holder" ON "terminal_session" ("holder") WHERE "holder" IS NOT NULL;
+CREATE INDEX "terminal_session_by_launch" ON "terminal_session" ("launch_of", "launch");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ts', 'source', 'ag', 'Agent'),
   ('ts', 'source', 'tl', 'Tool'),
@@ -268,6 +227,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "terminal_session_view" AS SELECT
   "terminal_session"."id",
   "terminal_session"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."launch_of") AS "launch_of",
+  "terminal_session"."launch",
   "terminal_session"."environment",
   (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."holder") AS "holder",
   (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."role") AS "role",

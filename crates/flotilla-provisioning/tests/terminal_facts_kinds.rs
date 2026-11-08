@@ -1,5 +1,6 @@
-//! PROPOSAL (#3108): the stored shape of the records a TerminalSession launch would need on the
-//! engine, checked in for the owner's schema look-over before anything reads or writes them.
+//! PROPOSAL (#3108): TerminalSession with its launch number, and the record its launches would
+//! need on the engine, checked in for the owner's schema look-over before anything reads or
+//! writes them.
 
 mod schema_support;
 
