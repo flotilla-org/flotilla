@@ -917,7 +917,9 @@ fn spawn_controller_loops(
                 secondaries.push(Box::new(flotilla_crew::convoy::EngineConvoyWake { engine: daemon.convoy_engine_path() }));
                 // A convoy's checkouts are the engine's: their changes wake the convoy holding them.
                 if let Ok(service) = daemon.decided_store() {
-                    secondaries.push(Box::new(flotilla_provisioning::engine::checkouts::CheckoutConvoyWake::new(service)));
+                    secondaries.push(Box::new(flotilla_provisioning::engine::checkouts::CheckoutConvoyWake::new(Arc::clone(&service))));
+                    // A convoy reads its vessels' phases from the engine, so their records wake it.
+                    secondaries.push(Box::new(flotilla_provisioning::engine::vessel::VesselConvoyWake::new(service)));
                 }
                 (
                     secondaries,

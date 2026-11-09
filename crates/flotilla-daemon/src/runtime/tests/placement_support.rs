@@ -1,5 +1,9 @@
 use super::*;
 
+/// A controller resync interval no test outlives: the controllers run on their wakes alone, so a
+/// missing wake fails the test instead of waiting for a periodic resync.
+const WAKES_ONLY: Duration = Duration::from_secs(24 * 60 * 60);
+
 pub(super) async fn replicate_local_kind<T: Resource>(source: &InProcessDaemon, target: &InProcessDaemon) {
     let listed = source
         .resource_backend()
@@ -145,17 +149,12 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         .with_environment_tools(fixed_environment_tools(temp.path()))
         .with_provisioning_lifecycles(Some(feta_provisioning)),
     );
-    let mut controller_handles = spawn_controller_loops(
-        kiwi_state,
-        NAMESPACE,
-        Duration::from_millis(25),
-        ControllerSupervision::default(),
-        RuntimeHealth::default(),
-    );
+    let mut controller_handles =
+        spawn_controller_loops(kiwi_state, NAMESPACE, WAKES_ONLY, ControllerSupervision::default(), RuntimeHealth::default());
     controller_handles.extend(spawn_controller_loops(
         feta_state,
         NAMESPACE,
-        Duration::from_millis(25),
+        WAKES_ONLY,
         ControllerSupervision::default(),
         RuntimeHealth::default(),
     ));
