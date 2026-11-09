@@ -2,7 +2,7 @@
 //! single writer of that kind's realisation edges there.
 //!
 //! The controller does the kind's provider work through its [`Actuator`] and records what the
-//! work found as lifecycle steps. It never polls and never sleeps; it wakes on:
+//! work found as lifecycle steps. It never polls; it wakes on:
 //!
 //! - its start: each live resource here is observed once, which adopts a backing that is
 //!   already there and loses one that is gone;
@@ -16,11 +16,15 @@
 //! - a fact a failed release waits on changing ([`Actuator::release_waits`]), such as a
 //!   checkout's integration once its work is cleaned up;
 //! - one of its own flights (realise, release, observe) finishing;
-//! - a [`BackingEvent`] its provider pushes, such as a container's death.
+//! - a [`BackingEvent`] its provider pushes, such as a container's death;
+//! - the earliest time a provider said a failed try could succeed ([`ProviderFailure::retry_at`]):
+//!   one deadline for the kind, never an interval.
 //!
-//! A retryable failure is recorded and nothing else: the resource is tried again only on an event
-//! that could change the outcome. A non-retryable failure, or a spent failure limit, gives up. A
-//! failed release is tried again only on a change of a record it depends on, never at once.
+//! A retryable failure is recorded and nothing else: the resource is tried again on an event
+//! that could change the outcome, or at the time its provider named, no sooner than the kind's
+//! backoff allows. A non-retryable failure, or a spent failure limit, gives up. A failed release
+//! is tried again only on a change of a record it depends on or at its provider's time, never at
+//! once.
 //!
 //! Who writes what: the holder's controller requests a resource (`Lifecycles::request`, or
 //! `replace_launch` for a successor launch); this controller writes every edge after that,
@@ -68,6 +72,17 @@ pub struct ProviderFailure {
     pub cause: Cause,
     /// Whether another try could succeed once something changes.
     pub retryable: bool,
+    /// When time alone could let another try succeed, as the provider knows it: a rate limit's
+    /// reset, a credential minted again. None waits for an event. Held in memory only: a restart
+    /// starts again from its observation.
+    pub retry_at: Option<Timestamp>,
+}
+
+impl ProviderFailure {
+    /// A failure that only an event, or nothing, could change.
+    pub fn new(cause: Cause, retryable: bool) -> Self {
+        Self { cause, retryable, retry_at: None }
+    }
 }
 
 /// A backing fact the provider pushed for a resource.
@@ -148,6 +163,8 @@ enum Trigger {
     Own,
     /// A record it depends on changed: a failed attempt may run again.
     Dependency,
+    /// The time its provider named for another try came.
+    Retry,
     /// The controller started: the backing is observed.
     Start,
     /// A host probe saw the backing change: a realised one is observed again.
@@ -202,7 +219,7 @@ impl Found {
 /// (`release_failed`) is tried again only when a record it depends on changed.
 fn act(state: &LifecycleState, judgement: &Judgement, found: &Found, trigger: Trigger, usable_again: bool, release_failed: bool) -> Action {
     let usable = found.usable();
-    let release_again = !release_failed || trigger == Trigger::Dependency;
+    let release_again = !release_failed || matches!(trigger, Trigger::Dependency | Trigger::Retry);
     match state {
         LifecycleState::Requested { .. } if found.release() && release_again => Action::Release { identity: None },
         LifecycleState::Realised { identity } if found.release() && release_again => Action::Release { identity: Some(identity.clone()) },
@@ -214,11 +231,21 @@ fn act(state: &LifecycleState, judgement: &Judgement, found: &Found, trigger: Tr
                 Action::GiveUp { cause: last.clone(), retryable: last_failure.as_ref().is_some_and(|failure| failure.retryable) }
             }
             Judgement::InProgress if usable => Action::Realise,
-            Judgement::Retrying { .. } if usable && (trigger == Trigger::Dependency || usable_again) => Action::Realise,
+            Judgement::Retrying { .. } if usable && (matches!(trigger, Trigger::Dependency | Trigger::Retry) || usable_again) => {
+                Action::Realise
+            }
             _ => Action::Nothing,
         },
         LifecycleState::Realised { .. } if matches!(trigger, Trigger::Start | Trigger::Recheck) => Action::Observe,
         _ => Action::Nothing,
+    }
+}
+
+/// Sleeps `wait`, or forever without one.
+async fn sleep(wait: Option<std::time::Duration>) {
+    match wait {
+        Some(wait) => tokio::time::sleep(wait).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -243,8 +270,11 @@ pub struct Controller<K: LifecycleKind, A: Actuator<K>> {
     usable: BTreeMap<String, bool>,
     flights: JoinSet<(String, Done)>,
     in_flight: BTreeSet<String>,
-    /// The resources whose last release failed: tried again only on a dependency's change.
+    /// The resources whose last release failed: tried again only on a dependency's change or at
+    /// their provider's time.
     release_failed: BTreeSet<String>,
+    /// When each failed resource is tried again, as its provider named and the backoff allows.
+    retries: BTreeMap<String, Timestamp>,
 }
 
 impl<K, A> Controller<K, A>
@@ -276,6 +306,7 @@ where
             flights: JoinSet::new(),
             in_flight: BTreeSet::new(),
             release_failed: BTreeSet::new(),
+            retries: BTreeMap::new(),
         })
     }
 
@@ -292,7 +323,17 @@ where
         let start = self.lifecycles.live().iter().map(|resource| (resource.name().to_owned(), Trigger::Start)).collect();
         self.evaluate(start).await;
         loop {
+            let retry =
+                self.retries.values().min().and_then(|at| at.to_datetime()).map(|at| (at - self.clock.now()).to_std().unwrap_or_default());
             tokio::select! {
+                () = sleep(retry) => {
+                    let now = Timestamp::from_datetime(&self.clock.now());
+                    let due: Vec<String> = self.retries.iter().filter(|(_, at)| **at <= now).map(|(name, _)| name.clone()).collect();
+                    for name in &due {
+                        self.retries.remove(name);
+                    }
+                    self.evaluate(due.into_iter().map(|name| (name, Trigger::Retry)).collect()).await;
+                }
                 // Cancel-safe: an unconsumed wake stays for the next turn.
                 () = self.watch.woken() => {
                     match self.watch.pass(|_, followed| Ok(followed)).await {
@@ -460,6 +501,10 @@ where
     async fn finish(&mut self, name: &str, done: Done) {
         let Some(resource) = self.lifecycles.get(name) else { return };
         let state = resource.state().clone();
+        // A new try ran: what it found decides any later one.
+        if !matches!(done, Done::Observed(_)) {
+            self.retries.remove(name);
+        }
         match (done, &state) {
             (Done::Realised(Ok(identity)), _) => {
                 if let Some(EngineError::Refused(_)) = self.write(name, Step::Realised { identity: identity.clone() }).await {
@@ -477,7 +522,9 @@ where
                 }
             }
             (Done::Realised(Err(failure)), _) => {
+                let retry_at = failure.retry_at.filter(|_| failure.retryable);
                 self.write(name, Step::Attempted(Outcome::Failed { cause: failure.cause, retryable: failure.retryable })).await;
+                self.schedule(name, retry_at);
             }
             (Done::Released(Ok(())), state) if state.live() => {
                 self.release_failed.remove(name);
@@ -485,7 +532,9 @@ where
             }
             (Done::Released(Err(failure)), LifecycleState::Requested { .. }) => {
                 self.release_failed.insert(name.to_owned());
+                let retry_at = failure.retry_at.filter(|_| failure.retryable);
                 self.write(name, Step::Attempted(Outcome::Failed { cause: failure.cause, retryable: failure.retryable })).await;
+                self.schedule(name, retry_at);
             }
             (Done::Released(Err(failure)), _) => {
                 // A realised resource has no failed-teardown edge yet, so the failure is not
@@ -505,6 +554,16 @@ where
             }
             (Done::Observed(Err(cause)), _) => warn!(kind = K::NAME, name, ?cause, "observation failed"),
             _ => {}
+        }
+    }
+
+    /// Tries `name` again at `retry_at`, no sooner than its kind's backoff after the failure just
+    /// recorded, while its failure limit allows another try. A failure that is not counted, such
+    /// as a realised resource's failed release, is never retried on time.
+    fn schedule(&mut self, name: &str, retry_at: Option<Timestamp>) {
+        let Some(retry_at) = retry_at else { return };
+        if let Some(Judgement::Retrying { next, .. }) = self.lifecycles.get(name).map(|resource| judge::<K>(resource.state())) {
+            self.retries.insert(name.to_owned(), retry_at.max(next));
         }
     }
 
@@ -541,6 +600,7 @@ where
     fn forget(&mut self, name: &str) {
         self.usable.remove(name);
         self.release_failed.remove(name);
+        self.retries.remove(name);
         self.unlink(name);
     }
 

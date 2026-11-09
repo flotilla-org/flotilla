@@ -350,17 +350,17 @@ fn created_at(read: &mut Read<'_>, name: &str, home: &str) -> Result<u64, StoreE
 }
 
 fn transient(message: impl Into<String>) -> ProviderFailure {
-    ProviderFailure { cause: Cause::new(CauseCategory::Transient, message), retryable: true }
+    ProviderFailure::new(Cause::new(CauseCategory::Transient, message), true)
 }
 
 /// A failed making of a checkout: wrong inputs and unknown failures give up, as the old
 /// reconciler did; a transport or disk failure is tried again once something changes.
 fn creation_failure(message: String) -> ProviderFailure {
     match classify(&message) {
-        CloneFailure::Transport => ProviderFailure { cause: Cause::new(CauseCategory::External, message), retryable: true },
+        CloneFailure::Transport => ProviderFailure::new(Cause::new(CauseCategory::External, message), true),
         CloneFailure::DiskFull => transient(message),
-        CloneFailure::Misconfigured => ProviderFailure { cause: Cause::new(CauseCategory::Misconfigured, message), retryable: false },
-        CloneFailure::Other => ProviderFailure { cause: Cause::new(CauseCategory::Refused, message), retryable: false },
+        CloneFailure::Misconfigured => ProviderFailure::new(Cause::new(CauseCategory::Misconfigured, message), false),
+        CloneFailure::Other => ProviderFailure::new(Cause::new(CauseCategory::Refused, message), false),
     }
 }
 
@@ -415,10 +415,10 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
             Some((_, LifecycleState::Realised { .. }, clone_request)) if clone_request.environment == request.environment => {
                 Ok(Some(clone_request.path))
             }
-            Some((launch, LifecycleState::Realised { .. }, _)) => Err(ProviderFailure {
-                cause: Cause::new(CauseCategory::Misconfigured, format!("clone {launch} is in another environment than the checkout")),
-                retryable: false,
-            }),
+            Some((launch, LifecycleState::Realised { .. }, _)) => Err(ProviderFailure::new(
+                Cause::new(CauseCategory::Misconfigured, format!("clone {launch} is in another environment than the checkout")),
+                false,
+            )),
             Some((launch, ..)) => Err(transient(format!("clone {launch} is not realised"))),
             None => Err(transient(format!("clone {} is not held", clone.name))),
         }
@@ -488,7 +488,7 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
     /// change request from; a branch shared with a ready local clone of the same convoy, or a
     /// launch whose target already exists (a retry), is not asked about.
     async fn admit_branch(&self, name: &str, request: &CheckoutRequest, continuing: bool, sharing: bool) -> Result<(), ProviderFailure> {
-        let refused = |message: String| ProviderFailure { cause: Cause::new(CauseCategory::Misconfigured, message), retryable: false };
+        let refused = |message: String| ProviderFailure::new(Cause::new(CauseCategory::Misconfigured, message), false);
         if let Some(other) = self.conflicting(name, request, continuing)? {
             return Err(refused(format!("checkout branch {} conflicts with Checkout {other}; choose a fresh branch name", request.branch)));
         }
@@ -626,10 +626,10 @@ where
                         self.staged.stage(name, CheckoutFacts { degraded: None });
                         Ok(request.path.clone())
                     }
-                    Ok(Some(false)) => Err(ProviderFailure {
-                        cause: Cause::new(CauseCategory::Misconfigured, format!("no checkout at {}", request.path)),
-                        retryable: false,
-                    }),
+                    Ok(Some(false)) => Err(ProviderFailure::new(
+                        Cause::new(CauseCategory::Misconfigured, format!("no checkout at {}", request.path)),
+                        false,
+                    )),
                     Ok(None) => Err(transient(format!("{} cannot be observed from this host", request.path))),
                     Err(error) => Err(transient(error)),
                 };

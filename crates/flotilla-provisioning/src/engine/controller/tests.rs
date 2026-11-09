@@ -147,7 +147,7 @@ impl Actuator<EnvironmentKind> for Scripted {
 
 /// A retryable or final failure.
 fn failure(detail: &str, retryable: bool) -> ProviderFailure {
-    ProviderFailure { cause: Cause::new(CauseCategory::Transient, detail), retryable }
+    ProviderFailure::new(Cause::new(CauseCategory::Transient, detail), retryable)
 }
 
 struct World {
@@ -302,6 +302,38 @@ async fn the_failure_limit_bounds_retries() {
             .await;
     }
     assert!(gave_up(&world), "the limit stops the retries");
+    let limit = <EnvironmentKind as flotilla_state_machines::machines::lifecycle::LifecycleKind>::policy().max_failures;
+    assert_eq!(world.actuator.script().realised.len() as u32, limit);
+}
+
+/// A retryable failure whose provider names when time alone could fix it.
+fn failure_until(detail: &str, retry_at: Timestamp) -> ProviderFailure {
+    ProviderFailure { retry_at: Some(retry_at), ..failure(detail, true) }
+}
+
+// A failure whose provider named a time is tried again then, with no event, but no sooner than
+// the kind's backoff (a second after the first failure).
+#[tokio::test]
+async fn a_failure_with_a_retry_time_is_tried_again_then() {
+    let mut world = World::open();
+    let failed_at = std::time::Instant::now();
+    world.actuator.script().realise.insert("a".into(), VecDeque::from([Err(failure_until("rate limited", World::now()))]));
+    world.start();
+    world.request("a");
+    world.until("a realised at its retry time", |world| world.state("a").realised()).await;
+    assert_eq!(world.actuator.script().realised.iter().filter(|key| *key == "a").count(), 2);
+    assert!(failed_at.elapsed() >= Duration::from_millis(900), "tried again after {:?}, before the backoff", failed_at.elapsed());
+}
+
+// Retry times do not lift the failure limit: a provider that keeps naming one gives up there.
+#[tokio::test]
+async fn retry_times_stop_at_the_failure_limit() {
+    let mut world = World::open();
+    let failing = (0..10).map(|_| Err(failure_until("rate limited", World::now()))).collect();
+    world.actuator.script().realise.insert("a".into(), failing);
+    world.start();
+    world.request("a");
+    world.until("a gave up", |world| matches!(world.state("a"), LifecycleState::GaveUp { .. })).await;
     let limit = <EnvironmentKind as flotilla_state_machines::machines::lifecycle::LifecycleKind>::policy().max_failures;
     assert_eq!(world.actuator.script().realised.len() as u32, limit);
 }

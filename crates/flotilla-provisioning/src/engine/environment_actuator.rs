@@ -93,7 +93,7 @@ const OBSERVATION: KindCode = <HostObservation as Kind>::CODE;
 
 fn failed(detail: impl Into<String>, retryable: bool) -> ProviderFailure {
     let category = if retryable { CauseCategory::Transient } else { CauseCategory::External };
-    ProviderFailure { cause: Cause::new(category, detail.into()), retryable }
+    ProviderFailure::new(Cause::new(category, detail.into()), retryable)
 }
 
 /// The vessel `holder` names, if it is a vessel's.

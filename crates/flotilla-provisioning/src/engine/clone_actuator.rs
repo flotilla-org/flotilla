@@ -171,18 +171,14 @@ where
                 Ok(request.path.clone())
             }
             Err(message) => Err(match classify(&message) {
-                CloneFailure::Misconfigured => {
-                    ProviderFailure { cause: Cause::new(CauseCategory::Misconfigured, message), retryable: false }
-                }
+                CloneFailure::Misconfigured => ProviderFailure::new(Cause::new(CauseCategory::Misconfigured, message), false),
                 CloneFailure::Transport => {
                     if let Some(remote) = remote_host(&request.url) {
                         self.remotes.unreachable(&remote, &request.url, &message);
                     }
-                    ProviderFailure { cause: Cause::new(CauseCategory::External, message), retryable: true }
+                    ProviderFailure::new(Cause::new(CauseCategory::External, message), true)
                 }
-                CloneFailure::DiskFull | CloneFailure::Other => {
-                    ProviderFailure { cause: Cause::new(CauseCategory::Transient, message), retryable: true }
-                }
+                CloneFailure::DiskFull | CloneFailure::Other => ProviderFailure::new(Cause::new(CauseCategory::Transient, message), true),
             }),
         }
     }
