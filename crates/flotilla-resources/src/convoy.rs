@@ -19,6 +19,7 @@ pub mod engine;
 pub mod promises;
 #[doc(hidden)]
 pub mod reconcile;
+pub mod view;
 
 pub use reconcile::{
     evaluate_crew_completion, evaluate_landing_settlement, observed_digest_claims, reconcile, ConvoyEvent, ConvoyTeardownRuntime,
