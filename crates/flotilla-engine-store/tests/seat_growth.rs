@@ -1,4 +1,4 @@
-//! A standing convoy compacts at the cap without changing its identity.
+//! A convoy's seats grow within the cap; retired seats keep their names.
 use flotilla_engine_store::{convoy_registry, StoreLog};
 use flotilla_schema::{Address, Frozen, Kind, Timestamp};
 use flotilla_schema_sqlite::Store;
@@ -9,7 +9,7 @@ use std::{
 };
 
 #[test]
-fn standing_rollover_keeps_identity_live_seats_and_standing_duties() {
+fn retired_seats_keep_their_names_and_replicas_follow_seat_edges() {
     let name = "project:flotilla/convoy:governor";
     let address: Address = name.parse().unwrap();
     let store =
@@ -28,6 +28,7 @@ fn standing_rollover_keeps_identity_live_seats_and_standing_duties() {
         seat: name.seat.clone(),
         parent,
         supervised_by: address.clone(),
+        failed: None,
         retired: false,
         replacements: 0,
     };
@@ -91,49 +92,44 @@ fn standing_rollover_keeps_identity_live_seats_and_standing_duties() {
     )
     .unwrap();
     assert!(matches!(home.apply(name, ReplaceSeat(b.clone()), &world, Timestamp(4)), Err(WriteError::Refused(ConvoyRefusal::SeatRetired))));
-    home.apply(name, Rollover { by: by.clone(), authority: authority.clone() }, &world, Timestamp(5)).unwrap();
+    // A Fail verdict and a subject's link, unlink and relink write their rows in place.
+    let fail = FailSeat { seat: child.clone(), reason: "crashed".into(), by: by.clone(), authority: authority.clone() };
+    home.apply(name, fail, &world, Timestamp(5)).unwrap();
+    let change: Address = "project:change".parse().unwrap();
+    let link = || Link { subject: change.clone(), source: LinkSource::Claim, by: by.clone(), authority: authority.clone() };
+    home.apply(name, link(), &world, Timestamp(5)).unwrap();
+    home.apply(name, Unlink { subject: change.clone(), by: by.clone(), authority: authority.clone() }, &world, Timestamp(5)).unwrap();
+    home.apply(name, link(), &world, Timestamp(5)).unwrap();
     let held = home.get(name).unwrap();
-    assert_eq!(held.name(), address.as_str());
-    assert_eq!(held.spec().seats.len(), 2);
-    assert!(held.spec().seats.iter().all(|row| row.version == held.version().0));
-    assert_eq!(held.spec().seat(&child).unwrap().1.parent, None);
-    assert_eq!(held.spec().duties.keys().copied().collect::<Vec<_>>(), vec![DutyId(0)]);
-    assert!(held.spec().promises.is_empty());
-    assert_eq!(held.spec().promise_floor, 10);
-    // Reload every persisted collection immediately: no obsolete before rows
-    // may survive the replacement, even before another AddSeat reuses positions.
+    assert_eq!(held.spec().seats.len(), 3);
+    assert_eq!(held.spec().seat(&child).unwrap().1.failed.as_deref(), Some("crashed"));
+    assert_eq!(held.spec().subjects.iter().map(|row| row.record.unlinked).collect::<Vec<_>>(), [true, false]);
+    // The home's copy carries the rows' create stamps, as storage does, and every entry
+    // replays on a replica to the same convoy.
     {
         let mut database = store.lock().unwrap();
         let mut read = database.read().unwrap();
         let id = read.resolve(Resource::<Convoy>::CODE, name, "home").unwrap().unwrap();
         let loaded = read.load::<Resource<Convoy>>(id).unwrap().unwrap();
         assert_eq!(&loaded.value, held);
-        assert_eq!(loaded.value.spec().seats.len(), 2);
-        assert!(loaded.value.spec().promises.is_empty());
         let changes = read.changes(id, 0, 100).unwrap();
         let headers = read.changes_of(&changes).unwrap();
         let mut replica = Store::open(rusqlite::Connection::open_in_memory().unwrap(), "replica", convoy_registry().unwrap()).unwrap();
         let mut write = replica.write().unwrap();
         // Each entry's change first, as the stream sends it (#4024).
         headers.iter().for_each(|header| write.record_change(header).unwrap());
-        for change in &changes[..changes.len() - 1] {
+        for change in &changes {
             write.apply(change).unwrap();
         }
         let peer_id = write.resolve(Resource::<Convoy>::CODE, name, "home").unwrap().unwrap();
-        let before = write.load::<Resource<Convoy>>(peer_id).unwrap().unwrap();
-        assert_eq!(before.value.spec().seats.len(), 3);
-        assert_eq!(before.value.spec().promises.len(), 1);
-        write.apply(changes.last().unwrap()).unwrap();
         let after = write.load::<Resource<Convoy>>(peer_id).unwrap().unwrap();
-        assert_eq!(&after.value, held, "replica drops the ended generation's rows");
+        assert_eq!(&after.value, held);
         write.commit().unwrap();
     }
     assert!(matches!(
         home.apply(name, ReplaceSeat(a.clone()), &world, Timestamp(6)),
         Err(WriteError::Refused(ConvoyRefusal::ReplacementsExhausted))
     ));
-    home.apply(name, add(b.clone()), &world, Timestamp(7)).unwrap();
-    assert_eq!(home.get(name).unwrap().spec().seat(&b).unwrap().1.replacements, 0);
     let held = home.get(name).unwrap();
     let mut database = store.lock().unwrap();
     let mut read = database.read().unwrap();
@@ -162,6 +158,7 @@ fn previous_database_and_create_event_decode_with_growth_defaults() {
                 seat: owner.seat.clone(),
                 parent: None,
                 supervised_by: project,
+                failed: None,
                 retired: false,
                 replacements: 0,
             }],
@@ -180,9 +177,8 @@ fn previous_database_and_create_event_decode_with_growth_defaults() {
         let header = read.changes_of(std::slice::from_ref(&event)).unwrap().remove(0);
         (event, header)
     };
-    // Previous-generation create events did not name the three new fields.
+    // Previous-generation create events did not name the two seat growth fields.
     event.effect.changes.retain_mut(|change| match change {
-        flotilla_schema::Change::Set { row, field, .. } if row.is_empty() && field == "promise_floor" => false,
         flotilla_schema::Change::Append { records, values, .. } if records == "seats" => {
             values.retain(|name, _| name != "retired" && name != "replacements");
             true
@@ -197,14 +193,13 @@ fn previous_database_and_create_event_decode_with_growth_defaults() {
     let mut read = follower.read().unwrap();
     let id = read.resolve(Resource::<Convoy>::CODE, name, "home").unwrap().unwrap();
     let spec = read.load::<Resource<Convoy>>(id).unwrap().unwrap().value.spec().clone();
-    assert_eq!(spec.promise_floor, 0);
     assert!(!spec.seats.iter().next().unwrap().record.retired);
     assert_eq!(spec.seats.iter().next().unwrap().record.replacements, 0);
     drop(read);
     drop(home);
     let conn = Arc::try_unwrap(store).unwrap_or_else(|_| panic!("store still held")).into_inner().unwrap().into_connection();
     // Recreate the exact old table shape, with the prior-generation rows still present.
-    conn.execute_batch("DROP VIEW convoy_view; DROP VIEW convoy_seats_view; ALTER TABLE convoy DROP COLUMN promise_floor; ALTER TABLE convoy_seats DROP COLUMN retired; ALTER TABLE convoy_seats DROP COLUMN replacements;").unwrap();
+    conn.execute_batch("DROP VIEW convoy_view; DROP VIEW convoy_seats_view; ALTER TABLE convoy_seats DROP COLUMN retired; ALTER TABLE convoy_seats DROP COLUMN replacements;").unwrap();
     let mut reopened = Store::open(conn, "home", convoy_registry().unwrap()).unwrap();
     let mut read = reopened.read().unwrap();
     let id = read.resolve(Resource::<Convoy>::CODE, name, "home").unwrap().unwrap();
@@ -220,12 +215,13 @@ fn failed_old_shape_upgrade_rolls_back_eligible_columns() {
     let conn = rusqlite::Connection::open(uri).unwrap();
     let store = Store::open(conn, "home", convoy_registry().unwrap()).unwrap();
     let observer = store.into_connection();
-    observer.execute_batch("DROP VIEW convoy_view; DROP VIEW convoy_seats_view; ALTER TABLE convoy DROP COLUMN promise_floor; ALTER TABLE convoy DROP COLUMN priority;").unwrap();
+    // `retired` is eligible to be added; `failed` has no previous-generation default, so its absence is drift.
+    observer.execute_batch("DROP VIEW convoy_view; DROP VIEW convoy_seats_view; ALTER TABLE convoy_seats DROP COLUMN retired; ALTER TABLE convoy_seats DROP COLUMN failed;").unwrap();
     let definition =
-        || observer.query_row("SELECT sql FROM sqlite_master WHERE name = 'convoy'", [], |row| row.get::<_, String>(0)).unwrap();
+        || observer.query_row("SELECT sql FROM sqlite_master WHERE name = 'convoy_seats'", [], |row| row.get::<_, String>(0)).unwrap();
     let before = definition();
-    assert!(!before.contains("promise_floor"));
+    assert!(!before.contains("retired"));
     let result = Store::open(rusqlite::Connection::open(uri).unwrap(), "home", convoy_registry().unwrap());
-    assert!(matches!(result, Err(flotilla_schema_sqlite::StoreError::KindTableDrift { table, .. }) if table == "convoy"));
+    assert!(matches!(result, Err(flotilla_schema_sqlite::StoreError::KindTableDrift { table, .. }) if table == "convoy_seats"));
     assert_eq!(definition(), before, "the attempted ADD COLUMN must roll back on unrelated drift");
 }

@@ -1,11 +1,11 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -215,7 +215,7 @@
-           else if (w.seats.get(seat).replacements >= REPLACEMENT_LIMIT) Refused(ReplacementsExhausted)
-           else withSeat(w, seat, { ...w.seats.get(seat), replacements: w.seats.get(seat).replacements + 1 })
-       | Deliver => if (openPromises(w).size() > 0) Refused(PromisesOutstanding(openPromises(w)))
--          else if (holdingDuties(w).size() > 0) Refused(DutyHolds(holdingDuties(w)))
-+          else if (false) Refused(DutyHolds(holdingDuties(w)))
-           else Moved(Delivered(w))
-       | Abandon(a) => if (not(a.authorised) or a.reason == "") Refused(Unauthorised)
-           else Moved(Abandoned({ work: w, reason: a.reason }))
+@@ -228,7 +228,7 @@
+     else opened({ ...w, subjects: w.subjects.exclude(Set(a.subject)) })
+   pure def deliverRule(w: Work, d: { disposition: str }): Next =
+     if (openPromises(w).size() > 0) Refused(PromisesOutstanding(openPromises(w)))
+-    else if (holdingDuties(w).size() > 0) Refused(DutyHolds(holdingDuties(w)))
++    else if (false) Refused(DutyHolds(holdingDuties(w)))
+     else Moved({ work: w, phase: Delivered(d.disposition) })
+   pure def abandonRule(w: Work, a: { authorised: bool, cause: AbandonCause, reason: str }): Next =
+     if (not(a.authorised) or a.reason == "") Refused(Unauthorised)

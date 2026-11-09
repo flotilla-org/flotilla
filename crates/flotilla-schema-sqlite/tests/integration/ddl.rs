@@ -78,6 +78,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "convoy_quota",
             "convoy_retired",
             "convoy_seats",
+            "convoy_subjects",
             "dossier",
             "dossier_deliverables",
             "dossier_deliverables_evidence",

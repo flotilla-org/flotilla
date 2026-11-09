@@ -517,6 +517,26 @@ where
         let change = self.change(writer, at, reads);
         self.insert_created(&change, resource)
     }
+
+    /// Returns the resource as committed: the insert stamps every records row with the create's
+    /// version, so the home's copy must carry those stamps or it differs from what storage holds.
+    fn create_resource(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<M>,
+        reads: &[InputRead],
+    ) -> Result<Resource<M>, LogError> {
+        let change = self.change(writer, at, reads);
+        let mut store = lock_store(&self.store);
+        let mut write = store.write().map_err(refused)?;
+        let change = write.open_change(&change).map_err(refused)?;
+        let stamp = write.insert(resource.name(), &resource, change).map_err(refused)?;
+        let stored = write.load::<Resource<M>>(stamp.id).map_err(refused)?.ok_or_else(|| LogError::new("created resource not found"))?;
+        write.commit().map_err(refused)?;
+        Ok(stored.value)
+    }
+
     fn edge(&mut self, writer: &str, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
         self.edge_with_writes(writer, previous, next, event, &[])
     }

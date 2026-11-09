@@ -345,6 +345,7 @@ pub fn request(convoy: &ResourceObject<OldConvoy>) -> Result<ConvoyRequest, Stri
     let seats = crews
         .seats()
         .map(|(_, seat)| Seat {
+            failed: None,
             retired: false,
             replacements: 0,
             role: seat.role.clone(),

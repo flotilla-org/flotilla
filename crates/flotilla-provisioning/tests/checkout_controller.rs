@@ -469,26 +469,6 @@ async fn a_local_clone_records_its_degradation_and_a_sibling_shares_its_branch()
     assert_eq!(intents, ["NewBranch", "ShareConvoyBranch"]);
 }
 
-// Behaviour: a rollover ends the generation a checkout was requested in: its checkout is released,
-// and a checkout requested after the rollover is not.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_rollover_releases_the_previous_generations_checkouts_only() {
-    let world = World::start(RecordingProvider {
-        asked: Mutex::new(Asked { inspection: Some(inspection(true, true, false)), ..Asked::default() }),
-    });
-    world.checkouts.open_convoy("c1");
-    let before = world.ready_worktree("c1", "before").await;
-    world.checkouts.rollover_convoy("c1");
-    world.until("released", |world| world.released(&before)).await;
-    let after = world.ready_worktree("c1", "after").await;
-    // Another write to the Convoy wakes the later checkout: it is still held.
-    world.checkouts.readmit_convoy("c1");
-    world.until("the readmission passed", |world| world.ready(&after) && world.provider.asked().removals.len() == 1).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(world.ready(&after), "a checkout requested after the rollover is held by the next generation");
-    assert_eq!(world.provider.asked().removals.len(), 1);
-}
-
 // Behaviour: a refused removal is not tried again at once; the checkout's integration being
 // written again, as cleaning its work up does, tries it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -552,12 +532,12 @@ fn convoy_holder() -> CheckoutHolder {
 }
 
 // Behaviour: where the Convoy's entries after the version read were lost to a snapshot, its end
-// is judged from the snapshot: an abandonment or a rollover since the read ends the checkout's
+// is judged from the snapshot: a delivery or an abandonment since the read ends the checkout's
 // holder, and a write that ends nothing does not.
 #[test]
 fn a_holder_ending_lost_to_a_snapshot_is_judged_from_the_snapshot() {
     assert!(ended_across_a_snapshot(|beta| beta.abandon_convoy("c1", "deleted")), "abandoned");
-    assert!(ended_across_a_snapshot(|beta| beta.rollover_convoy("c1")), "rolled over");
+    assert!(ended_across_a_snapshot(|beta| beta.deliver_convoy("c1")), "delivered");
     assert!(!ended_across_a_snapshot(|beta| beta.readmit_convoy("c1")), "readmitted, still open");
     assert!(!ended_across_a_snapshot(|_| ()), "nothing written since");
 }

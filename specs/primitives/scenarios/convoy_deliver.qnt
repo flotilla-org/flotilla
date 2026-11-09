@@ -1,7 +1,7 @@
 module convoy_deliver {
   import convoy(IDS = Set(1), SEAT_LIMIT = 3, REPLACEMENT_LIMIT = 1) as C from "../machines/convoy"
   var now: int
-  // The replacements granted to seat "a", which its record must carry, across a rollover too.
+  // The replacements granted to seat "a", which its record must carry.
   var replacedA: int
   action keepWorld = all { now' = now, replacedA' = replacedA }
   action tick = all { now < 1, now' = now + 1, replacedA' = replacedA }
@@ -32,12 +32,15 @@ module convoy_deliver {
       C::admitRequest(1, { project: "project", projectKnown: true,
         promises: promises.mapBy(_ => { promise: definition, source: source, owner: owner }),
         duties: if (lifetimeDuty) Map(0 -> { owner: "a", scope: C::Lifetime, terms: "terms" }) else Map(),
-        seats: if (crowded) Map("a" -> { parent: C::Root, supervisedBy: "op", replacements: 0 }, "c" -> { parent: C::Under("a"), supervisedBy: "a", replacements: 0 },
-            "d" -> { parent: C::Under("a"), supervisedBy: "a", replacements: 0 })
-          else Map("a" -> { parent: C::Root, supervisedBy: "op", replacements: 0 }), quota: Map(0 -> 1, 1 -> 1), priority: 1 }),
+        seats: if (crowded) Map("a" -> { parent: C::Root, supervisedBy: "op", replacements: 0, failed: "" }, "c" -> { parent: C::Under("a"), supervisedBy: "a", replacements: 0, failed: "" },
+            "d" -> { parent: C::Under("a"), supervisedBy: "a", replacements: 0, failed: "" })
+          else Map("a" -> { parent: C::Root, supervisedBy: "op", replacements: 0, failed: "" }), quota: Map(0 -> 1, 1 -> 1), priority: 1 }),
       keepWorld,
     }
   }
+  // FailSeat, Link, Unlink and Abandon's cause read and write nothing any other
+  // edge reads, so they would multiply this graph without reaching a new
+  // interleaving; the full-graph conformance harness covers them.
   action step = {
     nondet p = Set(0, 1).oneOf()
     nondet seat = Set("a", "b").oneOf()
@@ -56,10 +59,9 @@ module convoy_deliver {
       { nondet parent = Set("a", "b", "z").oneOf() all { C::addSeat(1, "b", parent, "a", auth), keepWorld } },
       all { C::resupervise(1, "b", "op", auth), keepWorld },
       all { C::retireSeat(1, seat, auth), keepWorld },
-      all { C::rollover(1, auth), keepWorld },
       all { C::replaceSeat(1, "a"), now' = now, replacedA' = replacedA + 1 },
-      all { C::deliver(1), keepWorld },
-      all { C::abandon(1, auth, reason), keepWorld },
+      all { C::deliver(1, "merged"), keepWorld },
+      all { C::abandon(1, auth, C::OperatorDecision, reason), keepWorld },
       all { C::readmit(1, Map(0 -> 2, 1 -> 1), auth), keepWorld },
       all { C::unchanged, tick },
     }
@@ -70,13 +72,13 @@ module convoy_deliver {
   // Every convoy holds an obligation: a promise or a convoy-lifetime duty.
   val everyConvoyObliged = everyState(s => C::work(s).promises.keys().size() > 0 or C::work(s).spec.duties.keys().exists(d => C::lifetime(C::work(s).spec.duties.get(d))))
   // Delivered: no promise open, and no lifetime duty holding.
-  val deliveredSettled = everyState(s => match s {
-    | Delivered(w) => C::openPromises(w).size() == 0 and C::holdingDuties(w).size() == 0
+  val deliveredSettled = everyState(s => match s.phase {
+    | Delivered(_) => C::openPromises(s.work).size() == 0 and C::holdingDuties(s.work).size() == 0
     | _ => true
   })
   // Finality is checked through the rule interface: an operator, who may
   // settle anything open, can neither submit, reject, keep, retract nor
-  // reassign a settled promise. It lives here, not in the machine, to keep
+  // reassign a settled promise, and the crew cannot declare its id again. It lives here, not in the machine, to keep
   // other compositions' IR under Apalache's limit.
   def settledFinal(s: C::State): bool = C::work(s).promises.keys().forall(p => {
     val r = C::work(s).promises.get(p)
@@ -86,7 +88,8 @@ module convoy_deliver {
       C::Keep(C::Observed({ promise: p, submission: r.submissions.length() })),
       C::Keep(C::Verdict({ promise: p, by: "operator", authority: C::Operator, reason: "decision" })),
       C::Retract({ promise: p, by: "operator", authority: C::Operator, reason: "decision" }),
-      C::Reassign({ promise: p, to: r.owner, by: "operator", authority: C::Operator })
+      C::Reassign({ promise: p, to: r.owner, by: "operator", authority: C::Operator }),
+      C::Declare({ promise: p, definition: definition, owner: r.owner })
     ).forall(e => not(C::moved(C::step(s, e))))
   })
   val settledPromisesFinal = everyState(s => settledFinal(s))
@@ -95,14 +98,11 @@ module convoy_deliver {
     C::work(s).promises.get(p).state != C::Submitted or C::work(s).promises.get(p).submissions.length() > 0))
   // A crew-declared promise retracted by its owner had no submission: the
   // owner's unilateral retraction closes once anything is submitted.
-  val ownerRetractsOnlyUnsubmitted = everyState(s => match s {
-    | Open(w) => w.promises.keys().forall(p => {
-        val r = w.promises.get(p)
-        not(C::open(r)) or r.submissions.length() == 0 or
-          not(C::moved(C::step(s, C::Retract({ promise: p, by: r.owner, authority: C::Owner, reason: "decision" }))))
-      })
-    | _ => true
-  })
+  val ownerRetractsOnlyUnsubmitted = everyState(s => not(C::isOpen(s)) or s.work.promises.keys().forall(p => {
+    val r = s.work.promises.get(p)
+    not(C::open(r)) or r.submissions.length() == 0 or
+      not(C::moved(C::step(s, C::Retract({ promise: p, by: r.owner, authority: C::Owner, reason: "decision" }))))
+  }))
   // Every promise and duty owner is a seat, and every seat's parent is a seat.
   val ownersAreSeats = everyState(s => C::work(s).promises.keys().forall(p => C::work(s).seats.keys().contains(C::work(s).promises.get(p).owner))
     and C::work(s).spec.duties.keys().forall(d => C::work(s).seats.keys().contains(C::work(s).spec.duties.get(d).owner)))
@@ -118,21 +118,16 @@ module convoy_deliver {
   // Replacement counts stay within the limit, and seat "a" carries every replacement granted to it.
   val replacementsWithinLimit = everyState(s => C::work(s).seats.keys().forall(seat => C::work(s).seats.get(seat).replacements <= C::REPLACEMENT_LIMIT))
   val replacementsCarried = everyState(s => not(C::work(s).seats.keys().contains("a")) or C::work(s).seats.get("a").replacements == replacedA)
-  // Promise ids of an ended generation are never reused.
-  val promisesAboveFloor = everyState(s => C::work(s).promises.keys().forall(p => p >= C::work(s).promiseFloor))
-  val safety = replacementsWithinLimit and replacementsCarried and seatsWithinLimit and retiredSeatsHoldNothing and promisesAboveFloor and ownersAreSeats and seatTreeClosed and seatTreeAcyclic and everyConvoyObliged and deliveredSettled and settledPromisesFinal and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
+  val safety = replacementsWithinLimit and replacementsCarried and seatsWithinLimit and retiredSeatsHoldNothing and ownersAreSeats and seatTreeClosed and seatTreeAcyclic and everyConvoyObliged and deliveredSettled and settledPromisesFinal and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
   // No inductive invariant: a universe of every owned-promise shape is beyond
   // Apalache in a crew's memory, and the fast tier exhausts this scenario's
   // complete finite graph, which covers every depth at its bounds.
   val view = (C::convoys, now, replacedA)
-  action deliverReady(id: int): bool = all { C::deliver(id), keepWorld }
+  action deliverReady(id: int): bool = all { C::deliver(id, "merged"), keepWorld }
   // Once nothing is open and no lifetime duty holds, fair delivery ends the convoy.
   temporal liveness = Set(1).forall(id => weakFair(deliverReady(id), view) implies always(
     (match C::convoys.get(id) {
-      | Present(s) => match s {
-          | Open(w) => C::openPromises(w).size() == 0 and C::holdingDuties(w).size() == 0
-          | _ => false
-        }
+      | Present(s) => C::isOpen(s) and C::openPromises(s.work).size() == 0 and C::holdingDuties(s.work).size() == 0
       | Absent => false
-    }) implies eventually(match C::convoys.get(id) { | Present(s) => match s { | Open(_) => false | _ => true } | Absent => false })))
+    }) implies eventually(match C::convoys.get(id) { | Present(s) => not(C::isOpen(s)) | Absent => false })))
 }

@@ -135,6 +135,7 @@ fn request(n: usize) -> ConvoyRequest {
         duties: [(DutyId(0), Duty { owner: seat("lead"), scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
         seats: vec![
             Seat {
+                failed: None,
                 retired: false,
                 replacements: 0,
                 role: "lead".into(),
@@ -143,6 +144,7 @@ fn request(n: usize) -> ConvoyRequest {
                 supervised_by: address("supervisor"),
             },
             Seat {
+                failed: None,
                 retired: false,
                 replacements: 0,
                 role: "coder".into(),

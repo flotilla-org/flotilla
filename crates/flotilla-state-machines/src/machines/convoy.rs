@@ -14,11 +14,17 @@
 //! in force and the retired duties), as the layer 3 look-over approved
 //! (#3627). Records change only through edges: an effect writes them as
 //! [`ConvoyWrite`]s, which the home applies once the log takes the edge and a
-//! store log writes as the edge's rows. Within a generation, promise ids and
-//! seat names stay reserved. Rollover compacts the live generation, leaving
-//! history in the log: promise ids remain below the floor, live seats keep
-//! their replacement counts, and only standing duties carry over. The
-//! project, priority and frozen promise kinds never change after admission.
+//! store log writes as the edge's rows. Promise ids and seat names stay
+//! reserved for the convoy's life. Nothing rolls over: each generation of a
+//! standing role is its own convoy. The project, priority and frozen promise
+//! kinds never change after admission.
+//!
+//! Subjects linked after admission (a change request a crew claims, one an
+//! operator links, one a relay links) are records: an unlink marks its row
+//! and a relink appends another, so the history stays. A seat's Fail verdict
+//! is a record on the seat, with its reason. A delivered convoy records its
+//! disposition, and an abandoned one its cause: its work failed, or an
+//! operator decided.
 //!
 //! No role name, vessel class or promise kind appears here: a seat's role, a
 //! quota's vessel class and a promise's kind are interned text, and the kinds'
@@ -109,6 +115,11 @@ pub struct Seat {
     #[store(flatten)]
     pub parent: Option<SeatName>,
     pub supervised_by: Address,
+    /// A supervisor's or operator's Fail verdict on the seat, its reason;
+    /// final for the seat.
+    // ADR 0047 N→N+1: old seats have no verdict. Remove this decode default one roll after seat verdicts land.
+    #[serde(default)]
+    pub failed: Option<String>,
     // ADR 0047 N→N+1: old seats had neither field. Remove these decode defaults one roll after seat growth lands.
     #[serde(default)]
     pub retired: bool,
@@ -249,20 +260,55 @@ pub struct PromiseKind {
     pub kept: Vec<Template>,
 }
 
+/// How a subject came to be linked to the convoy after admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
+pub enum LinkSource {
+    /// A crew member claimed it as its work.
+    #[store(code = "cl")]
+    Claim,
+    /// An operator linked it.
+    #[store(code = "op")]
+    Operator,
+    /// A relay linked it on an observed event.
+    #[store(code = "rl")]
+    Relay,
+}
+
+/// One subject link, such as a change request: an unlink marks the row, and a
+/// relink appends another.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
+pub struct SubjectLink {
+    pub subject: Address,
+    pub source: LinkSource,
+    pub unlinked: bool,
+}
+
+/// Why a convoy ended without delivering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
+pub enum AbandonCause {
+    /// Its work failed, such as a failed vessel.
+    #[store(code = "fa")]
+    Failed,
+    /// An operator decided; the log entry names who.
+    #[store(code = "op")]
+    Operator,
+}
+
 /// What admission fixes, and the records edges change. It declares the
 /// stored Convoy (kind code `cv`), indexed for a project's open convoys.
-/// Seats and promises are records in admission order, so a row's position is
-/// fixed within its generation; rollover starts compact record tables.
+/// Subjects, seats and promises are records in the order they arrived, so a
+/// row's position is fixed for the convoy's life.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[store(kind = "Convoy", code = "cv", state = ConvoyState, index(name = "open_by_project", eq(project), when(state in [Open])))]
 pub struct ConvoySpec {
     pub project: Address,
-    // ADR 0047 N→N+1: remove this decode default one roll after seat growth lands.
-    #[serde(default)]
-    pub promise_floor: u64,
     pub priority: Priority,
     #[store(frozen)]
     pub kinds: Frozen<PromiseKinds>,
+    // ADR 0047 N→N+1: older convoys link no subjects. Remove this decode default one roll after subject links land.
+    #[serde(default)]
+    #[store(records)]
+    pub subjects: Records<SubjectLink>,
     #[store(child)]
     pub duties: BTreeMap<DutyId, Duty>,
     #[store(records)]
@@ -282,10 +328,12 @@ states! {
         Delivered {
             #[store(child)] quota: BTreeMap<VesselClass, u32>,
             #[store(child)] retired: BTreeSet<DutyId>,
+            disposition: String,
         } = "de",
         Abandoned {
             #[store(child)] quota: BTreeMap<VesselClass, u32>,
             #[store(child)] retired: BTreeSet<DutyId>,
+            cause: AbandonCause,
             reason: String,
         } = "ab",
     }
@@ -313,6 +361,22 @@ impl ConvoyState {
             _ => None,
         }
     }
+
+    /// Why it was abandoned, once Abandoned.
+    pub fn cause(&self) -> Option<AbandonCause> {
+        match self {
+            ConvoyState::Abandoned { cause, .. } => Some(*cause),
+            _ => None,
+        }
+    }
+
+    /// How the work was delivered, once Delivered.
+    pub fn disposition(&self) -> Option<&str> {
+        match self {
+            ConvoyState::Delivered { disposition, .. } => Some(disposition),
+            _ => None,
+        }
+    }
 }
 
 impl Promise {
@@ -324,15 +388,11 @@ impl Promise {
 
 impl ConvoySpec {
     /// A promise's row, by its id.
-    /// Positions belong to this snapshot; never cache one across edges or rollover.
-    /// Consumers retain PromiseId and resolve it against the current spec.
     pub fn promise(&self, id: PromiseId) -> Option<(Position, &Promise)> {
         self.promises.iter().find(|row| row.record.id == id).map(|row| (row.position, &row.record))
     }
 
     /// A seat's row, by its name.
-    /// Positions belong to this snapshot; rollover compacts them. Consumers
-    /// retain SeatName and resolve it again instead of caching a Position.
     pub fn seat(&self, name: &SeatName) -> Option<(Position, &Seat)> {
         self.seats.iter().find(|row| row.record.role == name.role && row.record.seat == name.seat).map(|row| (row.position, &row.record))
     }
@@ -340,6 +400,11 @@ impl ConvoySpec {
     /// The promises still Pending or Submitted.
     pub fn outstanding(&self) -> BTreeSet<PromiseId> {
         self.promises.iter().filter(|row| row.record.open()).map(|row| row.record.id).collect()
+    }
+
+    /// The subjects linked now: those with a row not marked unlinked.
+    pub fn linked(&self) -> BTreeSet<&Address> {
+        self.subjects.iter().filter(|row| !row.record.unlinked).map(|row| &row.record.subject).collect()
     }
 
     /// The convoy-lifetime duties not yet retired: each holds `Deliver`.
@@ -480,7 +545,7 @@ pub struct Resupervise {
     pub authority: Ref<Authorisation>,
 }
 
-/// Retires an unoccupied seat, reserving its name until rollover.
+/// Retires an unoccupied seat; its name stays reserved.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetireSeat {
     pub seat: SeatName,
@@ -488,9 +553,30 @@ pub struct RetireSeat {
     pub authority: Ref<Authorisation>,
 }
 
-/// The standing convoy starts a compact live generation under the same identity.
+/// An authorised Fail verdict on a seat, with its reason: final for the seat,
+/// and a record only. What follows from it (the convoy failing) is the
+/// caller's decision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Rollover {
+pub struct FailSeat {
+    pub seat: SeatName,
+    pub reason: String,
+    pub by: SeatName,
+    pub authority: Ref<Authorisation>,
+}
+
+/// An authorised link of a subject not linked now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Link {
+    pub subject: Address,
+    pub source: LinkSource,
+    pub by: SeatName,
+    pub authority: Ref<Authorisation>,
+}
+
+/// An authorised unlink of a subject linked now; its row stays, marked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unlink {
+    pub subject: Address,
     pub by: SeatName,
     pub authority: Ref<Authorisation>,
 }
@@ -502,14 +588,19 @@ pub struct Rollover {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplaceSeat(pub SeatName);
 
-/// Nothing is Pending or Submitted and no lifetime duty holds.
+/// Nothing is Pending or Submitted and no lifetime duty holds. The
+/// disposition says how the work was delivered, such as `merged`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Deliver;
+pub struct Deliver {
+    pub disposition: String,
+}
 
-/// An authorised decision to stop, with its reason. Nothing abandons a convoy automatically.
+/// An authorised decision to stop, with its cause and reason. Nothing
+/// abandons a convoy automatically.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Abandon {
     pub by: SeatName,
+    pub cause: AbandonCause,
     pub reason: String,
     pub authority: Ref<Authorisation>,
 }
@@ -558,16 +649,18 @@ edges! {
         AddSeat(AddSeat) = "as",
         Resupervise(Resupervise) = "sv",
         RetireSeat(RetireSeat) = "sr",
-        Rollover(Rollover) = "ro",
+        FailSeat(FailSeat) = "fs",
         ReplaceSeat(ReplaceSeat) = "rp",
+        Link(Link) = "lk",
+        Unlink(Unlink) = "ul",
         Deliver(Deliver) = "de",
         Abandon(Abandon) = "ab",
         Readmit(Readmit) = "ra",
     }
 }
 
-/// A write to the convoy's records: a promise or seat appended, a
-/// submission appended under a promise, or one field of an existing row.
+/// A write to the convoy's records: a promise, seat or subject link appended,
+/// a submission appended under a promise, or one field of an existing row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConvoyWrite {
     Promise(Promise),
@@ -578,10 +671,9 @@ pub enum ConvoyWrite {
     Supervisor { seat: Position, supervised_by: Address },
     Retired { seat: Position },
     Replaced { seat: Position, count: u32 },
-    GenerationSeats { before: Records<Seat>, after: Records<Seat> },
-    GenerationPromises { before: Records<Promise> },
-    GenerationDuties { before: BTreeMap<DutyId, Duty>, after: BTreeMap<DutyId, Duty> },
-    PromiseFloor(u64),
+    Failed { seat: Position, reason: String },
+    Subject(SubjectLink),
+    Unlinked { subject: Position },
 }
 
 impl RecordWrite<ConvoySpec> for ConvoyWrite {
@@ -591,9 +683,8 @@ impl RecordWrite<ConvoySpec> for ConvoyWrite {
             | ConvoyWrite::Supervisor { .. }
             | ConvoyWrite::Retired { .. }
             | ConvoyWrite::Replaced { .. }
-            | ConvoyWrite::GenerationSeats { .. } => "seats",
-            ConvoyWrite::GenerationDuties { .. } => "duties",
-            ConvoyWrite::PromiseFloor(_) => "promise_floor",
+            | ConvoyWrite::Failed { .. } => "seats",
+            ConvoyWrite::Subject(_) | ConvoyWrite::Unlinked { .. } => "subjects",
             _ => "promises",
         }
     }
@@ -612,24 +703,17 @@ impl RecordWrite<ConvoySpec> for ConvoyWrite {
                 }
                 Ok(())
             }
-            ConvoyWrite::GenerationSeats { after, .. } => {
-                let mut seats = Records::new();
-                for row in after.iter() {
-                    seats.append(version, row.record.clone())?;
+            ConvoyWrite::Failed { seat, reason } => {
+                if let Some(row) = spec.seats.get_mut(*seat) {
+                    row.failed = Some(reason.clone());
                 }
-                spec.seats = seats;
                 Ok(())
             }
-            ConvoyWrite::GenerationPromises { .. } => {
-                spec.promises = Records::new();
-                Ok(())
-            }
-            ConvoyWrite::GenerationDuties { after, .. } => {
-                spec.duties.clone_from(after);
-                Ok(())
-            }
-            ConvoyWrite::PromiseFloor(floor) => {
-                spec.promise_floor = *floor;
+            ConvoyWrite::Subject(link) => spec.subjects.append(version, link.clone()).map(drop),
+            ConvoyWrite::Unlinked { subject } => {
+                if let Some(row) = spec.subjects.get_mut(*subject) {
+                    row.unlinked = true;
+                }
                 Ok(())
             }
             ConvoyWrite::Promise(promise) => spec.promises.append(version, promise.clone()).map(drop),
@@ -663,21 +747,16 @@ impl RecordWrite<ConvoySpec> for ConvoyWrite {
 /// The convoy's records, as a stored edge addresses them.
 const PROMISES: RecordsOf<Resource<Convoy>, Promise> = RecordsOf::new("promises");
 const SEATS: RecordsOf<Resource<Convoy>, Seat> = RecordsOf::new("seats");
-// Kind specs deliberately have no generated edge handles: the holder owns the
-// stored root. As with SEATS, bind this handle to that holder. The second
-// argument counts nested tables (zero for u64); it is not a column ordinal.
-const PROMISE_FLOOR: flotilla_schema::ColumnOf<Resource<Convoy>, u64> =
-    flotilla_schema::ColumnOf::new("promise_floor", 0, <flotilla_schema::adapt::AsColumns as flotilla_schema::adapt::Adapter<u64>>::encode);
+const SUBJECTS: RecordsOf<Resource<Convoy>, SubjectLink> = RecordsOf::new("subjects");
 
 impl StoredWrite<Resource<Convoy>> for ConvoyWrite {
     fn store(&self, edge: StoredEdge<Resource<Convoy>>) -> Result<StoredEdge<Resource<Convoy>>, EdgeError> {
         match self {
             ConvoyWrite::Retired { seat } => edge.set_in(SEATS, *seat, Seat::RETIRED, &true),
             ConvoyWrite::Replaced { seat, count } => edge.set_in(SEATS, *seat, Seat::REPLACEMENTS, count),
-            ConvoyWrite::GenerationSeats { before, after } => edge.replace_records(SEATS, before, after),
-            ConvoyWrite::GenerationPromises { before } => edge.replace_records(PROMISES, before, &Records::new()),
-            ConvoyWrite::GenerationDuties { before, after } => edge.replace_children("duties", before, after),
-            ConvoyWrite::PromiseFloor(floor) => edge.set(PROMISE_FLOOR, floor),
+            ConvoyWrite::Failed { seat, reason } => edge.set_in(SEATS, *seat, Seat::FAILED, &Some(reason.clone())),
+            ConvoyWrite::Subject(link) => edge.append(SUBJECTS, link),
+            ConvoyWrite::Unlinked { subject } => edge.set_in(SUBJECTS, *subject, SubjectLink::UNLINKED, &true),
             ConvoyWrite::Promise(promise) => edge.append(PROMISES, promise),
             ConvoyWrite::Seat(seat) => edge.append(SEATS, seat),
             ConvoyWrite::Submission { promise, submission } => edge.append_in(PROMISES, *promise, Promise::SUBMISSIONS, submission),
@@ -719,6 +798,12 @@ pub enum ConvoyRefusal {
     SeatRetired,
     SeatsFull,
     ReplacementsExhausted,
+    /// The seat already has a Fail verdict.
+    SeatFailed,
+    /// The subject is linked now.
+    SubjectLinked,
+    /// The subject is not linked now.
+    UnknownSubject,
     /// Admission's seats are not a tree: a seat is above itself.
     SeatCycle,
 }
@@ -736,7 +821,7 @@ impl From<WrongState<ConvoyLabel, ConvoyEdgeKind>> for ConvoyRefusal {
 }
 
 /// A decision by an authorised party (retiring a duty, fan-out, a supervision
-/// change, abandoning, readmitting); reads `true` when it is authorised. The
+/// change, a seat verdict, a subject link, abandoning, readmitting); reads `true` when it is authorised. The
 /// caller works it out from seat relations, as the spec's `authorised`.
 pub struct Authorisation;
 impl Kind for Authorisation {
@@ -843,8 +928,7 @@ pub struct Convoy;
 impl Machine for Convoy {
     const NAME: &'static str = "Convoy";
     // ADR 0047 N→N+1: remove one roll after seat growth lands.
-    const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] =
-        &[("", "promise_floor", 0), ("seats", "retired", 0), ("seats", "replacements", 0)];
+    const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = &[("seats", "retired", 0), ("seats", "replacements", 0)];
     type Request = ConvoyRequest;
     type Spec = ConvoySpec;
     type State = ConvoyState;
@@ -960,18 +1044,42 @@ impl Machine for Convoy {
                     }),
             )
             .edge(
-                EdgeDef::<Self, Rollover>::new()
+                EdgeDef::<Self, FailSeat>::new()
                     .from([Open])
                     .to([Open])
-                    .writes(["seats", "promises", "duties", "promise_floor"])
-                    .changes(["retired"])
-                    .gate("authorised standing convoy with no open promises", gate_rollover)
-                    .effect(rollover),
+                    .writes(["seats"])
+                    .gate("an authorised verdict with a reason on a known seat not yet failed", gate_fail_seat)
+                    .effect(|h, state, fail| {
+                        if let Some((seat, _)) = h.spec().seat(&fail.seat) {
+                            h.write(ConvoyWrite::Failed { seat, reason: fail.reason.clone() });
+                        }
+                        state
+                    }),
+            )
+            .edge(
+                EdgeDef::<Self, Link>::new()
+                    .from([Open])
+                    .to([Open])
+                    .writes(["subjects"])
+                    .gate("an authorised link of a subject not linked now", gate_link)
+                    .effect(|h, state, link| {
+                        h.write(ConvoyWrite::Subject(SubjectLink { subject: link.subject.clone(), source: link.source, unlinked: false }));
+                        state
+                    }),
+            )
+            .edge(
+                EdgeDef::<Self, Unlink>::new()
+                    .from([Open])
+                    .to([Open])
+                    .writes(["subjects"])
+                    .gate("an authorised unlink of a subject linked now", gate_unlink)
+                    .effect(unlink),
             )
             .edge(
                 EdgeDef::<Self, Deliver>::new()
                     .from([Open])
                     .to([Delivered])
+                    .changes(["disposition"])
                     .gate("nothing open and no lifetime duty holding", gate_deliver)
                     .effect(deliver),
             )
@@ -979,7 +1087,7 @@ impl Machine for Convoy {
                 EdgeDef::<Self, Abandon>::new()
                     .from([Open])
                     .to([Abandoned])
-                    .changes(["reason"])
+                    .changes(["cause", "reason"])
                     .gate("an authorised decision with a reason", gate_abandon)
                     .effect(abandon),
             )
@@ -1025,14 +1133,15 @@ impl Machine for Convoy {
         let now = admission.now();
         let mut spec = ConvoySpec {
             project: request.project,
-            promise_floor: 0,
             priority: request.priority,
             kinds: request.kinds,
+            subjects: Records::new(),
             duties: request.duties,
             seats: Records::new(),
             promises: Records::new(),
         };
         for mut seat in request.seats {
+            seat.failed = None;
             seat.retired = false;
             seat.replacements = 0;
             spec.seats.append(0, seat).expect("a request holds fewer than 2^32 seats");
@@ -1122,7 +1231,7 @@ fn may_reassign(promise: &Promise, by: &SeatName, authority: Authority) -> bool 
 // The kind is opaque here, as in the spec: the write path declares only a
 // kind the convoy froze (`crate::kinds`).
 fn gate_declare(h: &mut Handle<'_, Convoy>, declare: &Declare) -> Result<(), ConvoyRefusal> {
-    if u64::from(declare.promise.0) < h.spec().promise_floor || h.spec().promise(declare.promise).is_some() {
+    if h.spec().promise(declare.promise).is_some() {
         return Err(ConvoyRefusal::PromiseExists);
     }
     let (_, owner) = h.spec().seat(&declare.owner).ok_or(ConvoyRefusal::UnknownSeat)?;
@@ -1241,6 +1350,38 @@ fn gate_deliver(h: &mut Handle<'_, Convoy>, _: &Deliver) -> Result<(), ConvoyRef
     Ok(())
 }
 
+// Spec: an unauthorised verdict and an empty reason both refuse `Unauthorised`.
+fn gate_fail_seat(h: &mut Handle<'_, Convoy>, fail: &FailSeat) -> Result<(), ConvoyRefusal> {
+    if !authorised(h, &fail.authority) || fail.reason.is_empty() {
+        return Err(ConvoyRefusal::Unauthorised);
+    }
+    let (_, seat) = h.spec().seat(&fail.seat).ok_or(ConvoyRefusal::UnknownSeat)?;
+    if seat.failed.is_some() {
+        return Err(ConvoyRefusal::SeatFailed);
+    }
+    Ok(())
+}
+
+fn gate_link(h: &mut Handle<'_, Convoy>, link: &Link) -> Result<(), ConvoyRefusal> {
+    if !authorised(h, &link.authority) {
+        return Err(ConvoyRefusal::Unauthorised);
+    }
+    if h.spec().linked().contains(&link.subject) {
+        return Err(ConvoyRefusal::SubjectLinked);
+    }
+    Ok(())
+}
+
+fn gate_unlink(h: &mut Handle<'_, Convoy>, unlink: &Unlink) -> Result<(), ConvoyRefusal> {
+    if !authorised(h, &unlink.authority) {
+        return Err(ConvoyRefusal::Unauthorised);
+    }
+    if !h.spec().linked().contains(&unlink.subject) {
+        return Err(ConvoyRefusal::UnknownSubject);
+    }
+    Ok(())
+}
+
 // Spec: an unauthorised decision and an empty reason both refuse `Unauthorised`.
 fn gate_abandon(h: &mut Handle<'_, Convoy>, abandon: &Abandon) -> Result<(), ConvoyRefusal> {
     if !authorised(h, &abandon.authority) || abandon.reason.is_empty() {
@@ -1321,6 +1462,7 @@ fn add_seat(h: &mut Handle<'_, Convoy>, state: ConvoyState, add: &AddSeat) -> Co
         seat: add.seat.seat.clone(),
         parent: Some(add.parent.clone()),
         supervised_by: add.supervised_by.clone(),
+        failed: None,
         retired: false,
         replacements: 0,
     };
@@ -1348,16 +1490,33 @@ fn retire_duty(_: &mut Handle<'_, Convoy>, state: ConvoyState, retire: &RetireDu
     }
 }
 
-fn deliver(_: &mut Handle<'_, Convoy>, state: ConvoyState, _: &Deliver) -> ConvoyState {
+// Only one row of a subject is linked at a time; the gate saw it.
+fn unlink(h: &mut Handle<'_, Convoy>, state: ConvoyState, unlink: &Unlink) -> ConvoyState {
+    let linked: Vec<Position> = h
+        .spec()
+        .subjects
+        .iter()
+        .filter(|row| !row.record.unlinked && row.record.subject == unlink.subject)
+        .map(|row| row.position)
+        .collect();
+    for subject in linked {
+        h.write(ConvoyWrite::Unlinked { subject });
+    }
+    state
+}
+
+fn deliver(_: &mut Handle<'_, Convoy>, state: ConvoyState, deliver: &Deliver) -> ConvoyState {
     match state {
-        ConvoyState::Open { quota, retired } => ConvoyState::Delivered { quota, retired },
+        ConvoyState::Open { quota, retired } => ConvoyState::Delivered { quota, retired, disposition: deliver.disposition.clone() },
         other => other,
     }
 }
 
 fn abandon(_: &mut Handle<'_, Convoy>, state: ConvoyState, abandon: &Abandon) -> ConvoyState {
     match state {
-        ConvoyState::Open { quota, retired } => ConvoyState::Abandoned { quota, retired, reason: abandon.reason.clone() },
+        ConvoyState::Open { quota, retired } => {
+            ConvoyState::Abandoned { quota, retired, cause: abandon.cause, reason: abandon.reason.clone() }
+        }
         other => other,
     }
 }
@@ -1412,47 +1571,4 @@ fn gate_replace_seat(h: &mut Handle<'_, Convoy>, replace: &ReplaceSeat) -> Resul
         return Err(ConvoyRefusal::ReplacementsExhausted);
     }
     Ok(())
-}
-
-fn gate_rollover(h: &mut Handle<'_, Convoy>, rollover: &Rollover) -> Result<(), ConvoyRefusal> {
-    if !authorised(h, &rollover.authority) {
-        return Err(ConvoyRefusal::Unauthorised);
-    }
-    if h.spec().holding(h.state().retired()).is_empty() {
-        return Err(ConvoyRefusal::NoObligations);
-    }
-    let outstanding = h.spec().outstanding();
-    if !outstanding.is_empty() {
-        return Err(ConvoyRefusal::PromisesOutstanding(outstanding));
-    }
-    Ok(())
-}
-
-fn rollover(h: &mut Handle<'_, Convoy>, state: ConvoyState, _: &Rollover) -> ConvoyState {
-    let before = h.spec().clone();
-    let mut after = before.clone();
-    after.promise_floor =
-        before.promises.iter().map(|r| u64::from(r.record.id.0) + 1).max().unwrap_or(before.promise_floor).max(before.promise_floor);
-    let live: BTreeSet<_> = before.seats.iter().filter(|r| !r.record.retired).map(|r| r.record.name()).collect();
-    after.seats = Records::new();
-    for row in before.seats.iter().filter(|r| !r.record.retired) {
-        let mut seat = row.record.clone();
-        if seat.parent.as_ref().is_some_and(|p| !live.contains(p)) {
-            seat.parent = None;
-        }
-        // This is an unversioned replacement payload. GenerationSeats::apply stamps
-        // every carried row with the actual committed edge version before storage.
-        after.seats.append(0, seat).expect("rollover only drops seats");
-    }
-    let holding = before.holding(state.retired());
-    after.duties.retain(|id, _| holding.contains(id));
-    after.promises = Records::new();
-    h.write(ConvoyWrite::GenerationSeats { before: before.seats, after: after.seats });
-    h.write(ConvoyWrite::GenerationPromises { before: before.promises });
-    h.write(ConvoyWrite::GenerationDuties { before: before.duties, after: after.duties });
-    h.write(ConvoyWrite::PromiseFloor(after.promise_floor));
-    match state {
-        ConvoyState::Open { quota, .. } => ConvoyState::Open { quota, retired: BTreeSet::new() },
-        other => other,
-    }
 }

@@ -279,6 +279,6 @@ fn record_stamps_are_never_null(tc: TestCase) {
         }
     }
     // Every engine kind's history is its log entries; the records are the dossier's deliverables
-    // and evidence, and the convoy's seats, promises and submissions.
-    assert_eq!(checked, 5);
+    // and evidence, and the convoy's subject links, seats, promises and submissions.
+    assert_eq!(checked, 6);
 }

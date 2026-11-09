@@ -35,6 +35,22 @@ fn narrowed(kinds: KindRegistry, without: &[(&str, &str, &str)]) -> KindRegistry
     older
 }
 
+/// `kinds` with `table`'s `column` declaring a previous-generation default of 0, as a kind's
+/// `STORED_DEFAULTS` would, so opening may add it to a table that lacks it.
+fn defaulted(kinds: KindRegistry, table: &str, column: &str) -> KindRegistry {
+    let mut widened = KindRegistry::new();
+    for set in kinds.iter() {
+        let mut set = set.clone();
+        for def in set.tables.iter_mut().filter(|def| def.name == table).flat_map(|def| def.columns.iter_mut()) {
+            if def.name == column {
+                def.properties.insert("previous_generation_default".into(), 0.into());
+            }
+        }
+        widened.register_table_set(set).expect("defaulted registry");
+    }
+    widened
+}
+
 /// The engine registry before the Service consumer and the Dependency relation.
 fn registry_without_services() -> KindRegistry {
     narrowed(registry().expect("registry"), &[("message", "receiver_kind", "sv"), ("message", "relation", "dy")])
@@ -186,7 +202,8 @@ fn widening_a_table_with_a_dangling_row_is_refused() {
 
 // Behaviour (#3972 review): a table that both lacks a column opening adds with its default and
 // lacks a code is widened, not refused: the rebuild adds the column with its default. Here the
-// Convoy table predates `promise_floor` and the `ab` code (its guard is kept, see [`narrowed`]).
+// Convoy table predates the `ab` code (its guard is kept, see [`narrowed`]) and a root column
+// given a previous-generation default, since Convoy no longer declares a defaulted root column.
 #[test]
 fn a_table_missing_a_defaulted_column_and_a_code_is_widened() {
     use flotilla_engine_store::{convoy_registry, StoreLog};
@@ -197,7 +214,8 @@ fn a_table_missing_a_defaulted_column_and_a_code_is_widened() {
         sync::{Arc, Mutex},
     };
 
-    let older = narrowed(convoy_registry().expect("registry"), &[("convoy", "state", "ab")]);
+    let current = defaulted(convoy_registry().expect("registry"), "convoy", "priority");
+    let older = narrowed(current.clone(), &[("convoy", "state", "ab")]);
     let store = Arc::new(Mutex::new(Store::open(Connection::open_in_memory().expect("SQLite"), HOME, older).expect("old store")));
     let mut home = Home::<Convoy, _>::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("convoy home");
     let project: Address = "project:fleet".parse().expect("project");
@@ -207,6 +225,7 @@ fn a_table_missing_a_defaulted_column_and_a_code_is_widened() {
         seat: owner.seat.clone(),
         parent: None,
         supervised_by: project.clone(),
+        failed: None,
         retired: false,
         replacements: 0,
     };
@@ -225,15 +244,15 @@ fn a_table_missing_a_defaulted_column_and_a_code_is_widened() {
     let (id, before): (i64, i64) =
         conn.query_row("SELECT id, version FROM convoy", [], |row| Ok((row.get(0)?, row.get(1)?))).expect("convoy row");
     let duties = count(&conn, "convoy_duties");
-    conn.execute_batch("DROP VIEW convoy_view; ALTER TABLE convoy DROP COLUMN promise_floor;").expect("predate promise_floor");
+    conn.execute_batch("DROP VIEW convoy_view; ALTER TABLE convoy DROP COLUMN priority;").expect("predate priority");
 
-    let store = Store::open(conn, HOME, convoy_registry().expect("registry")).expect("widened with the default");
+    let store = Store::open(conn, HOME, current.clone()).expect("widened with the default");
     let conn = store.into_connection();
     let row: (i64, i64, i64) = conn
-        .query_row("SELECT id, version, promise_floor FROM convoy", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .query_row("SELECT id, version, priority FROM convoy", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .expect("convoy row");
     assert_eq!(row, (id, before, 0));
     assert_eq!(count(&conn, "convoy_duties"), duties);
     let stored: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE name = 'convoy'", [], |row| row.get(0)).expect("table");
-    assert!(schema_ddl(&convoy_registry().expect("registry"), DdlMode::Create).contains(&format!("{stored};\n")), "{stored}");
+    assert!(schema_ddl(&current, DdlMode::Create).contains(&format!("{stored};\n")), "{stored}");
 }

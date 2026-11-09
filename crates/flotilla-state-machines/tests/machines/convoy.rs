@@ -5,9 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_schema::{Address, Code, CodeEnum, Frozen, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        Abandon, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoySpec,
-        ConvoyState, Declare, Deliver, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, Progress, PromiseId, PromiseKinds,
-        PromiseSource, Quota, Readmit, Reassign, Reject, Resupervise, RetireDuty, Retract, Seat, SeatName, Submit, Terms, VesselClass,
+        Abandon, AbandonCause, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest,
+        ConvoySpec, ConvoyState, Declare, Deliver, Duty, DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority,
+        Progress, PromiseId, PromiseKinds, PromiseSource, Quota, Readmit, Reassign, Reject, Resupervise, RetireDuty, Retract, Seat,
+        SeatName, Submit, Terms, Unlink, VesselClass,
     },
     Coded, Diagram, Home, InputRead, Machine, Ref, StateValue, Version, WriteError,
 };
@@ -33,6 +34,7 @@ fn seat(role: &str) -> SeatName {
 
 fn seat_row(role: &str, parent: Option<&str>) -> Seat {
     Seat {
+        failed: None,
         retired: false,
         replacements: 0,
         role: role.into(),
@@ -108,6 +110,10 @@ fn retract(id: u32, by: &str, authority: Authority) -> Retract {
     Retract { promise: PromiseId(id), by: seat(by), authority, reason: "decision".into() }
 }
 
+fn merged() -> Deliver {
+    Deliver { disposition: "merged".into() }
+}
+
 fn verdict(id: u32, authority: Authority) -> Keep {
     Keep::Verdict { promise: PromiseId(id), by: seat("decider"), authority, reason: "decision".into() }
 }
@@ -119,16 +125,16 @@ fn the_declaration_is_valid() {
 }
 
 // State and edge codes are stable: renames never change them. Every label
-// carries the quota in force and the retired duties; Abandoned also carries
-// its reason. Codes kept from the earlier machine stay (`ke`, `rt`, `de`,
+// carries the quota in force and the retired duties; Delivered also carries
+// its disposition, and Abandoned its cause and reason. Codes kept from the earlier machine stay (`ke`, `rt`, `de`,
 // `ab`, `ra`).
 #[test]
 fn codes_are_pinned() {
     let labels: Vec<_> = ConvoyLabel::ALL.iter().map(|s| (s.name(), s.code(), ConvoyState::fields(*s))).collect();
     let expected: [(&str, Code, &[&str]); 3] = [
         ("Open", Code::new("op"), &["quota", "retired"]),
-        ("Delivered", Code::new("de"), &["quota", "retired"]),
-        ("Abandoned", Code::new("ab"), &["quota", "retired", "reason"]),
+        ("Delivered", Code::new("de"), &["quota", "retired", "disposition"]),
+        ("Abandoned", Code::new("ab"), &["quota", "retired", "cause", "reason"]),
     ];
     assert_eq!(labels, expected);
     let edges: Vec<_> = ConvoyEdgeKind::ALL.iter().map(|k| (k.name(), k.code().as_str().to_owned())).collect();
@@ -143,8 +149,10 @@ fn codes_are_pinned() {
         ("add_seat", "as"),
         ("resupervise", "sv"),
         ("retire_seat", "sr"),
-        ("rollover", "ro"),
+        ("fail_seat", "fs"),
         ("replace_seat", "rp"),
+        ("link", "lk"),
+        ("unlink", "ul"),
         ("deliver", "de"),
         ("abandon", "ab"),
         ("readmit", "ra"),
@@ -163,8 +171,11 @@ fn the_diagram_is_pinned() {
         "  Open --> Open: retire_duty [retired]\n",
         "  Open --> Open: add_seat writes seats\n",
         "  Open --> Open: resupervise writes seats\n",
-        "  Open --> Delivered: deliver\n",
-        "  Open --> Abandoned: abandon [reason]\n",
+        "  Open --> Open: fail_seat writes seats\n",
+        "  Open --> Open: link writes subjects\n",
+        "  Open --> Open: unlink writes subjects\n",
+        "  Open --> Delivered: deliver [disposition]\n",
+        "  Open --> Abandoned: abandon [cause, reason]\n",
         "  Open --> Open: readmit [quota]\n",
         "  note right of Delivered: the convoy delivered its work\n",
     ] {
@@ -379,29 +390,82 @@ fn deliver_waits_for_promises_then_duties() {
     let mut with_duty = request(&[(0, PromiseSource::Template)]);
     with_duty.duties = [(DutyId(0), lifetime("lead"))].into();
     let mut home = convoy(with_duty);
-    assert_eq!(apply(&mut home, Deliver), refused(ConvoyRefusal::PromisesOutstanding([PromiseId(0)].into())));
+    assert_eq!(apply(&mut home, merged()), refused(ConvoyRefusal::PromisesOutstanding([PromiseId(0)].into())));
     apply(&mut home, verdict(0, Authority::Operator)).expect("kept");
-    assert_eq!(apply(&mut home, Deliver), refused(ConvoyRefusal::DutyHolds([DutyId(0)].into())));
+    assert_eq!(apply(&mut home, merged()), refused(ConvoyRefusal::DutyHolds([DutyId(0)].into())));
     let retire = |duty: u32, authority: &str| RetireDuty { duty: DutyId(duty), by: seat("lead"), authority: Ref::new(authority) };
     assert_eq!(apply(&mut home, retire(0, NO)), refused(ConvoyRefusal::Unauthorised));
     assert_eq!(apply(&mut home, retire(1, YES)), refused(ConvoyRefusal::UnknownDuty));
     apply(&mut home, retire(0, YES)).expect("retired");
     assert_eq!(apply(&mut home, retire(0, YES)), refused(ConvoyRefusal::UnknownDuty), "already retired");
-    apply(&mut home, Deliver).expect("delivered");
+    apply(&mut home, merged()).expect("delivered");
     let state = home.get("c").expect("exists").state().clone();
-    assert_eq!(state, ConvoyState::Delivered { quota: quota(&[("standard", 1)]), retired: [DutyId(0)].into() });
+    let delivered = ConvoyState::Delivered { quota: quota(&[("standard", 1)]), retired: [DutyId(0)].into(), disposition: "merged".into() };
+    assert_eq!(state, delivered);
     assert_eq!(apply(&mut home, submit(0, "coder", YES)), refused(ConvoyRefusal::NotOpen));
 }
 
-// Abandon is an authorised decision with a reason, kept beside the work.
+// Abandon is an authorised decision with a cause and a reason, kept beside the work.
 #[test]
 fn abandon_is_an_authorised_decision() {
     let mut home = convoy(request(&[(0, PromiseSource::Template)]));
-    let abandon = |reason: &str, authority: &str| Abandon { by: seat("lead"), reason: reason.into(), authority: Ref::new(authority) };
-    assert_eq!(apply(&mut home, abandon("decision", NO)), refused(ConvoyRefusal::Unauthorised));
+    let abandon = |reason: &str, authority: &str| Abandon {
+        by: seat("lead"),
+        cause: AbandonCause::Failed,
+        reason: reason.into(),
+        authority: Ref::new(authority),
+    };
+    assert_eq!(apply(&mut home, abandon("vessel failed", NO)), refused(ConvoyRefusal::Unauthorised));
     assert_eq!(apply(&mut home, abandon("", YES)), refused(ConvoyRefusal::Unauthorised));
-    apply(&mut home, abandon("decision", YES)).expect("abandoned");
-    assert_eq!(home.get("c").expect("exists").state().reason(), Some("decision"));
+    apply(&mut home, abandon("vessel failed", YES)).expect("abandoned");
+    let state = home.get("c").expect("exists").state().clone();
+    assert_eq!((state.cause(), state.reason()), (Some(AbandonCause::Failed), Some("vessel failed")));
+}
+
+// A Fail verdict is authorised, has a reason, names a known seat and is
+// final for the seat; it records the reason and changes nothing else.
+#[test]
+fn a_seat_fails_once_with_a_reason() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
+    let fail = |role: &str, reason: &str, authority: &str| FailSeat {
+        seat: seat(role),
+        reason: reason.into(),
+        by: seat("lead"),
+        authority: Ref::new(authority),
+    };
+    assert_eq!(apply(&mut home, fail("coder", "crashed", NO)), refused(ConvoyRefusal::Unauthorised));
+    assert_eq!(apply(&mut home, fail("coder", "", YES)), refused(ConvoyRefusal::Unauthorised));
+    assert_eq!(apply(&mut home, fail("nobody", "crashed", YES)), refused(ConvoyRefusal::UnknownSeat));
+    apply(&mut home, fail("coder", "crashed", YES)).expect("failed");
+    assert_eq!(apply(&mut home, fail("coder", "again", YES)), refused(ConvoyRefusal::SeatFailed));
+    let convoy = home.get("c").expect("exists");
+    let (_, coder) = convoy.spec().seat(&seat("coder")).expect("seat");
+    assert_eq!(coder.failed.as_deref(), Some("crashed"));
+    assert_eq!(convoy.state(), &ConvoyState::Open { quota: quota(&[("standard", 1)]), retired: BTreeSet::new() });
+    assert_eq!(progress(&home, 0), Progress::Pending, "the verdict settles none of the seat's promises");
+}
+
+// A subject is linked at most once at a time. An unlink marks its row, and a
+// relink appends another, so the history stays.
+#[test]
+fn subjects_link_unlink_and_relink() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
+    let change = address("change");
+    let link =
+        |source: LinkSource, authority: &str| Link { subject: address("change"), source, by: seat("lead"), authority: Ref::new(authority) };
+    let unlink = |authority: &str| Unlink { subject: address("change"), by: seat("lead"), authority: Ref::new(authority) };
+    assert_eq!(apply(&mut home, link(LinkSource::Claim, NO)), refused(ConvoyRefusal::Unauthorised));
+    assert_eq!(apply(&mut home, unlink(YES)), refused(ConvoyRefusal::UnknownSubject));
+    apply(&mut home, link(LinkSource::Claim, YES)).expect("linked");
+    assert_eq!(apply(&mut home, link(LinkSource::Relay, YES)), refused(ConvoyRefusal::SubjectLinked));
+    assert_eq!(apply(&mut home, unlink(NO)), refused(ConvoyRefusal::Unauthorised));
+    apply(&mut home, unlink(YES)).expect("unlinked");
+    assert!(home.get("c").expect("exists").spec().linked().is_empty());
+    apply(&mut home, link(LinkSource::Operator, YES)).expect("relinked");
+    let spec = home.get("c").expect("exists").spec().clone();
+    assert_eq!(spec.linked(), BTreeSet::from([&change]));
+    let rows: Vec<_> = spec.subjects.iter().map(|row| (row.record.source, row.record.unlinked)).collect();
+    assert_eq!(rows, [(LinkSource::Claim, true), (LinkSource::Operator, false)]);
 }
 
 // Readmission raises the quota over the same classes, never lowering a count.
@@ -418,29 +482,31 @@ fn readmission_only_raises_the_quota() {
 }
 
 // ADR 0047: the previous generation's stored record representation has no
-// retired/replacement/floor fields; new writes include their current values.
+// failed/retired/replacement fields on seats, no subjects, and a promise
+// floor; new writes include the current fields and drop the floor.
 #[test]
 fn previous_seat_and_convoy_records_decode_with_growth_defaults() {
     let row = seat_row("a", None);
     let mut previous = serde_json::to_value(&row).expect("encode seat");
+    previous.as_object_mut().unwrap().remove("failed");
     previous.as_object_mut().unwrap().remove("retired");
     previous.as_object_mut().unwrap().remove("replacements");
     let decoded: Seat = serde_json::from_value(previous).expect("N→N+1 seat");
-    assert!(!decoded.retired);
-    assert_eq!(decoded.replacements, 0);
+    assert_eq!((decoded.failed, decoded.retired, decoded.replacements), (None, false, 0));
     let spec = ConvoySpec {
         project: project(),
-        promise_floor: 0,
         priority: Priority(0),
         kinds: Frozen::new(PromiseKinds::default()).unwrap(),
+        subjects: flotilla_schema::Records::new(),
         duties: BTreeMap::new(),
         seats: flotilla_schema::Records::new(),
         promises: flotilla_schema::Records::new(),
     };
     let mut previous = serde_json::to_value(&spec).expect("encode convoy spec");
-    previous.as_object_mut().unwrap().remove("promise_floor");
+    previous.as_object_mut().unwrap().remove("subjects");
+    previous.as_object_mut().unwrap().insert("promise_floor".into(), serde_json::json!(3));
     let decoded: ConvoySpec = serde_json::from_value(previous).expect("N→N+1 convoy spec");
-    assert_eq!(decoded.promise_floor, 0);
+    assert_eq!(decoded, spec);
 }
 
 #[test]

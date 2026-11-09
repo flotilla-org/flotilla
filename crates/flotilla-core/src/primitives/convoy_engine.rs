@@ -24,8 +24,8 @@ use flotilla_resources::{
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::convoy::{
-        AddSeat, Authority, Convoy, ConvoyEdge, ConvoyLabel, Declare, Deliver, Keep, Progress, Promise, PromiseId, Reassign, Reject,
-        Retract, SeatName, Submit,
+        AbandonCause, AddSeat, Authority, Convoy, ConvoyEdge, ConvoyLabel, Declare, Deliver, Keep, Progress, Promise, PromiseId, Reassign,
+        Reject, Retract, SeatName, Submit,
     },
     Ref, Resource,
 };
@@ -38,6 +38,10 @@ use super::{
 
 /// The role a decider outside the convoy is named by in an edge's `by`.
 const OPERATOR: &str = "operator";
+
+/// The disposition of a delivery the old convoy's landing drives: the old
+/// path records no more than that it landed.
+const DELIVERED: &str = "landed";
 
 /// This home's engine-first Convoy writer, in the old shape.
 pub struct ConvoyEngine {
@@ -118,7 +122,7 @@ fn operator(principal: &str) -> SeatName {
 /// The next unused promise id: ids are never reused, retracted ones included.
 fn next_id(convoy: &Resource<Convoy>) -> Result<PromiseId, String> {
     let spec = convoy.spec();
-    let next = spec.promises.iter().map(|row| u64::from(row.record.id.0) + 1).max().unwrap_or(0).max(spec.promise_floor);
+    let next = spec.promises.iter().map(|row| u64::from(row.record.id.0) + 1).max().unwrap_or(0);
     u32::try_from(next).map(PromiseId).map_err(|_| "convoy promise ids exhausted".into())
 }
 
@@ -416,8 +420,13 @@ impl EngineConvoys for ConvoyEngine {
     }
 
     async fn deliver(&self, convoy: &ResourceObject<OldConvoy>) -> Result<(), String> {
-        self.edit(convoy, |current, _| Ok((if current.label() == ConvoyLabel::Delivered { Vec::new() } else { vec![Deliver.into()] }, ())))
-            .await
+        self.edit(convoy, |current, _| {
+            Ok((
+                if current.label() == ConvoyLabel::Delivered { Vec::new() } else { vec![Deliver { disposition: DELIVERED.into() }.into()] },
+                (),
+            ))
+        })
+        .await
     }
 
     async fn abandon(&self, convoy: &ResourceObject<OldConvoy>, principal: &str, reason: &str) -> Result<(), String> {
@@ -429,7 +438,13 @@ impl EngineConvoys for ConvoyEngine {
             }
             let authority = input(&name, "abandon");
             world.authority.put(&Ref::new(authority.as_str()), true);
-            Ok((vec![flotilla_state_machines::machines::convoy::Abandon { by, reason, authority: Ref::new(authority) }.into()], ()))
+            let abandon = flotilla_state_machines::machines::convoy::Abandon {
+                by,
+                cause: AbandonCause::Operator,
+                reason,
+                authority: Ref::new(authority),
+            };
+            Ok((vec![abandon.into()], ()))
         })
         .await
     }

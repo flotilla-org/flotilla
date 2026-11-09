@@ -9,8 +9,8 @@
 //! - **Waits**, which are not tries: it is tried only while its environment is realised and, for
 //!   a worktree or local clone, its clone's launch is realised.
 //! - **The holder** is the engine Convoy the launch was created under, at the version its
-//!   requester read: it has ended at the first entry after that version that delivers, abandons
-//!   or rolls it over, read from the Convoy's log rather than from its current state.
+//!   requester read: it has ended at the first entry after that version that delivers or
+//!   abandons it, read from the Convoy's log rather than from its current state.
 //! - **Release** inspects the checkout afresh, records the inspection, and removes it as its
 //!   integration says: a landed branch by the landed removal, a clean and pushed one plainly,
 //!   keeping its branch, and anything else archived first. An adopted checkout is never removed
@@ -30,7 +30,7 @@ use flotilla_schema::{Identity, Kind, KindCode};
 use flotilla_schema_sqlite::{Read, ResourceId, StoreError};
 use flotilla_state_machines::{
     machines::{
-        convoy::{Convoy as EngineConvoy, ConvoyEdgeKind, ConvoyLabel},
+        convoy::{Convoy as EngineConvoy, ConvoyLabel},
         lifecycle::{Lifecycle, LifecycleState},
     },
     Cause, CauseCategory, Resource, StateValue,
@@ -192,8 +192,8 @@ const OBSERVATION: KindCode = <HostObservation as Kind>::CODE;
 const PAGE: u32 = 64;
 
 /// The holder of checkout launch `name` at `home`: the engine Convoy its creation change names,
-/// ended at the first entry after the version read that delivers, abandons or rolls it over. A
-/// launch created under no Convoy is never ended here.
+/// ended at the first entry after the version read that delivers or abandons it. A launch
+/// created under no Convoy is never ended here.
 pub fn convoy_holding(read: &mut Read<'_>, name: &str, home: &str) -> Result<Holding, StoreError> {
     let Some(id) = read.resolve(CHECKOUT, name, home)? else { return Ok(Holding::open()) };
     let Some(created) = read.changes(id, 0, 1)?.into_iter().next() else { return Ok(Holding::open()) };
@@ -210,8 +210,8 @@ pub fn convoy_holding(read: &mut Read<'_>, name: &str, home: &str) -> Result<Hol
     Ok(Holding { ended, record: Some(record) })
 }
 
-/// Whether engine Convoy `id` has ended since version `read_at`: an entry after it delivers,
-/// abandons or rolls it over. Its entries are read forward from `read_at` and the read stops at
+/// Whether engine Convoy `id` has ended since version `read_at`: an entry after it delivers or
+/// abandons it. Its entries are read forward from `read_at` and the read stops at
 /// the first ending, so each judgement reads the entries written since the checkout's request up
 /// to that ending: few for a convoy's own checkouts, more for one requested long ago.
 ///
@@ -242,29 +242,23 @@ fn ended_since(read: &mut Read<'_>, id: ResourceId, read_at: u64) -> Result<bool
     }
 }
 
-/// Whether log entry `entry` ends a Convoy's generation: delivered, abandoned or rolled over.
+/// Whether log entry `entry` ends a Convoy: delivered or abandoned.
 fn ends_convoy(entry: &flotilla_schema::Event) -> bool {
-    let flotilla_schema::Cause::Edge { edge, to, .. } = &entry.cause else { return false };
-    *edge == ConvoyEdgeKind::Rollover.code() || [ConvoyLabel::Delivered, ConvoyLabel::Abandoned].iter().any(|label| *to == label.code())
+    let flotilla_schema::Cause::Edge { to, .. } = &entry.cause else { return false };
+    [ConvoyLabel::Delivered, ConvoyLabel::Abandoned].iter().any(|label| *to == label.code())
 }
 
 /// Whether the snapshot of Convoy `id` this store holds shows it ended since `read_at`, for the
 /// entries before the snapshot that this store never received. Its cause, the change the
 /// snapshot's state came from (kept in `snapshot_cause`), says whether anything was written after
-/// `read_at`; if so, the state says a delivery or abandonment, and the seats a rollover: rollover
-/// restamps every seat it carries with its own version and drops retired ones, so a generation
-/// that rolled over after `read_at` holds no seat stamped at or before it.
+/// `read_at`; if so, the state says whether it was delivered or abandoned.
 fn ended_in_snapshot(read: &mut Read<'_>, id: ResourceId, read_at: u64) -> Result<bool, StoreError> {
     let Some(snapshot) = read.load_snapshot(id)? else { return Ok(false) };
     if snapshot.cause.as_ref().is_some_and(|cause| cause.seq <= read_at) {
         return Ok(false);
     }
     let convoy = snapshot.decode::<Resource<EngineConvoy>>()?;
-    if convoy.state().label() != ConvoyLabel::Open {
-        return Ok(true);
-    }
-    let seats = &convoy.spec().seats;
-    Ok(seats.iter().next().is_some() && seats.iter().all(|seat| seat.version > read_at))
+    Ok(convoy.state().label() != ConvoyLabel::Open)
 }
 
 /// The removal a checkout's integration calls for, with its clone at `clone_path` when it is a

@@ -479,10 +479,10 @@ fn tokio_block<F: std::future::Future>(future: F) -> F::Output {
 }
 
 #[tokio::test]
-async fn standing_admission_and_rollover_use_the_ensure_role_identity() {
+async fn standing_admission_uses_the_ensure_role_identity() {
     use flotilla_resources::{convoy::engine::SkipReason, Selector, ENSURED_FROM_ANNOTATION};
     use flotilla_schema::Timestamp;
-    use flotilla_state_machines::{machines::convoy::Rollover, Ref};
+    use flotilla_state_machines::Ref;
     let fixture = fixture();
     let governor = CrewSpec::builder()
         .role("governor".to_string())
@@ -515,8 +515,6 @@ async fn standing_admission_and_rollover_use_the_ensure_role_identity() {
             Timestamp(8),
         )
         .unwrap();
-    assert_eq!(fixture.convoys.get(name).unwrap().spec().duties, duties);
-    fixture.convoys.apply(name, Rollover { by: SeatName::new("governor", ""), authority }, Timestamp(9)).unwrap();
     assert_eq!(fixture.convoys.get(name).unwrap().spec().duties, duties);
     assert!(fixture.engine.holds(&old));
     assert_eq!(fixture.convoys.get(name).unwrap().name(), name);

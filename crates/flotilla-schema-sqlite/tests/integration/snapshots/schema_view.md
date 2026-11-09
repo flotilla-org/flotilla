@@ -6,10 +6,11 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 |---|---|--:|---|---|---|
 | `awaiting_reply` | root | 12 | – | – | `open_by_sender` (sender), `open_by_subject` (subject), `by_message` (message), `deadline` (deadline) |
 | `agent_session` | root | 9 | – | – | – |
-| `convoy` | root | 9 | – | `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_quota` (state data), `convoy_retired` (state data) | `open_by_project` (project) |
+| `convoy` | root | 10 | – | `convoy_subjects` (records), `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_quota` (state data), `convoy_retired` (state data) | `open_by_project` (project) |
+| `convoy_subjects` | records | 6 | – | – | – |
 | `convoy_duties` | child | 6 | 1: `scope` 1 | `convoy_duties_scope_promises` (child) | – |
 | `convoy_duties_scope_promises` | child | 3 | – | – | – |
-| `convoy_seats` | records | 10 | – | – | – |
+| `convoy_seats` | records | 11 | – | – | – |
 | `convoy_promises` | records | 12 | – | `convoy_promises_submissions` (records) | `by_label` (unique convoy, label) |
 | `convoy_promises_submissions` | records | 8 | – | – | `by_address` (address) |
 | `convoy_quota` | state data | 3 | – | – | – |
@@ -44,7 +45,7 @@ Tables wider than 30 columns:
 States with data (one label column, then data shared by name across the labels):
 - `awaiting_reply`.`state`: label `state` and `state_since`; data columns `reason`; data tables –
 - `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `activity`, `activity_since`, `activity_cause`, `reason`; data tables –
-- `convoy`.`state`: label `state` and `state_since`; data columns `reason`; data tables `convoy_quota`, `convoy_retired`
+- `convoy`.`state`: label `state` and `state_since`; data columns `disposition`, `cause`, `reason`; data tables `convoy_quota`, `convoy_retired`
 - `ensure`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `bound`; data tables `ensure_recorded`, `ensure_created`
 - `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –
 - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_by`, `hold_until`, `reason`, `closed_by`, `signature_who`, `signature_at`; data tables `ticket_assignees`, `ticket_notes`
@@ -60,6 +61,7 @@ Interned column domains:
 | `awaiting_reply` | `subject` | `ad` |
 | `awaiting_reply` | `kind` | `ak` |
 | `convoy` | `project` | `ad` |
+| `convoy_subjects` | `subject` | `ad` |
 | `convoy_duties` | `owner_role` | `rl` |
 | `convoy_duties` | `owner_seat` | `st` |
 | `convoy_seats` | `role` | `rl` |

@@ -8,9 +8,10 @@
 //! - `Declare`, `Reject`, `Keep(Observed)`, `Keep(Verdict)`, `Retract` and
 //!   `Reassign`: those edges, field for field.
 //! - `Submit{durable}`: the `submit` edge, its durability reading `durable`.
-//! - `RetireDuty`, `AddSeat`, `Resupervise`, `Abandon` and `Readmit`: those
-//!   edges, their authority reading `authorised`.
-//! - `Deliver`: the `deliver` edge.
+//! - `RetireDuty`, `AddSeat`, `Resupervise`, `RetireSeat`, `FailSeat`,
+//!   `Link`, `Unlink`, `Abandon` and `Readmit`: those edges, their authority
+//!   reading `authorised`.
+//! - `Deliver`: the `deliver` edge, with its disposition.
 //!
 //! Value mapping:
 //! - A seat is the [`SeatName`] whose role is the spec's text and whose
@@ -18,22 +19,30 @@
 //! - The project, a promise's target, a submission's reference and a
 //!   supervisor are addresses ([`address`]).
 //! - A vessel class is its number as text.
+//! - A subject is an address; the spec's link source `ByOperator` is
+//!   [`LinkSource::Operator`], and its abandon causes `WorkFailed` and
+//!   `OperatorDecision` are [`AbandonCause::Failed`] and
+//!   [`AbandonCause::Operator`].
 //! - A duty's terms are its note.
 //! - A submission's revision is fixed: the spec's reference is all it compares.
 //!
-//! State mapping: the spec's `Work = {spec, promises, seats, retired, quota}`
-//! is the spec's project, duties and priority, the promise and seat records
-//! keyed by id and name, and the state's retired duties and quota.
-//! `Open { .. }` is `Open(work)`, `Delivered { .. }` is `Delivered(work)` and
-//! `Abandoned { reason, .. }` is `Abandoned({work, reason})`. The frozen
-//! promise kinds and each row's stamps and times are not in the spec.
+//! State mapping: the spec's `Work = {spec, promises, seats, retired, quota,
+//! retiredSeats, subjects}` is the spec's project, duties and priority, the
+//! promise and seat records keyed by id and name, the state's retired duties
+//! and quota, and the subjects linked now (the spec keeps no unlinked rows).
+//! The state is `{work, phase}`: `Open { .. }` is phase `Open`,
+//! `Delivered { disposition, .. }` is `Delivered(disposition)` and
+//! `Abandoned { cause, reason, .. }` is `Abandoned({cause, reason})`. The
+//! frozen promise kinds, each link's source and each row's stamps and times
+//! are not in the spec.
 
 use flotilla_schema::{Frozen, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        Abandon, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyRefusal, ConvoyRequest, ConvoySpec, ConvoyState, Declare, Deliver,
-        Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, Progress, PromiseId, PromiseKinds, PromiseSource, Quota, Readmit,
-        Reassign, Reject, ReplaceSeat, Resupervise, RetireDuty, RetireSeat, Retract, Rollover, Seat, SeatName, Submit, Terms, VesselClass,
+        Abandon, AbandonCause, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyRefusal, ConvoyRequest, ConvoySpec, ConvoyState, Declare,
+        Deliver, Duty, DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress, PromiseId, PromiseKinds,
+        PromiseSource, Quota, Readmit, Reassign, Reject, ReplaceSeat, Resupervise, RetireDuty, RetireSeat, Retract, Seat, SeatName, Submit,
+        Terms, Unlink, VesselClass,
     },
     Home, Ref, WriteError,
 };
@@ -100,6 +109,30 @@ fn source_name(source: PromiseSource) -> &'static str {
     }
 }
 
+fn link_source_of(v: &Value) -> LinkSource {
+    match tag(v) {
+        "Claim" => LinkSource::Claim,
+        "ByOperator" => LinkSource::Operator,
+        "Relay" => LinkSource::Relay,
+        other => panic!("link source {other}"),
+    }
+}
+
+fn cause_of(v: &Value) -> AbandonCause {
+    match tag(v) {
+        "WorkFailed" => AbandonCause::Failed,
+        "OperatorDecision" => AbandonCause::Operator,
+        other => panic!("abandon cause {other}"),
+    }
+}
+
+fn cause_name(cause: AbandonCause) -> &'static str {
+    match cause {
+        AbandonCause::Failed => "WorkFailed",
+        AbandonCause::Operator => "OperatorDecision",
+    }
+}
+
 fn authority_of(v: &Value) -> Authority {
     match tag(v) {
         "Operator" => Authority::Operator,
@@ -133,7 +166,9 @@ fn seat_of(name: &str, v: &Value) -> Seat {
         "Root" => None,
         _ => Some(seat(payload(&v["parent"]))),
     };
+    let failed = text(&v["failed"]);
     Seat {
+        failed: (!failed.is_empty()).then(|| failed.into()),
         retired: false,
         replacements: id(&v["replacements"]),
         role: name.into(),
@@ -148,7 +183,12 @@ fn seat_value(seat: &Seat) -> Value {
         None => bare("Root"),
         Some(parent) => variant("Under", seat_text(parent)),
     };
-    json!({ "parent": parent, "supervisedBy": seat.supervised_by.name(), "replacements": int(seat.replacements.into()) })
+    json!({
+        "parent": parent,
+        "supervisedBy": seat.supervised_by.name(),
+        "replacements": int(seat.replacements.into()),
+        "failed": seat.failed.as_deref().unwrap_or_default(),
+    })
 }
 
 fn kinds() -> Frozen<PromiseKinds> {
@@ -211,6 +251,9 @@ fn refusal_of(refusal: ConvoyRefusal) -> Value {
         ConvoyRefusal::SeatRetired => "SeatRetired",
         ConvoyRefusal::SeatsFull => "SeatsFull",
         ConvoyRefusal::ReplacementsExhausted => "ReplacementsExhausted",
+        ConvoyRefusal::SeatFailed => "SeatFailed",
+        ConvoyRefusal::SubjectLinked => "SubjectLinked",
+        ConvoyRefusal::UnknownSubject => "UnknownSubject",
         ConvoyRefusal::SeatCycle => "SeatCycle",
     };
     bare(name)
@@ -255,13 +298,13 @@ fn work(spec: &ConvoySpec, state: &ConvoyState) -> Value {
         "promises": map_of(promises),
         "seats": Value::Object(seats),
         "retiredSeats": set_of(spec.seats.iter().filter(|r| r.record.retired).map(|r| seat_text(&r.record.name()))),
-        "promiseFloor": int(spec.promise_floor.try_into().expect("model floor")),
+        "subjects": set_of(spec.linked().into_iter().map(|subject| json!(subject.name()))),
         "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
         "quota": quota_value(state.quota()),
     })
 }
 
-/// The request that admitted an initial `Open(work)`: its fixed fields, its
+/// The request that admitted an initial open `work`: its fixed fields, its
 /// promises as admitted and its seats, with the quota in force as the
 /// admitted quota.
 fn admitted_request(work: &Value) -> ConvoyRequest {
@@ -305,7 +348,7 @@ impl Conformance for ConvoyConformance {
 
     fn create(state: &Value) -> Home<Convoy> {
         let mut home = Home::<Convoy>::new("home").expect("valid declaration");
-        let request = admitted_request(payload(state));
+        let request = admitted_request(&state["work"]);
         // An admitted convoy's project was known.
         home.create(NAME, request.clone(), &projects(&request, true), Timestamp(0)).expect("admitted");
         home
@@ -385,10 +428,21 @@ impl Conformance for ConvoyConformance {
                 outcome(home.apply(NAME, change, &world, at))
             }
             "RetireSeat" => outcome(home.apply(NAME, RetireSeat { seat: seat(&o["seat"]), by, authority }, &world, at)),
-            "Rollover" => outcome(home.apply(NAME, Rollover { by, authority }, &world, at)),
+            "FailSeat" => {
+                let fail = FailSeat { seat: seat(&o["seat"]), reason: text(&o["reason"]).into(), by, authority };
+                outcome(home.apply(NAME, fail, &world, at))
+            }
             "ReplaceSeat" => outcome(home.apply(NAME, ReplaceSeat(seat(o)), &world, at)),
-            "Deliver" => outcome(home.apply(NAME, Deliver, &world, at)),
-            "Abandon" => outcome(home.apply(NAME, Abandon { by, reason: text(&o["reason"]).into(), authority }, &world, at)),
+            "Link" => {
+                let link = Link { subject: address(&o["subject"]), source: link_source_of(&o["source"]), by, authority };
+                outcome(home.apply(NAME, link, &world, at))
+            }
+            "Unlink" => outcome(home.apply(NAME, Unlink { subject: address(&o["subject"]), by, authority }, &world, at)),
+            "Deliver" => outcome(home.apply(NAME, Deliver { disposition: text(&o["disposition"]).into() }, &world, at)),
+            "Abandon" => {
+                let abandon = Abandon { by, cause: cause_of(&o["cause"]), reason: text(&o["reason"]).into(), authority };
+                outcome(home.apply(NAME, abandon, &world, at))
+            }
             "Readmit" => outcome(home.apply(NAME, Readmit { quota: quota_of(&o["quota"]), by, authority }, &world, at)),
             other => panic!("convoy event {other}"),
         }
@@ -396,12 +450,14 @@ impl Conformance for ConvoyConformance {
 
     fn encode(home: &Home<Convoy>) -> Value {
         let c = home.get(NAME).expect("exists");
-        let work = work(c.spec(), c.state());
-        match c.state() {
-            ConvoyState::Open { .. } => variant("Open", work),
-            ConvoyState::Delivered { .. } => variant("Delivered", work),
-            ConvoyState::Abandoned { reason, .. } => variant("Abandoned", json!({ "work": work, "reason": reason })),
-        }
+        let phase = match c.state() {
+            ConvoyState::Open { .. } => bare("Open"),
+            ConvoyState::Delivered { disposition, .. } => variant("Delivered", json!(disposition)),
+            ConvoyState::Abandoned { cause, reason, .. } => {
+                variant("Abandoned", json!({ "cause": bare(cause_name(*cause)), "reason": reason }))
+            }
+        };
+        json!({ "work": work(c.spec(), c.state()), "phase": phase })
     }
 
     fn version(home: &Home<Convoy>) -> u64 {

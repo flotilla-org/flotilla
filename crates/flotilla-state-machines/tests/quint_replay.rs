@@ -607,10 +607,11 @@ fn refuse_without_evidence(
 // class is its number as text; a duty's terms are its note.
 
 fn convoy_work(state: &Value) -> &Value {
-    match tag(state) {
-        "Abandoned" => &payload(state)["work"],
-        _ => payload(state),
-    }
+    &state["work"]
+}
+
+fn convoy_open(state: &Value) -> bool {
+    tag(&state["phase"]) == "Open"
 }
 
 fn class(n: u32) -> VesselClass {
@@ -696,6 +697,7 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
     let mut seats: Vec<convoy::Seat> = text_keyed(&work["seats"])
         .into_iter()
         .map(|(name, record)| convoy::Seat {
+            failed: None,
             retired: false,
             replacements: small(&record["replacements"]),
             role: name.into(),
@@ -725,9 +727,10 @@ fn progress_name(progress: convoy::Progress) -> &'static str {
     }
 }
 
-/// The spec's `Open(Work) | Delivered(Work) | Abandoned({ work, reason })`,
-/// where `Work = { spec, promises, seats, retired, quota }`: the spec's fixed
-/// fields and records, and the state's retired duties and quota in force.
+/// The spec's `{ work, phase }`, where `Work = { spec, promises, seats,
+/// retired, quota, retiredSeats, subjects }`: the spec's fixed fields and
+/// records, the subjects linked now, and the state's retired duties and quota
+/// in force.
 fn convoy_value(resource: &Resource<Convoy>) -> Value {
     let spec = resource.spec();
     let state = resource.state();
@@ -754,7 +757,14 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
             None => constant("Root"),
             Some(parent) => variant("Under", seat_text(parent)),
         };
-        (seat_text(&row.record.name()), json!({ "parent": parent, "supervisedBy": row.record.supervised_by.name(), "replacements": int(row.record.replacements.into()) }))
+        let record = &row.record;
+        let seat = json!({
+            "parent": parent,
+            "supervisedBy": record.supervised_by.name(),
+            "replacements": int(record.replacements.into()),
+            "failed": record.failed.as_deref().unwrap_or_default(),
+        });
+        (seat_text(&record.name()), seat)
     }));
     let duties = spec.duties.iter().map(|(id, duty)| {
         let scope = match &duty.scope {
@@ -771,15 +781,22 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
         "promises": map_of(promises),
         "seats": seats,
         "retiredSeats": set_of(spec.seats.iter().filter(|r| r.record.retired).map(|r| json!(r.record.role))),
-        "promiseFloor": int(spec.promise_floor.try_into().expect("model floor")),
+        "subjects": set_of(spec.linked().into_iter().map(|subject| json!(subject.name()))),
         "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
         "quota": quota_value(state.quota()),
     });
-    match state {
-        ConvoyState::Open { .. } => variant("Open", work),
-        ConvoyState::Delivered { .. } => variant("Delivered", work),
-        ConvoyState::Abandoned { reason, .. } => variant("Abandoned", json!({ "work": work, "reason": reason })),
-    }
+    let phase = match state {
+        ConvoyState::Open { .. } => constant("Open"),
+        ConvoyState::Delivered { disposition, .. } => variant("Delivered", json!(disposition)),
+        ConvoyState::Abandoned { cause, reason, .. } => {
+            let cause = match cause {
+                convoy::AbandonCause::Failed => "WorkFailed",
+                convoy::AbandonCause::Operator => "OperatorDecision",
+            };
+            variant("Abandoned", json!({ "cause": constant(cause), "reason": reason }))
+        }
+    };
+    json!({ "work": work, "phase": phase })
 }
 
 fn check_convoys(home: &Home<Convoy>, state: &Value, step: &Step) {
@@ -802,6 +819,16 @@ fn reference() -> flotilla_address::Address {
 
 fn by() -> SeatName {
     SeatName::new(OWNER, "")
+}
+
+/// The scenario delivers with the disposition `"merged"`.
+fn delivered() -> convoy::Deliver {
+    convoy::Deliver { disposition: "merged".into() }
+}
+
+/// The scenario abandons by an operator's decision.
+fn abandon(reason: &str) -> convoy::Abandon {
+    convoy::Abandon { by: by(), cause: convoy::AbandonCause::Operator, reason: reason.into(), authority: owner() }
 }
 
 fn admit(home: &mut Home<Convoy>, step: &Step, id: i64, tally: &mut Tally) {
@@ -832,12 +859,12 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
             authority: convoy::Authority::Operator,
             reason: "decision".into(),
         };
-        if tag(model) != "Open" {
+        if !convoy_open(model) {
             let probes = vec![
                 verdict(PromiseId(0)).into(),
                 retract(PromiseId(0)).into(),
-                convoy::Deliver.into(),
-                convoy::Abandon { by: by(), reason: "decision".into(), authority: owner() }.into(),
+                delivered().into(),
+                abandon("decision").into(),
                 convoy::Readmit { quota: current, by: by(), authority: owner() }.into(),
             ];
             assert_end_refuses(home, &name, probes, &world, now, step, tally);
@@ -847,8 +874,8 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
         // readmitted, and an empty reason abandons nothing.
         let refused = convoy_world(false, true);
         let decisions: [(ConvoyEdge, &MemoryConvoyWorld); 3] = [
-            (convoy::Abandon { by: by(), reason: "decision".into(), authority: owner() }.into(), &refused),
-            (convoy::Abandon { by: by(), reason: String::new(), authority: owner() }.into(), &world),
+            (abandon("decision").into(), &refused),
+            (abandon("").into(), &world),
             (convoy::Readmit { quota: current, by: by(), authority: owner() }.into(), &refused),
         ];
         for (edge, decision_world) in decisions {
@@ -857,7 +884,7 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
         }
         let promises = pairs(&work["promises"]);
         let open = |pair: &&Value| matches!(tag(&pair[1]["state"]), "Pending" | "Submitted");
-        if would_accept(home, &name, convoy::Deliver, &world, now, tally) {
+        if would_accept(home, &name, delivered(), &world, now, tally) {
             assert!(!promises.iter().any(|pair| open(&pair)), "{step}: convoy {id} delivers with a promise open");
         }
         for pair in promises.iter().filter(|pair| !open(pair)) {
@@ -972,13 +999,9 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
                 &step,
                 tally,
             ),
-            "rollover" => accept(&mut home, &name, convoy::Rollover { by: by(), authority: owner() }, &world, now, &step, tally),
             "replaceSeat" => accept(&mut home, &name, convoy::ReplaceSeat(SeatName::new("a", "")), &world, now, &step, tally),
-            "deliver" => accept(&mut home, &name, convoy::Deliver, &world, now, &step, tally),
-            "abandon" => {
-                let edge = convoy::Abandon { by: by(), reason: reason(), authority: owner() };
-                accept(&mut home, &name, edge, &world, now, &step, tally);
-            }
+            "deliver" => accept(&mut home, &name, delivered(), &world, now, &step, tally),
+            "abandon" => accept(&mut home, &name, abandon(&reason()), &world, now, &step, tally),
             // The scenario readmits with a fixed quota, `Map(0 -> 2, 1 -> 1)`.
             "readmit" => {
                 let quota = BTreeMap::from([(class(0), 2), (class(1), 1)]);

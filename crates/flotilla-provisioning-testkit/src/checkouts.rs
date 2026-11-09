@@ -23,8 +23,8 @@ use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
     machines::{
         convoy::{
-            Abandon, Convoy, ConvoyRequest, Deliver, Duty, DutyId, DutyScope, MemoryConvoyWorld, Priority, PromiseKinds, Readmit,
-            RetireDuty, Rollover, Seat, SeatName, Terms, VesselClass,
+            Abandon, AbandonCause, Convoy, ConvoyRequest, Deliver, Duty, DutyId, DutyScope, MemoryConvoyWorld, Priority, PromiseKinds,
+            Readmit, RetireDuty, Seat, SeatName, Terms, VesselClass,
         },
         lifecycle::{LifecycleState, VanishCause},
     },
@@ -132,6 +132,7 @@ impl CheckoutFixture {
             seat: String::new(),
             parent: None,
             supervised_by: Address::project(PROJECT).expect("project"),
+            failed: None,
             retired: false,
             replacements: 0,
         };
@@ -153,12 +154,6 @@ impl CheckoutFixture {
         if self.convoys.lock().expect("convoys").get(name).is_none() {
             self.open_convoy(name);
         }
-    }
-
-    /// Rolls engine Convoy `name` over to its next generation: its lead's duty is standing.
-    pub fn rollover_convoy(&self, name: &str) {
-        let rollover = Rollover { by: lead(), authority: Ref::new(AUTHORITY) };
-        self.convoys.lock().expect("convoys").apply(name, rollover, &convoy_world(), Self::now()).expect("convoy rolled over");
     }
 
     /// Readmits engine Convoy `name` with one more standard vessel: a write that ends nothing.
@@ -183,12 +178,12 @@ impl CheckoutFixture {
         let mut convoys = self.convoys.lock().expect("convoys");
         let retire = RetireDuty { duty: DUTY, by: lead(), authority: Ref::new(AUTHORITY) };
         convoys.apply(name, retire, &convoy_world(), Self::now()).expect("duty retired");
-        convoys.apply(name, Deliver, &convoy_world(), Self::now()).expect("convoy delivered");
+        convoys.apply(name, Deliver { disposition: "merged".into() }, &convoy_world(), Self::now()).expect("convoy delivered");
     }
 
     /// Ends engine Convoy `name` as abandoned by the operator, for `reason`.
     pub fn abandon_convoy(&self, name: &str, reason: &str) {
-        let abandon = Abandon { by: lead(), reason: reason.into(), authority: Ref::new(AUTHORITY) };
+        let abandon = Abandon { by: lead(), cause: AbandonCause::Operator, reason: reason.into(), authority: Ref::new(AUTHORITY) };
         self.convoys.lock().expect("convoys").apply(name, abandon, &convoy_world(), Self::now()).expect("convoy abandoned");
     }
 

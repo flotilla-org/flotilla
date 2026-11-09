@@ -85,6 +85,7 @@ fn convoy_request() -> ConvoyRequest {
         promises: [(PromiseId(0), promise())].into(),
         duties: [(DutyId(0), Duty { owner: SeatName::new("coder", ""), scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
         seats: vec![Seat {
+            failed: None,
             retired: false,
             replacements: 0,
             role: "coder".into(),
@@ -313,7 +314,7 @@ fn a_resources_edge_moves_since_only_with_the_label() {
     let parts = edge.into_parts();
     assert_eq!(
         (root_sets(&parts), parts.rows.len(), parts.from.code),
-        (vec!["state", "reason"], 1, Code::new("op")),
+        (vec!["state", "disposition", "cause", "reason"], 1, Code::new("op")),
         "the whole state, one retired row"
     );
     assert_eq!(parts.sets[0].values[1], flotilla_schema::Value::Int(1), "the stored since");
@@ -325,12 +326,16 @@ fn a_resources_edge_moves_since_only_with_the_label() {
     );
     assert_eq!(parts.event.arguments::<ConvoyEdge>().expect("arguments"), event.arguments.edge);
 
-    let event = home.apply("c", Deliver, &world, Timestamp(8)).expect("delivered");
+    let event = home.apply("c", Deliver { disposition: "merged".into() }, &world, Timestamp(8)).expect("delivered");
     let resource = home.get("c").expect("exists");
     let edge = resource.stored_edge(&kept, &event).expect("edge");
     assert_eq!(resource.stored_state(), &State::new(resource.state().clone(), Timestamp(8)), "a label change moves since");
     let parts = edge.into_parts();
-    assert_eq!((root_sets(&parts), parts.rows.len()), (vec!["state", "reason"], 0), "the whole state, no row changed");
+    assert_eq!(
+        (root_sets(&parts), parts.rows.len()),
+        (vec!["state", "disposition", "cause", "reason"], 0),
+        "the whole state, no row changed"
+    );
 }
 
 // `live_leases` and the `live_by_host` index agree on which vessels are live:
@@ -364,7 +369,7 @@ fn convoy_and_awaiting_reply_round_trip() {
     use flotilla_schema::Records;
     use flotilla_state_machines::machines::{
         awaiting_reply::{Awaited, AwaitingReply, AwaitingReplySpec, AwaitingReplyState},
-        convoy::{ConvoySpec, ConvoyState, Progress, Promise, PromiseKind, Submission},
+        convoy::{AbandonCause, ConvoySpec, ConvoyState, LinkSource, Progress, Promise, PromiseKind, SubjectLink, Submission},
     };
 
     let seat = |role: &str, seat: &str| SeatName { role: role.into(), seat: seat.into() };
@@ -390,13 +395,22 @@ fn convoy_and_awaiting_reply_round_trip() {
     seats
         .append(
             1,
-            Seat { retired: false, replacements: 0, role: "lead".into(), seat: String::new(), parent: None, supervised_by: project() },
+            Seat {
+                failed: None,
+                retired: false,
+                replacements: 0,
+                role: "lead".into(),
+                seat: String::new(),
+                parent: None,
+                supervised_by: project(),
+            },
         )
         .expect("room");
     seats
         .append(
             1,
             Seat {
+                failed: Some("crashed".into()),
                 retired: false,
                 replacements: 0,
                 role: "coder".into(),
@@ -419,11 +433,14 @@ fn convoy_and_awaiting_reply_round_trip() {
     ]
     .into();
     let kinds = PromiseKinds { kinds: [("pr".to_owned(), PromiseKind::default())].into() };
+    let mut subjects = Records::new();
+    subjects.append(1, SubjectLink { subject: project(), source: LinkSource::Claim, unlinked: true }).expect("room");
+    subjects.append(2, SubjectLink { subject: project(), source: LinkSource::Relay, unlinked: false }).expect("room");
     let spec = ConvoySpec {
-        promise_floor: 0,
         project: project(),
         priority: Priority(3),
         kinds: Frozen::new(kinds).expect("frozen"),
+        subjects,
         duties,
         seats,
         promises,
@@ -432,6 +449,7 @@ fn convoy_and_awaiting_reply_round_trip() {
         ConvoyState::Abandoned {
             quota: [(VesselClass::new("standard"), 2)].into(),
             retired: BTreeSet::from([DutyId(0)]),
+            cause: AbandonCause::Operator,
             reason: "decision".into(),
         },
         Timestamp(5),

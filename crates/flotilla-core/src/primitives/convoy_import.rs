@@ -255,6 +255,7 @@ pub fn import_convoy(
             .append(
                 1,
                 Seat {
+                    failed: None,
                     retired: false,
                     replacements: 0,
                     role: seat.role.clone(),
@@ -267,7 +268,7 @@ pub fn import_convoy(
     }
     let used: BTreeSet<&str> = promises.iter().map(|row| row.record.kind.as_str()).collect();
     let kinds = Catalog::resolve(&stock(), &[]).and_then(|catalog| catalog.freeze(used)).map_err(|error| refuse(error.to_string()))?;
-    let spec = ConvoySpec { promise_floor: 0, project, priority: Priority(0), kinds, duties, seats, promises };
+    let spec = ConvoySpec { project, priority: Priority(0), kinds, subjects: Records::new(), duties, seats, promises };
     let state = StoredState::<Convoy>::new(ConvoyState::Open { quota: BTreeMap::new(), retired: BTreeSet::new() }, since);
     let resource = Resource::stored(map::engine_name(convoy).map_err(refuse)?, spec, state, Version(1));
     check(&resource).map_err(refuse)?;
@@ -654,24 +655,7 @@ pub fn import_all<'a>(
             Ok(ImportOutcome::Imported(mut imported)) => {
                 // Old generations remain in the old archive. Only their identities go
                 // into the creation's history, never into the live convoy's seats.
-                // declarations includes every status promise, including retracted and
-                // ended ones: each consumed an id even though its work is finished.
-                let floor: u64 = generations.iter().filter_map(|c| c.status.as_ref().map(|s| map::declarations(c, s).len() as u64)).sum();
-                let mut spec = imported.resource.spec().clone();
-                spec.promises = match offset_promises(&spec.promises, floor) {
-                    Ok(promises) => promises,
-                    Err(reason) => {
-                        report.refused.push(ConvoyImportRefusal::Unmappable { convoy: current.metadata.name.clone(), reason });
-                        continue;
-                    }
-                };
-                spec.promise_floor = floor;
-                imported.resource = Resource::stored(
-                    imported.resource.name().to_owned(),
-                    spec,
-                    imported.resource.stored_state().clone(),
-                    imported.resource.version(),
-                );
+                // Each generation is its own convoy, so its promise ids are its own.
                 imported.history.previous_generations = generations.iter().map(|c| c.metadata.name.clone()).collect();
                 report.folded_generations += generations.len();
                 report.imported.push(*imported);
@@ -681,18 +665,4 @@ pub fn import_all<'a>(
         }
     }
     report
-}
-
-/// Reserve the ids consumed by earlier generations without changing live promise order.
-fn offset_promises(source: &Records<Promise>, floor: u64) -> Result<Records<Promise>, String> {
-    let mut promises = Records::new();
-    for row in source.iter() {
-        let mut promise = row.record.clone();
-        promise.id = PromiseId(
-            u32::try_from(u64::from(promise.id.0).checked_add(floor).ok_or("folded generations exhaust promise ids")?)
-                .map_err(|_| "folded generations exhaust promise ids")?,
-        );
-        promises.append(1, promise).map_err(|_| "folded generations exhaust promise rows")?;
-    }
-    Ok(promises)
 }

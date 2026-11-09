@@ -35,6 +35,7 @@ fn request() -> ConvoyRequest {
         .into(),
         duties: Default::default(),
         seats: vec![Seat {
+            failed: None,
             retired: false,
             replacements: 0,
             role: "coder".into(),
@@ -138,7 +139,7 @@ fn a_taken_label_is_refused_after_a_restart_and_changes_nothing() {
 fn ended_standing_generations_are_replaced_atomically(tc: hegel::TestCase) {
     use flotilla_schema::{Cause, Kind};
     use flotilla_state_machines::{
-        machines::convoy::{Abandon, Authority, Convoy, ConvoyLabel, Deliver, Keep},
+        machines::convoy::{Abandon, AbandonCause, Authority, Convoy, ConvoyLabel, Deliver, Keep},
         Resource,
     };
     // Sequences cover both terminal labels, duplicate admission and optional
@@ -164,13 +165,18 @@ fn ended_standing_generations_are_replaced_atomically(tc: hegel::TestCase) {
                     Timestamp(3),
                 )
                 .expect("keep");
-            convoys.apply("standing", Deliver, Timestamp(4)).expect("deliver");
+            convoys.apply("standing", Deliver { disposition: "merged".into() }, Timestamp(4)).expect("deliver");
         } else {
             convoys.world(|world| world.authority.put(&Ref::new("operator"), true));
             convoys
                 .apply(
                     "standing",
-                    Abandon { by: SeatName::new("operator", ""), reason: "replace generation".into(), authority: Ref::new("operator") },
+                    Abandon {
+                        by: SeatName::new("operator", ""),
+                        cause: AbandonCause::Operator,
+                        reason: "replace generation".into(),
+                        authority: Ref::new("operator"),
+                    },
                     Timestamp(4),
                 )
                 .expect("abandon");
@@ -217,7 +223,7 @@ fn ended_standing_generations_are_replaced_atomically(tc: hegel::TestCase) {
 fn a_missing_resident_generation_returns_an_error() {
     use flotilla_schema::{Kind, NewChange};
     use flotilla_state_machines::{
-        machines::convoy::{Abandon, Convoy},
+        machines::convoy::{Abandon, AbandonCause, Convoy},
         Resource, WriteError,
     };
     for expunge in [false, true] {
@@ -232,7 +238,12 @@ fn a_missing_resident_generation_returns_an_error() {
         convoys
             .apply(
                 "standing",
-                Abandon { by: SeatName::new("operator", ""), reason: "ended".into(), authority: Ref::new("operator") },
+                Abandon {
+                    by: SeatName::new("operator", ""),
+                    cause: AbandonCause::Operator,
+                    reason: "ended".into(),
+                    authority: Ref::new("operator"),
+                },
                 Timestamp(2),
             )
             .expect("end");

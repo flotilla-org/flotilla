@@ -251,7 +251,7 @@ fn an_open_stall_becomes_the_seats_stall_record() {
     assert!(folded.refused.is_empty(), "{:?}", folded.refused);
     assert!(folded.rehearsal.is_empty(), "{:?}", folded.rehearsal);
     let folded = &folded.imported[0];
-    assert_eq!(folded.resource.spec().promises.iter().next().unwrap().record.id.0, 1);
+    assert_eq!(folded.resource.spec().promises.iter().next().unwrap().record.id.0, 0);
     let carried = &folded.stall.as_ref().unwrap().spec;
     assert_eq!(carried.message, record.message);
     assert_eq!(carried.subject.as_ref().unwrap().as_str(), "project:fleet/convoy:coder/role:coder");
@@ -397,8 +397,8 @@ fn standing_generations_fold_into_one_stable_convoy() {
     assert_eq!(imported.resource.name(), "project:fleet/convoy:governor");
     assert_eq!(imported.history.previous_generations, vec!["governor-1"]);
     assert_eq!(imported.resource.spec().seats.len(), 1);
-    assert_eq!(imported.resource.spec().promise_floor, 1);
-    assert_eq!(imported.resource.spec().promises.iter().next().unwrap().record.id.0, 1);
+    // Each generation is its own convoy: the live one's promise ids are its own.
+    assert_eq!(imported.resource.spec().promises.iter().next().unwrap().record.id.0, 0);
     live.spec.generation = 1;
     let duplicate = rehearse_all([&live, &old], HOME, &[], &World { standing_ruled: true });
     assert!(duplicate.imported.is_empty());
@@ -406,7 +406,7 @@ fn standing_generations_fold_into_one_stable_convoy() {
 }
 
 #[test]
-fn standing_fold_counts_retracted_ids_and_refuses_an_earlier_live_generation() {
+fn standing_fold_refuses_an_earlier_live_generation() {
     let mut old = convoy("governor-1", ConvoyPhase::Active, vec![agent("governor", true)]);
     let mut live = convoy("governor-2", ConvoyPhase::Active, vec![agent("governor", true)]);
     for (generation, record) in [(1, &mut old), (2, &mut live)] {
@@ -414,14 +414,10 @@ fn standing_fold_counts_retracted_ids_and_refuses_an_earlier_live_generation() {
         record.spec.generation = generation;
         record.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "ensure-governor".into());
     }
-    operate(&mut old, "governor", PromiseOperation::Declare { id: "extra".into(), kind: PromiseKind::Pr, source: PromiseSource::Crew });
-    operate(&mut old, "governor", PromiseOperation::Retract { id: "extra".into(), reason: "ended work".into() });
-    assert_eq!(promises::owned(old.status.as_ref().unwrap(), "work", "governor").last().unwrap().state, promises::PromiseState::Retracted);
     old.status.as_mut().unwrap().phase = ConvoyPhase::Landed;
     let report = rehearse_all([&old, &live], HOME, &[], &World { standing_ruled: true });
     assert!(report.refused.is_empty(), "{:?}", report.refused);
-    assert_eq!(report.imported[0].resource.spec().promise_floor, 2);
-    assert_eq!(report.imported[0].resource.spec().promises.iter().next().unwrap().record.id.0, 2);
+    assert_eq!(report.imported.len(), 1);
     old.status.as_mut().unwrap().phase = ConvoyPhase::Active;
     live.status.as_mut().unwrap().phase = ConvoyPhase::Landed;
     let report = rehearse_all([&old, &live], HOME, &[], &World { standing_ruled: true });

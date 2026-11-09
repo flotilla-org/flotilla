@@ -166,6 +166,7 @@ fn calibrate() {
                     .into(),
                     duties: [(DutyId(0), Duty { owner, scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
                     seats: vec![Seat {
+                        failed: None,
                         retired: false,
                         replacements: 0,
                         role: "coder".into(),
