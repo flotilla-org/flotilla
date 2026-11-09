@@ -179,7 +179,7 @@ impl VesselReconciler {
     /// Session `name`'s newest launch at this home, the vessel's.
     fn terminal_session(&self, name: &str) -> Result<ResourceObject<TerminalSession>, ResourceError> {
         let record = self.terminals()?.get(name, None).map_err(ResourceError::other)?.ok_or_else(|| ResourceError::not_found(name))?;
-        Ok(record.read_view(&self.namespace, None, None))
+        Ok(record.read_view(&self.namespace, None, None, None))
     }
 
     /// The environment `name`, at whichever home holds it: environment names are fleet-unique.

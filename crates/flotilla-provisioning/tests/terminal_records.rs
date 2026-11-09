@@ -144,3 +144,42 @@ async fn old_store_reads_see_each_sessions_newest_launch() {
     assert_eq!(listed.iter().map(|session| session.metadata.name.as_str()).collect::<Vec<_>>(), [request.session.as_str()]);
     assert!(sessions.delete(&request.session).await.is_err(), "a session ends with its holder; it is not deleted");
 }
+
+// Behaviour (#3108): a session's view says when its environment cannot serve it, from the
+// Environment's own record: not ready while the launch waits on it, or ended under a running
+// launch (explained as the provider being unavailable; terminal_health's tests).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sessions_view_explains_an_environment_that_cannot_serve_it() {
+    use std::sync::Arc;
+
+    use flotilla_provisioning_testkit::EnvironmentFixture;
+    use flotilla_resources::{environment_records::LaunchFacts, EnvironmentSpec, HostDirectEnvironmentSpec, TerminalSession};
+    use flotilla_store::{ResourceBackend, TerminalViews};
+
+    let environments = EnvironmentFixture::at("home");
+    let terminals = TerminalsFixture::over("home", Arc::clone(&environments.store));
+    let environments = environments.serving_terminals(terminals.terminals.clone() as Arc<dyn TerminalRecords>);
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    backend.install_engine_records(Arc::new(TerminalViews::new(backend.clone(), "flotilla", environments.reads.clone())));
+    let status = || async {
+        let session = backend.using::<TerminalSession>("flotilla").get("terminal-work-coder").await.expect("session view");
+        session.status.expect("status")
+    };
+
+    let spec = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "home".into(), repo_default_dir: "/work".into() }),
+        ..EnvironmentSpec::default()
+    };
+    environments.request("env", &spec, None);
+    let launch = terminals.request(&TerminalsFixture::agent("work", "coder", "env"));
+    // Waiting on an environment still being realised.
+    assert_eq!(status().await.environment_unavailable.as_deref(), Some("environment env: being realised"));
+
+    environments.ready("env", "backing", LaunchFacts::default());
+    assert_eq!(status().await.environment_unavailable, None, "a ready environment serves a waiting launch");
+    terminals.ready(&launch, "crew-session", &facts());
+    assert_eq!(status().await.environment_unavailable, None, "a ready environment serves a running launch");
+
+    environments.lose("env", "cgroup_oom");
+    assert_eq!(status().await.environment_unavailable.as_deref(), Some("environment env: cgroup_oom"));
+}

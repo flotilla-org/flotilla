@@ -284,6 +284,11 @@ pub struct TerminalSessionStatus {
     /// roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_unreachable: Option<String>,
+    /// Why the environment this launch runs in, or waits on, cannot serve it: it ended (lost,
+    /// failed, given up or released), or it is not ready while the launch waits on it. Read from
+    /// the Environment's own record when the view is composed (#3108).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_unavailable: Option<String>,
 }
 
 impl TerminalSessionStatus {

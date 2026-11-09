@@ -335,7 +335,7 @@ async fn crew_restart_starts_the_next_launch_once() {
     let first = terminals.request(&request);
     terminals.ready(&first, "first-runtime", &Default::default());
     terminals.exited(&first, "agent exited with code 0");
-    let stopped = terminals.record(&first).read_view("flotilla", None, None);
+    let stopped = terminals.record(&first).read_view("flotilla", None, None, None);
     crew.restart_terminal(&stopped).expect("request next");
     let next = terminals.record(&request.session).name;
     assert_ne!(next, first);

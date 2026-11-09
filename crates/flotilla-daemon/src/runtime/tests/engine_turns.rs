@@ -132,7 +132,7 @@ impl EngineCrew {
         let reads = self.daemon.lifecycle_reads();
         let terminals = reads.terminals().expect("terminal sessions");
         let record = terminals.get(&self.launch, None).expect("read the launch").expect("the launch");
-        record.read_view(NAMESPACE, None, terminals.observations().get(&self.launch).as_ref()).status.expect("status")
+        record.read_view(NAMESPACE, None, terminals.observations().get(&self.launch).as_ref(), None).status.expect("status")
     }
 
     fn at(time: chrono::DateTime<Utc>) -> Timestamp {

@@ -25,6 +25,13 @@ pub fn condition(status: &TerminalSessionStatus) -> Option<ExplainedTerminalCond
                     since.to_rfc3339()
                 ),
             })
+            // The environment it runs in, or waits on, cannot serve it.
+            .or_else(|| {
+                status
+                    .environment_unavailable
+                    .as_ref()
+                    .map(|message| ExplainedTerminalCondition::ProviderUnavailable { message: message.clone() })
+            })
             // #3618: a crew that cannot reach its daemon loses hooks and settlement.
             .or_else(|| {
                 status
@@ -70,7 +77,7 @@ mod tests {
         let launch = terminals.request(&TerminalsFixture::agent("crew-vessel", "coder", "env"));
         terminals.ready(&launch, "crew-session", &Default::default());
         terminals.exited(&launch, "agent exited with code 3; resume relaunches it in the existing checkout");
-        let view = terminals.record(&launch).read_view("flotilla", None, None);
+        let view = terminals.record(&launch).read_view("flotilla", None, None, None);
         let status = view.status.expect("status");
         assert_eq!(status.phase, TerminalSessionPhase::Stopped);
         assert_eq!(status.inner_command_status, Some(InnerCommandStatus::Exited));
@@ -86,9 +93,32 @@ mod tests {
         let other = terminals.request(&TerminalsFixture::agent("other-vessel", "coder", "env"));
         terminals.ready(&other, "other-session", &Default::default());
         terminals.lost(&other, "cleat daemon gone");
-        let lost = terminals.record(&other).read_view("flotilla", None, None).status.expect("status");
+        let lost = terminals.record(&other).read_view("flotilla", None, None, None).status.expect("status");
         assert_eq!(lost.inner_command_status, None);
         assert!(matches!(condition(&lost), Some(ExplainedTerminalCondition::SessionLost { .. })));
+    }
+
+    // An environment that cannot serve the launch explains as the provider being unavailable,
+    // after a held turn and before an unreachable daemon.
+    #[test]
+    fn an_unavailable_environment_explains_as_provider_unavailable() {
+        let mut status = TerminalSessionStatus {
+            environment_unavailable: Some("environment env: cgroup_oom".into()),
+            daemon_unreachable: Some("daemon forward down".into()),
+            ..running()
+        };
+        assert_eq!(
+            condition(&status),
+            Some(ExplainedTerminalCondition::ProviderUnavailable { message: "environment env: cgroup_oom".into() })
+        );
+        status.delivery_unconfirmed_since = Some(Utc::now());
+        assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::DeliveryUnconfirmed { .. })));
+        let starting = TerminalSessionStatus {
+            phase: TerminalSessionPhase::Starting,
+            environment_unavailable: Some("environment env: being realised".into()),
+            ..Default::default()
+        };
+        assert!(matches!(condition(&starting), Some(ExplainedTerminalCondition::ProviderUnavailable { .. })));
     }
 
     // Confirmed loss and a held turn are each explained distinctly; a running session with no

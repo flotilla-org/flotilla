@@ -9,7 +9,7 @@
 //! typed reads, lists and watches of the kind; its writes are refused.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -19,6 +19,7 @@ use futures::{stream::BoxStream, StreamExt};
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
     engine_records::{EngineObject, EngineRecords},
+    environment_records::EnvironmentRecord,
     lifecycle_reads::LifecycleReads,
     terminal_records::{newest_launches, TerminalHolderView, TerminalRecord, TerminalRecords},
     ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
@@ -85,6 +86,7 @@ impl TerminalViews {
             return Ok(Vec::new());
         }
         let holders = self.holders(&records).await?;
+        let environments = self.environments(&records).await;
         let terminals = self.reads.terminals().map_err(ResourceError::other)?;
         let here = terminals.home().to_owned();
         Ok(records
@@ -93,7 +95,8 @@ impl TerminalViews {
                 let holder = record.vessel.as_ref().and_then(|vessel| holders.get(vessel));
                 let local = record.home == here;
                 let observation = local.then(|| terminals.observations().get(&record.name)).flatten();
-                let object = record.read_view(&self.namespace, holder, observation.as_ref());
+                let environment = environments.get(&(record.environment.clone(), record.environment_home.clone()));
+                let object = record.read_view(&self.namespace, holder, observation.as_ref(), environment);
                 let provenance = if local {
                     ResourceProvenance::Local
                 } else {
@@ -102,6 +105,33 @@ impl TerminalViews {
                 ReadResourceObject { object, provenance }
             })
             .collect())
+    }
+
+    /// The environments `records` run in, by name and home, as their records read here. One that
+    /// cannot be read is left out: its health is unknown, not bad.
+    async fn environments(&self, records: &[TerminalRecord]) -> BTreeMap<(String, String), EnvironmentRecord> {
+        let wanted: BTreeSet<(String, String)> =
+            records.iter().map(|record| (record.environment.clone(), record.environment_home.clone())).collect();
+        let read = self
+            .blocking(move |reads| {
+                let environments = reads.environments()?;
+                let mut held = BTreeMap::new();
+                for (name, home) in wanted {
+                    match environments.get(&name, Some(&home)) {
+                        Ok(Some(record)) => {
+                            held.insert((name, home), record);
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::debug!(%name, %home, %error, "a terminal's environment could not be read"),
+                    }
+                }
+                Ok(held)
+            })
+            .await;
+        read.unwrap_or_else(|error| {
+            tracing::debug!(%error, "terminals' environments could not be read");
+            BTreeMap::new()
+        })
     }
 
     /// The holder Vessels `records` name, local or replicated.

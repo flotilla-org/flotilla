@@ -112,6 +112,18 @@ impl TerminalRecord {
         matches!(self.reading, LifecycleReading::Ready { .. })
     }
 
+    /// Why `environment`, the one this launch runs in, cannot serve it, if it cannot: it ended, or
+    /// it is not ready while the launch waits on it. A launch that has itself ended has nothing to
+    /// be served, and an environment with no record here says nothing.
+    pub fn environment_unavailable(&self, environment: Option<&crate::environment_records::EnvironmentRecord>) -> Option<String> {
+        let environment = environment?;
+        let waiting =
+            matches!(self.reading, LifecycleReading::InProgress | LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. });
+        let unavailable = (self.is_running() && environment.ended()) || (waiting && !environment.is_ready());
+        unavailable
+            .then(|| format!("environment {}: {}", environment.name, environment.reading.reason().unwrap_or_else(|| "unavailable".into())))
+    }
+
     pub fn is_agent(&self) -> bool {
         matches!(self.source, TerminalLaunchSource::Agent { .. })
     }
@@ -181,12 +193,14 @@ impl TerminalRecord {
     /// This launch in the old TerminalSession shape, for readers not yet converted to records: a
     /// read view only, never written. It is named as its session, its resource version is the
     /// launch, and its holder's convoy and labels come from `holder`; what its home observes of
-    /// it, from `observation`, which only its home has.
+    /// it, from `observation`, which only its home has; its environment's health, from
+    /// `environment`, that environment's record.
     pub fn read_view(
         &self,
         namespace: &str,
         holder: Option<&TerminalHolderView>,
         observation: Option<&TerminalObservation>,
+        environment: Option<&crate::environment_records::EnvironmentRecord>,
     ) -> crate::ResourceObject<crate::TerminalSession> {
         use crate::{
             CrewSessionStatus, ObjectMeta, OwnerReference, Resource, TerminalCrewContext, TerminalSessionPhase, TerminalSessionSource,
@@ -280,6 +294,7 @@ impl TerminalRecord {
                 occupancy: observation.occupancy,
                 daemon_unreachable: observation.daemon_unreachable,
                 delivery_unconfirmed_since: observation.delivery_unconfirmed_since,
+                environment_unavailable: self.environment_unavailable(environment),
             }),
         }
     }
