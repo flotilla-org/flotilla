@@ -167,11 +167,13 @@ impl flotilla_core::primitives::ports::HomeReads for DecidedHomeReads {
 /// The homes a round's keepalive says its server holds.
 type Homes = Vec<String>;
 
-/// The homes whose change streams this host holds back. A held home's rounds are fetched but not
-/// installed, and its follower waits for the release before asking again. Routing scenarios use it
-/// to prove a decision does not depend on what a home writes after the hold reaching this host.
-/// A home's log replicates whole, since a follower's store keeps every home's prefix, so a hold
-/// cuts the home's stream at a point; it cannot hold back some kinds and pass others.
+/// The homes whose change streams this host has paused, for routing scenarios that prove a
+/// decision does not depend on what a home writes after the pause reaching this host. A held
+/// home's rounds are fetched but not installed, and its follower waits for the release before
+/// asking again. A home's log replicates whole, since a follower's store keeps every home's
+/// prefix, so a hold pauses the home's whole stream at a point rather than some of its kinds.
+///
+/// Production daemons never hold a home: the set stays empty, and each round costs one read of it.
 #[derive(Clone)]
 pub struct StreamHolds(Arc<tokio::sync::watch::Sender<BTreeSet<String>>>);
 
