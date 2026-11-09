@@ -1316,6 +1316,8 @@ mod tests {
         let server = DaemonServer::new(vec![], config, fake_discovery(false), socket.clone(), Duration::from_secs(30))
             .await
             .expect("build in-process daemon server");
+        // The ops inventory reads the engine's checkouts, as a composed daemon's does.
+        flotilla_daemon_testkit::engine::engine(&server.daemon());
         let backend = server.daemon().resource_backend().clone();
         backend
             .using::<Project>("flotilla")
