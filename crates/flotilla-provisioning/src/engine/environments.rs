@@ -342,8 +342,8 @@ impl flotilla_store::controller::SecondaryWatch for EnvironmentHolderWake {
 
     fn spawn(
         self: Box<Self>,
-        backend: flotilla_store::ResourceBackend,
-        namespace: String,
+        _backend: flotilla_store::ResourceBackend,
+        _namespace: String,
         sender: flotilla_store::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), flotilla_resources::ResourceError>> + Send>> {
         Box::pin(async move {
@@ -370,12 +370,9 @@ impl flotilla_store::controller::SecondaryWatch for EnvironmentHolderWake {
                     })
                     .await;
                 match woken {
-                    Ok((mut vessels, every_vessel)) => {
+                    Ok((vessels, every_vessel)) => {
                         if every_vessel {
-                            match backend.clone().using::<flotilla_resources::Vessel>(&namespace).list().await {
-                                Ok(list) => vessels.extend(list.items.into_iter().map(|vessel| vessel.metadata.name)),
-                                Err(error) => tracing::warn!(%error, "the environment holder wake could not list the vessels"),
-                            }
+                            sender.send_every();
                         }
                         for vessel in vessels {
                             if sender.send(vessel).await.is_err() {

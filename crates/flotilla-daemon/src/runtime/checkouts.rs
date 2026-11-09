@@ -220,24 +220,24 @@ impl HolderInputs for ConvoyHolderInputs {
 
 /// Rechecks this home's checkout launches as the observed-checkout refresh sees their paths change
 /// (#3108): a checkout observed at a launch's path, or no longer observed there, names that launch
-/// to the Checkout controller, which observes it again. Its wake is the observed store's watch.
+/// to the Checkout controller, which observes it again. Its wake is the observed store's watch;
+/// a watch opened again after a failure rechecks every launch, since changes in the gap are unseen.
 pub(super) async fn recheck_on_observed_refresh(state: Arc<super::state::ControllerRuntimeState>) {
     let namespace = state.namespace.clone();
     let observed = state.daemon.observed_resource_backend().using::<flotilla_resources::Checkout>(&namespace);
+    let mut reopened = false;
     loop {
-        let setup = async {
-            let listed = observed.list().await?;
-            let watch = observed.watch(flotilla_resources::WatchStart::resuming_from(&listed)).await?;
-            Ok::<_, ResourceError>(watch)
-        }
-        .await;
-        let mut watch = match setup {
+        let mut watch = match observed.watch(flotilla_resources::WatchStart::Now).await {
             Ok(watch) => watch,
             Err(error) => {
                 error!(%error, "checkout rechecks stopped: the observed checkouts cannot be watched");
                 return;
             }
         };
+        if reopened && !recheck_launches(&state, None).await {
+            return;
+        }
+        reopened = true;
         while let Some(event) = watch.next().await {
             let path = match event {
                 Ok(
@@ -252,29 +252,36 @@ pub(super) async fn recheck_on_observed_refresh(state: Arc<super::state::Control
                     break;
                 }
             };
-            let reads = state.daemon.lifecycle_reads();
-            let here = match tokio::task::spawn_blocking(move || reads.checkouts()?.here())
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|here| here)
-            {
-                Ok(here) => here,
-                Err(error) => {
-                    warn!(%error, "checkouts here could not be read for a recheck");
-                    continue;
-                }
-            };
-            let launches = flotilla_resources::checkout_records::latest_launches(here)
-                .into_values()
-                .filter(|checkout| checkout.is_ready() && path.as_deref().is_none_or(|path| checkout.ready_path() == Some(path)))
-                .map(|checkout| checkout.name);
-            for launch in launches {
-                if state.checkout_rechecks.send(launch).await.is_err() {
-                    return;
-                }
+            if !recheck_launches(&state, path.as_deref()).await {
+                return;
             }
         }
     }
+}
+
+/// Names this home's ready launches at `path` (every ready launch when `None`) to the Checkout
+/// controller; false once the controller has stopped.
+async fn recheck_launches(state: &super::state::ControllerRuntimeState, path: Option<&str>) -> bool {
+    let reads = state.daemon.lifecycle_reads();
+    let here =
+        match tokio::task::spawn_blocking(move || reads.checkouts()?.here()).await.map_err(|error| error.to_string()).and_then(|here| here)
+        {
+            Ok(here) => here,
+            Err(error) => {
+                warn!(%error, "checkouts here could not be read for a recheck");
+                return true;
+            }
+        };
+    let launches = flotilla_resources::checkout_records::latest_launches(here)
+        .into_values()
+        .filter(|checkout| checkout.is_ready() && path.is_none_or(|path| checkout.ready_path() == Some(path)))
+        .map(|checkout| checkout.name);
+    for launch in launches {
+        if state.checkout_rechecks.send(launch).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// What a gate's inspection request asks of this host: checkout `checkout` inspected afresh, its

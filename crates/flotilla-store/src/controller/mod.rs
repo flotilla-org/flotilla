@@ -186,6 +186,7 @@ pub trait SecondaryWatch: Send + Sync {
 pub struct WorkQueueSender {
     sender: mpsc::UnboundedSender<String>,
     progress: Arc<StdMutex<QueueProgress>>,
+    every: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Default)]
@@ -202,7 +203,7 @@ impl WorkQueueSender {
     /// simulate progress in the real controller loop.
     pub fn channel() -> (Self, mpsc::UnboundedReceiver<String>) {
         let (sender, receiver) = mpsc::unbounded_channel();
-        (Self { sender, progress: Arc::default() }, receiver)
+        (Self { sender, progress: Arc::default(), every: Arc::default() }, receiver)
     }
 
     /// Enqueue completes without suspension; the async signature keeps watch producers uniform.
@@ -219,6 +220,12 @@ impl WorkQueueSender {
             }
         }
         Ok(())
+    }
+
+    /// Asks the controller to queue every resource it holds, for a change that names none of them.
+    /// Requests made before the controller lists coalesce into one listing.
+    pub fn send_every(&self) {
+        self.every.notify_one();
     }
 
     fn start(&self, name: &str) -> Duration {
@@ -718,6 +725,7 @@ impl<R: Reconciler> ControllerLoop<R> {
     {
         let ControllerLoop { primary, secondaries, reconciler, resync_interval, backend } = self;
         let (sender, mut receiver) = WorkQueueSender::channel();
+        let every = Arc::clone(&sender.every);
         let (watch_exited_tx, mut watch_exited_rx) = mpsc::unbounded_channel();
         let primary_watch = Self::spawn_primary_watch(primary.clone(), sender.clone(), watch_exited_tx.clone(), None);
         let secondary_templates = secondaries;
@@ -1038,6 +1046,11 @@ impl<R: Reconciler> ControllerLoop<R> {
                     let live_names = Self::resync_all(&primary, &sender).await?;
                     metrics.resyncs.increment();
                     metrics.resync_enqueued.add(live_names.len() as u64);
+                    finalizer_failures.retain(|name, _| live_names.contains(name));
+                }
+                _ = every.notified() => {
+                    let _busy = metrics.busy();
+                    let live_names = Self::resync_all(&primary, &sender).await?;
                     finalizer_failures.retain(|name, _| live_names.contains(name));
                 }
                 Some(exited) = watch_exited_rx.recv() => {

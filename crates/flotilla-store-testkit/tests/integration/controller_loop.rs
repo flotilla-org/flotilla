@@ -491,6 +491,34 @@ impl flotilla_store::controller::SecondaryWatch for FloodingSecondaryWatch {
     }
 }
 
+/// Asks for every primary each time `fire` is notified, as a change that names none of them does.
+#[derive(Clone)]
+struct EverySecondaryWatch {
+    fire: Arc<Notify>,
+}
+
+impl flotilla_store::controller::SecondaryWatch for EverySecondaryWatch {
+    type Primary = PrimaryResource;
+
+    fn clone_box(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            loop {
+                self.fire.notified().await;
+                sender.send_every();
+            }
+        })
+    }
+}
+
 #[derive(Clone)]
 struct BlockingFirstReconciler {
     entered: Arc<Notify>,
@@ -996,6 +1024,47 @@ async fn flooded_secondary_queue_does_not_block_resync_or_other_primaries() {
     })
     .await
     .expect("resync and beta must keep progressing under a hot alpha watch");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_secondary_asking_for_every_primary_reconciles_each_once_more() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    for name in ["alpha", "beta"] {
+        primaries.create(&primary_meta(name), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+    }
+    let fire = Arc::new(Notify::new());
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(EverySecondaryWatch { fire: Arc::clone(&fire) })],
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
+            // No resync falls due in the test: only the secondary's request wakes both.
+            resync_interval: Duration::from_secs(3600),
+            backend,
+        }
+        .run(),
+    );
+    let count = |name: &str| reconciled.lock().expect("reconciled lock").iter().filter(|seen| seen.as_str() == name).count();
+    timeout(Duration::from_secs(1), async {
+        while count("alpha") < 1 || count("beta") < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the initial list should reconcile both");
+
+    fire.notify_one();
+    timeout(Duration::from_secs(1), async {
+        while count("alpha") < 2 || count("beta") < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("asking for every primary should reconcile both again");
     harness.shutdown().await;
 }
 
