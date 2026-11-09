@@ -209,6 +209,62 @@ contract!(socket_file_expiry, expiry, true, true);
 #[cfg(unix)]
 contract!(socket_file_restart, restart, true, true);
 
+/// The hosting clock in real milliseconds, as a deployed host's.
+#[cfg(unix)]
+struct RealClock(std::time::Instant);
+#[cfg(unix)]
+impl Clock for RealClock {
+    fn read(&self) -> io::Result<ClockReading> {
+        Ok(ClockReading { epoch: "real".into(), tick: self.0.elapsed().as_millis().try_into().unwrap() })
+    }
+}
+
+// With nobody touching the authority, a socket publication ends at its expiry: the server wakes
+// at the deadline, withdraws it, tells its watchers and closes the publisher's lease.
+#[cfg(unix)]
+#[tokio::test]
+async fn socket_publication_ends_at_its_expiry_without_activity() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+    let identity = tender::ssh::Identity::from_secret([1; 32]);
+    let caller = tender::ssh::Identity::from_secret([2; 32]);
+    let session = Session { caller: caller.fingerprint(), pinned_host: identity.fingerprint(), via: None };
+    let clock = Arc::new(RealClock(std::time::Instant::now()));
+    let authority = MemoryTender::hosted(session.pinned_host.clone(), clock.clone(), Arc::new(MemoryStore::default())).unwrap();
+    authority.allow_browse(session.caller.clone()).unwrap();
+    authority
+        .grant(Grant {
+            grantee: session.caller.clone(),
+            namespace: Namespace("n".into()),
+            audience_ceiling: BTreeSet::from([session.caller.clone()]),
+            expires_at: clock.read().unwrap().tick + 300,
+        })
+        .unwrap();
+    let path = directory.path().join("listener");
+    let _server = tender::ssh::Server::bind(path.clone(), identity, authority).unwrap();
+    let client = tender::ssh::SshTender::new(path, session.pinned_host.clone(), vec![caller]).unwrap();
+    let request = PublishRequest {
+        namespace: Namespace("n".into()),
+        name: "expiring".into(),
+        audience: BTreeSet::from([session.caller.clone()]),
+        reclaim: None,
+    };
+    let mut published = client.publish(&session, request).await.unwrap();
+    let mut watch = client.watch(&session).await.unwrap();
+    assert_eq!(watch.recv().await.unwrap()[0].availability, Availability::Available);
+
+    let withdrawn = timeout(Duration::from_secs(3), async {
+        loop {
+            let publications = watch.recv().await.expect("watch open");
+            if publications[0].availability == Availability::Withdrawn {
+                return;
+            }
+        }
+    });
+    withdrawn.await.expect("watchers hear the expiry");
+    assert!(timeout(Duration::from_secs(3), published.incoming.recv()).await.expect("lease closes").is_none());
+}
+
 // Generated sequences cross expiry (0..=12), duplicate ticks, clock regression,
 // and restart interleavings. A withdrawn publication can never regain reachability.
 #[hegel::test]

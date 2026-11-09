@@ -20,6 +20,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify};
 use url::Url;
 
+/// Failed fleet sync passes retried on a backoff before only a queued blob retries.
+const SYNC_RETRIES: u32 = 10;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlobDigest(String);
 
@@ -769,8 +772,11 @@ impl TieredBlobStore {
             }
         }
     }
+    /// Copies queued blobs to the fleet at once and whenever a blob is queued. Nothing here waits
+    /// on time: a failed pass is retried with a backoff of 2 s to 5 min, ten times in a row, and
+    /// after that only a newly queued blob tries again.
     pub async fn run_sync(self: Arc<Self>) {
-        let mut delay = Duration::from_secs(1);
+        let mut failures = 0_u32;
         loop {
             let failed = match self.sync_once().await {
                 Ok(status) if status.last_error.is_none() => false,
@@ -780,12 +786,15 @@ impl TieredBlobStore {
                     true
                 }
             };
-            if failed {
-                delay = (delay * 2).min(Duration::from_secs(300));
-                tokio::time::sleep(delay).await;
+            failures = if failed { failures + 1 } else { 0 };
+            if failed && failures <= SYNC_RETRIES {
+                let delay = (Duration::from_secs(1) * 2_u32.pow(failures)).min(Duration::from_secs(300));
+                tokio::select! { () = self.wake.notified() => {}, () = tokio::time::sleep(delay) => {} }
             } else {
-                delay = Duration::from_secs(1);
-                tokio::select! { () = self.wake.notified() => {}, () = tokio::time::sleep(Duration::from_secs(30)) => {} }
+                if failed {
+                    tracing::warn!(failures, "blob fleet sync keeps failing; retrying when a blob is queued");
+                }
+                self.wake.notified().await;
             }
         }
     }

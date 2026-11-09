@@ -248,9 +248,11 @@ impl Server {
         let relays = router.clone();
         let task = tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(MAX_CHANNELS));
-            let mut cleanup = tokio::time::interval(Duration::from_secs(1));
+            // Registrations end with their leases: on a lease change, and at the earliest expiry.
+            let mut lease_changes = authority.lease_changes();
             let mut connections = tokio::task::JoinSet::new();
             loop {
+                let expiry = authority.until_expiry(None);
                 tokio::select! {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
@@ -268,7 +270,10 @@ impl Server {
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
-                    _ = cleanup.tick() => {
+                    _ = lease_changes.changed() => {
+                        registrations.lock().expect("registrations lock").retain(|_, registration| authority.lease_active(&registration.lease));
+                    }
+                    () = expiry_wake(expiry) => {
                         registrations.lock().expect("registrations lock").retain(|_, registration| authority.lease_active(&registration.lease));
                     }
                 }
@@ -370,11 +375,14 @@ async fn serve(
                 let control = async {
                     write_control(&mut stream, &Response::Lease(lease.clone())).await?;
                     let mut byte = [0];
-                    let mut health = tokio::time::interval(Duration::from_secs(1));
-                    loop {
+                    // The lease ends on a change of the authority's leases or at its expiry.
+                    let mut lease_changes = policy.lease_changes();
+                    while policy.lease_active(&lease) {
+                        let expiry = policy.until_expiry(Some(&lease));
                         tokio::select! {
                             result = stream.read(&mut byte) => { result?; break }
-                            _ = health.tick() => { if !policy.lease_active(&lease) { break } }
+                            _ = lease_changes.changed() => {}
+                            () = expiry_wake(expiry) => {}
                         }
                     }
                     Ok::<_, io::Error>(())
@@ -809,6 +817,14 @@ impl SshTender {
 enum RetryPause {
     Elapsed,
     Cancelled,
+}
+
+/// Sleeps until an expiry deadline, or forever without one.
+async fn expiry_wake(expiry: Option<Duration>) {
+    match expiry {
+        Some(expiry) => sleep(expiry).await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn pause_publisher_retry(

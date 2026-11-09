@@ -1493,8 +1493,12 @@ impl InProcessDaemon {
         daemon.spawn_checkout_provider_retirement();
 
         let weak = Arc::downgrade(&daemon);
+        let mut namespace_changes = daemon.checkout_namespace_changes.subscribe();
         tokio::spawn(async move {
             while let Some(daemon) = weak.upgrade() {
+                // Mark the current namespace before listing; a change during setup stays pending
+                // and restarts the subscription below.
+                namespace_changes.borrow_and_update();
                 let namespace = daemon.provisioning_namespace().await;
                 let repositories = daemon.resource_backend.clone().using::<Repository>(&namespace);
                 let listed = match repositories.list().await {
@@ -1521,18 +1525,13 @@ impl InProcessDaemon {
                     }
                 };
                 drop(daemon);
-                let mut namespace_check = tokio::time::interval(Duration::from_secs(1));
-                namespace_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                namespace_check.tick().await;
+                let mut retry = false;
                 loop {
                     let event = tokio::select! {
                         event = watch.next() => event,
-                        _ = namespace_check.tick() => {
-                            let Some(daemon) = weak.upgrade() else { return };
-                            if daemon.provisioning_namespace().await != namespace {
-                                break;
-                            }
-                            continue;
+                        changed = namespace_changes.changed() => {
+                            if changed.is_err() { return; }
+                            break;
                         }
                     };
                     let name = match event {
@@ -1541,9 +1540,13 @@ impl InProcessDaemon {
                         Some(Ok(_)) => continue,
                         Some(Err(error)) => {
                             warn!(%error, "repository provider cache watch failed");
+                            retry = true;
                             break;
                         }
-                        None => break,
+                        None => {
+                            retry = true;
+                            break;
+                        }
                     };
                     let Some(daemon) = weak.upgrade() else { return };
                     daemon.admission.repository_change_requests().write().await.retain(|key, _| key.to_string() != name);
@@ -1553,7 +1556,9 @@ impl InProcessDaemon {
                         .await
                         .retain(|(cached_namespace, key), _| cached_namespace != &namespace || key.to_string() != name);
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                if retry {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         });
 

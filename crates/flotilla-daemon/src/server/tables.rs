@@ -637,23 +637,35 @@ impl TableSource {
                 resource_events(opener, snapshot.start.clone()).boxed()
             }
             Self::Decided { service, .. } => {
-                let (service, namespace, sequence) = (service.clone(), query.namespace.clone(), snapshot.sequence);
-                futures::stream::unfold((service, namespace, sequence), |(service, namespace, mut sequence)| async move {
+                // The store's commit wake: each commit moving the table's home wakes a read of its
+                // sequence. The first read covers commits between the snapshot and the listener.
+                let home = decided::home(&query.namespace, service.home());
+                let wake = Arc::new(tokio::sync::Notify::new());
+                let listener: Arc<flotilla_schema_sqlite::stream::CommitListener> = {
+                    let (wake, home) = (Arc::clone(&wake), home.clone());
+                    Arc::new(move |committed: &flotilla_schema_sqlite::stream::Committed<'_>| {
+                        if committed.moved(&home) {
+                            wake.notify_one();
+                        }
+                    })
+                };
+                // The store holds the listener weakly; the stream holds it while it lives.
+                service.on_commit(Arc::downgrade(&listener));
+                let state = (service.clone(), home, snapshot.sequence, wake, listener, true);
+                futures::stream::unfold(state, |(service, home, mut sequence, wake, listener, mut first)| async move {
                     loop {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        let scope = namespace.clone();
-                        match decided::blocking(&service, move |store| {
-                            let home = decided::home(&scope, store.home());
-                            store.read()?.last_sequence(&home)
-                        })
-                        .await
-                        {
+                        if !first {
+                            wake.notified().await;
+                        }
+                        first = false;
+                        let scope = home.clone();
+                        match decided::blocking(&service, move |store| store.read()?.last_sequence(&scope)).await {
                             Ok(latest) if latest == sequence => continue,
                             Ok(latest) => {
                                 sequence = latest;
-                                return Some((Ok(()), (service, namespace, sequence)));
+                                return Some((Ok(()), (service, home, sequence, wake, listener, first)));
                             }
-                            Err(error) => return Some((Err(error), (service, namespace, sequence))),
+                            Err(error) => return Some((Err(error), (service, home, sequence, wake, listener, first))),
                         }
                     }
                 })

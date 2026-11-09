@@ -49,11 +49,6 @@ use crate::{
     supervisor::{supervise, ControllerSupervision},
 };
 
-/// Cadence of the liveness marker (see `spawn_liveness_watchdog_task`). Long
-/// enough to be quiet in a healthy log, short enough to bound how much time a
-/// wedge can hide in.
-pub(super) const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
-
 pub(super) const MANIFEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(super) const CONVOY_ENSURE_CONDITION_TYPE: &str = "Controller/standing_convoy_ensure";
@@ -975,17 +970,6 @@ pub(super) fn spawn_convoy_ensure_reconciler_task(
 pub(super) enum PeriodicTaskStart {
     Immediate,
     AfterInterval,
-}
-
-/// Emits one liveness line per interval so a daemon that stops scheduling is
-/// visible in the log by the *absence* of a known-cadence marker, rather than by
-/// the absence of incidental chatter. Added after flotilla#1111, where the only
-/// evidence of a wedged daemon was that unrelated debug lines stopped.
-pub(super) fn spawn_liveness_watchdog_task(tasks: usize, interval: Duration) -> JoinHandle<()> {
-    let started = tokio::time::Instant::now();
-    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || async move {
-        info!(uptime_secs = started.elapsed().as_secs(), supervisory_tasks = tasks, "daemon alive");
-    })
 }
 
 pub(super) fn spawn_periodic_task<Operation, OperationFuture>(

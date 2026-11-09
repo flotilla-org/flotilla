@@ -62,11 +62,10 @@ use self::state::ControllerRuntimeState;
 use self::tasks::{
     run_artifact_gc, run_checkout_archive_gc, spawn_adopted_checkout_projection_task, spawn_aggregator_task,
     spawn_convoy_ensure_reconciler_task, spawn_dispatch_reconciler_task, spawn_environment_orphan_sweep_task, spawn_event_expiry_task,
-    spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task, spawn_liveness_watchdog_task,
-    spawn_local_fulfilment_probe_task, spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task,
-    spawn_provisioned_environment_reconciliation_task, spawn_sleep_inhibitor_task, spawn_ssh_fulfilment_probe_task,
-    spawn_startup_restoration, spawn_vessel_placement_projector, supervise_controller, CheckoutArchiveRoot, CheckoutArchiveSweep,
-    PeriodicTaskStart, LIVENESS_WATCHDOG_INTERVAL, MANIFEST_RECONCILE_INTERVAL,
+    spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task, spawn_local_fulfilment_probe_task,
+    spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task, spawn_provisioned_environment_reconciliation_task,
+    spawn_sleep_inhibitor_task, spawn_ssh_fulfilment_probe_task, spawn_startup_restoration, spawn_vessel_placement_projector,
+    supervise_controller, CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart, MANIFEST_RECONCILE_INTERVAL,
 };
 use self::terminal::TerminalControllerRuntime;
 use crate::server::environment_sockets::EnvironmentSocketService;
@@ -572,11 +571,6 @@ impl DaemonRuntime {
                 .runtime_health(runtime_health)
                 .build(),
         ));
-
-        // +1 for the watchdog's own handle, pushed below, so this count matches
-        // `self.tasks.len()` at drop time.
-        let supervisory_tasks = tasks.len() + 1;
-        tasks.push(spawn_liveness_watchdog_task(supervisory_tasks, LIVENESS_WATCHDOG_INTERVAL));
 
         Ok(Self { tasks, blob_store, controller_metrics, stop_expected: false })
     }
