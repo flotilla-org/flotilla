@@ -1,6 +1,6 @@
 //! Pins today's phase transitions (the old reconciler's fixpoints) against [`derive`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use super::*;
 use crate::workflow_template::{CrewSource, CrewSpec, VesselRequirement};
@@ -36,7 +36,6 @@ struct Case {
     snapshot: WorkflowSnapshot,
     vessels: BTreeMap<String, VesselReading>,
     crew: BTreeMap<String, BTreeMap<String, CrewReading>>,
-    forced: BTreeSet<String>,
 }
 
 impl Case {
@@ -48,7 +47,6 @@ impl Case {
             snapshot: snapshot(vec![requirement("build", &[], &["coder"]), requirement("review", &["build"], &["reviewer"])]),
             vessels: BTreeMap::new(),
             crew: BTreeMap::new(),
-            forced: BTreeSet::new(),
         }
     }
 
@@ -69,13 +67,15 @@ impl Case {
             snapshot: &self.snapshot,
             vessels: &self.vessels,
             crew: &self.crew,
-            forced: &self.forced,
         })
     }
 }
 
-const WORKING: CrewReading = CrewReading { done: false, handed_back: false, failed: false, stalled: false, working: true };
-const DONE: CrewReading = CrewReading { done: true, handed_back: false, failed: false, stalled: false, working: true };
+/// A working seat owing one open promise, and the same seat once it is kept.
+const WORKING: CrewReading = CrewReading { promises: 1, open: 1, handed_back: false, failed: false, stalled: false, working: true };
+const DONE: CrewReading = CrewReading { open: 0, ..WORKING };
+/// A seat not yet launched, owing the promise admission declared for it.
+const OWING: CrewReading = CrewReading { promises: 1, open: 1, handed_back: false, failed: false, stalled: false, working: false };
 
 fn ready() -> VesselReading {
     VesselReading::At(VesselPhase::Ready)
@@ -105,21 +105,37 @@ fn a_provisioning_vessel_keeps_its_work_ready_and_a_ready_one_runs_it() {
 
 #[test]
 fn a_completed_work_readies_its_dependant() {
-    let reading = Case::two_works().vessel("build", ready()).crew("build", "coder", DONE).derive();
+    let reading = Case::two_works().vessel("build", ready()).crew("build", "coder", DONE).crew("review", "reviewer", OWING).derive();
     assert_eq!(reading.work["build"], WorkPhase::Complete);
     assert_eq!(reading.work["review"], WorkPhase::Ready);
     assert_eq!(reading.phase, ConvoyPhase::Active);
 }
 
 #[test]
-fn every_work_complete_is_landing_and_a_new_turn_reopens_it() {
+fn every_promise_settled_is_landing_and_an_open_one_reopens_it() {
     let case =
         Case::two_works().vessel("build", ready()).crew("build", "coder", DONE).vessel("review", ready()).crew("review", "reviewer", DONE);
     assert_eq!(case.derive().phase, ConvoyPhase::Landing);
-    // A delivered turn (or a resume) sets the crew working again: the old reconciler wrote
-    // Active and the work back to Running.
-    let reading = case.crew("review", "reviewer", WORKING).derive();
+    // A new promise, or a rejected submission back to Pending, reopens the work and the convoy.
+    let reopened = CrewReading { promises: 2, open: 1, ..WORKING };
+    let reading = case.crew("review", "reviewer", reopened).derive();
     assert_eq!(reading.work["review"], WorkPhase::Running);
+    assert_eq!(reading.crew["review"]["reviewer"], CrewWorkPhase::Working);
+    assert_eq!(reading.phase, ConvoyPhase::Active);
+}
+
+#[test]
+fn a_work_completes_when_every_promise_its_seats_own_settles() {
+    // Retracted promises are settled too: the reading counts only the open ones.
+    let case = Case::two_works()
+        .vessel("build", ready())
+        .crew("build", "coder", CrewReading { promises: 3, open: 1, ..WORKING })
+        .crew("review", "reviewer", OWING);
+    assert_eq!(case.derive().work["build"], WorkPhase::Running);
+    let reading = case.crew("build", "coder", CrewReading { promises: 3, open: 0, ..WORKING }).derive();
+    assert_eq!(reading.work["build"], WorkPhase::Complete);
+    assert_eq!(reading.crew["build"]["coder"], CrewWorkPhase::Done);
+    // The dependant's promises are still open: Landing waits for every seat.
     assert_eq!(reading.phase, ConvoyPhase::Active);
 }
 
@@ -188,23 +204,19 @@ fn a_failed_crew_member_fails_a_finite_work_and_stalls_a_standing_one() {
 }
 
 #[test]
-fn a_standing_convoys_failed_or_vanished_vessel_is_an_interruption() {
-    for reading in [VesselReading::At(VesselPhase::Failed), VesselReading::Gone] {
-        let mut case = Case::two_works().vessel("build", reading);
-        case.standing = true;
-        let derived = case.derive();
-        assert_eq!(derived.work["build"], WorkPhase::Interrupted, "{reading:?}");
-        assert_eq!(derived.phase, ConvoyPhase::Interrupted, "{reading:?}");
-    }
-}
-
-#[test]
-fn an_operator_forced_work_is_complete_whatever_its_crew_says() {
-    let mut case = Case::two_works().vessel("build", ready()).crew("build", "coder", WORKING);
-    case.forced.insert("build".into());
-    let reading = case.derive();
-    assert_eq!(reading.work["build"], WorkPhase::Complete);
-    assert_eq!(reading.work["review"], WorkPhase::Ready);
+fn a_standing_convoys_failed_vessel_fails_it_and_a_vanished_one_interrupts_it() {
+    // Failed costs a strike: the convoy fails and the role's next launch replaces it. Lost is
+    // replaced within the convoy.
+    let mut failed = Case::two_works().vessel("build", VesselReading::At(VesselPhase::Failed));
+    failed.standing = true;
+    let derived = failed.derive();
+    assert_eq!(derived.work["build"], WorkPhase::Failed);
+    assert_eq!(derived.phase, ConvoyPhase::Failed);
+    let mut gone = Case::two_works().vessel("build", VesselReading::Gone);
+    gone.standing = true;
+    let derived = gone.derive();
+    assert_eq!(derived.work["build"], WorkPhase::Interrupted);
+    assert_eq!(derived.phase, ConvoyPhase::Interrupted);
 }
 
 #[test]
@@ -218,15 +230,19 @@ fn an_abandoned_convoy_abandons_its_unfinished_work() {
 }
 
 #[test]
-fn a_handed_back_member_neither_completes_nor_blocks_its_work() {
-    // The old roll-up completes a work only when every member is Done; a member that handed
-    // back is not Done, so the work keeps running on the member it handed to.
-    let handed = CrewReading { handed_back: true, ..WORKING };
+fn a_handed_back_seat_owes_nothing_and_the_seat_it_handed_to_counts() {
+    // The handoff moved the coder's promises to a seat the template does not name.
+    let handed = CrewReading { promises: 0, open: 0, handed_back: true, ..WORKING };
     let mut case = Case::two_works();
-    case.snapshot = snapshot(vec![requirement("build", &[], &["coder", "fixer"])]);
-    let reading = case.vessel("build", ready()).crew("build", "coder", handed).crew("build", "fixer", WORKING).derive();
+    case.snapshot = snapshot(vec![requirement("build", &[], &["coder"])]);
+    let case = case.vessel("build", ready()).crew("build", "coder", handed).crew("build", "fixer", WORKING);
+    let reading = case.derive();
     assert_eq!(reading.crew["build"]["coder"], CrewWorkPhase::HandedBack);
+    assert_eq!(reading.crew["build"]["fixer"], CrewWorkPhase::Working);
     assert_eq!(reading.work["build"], WorkPhase::Running);
+    let reading = case.crew("build", "fixer", DONE).derive();
+    assert_eq!(reading.work["build"], WorkPhase::Complete);
+    assert_eq!(reading.phase, ConvoyPhase::Landing);
 }
 
 #[test]
@@ -246,10 +262,36 @@ fn works_that_have_not_started_never_read_landing() {
     let mut case = Case::two_works();
     case.snapshot = snapshot(vec![requirement("review", &["build"], &["reviewer"])]);
     assert_eq!(case.derive().phase, ConvoyPhase::Pending);
-    // A work whose template has no crew completes only by verdict, so it never lands unstarted.
-    let mut crewless = Case::two_works();
-    crewless.snapshot = snapshot(vec![requirement("build", &[], &[])]);
-    let reading = crewless.vessel("build", ready()).derive();
+    // Running seats owing nothing yet: no promise exists, so nothing lands.
+    let reading =
+        Case::two_works().vessel("build", ready()).crew("build", "coder", CrewReading { promises: 0, open: 0, ..WORKING }).derive();
     assert_eq!(reading.work["build"], WorkPhase::Running);
-    assert_ne!(reading.phase, ConvoyPhase::Landing);
+    assert_eq!(reading.phase, ConvoyPhase::Active);
+}
+
+#[test]
+fn a_work_owing_no_promise_completes_nothing_and_releases_its_dependant_once_it_runs() {
+    // `build` is a tool vessel whose seat owns no promise; `review` owes one.
+    let case = Case::two_works().vessel("build", VesselReading::At(VesselPhase::Provisioning)).crew("review", "reviewer", WORKING);
+    assert_eq!(case.derive().work["review"], WorkPhase::Pending);
+    let case = case.vessel("build", ready());
+    let reading = case.derive();
+    assert_eq!(reading.work["build"], WorkPhase::Running);
+    assert_eq!(reading.work["review"], WorkPhase::Ready);
+    // It gates nothing: the convoy lands on the promises the other seats own.
+    let reading = case.vessel("review", ready()).crew("review", "reviewer", DONE).derive();
+    assert_eq!(reading.work["build"], WorkPhase::Running);
+    assert_eq!(reading.phase, ConvoyPhase::Landing);
+}
+
+#[test]
+fn a_tool_seat_owning_a_ledger_lands_when_it_is_kept() {
+    // The builtin `scratch`: one tool vessel, its `shell` seat owning a decision-ledger promise.
+    let mut case = Case::two_works();
+    case.snapshot = snapshot(vec![requirement("work", &[], &["shell"])]);
+    let case = case.vessel("work", ready()).crew("work", "shell", WORKING);
+    assert_eq!(case.derive().phase, ConvoyPhase::Active);
+    let reading = case.crew("work", "shell", DONE).derive();
+    assert_eq!(reading.work["work"], WorkPhase::Complete);
+    assert_eq!(reading.phase, ConvoyPhase::Landing);
 }
