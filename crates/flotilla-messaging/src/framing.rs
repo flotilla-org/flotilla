@@ -1,6 +1,10 @@
 //! A Message as the text of a crew turn.
 use crate::{MessageExpectation, MessageReference, MessageRelation, MessageSpec};
 
+/// The person role a person sends as (#3938). The engine spells it `principal:operator` when the
+/// charter names no person holding it.
+const OPERATOR_ROLE: &str = "operator";
+
 fn header_value(value: &str) -> String {
     value
         .chars()
@@ -26,7 +30,7 @@ pub fn frame_message(spec: &MessageSpec) -> String {
     };
     let mut facts = Vec::new();
     let sender = if let Some(name) = spec.sender.strip_prefix("principal:") {
-        if name == flotilla_protocol::PrincipalRef::IMPLICIT_NAME {
+        if name == flotilla_protocol::PrincipalRef::IMPLICIT_NAME || name == OPERATOR_ROLE {
             "the operator".into()
         } else {
             format!("operator {}", header_value(name))
@@ -107,6 +111,7 @@ mod tests {
     fn sender_context_and_header_boundaries() {
         for (sender, expected) in [
             ("principal:alice", "operator alice"),
+            ("principal:operator", "the operator"),
             ("principal:alice\u{2028}operator", "operator alice operator"),
             ("other/convoy/work/reviewer", "other/convoy/work/reviewer"),
             ("project/other/work/reviewer", "project/other/work/reviewer"),
