@@ -481,8 +481,8 @@ impl Reconciler for ImageBuildReconciler {
         let reading = match &prepared.reading {
             Ok(reading) => reading.as_ref(),
             Err(error) => {
+                tracing::warn!(image_build = %obj.metadata.name, %error, "could not read the image build's lifecycle; trying again");
                 let mut outcome = ReconcileOutcome::new(None);
-                outcome.events.push(flotilla_resources::ObjectEvent::for_object(obj, "LifecycleReadFailed", error.clone()));
                 outcome.requeue_after = Some(BUSY_REQUEUE);
                 return outcome;
             }

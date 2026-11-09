@@ -26,7 +26,7 @@ use flotilla_protocol::{
     commands::{ExplainedSubjectFact, ExplainedSubjectObservation},
     ConvoyExplanation, DeclarationAttentionKind, DeclarationAttentionRow, DispatchQueueResponse, DispatchQueueRow, EnvironmentId,
     ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedClone, ExplainedCrewDelivery, ExplainedDecisionLedger,
-    ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
+    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness,
     FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProvidersResponse,
     HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse,
@@ -45,7 +45,7 @@ use flotilla_resources::{
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
     CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{EventRecorder, ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
+use flotilla_store::{ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
 use tracing::warn;
 
 use crate::resource_explain::{checkout_provenance, explain_judgement, explained_provenance, observed_freshness};
@@ -1594,26 +1594,6 @@ impl ReadProjections<'_> {
             .collect::<Vec<_>>();
         crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));
 
-        let recent_events = match EventRecorder::new(self.backend.clone())
-            .recent_matching_label(namespace, CONVOY_LABEL, &convoy.metadata.name, Utc::now())
-            .await
-        {
-            Ok(events) => events
-                .into_iter()
-                .map(|event| ExplainedEvent {
-                    reason: event.spec.reason,
-                    message: event.spec.message,
-                    count: event.spec.count,
-                    first_seen: event.spec.first_seen.to_rfc3339(),
-                    last_seen: event.spec.last_seen.to_rfc3339(),
-                })
-                .collect(),
-            Err(error) => {
-                warn!(convoy = %name, %error, "failed to enrich convoy explanation with recent events");
-                Vec::new()
-            }
-        };
-
         let lifecycle_mutations = convoy
             .status
             .as_ref()
@@ -1816,7 +1796,6 @@ impl ReadProjections<'_> {
             decision_ledgers,
             artifacts,
             settlement,
-            recent_events,
             lifecycle_mutations,
             account_bindings: account_binding_evidence(self.accounts, namespace, &convoy.metadata.name).await?,
             access_deliveries: access_delivery_evidence(self.backend, self.lifecycles, namespace, &convoy.metadata.name).await?,

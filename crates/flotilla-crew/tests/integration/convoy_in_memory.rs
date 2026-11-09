@@ -1,7 +1,7 @@
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
-    external_patches, reconcile, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase, Event, FreshCloneCheckoutSpec, FulfilmentKind,
+    external_patches, reconcile, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase, FreshCloneCheckoutSpec, FulfilmentKind,
     FulfilmentKindSpec, FulfilmentRealisation, InputMeta, IssueSnapshot, LifecycleAuthority, RepositoryKey, RepositorySpec, ResourceError,
     Vessel, VesselPhase, VesselStatus, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION,
     PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
@@ -136,18 +136,15 @@ async fn missing_template_transitions_convoy_to_failed() {
 
     timeout(Duration::from_secs(1), async {
         loop {
-            let events = backend.using::<Event>("flotilla").list().await.expect("list events").items;
-            if events
-                .iter()
-                .any(|event| event.spec.regarding.name == "convoy-missing-template" && event.spec.reason == "WorkflowTemplateNotFound")
-            {
+            let convoy = convoys.get("convoy-missing-template").await.expect("convoy get should succeed");
+            if convoy.status.is_some_and(|status| status.phase == ConvoyPhase::Failed) {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("template refusal should become an object event");
+    .expect("template refusal should fail the convoy");
 
     let convoy = convoys.get("convoy-missing-template").await.expect("convoy get should succeed");
     let status = convoy.status.expect("convoy status");

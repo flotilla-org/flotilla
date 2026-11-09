@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::commands::AttachMode;
 use flotilla_protocol::CliListKind;
@@ -35,7 +34,6 @@ use flotilla_protocol::RepoSelector;
 use flotilla_protocol::ResourceCursor;
 use flotilla_protocol::ResourceRecordType;
 use flotilla_resources::Clock;
-use flotilla_resources::EventRegarding;
 use flotilla_resources::IssueSourceResolution;
 use flotilla_resources::IssueSourceUnavailable;
 use flotilla_resources::ProjectSpec;
@@ -47,7 +45,6 @@ use flotilla_store::get_resource_kind_including_replicas;
 use flotilla_store::list_resource_kind;
 use flotilla_store::list_resource_kind_including_replicas;
 use flotilla_store::resolve_project_issue_sources;
-use flotilla_store::EventRecorder;
 use flotilla_store::ResourceBackend;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -408,25 +405,6 @@ impl ProjectionsActions<'_> {
                         }
                         Err(error) => {
                             warn!(resource_kind = %visible.kind, resource = %name, %error, "failed to decode project spec for resource read");
-                        }
-                    }
-                }
-                if visible.kind != "Event" {
-                    let object_name = value["metadata"]["name"].as_str().unwrap_or(name);
-                    let regarding = EventRegarding {
-                        api_version: value["apiVersion"].as_str().unwrap_or("flotilla.work/v1").to_string(),
-                        kind: visible.kind.clone(),
-                        namespace: namespace.clone(),
-                        name: object_name.to_string(),
-                    };
-                    match EventRecorder::new(self.resource_backend.clone()).recent_for(&regarding, Utc::now()).await {
-                        Ok(events) if !events.is_empty() => {
-                            value["recentEvents"] =
-                                serde_json::Value::Array(events.into_iter().filter_map(|event| serde_json::to_value(event).ok()).collect());
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            warn!(resource_kind = %visible.kind, resource = %name, %error, "failed to enrich resource read with recent events")
                         }
                     }
                 }

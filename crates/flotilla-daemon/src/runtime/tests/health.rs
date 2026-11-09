@@ -104,25 +104,12 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
         }),
         Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(engine_convoy)),
     );
-    let convoy_controller = tokio::spawn(
-        ControllerLoop {
-            primary: backend.using::<Convoy>(NAMESPACE),
-            secondaries: Vec::new(),
-            reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE)),
-            resync_interval: Duration::from_secs(60),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
-
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let gave_up = matches!(
+            if matches!(
                 engine.clones.get(&launch, None).ok().flatten().map(|clone| clone.reading),
                 Some(flotilla_protocol::LifecycleReading::GaveUp { .. })
-            );
-            let events = backend.using::<flotilla_resources::Event>(NAMESPACE).list().await.expect("events").items;
-            if gave_up && events.iter().any(|event| event.spec.reason == "WorkflowTemplateNotFound") {
+            ) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -153,11 +140,6 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
         "explain shows the clone's cause: {:?}",
         clone.reading
     );
-    assert!(explanation
-        .recent_events
-        .iter()
-        .any(|event| { event.reason == "WorkflowTemplateNotFound" && event.message.contains("missing-workflow") }));
-    convoy_controller.abort();
 }
 
 #[tokio::test]

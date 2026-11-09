@@ -2190,7 +2190,6 @@ async fn landed_with_reopened_change_request_does_not_write_phase() {
     let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landed, Some(Some(false)), None, false).await;
 
     assert_eq!(outcome.patch, None);
-    assert!(outcome.events.is_empty());
 }
 
 #[tokio::test]

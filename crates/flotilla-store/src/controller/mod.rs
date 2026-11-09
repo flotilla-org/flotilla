@@ -24,7 +24,6 @@ use crate::{
     labels::LifecycleAuthority,
     load_metrics::ControllerLoadMetrics,
     resource::{InputMeta, Resource, ResourceObject},
-    EventRecorder, ObjectEvent,
 };
 
 #[allow(async_fn_in_trait)]
@@ -151,17 +150,16 @@ impl FinalizerFailure {
 pub struct ReconcileOutcome<T: Resource> {
     pub patch: Option<T::StatusPatch>,
     pub actuations: Vec<Actuation>,
-    pub events: Vec<ObjectEvent>,
     pub requeue_after: Option<Duration>,
 }
 
 impl<T: Resource> ReconcileOutcome<T> {
     pub fn new(patch: Option<T::StatusPatch>) -> Self {
-        Self { patch, actuations: Vec::new(), events: Vec::new(), requeue_after: None }
+        Self { patch, actuations: Vec::new(), requeue_after: None }
     }
 
     pub fn with_actuations(patch: Option<T::StatusPatch>, actuations: Vec<Actuation>) -> Self {
-        Self { patch, actuations, events: Vec::new(), requeue_after: None }
+        Self { patch, actuations, requeue_after: None }
     }
 }
 
@@ -873,17 +871,6 @@ impl<R: Reconciler> ControllerLoop<R> {
                     for actuation in outcome.actuations {
                         Self::apply_actuation(&primary.backend, &primary.namespace, actuation).await?;
                     }
-                    let recorder = EventRecorder::new(primary.backend.clone());
-                    for event in outcome.events {
-                        if let Err(event_error) = recorder.record(event, Utc::now()).await {
-                            warn!(
-                                resource_kind = R::Resource::API_PATHS.kind,
-                                resource = %name,
-                                %event_error,
-                                "controller failed to record outcome event",
-                            );
-                        }
-                    }
                     if let Some(patch) = outcome.patch {
                         Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await?;
                     }
@@ -934,12 +921,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                     Ok(()) => {}
                     Err(err) => {
                         if attempted_reconcile {
-                            let recorder = EventRecorder::new(primary.backend.clone());
-                            if let Err(event_error) =
-                                recorder.record(ObjectEvent::for_object(&object, "ReconcileFailed", err.to_string()), Utc::now()).await
-                            {
-                                warn!(resource_kind = R::Resource::API_PATHS.kind, resource = %name, %event_error, "controller failed to record reconcile event");
-                            }
+                            // Counted with the kind's controller failures (#3206); told here, not stored.
+                            warn!(resource_kind = R::Resource::API_PATHS.kind, resource = %name, error = %err, "reconcile failed");
                         }
                         let mut terminal = false;
                         // A finalizer or its removal write may fail without

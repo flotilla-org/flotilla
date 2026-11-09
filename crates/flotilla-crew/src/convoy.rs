@@ -802,7 +802,6 @@ impl Reconciler for ConvoyReconciler {
                         .is_none()
                         .then_some(ConvoyStatusPatch::SetStalled { condition: Some(condition) }),
                     actuations: Vec::new(),
-                    events: Vec::new(),
                     requeue_after: Some(std::time::Duration::from_secs(30)),
                 };
             }
@@ -810,7 +809,6 @@ impl Reconciler for ConvoyReconciler {
                 return ControllerReconcileOutcome {
                     patch: Some(ConvoyStatusPatch::SetStalled { condition: None }),
                     actuations: Vec::new(),
-                    events: Vec::new(),
                     requeue_after: None,
                 };
             }
@@ -828,7 +826,6 @@ impl Reconciler for ConvoyReconciler {
             return ControllerReconcileOutcome {
                 patch: Some(ConvoyStatusPatch::DiscoverSubjects { subjects: missing, source: SubjectDiscoverySource::Branch, at: now }),
                 actuations: Vec::new(),
-                events: Vec::new(),
                 requeue_after: None,
             };
         }
@@ -847,7 +844,6 @@ impl Reconciler for ConvoyReconciler {
                     Some(format!("the engine refused this convoy's admission: {refusal}")),
                 )),
                 actuations: Vec::new(),
-                events: Vec::new(),
                 requeue_after: None,
             };
         }
@@ -856,17 +852,11 @@ impl Reconciler for ConvoyReconciler {
             return ControllerReconcileOutcome {
                 patch: Some(ConvoyStatusPatch::HandPromisesToEngine),
                 actuations: Vec::new(),
-                events: Vec::new(),
                 requeue_after: None,
             };
         }
         if let Some(patch) = &prepared.promise_patch {
-            return ControllerReconcileOutcome {
-                patch: Some(patch.clone()),
-                actuations: Vec::new(),
-                events: Vec::new(),
-                requeue_after: None,
-            };
+            return ControllerReconcileOutcome { patch: Some(patch.clone()), actuations: Vec::new(), requeue_after: None };
         }
         let mut outcome = reconcile_internal(
             obj,
@@ -930,10 +920,12 @@ impl Reconciler for ConvoyReconciler {
             .filter(|deadline| *deadline > now)
             .filter_map(|deadline| (deadline - now).to_std().ok())
             .min();
+        for event in outcome.events {
+            trace_convoy_event(obj, event);
+        }
         ControllerReconcileOutcome {
             patch: outcome.patch,
             actuations: outcome.actuations,
-            events: outcome.events.into_iter().map(|event| convoy_object_event(obj, event)).collect(),
             // A held Done rechecks at the engine delivery adapter's pace: no
             // Message watch wakes this reconciler when the turn is delivered.
             requeue_after: prepared

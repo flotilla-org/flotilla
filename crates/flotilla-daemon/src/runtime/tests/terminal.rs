@@ -226,7 +226,8 @@ async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable
         profile.host_id.clone(),
         profile.host_direct_environment_name(),
     ));
-    let events = backend.clone().using::<flotilla_resources::Event>(NAMESPACE);
+    // A failed reconcile is counted with the controller's failures and traced, not stored.
+    let metrics = Arc::new(flotilla_store::load_metrics::ControllerLoadMetrics::default());
     let loop_task = tokio::spawn(
         ControllerLoop {
             primary: sessions.clone(),
@@ -236,27 +237,14 @@ async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable
             resync_interval: Duration::from_secs(3600),
             backend,
         }
-        .run(),
+        .run_observed(Arc::clone(&metrics)),
     );
 
     // Each attempt is awaited until the controller records its failure, so the next one is due
     // when the clock next moves. An attempt takes as many polls as the restarted daemon's other
     // tasks leave it, so a fixed number of yields does not cover it under load, and an attempt
     // that finishes after the clock moves pushes every later one past the test's last step.
-    let attempts = || async {
-        events
-            .list()
-            .await
-            .map(|events| {
-                events
-                    .items
-                    .iter()
-                    .filter(|event| event.spec.reason == "ReconcileFailed" && event.spec.regarding.name == session_name)
-                    .map(|event| event.spec.count)
-                    .sum::<u64>()
-            })
-            .unwrap_or(0)
-    };
+    let attempts = || async { metrics.failures.get() };
     for (attempt, delay) in [0, 60, 120, 240, 480].into_iter().enumerate() {
         if delay > 0 {
             tokio::time::advance(Duration::from_secs(delay)).await;

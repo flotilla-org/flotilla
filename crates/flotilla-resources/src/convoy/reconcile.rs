@@ -752,7 +752,8 @@ fn checkout_expectation_is_discharged(
         })
 }
 
-pub fn convoy_object_event(obj: &ResourceObject<Convoy>, event: ConvoyEvent) -> crate::ObjectEvent {
+/// Traces one convoy transition; transitions are telemetry, not stored.
+pub fn trace_convoy_event(obj: &ResourceObject<Convoy>, event: ConvoyEvent) {
     let (reason, message) = match event {
         ConvoyEvent::LandingEntered { entry } => ("ConvoyLandingEntered", format!("landing at {}: {}", entry.entered_at, entry.reason())),
         ConvoyEvent::PhaseChanged { from, to } => ("ConvoyPhaseChanged", format!("convoy phase changed from {from:?} to {to:?}")),
@@ -769,9 +770,7 @@ pub fn convoy_object_event(obj: &ResourceObject<Convoy>, event: ConvoyEvent) -> 
         }
         ConvoyEvent::MissingInput { name } => ("WorkflowInputMissing", format!("required workflow input {name} is missing")),
     };
-    let mut event = crate::ObjectEvent::for_object(obj, reason, message);
-    event.related_labels.insert(CONVOY_LABEL.to_string(), obj.metadata.name.clone());
-    event
+    tracing::info!(convoy = %obj.metadata.name, namespace = %obj.metadata.namespace, reason, %message, "convoy event");
 }
 
 /// Test-support reconcile entry that carries no vessel, checkout,

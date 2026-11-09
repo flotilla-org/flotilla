@@ -19,12 +19,12 @@ use std::{
 use flotilla_charter::charter_store::read_charter_source;
 use flotilla_resources::{
     manifest_roots::{ManifestRoots, PassReport, RootDeclaration, RootView},
-    CharterSource, DocumentKey, DocumentPhase, DocumentState, EventRegarding, ManifestRootSpec, ObjectEvent, ResolutionAction,
-    ResolutionOutcome, ResourceError, MANAGED_BY_LABEL,
+    CharterSource, DocumentKey, DocumentPhase, DocumentState, ManifestRootSpec, ResolutionAction, ResolutionOutcome, ResourceError,
+    MANAGED_BY_LABEL,
 };
 use flotilla_store::{
     apply_manifest_resource_document, delete_resource_kind, get_resource_kind, resource_document_spec_hash, validate_resource_document,
-    EventRecorder, OldStoreManifestRoots, ResourceBackend,
+    OldStoreManifestRoots, ResourceBackend,
 };
 use flotilla_vcs::vcs::Vcs;
 use serde::Deserialize;
@@ -110,7 +110,6 @@ pub struct ResourceManifestReconciler {
     vcs: Option<Arc<dyn Vcs>>,
     warned_unmanaged: HashSet<ObjectIdentity>,
     warned_drift: HashSet<(ObjectIdentity, String, Option<String>)>,
-    events: EventRecorder,
 }
 
 pub(crate) fn manifest_root_name(host: &str, path: &Path, source: &str) -> String {
@@ -160,7 +159,6 @@ pub(crate) async fn materialize_bound_manifest_root(
 impl ResourceManifestReconciler {
     pub(crate) fn new(backend: ResourceBackend, default_namespace: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
-            events: EventRecorder::new(backend.clone()),
             roots: Arc::new(OldStoreManifestRoots::new(backend.clone())),
             backend,
             default_namespace: default_namespace.into(),
@@ -630,7 +628,6 @@ impl ResourceManifestReconciler {
         };
         let previous_cause = (previous.phase == DocumentPhase::Orphaned).then(|| previous.reason.as_deref().map(orphan_cause)).flatten();
         if previous_cause != Some(cause) {
-            self.record_refusal_event(&identity, "ManifestPruneRefused", format!("{}: removed in {removed_in}: {reason}", key.path)).await;
             warn!(object = %identity, source = %self.source, path = %key.path, %reason, "manifest document removed; its resource is orphaned");
         }
         report.orphaned += 1;
@@ -827,12 +824,6 @@ impl ResourceManifestReconciler {
             ));
         }
         if labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(MANIFEST_MANAGED_BY_VALUE) {
-            self.record_refusal_event(
-                identity,
-                "ManifestAdoptionRefused",
-                format!("{}: manifest names an unmanaged object", path.display()),
-            )
-            .await;
             if self.warned_unmanaged.insert(identity.clone()) {
                 warn!(object = %identity, source = %self.source, path = %path.display(), "manifest names an unmanaged object; refusing adoption");
             }
@@ -848,12 +839,6 @@ impl ResourceManifestReconciler {
         }
         self.warned_unmanaged.remove(identity);
         if baseline.as_deref() != Some(live_hash.as_str()) {
-            self.record_refusal_event(
-                identity,
-                "ManifestOverwriteRefused",
-                format!("{}: manifest-managed object has live drift", path.display()),
-            )
-            .await;
             if self.warned_drift.insert((identity.clone(), live_hash.clone(), baseline.clone())) {
                 warn!(object = %identity, live_digest = %live_hash, "manifest-managed object has live drift; refusing overwrite");
             }
@@ -883,23 +868,6 @@ impl ResourceManifestReconciler {
     fn clear_warnings(&mut self, identity: &ObjectIdentity) {
         self.warned_unmanaged.remove(identity);
         self.warned_drift.retain(|(warned, _, _)| warned != identity);
-    }
-
-    async fn record_refusal_event(&self, identity: &ObjectIdentity, reason: &str, message: String) {
-        let event = ObjectEvent {
-            regarding: EventRegarding {
-                api_version: "flotilla.work/v1".to_string(),
-                kind: identity.kind.clone(),
-                namespace: identity.namespace.clone(),
-                name: identity.name.clone(),
-            },
-            reason: reason.to_string(),
-            message,
-            related_labels: BTreeMap::new(),
-        };
-        if let Err(error) = self.events.record(event, chrono::Utc::now()).await {
-            warn!(object = %identity, %error, "failed to record manifest refusal event");
-        }
     }
 
     async fn adopt_live_spec(&self, source: &Path, identity: &ObjectIdentity, existing: &Value) -> Result<(), String> {
