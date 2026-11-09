@@ -156,6 +156,35 @@ CREATE VIEW "ensure_created_view" AS SELECT
   "ensure_created"."ensure",
   (SELECT "s" FROM "strings" WHERE "id" = "ensure_created"."value") AS "value"
 FROM "ensure_created";
+CREATE TABLE "terminal_launch_facts" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "endpoint_runtime_root" TEXT,
+  "endpoint_daemon" TEXT,
+  "agent_adapter" INTEGER REFERENCES "strings" ("id"),
+  "agent_model" TEXT,
+  "agent_stance" TEXT,
+  "build_jobs" INTEGER,
+  CHECK (CASE WHEN "endpoint_runtime_root" IS NOT NULL
+      THEN "endpoint_daemon" IS NOT NULL
+      ELSE "endpoint_daemon" IS NULL
+      END),
+  CHECK (CASE WHEN "agent_adapter" IS NOT NULL
+      THEN "agent_stance" IS NOT NULL
+      ELSE "agent_model" IS NULL
+      AND "agent_stance" IS NULL
+      END)
+) STRICT;
+CREATE VIEW "terminal_launch_facts_view" AS SELECT
+  "terminal_launch_facts"."id",
+  "terminal_launch_facts"."version",
+  "terminal_launch_facts"."endpoint_runtime_root",
+  "terminal_launch_facts"."endpoint_daemon",
+  (SELECT "s" FROM "strings" WHERE "id" = "terminal_launch_facts"."agent_adapter") AS "agent_adapter",
+  "terminal_launch_facts"."agent_model",
+  "terminal_launch_facts"."agent_stance",
+  "terminal_launch_facts"."build_jobs"
+FROM "terminal_launch_facts";
 CREATE TABLE "terminal_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

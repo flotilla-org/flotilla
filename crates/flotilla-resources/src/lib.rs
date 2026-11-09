@@ -101,6 +101,7 @@ pub mod retention;
 mod review_bundle;
 mod status_patch;
 pub mod terminal_launches;
+pub mod terminal_records;
 #[doc(hidden)]
 pub mod terminal_session;
 #[doc(hidden)]

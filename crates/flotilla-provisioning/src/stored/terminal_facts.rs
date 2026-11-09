@@ -1,13 +1,10 @@
-//! PROPOSAL for the owner's schema look-over (#3108): the record a TerminalSession launch needs
-//! beside its request once the engine is its single writer. Nothing registers it in a production
-//! registry and nothing reads or writes it; [`super::terminal_proposal_registry`] exists only so
-//! its DDL and view can be shown.
+//! The record a TerminalSession launch needs beside its request (#3108, owner's look-over): what
+//! the launch was given when it was realised.
 //!
-//! Not proposed, by the owner's rulings: composer drafts (the terminal pool holds set-aside text
-//! in memory), environment usability (the TerminalSession controller reads it from the
-//! environment's provider in memory, as the Environment and Clone controllers read theirs, since
-//! a session and its environment share a home and nothing else reads it), and progress, liveness
-//! and screen readings (in memory at the adapter, traced).
+//! Not stored, by the owner's rulings: composer drafts (the terminal pool holds set-aside text in
+//! memory), environment usability (the TerminalSession controller reads it from the environment's
+//! record, as the Clone controller reads its environment's), and progress, liveness and screen
+//! readings (in memory at the adapter, traced).
 
 use flotilla_schema::Stored;
 

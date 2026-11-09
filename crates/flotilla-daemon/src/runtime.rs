@@ -1323,6 +1323,7 @@ async fn open_provisioning_lifecycles(
         environments::EngineEnvironments,
         launch_log::{LaunchLog, StagedFacts},
         reads::{LifecycleReadPort, StoreReads},
+        terminals::EngineTerminals,
         vessel::PlacementLifecycles,
         LifecycleHome, ProvisioningLifecycles,
     };
@@ -1378,15 +1379,19 @@ async fn open_provisioning_lifecycles(
     let clone_changes = clones.follow(daemon.decided_store()?)?;
     // Every checkout reader and requester goes through the engine's checkouts.
     let checkout_changes = lifecycles.checkout_records.follow(daemon.decided_store()?)?;
+    // Terminal-session readers read the engine's launches.
+    let terminals = Arc::new(EngineTerminals::over(Arc::clone(&lifecycles.terminal_sessions) as _, daemon.decided_store()?));
+    let terminal_changes = terminals.follow(daemon.decided_store()?)?;
     daemon.install_lifecycle_reads(Arc::new(
         LifecycleReadPort::new(StoreReads::new(store), home)
             .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>)
             .with_clones(clones as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
-            .with_checkouts(Arc::clone(&lifecycles.checkout_records) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>),
+            .with_checkouts(Arc::clone(&lifecycles.checkout_records) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
+            .with_terminals(terminals as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>),
     ))?;
     // Cached checkout providers end with the checkout launches they belong to.
     daemon.follow_checkout_provider_lifetimes()?;
-    Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes]))
+    Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes, terminal_changes]))
 }
 
 /// Which seats a vessel serves (#3629 layer 8): its sessions by their vessel label, with each role

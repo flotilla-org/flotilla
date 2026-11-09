@@ -59,6 +59,7 @@ pub mod reads;
 pub mod repositories;
 pub mod repository_import;
 pub mod terminal_session;
+pub mod terminals;
 #[cfg(test)]
 mod tests;
 pub mod vessel;

@@ -154,16 +154,23 @@ pub struct LifecycleReadPort {
     clones: Option<Arc<dyn flotilla_resources::clone_records::CloneRecords>>,
     checkouts: Option<Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>>,
     agent_sessions: Option<Arc<dyn flotilla_resources::agent_activity::AgentSessionReads>>,
+    terminals: Option<Arc<dyn flotilla_resources::terminal_records::TerminalRecords>>,
 }
 
 impl LifecycleReadPort {
     pub fn new(reads: StoreReads, home: String) -> Self {
-        Self { reads, home, environments: None, clones: None, checkouts: None, agent_sessions: None }
+        Self { reads, home, environments: None, clones: None, checkouts: None, agent_sessions: None, terminals: None }
     }
 
     /// Serves `sessions` as the engine's AgentSessions.
     pub fn with_agent_sessions(mut self, sessions: Arc<dyn flotilla_resources::agent_activity::AgentSessionReads>) -> Self {
         self.agent_sessions = Some(sessions);
+        self
+    }
+
+    /// Serves `terminals` as the engine's terminal sessions.
+    pub fn with_terminals(mut self, terminals: Arc<dyn flotilla_resources::terminal_records::TerminalRecords>) -> Self {
+        self.terminals = Some(terminals);
         self
     }
 
@@ -201,6 +208,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
 
     fn agent_sessions(&self) -> Result<&dyn flotilla_resources::agent_activity::AgentSessionReads, String> {
         self.agent_sessions.as_deref().ok_or_else(|| "this read port serves no AgentSessions".to_owned())
+    }
+
+    fn terminals(&self) -> Result<&dyn flotilla_resources::terminal_records::TerminalRecords, String> {
+        self.terminals.as_deref().ok_or_else(|| "this read port serves no terminal sessions".to_owned())
     }
 
     fn try_terminal_launch(

@@ -70,6 +70,12 @@ pub trait LifecycleReads: Send + Sync {
         Err("AgentSessions are not served without the engine".into())
     }
 
+    /// The engine's terminal sessions (#3108): every terminal session reader and requester goes
+    /// through them. Unavailable where no engine is installed.
+    fn terminals(&self) -> Result<&dyn crate::terminal_records::TerminalRecords, String> {
+        Err("terminal sessions are not served without the engine".into())
+    }
+
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
     /// `None` when the engine holds no such resource: the switch is off, or it was written before.
     ///
@@ -142,6 +148,10 @@ impl LifecycleReads for LateLifecycleReads {
 
     fn agent_sessions(&self) -> Result<&dyn crate::agent_activity::AgentSessionReads, String> {
         self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.agent_sessions()
+    }
+
+    fn terminals(&self) -> Result<&dyn crate::terminal_records::TerminalRecords, String> {
+        self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.terminals()
     }
 
     fn try_reading(

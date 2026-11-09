@@ -90,10 +90,11 @@ const SECOND: i64 = 1_000_000;
 
 /// Registers the kinds declared here into `registry`, each under the code it
 /// holds for good: Environment `ev`, ImageBuild `ib`, Clone `cl`, Checkout
-/// `ck` and TerminalSession `ts`.
+/// `ck`, TerminalSession `ts` and its launch facts `tf`.
 pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     register_provisioning(registry)?;
     registry.register::<Resource<terminal_session::TerminalSession>>()?;
+    registry.register::<terminal_facts::TerminalLaunchFacts>()?;
     account::register(registry)?;
     manifest_root::register(registry)?;
     definition::register(registry)?;
@@ -148,20 +149,11 @@ pub fn registry() -> Result<KindRegistry, RegistryError> {
 }
 
 /// The crew kinds (Track B): Vessel and Ensure, declared by the engine, and
-/// TerminalSession, for their DDL snapshot.
+/// TerminalSession with its launch facts, for their DDL snapshot.
 pub fn crew_registry() -> Result<KindRegistry, RegistryError> {
     let mut registry = KindRegistry::new();
     registry.register::<Resource<Vessel>>()?;
     registry.register::<Resource<Ensure>>()?;
-    registry.register::<Resource<terminal_session::TerminalSession>>()?;
-    Ok(registry)
-}
-
-/// PROPOSAL, for the owner's schema look-over only (#3108): the record TerminalSession launches
-/// would need on the engine ([`terminal_facts`]), beside TerminalSession. No store opens this
-/// registry.
-pub fn terminal_proposal_registry() -> Result<KindRegistry, RegistryError> {
-    let mut registry = KindRegistry::new();
     registry.register::<Resource<terminal_session::TerminalSession>>()?;
     registry.register::<terminal_facts::TerminalLaunchFacts>()?;
     Ok(registry)
