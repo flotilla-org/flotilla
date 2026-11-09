@@ -1207,12 +1207,12 @@ async fn reconnect_loop_bounds_real_unsupported_watch_errors() {
 async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_discovery_testkit::fake_discovery;
-    use flotilla_resources::{ChangeRequest, K8sResourceObject, ResourceObject, WatchEvent};
+    use flotilla_resources::{ChangeRequest, InputMeta, K8sResourceObject, ResourceObject};
     use flotilla_store::ResourceBackend;
     let tmp = tempfile::tempdir().expect("config");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-namespace-2523\"\n").expect("config");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let daemon: Arc<dyn DaemonHandle> = InProcessDaemon::new_with_resource_backend(
+    let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::new(ConfigStore::with_base(tmp.path())),
         fake_discovery(false),
@@ -1221,6 +1221,10 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // ChangeRequest is served by the engine, which keeps no namespaces: a watch of any namespace
+    // streams its records, labelled with that namespace.
+    let observations = daemon.resource_backend().using::<ChangeRequest>("new-island");
+    let daemon: Arc<dyn DaemonHandle> = daemon;
     let mut state = ConnectorState::default();
     let mut watched = BTreeSet::new();
     let mut tasks = tokio::task::JoinSet::new();
@@ -1233,8 +1237,14 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
         serde_json::from_value::<K8sResourceObject<ChangeRequest>>(json).expect("typed observation"),
     )
     .expect("observation");
-    let writer = backend.replica_writer::<ChangeRequest>(flotilla_protocol::NodeId::new("kiwi"), "new-island");
-    writer.apply(WatchEvent::Added(object.clone()), chrono::Utc::now()).await.expect("pre-existing replica");
+    let created = observations
+        .create(&InputMeta::builder().name(object.metadata.name.clone()).build(), &object.spec)
+        .await
+        .expect("pre-existing observation");
+    observations
+        .update_status(&object.metadata.name, &created.metadata.resource_version, object.status.as_ref().expect("status"))
+        .await
+        .expect("pre-existing observation status");
     let mut row = linked_subject_convoy();
     row.resource.namespace = "new-island".into();
     state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
@@ -1245,7 +1255,11 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
     ensure_resource_watches(&daemon, &mut state, &mut watched, &mut tasks, &tx).await.expect("discover namespace");
     assert_eq!(state.resources.projection().change_requests.len(), 1, "own initial snapshot bootstrapped the replica");
     object.status.as_mut().expect("status").state.value = Some(flotilla_resources::ObservedChangeRequestState::Merged);
-    writer.apply(WatchEvent::Modified(object.clone()), chrono::Utc::now()).await.expect("update");
+    let current = observations.get(&object.metadata.name).await.expect("observation");
+    observations
+        .update_status(&object.metadata.name, &current.metadata.resource_version, object.status.as_ref().expect("status"))
+        .await
+        .expect("update");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             rx.recv().await.expect("update channel").expect("watch event").apply(&mut state).expect("apply");
@@ -1258,7 +1272,7 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
     })
     .await
     .expect("update not lost");
-    writer.apply(WatchEvent::Deleted(object), chrono::Utc::now()).await.expect("deletion");
+    observations.delete(&object.metadata.name).await.expect("deletion");
     tokio::time::timeout(Duration::from_secs(2), async {
         while !state.resources.projection().change_requests.is_empty() {
             rx.recv().await.expect("update channel").expect("watch event").apply(&mut state).expect("apply");
