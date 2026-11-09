@@ -286,6 +286,7 @@ mod tests {
 
     // #1769: CLI preflight resolves aliases and slugs to the same Repository key,
     // and cwd is optional outside observed checkouts; no path is adopted by lookup.
+    #[cfg(unix)]
     #[tokio::test]
     async fn cli_repository_preflight_uses_durable_identity() {
         use std::sync::Arc;
@@ -315,6 +316,8 @@ mod tests {
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
+        // Path lookups read the engine's checkouts, as a composed daemon's do.
+        flotilla_daemon_testkit::engine::engine(&daemon);
         let backend = daemon.resource_backend();
         let spec = RepositorySpec::remote("https://github.com/acme/widgets").expect("repository");
         let key = spec.key();
