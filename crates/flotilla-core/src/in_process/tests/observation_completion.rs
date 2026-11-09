@@ -278,28 +278,28 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
 }
 
 #[tokio::test]
-async fn completion_discovers_pr_without_refusal_or_escalation() {
-    completion_claim_observation_case(false, false, false).await;
+async fn submission_discovers_pr_without_refusal_or_escalation() {
+    pr_submission_observation_case(false, false, false).await;
 }
 
-// #3586: advisory completion succeeds without forge observation during a limit.
+// #3586: a PR submission succeeds without forge observation during a limit.
 #[tokio::test(start_paused = true)]
-async fn rate_limited_completion_is_advisory() {
-    completion_claim_observation_case(true, false, false).await;
+async fn rate_limited_submission_succeeds() {
+    pr_submission_observation_case(true, false, false).await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn completion_with_missing_non_forge_evidence_is_advisory() {
-    completion_claim_observation_case(true, true, false).await;
+async fn submission_with_missing_non_forge_evidence_succeeds() {
+    pr_submission_observation_case(true, true, false).await;
 }
 
-// #3586: mixed observation failures cannot turn advisory completion into a refusal.
+// #3586: mixed observation failures cannot turn a PR submission into a refusal.
 #[tokio::test(start_paused = true)]
-async fn completion_with_mixed_observation_errors_is_advisory() {
-    completion_claim_observation_case(false, false, true).await;
+async fn submission_with_mixed_observation_errors_succeeds() {
+    pr_submission_observation_case(false, false, true).await;
 }
 
-async fn completion_claim_observation_case(rate_limited: bool, missing_artifact: bool, mixed: bool) {
+async fn pr_submission_observation_case(rate_limited: bool, missing_artifact: bool, mixed: bool) {
     #[derive(Default)]
     struct DeliveredTurns(std::sync::Mutex<Vec<flotilla_crew::leaf_engine::CrewTurnIntent>>);
     #[async_trait]
@@ -522,28 +522,26 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         vessel_ref: Some("refused-claim-vessel".to_string()),
         role: Some("coder".to_string()),
     };
-    let claim = || {
-        daemon.crew_complete_with_disposition_internal(
+    let submit = || {
+        daemon.crew.promise(
             &context,
-            Some("https://github.com/flotilla-org/flotilla/pull/2200".to_string()),
-            None,
-            Some("https://github.com/flotilla-org/flotilla/pull/2200#issuecomment-1".to_string()),
+            flotilla_protocol::commands::CrewPromiseOperation::Submit {
+                promise: None,
+                kind: "pr".into(),
+                reference: "https://github.com/flotilla-org/flotilla/pull/2200".into(),
+                metadata: Default::default(),
+            },
         )
     };
     // #3586: even conflicts, rate limits and missing non-forge evidence do not
-    // make the advisory command refuse, observe the forge, or escalate.
+    // make a PR submission refuse, observe the forge, or escalate.
     runner.rate_limit_all.store(rate_limited, Ordering::SeqCst);
     runner.mixed_history_errors.store(mixed, Ordering::SeqCst);
     let calls = runner.calls.lock().unwrap().len();
     for _ in 0..3 {
-        let advisory = claim().await.expect("advisory succeeds");
-        assert!(
-            matches!(advisory, flotilla_protocol::CommandValue::CrewCompletionAdvisory { ref pending }
-            if pending.iter().any(|p| p.contains("waiting on PR merge"))),
-            "{advisory:?}"
-        );
+        submit().await.expect("submission succeeds");
     }
-    assert_eq!(runner.calls.lock().unwrap().len(), calls, "advisory does not poll the forge");
+    assert_eq!(runner.calls.lock().unwrap().len(), calls, "a submission does not poll the forge");
     let status = convoys.get("refused-claim").await.unwrap().status.unwrap();
     assert!(status.subjects.iter().any(|entry| entry.subject.id == "2200"));
     assert!(status.crew_work["work"]["coder"].completion_refusal.is_none());

@@ -125,7 +125,15 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
                 assert_eq!(crew.crew_list_internal(&context).await.expect("orientation").members.len(), 1);
             }
             "complete" => {
-                crew.complete(&context, None, None, Some("https://example.test/ledger".into()), false, None).await.expect("completion");
+                crew.complete(
+                    &context,
+                    None,
+                    None,
+                    Some("https://example.test/ledger".into()),
+                    Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
+                )
+                .await
+                .expect("completion");
             }
             "teardown" => {
                 crew.teardown("flotilla", "crew", false).await.expect("teardown");
@@ -215,7 +223,15 @@ async fn completion_advisory_does_not_write_claim_evidence() {
         )
         .await
         .expect("replica artifact");
-    crew.complete(&command_context(), None, None, Some("https://example.test/ledger".into()), false, None).await.expect("complete");
+    crew.complete(
+        &command_context(),
+        None,
+        None,
+        Some("https://example.test/ledger".into()),
+        Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
+    )
+    .await
+    .expect("complete");
     let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
     assert!(convoy.status.expect("status").crew_work["work"]["coder"].decision_ledger_digest.is_none());
 }
@@ -235,7 +251,14 @@ async fn completion_refreshes_caller_after_lock_wait() {
     let guard = lock.lock().await;
     let before = backend.read_calls().get("TerminalSession").copied().unwrap_or_default();
     let task = tokio::spawn(async move {
-        crew.complete(&command_context(), None, None, Some("https://example.test/ledger".into()), false, None).await
+        crew.complete(
+            &command_context(),
+            None,
+            None,
+            Some("https://example.test/ledger".into()),
+            Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
+        )
+        .await
     });
     // Read observation synchronizes the interleaving. The timeout is a harness
     // deadlock guard, not a request-performance assertion.

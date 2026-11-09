@@ -33,7 +33,6 @@ define_resource!(
         "metadata.name",
         "status.phase",
         "status.crew.id",
-        "status.completion_pending.authority",
         "spec.role",
         "spec.env_ref",
         "spec.source.context.convoy",
@@ -398,11 +397,6 @@ pub struct TerminalSessionStatus {
     /// seat. Cleat's attachment state is authoritative for this observation.
     #[serde(default)]
     pub occupancy: TerminalOccupancy,
-    /// A crew completion accepted by this host but not yet acknowledged by
-    /// the convoy authority. The local terminal session owns this durable
-    /// intent so a daemon restart or mesh partition cannot lose the final act.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion_pending: Option<CrewCompletionPending>,
     /// Set when the controller exhausts its budget for one repeated reconcile
     /// error. The controller may either park or continue retrying with backoff,
     /// according to its error policy.
@@ -414,22 +408,6 @@ pub struct TerminalSessionStatus {
     /// roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_unreachable: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CrewCompletionPending {
-    pub message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disposition: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decision_ledger_ref: Option<String>,
-    #[serde(default)]
-    pub force: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub principal_ref: Option<flotilla_protocol::PrincipalRef>,
-    pub attempted_at: DateTime<Utc>,
-    pub authority: String,
-    pub last_error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -864,11 +842,21 @@ mod tests {
         assert!(first.should_replace_with(&refresh));
     }
 
-    // Composer drafts are held in memory now; a stored status that saved some still decodes.
+    // Composer drafts are held in memory now, and a crew completion is no longer queued for an
+    // unreachable home; a stored status that saved either still decodes.
     #[test]
-    fn status_with_retired_stashed_drafts_still_decodes() {
-        let status: TerminalSessionStatus =
-            serde_json::from_value(serde_json::json!({ "phase": "Running", "stashed_drafts": ["half a thought"] })).expect("decodes");
+    fn status_with_retired_stashed_drafts_and_pending_completion_still_decodes() {
+        let status: TerminalSessionStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Running",
+            "stashed_drafts": ["half a thought"],
+            "completion_pending": {
+                "message": "https://github.com/flotilla-org/flotilla/pull/1300",
+                "attempted_at": "2026-08-01T12:00:00Z",
+                "authority": "kiwi",
+                "last_error": "authority unreachable for convoy-a"
+            }
+        }))
+        .expect("decodes");
         assert_eq!(status.phase, TerminalSessionPhase::Running);
     }
 }

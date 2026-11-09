@@ -1966,7 +1966,7 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
 }
 
 #[tokio::test]
-async fn crew_completion_partition_is_queued_and_names_the_unreachable_authority() {
+async fn crew_completion_to_an_unreachable_home_fails_and_queues_nothing() {
     let (_tmp, daemon) = empty_daemon().await;
     let home = HostName::new("feta");
     apply_convoy_replica_feed(&daemon, "flotilla", "stranded", home.clone()).await;
@@ -2028,97 +2028,37 @@ async fn crew_completion_partition_is_queued_and_names_the_unreachable_authority
     }
     let router = empty_remote_command_router(&daemon, &peer_manager);
 
-    let error = router
-        .dispatch_execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() },
-                    message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
-                    disposition: None,
-                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1300#issuecomment-1".into()),
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect_err("partitioned completion should report that it was queued");
-
-    assert_eq!(
-        error,
-        "completion pending: authority unreachable for stranded at feta: connect to feta at ssh://feta.example: outbound channel closed"
-    );
-    // Waiting on CrewCompletion (owner look-over pending): the queued intent's durable record names
-    // authority `feta` and an error containing "authority unreachable for stranded". It lived on
-    // the retired TerminalSessionStatus.completion_pending; restore these asserts against it.
-
-    router
-        .dispatch_execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() },
-                    message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
-                    disposition: None,
-                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1301#issuecomment-2".into()),
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect_err("corrected completion should remain queued during the partition");
-    // Waiting on CrewCompletion (owner look-over pending): the queued intent's durable record carries
-    // the corrected message (pull/1301) and decision ledger ref (pull/1301#issuecomment-2).
+    let forced = || {
+        Command::builder()
+            .action(CommandAction::CrewComplete {
+                context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() },
+                message: Some("operator verdict".into()),
+                disposition: None,
+                decision_ledger_ref: None,
+            })
+            .build()
+    };
+    // A forced completion to an unreachable convoy home fails, naming the home; nothing is
+    // queued, so nothing is sent once the route heals.
+    let error = router.dispatch_execute(forced()).await.expect_err("partitioned completion fails");
+    assert!(error.contains("convoy flotilla/stranded is homed at feta") && error.contains("home is unreachable"), "{error}");
+    assert!(error.contains("connect to feta at ssh://feta.example: outbound channel closed"), "{error}");
 
     let delivered = Arc::new(StdMutex::new(Vec::new()));
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(CapturePeerSender(Arc::clone(&delivered))));
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if !delivered.lock().expect("delivered lock").is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("queued completion should retry when the authority route heals");
+    // Longer than the retired outbox's first retry (1 s).
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(delivered.lock().expect("delivered lock").is_empty(), "a failed completion is not retried");
 
-    let request_id = match delivered.lock().expect("delivered lock").first().expect("retried command") {
-        PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, command, .. }) => {
-            assert!(matches!(
-                &command.action,
-                CommandAction::CrewComplete { message: Some(message), .. }
-                    if message == "https://github.com/flotilla-org/flotilla/pull/1301"
-            ));
+    router.dispatch_execute(forced()).await.expect("a reachable home receives the completion");
+    let request_id = match delivered.lock().expect("delivered lock").as_slice() {
+        [PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, command, .. })] => {
+            assert!(matches!(&command.action, CommandAction::CrewComplete { .. }));
             *request_id
         }
-        other => panic!("expected retried crew completion, got {other:?}"),
+        other => panic!("expected one routed crew completion, got {other:?}"),
     };
-    router.complete_remote_command(request_id, node("feta"), CommandValue::Error { message: "crew work no longer exists".into() }).await;
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert_eq!(delivered.lock().expect("delivered lock").len(), 1, "permanent authority rejection must not retry");
-    // Waiting on CrewCompletion (owner look-over pending): the queued intent's durable record is retired
-    // by the authority's rejection.
-
-    router
-        .dispatch_execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() },
-                    message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
-                    disposition: None,
-                    decision_ledger_ref: None,
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect("reachable authority should accept a fresh completion");
-    let request_id = match delivered.lock().expect("delivered lock").get(1).expect("fresh completion") {
-        PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, .. }) => *request_id,
-        other => panic!("expected fresh crew completion, got {other:?}"),
-    };
-    router.complete_remote_command(request_id, node("feta"), CommandValue::CrewCompletionAdvisory { pending: vec![] }).await;
-    // Waiting on CrewCompletion (owner look-over pending): the queued intent's durable record is retired
-    // by the authority's successful acknowledgement.
+    router.complete_remote_command(request_id, node("feta"), CommandValue::Ok).await;
 
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(FailingPeerSender));
     // Both live crew queries route to the authority and report partitions;
@@ -2465,7 +2405,6 @@ async fn command_target_resolver_keeps_reads_local_and_routes_explicit_delivery(
                 message: None,
                 disposition: None,
                 decision_ledger_ref: None,
-                force: false,
             },
             None,
         )
@@ -6219,39 +6158,17 @@ fn placed_caller_claims(daemon: &InProcessDaemon) -> HashMap<String, String> {
     ])
 }
 
-async fn caller_can_stall_and_complete(daemon: &InProcessDaemon, caller: flotilla_protocol::CommandCaller) {
+async fn caller_can_stall_and_promise(daemon: &InProcessDaemon, caller: flotilla_protocol::CommandCaller) {
     let backend = daemon.resource_backend();
     let convoys = backend.using::<Convoy>("flotilla");
     let convoy = convoys.get("own").await.unwrap();
     let mut status = convoy.status.unwrap();
     let coder = &mut status.workflow_snapshot.as_mut().unwrap().vessels[0].crew[0];
-    // This identity scenario has no PR deliverable. It still supplies real
-    // admitted ledger metadata, so completion exercises the normal lifecycle.
+    // This identity scenario has no PR deliverable.
     coder.deliverer = false;
     coder.completion_conditions.clear();
     coder.promises.clear();
     convoys.update_status("own", &convoy.metadata.resource_version, &status).await.unwrap();
-    let name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::artifact_address("own", "coder", "decision-ledger", "own").expect("artifact address"),
-    )
-    .expect("record name");
-    backend
-        .using::<flotilla_resources::Artifact>("flotilla")
-        .create(
-            &InputMeta::builder().name(name).build(),
-            &flotilla_resources::ArtifactSpec::builder()
-                .convoy("own".into())
-                .producer("coder".into())
-                .kind("decision-ledger".into())
-                .subject("own".into())
-                .digest("admitted-ledger".into())
-                .size(1)
-                .media_type("text/markdown".into())
-                .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
-                .build(),
-        )
-        .await
-        .unwrap();
     let context = CrewCommandContext { crew_id: caller.crew.as_ref().map(|crew| crew.crew_id.clone()), ..Default::default() };
     for action in [
         CommandAction::CrewStall {
@@ -6260,32 +6177,28 @@ async fn caller_can_stall_and_complete(daemon: &InProcessDaemon, caller: flotill
             proposed_disposition: None,
             message: "waiting for dependency".into(),
         },
-        CommandAction::CrewComplete { context, message: Some("done".into()), disposition: None, decision_ledger_ref: None, force: false },
+        CommandAction::CrewPromise {
+            context,
+            operation: flotilla_protocol::commands::CrewPromiseOperation::Promise { id: "follow-up".into(), kind: "pr".into() },
+        },
     ] {
         let stalling = matches!(action, CommandAction::CrewStall { .. });
         let mut events = daemon.subscribe();
         let id = daemon.execute_for_caller(Command::builder().action(action).build(), Some(caller.clone())).await.unwrap();
         let event = super::environment_connection::command_completion(&mut events, id).await.unwrap();
-        assert!(
-            matches!(&event, DaemonEvent::CommandFinished { result, .. }
-            if if stalling { matches!(result, CommandValue::Ok) } else { matches!(result, CommandValue::CrewCompletionAdvisory { .. }) }),
-            "{event:?}"
-        );
+        assert!(matches!(&event, DaemonEvent::CommandFinished { result: CommandValue::Ok, .. }), "{event:?}");
         let status = convoys.get("own").await.unwrap().status.unwrap();
-        let work = &status.crew_work["work"]["coder"];
-        if stalling {
-            assert_eq!(work.phase, flotilla_resources::CrewWorkPhase::Stalled);
-        } else {
-            assert_eq!(work.phase, flotilla_resources::CrewWorkPhase::Stalled);
-            assert!(work.completion_refusal.is_none());
+        assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Stalled);
+        if !stalling {
+            assert!(flotilla_resources::promises::owned(&status, "work", "coder").iter().any(|promise| promise.id == "follow-up"));
         }
     }
 }
 
 // Host-direct is out of scope: keep its existing variable-derived crew identity
-// and prove both stall and completion still persist through the real lifecycle.
+// and prove both a stall and a promise still persist through the real lifecycle.
 #[tokio::test]
-async fn host_direct_caller_keeps_crew_completion_and_stall() {
+async fn host_direct_caller_keeps_crew_stall_and_promise() {
     let (_tmp, daemon) = placed_crew_daemon("host-direct-fixture").await;
     let environments = engine_environments(&daemon);
     let host_direct = serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
@@ -6312,7 +6225,7 @@ async fn host_direct_caller_keeps_crew_completion_and_stall() {
     let resolution = super::caller::resolve_main_caller(&daemon, evidence, &placed_caller_claims(&daemon), None).await.unwrap();
     assert!(!resolution.transport_bound);
     assert_eq!(resolution.caller.crew.as_ref().unwrap().crew_id, launch_of(&daemon, "placed-session"));
-    caller_can_stall_and_complete(&daemon, resolution.caller).await;
+    caller_can_stall_and_promise(&daemon, resolution.caller).await;
 }
 
 // A pre-#3270 mount set continues to work independently of socket adoption.
@@ -6339,7 +6252,7 @@ async fn legacy_mount_caller_keeps_working_until_vessel_ends() {
     let old_mounts = caller_mountinfo(&environment, false);
     let legacy = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&old_mounts)).await.unwrap();
     assert!(!legacy.transport_bound);
-    caller_can_stall_and_complete(&daemon, legacy.caller).await;
+    caller_can_stall_and_promise(&daemon, legacy.caller).await;
     // Legacy operation did not need the environment realised under the container's ID.
     // Once it is, that immutable ID enables the strict path.
     use flotilla_resources::environment_records::EnvironmentRecords;

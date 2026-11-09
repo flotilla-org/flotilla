@@ -196,33 +196,6 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     assert_eq!(initial_status.crew_work["implement"]["reviewer"].started_at, None);
     assert!(!initial_status.crew_work["implement"].contains_key("watcher"));
 
-    let mut rx = daemon.subscribe();
-    let refused_complete_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: crew_context.clone(),
-                    message: Some("delegate attempted completion".to_string()),
-                    disposition: None,
-                    decision_ledger_ref: None,
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect("dispatch refused completion");
-    assert!(matches!(wait_for_command_result(&mut rx, refused_complete_id).await,
-            CommandValue::CrewCompletionAdvisory { pending } if pending.iter().any(|p| p.contains("decision-ledger"))));
-    let after_refusal = convoys.get(&crew_record).await.expect("crew convoy after refusal").status.expect("convoy status after refusal");
-    assert_eq!(after_refusal.phase, initial_status.phase);
-    assert_eq!(after_refusal.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert!(after_refusal.crew_work["implement"]["coder"].completion_refusal.is_none());
-    assert_eq!(
-        terminals.get(&coder.metadata.name).await.expect("coder session after refusal").status.expect("coder session status").phase,
-        TerminalSessionPhase::Running,
-        "refused completion must leave the crew session alive"
-    );
-
     let ledger_name = flotilla_resources::address::record_name(
         &flotilla_resources::address::artifact_address(&crew_record, "coder", "decision-ledger", &crew_record).expect("artifact address"),
     )
@@ -249,22 +222,6 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .await
         .expect("publish coder ledger artifact");
 
-    let mut rx = daemon.subscribe();
-    let coder_complete_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: crew_context.clone(),
-                    message: Some("implementation ready".to_string()),
-                    disposition: None,
-                    decision_ledger_ref: None,
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect("coder complete");
-    assert!(matches!(wait_for_command_result(&mut rx, coder_complete_id).await, CommandValue::CrewCompletionAdvisory { .. }));
     wait_until(|| {
         let convoys = convoys.clone();
         let crew_record = crew_record.clone();
@@ -540,23 +497,6 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     )
     .await;
     let mut rx = daemon.subscribe();
-    let coder_recomplete_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some(revived_coder_id.clone()), ..Default::default() },
-                    message: Some("review findings addressed".to_string()),
-                    disposition: None,
-                    decision_ledger_ref: None,
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect("coder re-complete");
-    assert!(matches!(wait_for_command_result(&mut rx, coder_recomplete_id).await, CommandValue::CrewCompletionAdvisory { .. }));
-
-    let mut rx = daemon.subscribe();
     let return_to_reviewer_id = daemon
         .execute(
             Command::builder()
@@ -597,8 +537,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
             .expect("record observed absence of a change request");
     }
     record_successful_empty_branch_scan(&backend, &crew_record).await;
-    // This recovery fixture's reviewer has no promises. The operator override
-    // remains available; advisory completion cannot terminalize an empty role.
+    // This recovery fixture's reviewer has no promises, so only the operator's forced completion
+    // ends its part.
     assert_eq!(
         daemon
             .crew_complete_as_principal_internal(
@@ -606,8 +546,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
                 Some("changes accepted".into()),
                 None,
                 None,
-                true,
-                Some(flotilla_protocol::PrincipalRef::implicit_for_namespace(NAMESPACE)),
+                flotilla_protocol::PrincipalRef::implicit_for_namespace(NAMESPACE),
             )
             .await
             .unwrap(),

@@ -78,8 +78,7 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
                 return Err("EnvironmentCommandDenied: explicit routing is forbidden".into());
             }
             match &mut command.action {
-                CommandAction::CrewComplete { context, force: false, .. }
-                | CommandAction::CrewStall { context, .. }
+                CommandAction::CrewStall { context, .. }
                 | CommandAction::CrewPromise { context, .. }
                 | CommandAction::QueryCrewCapabilities { context }
                 | CommandAction::QueryCrewList { context }
@@ -337,7 +336,6 @@ mod tests {
                         message: None,
                         disposition: None,
                         decision_ledger_ref: None,
-                        force: true,
                     })
                     .build(),
             },

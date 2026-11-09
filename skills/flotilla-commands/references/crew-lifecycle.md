@@ -15,8 +15,8 @@ flotilla convoy CONVOY explain
 Submit PR references with `crew submit`; PR promises remain submitted until
 merge. Continue remaining promises after each merge. Your part ends when every
 promise is kept or retracted. A role holding no promises is never automatically
-Done. `crew complete` is advisory: it discovers PR URLs and reports pending
-promises, and `--force` remains the operator override.
+Done. `crew complete --force` is the operator's forced settlement; crews do not
+run it.
 If a submission is rejected, resubmit corrected evidence. To withdraw a
 submitted promise, use `flotilla crew retract --promise ID --reason REASON`;
 this opens a `retraction-proposed` stall for the supervisor's decision. Only an

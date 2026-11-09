@@ -1185,13 +1185,14 @@ impl CrewService {
         Ok(())
     }
 
+    /// An operator's forced completion of the caller's part: a verdict keeping its open promises,
+    /// attributed to `principal`. Crews report their work with `crew submit` instead.
     pub async fn complete(
         &self,
         requested: &CrewCommandContext,
         message: Option<String>,
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
-        force: bool,
         principal: Option<PrincipalRef>,
     ) -> Result<flotilla_protocol::CommandValue, String> {
         if decision_ledger_ref.as_deref().is_some_and(|reference| !(reference.starts_with("https://") || reference.starts_with("http://")))
@@ -1213,93 +1214,8 @@ impl CrewService {
         let mut convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
         // With the engine holding it, the promises read here are the engine's (#3587 layer 8).
         convoy = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, &convoy)?.into_owned();
-        // URL parsing needs every declared forge endpoint; read this catalogue once.
-        let forges = self
-            .resource_backend
-            .definitions::<Forge>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|forge| forge.spec)
-            .collect::<Vec<_>>();
-        let claim_subjects = message
-            .as_deref()
-            .into_iter()
-            .flat_map(|text| change_request_subjects_from_claim(text, &convoy.spec.repositories, &forges))
-            .collect::<BTreeSet<_>>();
         ensure_crew_work_is_defined(&convoy, &context)?;
-        // Discover submission evidence without making a completion claim.
-        // The parser admits only this convoy's repositories.
-        if !claim_subjects.is_empty() {
-            convoy = apply_resource_status_patch(
-                &convoys,
-                convoy_name,
-                &ConvoyStatusPatch::DiscoverSubjects {
-                    subjects: claim_subjects.iter().cloned().map(|subject| (subject, flotilla_protocol::Relationship::Produces)).collect(),
-                    source: flotilla_resources::SubjectDiscoverySource::Claim,
-                    at: self.clock.now(),
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        }
-        for subject in &claim_subjects {
-            if let Some(operation) = convoy.status.as_ref().and_then(|status| {
-                flotilla_resources::promises::discovered_submission(
-                    status,
-                    &context.vessel,
-                    &context.caller_role,
-                    subject,
-                    &forges,
-                    self.clock.now(),
-                )
-            }) {
-                if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
-                    engine
-                        .promise(
-                            &convoy,
-                            &context.vessel,
-                            &context.caller_role,
-                            &operation,
-                            flotilla_resources::convoy::engine::Actor::Crew,
-                        )
-                        .await?;
-                    let reread = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
-                    convoy = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, &reread)?.into_owned();
-                    continue;
-                }
-                convoy = apply_resource_status_patch(
-                    &convoys,
-                    convoy_name,
-                    &ConvoyStatusPatch::Promise { vessel: context.vessel.clone(), role: context.caller_role.clone(), operation },
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            }
-        }
-        if !force {
-            let pending = convoy
-                .status
-                .as_ref()
-                .map(|status| {
-                    flotilla_resources::promises::owned(status, &context.vessel, &context.caller_role)
-                        .iter()
-                        .filter(|promise| !promise.state.terminal())
-                        .map(|promise| {
-                            let waits_on = match (promise.kind, promise.state) {
-                                (_, flotilla_resources::promises::PromiseState::Open) => "submission",
-                                (flotilla_resources::promises::PromiseKind::Pr, _) => "PR merge",
-                                (flotilla_resources::promises::PromiseKind::DecisionLedger, _) => "decision-ledger artifact",
-                            };
-                            format!("{}: waiting on {waits_on}", promise.id)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            return Ok(CommandValue::CrewCompletionAdvisory { pending });
-        }
-        let principal = principal.ok_or_else(|| "`--force` requires an operator principal".to_string())?;
+        let principal = principal.ok_or_else(|| "a forced completion requires an operator principal".to_string())?;
         if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
             // `--force` is an operator's attributed verdict on the crew's open
             // promises (#3574 decision 8); the engine refuses what it may not keep.

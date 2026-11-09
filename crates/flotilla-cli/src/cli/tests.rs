@@ -831,26 +831,10 @@ fn convoy_explanation_subject_observations_snapshot() {
     "###);
 }
 
-// A completion wait must keep the caller pending, state the deadline, and
-// retry the original claim only when GitHub's advertised cooldown has elapsed.
-#[tokio::test(start_paused = true)]
-async fn crew_completion_wait_retries_same_claim_after_deadline() {
-    completion_wait_case(false, false).await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn cancelling_completion_wait_stops_future_claims() {
-    completion_wait_case(true, false).await;
-}
-
-// #3586: pending PR promises are advisory, exit successfully and never retry.
-// Glue: exercise the CLI's existing command-result boundary with one event.
+// A forced completion is a plain command: a failure (an unreachable convoy home) ends it, and
+// the caller never submits it again.
 #[tokio::test]
-async fn crew_completion_advisory_succeeds_without_retry() {
-    completion_wait_case(false, true).await;
-}
-
-async fn completion_wait_case(cancel: bool, advisory: bool) {
+async fn a_failed_forced_completion_is_not_retried() {
     use std::sync::{Arc, Mutex};
 
     use flotilla_protocol::{Command, CommandAction, CrewCommandContext};
@@ -871,50 +855,25 @@ async fn completion_wait_case(cancel: bool, advisory: bool) {
                 vessel_ref: Some("vessel".into()),
                 role: Some("coder".into()),
             },
-            message: Some("PR delivered".into()),
+            message: Some("operator verdict".into()),
             disposition: None,
-            decision_ledger_ref: Some("ledger".into()),
-            force: false,
+            decision_ledger_ref: None,
         },
     };
     let mut run = Box::pin(super::run_command(&daemon, command.clone(), super::OutputFormat::Json));
     // Drive subscription/dispatch before emitting the fake daemon event.
     assert!(futures::poll!(&mut run).is_pending());
-    let event = |result| DaemonEvent::CommandFinished {
+    tx.send(DaemonEvent::CommandFinished {
         command_id: 1,
         node_id: NodeId::new("node-local-test"),
         repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "".into() },
         repo: None,
-        result,
-    };
-    if advisory {
-        let result = CommandValue::CrewCompletionAdvisory { pending: vec!["template/pr: waiting on PR merge".into()] };
-        tx.send(event(result.clone())).expect("advisory event");
-        assert_eq!(run.await.expect("successful CLI result"), result);
-        assert_eq!(calls.lock().expect("calls").len(), 1);
-        assert!(format_command_result(&result).contains("template/pr: waiting on PR merge"));
-        return;
-    }
-    tx.send(event(CommandValue::CrewCompletionWaiting {
-        reason: "GitHub secondary limit".into(),
-        retry_at: chrono::Utc::now() + chrono::Duration::seconds(60),
-    }))
-    .expect("wait event");
-    assert!(futures::poll!(&mut run).is_pending());
-    tokio::time::advance(std::time::Duration::from_secs(59)).await;
-    assert!(futures::poll!(&mut run).is_pending());
-    assert_eq!(calls.lock().expect("calls").len(), 1);
-    if cancel {
-        drop(run);
-        tokio::time::advance(std::time::Duration::from_secs(120)).await;
-        assert_eq!(calls.lock().expect("calls").len(), 1, "cancelled caller must not submit another claim");
-        return;
-    }
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    assert!(futures::poll!(&mut run).is_pending());
-    assert_eq!(*calls.lock().expect("calls"), vec![command.clone(), command]);
-    tx.send(event(CommandValue::Ok)).expect("ready event");
-    assert_eq!(run.await.expect("completed claim"), CommandValue::Ok);
+        result: CommandValue::Error { message: "convoy home kiwi is unreachable".into() },
+    })
+    .expect("failure event");
+    let result = run.await.expect("the failure ends the command");
+    assert!(matches!(&result, CommandValue::Error { message } if message.contains("unreachable")), "{result:?}");
+    assert_eq!(*calls.lock().expect("calls"), vec![command]);
 }
 
 // #2498: human output abbreviates Unicode evidence; --full and JSON retain it.

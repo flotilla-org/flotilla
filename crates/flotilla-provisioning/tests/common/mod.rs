@@ -369,7 +369,6 @@ pub async fn create_stopped_terminal(
                 screen_obstruction: None,
                 turn_delivery_hold: None,
                 occupancy: Default::default(),
-                completion_pending: None,
                 degraded: None,
                 daemon_unreachable: None,
             },

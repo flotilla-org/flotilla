@@ -214,6 +214,12 @@ impl CrewNoun {
                 return Err(format!("`flotilla crew {}` does not accept completion options", subject.value));
             }
             ("complete", SubjectInterpretation::Ordinary, None) => {
+                if !self.force {
+                    return Err(
+                        "`flotilla crew complete` is an operator's forced completion and requires --force; crews report a PR with `flotilla crew submit`"
+                            .to_string(),
+                    );
+                }
                 if self.reason.is_some() {
                     return Err("--reason is only valid with `flotilla crew stall`".to_string());
                 }
@@ -232,7 +238,6 @@ impl CrewNoun {
                     message: self.message,
                     disposition: self.disposition,
                     decision_ledger_ref: self.decision_ledger_ref,
-                    force: self.force,
                 }
             }
             ("fail", SubjectInterpretation::Ordinary, None)
@@ -578,7 +583,7 @@ mod tests {
 
     #[test]
     fn complete_uses_ambient_crew_identity() {
-        let noun = CrewNoun::try_parse_from(["crew", "complete", "--message", "ready for review"]).expect("parse complete");
+        let noun = CrewNoun::try_parse_from(["crew", "complete", "--force", "--message", "ready for review"]).expect("parse complete");
         assert_eq!(
             action(noun, Some("crew-123")),
             CommandAction::CrewComplete {
@@ -586,15 +591,15 @@ mod tests {
                 message: Some("ready for review".into()),
                 disposition: None,
                 decision_ledger_ref: None,
-                force: false,
             }
         );
     }
 
     #[test]
     fn complete_preserves_declared_disposition() {
-        let noun = CrewNoun::try_parse_from(["crew", "complete", "--message", "ready for review", "--disposition", "changes-pushed"])
-            .expect("parse complete disposition");
+        let noun =
+            CrewNoun::try_parse_from(["crew", "complete", "--force", "--message", "ready for review", "--disposition", "changes-pushed"])
+                .expect("parse complete disposition");
         assert_eq!(
             action(noun, Some("crew-123")),
             CommandAction::CrewComplete {
@@ -602,7 +607,6 @@ mod tests {
                 message: Some("ready for review".into()),
                 disposition: Some("changes-pushed".into()),
                 decision_ledger_ref: None,
-                force: false,
             }
         );
     }
@@ -610,7 +614,7 @@ mod tests {
     #[test]
     fn complete_preserves_decision_ledger_pointer() {
         let url = "https://github.com/flotilla-org/flotilla/pull/1#issuecomment-2";
-        let noun = CrewNoun::try_parse_from(["crew", "complete", "--decision-ledger-ref", url]).expect("parse ledger pointer");
+        let noun = CrewNoun::try_parse_from(["crew", "complete", "--force", "--decision-ledger-ref", url]).expect("parse ledger pointer");
         assert_eq!(
             action(noun, Some("crew-123")),
             CommandAction::CrewComplete {
@@ -618,15 +622,14 @@ mod tests {
                 message: None,
                 disposition: None,
                 decision_ledger_ref: Some(url.into()),
-                force: false,
             }
         );
     }
 
     #[test]
     fn decision_ledger_pointer_must_be_a_comment_url() {
-        let noun =
-            CrewNoun::try_parse_from(["crew", "complete", "--decision-ledger-ref", "not-a-url"]).expect("parse invalid ledger pointer");
+        let noun = CrewNoun::try_parse_from(["crew", "complete", "--force", "--decision-ledger-ref", "not-a-url"])
+            .expect("parse invalid ledger pointer");
         assert_eq!(
             noun.resolve_with_crew_id(Some("crew-123".into())).expect_err("invalid pointer should fail"),
             "--decision-ledger-ref must use an HTTP(S) URL"
@@ -643,10 +646,14 @@ mod tests {
         );
     }
 
+    // Completion is only ever an operator's forced verdict; a crew reports its PR with `crew submit`.
     #[test]
-    fn complete_preserves_operator_force() {
+    fn complete_requires_operator_force() {
         let noun = CrewNoun::try_parse_from(["crew", "complete", "--force"]).expect("parse forced completion");
-        assert!(matches!(action(noun, Some("crew-123")), CommandAction::CrewComplete { force: true, .. }));
+        assert!(matches!(action(noun, Some("crew-123")), CommandAction::CrewComplete { .. }));
+        let noun = CrewNoun::try_parse_from(["crew", "complete", "--message", "PR ready"]).expect("parse unforced completion");
+        let error = noun.resolve_with_crew_id(Some("crew-123".into())).expect_err("unforced completion is refused");
+        assert!(error.contains("--force") && error.contains("flotilla crew submit"), "{error}");
     }
 
     #[test]

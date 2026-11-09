@@ -63,6 +63,6 @@ promise, retraction proposes a stall for the supplier to decide.
 
 Deliverers receive a template `pr` promise at admission. Submit your PR and
 ledger; your part ends when every promise is kept or retracted. A role holding
-no promises is never automatically Done. `crew complete` is advisory for one
-generation: it discovers PR URLs in its message and reports pending promises
-without claiming completion or refusing. `--force` remains the operator override.
+no promises is never automatically Done. Report a PR with `crew submit`;
+`crew complete --force` is the operator's forced settlement, and crews do not
+run it.

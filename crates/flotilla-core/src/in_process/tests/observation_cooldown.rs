@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
 use chrono::Utc;
-use flotilla_protocol::{CommandValue, CrewCommandContext};
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, Vessel, VesselSpec,
 };
@@ -95,7 +94,7 @@ fn convoy_branch_refresh_reuses_repository_results(tc: hegel::TestCase) {
 // a completion claim. Another crew's artifact never keeps that promise.
 #[tokio::test]
 async fn prless_decision_ledger_promise_settles_without_a_claim() {
-    let (daemon, backend, _temp, watch, _engine) = stall_test_daemon().await;
+    let (_daemon, backend, _temp, watch, _engine) = stall_test_daemon().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let created = convoys
         .create(
@@ -149,15 +148,7 @@ async fn prless_decision_ledger_promise_settles_without_a_claim() {
         )
         .await
         .expect("vessel");
-    let context = CrewCommandContext {
-        namespace: Some("flotilla".into()),
-        convoy: Some("ledger-claim".into()),
-        vessel_ref: Some("ledger-claim-vessel".into()),
-        role: Some("coder".into()),
-        ..Default::default()
-    };
-    // #3586: the ledger promise is observed and kept by reconciliation; the
-    // advisory command never writes a completion claim or its ledger digest.
+    // #3586: the ledger promise is observed and kept by reconciliation, with no completion claim.
     let current = convoys.get("ledger-claim").await.unwrap();
     for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], current.status.as_ref().unwrap()) {
         flotilla_store::apply_status_patch(
@@ -168,8 +159,6 @@ async fn prless_decision_ledger_promise_settles_without_a_claim() {
         .await
         .unwrap();
     }
-    let advisory = daemon.crew_complete_with_disposition_internal(&context, None, None, None).await.unwrap();
-    assert!(matches!(advisory, CommandValue::CrewCompletionAdvisory { .. }));
     let mut status = convoys.get("ledger-claim").await.unwrap().status.unwrap();
     let artifacts = backend.using::<flotilla_resources::Artifact>("flotilla");
     let mut observed = BTreeMap::new();

@@ -4780,34 +4780,16 @@ impl InProcessDaemon {
         self.crew.crew_list_internal(requested).await
     }
 
-    pub async fn crew_complete_internal(
-        &self,
-        requested: &CrewCommandContext,
-        message: Option<String>,
-    ) -> Result<flotilla_protocol::CommandValue, String> {
-        self.crew_complete_with_disposition_internal(requested, message, None, None).await
-    }
-
-    pub async fn crew_complete_with_disposition_internal(
-        &self,
-        requested: &CrewCommandContext,
-        message: Option<String>,
-        disposition: Option<String>,
-        decision_ledger_ref: Option<String>,
-    ) -> Result<flotilla_protocol::CommandValue, String> {
-        self.crew_complete_as_principal_internal(requested, message, disposition, decision_ledger_ref, false, None).await
-    }
-
+    /// An operator's forced completion of a crew member's part, attributed to `principal`.
     pub async fn crew_complete_as_principal_internal(
         &self,
         requested: &CrewCommandContext,
         message: Option<String>,
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
-        force: bool,
-        principal: Option<PrincipalRef>,
+        principal: PrincipalRef,
     ) -> Result<flotilla_protocol::CommandValue, String> {
-        self.crew.complete(requested, message, disposition, decision_ledger_ref, force, principal).await
+        self.crew.complete(requested, message, disposition, decision_ledger_ref, Some(principal)).await
     }
 
     pub async fn crew_fail_internal(

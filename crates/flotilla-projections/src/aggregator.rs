@@ -3045,10 +3045,6 @@ impl Aggregator {
             Some(limits) => Some(placement_limits.unwrap_or_default().with_overrides(limits)),
             None => placement_limits,
         };
-        let completion_pending = matching_sessions()
-            .filter_map(|session| session.object.status.as_ref()?.completion_pending.as_ref())
-            .min_by_key(|pending| pending.attempted_at)
-            .cloned();
         let vessel_subject = AttentionSubject::Vessel { convoy: convoy_ref.name.clone(), vessel: definition.name.clone() };
         let credential_attention = self
             .convoy_attentions(&convoy_ref.namespace, &convoy_ref.name)
@@ -3075,7 +3071,7 @@ impl Aggregator {
             // Several blocked sessions on one vessel show one, chosen
             // lexicographically (role first) so the row is stable.
             .min();
-        let surface_state = if credential_attention.is_some() || completion_pending.is_some() || obstruction.is_some() {
+        let surface_state = if credential_attention.is_some() || obstruction.is_some() {
             SurfaceState::NeedsYou
         } else if let Some(stalled) = stalled.filter(|stalled| {
             matches!(&stalled.maker, Some(flotilla_resources::LeafMaker::Actor { vessel, .. }) if vessel == &definition.name)
@@ -3136,7 +3132,6 @@ impl Aggregator {
                     state
                         .filter(|state| state.phase == ResourceWorkPhase::Interrupted)
                         .and_then(|state| state.message.clone())
-                        .or_else(|| completion_pending.map(|pending| format!("completion pending: {}", pending.last_error)))
                         .or_else(|| obstruction.clone())
                         .or_else(|| terminal_condition.clone())
                         .or_else(|| state.and_then(|state| state.message.clone()))
@@ -3745,37 +3740,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_crew_completion_is_visible_on_the_convoy() {
-        let state = AggregatorProjectionState::new();
-        let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
-
-        let mut session = session_object("terminal-convoy-a-implement").await;
-        session.metadata.labels =
-            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        session.status.as_mut().expect("running status").completion_pending = Some(flotilla_resources::CrewCompletionPending {
-            message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
-            disposition: None,
-            decision_ledger_ref: None,
-            force: false,
-            principal_ref: None,
-            attempted_at: Utc::now(),
-            authority: "kiwi".into(),
-            last_error: "authority unreachable for convoy-a".into(),
-        });
-
-        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
-
-        let result_set = state.result_set().await;
-        let convoy = result_set.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
-        assert!(convoy.surface_state.needs_attention());
-        let vessel = convoy.vessels.first().expect("vessel row");
-        assert!(vessel.surface_state.needs_attention());
-        assert_eq!(vessel.message.as_deref(), Some("completion pending: authority unreachable for convoy-a"));
-    }
-
-    #[tokio::test]
     async fn adopted_change_request_claim_does_not_raise_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
@@ -3926,16 +3890,14 @@ mod tests {
         let mut session = session_object("terminal-convoy-a-review").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "review".to_string())]);
-        session.status.as_mut().expect("session status").completion_pending = Some(flotilla_resources::CrewCompletionPending {
-            message: None,
-            disposition: None,
-            decision_ledger_ref: None,
-            force: false,
-            principal_ref: None,
-            attempted_at: Utc::now(),
-            authority: "local".into(),
-            last_error: "authority unreachable".into(),
+        // An idle crew whose composer holds text needs the operator.
+        let status = session.status.as_mut().expect("session status");
+        status.attention = Some(TerminalAttention {
+            state: TerminalAttentionState::Unobservable,
+            as_of: Utc::now(),
+            source: TerminalAttentionSource::Screen,
         });
+        status.screen_obstruction = Some(flotilla_resources::ScreenObstruction::ComposerText { reply: None, chars: 3 });
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
 
         let result = state.result_set().await;

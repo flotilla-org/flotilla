@@ -9511,94 +9511,6 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
 }
 
 #[tokio::test]
-async fn crew_completion_advisory_does_not_claim_or_consume_a_follow_up() {
-    let (_temp, _repo, daemon, engine) = daemon_for_cwd_with_engine().await;
-    let backend = daemon.resource_backend();
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("turn-boundary".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([(
-                        "coder".to_string(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                    )]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark crew working");
-    backend
-        .clone()
-        .using::<flotilla_resources::Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("work-vessel".to_string()).build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "turn-boundary".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create vessel");
-    engine.terminals.request(&crew_session_request("coder-session", "work-vessel", "coder", "coding", "test-env", "cleat"));
-    daemon
-        .convoy_resume_internal(
-            "flotilla",
-            "turn-boundary",
-            "Begin the follow-up turn",
-            Some("work"),
-            Some("coder"),
-            ResumeIntent::Reminder,
-        )
-        .await
-        .expect("queue pending brief");
-
-    let context = flotilla_protocol::CrewCommandContext {
-        crew_id: None,
-        namespace: Some("flotilla".to_string()),
-        convoy: Some("turn-boundary".to_string()),
-        vessel_ref: Some("work-vessel".to_string()),
-        role: Some("coder".to_string()),
-    };
-    let mut events = daemon.subscribe();
-    let command_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: context.clone(),
-                    message: Some("first turn complete".to_string()),
-                    disposition: Some("satisfied".to_string()),
-                    decision_ledger_ref: Some("https://example.test/pull/1#decision-ledger".to_string()),
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect("dispatch first completion");
-    assert!(matches!(recv_command_finished(&mut events, command_id).await, CommandValue::CrewCompletionAdvisory { .. }));
-    let status = convoys.get("turn-boundary").await.unwrap().status.unwrap();
-    let crew = &status.crew_work["work"]["coder"];
-    assert_eq!(crew.phase, flotilla_resources::CrewWorkPhase::Working);
-    assert!(crew.superseded_claims.is_empty());
-    assert!(crew.finished_at.is_none());
-}
-
-#[tokio::test]
 async fn convoy_explain_reports_completed_work_without_a_crew_claim() {
     let (_temp, _repo, daemon) = daemon_for_cwd().await;
     let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
@@ -9644,7 +9556,7 @@ async fn convoy_explain_reports_completed_work_without_a_crew_claim() {
 }
 
 #[tokio::test]
-async fn crew_completion_reports_pending_promises_without_a_refusal() {
+async fn operator_forced_completion_settles_a_ledger_less_crew() {
     let (_temp, _repo, daemon) = daemon_for_cwd().await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -9703,34 +9615,6 @@ async fn crew_completion_reports_pending_promises_without_a_refusal() {
             .await
             .unwrap();
     }
-    let before = convoys.get("missing-ledger").await.expect("read convoy before refusal").status.expect("convoy status before refusal");
-    let advisory = daemon
-        .crew_complete_with_disposition_internal(
-            &flotilla_protocol::CrewCommandContext {
-                crew_id: None,
-                namespace: Some("flotilla".to_string()),
-                convoy: Some("missing-ledger".to_string()),
-                vessel_ref: Some("missing-ledger-vessel".to_string()),
-                role: Some("coder".to_string()),
-            },
-            Some("done".to_string()),
-            None,
-            None,
-        )
-        .await
-        .expect("advisory exits successfully");
-    assert!(
-        matches!(advisory, CommandValue::CrewCompletionAdvisory { ref pending }
-        if pending.iter().any(|p| p.contains("template/decision-ledger"))),
-        "{advisory:?}"
-    );
-
-    let status = convoys.get("missing-ledger").await.expect("read convoy").status.expect("convoy status");
-    assert_eq!(status.phase, before.phase);
-    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert!(status.crew_work["work"]["coder"].completion_refusal.is_none());
-    assert!(status.stalled.is_none());
-
     let operator = flotilla_protocol::PrincipalRef { namespace: "flotilla".to_string(), name: "operator".to_string() };
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -9747,7 +9631,6 @@ async fn crew_completion_reports_pending_promises_without_a_refusal() {
                     message: Some("operator accepted the ledger-less claim".to_string()),
                     disposition: None,
                     decision_ledger_ref: None,
-                    force: true,
                 })
                 .build(),
             Some(operator.clone()),

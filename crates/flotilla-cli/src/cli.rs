@@ -4,18 +4,16 @@ pub mod image_check;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
-    commands::ExplainedSubjectFact, output::OutputFormat, CliListKind, CliListResponse, Command, CommandAction, CommandValue,
-    CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, EvidenceFreshness, FleetHealthResponse, FleetHostStaleness,
-    FleetListResponse, FleetObservationAgreement, FleetStaleness, FulfilmentListResponse, FulfilmentRow, HostProvidersResponse,
-    HostStatusResponse, NodeId, NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey,
-    TopologyResponse,
+    commands::ExplainedSubjectFact, output::OutputFormat, CliListKind, CliListResponse, Command, CommandValue, CrewListResponse,
+    DaemonEvent, EnvironmentInfo, EnvironmentStatus, EvidenceFreshness, FleetHealthResponse, FleetHostStaleness, FleetListResponse,
+    FleetObservationAgreement, FleetStaleness, FulfilmentListResponse, FulfilmentRow, HostProvidersResponse, HostStatusResponse, NodeId,
+    NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::{DaemonEndpoint, SocketDaemon};
@@ -1432,14 +1430,6 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::CrewEscalated { receiver } => format!("escalated to {receiver}"),
         CommandValue::CrewEscalationRefused { rung, reason } => format!("escalation refused at {rung} rung: {reason}"),
         CommandValue::CrewFollowUpDelivered => flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION.to_string(),
-        CommandValue::CrewCompletionAdvisory { pending } => {
-            if pending.is_empty() {
-                "Your part ends when your promises are kept or retracted.".into()
-            } else {
-                format!("Pending promises:\n{}", pending.join("\n"))
-            }
-        }
-        CommandValue::CrewCompletionWaiting { reason, retry_at } => format!("crew completion waiting until {retry_at}: {reason}"),
         CommandValue::ResourceReconciled { message, .. } => message.clone(),
         CommandValue::ConvoyBriefDelivered { displaced: Some(displaced) } => {
             format!("brief delivered now; displaced pending brief:\n{displaced}")
@@ -1932,7 +1922,7 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
     }
 
     let mut rx = daemon.subscribe();
-    let mut command_id = daemon.execute(command.clone()).await?;
+    let command_id = daemon.execute(command.clone()).await?;
 
     loop {
         match rx.recv().await {
@@ -1947,22 +1937,6 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
                 }
             }
             Ok(ref event @ DaemonEvent::CommandFinished { command_id: id, ref result, .. }) if id == command_id => {
-                if let CommandValue::CrewCompletionWaiting { retry_at, .. } = result {
-                    if !matches!(command.action, CommandAction::CrewComplete { .. }) {
-                        return Err("unexpected completion wait for a non-completion command".into());
-                    }
-                    // JSON mode retains one final stdout document; wait progress
-                    // is diagnostic output, just like lag/disconnection notices.
-                    eprintln!("{}", format_command_result(result));
-                    // Remote clock skew may shift this sleep; the daemon checks
-                    // its own cooldown and all gates again on every re-claim.
-                    // This live wait lasts until evidence recovers or the caller
-                    // cancels; dropping it leaves no queued retry in the daemon.
-                    let delay = retry_at.signed_duration_since(Utc::now()).to_std().unwrap_or_default();
-                    tokio::time::sleep(delay.max(Duration::from_millis(10))).await;
-                    command_id = daemon.execute(command.clone()).await?;
-                    continue;
-                }
                 match format {
                     OutputFormat::Human => {
                         println!("{}", format_event_human(event));

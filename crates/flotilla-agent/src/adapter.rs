@@ -1638,7 +1638,7 @@ mod tests {
         assert!(settlement.contains("take a new clean final snapshot before resubmitting the ledger"));
         assert_eq!(content.matches("follows the settlement order in `## Decision ledger`").count(), 1);
         assert!(content.contains("Follow the settlement order in `## Decision ledger`: submit your PR"));
-        assert!(content.contains("`crew complete` is advisory"));
+        assert!(content.contains("Only an operator may force settlement, with `crew complete --force`."));
         assert!(content.contains("Background delegates and sub-agents must never run those verbs"));
         assert!(content.contains("Crews never enact failure"));
         assert!(content.contains("--propose <resume|reduce-scope|fail>"));

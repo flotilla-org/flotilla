@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyStatusPatch, CrewCompletionPending, CrewMessageSender, CrewWorkPhase, InputMeta,
-    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    Convoy as ResourceConvoy, ConvoyStatusPatch, CrewMessageSender, CrewWorkPhase, InputMeta, TerminalAttentionState,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
 
@@ -507,52 +507,37 @@ async fn replica_withdraw_preserves_receiver_submission_on_race() {
 }
 
 #[tokio::test]
-async fn fresh_idle_admission_keeps_completion_and_delivery_evidence_receiver_owned() {
-    for completion_pending in [false, true] {
-        for degraded in [false, true] {
-            let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
-            probe.fail.store(false, Ordering::SeqCst);
-            let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-            let holder = sessions.get("session").await.expect("holder");
-            let now = Utc::now();
-            let status = flotilla_resources::TerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                session_id: Some("actual-session".into()),
-                attention: Some(flotilla_resources::TerminalAttention {
-                    state: TerminalAttentionState::Idle,
-                    as_of: now,
-                    source: flotilla_resources::TerminalAttentionSource::Screen,
-                }),
-                completion_pending: completion_pending.then(|| CrewCompletionPending {
-                    message: Some("previous completion".into()),
-                    disposition: None,
-                    decision_ledger_ref: None,
-                    force: false,
-                    principal_ref: None,
-                    attempted_at: now,
-                    authority: "crew".into(),
-                    last_error: "awaiting settlement".into(),
-                }),
-                degraded: degraded.then(|| flotilla_resources::TerminalSessionDegradedCondition {
-                    reason: flotilla_resources::TERMINAL_DELIVERY_UNCONFIRMED_REASON.into(),
-                    message: "held earlier input".into(),
-                    message_id: Some("earlier".into()),
-                    consecutive_failures: 1,
-                    observed_at: now,
-                }),
-                ..Default::default()
-            };
-            sessions
-                .update_status("session", &holder.metadata.resource_version, &status)
-                .await
-                .expect("fresh idle with legacy obligations");
-            crew.resume("flotilla", "crew", "next admitted brief", None, None).await.expect("admit at idle boundary");
-            assert_eq!(sessions.get("session").await.expect("unchanged receiver evidence").status, Some(status));
-            let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
-            assert_eq!(records.len(), 1);
-            assert!(records[0].status.as_ref().expect("admission status").resolved_receiver.is_none());
-            assert_eq!(probe.calls.load(Ordering::SeqCst), 1, "workflow resumes but does not deliver");
-        }
+async fn fresh_idle_admission_keeps_delivery_evidence_receiver_owned() {
+    for degraded in [false, true] {
+        let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
+        probe.fail.store(false, Ordering::SeqCst);
+        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+        let holder = sessions.get("session").await.expect("holder");
+        let now = Utc::now();
+        let status = flotilla_resources::TerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Running,
+            session_id: Some("actual-session".into()),
+            attention: Some(flotilla_resources::TerminalAttention {
+                state: TerminalAttentionState::Idle,
+                as_of: now,
+                source: flotilla_resources::TerminalAttentionSource::Screen,
+            }),
+            degraded: degraded.then(|| flotilla_resources::TerminalSessionDegradedCondition {
+                reason: flotilla_resources::TERMINAL_DELIVERY_UNCONFIRMED_REASON.into(),
+                message: "held earlier input".into(),
+                message_id: Some("earlier".into()),
+                consecutive_failures: 1,
+                observed_at: now,
+            }),
+            ..Default::default()
+        };
+        sessions.update_status("session", &holder.metadata.resource_version, &status).await.expect("fresh idle with legacy obligations");
+        crew.resume("flotilla", "crew", "next admitted brief", None, None).await.expect("admit at idle boundary");
+        assert_eq!(sessions.get("session").await.expect("unchanged receiver evidence").status, Some(status));
+        let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
+        assert_eq!(records.len(), 1);
+        assert!(records[0].status.as_ref().expect("admission status").resolved_receiver.is_none());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1, "workflow resumes but does not deliver");
     }
 }
 

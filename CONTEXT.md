@@ -965,11 +965,12 @@ retired (ADR 0058).
 _Avoid_: Bot, assistant.
 
 **Settlement Claim**:
-The crew's turn-ending report (ADR 0017), filed by `crew complete` — the
-crew *claims* its brief is fulfilled. Claims are never world-facts and never
-evidence of safety; integration conditions and observations judge the world.
-Since ADR 0061 it carries no deliverable reference and is refused while any
-of the crew member's **Promises** is open or submitted.
+The crew's turn-ending report (ADR 0017): the crew *claims* its brief is
+fulfilled. Claims are never world-facts and never evidence of safety;
+integration conditions and observations judge the world. Since ADR 0061 it
+carries no deliverable reference. Crews no longer file one: a crew member's
+part ends when its **Promises** are kept or retracted, and the only claim left
+is an operator's forced `crew complete --force`.
 _Avoid_: Completion (that is the admission-time stage), outcome, result.
 
 **Disposition**:

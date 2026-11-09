@@ -2167,24 +2167,6 @@ async fn artifact_environment_reference_contract() {
         let status = leader.resource_backend().using::<Convoy>(namespace).get(convoy).await.unwrap().status.unwrap();
         let promise = status.promises["work"]["coder"].iter().find(|p| p.id == "route-proof").unwrap();
         assert_eq!(promise.state, flotilla_resources::promises::PromiseState::Retracted);
-        let completion = || {
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some(launch.clone()), ..Default::default() },
-                    message: Some("finished".into()),
-                    disposition: None,
-                    decision_ledger_ref: None,
-                    force: false,
-                })
-                .build()
-        };
-        let mut events = leader.subscribe();
-        let id = topology.client.execute(completion()).await.expect("dispatch completion");
-        let result = await_command_result(&mut events, id).await;
-        assert!(
-            matches!(&result, CommandValue::CrewCompletionAdvisory { pending } if pending.iter().any(|p| p.contains("decision-ledger"))),
-            "advisory reports the pending ledger artifact: {result:?}"
-        );
         let ledger = b"## Decision ledger\n\n1. **Brief silence:** Test setup.\n- **Choice:** Exercise every environment.\n- **Alternative:** Only local.\n- **If asking were free:** Which environment?\n";
         let source = workspace.path().join("ledger.md");
         tokio::fs::write(&source, ledger).await.expect("ledger source");
@@ -2233,10 +2215,6 @@ async fn artifact_environment_reference_contract() {
             .expect("crew can qualify its own namespace");
         assert_eq!(tokio::fs::read(operator_destination).await.expect("operator file"), ledger);
         assert_eq!(tokio::fs::read(destination).await.expect("ledger destination"), ledger);
-        // Observe only the completion below; earlier artifact requests can fill the broadcast buffer.
-        let mut events = leader.subscribe();
-        let id = topology.client.execute(completion()).await.expect("dispatch completion with ledger");
-        assert!(matches!(await_command_result(&mut events, id).await, CommandValue::CrewCompletionAdvisory { .. }));
         // Automatic reconciliation is deliberately gated in this transport
         // contract. Drive the real convoy reconciler after transferring evidence.
         use flotilla_store::controller::Reconciler;

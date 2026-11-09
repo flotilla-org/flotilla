@@ -1069,6 +1069,7 @@ pub enum CommandAction {
         context: CrewCommandContext,
         operation: CrewPromiseOperation,
     },
+    /// An operator's forced completion of a crew member's part: a verdict on its open promises.
     CrewComplete {
         context: CrewCommandContext,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1077,8 +1078,6 @@ pub enum CommandAction {
         disposition: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         decision_ledger_ref: Option<String>,
-        #[serde(default)]
-        force: bool,
     },
     CrewFail {
         context: CrewCommandContext,
@@ -1412,7 +1411,7 @@ impl Command {
             CommandAction::ConvoyWithdrawPendingBrief { .. } => "Withdrawing pending convoy brief...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
             CommandAction::CrewPromise { .. } => "Updating crew promises...",
-            CommandAction::CrewComplete { .. } => "Inspecting crew promises...",
+            CommandAction::CrewComplete { .. } => "Forcing crew completion...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
             CommandAction::CrewStall { .. } => "Stalling crew work...",
             CommandAction::CrewSupervise { .. } => "Supervising crew work...",
@@ -1539,10 +1538,6 @@ pub enum CommandValue {
     },
     Ok,
     CrewFollowUpDelivered,
-    /// Advisory only: promise settlement is reconciled independently.
-    CrewCompletionAdvisory {
-        pending: Vec<String>,
-    },
     /// The named receiver admitted the next supervision obligation.
     CrewEscalated {
         receiver: String,
@@ -1551,11 +1546,6 @@ pub enum CommandValue {
     CrewEscalationRefused {
         rung: crate::StallRung,
         reason: String,
-    },
-    /// The claim is still unmet; a CLI caller waits and retries at this deadline.
-    CrewCompletionWaiting {
-        reason: String,
-        retry_at: chrono::DateTime<chrono::Utc>,
     },
     ResourceReconciled {
         resource_kind: String,
@@ -1907,7 +1897,6 @@ mod tests {
                     message: Some("ready for review".into()),
                     disposition: Some("changes-pushed".into()),
                     decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1#issuecomment-2".into()),
-                    force: false,
                 })
                 .build(),
             Command::builder()
@@ -2039,11 +2028,6 @@ mod tests {
             CommandValue::ChangeStreamFrame { session: "round".into(), frame: vec![0, 127, 128, 255] },
             CommandValue::Ok,
             CommandValue::CrewFollowUpDelivered,
-            CommandValue::CrewCompletionAdvisory { pending: vec!["template/pr: waiting on PR merge".into()] },
-            CommandValue::CrewCompletionWaiting {
-                reason: "GitHub secondary limit".into(),
-                retry_at: "2026-10-03T09:21:59Z".parse().expect("retry deadline"),
-            },
             CommandValue::ConvoyBriefDelivered { displaced: Some("older instruction".into()) },
             CommandValue::ConvoyBriefQueued { displaced: Some("older instruction".into()) },
             CommandValue::ConvoyBriefWithdrawn { withdrawn: Some("latest instruction".into()) },
