@@ -91,6 +91,9 @@ pub struct PrincipalRef {
 
 impl PrincipalRef {
     pub const IMPLICIT_NAME: &'static str = "implicit";
+    /// The person role a person sends as (#3938). With no person named for it in the charter, its
+    /// sender is `principal:operator`: the role, not a person named "operator".
+    pub const OPERATOR_ROLE: &'static str = "operator";
 
     pub fn implicit_for_namespace(namespace: impl Into<String>) -> Self {
         Self { namespace: namespace.into(), name: Self::IMPLICIT_NAME.to_string() }

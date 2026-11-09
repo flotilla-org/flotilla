@@ -66,7 +66,7 @@ pub const FLEET_ROLES: [FleetRole; 7] = [TURN_RULES, NUDGE, STALL_JUDGE, CAPABIL
 /// escalated past every supervisor, held turns waiting on a ruling, and the
 /// rulings and messages a person sends to crews.
 pub const OPERATOR: FleetRole = FleetRole {
-    name: "operator",
+    name: flotilla_protocol::PrincipalRef::OPERATOR_ROLE,
     purpose: "Hears crew stalls escalated past every supervisor and held turns, and sends a person's rulings and messages to crews.",
 };
 
