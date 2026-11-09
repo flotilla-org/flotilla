@@ -3339,7 +3339,9 @@ async fn placement_host_capacity_scenario(hold_definitions: bool) {
     seed_host_capacity(&follower, 0, 1_000_000 * 1024 * 1024 * 1024).await;
     follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
     // Admission runs on the placement host. Holding definition replication
-    // verifies that admission needs neither definition replicated to the origin.
+    // verifies that admission needs neither definition replicated to the origin:
+    // old-store replication carries only Host and FulfilmentKind, and the engine,
+    // which replicates a home's log whole, is held from before the follower writes them.
     let topology = if hold_definitions {
         spawn_in_memory_request_topology_with_replication_kinds(leader, follower, &[Host::API_PATHS.kind, FulfilmentKind::API_PATHS.kind])
             .await
@@ -3353,6 +3355,9 @@ async fn placement_host_capacity_scenario(hold_definitions: bool) {
 
     seed_target_fulfilment_kind(&topology, namespace, &placement_policy).await;
     await_host_capacity(&topology.leader, &remote_host_id).await;
+    if hold_definitions {
+        topology.hold_follower_stream_at_leader().await;
+    }
     // The follower performs admission; seed its prerequisites synchronously.
     seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
 

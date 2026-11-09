@@ -11,7 +11,7 @@ use flotilla_replication::{DigestControl, DigestScheduler};
 use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
-use flotilla_daemon::server::{build_remote_command_router, peer_runtime::PeerRuntime};
+use flotilla_daemon::server::{build_remote_command_router, change_stream::StreamHolds, peer_runtime::PeerRuntime};
 use flotilla_daemon::{
     blob_store::TieredBlobStore,
     peer::{
@@ -56,7 +56,28 @@ pub struct InMemoryRequestTopology {
     pub leader_host: HostName,
     pub follower_host: HostName,
     pub shutdown_tx: watch::Sender<bool>,
+    /// The homes whose change streams the leader holds back.
+    pub leader_stream_holds: StreamHolds,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl InMemoryRequestTopology {
+    /// Holds the follower's change stream at the leader once the leader has installed everything
+    /// the follower has committed so far. The leader keeps what came before and installs nothing
+    /// the follower commits after, so a scenario can prove an outcome needs none of it there.
+    pub async fn hold_follower_stream_at_leader(&self) {
+        let follower = self.follower.decided_store().expect("follower engine store");
+        let leader = self.leader.decided_store().expect("leader engine store");
+        let home = follower.home().to_owned();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while leader.watermark(&home).expect("leader watermark").home_seq < follower.last_sequence(&home).expect("follower log") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leader should catch up with the follower's change stream");
+        self.leader_stream_holds.hold(&home);
+    }
 }
 
 impl Drop for InMemoryRequestTopology {
@@ -414,6 +435,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
         leader_remote_router.install_blob_store(blob_store)?;
     }
     let follower_remote_router = build_remote_command_router(&follower, &follower_peer_manager);
+    let leader_stream_holds = StreamHolds::default();
 
     let (leader_runtime_handle, _leader_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
         PeerRuntime::new(
@@ -425,6 +447,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
             None,
         )
         .with_replication_kinds(replication_kinds)
+        .with_stream_holds(leader_stream_holds.clone())
         .spawn();
     let (follower_runtime_handle, _follower_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
         PeerRuntime::new(
@@ -501,6 +524,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
         leader_host,
         follower_host,
         shutdown_tx,
+        leader_stream_holds,
         _tasks: vec![leader_runtime_handle, follower_runtime_handle, client_session_handle],
     })
 }

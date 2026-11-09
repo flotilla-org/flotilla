@@ -6702,7 +6702,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     });
     // A missing forwarded socket must use the working peer route immediately.
     let missing = rigging_tls::client_builder().unix_socket(dir.path().join("missing.sock")).build().unwrap();
-    super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&missing), &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&missing), &router, &Default::default()).await.unwrap();
     // Twenty writes, each a change and its entry (#4024).
     assert_eq!(target.watermark("home").unwrap().home_seq, 40);
     // The stand-in replaces only HTTP: one unavailable route, then a damaged
@@ -6730,14 +6730,16 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         }
     });
     seed("tail");
-    super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&http), &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&http), &router, &Default::default()).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 42);
     seed("partial");
-    let error = super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&http), &router).await.unwrap_err();
+    let error = super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&http), &router, &Default::default())
+        .await
+        .unwrap_err();
     assert_eq!(error, "truncated home stream", "a mid-body failure must not fall back");
     assert_eq!(target.watermark("home").unwrap().home_seq, 42);
     serving.await.unwrap();
-    super::change_stream::follow_round(Arc::clone(&target), "home", "home", None, &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", None, &router, &Default::default()).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 44);
     for index in 0..=21 {
         let name = match index {
@@ -6788,7 +6790,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     tokio::time::pause();
     let round = tokio::spawn({
         let (target, router) = (Arc::clone(&target), router.clone());
-        async move { super::change_stream::follow_round(target, "home", "home", None, &router).await }
+        async move { super::change_stream::follow_round(target, "home", "home", None, &router, &Default::default()).await }
     });
     let error = loop {
         for _ in 0..64 {
@@ -6834,8 +6836,13 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         current.version = stamp.version;
         current.value = next;
     }
-    let following =
-        tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(Arc::clone(&local), "home".into(), None, router.clone()));
+    let following = tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(
+        Arc::clone(&local),
+        "home".into(),
+        None,
+        router.clone(),
+        Default::default(),
+    ));
     let failure = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Some(replica) = local
@@ -6862,7 +6869,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     assert!(failure.message.unwrap().contains("home/rs/large"));
     assert!(!fresh.has_watermark("home"));
 
-    super::change_stream::follow_round(Arc::clone(&target), "home", "home", None, &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", None, &router, &Default::default()).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 176);
     let hosts = home.list_hosts_internal().await.unwrap();
     let environment = &hosts.hosts.iter().find(|host| host.is_local).unwrap().environment_id.clone().unwrap();
@@ -6897,8 +6904,13 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
             write.commit()
         })
         .unwrap();
-    let following =
-        tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(Arc::clone(&local), "home".into(), None, router.clone()));
+    let following = tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(
+        Arc::clone(&local),
+        "home".into(),
+        None,
+        router.clone(),
+        Default::default(),
+    ));
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if fresh.has_watermark("home")

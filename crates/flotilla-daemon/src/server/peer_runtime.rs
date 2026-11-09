@@ -305,6 +305,7 @@ pub struct PeerRuntime {
     resource_socket_dir: Option<PathBuf>,
     replication_options: ReplicationOptions,
     replication_metrics: Arc<ReplicationLoadMetrics>,
+    stream_holds: super::change_stream::StreamHolds,
 }
 
 impl PeerRuntime {
@@ -325,6 +326,7 @@ impl PeerRuntime {
             resource_socket_dir,
             replication_options: ReplicationOptions::default(),
             replication_metrics: Arc::default(),
+            stream_holds: Default::default(),
         }
     }
 
@@ -336,6 +338,12 @@ impl PeerRuntime {
 
     pub fn with_replication_kinds(mut self, kinds: Option<&'static [&'static str]>) -> Self {
         self.replication_options = ReplicationOptions::new(kinds);
+        self
+    }
+
+    /// Share the homes whose change streams this host holds back.
+    pub fn with_stream_holds(mut self, holds: super::change_stream::StreamHolds) -> Self {
+        self.stream_holds = holds;
         self
     }
 
@@ -571,6 +579,7 @@ impl PeerRuntime {
 
         let replication_options = self.replication_options;
         let replication_metrics = self.replication_metrics;
+        let stream_holds = self.stream_holds;
         let outbound_daemon = Arc::clone(&self.daemon);
         let outbound_remote_command_router = self.remote_command_router.clone();
         let mut peer_connected_rx = peer_connected_rx;
@@ -611,6 +620,7 @@ impl PeerRuntime {
                                 home,
                                 notice.resource_socket_path.clone(),
                                 outbound_remote_command_router.clone(),
+                                stream_holds.clone(),
                             );
                             decided_followers
                                 .insert(notice.peer.clone(), (notice.generation, tokio_util::task::AbortOnDropHandle::new(task)));
