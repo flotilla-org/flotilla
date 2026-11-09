@@ -34,8 +34,8 @@ type EngineSlot = std::sync::Arc<std::sync::RwLock<EngineSlots>>;
 #[derive(Debug, Default)]
 struct EngineSlots {
     ports: std::collections::BTreeMap<&'static str, std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>>,
-    /// The engine keeps no namespaces: its records read in whichever namespace is asked, so a scan
-    /// for the namespaces holding a kind it serves answers with this daemon's one.
+    /// The engine keeps no namespaces: its records read in whichever namespace is asked, and carry
+    /// this daemon's one, as a scan for the namespaces holding a kind it serves answers.
     namespace: Option<String>,
 }
 
@@ -74,6 +74,12 @@ impl ResourceBackend {
     /// namespace scan of a kind the engine serves answers with it.
     pub fn serve_engine_in(&self, namespace: &str) {
         self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner).namespace = Some(namespace.to_owned());
+    }
+    /// The one namespace the engine serves `kind` in, when the engine serves it: its records are
+    /// in no other, whichever namespace they are read through.
+    pub fn engine_namespace(&self, kind: &str) -> Option<String> {
+        let engines = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        engines.ports.contains_key(kind).then(|| engines.namespace.clone()).flatten()
     }
     /// The engine port serving `kind`, when one is installed.
     pub(crate) fn engine_records(&self, kind: &str) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>> {
@@ -776,6 +782,11 @@ impl<T: Resource> TypedResolver<T> {
         (T::REPLICATION_CLASS != crate::ReplicationClass::Definitions).then(|| self.backend.engine_records(T::API_PATHS.kind)).flatten()
     }
 
+    /// The namespace this kind's engine records are in: the engine's, not the one read through.
+    fn engine_namespace(&self) -> String {
+        self.backend.engine_namespace(T::API_PATHS.kind).unwrap_or_else(|| self.namespace.clone())
+    }
+
     /// This home's own engine record `name`, if any.
     async fn engine_home_record(
         &self,
@@ -810,7 +821,7 @@ impl<T: Resource> TypedResolver<T> {
         let value = serde_json::to_value(spec).map_err(|error| ResourceError::decode(error.to_string()))?;
         let record =
             records.apply(T::API_PATHS.kind, &meta.name, &meta.labels, &meta.annotations, value).await.map_err(ResourceError::other)?;
-        crate::definition::engine_object(&self.namespace, record)
+        crate::definition::engine_object(&self.engine_namespace(), record)
     }
 
     pub async fn update(&self, meta: &InputMeta, resource_version: &str, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
@@ -854,7 +865,7 @@ impl<T: Resource> TypedResolver<T> {
             self.engine_current(&*records, name, resource_version).await?;
             let value = serde_json::to_value(status).map_err(|error| ResourceError::decode(error.to_string()))?;
             let record = records.set_status(T::API_PATHS.kind, name, value).await.map_err(ResourceError::other)?;
-            return crate::definition::engine_object(&self.namespace, record);
+            return crate::definition::engine_object(&self.engine_namespace(), record);
         }
         if !engine_owned {
             return dispatch_backend!(self, update_status_typed, name, resource_version, status);

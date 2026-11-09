@@ -61,6 +61,9 @@ tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 flotilla-daemon = { path = "../flotilla-daemon" }
+flotilla-provisioning = { path = "../flotilla-provisioning" }
+flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 
 [lints]
 workspace = true

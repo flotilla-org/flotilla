@@ -62,8 +62,10 @@ impl<T: Resource> DefinitionResolver<T> {
 
     /// An engine record as the old store's object: the stamps its port rebuilds, and no merge
     /// metadata, owner references or finalizers. The engine keeps no creation time.
+    /// It carries the engine's namespace, not the one read through.
     fn object(&self, record: EngineObject) -> Result<ResourceObject<T>, ResourceError> {
-        engine_object(&self.namespace, record)
+        let namespace = self.backend.engine_namespace(T::API_PATHS.kind).unwrap_or_else(|| self.namespace.clone());
+        engine_object(&namespace, record)
     }
 
     /// Every engine record of this kind, with the built-ins.

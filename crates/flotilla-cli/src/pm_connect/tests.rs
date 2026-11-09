@@ -1221,9 +1221,8 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    // ChangeRequest is served by the engine, which keeps no namespaces: a watch of any namespace
-    // streams its records, labelled with that namespace.
-    let observations = daemon.resource_backend().using::<ChangeRequest>("new-island");
+    // ChangeRequest is served by the engine, whose records are all in its one namespace.
+    let observations = daemon.resource_backend().using::<ChangeRequest>("flotilla");
     let daemon: Arc<dyn DaemonHandle> = daemon;
     let mut state = ConnectorState::default();
     let mut watched = BTreeSet::new();
@@ -1231,8 +1230,8 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     ensure_resource_watches(&daemon, &mut state, &mut watched, &mut tasks, &tx).await.expect("initial namespace");
     assert_eq!(watched, BTreeSet::from(["flotilla".into()]));
-    let mut json = subject_envelope().records[0].object.clone().expect("fixture observation");
-    json["metadata"]["namespace"] = serde_json::json!("new-island");
+    let opened = tasks.len();
+    let json = subject_envelope().records[0].object.clone().expect("fixture observation");
     let mut object = ResourceObject::<ChangeRequest>::from_k8s_object(
         serde_json::from_value::<K8sResourceObject<ChangeRequest>>(json).expect("typed observation"),
     )
@@ -1253,7 +1252,27 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
         state: Default::default(),
     })));
     ensure_resource_watches(&daemon, &mut state, &mut watched, &mut tasks, &tx).await.expect("discover namespace");
-    assert_eq!(state.resources.projection().change_requests.len(), 1, "own initial snapshot bootstrapped the replica");
+    // The engine-served kinds are already followed by the first namespace's watches: the new
+    // namespace adds watches only of the kinds kept per namespace.
+    for kind in ["changerequests", "issues", "forges", "repositories", "projects"] {
+        assert_eq!(state.single_namespace_kinds.get(kind).map(String::as_str), Some("flotilla"), "{kind} is the engine's");
+    }
+    assert_eq!(tasks.len(), opened + resources::KINDS.len() - state.single_namespace_kinds.len());
+    // The first namespace's watch follows cr-42's creation.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.resources.projection().change_requests.is_empty() {
+            rx.recv().await.expect("update channel").expect("watch event").apply(&mut state).expect("apply");
+        }
+    })
+    .await
+    .expect("creation followed");
+    // cr-42 is held once, in the engine's namespace, and stays there as its events arrive.
+    let held_once = |state: &ConnectorState| {
+        let held = &state.resources.projection().change_requests;
+        assert_eq!(held.len(), 1, "one change request held");
+        assert_eq!(held[0].metadata.namespace, "flotilla", "held in the engine's namespace");
+    };
+    held_once(&state);
     object.status.as_mut().expect("status").state.value = Some(flotilla_resources::ObservedChangeRequestState::Merged);
     let current = observations.get(&object.metadata.name).await.expect("observation");
     observations
@@ -1263,6 +1282,7 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             rx.recv().await.expect("update channel").expect("watch event").apply(&mut state).expect("apply");
+            held_once(&state);
             if state.resources.projection().change_requests[0].status.as_ref().expect("status").state.value
                 == Some(flotilla_resources::ObservedChangeRequestState::Merged)
             {
