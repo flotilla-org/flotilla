@@ -106,13 +106,13 @@ rigging-condition = { git = "https://github.com/flotilla-org/rigging", rev = "3c
 # depends on no other rigging crate; the pins above stay at drydock's rev so drydock and
 # flotilla share one copy of each, and all move to one rev when drydock next bumps rigging.
 rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", rev = "61018dd937661525bcbba5dd7e57ee6a1c887443" }
-binnacle-cli = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d", features = ["described", "clap"] }
-binnacle-core = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
-binnacle-described = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
-binnacle-described-http = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
-binnacle-format = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
-binnacle-layout = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
-binnacle-ratatui = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d", features = ["described"] }
+binnacle-cli = { git = "https://github.com/flotilla-org/binnacle", rev = "8ac04f6ddd95101f51d6cb915ecfbd8b016578d6", features = ["described", "clap"] }
+binnacle-core = { git = "https://github.com/flotilla-org/binnacle", rev = "8ac04f6ddd95101f51d6cb915ecfbd8b016578d6" }
+binnacle-described = { git = "https://github.com/flotilla-org/binnacle", rev = "8ac04f6ddd95101f51d6cb915ecfbd8b016578d6" }
+binnacle-described-http = { git = "https://github.com/flotilla-org/binnacle", rev = "8ac04f6ddd95101f51d6cb915ecfbd8b016578d6" }
+binnacle-format = { git = "https://github.com/flotilla-org/binnacle", rev = "8ac04f6ddd95101f51d6cb915ecfbd8b016578d6" }
+binnacle-layout = { git = "https://github.com/flotilla-org/binnacle", rev = "8ac04f6ddd95101f51d6cb915ecfbd8b016578d6" }
+binnacle-ratatui = { git = "https://github.com/flotilla-org/binnacle", rev = "8ac04f6ddd95101f51d6cb915ecfbd8b016578d6", features = ["described"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yml = "0.0.12"
 tokio-util = "0.7"
