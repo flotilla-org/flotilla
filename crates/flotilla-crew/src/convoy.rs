@@ -60,7 +60,6 @@ pub struct ConvoyReconciler {
 pub struct ConvoyPrepared {
     template: Option<ResourceObject<WorkflowTemplate>>,
     vessels: BTreeMap<String, ResourceObject<Vessel>>,
-    terminal_sessions: Vec<ResourceObject<TerminalSession>>,
     /// The checkouts held for the convoy, each its latest launch, by checkout name.
     checkouts: BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>,
     observed_subjects: Vec<Subject>,
@@ -135,12 +134,9 @@ impl ConvoyReconciler {
             .await?
             .items
             .into_iter()
-            .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
-            .collect();
-        let live = flotilla_store::read_terminal_sources(Arc::clone(&self.lifecycle_reads), sessions)
-            .await?
-            .iter()
-            .any(|session| session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running));
+            .collect::<Vec<_>>();
+        let live =
+            sessions.iter().any(|session| session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running));
         if !live {
             return Ok(false);
         }
@@ -574,12 +570,6 @@ impl Reconciler for ConvoyReconciler {
         } else {
             BTreeMap::new()
         };
-        let terminal_sessions = match &self.terminal_sessions {
-            Some(sessions) if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) => {
-                sessions.list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())])).await?.items
-            }
-            _ => Vec::new(),
-        };
         let forges = match &self.forges {
             Some(forges) => forges.list().await?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>(),
             None => Vec::new(),
@@ -717,25 +707,6 @@ impl Reconciler for ConvoyReconciler {
                 }
                 None => Err("convoy reclaim verifier unavailable".to_string()),
             };
-            for session in &terminal_sessions {
-                let (session_disposition, reason) = if session.metadata.deletion_timestamp.is_some() {
-                    ("already_deleting", "session deletion already requested")
-                } else if !matches!(session.metadata.lifecycle_authority(), Ok(None | Some(LifecycleAuthority::Managed))) {
-                    ("unmanaged", "session lifecycle is not managed")
-                } else if let Err(reason) = &result {
-                    ("retain", reason.as_str())
-                } else {
-                    ("request_deletion", "convoy teardown verified")
-                };
-                tracing::info!(
-                    convoy = %obj.metadata.name,
-                    session = %session.metadata.name,
-                    gate_outcome = if result.is_ok() { "allowed" } else { "refused" },
-                    session_disposition,
-                    reason,
-                    "terminal session reclaim decision"
-                );
-            }
             result.is_ok()
         } else {
             false
@@ -743,7 +714,6 @@ impl Reconciler for ConvoyReconciler {
         Ok(ConvoyPrepared {
             template,
             vessels,
-            terminal_sessions,
             checkouts,
             observed_subjects,
             promise_patch,
@@ -870,19 +840,6 @@ impl Reconciler for ConvoyReconciler {
             },
             now,
         );
-        // Landed convoy records are retained, so their deletion finalizer may
-        // never run. Sweep sessions here too: a missing vessel must not strand
-        // an orphan session after the independently verified reclaim gate.
-        if prepared.reclaim_eligible && obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-            outcome.actuations.extend(
-                prepared
-                    .terminal_sessions
-                    .iter()
-                    .filter(|session| session.metadata.deletion_timestamp.is_none())
-                    .filter(|session| matches!(session.metadata.lifecycle_authority(), Ok(None | Some(LifecycleAuthority::Managed))))
-                    .map(|session| Actuation::DeleteTerminalSession { name: session.metadata.name.clone() }),
-            );
-        }
         if outcome.patch.is_none() {
             if let Some(attention) = &prepared.settlement_attention {
                 let changed = obj
@@ -941,9 +898,6 @@ impl Reconciler for ConvoyReconciler {
 
         if let Some(vessels) = &self.vessels {
             delete_lifecycle_owned_matching(vessels, &selector).await?;
-        }
-        if let Some(terminal_sessions) = &self.terminal_sessions {
-            delete_lifecycle_owned_matching(terminal_sessions, &selector).await?;
         }
         // A finite convoy's checkouts are held for it alone: the Checkout controller releases them
         // once its engine Convoy has ended, and the convoy waits for that. A standing convoy's

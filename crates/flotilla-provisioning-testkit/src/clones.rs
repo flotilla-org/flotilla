@@ -161,8 +161,10 @@ pub struct RunningClones {
     pub clones: Arc<EngineClones>,
     /// The checkouts, and the engine Convoys they are held for, on the same store.
     pub checkouts: crate::CheckoutFixture,
-    /// The engine's readings, serving [`Self::environments`], [`Self::clones`] and
-    /// [`Self::checkouts`].
+    /// The terminal sessions, on the same store, their changes followed from its log.
+    pub terminals: crate::TerminalsFixture,
+    /// The engine's readings, serving [`Self::environments`], [`Self::clones`],
+    /// [`Self::checkouts`] and [`Self::terminals`].
     pub reads: Arc<dyn LifecycleReads>,
     controllers: Vec<tokio::task::JoinHandle<()>>,
     _directory: tempfile::TempDir,
@@ -236,12 +238,16 @@ impl RunningClones {
         let clones = Arc::new(EngineClones::new(Arc::clone(&lifecycles), service.store()));
         let follower = clones.follow(Arc::clone(&service)).expect("follow the clones");
         let checkouts = crate::CheckoutFixture::over(home, service.store());
-        let reads = Arc::new(
+        let mut terminals = crate::TerminalsFixture::over(home, service.store());
+        let terminal_follower = terminals.terminals.follow(Arc::clone(&service)).expect("follow the terminal sessions");
+        let reads: Arc<dyn LifecycleReads> = Arc::new(
             LifecycleReadPort::new(StoreReads::new(service.store()), home.to_owned())
                 .with_environments(Arc::clone(&environments.environments) as _)
                 .with_clones(Arc::clone(&clones) as Arc<dyn CloneRecords>)
-                .with_checkouts(Arc::clone(&checkouts.checkouts) as _),
+                .with_checkouts(Arc::clone(&checkouts.checkouts) as _)
+                .with_terminals(Arc::clone(&terminals.terminals) as _),
         );
+        terminals.reads = reads.clone();
         let actuator = Arc::new(CloneActuator::new(runtime, StoreReads::new(service.store()), home, staged, Arc::new(NoRemotes)));
         let controller =
             Controller::start(lifecycles, actuator, Arc::new(flotilla_resources::SystemClock), Arc::clone(&service)).expect("controller");
@@ -251,7 +257,16 @@ impl RunningClones {
             let _backing = backing;
             controller.run(backings).await;
         });
-        Self { service, environments, clones, checkouts, reads, controllers: vec![controller, follower], _directory: directory }
+        Self {
+            service,
+            environments,
+            clones,
+            checkouts,
+            terminals,
+            reads,
+            controllers: vec![controller, follower, terminal_follower],
+            _directory: directory,
+        }
     }
 }
 

@@ -93,14 +93,14 @@ use flotilla_protocol::{
 use flotilla_resources::{
     host_direct_environment_name, observed_change_request_subjects, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec,
-    CrewCompletionPending, Forge, ForgeKind, FulfilmentKind, InputMeta, IssueSourceResolution, IssueSourceUnavailable,
-    LandingCredentialScope, ObservedChangeRequestState, Project, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec,
-    ResourceError, ResourceObject, ResourceProvenance, SystemClock, TerminalSessionTarget, TurnDeliveryRung, WatchEvent, WatchStart,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, Forge,
+    ForgeKind, FulfilmentKind, InputMeta, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
+    ObservedChangeRequestState, Project, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError, ResourceObject,
+    ResourceProvenance, SystemClock, TerminalSessionTarget, TurnDeliveryRung, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase,
+    WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
 };
 #[cfg(test)]
-use flotilla_resources::{ConditionValue, TerminalSessionIdentity, CREDENTIAL_SCOPES_ANNOTATION};
+use flotilla_resources::{ConditionValue, TerminalSessionIdentity};
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::{
     apply_resource_document, apply_status_patch as apply_resource_status_patch, get_resource_kind_including_replicas, ResourceBackend,
@@ -2315,7 +2315,12 @@ impl InProcessDaemon {
             Err(_) => reads,
         };
         self.lifecycle_reads.install(Arc::clone(&reads))?;
-        self.resource_backend.install_terminal_readings(reads);
+        // The old store's TerminalSession reads are served from the engine's launches.
+        self.resource_backend.install_engine_records(Arc::new(flotilla_store::TerminalViews::new(
+            self.resource_backend.clone(),
+            DEFAULT_PROVISIONING_NAMESPACE,
+            reads,
+        )));
         Ok(())
     }
 
@@ -4747,23 +4752,6 @@ impl InProcessDaemon {
 
     pub async fn resolve_crew_routing_context(&self, requested: &CrewCommandContext) -> Result<CrewRoutingContext, String> {
         self.crew.resolve_crew_routing_context(requested).await
-    }
-
-    pub async fn mark_crew_completion_pending(
-        &self,
-        namespace: &str,
-        session_name: &str,
-        pending: CrewCompletionPending,
-    ) -> Result<(), String> {
-        self.crew.mark_crew_completion_pending(namespace, session_name, pending).await
-    }
-
-    pub async fn clear_crew_completion_pending(&self, namespace: &str, session_name: &str) -> Result<(), String> {
-        self.crew.clear_crew_completion_pending(namespace, session_name).await
-    }
-
-    pub async fn pending_crew_completions(&self) -> Result<Vec<(String, CrewCompletionPending, CrewCommandContext)>, String> {
-        self.crew.pending_crew_completions().await
     }
 
     pub async fn set_session_capability_source(&self, source: Arc<dyn flotilla_capability_contract::SessionCapabilitySource>) {

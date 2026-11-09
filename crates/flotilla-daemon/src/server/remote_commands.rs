@@ -19,7 +19,6 @@ use flotilla_protocol::{
     Command, CommandAction, CommandPeerEvent, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, NodeId,
     PeerWireMessage, RepoIdentity, RepoSelector, RoutedPeerMessage, Step, StepStatus,
 };
-use flotilla_resources::CrewCompletionPending;
 use flotilla_store::off_frame;
 use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
@@ -392,10 +391,6 @@ impl RemoteCommandRouter {
             TargetHost::ConvoyHome(home) => Some(home.clone()),
             _ => None,
         };
-        if let (Some(completion), Some(target)) = (&crew_completion, &existing_convoy_target) {
-            self.persist_crew_completion(completion, &target.home, &format!("authority acknowledgement pending for {}", completion.convoy))
-                .await;
-        }
         let request_id = {
             let mut pm = self.peer_manager.lock().await;
             pm.next_request_id()
@@ -443,7 +438,6 @@ impl RemoteCommandRouter {
                 match (crew_completion, existing_convoy_target) {
                     (Some(completion), Some(target)) => {
                         let message = self.authority_unreachable_message(&completion.convoy, &target.home, &err);
-                        self.persist_crew_completion(&completion, &target.home, &message).await;
                         self.spawn_crew_completion_retry(completion);
                         Err(format!("completion pending: {message}"))
                     }
@@ -483,9 +477,7 @@ impl RemoteCommandRouter {
         }
         if let (Some(completion), None) = (&crew_completion, &existing_convoy_target) {
             if !self.daemon.has_authoritative_convoy(&completion.namespace, &completion.convoy).await? {
-                let authority = HostName::new("unknown");
                 let message = format!("authority unreachable for {}: no authority route is available", completion.convoy);
-                self.persist_crew_completion(completion, &authority, &message).await;
                 self.spawn_crew_completion_retry(completion.clone());
                 return Err(format!("completion pending: {message}").into());
             }
@@ -834,10 +826,6 @@ impl RemoteCommandRouter {
         };
         drop(pending);
 
-        if let Some(completion) = entry.crew_completion.clone() {
-            self.finish_crew_completion(completion, &result).await;
-        }
-
         // Query commands: resolve the oneshot directly without broadcasting
         // a CommandFinished event.
         if let Some(tx) = entry.query_completion {
@@ -975,7 +963,6 @@ impl RemoteCommandRouter {
             let message = if let Some(completion) = entry.crew_completion.clone() {
                 let authority = HostName::new(node_id.to_string());
                 let pending_message = self.authority_unreachable_message(&completion.convoy, &authority, &transport_error);
-                self.persist_crew_completion(&completion, &authority, &pending_message).await;
                 self.spawn_crew_completion_retry(completion);
                 format!("completion pending: {pending_message}")
             } else {
@@ -1315,33 +1302,6 @@ impl RemoteCommandRouter {
         format!("authority unreachable for {convoy} at {authority}: {cause}")
     }
 
-    async fn persist_crew_completion(&self, completion: &PendingCrewCompletionRoute, authority: &HostName, last_error: &str) {
-        let pending = CrewCompletionPending {
-            message: completion.message.clone(),
-            disposition: completion.disposition.clone(),
-            decision_ledger_ref: completion.decision_ledger_ref.clone(),
-            force: completion.force,
-            principal_ref: completion.principal_ref.clone(),
-            attempted_at: chrono::Utc::now(),
-            authority: authority.to_string(),
-            last_error: last_error.to_string(),
-        };
-        if let Err(error) = self.daemon.mark_crew_completion_pending(&completion.namespace, &completion.session_name, pending).await {
-            tracing::warn!(session = %completion.session_name, %error, "failed to persist pending crew completion");
-        }
-    }
-
-    async fn finish_crew_completion(&self, completion: PendingCrewCompletionRoute, result: &CommandValue) {
-        match result {
-            CommandValue::Ok | CommandValue::CrewCompletionAdvisory { .. } | CommandValue::Error { .. } => {
-                if let Err(error) = self.daemon.clear_crew_completion_pending(&completion.namespace, &completion.session_name).await {
-                    tracing::warn!(session = %completion.session_name, %error, "failed to clear acknowledged crew completion");
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn spawn_crew_completion_retry(&self, completion: PendingCrewCompletionRoute) {
         let session_name = completion.session_name.clone();
         {
@@ -1384,31 +1344,6 @@ impl RemoteCommandRouter {
                 delay = (delay * 2).min(Duration::from_secs(30));
             }
         });
-    }
-
-    pub(super) async fn resume_pending_crew_completions(&self) {
-        let completions = match self.daemon.pending_crew_completions().await {
-            Ok(completions) => completions,
-            Err(error) => {
-                tracing::warn!(%error, "failed to load pending crew completions");
-                return;
-            }
-        };
-        for (session_name, pending, context) in completions {
-            let convoy = context.convoy.clone().unwrap_or_else(|| "unknown-convoy".to_string());
-            self.spawn_crew_completion_retry(PendingCrewCompletionRoute {
-                namespace: context.namespace.clone().unwrap_or_else(|| "flotilla".to_string()),
-                convoy,
-                session_name,
-                context,
-                message: pending.message,
-                disposition: pending.disposition,
-                decision_ledger_ref: pending.decision_ledger_ref,
-                force: pending.force,
-                principal_ref: pending.principal_ref,
-                authority: Some(HostName::new(pending.authority)),
-            });
-        }
     }
 
     async fn send_routed_to_convoy_home(

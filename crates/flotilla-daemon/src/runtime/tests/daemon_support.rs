@@ -111,44 +111,36 @@ impl std::io::Write for LogCaptureWriter {
     }
 }
 
-pub(super) async fn create_credential_test_session(backend: &ResourceBackend, name: &str, convoy: &str, vessel_ref: &str, env_ref: &str) {
-    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
-    let session = sessions
-        .create(
-            &empty_meta(name),
-            &TerminalSessionSpec {
-                env_ref: env_ref.to_string(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector { capability: "code".to_string(), adapter: None, model: None },
-                    brief: flotilla_resources::TerminalBrief {
-                        artifact_digest: None,
-                        path: ".flotilla/briefs/coder.md".to_string(),
-                        content: "Work on the issue".to_string(),
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: NAMESPACE.to_string(),
-                        convoy: convoy.to_string(),
-                        vessel_ref: vessel_ref.to_string(),
-                    }),
-                    message: None,
-                },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "test".to_string(),
+/// A live crew session `name`, held by vessel `vessel_ref` in environment `env_ref` at
+/// `terminals`: requested and realised under pool session `name`. Returns its launch.
+pub(super) fn create_credential_test_session(
+    terminals: &flotilla_provisioning_testkit::TerminalsFixture,
+    name: &str,
+    vessel_ref: &str,
+    env_ref: &str,
+) -> String {
+    let launch = terminals.request(&flotilla_resources::terminal_records::TerminalLaunchRequest {
+        session: name.to_string(),
+        environment: env_ref.to_string(),
+        vessel: Some(vessel_ref.to_string()),
+        role: "coder".to_string(),
+        pool: "test".to_string(),
+        cwd: "/workspace".to_string(),
+        env: Default::default(),
+        source: flotilla_resources::terminal_records::TerminalLaunchSource::Agent {
+            capability: "code".to_string(),
+            adapter: None,
+            model: None,
+            brief: flotilla_resources::TerminalBrief {
+                artifact_digest: None,
+                path: ".flotilla/briefs/coder.md".to_string(),
+                content: "Work on the issue".to_string(),
+                copies: Vec::new(),
             },
-        )
-        .await
-        .expect("create live crew session");
-    sessions
-        .update_status(
-            name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..TerminalSessionStatus::default() },
-        )
-        .await
-        .expect("mark crew session live");
+        },
+    });
+    terminals.ready(&launch, name, &Default::default());
+    launch
 }
 
 pub(super) fn manual_profile(host_id: &str, docker_available: bool) -> LocalProvisioningProfile {

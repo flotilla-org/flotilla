@@ -19,6 +19,7 @@ use flotilla_daemon::blob_store::TieredBlobStore;
 use flotilla_daemon::runtime::DaemonRuntime;
 use flotilla_daemon::runtime::RuntimeOptions;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_daemon_testkit::engine::{engine, run_session, runtime_terminals, session_request};
 use flotilla_daemon_testkit::server::apply_convoy_replica_feed;
 use flotilla_daemon_testkit::server::seed_trusted_remote_convoy_project;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_mesh;
@@ -67,16 +68,18 @@ use flotilla_protocol_testkit::TestIssue;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_resources::terminal_records::{
+    AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords,
+};
 use flotilla_resources::{
     Artifact, ArtifactSubjectBinding, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus,
     CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
-    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSessionStatus,
-    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Event, EventRegarding, EventSpec, FulfilmentKind, FulfilmentKindSpec, Host,
-    HostSpec, HostStatus, InputMeta, Message, RepositoryKey, Resource, ResourceError, ResourceProvenance, Selector, SystemClock,
-    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel,
-    VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSource, CrewSpec,
+    CrewWorkPhase, CrewWorkState, Event, EventRegarding, EventSpec, FulfilmentKind, FulfilmentKindSpec, Host, HostSpec, HostStatus,
+    InputMeta, Message, RepositoryKey, Resource, ResourceError, ResourceProvenance, Selector, SystemClock, TerminalBrief,
+    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement, VesselSpec,
+    WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec,
+    AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
 };
 use flotilla_store::off_frame;
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, old_store_resource_kinds, ResourceBackend};
@@ -160,6 +163,11 @@ fn test_config_store_with_floor(config_dir: std::path::PathBuf, free_space_floor
     let floor = free_space_floor_gib.map(|floor| format!("\n[admission]\nfree_space_floor_gib = {floor}\n")).unwrap_or_default();
     std::fs::write(config_dir.join("daemon.toml"), format!("machine_id = \"test-machine\"\n{floor}")).expect("write daemon config");
     Arc::new(ConfigStore::with_base(config_dir))
+}
+
+/// What a crew's terminal reports once its agent runs, as `adapter` with `stance`.
+fn crew_facts(adapter: &str, stance: &str) -> TerminalLaunchFacts {
+    TerminalLaunchFacts { agent: Some(AgentLaunch { adapter: adapter.into(), model: None, stance: stance.into() }), ..Default::default() }
 }
 
 async fn empty_daemon_named(host_name: &str) -> Arc<InProcessDaemon> {
@@ -1780,46 +1788,42 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
         .create(&InputMeta::builder().name(convoy.to_string()).build(), &ConvoySpec::builder().workflow_ref("scratch".to_string()).build())
         .await
         .expect("create home convoy");
-    let sessions = leader.resource_backend().using::<TerminalSession>(namespace);
-    let session = sessions
+    // The crew's vessel, holding its session, is the crew host's.
+    leader
+        .resource_backend()
+        .using::<Vessel>(namespace)
         .create(
-            &InputMeta::builder().name("terminal-artifact-coder".to_string()).build(),
-            &TerminalSessionSpec::builder()
-                .env_ref(leader.local_environment_id().to_string())
-                .role("coder".to_string())
-                .source(TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("coding"),
-                    brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: String::new(), copies: vec![] },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: namespace.into(),
-                        convoy: convoy.into(),
-                        vessel_ref: "artifact-demo-work".into(),
-                    }),
-                    message: None,
-                })
-                .cwd(workspace.path().to_string_lossy().into_owned())
-                .pool("cleat".to_string())
-                .build(),
-        )
-        .await
-        .expect("create crew terminal");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus {
-                crew: Some(
-                    CrewSessionStatus::builder()
-                        .id("crew-artifact".to_string())
-                        .adapter("codex".to_string())
-                        .stance("trusted".to_string())
-                        .build(),
-                ),
-                ..TerminalSessionStatus::default()
+            &InputMeta::builder().name("artifact-demo-work".into()).build(),
+            &VesselSpec {
+                convoy_ref: convoy.into(),
+                vessel_name: "work".into(),
+                fulfilment_kind_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
             },
         )
         .await
-        .expect("mark crew session");
+        .expect("crew vessel");
+    let launch = run_session(
+        &leader,
+        "terminal-artifact-coder",
+        &TerminalSessionSpec::builder()
+            .env_ref(leader.local_environment_id().to_string())
+            .role("coder".to_string())
+            .source(TerminalSessionSource::Agent {
+                selector: Selector::for_capability("coding"),
+                brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: String::new(), copies: vec![] },
+                context: Box::new(TerminalCrewContext {
+                    namespace: namespace.into(),
+                    convoy: convoy.into(),
+                    vessel_ref: "artifact-demo-work".into(),
+                }),
+                message: None,
+            })
+            .cwd(workspace.path().to_string_lossy().into_owned())
+            .pool("cleat".to_string())
+            .build(),
+        &crew_facts("codex", "trusted"),
+    );
     let caller = CommandCaller {
         principal_ref: PrincipalRef::implicit_for_namespace(namespace),
         process: None,
@@ -1829,7 +1833,7 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
                 .convoy(convoy.to_string())
                 .vessel("artifact-demo-work".to_string())
                 .role("coder".to_string())
-                .crew_id("crew-artifact".to_string())
+                .crew_id(launch.clone())
                 .build(),
         ),
     };
@@ -1877,6 +1881,12 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
         follower.node_id().as_str(),
         &leader.decided_store().expect("crew host decided store"),
     );
+    // The record the address names reaches the crew host by replication, which this read does
+    // not otherwise wait for.
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "home artifact should replicate to the crew host", || async {
+        !leader.resource_backend().including_replicas::<Artifact>(namespace).list().await.expect("crew host artifacts").items.is_empty()
+    })
+    .await;
     assert_eq!(
         topology.client.artifact_get(address.clone(), destination.clone()).await.expect("get by address"),
         (bytes.len() as u64, None)
@@ -2064,57 +2074,32 @@ async fn artifact_environment_reference_contract() {
             )
             .await
             .expect("crew vessel");
-        let sessions = leader.resource_backend().using::<TerminalSession>(namespace);
-        let session = sessions
-            .create(
-                &InputMeta::builder()
-                    .name("terminal-artifact-coder".to_string())
-                    .labels(BTreeMap::from([
-                        (CONVOY_LABEL.into(), convoy.into()),
-                        (VESSEL_LABEL.into(), "work".into()),
-                        (ROLE_LABEL.into(), "coder".into()),
-                    ]))
-                    .build(),
-                &TerminalSessionSpec::builder()
-                    .env_ref(env_ref)
-                    .role("coder".to_string())
-                    .source(TerminalSessionSource::Agent {
-                        selector: Selector::for_capability("coding"),
-                        brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: String::new(), copies: vec![] },
-                        context: Box::new(TerminalCrewContext {
-                            namespace: namespace.into(),
-                            convoy: convoy.into(),
-                            vessel_ref: "artifact-demo-work".into(),
-                        }),
-                        message: None,
-                    })
-                    .cwd(if environment_kind == ArtifactEnvironment::LocalHostDirect {
-                        workspace.path().to_string_lossy().into_owned()
-                    } else {
-                        "/crew".into()
-                    })
-                    .pool("cleat".to_string())
-                    .build(),
-            )
-            .await
-            .expect("create crew terminal");
-        sessions
-            .update_status(
-                &session.metadata.name,
-                &session.metadata.resource_version,
-                &TerminalSessionStatus {
-                    crew: Some(
-                        CrewSessionStatus::builder()
-                            .id("crew-artifact".to_string())
-                            .adapter("codex".to_string())
-                            .stance("trusted".to_string())
-                            .build(),
-                    ),
-                    ..TerminalSessionStatus::default()
-                },
-            )
-            .await
-            .expect("mark crew session");
+        // A runtime composed this daemon: the launch is written at its home as its controller writes it.
+        let terminals = runtime_terminals(&leader);
+        let launch = terminals.request(&session_request(
+            "terminal-artifact-coder",
+            &TerminalSessionSpec::builder()
+                .env_ref(env_ref)
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("coding"),
+                    brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: String::new(), copies: vec![] },
+                    context: Box::new(TerminalCrewContext {
+                        namespace: namespace.into(),
+                        convoy: convoy.into(),
+                        vessel_ref: "artifact-demo-work".into(),
+                    }),
+                    message: None,
+                })
+                .cwd(if environment_kind == ArtifactEnvironment::LocalHostDirect {
+                    workspace.path().to_string_lossy().into_owned()
+                } else {
+                    "/crew".into()
+                })
+                .pool("cleat".to_string())
+                .build(),
+        ));
+        terminals.ready(&launch, "terminal-artifact-coder", &crew_facts("codex", "trusted"));
         let caller = CommandCaller {
             principal_ref: PrincipalRef::implicit_for_namespace(namespace),
             process: None,
@@ -2124,7 +2109,7 @@ async fn artifact_environment_reference_contract() {
                     .convoy(convoy.to_string())
                     .vessel("artifact-demo-work".to_string())
                     .role("coder".to_string())
-                    .crew_id("crew-artifact".to_string())
+                    .crew_id(launch.clone())
                     .build(),
             ),
         };
@@ -2170,7 +2155,7 @@ async fn artifact_environment_reference_contract() {
                 .execute(
                     Command::builder()
                         .action(CommandAction::CrewPromise {
-                            context: CrewCommandContext { crew_id: Some("crew-artifact".into()), ..Default::default() },
+                            context: CrewCommandContext { crew_id: Some(launch.clone()), ..Default::default() },
                             operation,
                         })
                         .build(),
@@ -2185,7 +2170,7 @@ async fn artifact_environment_reference_contract() {
         let completion = || {
             Command::builder()
                 .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some("crew-artifact".into()), ..Default::default() },
+                    context: CrewCommandContext { crew_id: Some(launch.clone()), ..Default::default() },
                     message: Some("finished".into()),
                     disposition: None,
                     decision_ledger_ref: None,
@@ -3731,11 +3716,8 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     .await
     .expect("router topology");
     let (a, b) = if source_remote { (&topology.follower, &topology.leader) } else { (&topology.leader, &topology.follower) };
-    for (daemon, name, vessel, role, crew_id) in
-        [(a, "stalled-work", "work", "coder", "coder-id"), (b, "governor", "govern", "governor", "governor-id")]
-    {
-        off_frame(|| seed_supervision_crew(daemon, name, vessel, role, crew_id)).await;
-    }
+    off_frame(|| seed_supervision_crew(a, "stalled-work", "work", "coder")).await;
+    let governor = off_frame(|| seed_supervision_crew(b, "governor", "govern", "governor")).await;
     let b_backend = b.resource_backend();
     if subscriptions {
         off_frame(|| seed_governor_subscription(a, b)).await;
@@ -3749,7 +3731,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     let escalation_name =
         b_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("governor inbox").items[0].metadata.name.clone();
     off_frame(|| replicate_stall_to_governor(a, b)).await;
-    off_frame(|| supervise_stall_from_governor(&topology, a)).await;
+    off_frame(|| supervise_stall_from_governor(&topology, a, &governor)).await;
     off_frame(|| check_supervised_resume(a, &escalation_name)).await;
 }
 
@@ -3799,11 +3781,17 @@ async fn replicate_governor_to_source(a: &InProcessDaemon, b: &InProcessDaemon, 
         .replace(&b_backend.using::<Convoy>("flotilla").list().await.expect("governor"), Utc::now())
         .await
         .expect("replicate governor");
+    // The governor's launch travels B's engine log; its holder Vessel replicates beside the convoy.
+    flotilla_provisioning_testkit::replicate_home(
+        &b.decided_store().expect("governor home"),
+        b.node_id().as_str(),
+        &a.decided_store().expect("source home"),
+    );
     a_backend
-        .replica_writer::<TerminalSession>(b.node_id().clone(), "flotilla")
-        .replace(&b_backend.using::<TerminalSession>("flotilla").list().await.expect("governor session"), Utc::now())
+        .replica_writer::<Vessel>(b.node_id().clone(), "flotilla")
+        .replace(&b_backend.using::<Vessel>("flotilla").list().await.expect("governor vessel"), Utc::now())
         .await
-        .expect("replicate session");
+        .expect("replicate governor vessel");
     apply_convoy_replica_feed(a, "flotilla", "governor", b.host_name().clone()).await;
     if stale_home {
         // Ordinary Message homing follows resource provenance even when the
@@ -3839,7 +3827,7 @@ async fn check_supervised_resume(a: &InProcessDaemon, escalation_name: &str) {
 }
 
 /// One convoy with a working crew member and its running session, at `daemon`.
-async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &str, role: &str, crew_id: &str) {
+async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &str, role: &str) -> String {
     let backend = daemon.resource_backend();
     let convoys = backend.using::<Convoy>("flotilla");
     let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).role(role.into()).build();
@@ -3880,50 +3868,46 @@ async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &st
         )
         .await
         .expect("active crew");
-    let sessions = backend.using::<TerminalSession>("flotilla");
-    let session = sessions
+    // The crew's session is the daemon's engine launch, held for its vessel.
+    backend
+        .using::<Vessel>("flotilla")
         .create(
-            &InputMeta::builder()
-                .name(format!("{name}-session"))
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), name.into()),
-                    (VESSEL_LABEL.into(), vessel.into()),
-                    (ROLE_LABEL.into(), role.into()),
-                ]))
-                .build(),
-            &TerminalSessionSpec {
-                env_ref: "test-env".into(),
-                role: role.into(),
-                cwd: "/workspace".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("coding"),
-                    brief: TerminalBrief { path: "brief.md".into(), content: "original".into(), artifact_digest: None, copies: Vec::new() },
-                    context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: name.into(), vessel_ref: vessel.into() }),
-                    message: None,
-                },
+            &InputMeta::builder().name(vessel.into()).build(),
+            &VesselSpec {
+                convoy_ref: name.into(),
+                vessel_name: vessel.into(),
+                fulfilment_kind_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
             },
         )
         .await
-        .expect("session");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: flotilla_resources::TerminalSessionPhase::Running,
-                crew: Some(CrewSessionStatus { id: crew_id.into(), adapter: "codex".into(), model: None, stance: role.into() }),
-                attention: Some(flotilla_resources::TerminalAttention {
-                    state: flotilla_resources::TerminalAttentionState::Working,
-                    as_of: Utc::now(),
-                    source: flotilla_resources::TerminalAttentionSource::Hook,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("running crew session");
+        .expect("crew vessel");
+    let terminals = &engine(daemon).terminals;
+    let launch = terminals.request(&TerminalLaunchRequest {
+        session: format!("{name}-session"),
+        environment: "test-env".into(),
+        vessel: Some(vessel.into()),
+        role: role.into(),
+        pool: "cleat".into(),
+        cwd: "/workspace".into(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Agent {
+            capability: "coding".into(),
+            adapter: None,
+            model: None,
+            brief: TerminalBrief { path: "brief.md".into(), content: "original".into(), artifact_digest: None, copies: Vec::new() },
+        },
+    });
+    terminals.ready(&launch, &format!("{name}-session"), &crew_facts("codex", role));
+    let attention = flotilla_resources::TerminalAttention {
+        state: flotilla_resources::TerminalAttentionState::Working,
+        as_of: Utc::now(),
+        source: flotilla_resources::TerminalAttentionSource::Hook,
+    };
+    TerminalRecords::observations(terminals.terminals.as_ref()).update(&launch, |observation| {
+        observation.observe_attention(attention, Some("codex"));
+    });
+    launch
 }
 
 /// The project's governor role subscribes to supervision; its presence is held at `b` and
@@ -4002,10 +3986,10 @@ async fn check_supervision_escalation_pass(a: &InProcessDaemon, b: &InProcessDae
 
 /// The governor's supervision from its host resumes the stalled crew at `a`; another crew is
 /// refused.
-async fn supervise_stall_from_governor(topology: &InMemoryRequestTopology, a: &InProcessDaemon) {
+async fn supervise_stall_from_governor(topology: &InMemoryRequestTopology, a: &InProcessDaemon, governor: &str) {
     let convoys = a.resource_backend().using::<Convoy>("flotilla");
     let mut events = topology.leader.subscribe();
-    for crew_id in ["unrelated-crew", "governor-id"] {
+    for crew_id in ["unrelated-crew", governor] {
         let id = topology
             .client
             .execute(
@@ -4025,7 +4009,7 @@ async fn supervise_stall_from_governor(topology: &InMemoryRequestTopology, a: &I
             .expect("supervision command");
         let (node_id, result) = await_command_finished(&mut events, id).await;
         assert_eq!(node_id, *a.node_id());
-        if crew_id == "governor-id" {
+        if crew_id == governor {
             assert_eq!(result, CommandValue::Ok);
         } else {
             assert!(matches!(result, CommandValue::Error { message } if message.contains("does not own this supervision rung")));
@@ -4141,50 +4125,39 @@ async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {
         )
         .await
         .expect("unfinished exited work");
-    let sessions = backend.using::<TerminalSession>("flotilla");
-    let session = sessions
+    // The crew's session is the home's engine launch, held for its vessel; its agent exited.
+    backend
+        .using::<Vessel>("flotilla")
         .create(
-            &InputMeta::builder()
-                .name("exited-session".into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "exited-work".into()),
-                    (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
-                    (ROLE_LABEL.into(), "coder".into()),
-                ]))
-                .build(),
-            &TerminalSessionSpec {
-                env_ref: "warm-env".into(),
-                role: "coder".into(),
-                cwd: "/warm/checkout".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("coding"),
-                    brief: TerminalBrief {
-                        path: "brief.md".into(),
-                        content: "original brief".into(),
-                        artifact_digest: None,
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "exited-work".into(),
-                        vessel_ref: "exited-work-work".into(),
-                    }),
-                    message: None,
-                },
+            &InputMeta::builder().name("exited-work-work".into()).build(),
+            &VesselSpec {
+                convoy_ref: "exited-work".into(),
+                vessel_name: "work".into(),
+                fulfilment_kind_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
             },
         )
         .await
-        .expect("warm terminal");
-    sessions
-        .update_status(
-            "exited-session",
-            &session.metadata.resource_version,
-            &TerminalSessionStatus { phase: flotilla_resources::TerminalSessionPhase::Stopped, ..Default::default() },
-        )
-        .await
-        .expect("agent exited");
+        .expect("crew vessel");
+    let terminals = &engine(home).terminals;
+    let launch = terminals.request(&TerminalLaunchRequest {
+        session: "exited-session".into(),
+        environment: "warm-env".into(),
+        vessel: Some("exited-work-work".into()),
+        role: "coder".into(),
+        pool: "cleat".into(),
+        cwd: "/warm/checkout".into(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Agent {
+            capability: "coding".into(),
+            adapter: None,
+            model: None,
+            brief: TerminalBrief { path: "brief.md".into(), content: "original brief".into(), artifact_digest: None, copies: Vec::new() },
+        },
+    });
+    terminals.ready(&launch, "exited-session", &Default::default());
+    terminals.exited(&launch, "agent exited");
+    let sessions = backend.using::<TerminalSession>("flotilla");
     if remote_home {
         apply_convoy_replica_feed(&topology.leader, "flotilla", "exited-work", topology.follower_host.clone()).await;
     }
@@ -4639,7 +4612,11 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
             &ConvoyStatus {
                 workflow_snapshot: Some(WorkflowSnapshot {
                     cascade: None,
-                    vessels: vec![VesselRequirement::builder().name("work".into()).crew(vec![]).build()],
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".into())
+                        .crew(vec![])
+                        .credential_refs(BTreeSet::from(["github".into()]))
+                        .build()],
                     exit: None,
                     turn_delivery: Default::default(),
                     stall_nudges: Default::default(),
@@ -4672,33 +4649,32 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
         },
         None,
     );
-    backend
-        .using::<TerminalSession>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("capabilities-terminal".into())
-                .annotations(BTreeMap::from([(flotilla_resources::CREDENTIAL_REFS_ANNOTATION.into(), "[\"github\"]".into())]))
-                .build(),
-            &TerminalSessionSpec::builder()
-                .env_ref("capabilities-env".into())
-                .role(role.into())
-                .pool("cleat".into())
-                .cwd("/repo".into())
-                .source(TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("code"),
-                    brief: TerminalBrief { path: "brief.md".into(), content: String::new(), artifact_digest: None, copies: vec![] },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "capabilities".into(),
-                        vessel_ref: "capabilities-work".into(),
-                    }),
-                    message: None,
-                })
-                .build(),
-        )
-        .await
-        .expect("session");
+    // The session is the owner's engine launch for the vessel; its credential grants are the
+    // vessel requirement's, frozen in the convoy's workflow snapshot.
+    let terminals = &engine(owner).terminals;
+    let launch = terminals.request(&TerminalLaunchRequest {
+        session: "capabilities-terminal".into(),
+        environment: "capabilities-env".into(),
+        vessel: Some("capabilities-work".into()),
+        role: role.into(),
+        pool: "cleat".into(),
+        cwd: "/repo".into(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Agent {
+            capability: "code".into(),
+            adapter: None,
+            model: None,
+            brief: TerminalBrief { path: "brief.md".into(), content: String::new(), artifact_digest: None, copies: vec![] },
+        },
+    });
+    terminals.ready(&launch, "capabilities-terminal", &Default::default());
     if remote {
+        // The leader routes by the owner's launch, which reaches it with the owner's log.
+        flotilla_provisioning_testkit::replicate_home(
+            &topology.follower.decided_store().expect("owner decided store"),
+            topology.follower.node_id().as_str(),
+            &topology.leader.decided_store().expect("leader decided store"),
+        );
         apply_convoy_replica_feed(&topology.follower, "flotilla", "capabilities", topology.leader_host.clone()).await;
         topology
             .follower
@@ -4714,13 +4690,6 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
             .replace(&backend.using::<Vessel>("flotilla").list().await.expect("vessels"), Utc::now())
             .await
             .expect("vessel replica");
-        topology
-            .leader
-            .resource_backend()
-            .replica_writer::<TerminalSession>(owner.node_id().clone(), "flotilla")
-            .replace(&backend.using::<TerminalSession>("flotilla").list().await.expect("sessions"), Utc::now())
-            .await
-            .expect("session replica");
     }
     let context = CrewCommandContext::builder()
         .namespace("flotilla".into())

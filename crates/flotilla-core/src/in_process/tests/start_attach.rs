@@ -71,7 +71,7 @@ async fn slow_start_attach_does_not_fail() {
 // delays on both sides of the old 60-second boundary, including exactly 60.
 #[hegel::test]
 fn start_attach_lifecycle(tc: hegel::TestCase) {
-    use super::support::{create_running_session, create_test_environment, test_environments, test_meta};
+    use super::support::{create_running_session, create_test_environment, test_engine, test_meta};
     use flotilla_resources::{Host, HostSpec};
     use hegel::generators as gs;
 
@@ -84,13 +84,15 @@ fn start_attach_lifecycle(tc: hegel::TestCase) {
         create_identity_convoy(&backend, "convoy-slow", "coder", Some("flotilla")).await;
         let host = daemon.local_host_id().unwrap().to_string();
         backend.using::<Host>("flotilla").create(&test_meta(&host), &HostSpec::default()).await.unwrap();
-        let environments = test_environments(&daemon);
-        let env = create_test_environment(&environments, "start-env", &host);
+        let engine = test_engine(&daemon);
+        let env = create_test_environment(&engine.environments, "start-env", &host);
         let actor = async {
             tokio::time::sleep(Duration::from_secs(delay)).await;
             let convoys = backend.using::<Convoy>("flotilla");
             match outcome {
-                0 => create_running_session(&daemon, &env, "terminal-slow", "convoy-slow", "coder").await,
+                0 => {
+                    create_running_session(&engine, &backend, &env, "terminal-slow", "convoy-slow", "coder").await;
+                }
                 1 => {
                     let convoy = convoys.get("convoy-slow").await.unwrap();
                     convoys

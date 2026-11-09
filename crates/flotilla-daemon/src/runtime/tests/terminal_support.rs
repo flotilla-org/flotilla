@@ -1,10 +1,5 @@
 use super::*;
 
-pub(super) struct TransientTerminalPool {
-    pub(super) inner: FakeTerminalPool,
-    pub(super) available: AtomicBool,
-}
-
 pub(super) struct DeliveryProbePool {
     pub(super) inputs: StdMutex<Vec<String>>,
     pub(super) activities: Vec<ScreenActivity>,
@@ -174,123 +169,23 @@ impl TerminalPool for HooklessComposerPool {
     }
 }
 
-pub(super) async fn refresh_message_test_attention(runtime: &TerminalControllerRuntime, backend: &ResourceBackend, name: &str) {
-    refresh_message_test_attention_at(runtime, backend, name, Utc::now()).await;
-}
-
-pub(super) async fn refresh_message_test_attention_at(
-    runtime: &TerminalControllerRuntime,
-    backend: &ResourceBackend,
-    name: &str,
-    now: chrono::DateTime<Utc>,
-) {
-    let sessions = backend.using::<TerminalSession>(NAMESPACE);
-    let holder = sessions.get(name).await.expect("attention holder");
+/// Reads crew session `name`'s screen as the terminal probe does, and records what it shows as
+/// this home's observation of its launch, as of now.
+pub(super) async fn refresh_message_test_attention(runtime: &TerminalControllerRuntime, name: &str) {
+    let reads = runtime.state.daemon.lifecycle_reads();
+    let terminals = reads.terminals().expect("terminal sessions");
+    let launch = terminals.get(name, None).expect("read launch").expect("attention holder");
+    let holder = runtime.state.daemon.resource_backend().using::<TerminalSession>(NAMESPACE).get(name).await.expect("session view");
     let mut observation =
         runtime.observe_attention(name, (&holder).into()).await.expect("terminal observation").expect("observed attention");
     if let Some(attention) = &mut observation.attention {
-        attention.as_of = now;
+        attention.as_of = Utc::now();
     }
-    flotilla_store::apply_status_patch(
-        &sessions,
-        name,
-        &flotilla_resources::TerminalSessionStatusPatch::Observe {
-            obstruction: None,
-            attention: observation.attention,
-            occupancy: observation.occupancy,
-        },
-    )
-    .await
-    .expect("terminal controller attention projection");
+    let adapter = launch.agent().map(|agent| agent.adapter.clone());
+    terminals.observations().update(&launch.name, |held| {
+        held.observe(observation.attention, None, observation.occupancy, adapter.as_deref());
+    });
 }
-
-impl TransientTerminalPool {
-    pub(super) fn new() -> Self {
-        Self { inner: FakeTerminalPool::new(), available: AtomicBool::new(true) }
-    }
-
-    pub(super) fn set_available(&self, available: bool) {
-        self.available.store(available, Ordering::SeqCst);
-    }
-}
-
-#[async_trait]
-impl TerminalPool for TransientTerminalPool {
-    fn tracks_session_liveness(&self) -> bool {
-        true
-    }
-
-    async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
-        if !self.available.load(Ordering::SeqCst) {
-            return Err("terminal pool temporarily unavailable".to_string());
-        }
-        self.inner.list_sessions().await
-    }
-
-    async fn ensure_session(
-        &self,
-        session_name: &str,
-        command: &str,
-        cwd: &ExecutionEnvironmentPath,
-        env_vars: &TerminalEnvVars,
-        tags: &[TerminalSessionTag],
-    ) -> Result<(), String> {
-        self.inner.ensure_session(session_name, command, cwd, env_vars, tags).await
-    }
-
-    async fn ensure_session_with_size(
-        &self,
-        session_name: &str,
-        command: &str,
-        cwd: &ExecutionEnvironmentPath,
-        env_vars: &TerminalEnvVars,
-        tags: &[TerminalSessionTag],
-        initial_size: Option<TerminalSize>,
-    ) -> Result<(), String> {
-        self.inner.ensure_session_with_size(session_name, command, cwd, env_vars, tags, initial_size).await
-    }
-
-    fn attach_args(
-        &self,
-        session_name: &str,
-        command: &str,
-        cwd: &ExecutionEnvironmentPath,
-        env_vars: &TerminalEnvVars,
-    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
-        self.inner.attach_args(session_name, command, cwd, env_vars)
-    }
-
-    async fn kill_session(&self, session_name: &str) -> Result<(), String> {
-        self.inner.kill_session(session_name).await
-    }
-}
-
-pub(super) async fn daemon_with_transient_terminal_pool(
-    config: Arc<ConfigStore>,
-    backend: ResourceBackend,
-    pool: Arc<TransientTerminalPool>,
-) -> Arc<InProcessDaemon> {
-    let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(pool as Arc<dyn TerminalPool>));
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        config,
-        discovery,
-        flotilla_protocol::HostName::new("dinghy"),
-        backend,
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-    daemon
-        .replace_local_environment_bag_for_test(
-            EnvironmentBag::new()
-                .with(EnvironmentAssertion::env_var("HOME", "/Users/tester"))
-                .with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
-        )
-        .expect("transient pool environment bag");
-    daemon
-}
-
-use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
 // The vessel pool's process boundary exposes a Cleat endpoint; lifecycle behavior
 // uses the shared in-memory terminal pool, with no subprocess or live host.
@@ -439,4 +334,9 @@ impl CommandRunner for ControllerCleatRunner {
         };
         Ok(CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) })
     }
+}
+
+/// The name of session `session`'s first launch: a crew's id is its launch name (#3108).
+pub(super) fn first_launch(session: &str) -> String {
+    format!("{session}#1")
 }

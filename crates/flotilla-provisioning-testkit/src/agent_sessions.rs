@@ -69,6 +69,8 @@ impl AgentSessionReads for AgentSessionsFixture {
     /// Every home is heard from; only this home's sessions carry progress.
     fn read(&self, name: &str, origin: Option<&str>) -> Result<Option<AgentActivityView>, String> {
         let reading = self.sessions.lock().expect("agent sessions").get(name).cloned();
-        Ok(reading.map(|reading| AgentActivityView { reading, current: true, progress: origin.is_none().then(|| self.progress.get(name)) }))
+        // Progress is kept by session, as the daemon keeps it.
+        let progress = origin.is_none().then(|| self.progress.get(flotilla_resources::terminal_records::launched(name)));
+        Ok(reading.map(|reading| AgentActivityView { reading, current: true, progress }))
     }
 }

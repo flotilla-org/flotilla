@@ -9,9 +9,12 @@
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use flotilla_resources::terminal_records::{
-    launched, AgentLaunch, TerminalChange, TerminalLaunchFacts as FactsView, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecord,
-    TerminalRecords, TerminalRenewal,
+use flotilla_resources::{
+    terminal_records::{
+        launched, AgentLaunch, TerminalChange, TerminalLaunchFacts as FactsView, TerminalLaunchRequest, TerminalLaunchSource,
+        TerminalObservations, TerminalRecord, TerminalRecords, TerminalRenewal,
+    },
+    TerminalSession as OldTerminalSession, TerminalSessionSource,
 };
 use flotilla_schema::{Frozen, Kind, Ref, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, Store};
@@ -47,6 +50,38 @@ pub fn request_of(request: &TerminalLaunchRequest, home: &str) -> Result<Termina
                 brief: Frozen::new(brief.clone()).map_err(|error| format!("freeze the brief: {error}"))?,
             },
         },
+    })
+}
+
+/// The request old TerminalSession `obj` made at `home`, for its import: a crew session is held
+/// for its vessel, a tool for no one.
+pub fn request_of_old(obj: &flotilla_resources::ResourceObject<OldTerminalSession>, home: &str) -> Result<TerminalSessionRequest, String> {
+    let spec = &obj.spec;
+    let (source, holder) = match &spec.source {
+        TerminalSessionSource::Tool { command } => (Launch::Tool { command: command.clone() }, None),
+        TerminalSessionSource::Agent { selector, brief, context, .. } => {
+            let brief = brief.clone();
+            (
+                Launch::Agent {
+                    capability: selector.capability.clone(),
+                    adapter: selector.adapter.clone(),
+                    model: selector.model.clone(),
+                    brief: Frozen::new(brief).map_err(|error| format!("freeze the brief: {error}"))?,
+                },
+                Some(Holder::vessel(&context.vessel_ref)),
+            )
+        }
+    };
+    Ok(TerminalSessionRequest {
+        launch_of: obj.metadata.name.clone(),
+        launch: 0,
+        environment: Ref::new(spec.env_ref.clone(), home),
+        holder,
+        role: spec.role.clone(),
+        pool: spec.pool.clone(),
+        cwd: spec.cwd.clone(),
+        env: spec.env.clone(),
+        source,
     })
 }
 
@@ -155,6 +190,7 @@ pub struct EngineTerminals {
     reads: StoreReads,
     homes: Box<dyn Fn() -> Vec<String> + Send + Sync>,
     changes: tokio::sync::broadcast::Sender<TerminalChange>,
+    observations: TerminalObservations,
 }
 
 /// How many changes a slow follower may fall behind by; one that lags rereads everything.
@@ -170,7 +206,13 @@ impl EngineTerminals {
         store: Arc<Mutex<Store>>,
         homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
-        Self { lifecycles, reads: StoreReads::new(store), homes: Box::new(homes), changes: tokio::sync::broadcast::channel(CHANGES).0 }
+        Self {
+            lifecycles,
+            reads: StoreReads::new(store),
+            homes: Box::new(homes),
+            changes: tokio::sync::broadcast::channel(CHANGES).0,
+            observations: TerminalObservations::default(),
+        }
     }
 
     /// The port over `service`'s store and homes.
@@ -263,6 +305,10 @@ impl TerminalRecords for EngineTerminals {
 
     fn changes(&self) -> tokio::sync::broadcast::Receiver<TerminalChange> {
         self.changes.subscribe()
+    }
+
+    fn observations(&self) -> &TerminalObservations {
+        &self.observations
     }
 
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<TerminalRecord>, String> {

@@ -19,11 +19,14 @@ use flotilla_provisioning::{
 };
 use flotilla_resources::{
     lifecycle_reads::LifecycleReads,
-    terminal_records::{TerminalLaunchFacts as FactsView, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecord, TerminalRecords},
+    terminal_records::{
+        TerminalLaunchFacts as FactsView, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecord, TerminalRecords, PROCESS_EXITED,
+    },
 };
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::machines::lifecycle::VanishCause;
+use flotilla_state_machines::{Cause, CauseCategory, Outcome};
 
 /// One home's terminal sessions on a decided store, served through the engine's readings.
 pub struct TerminalsFixture {
@@ -51,14 +54,25 @@ impl TerminalsFixture {
 
     /// A fixture over `store`, whose home is `home`.
     pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
+        let owned = home.to_owned();
+        Self::over_homes(home, store, move || vec![owned.clone()])
+    }
+
+    /// A fixture over `service`'s store and home, reading every home it holds: other homes'
+    /// sessions arrive as their logs are replicated into it.
+    pub fn over_service(service: &Arc<flotilla_schema_sqlite::stream::Service>) -> Self {
+        let homes = Arc::clone(service);
+        Self::over_homes(service.home(), service.store(), move || homes.homes())
+    }
+
+    fn over_homes(home: &str, store: Arc<Mutex<Store>>, homes: impl Fn() -> Vec<String> + Send + Sync + 'static) -> Self {
         let staged = StagedFacts::default();
         let log = StoreLog::new(Arc::clone(&store));
         let lifecycles: Arc<dyn Lifecycles<TerminalSessionKind>> = Arc::new(LifecycleHome::new(
             home,
             open_home_with(&log, LaunchLog::new(log.clone(), staged.clone())).expect("terminal sessions"),
         ));
-        let owned = home.to_owned();
-        let terminals = Arc::new(EngineTerminals::new(Arc::clone(&lifecycles), Arc::clone(&store), move || vec![owned.clone()]));
+        let terminals = Arc::new(EngineTerminals::new(Arc::clone(&lifecycles), Arc::clone(&store), homes));
         let reads = Arc::new(
             LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), home.to_owned())
                 .with_terminals(Arc::clone(&terminals) as Arc<dyn TerminalRecords>),
@@ -101,9 +115,31 @@ impl TerminalsFixture {
         self.step(launch, Step::Realised { identity: session_id.to_owned() });
     }
 
-    /// Ends realised launch `launch`: its process exited.
+    /// Realises launch `launch` as pool session `session_id`, with `facts`, at `at`: a launch that
+    /// has been running since then.
+    pub fn ready_at(&self, launch: &str, session_id: &str, facts: &FactsView, at: Timestamp) {
+        self.staged.stage(launch, stored_facts(facts));
+        self.step_at(launch, Step::Realised { identity: session_id.to_owned() }, at);
+    }
+
+    /// Ends realised launch `launch`: its process exited, and it waits for a resume.
     pub fn exited(&self, launch: &str, reason: &str) {
+        self.step(launch, Step::Vanished { cause: VanishCause::Lost { reason: Some(format!("{PROCESS_EXITED}: {reason}")) } });
+    }
+
+    /// Ends realised launch `launch` lost: its pool no longer runs it, for `reason`.
+    pub fn lost(&self, launch: &str, reason: &str) {
+        self.step(launch, Step::Vanished { cause: VanishCause::Lost { reason: Some(reason.into()) } });
+    }
+
+    /// Ends realised launch `launch` failed, for `reason`.
+    pub fn failed(&self, launch: &str, reason: &str) {
         self.step(launch, Step::Vanished { cause: VanishCause::Failed { reason: reason.into() } });
+    }
+
+    /// Gives launch `launch` up: its pool refused it, for `cause`.
+    pub fn give_up(&self, launch: &str, cause: &str) {
+        self.step(launch, Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Refused, cause), retryable: false }));
     }
 
     /// Releases launch `launch`.
@@ -117,6 +153,10 @@ impl TerminalsFixture {
     }
 
     fn step(&self, launch: &str, step: Step) {
-        self.lifecycles.step(launch, &step, Timestamp::from_datetime(&chrono::Utc::now())).expect("terminal session step");
+        self.step_at(launch, step, Timestamp::from_datetime(&chrono::Utc::now()));
+    }
+
+    fn step_at(&self, launch: &str, step: Step, at: Timestamp) {
+        self.lifecycles.step(launch, &step, at).expect("terminal session step");
     }
 }

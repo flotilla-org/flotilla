@@ -530,15 +530,7 @@ impl<'a> RequestDispatcher<'a> {
         let Request::AgentHook { event } = request else {
             return Message::error_response(id, "AgentHook request selected the wrong handler");
         };
-        match handle_agent_hook(
-            &self.daemon.resource_backend(),
-            self.agent_state_store,
-            self.hook_identity_policy,
-            Some(Arc::clone(self.daemon)),
-            event,
-        )
-        .await
-        {
+        match handle_agent_hook(self.agent_state_store, self.hook_identity_policy, Some(Arc::clone(self.daemon)), event).await {
             Ok(()) => Message::ok_response(id, Response::AgentHook),
             Err(e) => {
                 warn!(err = %e, "failed to process agent hook event");
@@ -576,7 +568,6 @@ impl<'a> RequestDispatcher<'a> {
 /// Record one agent hook event: the agent state store entry and, for a managed terminal,
 /// its attention. The framed `AgentHook` request and the router's hook routes share it.
 pub(super) async fn handle_agent_hook(
-    backend: &flotilla_store::ResourceBackend,
     agent_state_store: &SharedAgentStateStore,
     hook_identity_policy: HookIdentityPolicy,
     daemon: Option<std::sync::Arc<InProcessDaemon>>,
@@ -687,7 +678,7 @@ pub(super) async fn handle_agent_hook(
         }
     }
     if let Some(primitives) = primitives {
-        if let Err(error) = record_hook_activity(backend, &primitives, &event).await {
+        if let Err(error) = record_hook_activity(daemon.as_ref().map(|daemon| daemon.lifecycle_reads()), &primitives, &event).await {
             // Activity is an additional observer. Its store/join errors must not
             // suppress the established agent registry and terminal attention path.
             tracing::warn!(session = %terminal.session_name, %error, "failed to record agent session activity");
@@ -700,34 +691,17 @@ pub(super) async fn handle_agent_hook(
         // Interrupted changes only the gated AgentSession observation; preserve legacy terminal attention.
         AgentEventType::Ended | AgentEventType::NoChange | AgentEventType::Interrupted => return Ok(()),
     };
-    if !event.native_codex_hook {
-        return crate::agent_attention::observe_hook_attention(backend, &terminal.namespace, &terminal.session_name, state).await;
-    }
-    let sessions = backend.using::<flotilla_resources::TerminalSession>(&terminal.namespace);
-    sessions.get(&terminal.session_name).await.map_err(|error| error.to_string())?;
-    let attention = flotilla_resources::TerminalAttention {
-        state,
-        as_of: chrono::Utc::now(),
-        source: flotilla_resources::TerminalAttentionSource::Hook,
-    };
-    flotilla_store::apply_status_patch(
-        &sessions,
-        &terminal.session_name,
-        &if event.harness == flotilla_protocol::AgentHarness::Codex {
-            flotilla_resources::TerminalSessionStatusPatch::ObserveNativeCodexHook { attention }
-        } else {
-            flotilla_resources::TerminalSessionStatusPatch::ObserveAttention { attention }
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    Ok(())
+    // What this home observes of its launches is its own: a daemon with no engine has none.
+    let Some(daemon) = daemon.as_ref() else { return Ok(()) };
+    let reads = daemon.lifecycle_reads();
+    let native_codex = event.native_codex_hook && event.harness == flotilla_protocol::AgentHarness::Codex;
+    crate::agent_attention::observe_hook_attention(reads.terminals()?, &terminal.session_name, state, native_codex)
 }
 
 /// Records change-only activity, keeping duplicate hooks off the store and
 /// blocking pool. The machine's gate remains authoritative across races.
 pub(super) async fn record_hook_activity(
-    backend: &flotilla_store::ResourceBackend,
+    reads: Option<std::sync::Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>>,
     primitives: &flotilla_core::primitives::MessagePrimitives,
     event: &AgentHookEvent,
 ) -> Result<(), String> {
@@ -741,5 +715,7 @@ pub(super) async fn record_hook_activity(
         AgentEventType::Started | AgentEventType::Ended | AgentEventType::NoChange => return Ok(()),
     };
     let (Some(terminal), Some(cause)) = (event.terminal.as_ref(), event.hook_event.as_ref()) else { return Ok(()) };
-    crate::agent_attention::record_agent_activity(backend, primitives, &terminal.namespace, &terminal.session_name, activity, cause).await
+    // What this home observes of its launches is its own: a daemon with no engine has none.
+    let Some(reads) = reads else { return Ok(()) };
+    crate::agent_attention::record_agent_activity(reads, primitives, &terminal.session_name, activity, cause).await
 }

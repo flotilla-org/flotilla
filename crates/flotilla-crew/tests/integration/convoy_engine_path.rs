@@ -306,17 +306,12 @@ impl flotilla_crew::ports::EngineMessages for Turns {
 // derives Done only once no turn to its live session is undelivered; while one
 // is, the reconciler holds the Done and rechecks soon, since no Message watch
 // wakes it when the turn is delivered. The engine's reading of the session's
-// launch decides whether it is live, whatever its stored phase says.
+// launch decides whether it is live.
 #[tokio::test]
 async fn an_undelivered_turn_holds_the_engines_derived_done() {
-    use flotilla_provisioning_testkit::{Ending, TerminalFixture};
-    use flotilla_resources::{TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, CONVOY_LABEL};
-    for (awaiting, ending, stored) in [
-        (true, Ending::Ready("sid"), TerminalSessionPhase::Stopped),
-        (false, Ending::Ready("sid"), TerminalSessionPhase::Stopped),
-        (true, Ending::Released, TerminalSessionPhase::Running),
-    ] {
-        let live = matches!(ending, Ending::Ready(_));
+    use flotilla_provisioning_testkit::TerminalsFixture;
+    use flotilla_resources::{TerminalSession, Vessel, VesselSpec};
+    for (awaiting, live) in [(true, true), (false, true), (true, false)] {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut convoy = ledger_convoy(&backend).await;
         // Handed over: the engine holds the kept promises; the stored status holds none.
@@ -325,39 +320,31 @@ async fn an_undelivered_turn_holds_the_engines_derived_done() {
         for promise in held.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("promises") {
             promise.state = PromiseState::Kept;
         }
-        let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
-        let session = sessions
+        backend
+            .clone()
+            .using::<Vessel>(NAMESPACE)
             .create(
-                &InputMeta::builder()
-                    .name("coder-session".into())
-                    .labels(BTreeMap::from([
-                        (CONVOY_LABEL.into(), "c".into()),
-                        (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
-                        (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
-                    ]))
-                    .build(),
-                &flotilla_resources::TerminalSessionSpec {
-                    env_ref: "env".into(),
-                    role: "coder".into(),
-                    source: TerminalSessionSource::Tool { command: "test".into() },
-                    cwd: "/workspace".into(),
-                    env: Default::default(),
-                    pool: "cleat".into(),
+                &InputMeta::builder().name("c-work".into()).build(),
+                &VesselSpec {
+                    convoy_ref: "c".into(),
+                    vessel_name: "work".into(),
+                    fulfilment_kind_ref: "kind".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
                 },
             )
             .await
-            .expect("session");
-        let session = sessions
-            .update_status(
-                "coder-session",
-                &session.metadata.resource_version,
-                &TerminalSessionStatus { phase: stored, ..Default::default() },
-            )
-            .await
-            .expect("stored phase");
-        let fixture = TerminalFixture::new(false);
-        fixture.request(&session);
-        fixture.finish(&session, ending);
+            .expect("holder vessel");
+        let fixture = TerminalsFixture::default();
+        let mut request = TerminalsFixture::agent("c-work", "coder", "env");
+        request.session = "coder-session".into();
+        let launch = fixture.request(&request);
+        fixture.ready(&launch, "sid", &Default::default());
+        if !live {
+            fixture.release(&launch);
+        }
+        backend.install_engine_records(Arc::new(flotilla_store::TerminalViews::new(backend.clone(), NAMESPACE, fixture.reads.clone())));
+        backend.serve_engine_in(NAMESPACE);
+        let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
         let messages: flotilla_crew::ports::MessagePath = Arc::new(OnceLock::new());
         let turns: Arc<dyn flotilla_crew::ports::EngineMessages> = Arc::new(Turns { backend: backend.clone(), awaiting });
         assert!(messages.set(turns).is_ok());

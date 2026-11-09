@@ -12,7 +12,7 @@ use flotilla_protocol::{
     CallerCrew, CommandAction, CommandCaller, CrewCommandContext, DaemonEvent, EnvironmentId, Message, PrincipalRef, Request, Response,
     ResponseResult,
 };
-use flotilla_resources::{TerminalSession, TerminalSessionSource, Vessel};
+use flotilla_resources::{TerminalSession, TerminalSessionPhase, TerminalSessionSource, Vessel};
 use flotilla_store::StoreQuery;
 use flotilla_transport::message::MessageSession;
 
@@ -32,7 +32,12 @@ pub(super) async fn environment_crews(daemon: &InProcessDaemon, environment: &En
     for session in sessions.items {
         let session = session.object;
         let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { continue };
-        let Some(crew) = session.status.as_ref().and_then(|status| status.crew.as_ref()) else { continue };
+        let Some(status) = session.status.as_ref() else { continue };
+        // A launch that has ended places no crew.
+        if matches!(status.phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed | TerminalSessionPhase::Lost) {
+            continue;
+        }
+        let Some(crew) = status.crew.as_ref() else { continue };
         let vessel = backend.using::<Vessel>(&namespace).get(&context.vessel_ref).await.map_err(|error| error.to_string())?;
         if vessel.spec.convoy_ref != context.convoy || context.namespace != namespace {
             return Err("EnvironmentIdentityInvalid: session ownership disagrees".into());

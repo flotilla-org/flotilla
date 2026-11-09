@@ -4,7 +4,7 @@
 mod start_attach;
 mod support;
 pub(super) use support::{
-    create_identity_convoy, create_running_session, create_test_environment, engine_fixture, test_engine, test_environments, test_meta,
+    create_identity_convoy, create_running_session, create_test_environment, engine_fixture, ensure_vessel, test_engine, test_meta,
     TestEngine,
 };
 mod admission;

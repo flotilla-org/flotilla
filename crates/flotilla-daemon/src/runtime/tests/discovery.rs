@@ -1,5 +1,7 @@
 use super::*;
 use crate::runtime::discovery::crew_pool_available;
+use crate::testkits::engine::engine;
+use crate::testkits::engine::session_request;
 
 #[cfg(unix)]
 #[tokio::test]
@@ -320,14 +322,18 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
         .cwd(worktree_path.display().to_string())
         .pool("cleat".to_string())
         .build();
-    let session = sessions.create(&identity.input_meta(), &spec).await.expect("tool session");
+    // The tool's launch is held by its vessel.
+    let mut request = session_request(&identity.name(), &spec);
+    request.vessel = Some(identity.vessel_ref.clone());
+    let launch = engine(&daemon).terminals.request(&request);
+    let session = sessions.get(&identity.name()).await.expect("tool session");
     for label in [None, Some("")] {
         let mut unowned = session.clone();
         unowned.metadata.labels.remove(flotilla_resources::VESSEL_REF_LABEL);
         if let Some(label) = label {
             unowned.metadata.labels.insert(flotilla_resources::VESSEL_REF_LABEL.to_string(), label.to_string());
         }
-        let error = terminal.ensure_session("unowned", (&unowned).into(), &[]).await.expect_err("missing vessel");
+        let error = terminal.ensure_session("unowned", &first_launch("unowned"), (&unowned).into(), &[]).await.expect_err("missing vessel");
         assert!(error.contains("requires a session vessel identity"), "{error}");
     }
     // An empty agent context must be refused even if metadata names a vessel.
@@ -347,9 +353,12 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
         }),
         message: None,
     };
-    let error = terminal.ensure_session("unowned-agent", (&unowned_agent).into(), &[]).await.expect_err("empty agent vessel");
+    let error = terminal
+        .ensure_session("unowned-agent", &first_launch("unowned-agent"), (&unowned_agent).into(), &[])
+        .await
+        .expect_err("empty agent vessel");
     assert!(error.contains("requires a session vessel identity"), "{error}");
-    let launched = terminal.ensure_session(&identity.name(), (&session).into(), &[]).await.expect("tool in vessel");
+    let launched = terminal.ensure_session(&identity.name(), &launch, (&session).into(), &[]).await.expect("tool in vessel");
     let session_id = launched.session_id;
     assert_eq!(vessel_pool.0.ensured.lock().await.len(), 1);
     assert!(pool.ensured.lock().await.is_empty(), "host pool must not launch tool crews");

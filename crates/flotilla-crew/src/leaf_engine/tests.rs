@@ -367,6 +367,7 @@ async fn actor_nudge_scenario(governors: &[(&str, u64, ConvoyPhase)]) -> (Resour
         .create(
             &InputMeta::builder()
                 .name("resumed-coder".into())
+                .annotations(launch_annotations("resumed-coder"))
                 .labels(BTreeMap::from([
                     (CONVOY_LABEL.into(), "stalled-work".into()),
                     (VESSEL_LABEL.into(), "work".into()),
@@ -423,6 +424,16 @@ async fn observe_actor_source(
     wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.expect("judge scenario");
 }
 
+/// The launch a test session's view shows: its first. Its AgentSession is named by it.
+fn test_launch(session: &str) -> String {
+    format!("{session}#1")
+}
+
+/// The annotations that make a test session's view show [`test_launch`].
+pub(super) fn launch_annotations(session: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([(flotilla_resources::terminal_records::LAUNCH_ANNOTATION.to_owned(), test_launch(session))])
+}
+
 /// Records an observation of the agent in session `name` on its AgentSession, as the daemon does
 /// beside the terminal's attention (#3108). An unobservable screen records nothing.
 fn observe_agent(name: &str, state: TerminalAttentionState, source: TerminalAttentionSource, at: DateTime<Utc>) {
@@ -436,7 +447,7 @@ fn observe_agent(name: &str, state: TerminalAttentionState, source: TerminalAtte
         TerminalAttentionSource::Screen => flotilla_resources::agent_activity::SCREEN_CAUSE,
         TerminalAttentionSource::Hook => "hook",
     };
-    agents().observe(name, activity, cause, at);
+    agents().observe(&test_launch(name), activity, cause, at);
     if source == TerminalAttentionSource::Hook {
         agents().progress.hook(name, at);
     }
@@ -588,6 +599,7 @@ async fn governor_session(backend: &ResourceBackend, governor: Option<TerminalAt
         .create(
             &InputMeta::builder()
                 .name("governor-session".into())
+                .annotations(launch_annotations("governor-session"))
                 .labels(BTreeMap::from([
                     (CONVOY_LABEL.into(), "stalled-work".into()),
                     (VESSEL_LABEL.into(), "supervise".into()),

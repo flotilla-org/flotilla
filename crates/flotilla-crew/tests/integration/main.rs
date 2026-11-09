@@ -8,9 +8,6 @@ mod convoy_in_memory;
 mod placement_tiebreak_capacity_wait;
 mod review_bundle;
 mod review_bundle_aggregator;
-mod terminal_actuator;
-mod terminal_lifecycle;
-mod terminal_session_reconciler;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;
 mod vessel_finalization;

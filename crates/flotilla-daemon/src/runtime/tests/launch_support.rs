@@ -1,5 +1,6 @@
 use super::*;
 use crate::server::environment_sockets::{EnvironmentSocketRegistry, EnvironmentSocketService};
+use crate::testkits::engine::request_session;
 
 pub(super) enum LaunchObservationRecord {
     Present,
@@ -271,15 +272,15 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
     // Managed launch cards read durable context, just as the live command does.
     let backend = daemon.resource_backend();
     freeze_crew(&backend, "demo", "demo-work", "coder", "claude-code", Vec::new()).await;
-    let terminal_meta = empty_meta("terminal-demo-work-coder");
-    if matches!(observation, LaunchObservationRecord::Present) {
-        backend.using::<TerminalSession>(NAMESPACE).create(&terminal_meta, &spec).await.expect("terminal context");
-    }
+    let launch_name = match observation {
+        LaunchObservationRecord::Present => request_session(&daemon, "terminal-demo-work-coder", &spec),
+        _ => first_launch("terminal-demo-work-coder"),
+    };
     bind_account(&daemon, "demo", "coder", "claude-max", "test@example.com").await;
     let tags: [flotilla_terminal::TerminalSessionTag; 0] = [];
 
     let launched = TerminalControllerRuntime { state }
-        .ensure_session("terminal-demo-work-coder", (&spec).into(), &tags)
+        .ensure_session("terminal-demo-work-coder", &launch_name, (&spec).into(), &tags)
         .await
         .expect("launch contained Claude with its granted credential");
 
@@ -346,9 +347,10 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
     assert!(!launch.command.contains("oauth-secret-material"));
     assert!(!launch.command.contains("superseded-spec-token"));
     assert_eq!(launch.initial_size, Some(CREW_SESSION_SIZE));
-    let crew_id = &launched.crew.expect("contained crew identity").id;
+    // A crew's id is its launch name (#3108).
+    assert!(launched.facts.agent.is_some(), "the contained launch resolves its crew's harness");
     for (name, expected) in [
-        ("FLOTILLA_CREW_ID", crew_id.as_str()),
+        ("FLOTILLA_CREW_ID", launch_name.as_str()),
         ("FLOTILLA_CONVOY", "demo"),
         ("FLOTILLA_VESSEL", "demo-work"),
         ("FLOTILLA_CREW_ROLE", "coder"),

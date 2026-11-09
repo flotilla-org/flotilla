@@ -6,20 +6,19 @@ use std::sync::Arc;
 use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
+use flotilla_resources::terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource};
 use flotilla_resources::{
     Convoy as ResourceConvoy, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, FulfilmentFacts,
     FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostCondition, HostSpec, HostStatus,
-    InputMeta, Project, ProjectSpec, ResourceProvenance, Selector, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
+    Project, ProjectSpec, ResourceProvenance, Selector, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    AGENT_ADAPTERS_CAPABILITY,
 };
 use flotilla_store::ResourceBackend;
 
 use super::support::{
     create_host_direct_host, create_host_direct_placement, create_identity_convoy, create_running_session, create_test_environment,
-    host_direct_kind, host_direct_kind_spec, put_host, read_host, test_environments, test_meta, trusted_codex_workflow,
+    ensure_vessel, host_direct_kind, host_direct_kind_spec, put_host, read_host, test_engine, test_meta, trusted_codex_workflow,
 };
 use crate::in_process::{placement_actuator_host_ref, placement_target_host, ConditionValue, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
@@ -503,15 +502,16 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
     )
     .await;
     let local_host = daemon.local_host_id().expect("local host id").to_string();
-    let environments = test_environments(&daemon);
-    let local_env = create_test_environment(&environments, "local-env", &local_host);
-    let ambiguous_env = create_test_environment(&environments, "ambiguous-env", "shared-host");
+    let engine = test_engine(&daemon);
+    let local_env = create_test_environment(&engine.environments, "local-env", &local_host);
+    let ambiguous_env = create_test_environment(&engine.environments, "ambiguous-env", "shared-host");
     for host_id in ["shared-host-id-a", "shared-host-id-b"] {
         let spec = HostSpec { display_name: "shared-host".to_string(), connection: Default::default(), ..HostSpec::default() };
         put_host(&daemon, host_id, &spec, &HostStatus::default()).await;
     }
-    create_running_session(&daemon, &ambiguous_env, "terminal-ambiguous", "convoy-ambiguous", "watcher").await;
-    create_running_session(&daemon, &local_env, "terminal-local", "convoy-local", "watcher").await;
+    let backend = daemon.resource_backend();
+    create_running_session(&engine, &backend, &ambiguous_env, "terminal-ambiguous", "convoy-ambiguous", "watcher").await;
+    create_running_session(&engine, &backend, &local_env, "terminal-local", "convoy-local", "watcher").await;
 
     let rows = daemon.fleet_list_internal().await.expect("fleet list").rows;
     let hosts_by_convoy = rows.into_iter().map(|row| (row.convoy, row.host)).collect::<BTreeMap<_, _>>();
@@ -533,64 +533,43 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
     )
     .await;
     let host = daemon.local_host_id().expect("local host id").to_string();
-    let environments = test_environments(&daemon);
-    let env = create_test_environment(&environments, "local-env", &host);
+    let engine = test_engine(&daemon);
+    let env = create_test_environment(&engine.environments, "local-env", &host);
+    let backend = daemon.resource_backend();
+    let mut crew_one = String::new();
     for (convoy, project) in [("convoy-one", "island-one"), ("convoy-two", "island-two")] {
-        create_identity_convoy(&daemon.resource_backend(), convoy, convoy, Some(project)).await;
+        create_identity_convoy(&backend, convoy, convoy, Some(project)).await;
         if convoy == "convoy-one" {
-            let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
-            let name = "terminal-convoy-one";
-            let created = terminals
-                .create(
-                    &InputMeta::builder()
-                        .name(name.to_string())
-                        .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.to_string())]))
-                        .build(),
-                    &ResourceTerminalSessionSpec {
-                        env_ref: env.clone(),
-                        role: "coder".to_string(),
-                        source: TerminalSessionSource::Agent {
-                            selector: Selector { capability: "code".to_string(), adapter: Some("codex".to_string()), model: None },
-                            brief: flotilla_resources::TerminalBrief {
-                                artifact_digest: None,
-                                path: "brief.md".to_string(),
-                                content: "Work".to_string(),
-                                copies: vec![],
-                            },
-                            context: Box::new(flotilla_resources::TerminalCrewContext {
-                                namespace: "flotilla".to_string(),
-                                convoy: convoy.to_string(),
-                                vessel_ref: "vessel-one".to_string(),
-                            }),
-                            message: None,
-                        },
-                        cwd: "/repo".to_string(),
-                        env: Default::default(),
-                        pool: "passthrough".to_string(),
+            ensure_vessel(&backend, "vessel-one", convoy, "work").await;
+            let launch = engine.terminals.request(&TerminalLaunchRequest {
+                session: "terminal-convoy-one".to_string(),
+                environment: env.clone(),
+                vessel: Some("vessel-one".to_string()),
+                role: "coder".to_string(),
+                pool: "passthrough".to_string(),
+                cwd: "/repo".to_string(),
+                env: Default::default(),
+                source: TerminalLaunchSource::Agent {
+                    capability: "code".to_string(),
+                    adapter: Some("codex".to_string()),
+                    model: None,
+                    brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
+                        path: "brief.md".to_string(),
+                        content: "Work".to_string(),
+                        copies: vec![],
                     },
-                )
-                .await
-                .expect("agent session");
-            terminals
-                .update_status(
-                    name,
-                    &created.metadata.resource_version,
-                    &ResourceTerminalSessionStatus {
-                        phase: ResourceTerminalSessionPhase::Running,
-                        session_id: Some("session-one".to_string()),
-                        crew: Some(flotilla_resources::CrewSessionStatus {
-                            id: "crew-one".to_string(),
-                            adapter: "codex".to_string(),
-                            model: None,
-                            stance: "coder".to_string(),
-                        }),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("agent status");
+                },
+            });
+            let facts = TerminalLaunchFacts {
+                agent: Some(AgentLaunch { adapter: "codex".to_string(), model: None, stance: "coder".to_string() }),
+                ..Default::default()
+            };
+            engine.terminals.ready(&launch, "session-one", &facts);
+            // Its crew id is its launch's name.
+            crew_one = launch;
         } else {
-            create_running_session(&daemon, &env, &format!("terminal-{convoy}"), convoy, "coder").await;
+            create_running_session(&engine, &backend, &env, &format!("terminal-{convoy}"), convoy, "coder").await;
         }
     }
 
@@ -599,7 +578,7 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
     let scoped = daemon.scoped_fleet_list(None, None, Some("convoy-one")).await.expect("crew convoy scope");
     assert_eq!(scoped.rows.len(), 1);
     assert_eq!(scoped.rows[0].convoy_ref.as_deref(), Some("convoy-one"));
-    let by_crew = daemon.scoped_fleet_list(None, Some("crew-one"), None).await.expect("crew identity scope");
+    let by_crew = daemon.scoped_fleet_list(None, Some(&crew_one), None).await.expect("crew identity scope");
     assert_eq!(by_crew.rows.len(), 1);
     assert_eq!(by_crew.rows[0].convoy_ref.as_deref(), Some("convoy-one"));
     assert!(daemon.scoped_fleet_list(None, Some("missing"), None).await.is_err());

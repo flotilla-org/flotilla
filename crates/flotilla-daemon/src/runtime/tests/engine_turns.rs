@@ -7,13 +7,14 @@
 //! passes run on events, never on a timer.
 
 use flotilla_core::primitives::MessagePrimitives;
-use flotilla_resources::{MessagePhase, MessageRelation, MessageSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
+use flotilla_resources::{MessagePhase, MessageRelation, MessageSpec};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::machines::agent_session::Activity;
 use flotilla_store::load_metrics::ControllerLoadMetrics;
 
 use super::*;
 use crate::runtime::primitives::MessageDelivery;
+use crate::testkits::engine::engine;
 
 /// A running crew session that holds role `coder` of convoy `turns`, typing through `pool`, with
 /// the engine's Message path open, as the runtime always opens it, and its fleet designated.
@@ -22,6 +23,8 @@ struct EngineCrew {
     daemon: Arc<InProcessDaemon>,
     state: Arc<ControllerRuntimeState>,
     primitives: Arc<MessagePrimitives>,
+    /// The launch the crew's session runs as: its crew id.
+    launch: String,
 }
 
 async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
@@ -43,26 +46,49 @@ async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
         .create(&empty_meta("turns"), &ConvoySpec::builder().workflow_ref("test".into()).project_ref(NAMESPACE.into()).build())
         .await
         .expect("convoy");
-    create_credential_test_session(&backend, "agent", "turns", "turns-work", &profile.host_direct_environment_name()).await;
-    let sessions = backend.using::<TerminalSession>(NAMESPACE);
-    let terminal = sessions.get("agent").await.expect("session");
-    let mut spec = terminal.spec.clone();
-    spec.pool = "turn-probe".into();
-    let TerminalSessionSource::Agent { selector, .. } = &mut spec.source else { unreachable!() };
-    selector.adapter = Some(adapter.into());
-    let mut meta = InputMeta::from(&terminal.metadata);
-    meta.labels.extend([(CONVOY_LABEL.into(), "turns".into()), (VESSEL_LABEL.into(), "work".into()), (ROLE_LABEL.into(), "coder".into())]);
-    let terminal = sessions.update(&meta, &terminal.metadata.resource_version, &spec).await.expect("crew session");
-    let mut status = terminal.status.clone().expect("status");
-    status.session_id = Some("agent".into());
-    status.crew = Some(flotilla_resources::CrewSessionStatus {
-        id: "turn-crew".into(),
-        adapter: adapter.into(),
-        model: None,
-        stance: "trusted-implicit".into(),
+    // The crew's vessel holds its session, which runs its agent under pool session `agent`.
+    backend
+        .clone()
+        .using::<Vessel>(NAMESPACE)
+        .create(
+            &empty_meta("turns-work"),
+            &VesselSpec {
+                convoy_ref: "turns".into(),
+                vessel_name: "work".into(),
+                fulfilment_kind_ref: "host-direct".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("crew vessel");
+    let terminals = &engine(&daemon).terminals;
+    let launch = terminals.request(&flotilla_resources::terminal_records::TerminalLaunchRequest {
+        session: "agent".into(),
+        environment: profile.host_direct_environment_name(),
+        vessel: Some("turns-work".into()),
+        role: "coder".into(),
+        pool: "turn-probe".into(),
+        cwd: "/workspace".into(),
+        env: Default::default(),
+        source: flotilla_resources::terminal_records::TerminalLaunchSource::Agent {
+            capability: "code".into(),
+            adapter: Some(adapter.into()),
+            model: None,
+            brief: flotilla_resources::TerminalBrief {
+                artifact_digest: None,
+                path: ".flotilla/briefs/coder.md".into(),
+                content: "Work on the issue".into(),
+                copies: Vec::new(),
+            },
+        },
     });
-    status.started_at = Some(Utc::now() - chrono::Duration::minutes(20));
-    sessions.update_status("agent", &terminal.metadata.resource_version, &status).await.expect("running session");
+    let agent =
+        flotilla_resources::terminal_records::AgentLaunch { adapter: adapter.into(), model: None, stance: "trusted-implicit".into() };
+    terminals.ready(
+        &launch,
+        "agent",
+        &flotilla_resources::terminal_records::TerminalLaunchFacts { agent: Some(agent), ..Default::default() },
+    );
     designate_fleet(&daemon).await;
     super::super::open_message_primitives(&daemon).await.expect("open the Message path");
     let primitives = daemon.message_primitives().expect("Message path");
@@ -74,7 +100,7 @@ async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
         profile.host_id.clone(),
         profile.host_direct_environment_name(),
     ));
-    EngineCrew { _temp: temp, daemon, state, primitives }
+    EngineCrew { _temp: temp, daemon, state, primitives, launch }
 }
 
 impl EngineCrew {
@@ -157,8 +183,8 @@ async fn held_turn_confirmed(adapter: &str, evidence: Evidence) -> bool {
     let agents = Arc::clone(crew.primitives.sessions());
     // Before the turn, the agent is Idle on its screen, or already Working.
     match evidence {
-        Evidence::PromptSubmit => agents.observe("agent", Activity::Working, "UserPromptSubmit".into(), EngineCrew::at(Utc::now())),
-        Evidence::Working | Evidence::CodexIdle => agents.observe_screen("agent", Activity::Idle, EngineCrew::at(Utc::now())),
+        Evidence::PromptSubmit => agents.observe(&crew.launch, Activity::Working, "UserPromptSubmit".into(), EngineCrew::at(Utc::now())),
+        Evidence::Working | Evidence::CodexIdle => agents.observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(Utc::now())),
     }
     .expect("activity before the turn");
     let mut delivery = crew.delivery();
@@ -170,12 +196,12 @@ async fn held_turn_confirmed(adapter: &str, evidence: Evidence) -> bool {
     let after = Utc::now() + chrono::Duration::milliseconds(1);
     match evidence {
         Evidence::Working => {
-            agents.observe_screen("agent", Activity::Working, EngineCrew::at(after)).expect("working");
+            agents.observe_screen(&crew.launch, Activity::Working, EngineCrew::at(after)).expect("working");
         }
         Evidence::PromptSubmit => crew.daemon.crew_progress().prompt_submit("agent", after),
         Evidence::CodexIdle => {
             // The notify hook's Idle matches the screen's and is refused; this daemon saw the hook.
-            assert!(!agents.observe("agent", Activity::Idle, "agent-turn-complete".into(), EngineCrew::at(after)).expect("idle hook"));
+            assert!(!agents.observe(&crew.launch, Activity::Idle, "agent-turn-complete".into(), EngineCrew::at(after)).expect("idle hook"));
             crew.daemon.crew_progress().hook("agent", after);
         }
     }
@@ -191,7 +217,7 @@ async fn a_sessions_pending_messages_are_typed_as_one_turn() {
     let pool = lossy_pool();
     let crew = engine_crew("claude-code", pool.clone()).await;
     let agents = Arc::clone(crew.primitives.sessions());
-    agents.observe_screen("agent", Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
+    agents.observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
     let mut delivery = crew.delivery();
     let sent = [
         ("first", "system:turn-rules", MessageRelation::System, "Complete this turn."),
@@ -211,7 +237,9 @@ async fn a_sessions_pending_messages_are_typed_as_one_turn() {
         expected.push(flotilla_messaging::frame_message(&view.object.spec));
     }
     assert_eq!(inputs[0], expected.join("\n\n"));
-    agents.observe_screen("agent", Activity::Working, EngineCrew::at(Utc::now() + chrono::Duration::milliseconds(1))).expect("working");
+    agents
+        .observe_screen(&crew.launch, Activity::Working, EngineCrew::at(Utc::now() + chrono::Duration::milliseconds(1)))
+        .expect("working");
     delivery.pass().await.expect("delivery pass");
     for (name, ..) in sent {
         assert!(crew.delivered(name).await, "{name} is received with its turn");
@@ -225,7 +253,7 @@ async fn a_sessions_pending_messages_are_typed_as_one_turn() {
 async fn an_operator_turn_supersedes_the_sessions_held_system_turns() {
     let pool = lossy_pool();
     let crew = engine_crew("claude-code", pool.clone()).await;
-    crew.primitives.sessions().observe_screen("agent", Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
+    crew.primitives.sessions().observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
     let mut delivery = crew.delivery();
     crew.send("rule-turn", "system:turn-rules", MessageRelation::System, "Complete this turn.").await;
     passes(&mut delivery, 20).await;
@@ -246,7 +274,7 @@ async fn native_codex_hooks_confirm_a_held_turn_only_once_the_agent_takes_it_up(
     for taken_up_by in [&["user-prompt-submit"][..], &["pre-tool-use", "post-tool-use"]] {
         let pool = lossy_pool();
         let crew = engine_crew("codex", pool.clone()).await;
-        crew.primitives.sessions().observe_screen("agent", Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
+        crew.primitives.sessions().observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
         let mut delivery = crew.delivery();
         crew.send("held-turn", "system:turn-rules", MessageRelation::System, "wake").await;
         passes(&mut delivery, 20).await;
@@ -331,7 +359,7 @@ async fn a_turn_cleat_refuses_for_controller_input_is_typed_once_the_controller_
         let crew = engine_crew("codex", cleat).await;
         // The TerminalSession reconciler's observation attaches the crew's recognizer.
         let runtime = TerminalControllerRuntime { state: Arc::clone(&crew.state) };
-        refresh_message_test_attention(&runtime, &crew.daemon.resource_backend(), "agent").await;
+        refresh_message_test_attention(&runtime, "agent").await;
         let mut delivery = crew.delivery();
         crew.send("queued-turn", "system:turn-rules", MessageRelation::System, "recover this turn").await;
         passes(&mut delivery, 4).await;
@@ -353,7 +381,7 @@ async fn a_turn_cleat_refuses_for_controller_input_is_typed_once_the_controller_
         assert_eq!(probe.draft.lock().expect("composer").as_deref(), abandoned.then_some(DRAFT), "the draft is typed back");
         assert!(crew.state.composer_drafts.held("agent").is_empty(), "nothing left held in memory");
         let sessions = crew.daemon.resource_backend().using::<TerminalSession>(NAMESPACE);
-        assert_eq!(sessions.get("agent").await.expect("session").status.expect("status").crew.expect("crew").id, "turn-crew");
+        assert_eq!(sessions.get("agent").await.expect("session").status.expect("status").crew.expect("crew").id, crew.launch);
     }
 }
 
@@ -390,7 +418,7 @@ async fn message_delivery_runs_on_events_not_a_timer() {
     }
     let pool = lossy_pool();
     let crew = engine_crew("claude-code", pool.clone()).await;
-    crew.primitives.sessions().observe_screen("agent", Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
+    crew.primitives.sessions().observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
     let metrics = Arc::new(ControllerLoadMetrics::default());
     let task = tokio::spawn(crew.delivery().run(Arc::clone(&metrics)));
     wait_until("the first pass", async || metrics.snapshot().reconcile.count() >= 1).await;

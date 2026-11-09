@@ -1047,19 +1047,25 @@ impl ReadProjections<'_> {
             )
         } else {
             let context = if let Some(crew_id) = crew_id {
-                StoreQuery {
-                    include_replicas: true,
-                    ..StoreQuery::related_kind(
-                        "metadata.name",
-                        "TerminalSession",
-                        "spec.source.context.convoy",
-                        StoreQuery {
+                // The engine serves terminal sessions, so the crew's convoy is found from its
+                // session first: no store relation joins them.
+                let crew_sessions = self
+                    .backend
+                    .query_declared::<ResourceTerminalSession>(
+                        namespace,
+                        &StoreQuery {
                             fields: BTreeMap::from([("status.crew.id".into(), crew_id.into())]),
                             include_replicas: true,
                             ..Default::default()
                         },
                     )
-                }
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let convoys = crew_sessions.items.into_iter().filter_map(|source| match source.object.spec.source {
+                    TerminalSessionSource::Agent { context, .. } => Some(context.convoy),
+                    TerminalSessionSource::Tool { .. } => None,
+                });
+                StoreQuery::names(convoys, true)
             } else {
                 StoreQuery::names([convoy.ok_or("scope requires a convoy")?.to_string()], true)
             };
@@ -1074,9 +1080,20 @@ impl ReadProjections<'_> {
             }
             None => scope.clone(),
         };
-        let mut terminal_query = StoreQuery {
-            include_replicas: true,
-            ..StoreQuery::related_kind("metadata.labels.\"flotilla.work/convoy\"", "Convoy", "metadata.name", scope)
+        let convoys = self.backend.query_declared::<ResourceConvoy>(namespace, &convoy_query).await.map_err(|error| error.to_string())?;
+        let mut terminal_query = if scoped {
+            // The engine serves terminal sessions, so a session is selected by its convoy's name:
+            // no store relation joins them. Its scope's convoys are among those just read.
+            StoreQuery {
+                field_values: BTreeMap::from([(
+                    "metadata.labels.\"flotilla.work/convoy\"".into(),
+                    convoys.items.iter().map(|source| source.object.metadata.name.clone()).collect(),
+                )]),
+                include_replicas: true,
+                ..Default::default()
+            }
+        } else {
+            StoreQuery::default()
         };
         if !scoped {
             // A full fleet lists every local and replicated session.
@@ -1095,14 +1112,6 @@ impl ReadProjections<'_> {
         }
         let sessions =
             self.backend.query_declared::<ResourceTerminalSession>(namespace, &terminal_query).await.map_err(|error| error.to_string())?;
-        let sessions = flotilla_resources::ReadResourceList {
-            items: sessions
-                .items
-                .iter()
-                .map(|source| flotilla_resources::terminal_launches::read_source(self.lifecycles, source).map(|(source, _)| source))
-                .collect::<Result<_, _>>()?,
-        };
-        let convoys = self.backend.query_declared::<ResourceConvoy>(namespace, &convoy_query).await.map_err(|error| error.to_string())?;
         let context_convoy = if !scoped || project.is_some() {
             None
         } else if let Some(crew_id) = crew_id {
@@ -1511,12 +1520,7 @@ impl ReadProjections<'_> {
             })
             .collect();
 
-        let selected_sessions_readings = receivers
-            .terminals()
-            .iter()
-            .map(|source| flotilla_resources::terminal_launches::read_source(self.lifecycles, source).map(|(source, _)| source))
-            .collect::<Result<Vec<_>, _>>()?;
-        let observed_sessions = selected_sessions_readings.as_slice();
+        let observed_sessions = receivers.terminals();
         let unclaimed_work = explained_unclaimed_work(convoy.status.as_ref(), observed_sessions, name);
         let selected_sessions = flotilla_resources::select_convoy_children(&convoy, observed_sessions);
         let queued_turns = convoy

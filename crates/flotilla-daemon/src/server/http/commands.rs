@@ -680,6 +680,7 @@ fn error_status(class: DispatcherErrorClass) -> StatusCode {
 mod tests {
     use std::sync::Arc;
 
+    use crate::server::tests::launch_of;
     use crate::testkits::engine::engine as install_engine;
 
     use axum::{
@@ -1503,11 +1504,8 @@ mod tests {
             let own = h.call("GET", url, None, cbor, caller.clone()).await;
             assert_eq!(own.0, StatusCode::OK);
             assert!(!own.1["outcome"].is_null());
-            let sessions = daemon.resource_backend().using::<flotilla_resources::TerminalSession>("flotilla");
-            let session = sessions.get("placed-session").await.unwrap();
-            let mut status = session.status.unwrap();
-            status.crew = None;
-            sessions.update_status("placed-session", &session.metadata.resource_version, &status).await.unwrap();
+            // The crew's launch ends.
+            install_engine(&daemon).terminals.release(&launch_of(&daemon, "placed-session"));
             let retired = h.call("GET", url, None, cbor, caller).await;
             assert_eq!(retired.0, StatusCode::FORBIDDEN);
             assert_eq!(retired.1["message"], "EnvironmentIdentityUnavailable: no placed crew");

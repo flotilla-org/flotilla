@@ -326,46 +326,25 @@ async fn teardown_reads_checkout_endings_from_the_engine() {
     }
 }
 
-// All explicit crew restart writers share captured launch identity; a delayed retry cannot reset a newer running launch.
+// A crew restart starts an ended session's next launch; a repeated or late restart while that
+// launch lives starts no third.
 #[tokio::test]
-async fn crew_restart_writes_engine_intent_and_refuses_a_stale_predecessor() {
-    use flotilla_provisioning::engine::{
-        terminal_session::{EngineTerminalLaunches, TerminalSessionBinding},
-        Lifecycles,
-    };
-    use flotilla_provisioning_testkit::{store_object, terminal_session, Ending, LifecycleFixture};
-    use flotilla_resources::{ReadResourceObject, ResourceProvenance, TerminalSessionPhase};
-    let (mut crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
-    let obj = store_object(&backend, terminal_session(TerminalSessionPhase::Stopped)).await;
-    let lifecycle = LifecycleFixture::<TerminalSessionBinding>::new(false);
-    lifecycle.request(&obj);
-    lifecycle.finish(&obj, Ending::Released);
-    Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = lifecycle.reads.clone();
-    backend.install_terminal_launches(Arc::new(EngineTerminalLaunches { lifecycles: lifecycle.home.clone() }));
-    let (selected, replaces) = crew
-        .terminal_source(ReadResourceObject { object: obj, provenance: ResourceProvenance::Local })
-        .await
-        .expect("selected predecessor");
-    let first = lifecycle.home.newest_launch("terminal-a").expect("first").name().to_owned();
-    assert_eq!(replaces.as_deref(), Some(first.as_str()));
-    crew.restart_terminal("flotilla", &selected.object, replaces.as_deref()).await.expect("request next");
-    crew.restart_terminal("flotilla", &selected.object, replaces.as_deref()).await.expect("retry same intent");
-    let current = lifecycle.reads.try_terminal_launch("terminal-a", None).expect("read").expect("current");
-    let next = lifecycle.home.newest_launch("terminal-a").expect("next").name().to_owned();
+async fn crew_restart_starts_the_next_launch_once() {
+    use flotilla_provisioning_testkit::TerminalsFixture;
+    let (mut crew, _backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    let terminals = TerminalsFixture::default();
+    Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = terminals.reads.clone();
+    let request = TerminalsFixture::agent("v1", "coder", "env");
+    let first = terminals.request(&request);
+    terminals.ready(&first, "first-runtime", &Default::default());
+    terminals.exited(&first, "agent exited with code 0");
+    let stopped = terminals.record(&first).read_view("flotilla", None, None);
+    crew.restart_terminal(&stopped).expect("request next");
+    let next = terminals.record(&request.session).name;
     assert_ne!(next, first);
-    assert_eq!(current.name, next);
-    lifecycle.finish(&selected.object, Ending::Ready("next-runtime"));
-    let version = backend.using::<ResourceTerminalSession>("flotilla").get("terminal-a").await.expect("before").metadata.resource_version;
-    assert!(crew
-        .restart_terminal("flotilla", &selected.object, replaces.as_deref())
-        .await
-        .expect_err("late writer")
-        .contains("no longer latest"));
-    assert_eq!(
-        backend.using::<ResourceTerminalSession>("flotilla").get("terminal-a").await.expect("after").metadata.resource_version,
-        version
-    );
-    assert_eq!(lifecycle.home.newest_launch("terminal-a").expect("held").name(), next, "no third launch");
-    lifecycle.poison();
-    assert!(crew.terminal_source(selected).await.expect_err("checked error").contains("poisoned"));
+    crew.restart_terminal(&stopped).expect("retry same intent");
+    terminals.ready(&next, "next-runtime", &Default::default());
+    crew.restart_terminal(&stopped).expect("late writer");
+    assert_eq!(terminals.record(&request.session).name, next, "no third launch");
+    assert!(terminals.record(&request.session).is_running());
 }

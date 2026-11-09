@@ -430,10 +430,6 @@ impl CredentialDelivery {
             if !selected(Some(&session.spec.env_ref)) {
                 continue;
             }
-            let session = flotilla_store::read_terminal_session(self.state.daemon.lifecycle_reads(), &session, None)
-                .await
-                .map_err(|error| error.to_string())?
-                .0;
             let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { continue };
             let running = session
                 .status

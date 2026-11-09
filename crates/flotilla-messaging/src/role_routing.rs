@@ -16,7 +16,6 @@ use crate::{
     TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
-pub const BRIEF_CHARTER_REVISION_ANNOTATION: &str = "flotilla.work/brief-charter-revision";
 pub const FLEET_STORE_SENDER: &str = "system:fleet-store";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,7 +469,13 @@ async fn reconcile_charter_notifications_from_receivers(
         };
         let Some(project) = projects.iter().find(|project| project.metadata.name == project_name) else { continue };
         let Some(revision) = flotilla_resources::role_cascade::project_charter_revision(project) else { continue };
-        if holder.object.metadata.annotations.get(BRIEF_CHARTER_REVISION_ANNOTATION) == Some(&revision) {
+        // Its brief was rendered from its convoy's frozen workflow cascade.
+        let briefed = convoy
+            .and_then(|convoy| convoy.status.as_ref())
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .and_then(|workflow| workflow.cascade.as_ref())
+            .and_then(|cascade| cascade.charter_commit.as_ref());
+        if briefed == Some(&revision) {
             continue;
         }
         let name = format!("charter-{:x}", Sha256::digest(format!("{receiver}\0{revision}").as_bytes()));

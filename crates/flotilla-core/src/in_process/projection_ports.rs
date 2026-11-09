@@ -199,14 +199,6 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for WithAgentSessions {
         self.reads.try_reading(kind, name, origin)
     }
 
-    fn try_terminal_launch(
-        &self,
-        name: &str,
-        origin: Option<&str>,
-    ) -> Result<Option<flotilla_resources::terminal_launches::TerminalLaunch>, String> {
-        self.reads.try_terminal_launch(name, origin)
-    }
-
     fn environments(&self) -> Result<&dyn flotilla_resources::environment_records::EnvironmentRecords, String> {
         self.reads.environments()
     }
@@ -221,6 +213,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for WithAgentSessions {
 
     fn agent_sessions(&self) -> Result<&dyn flotilla_resources::agent_activity::AgentSessionReads, String> {
         Ok(&self.agent_sessions)
+    }
+
+    fn terminals(&self) -> Result<&dyn flotilla_resources::terminal_records::TerminalRecords, String> {
+        self.reads.terminals()
     }
 }
 
@@ -333,7 +329,9 @@ mod agent_sessions {
                 let heard = self.service.watermark(home).map_err(|error| error.to_string())?.applied_through.to_datetime();
                 home_current(heard.filter(|at| *at > DateTime::<Utc>::UNIX_EPOCH), self.clock.now())
             };
-            let progress = (home == own).then(|| self.progress.get(name));
+            // Progress is kept by session as hooks name it; a launch reads its session's, which an
+            // earlier launch's can only precede.
+            let progress = (home == own).then(|| self.progress.get(flotilla_resources::terminal_records::launched(name)));
             Ok(reading.map(|reading| AgentActivityView { reading, current, progress }))
         }
     }

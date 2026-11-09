@@ -772,33 +772,11 @@ pub(super) fn passthrough_registry_with_environment(handle: EnvironmentHandle) -
     Arc::new(registry)
 }
 
-/// The fixtures serving test daemons' environments, by daemon.
-static ENGINE_ENVIRONMENTS: std::sync::LazyLock<StdMutex<HashMap<usize, Arc<EnvironmentFixture>>>> =
-    std::sync::LazyLock::new(Default::default);
-
-fn daemon_key(daemon: &InProcessDaemon) -> usize {
-    daemon as *const InProcessDaemon as usize
-}
-
-/// The engine's environments (and clones and checkouts) a test daemon reads (#3108), on its decided store: installed as its
-/// lifecycle reads on first use, and the same fixture after. Records are written as the
-/// Environment controller would write them; a daemon whose controller runs opens its lifecycles
-/// with [`engine_provisioning`] instead.
-pub(super) fn engine_environments(daemon: &InProcessDaemon) -> Arc<EnvironmentFixture> {
-    let mut fixtures = ENGINE_ENVIRONMENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if daemon.lifecycle_reads().environments().is_ok() {
-        return Arc::clone(fixtures.get(&daemon_key(daemon)).expect("the daemon's environments were installed by these helpers"));
-    }
-    let store = daemon.decided_store().expect("decided store").store();
-    let home = flotilla_engine_store::StoreLog::new(Arc::clone(&store)).home().to_owned();
-    // Its readings serve the engine's clones and checkouts on the same store too, as the
-    // runtime's do.
-    let engine = flotilla_provisioning_testkit::EngineFixture::over(&home, store);
-    daemon.install_lifecycle_reads(engine.reads()).expect("install the engine's environments");
-    let fixture = Arc::new(engine.environments);
-    fixtures.insert(daemon_key(daemon), Arc::clone(&fixture));
-    fixture
-}
+/// The engine's environments (and clones, checkouts and terminal sessions) a test daemon reads
+/// (#3108), on its decided store: installed as its lifecycle reads on first use, and the same
+/// engine after. Records are written as the Environment controller would write them; a daemon
+/// whose controller runs opens its lifecycles with [`engine_provisioning`] instead.
+pub(super) use crate::testkits::engine::engine_environments;
 
 /// Startup seeding as the runtime runs it, over the provisioning lifecycles [`engine_provisioning`]
 /// opens for `daemon`'s controllers.

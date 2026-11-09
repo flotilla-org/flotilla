@@ -294,9 +294,8 @@ impl StoreQuery {
 impl<T: Resource> TypedResolver<T> {
     pub async fn query_declared(&self, query: &StoreQuery) -> Result<ReadResourceList<T>, ResourceError> {
         if let Some(reads) = self.backend.definitions::<T>(&self.namespace).engine_reads().await {
-            // This resolver reads this home's rows: the engine's records written here (#3824).
-            let local = StoreQuery { include_replicas: false, ..query.clone() };
-            return Ok(ReadResourceList { items: crate::definition::select_reads(reads?, &local)? });
+            // The query decides whether other homes' rows count, as it does for the old store.
+            return Ok(ReadResourceList { items: crate::definition::select_reads(reads?, query)? });
         }
         let items = self.backend.store().query_decoded(ResourceKind::of::<T>(), &self.namespace, query).await?.into_typed()?;
         Ok(ReadResourceList { items })

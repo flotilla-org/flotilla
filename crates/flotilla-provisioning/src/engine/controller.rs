@@ -166,7 +166,8 @@ enum Trigger {
     Retry,
     /// The controller started: the backing is observed.
     Start,
-    /// A host probe saw the backing change: a realised one is observed again.
+    /// A host probe saw the backing change: a realised one is observed again, and a failed attempt
+    /// runs again, what it lacked having arrived.
     Recheck,
 }
 
@@ -230,7 +231,9 @@ fn act(state: &LifecycleState, judgement: &Judgement, found: &Found, trigger: Tr
                 Action::GiveUp { cause: last.clone(), retryable: last_failure.as_ref().is_some_and(|failure| failure.retryable) }
             }
             Judgement::InProgress if usable => Action::Realise,
-            Judgement::Retrying { .. } if usable && (matches!(trigger, Trigger::Dependency | Trigger::Retry) || usable_again) => {
+            Judgement::Retrying { .. }
+                if usable && (matches!(trigger, Trigger::Dependency | Trigger::Retry | Trigger::Recheck) || usable_again) =>
+            {
                 Action::Realise
             }
             _ => Action::Nothing,
@@ -308,8 +311,9 @@ where
         self.run_with(backing, rechecks).await
     }
 
-    /// Runs until `backing` closes, observing again each realised resource named on `rechecks`:
-    /// a host probe that saw its backing change without knowing what it now is.
+    /// Runs until `backing` closes, observing again each realised resource named on `rechecks`, and
+    /// trying again each retrying one: a host probe that saw its backing change without knowing
+    /// what it now is, or saw what a failed attempt lacked arrive.
     pub async fn run_with(mut self, mut backing: mpsc::Receiver<BackingEvent>, mut rechecks: mpsc::Receiver<String>) {
         let mut rechecking = true;
         let start = self.lifecycles.live().iter().map(|resource| (resource.name().to_owned(), Trigger::Start)).collect();

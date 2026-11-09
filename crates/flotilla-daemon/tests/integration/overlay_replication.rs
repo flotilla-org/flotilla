@@ -10,10 +10,10 @@ use flotilla_daemon_testkit::server::spawn_in_memory_request_topology;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{FleetStaleness, HostName, PeerConnectionState, QueryId, Relationship, SubjectKind};
 use flotilla_resources::{
+    terminal_records::{TerminalLaunchRequest, TerminalLaunchSource},
     Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, Host,
     HostSpec, HostStatus, InputMeta, IntegrationCondition, ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey, ResourceProvenance,
     TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselSpec,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{watch_resource_kind_replica_sources, ResourceBackend};
 use futures::StreamExt;
@@ -141,27 +141,30 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
         )
         .await
         .expect("create feta convoy");
+    // The crew's session is feta's engine launch, held for vessel `work` of the convoy.
     feta.resource_backend()
-        .using::<TerminalSession>("flotilla")
+        .using::<Vessel>("flotilla")
         .create(
-            &InputMeta::builder()
-                .name("feta-session".to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "feta-convoy".to_string()),
-                    (VESSEL_LABEL.to_string(), "work".to_string()),
-                    (ROLE_LABEL.to_string(), "coder".to_string()),
-                ]))
-                .build(),
-            &TerminalSessionSpec::builder()
-                .env_ref("feta-environment".to_string())
-                .role("coder".to_string())
-                .source(TerminalSessionSource::Tool { command: "true".to_string() })
-                .cwd("/tmp".to_string())
-                .pool("passthrough".to_string())
-                .build(),
+            &InputMeta::builder().name("feta-work".to_string()).build(),
+            &VesselSpec {
+                convoy_ref: "feta-convoy".to_string(),
+                vessel_name: "work".to_string(),
+                fulfilment_kind_ref: "host-direct".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
         )
         .await
-        .expect("create feta session");
+        .expect("create feta vessel");
+    crate::engine(&feta).terminals.request(&TerminalLaunchRequest {
+        session: "feta-session".to_string(),
+        environment: "feta-environment".to_string(),
+        vessel: Some("feta-work".to_string()),
+        role: "coder".to_string(),
+        pool: "passthrough".to_string(),
+        cwd: "/tmp".to_string(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Tool { command: "true".to_string() },
+    });
 
     let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect daemons");
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1649,41 +1652,32 @@ async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
         .create(&InputMeta::builder().name("convoy-homed-on-kiwi".to_string()).build(), &spec)
         .await
         .expect("create convoy on kiwi");
+    // The crew runs on feta: its session is feta's engine launch, held for vessel `work`.
     feta.resource_backend()
-        .using::<TerminalSession>("flotilla")
+        .using::<Vessel>("flotilla")
         .create(
-            &InputMeta::builder()
-                .name("crew-session".to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "convoy-homed-on-kiwi".to_string()),
-                    (VESSEL_LABEL.to_string(), "work".to_string()),
-                    (ROLE_LABEL.to_string(), "coder".to_string()),
-                ]))
-                .build(),
-            &TerminalSessionSpec::builder()
-                .env_ref("feta-environment".to_string())
-                .role("coder".to_string())
-                .source(TerminalSessionSource::Tool { command: "true".to_string() })
-                .cwd("/tmp".to_string())
-                .pool("passthrough".to_string())
-                .build(),
-        )
-        .await
-        .expect("create feta session");
-    let session = feta.resource_backend().using::<TerminalSession>("flotilla").get("crew-session").await.expect("session");
-    feta.resource_backend()
-        .using::<TerminalSession>("flotilla")
-        .update_status(
-            "crew-session",
-            &session.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("session-id".to_string()),
-                ..TerminalSessionStatus::default()
+            &InputMeta::builder().name("crew-work".to_string()).build(),
+            &VesselSpec {
+                convoy_ref: "convoy-homed-on-kiwi".to_string(),
+                vessel_name: "work".to_string(),
+                fulfilment_kind_ref: "host-direct".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
             },
         )
         .await
-        .expect("running session");
+        .expect("create feta vessel");
+    let terminals = &crate::engine(&feta).terminals;
+    let launch = terminals.request(&TerminalLaunchRequest {
+        session: "crew-session".to_string(),
+        environment: "feta-environment".to_string(),
+        vessel: Some("crew-work".to_string()),
+        role: "coder".to_string(),
+        pool: "passthrough".to_string(),
+        cwd: "/tmp".to_string(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Tool { command: "true".to_string() },
+    });
+    terminals.ready(&launch, "session-id", &Default::default());
 
     let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect daemons");
     std::fs::write(kiwi.config_store().base_path().join("hosts.toml"), "[hosts.feta]\nhostname = 'feta.example'\n").expect("hop config");

@@ -14,7 +14,6 @@ use flotilla_dummy_fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet};
 use flotilla_protocol::{commands::CommandValue, CommandAction};
 use flotilla_provisioning::reconcilers::ForgeDefaultBranchResolver;
 use flotilla_resources::TerminalAttentionState;
-use flotilla_store::ResourceBackend;
 use tracing::warn;
 
 /// Install the configured dummy fleet's factories, if any.
@@ -46,16 +45,11 @@ pub fn attach_dummy_fleet(fleet: &DummyFleet, daemon: &Arc<InProcessDaemon>) -> 
 /// process outlives a daemon restart, forwards to the current daemon's port.
 pub fn daemon_crew_port(daemon: &Arc<InProcessDaemon>) -> Arc<dyn CrewCommandPort> {
     let handle = Arc::clone(daemon) as Arc<dyn DaemonHandle>;
-    Arc::new(DaemonCrewPort {
-        commands: DaemonCommandPort::new(&handle),
-        backend: daemon.resource_backend(),
-        daemon: Arc::downgrade(daemon),
-    })
+    Arc::new(DaemonCrewPort { commands: DaemonCommandPort::new(&handle), daemon: Arc::downgrade(daemon) })
 }
 
 struct DaemonCrewPort {
     commands: Arc<DaemonCommandPort>,
-    backend: ResourceBackend,
     // Weak: the daemon holds its fleet, which holds this port.
     daemon: std::sync::Weak<InProcessDaemon>,
 }
@@ -77,14 +71,17 @@ impl CrewCommandPort for DaemonCrewPort {
             daemon.crew_progress().hook(session, daemon.clock().now());
             if let Some(primitives) = daemon.message_primitives() {
                 if let Err(error) =
-                    crate::agent_attention::record_agent_activity(&self.backend, &primitives, namespace, session, activity, cause).await
+                    crate::agent_attention::record_agent_activity(daemon.lifecycle_reads(), &primitives, session, activity, cause).await
                 {
                     // As for a harness hook: the AgentSession is an additional observer.
                     warn!(%session, %error, "failed to record dummy crew activity");
                 }
             }
         }
-        crate::agent_attention::observe_hook_attention(&self.backend, namespace, session, state).await
+        let _ = namespace;
+        let daemon = self.daemon.upgrade().ok_or("the daemon has stopped")?;
+        let reads = daemon.lifecycle_reads();
+        crate::agent_attention::observe_hook_attention(reads.terminals()?, session, state, false)
     }
 }
 

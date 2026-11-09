@@ -40,14 +40,6 @@ struct EngineSlots {
 }
 
 #[derive(Default)]
-struct TerminalReadSlot(std::sync::RwLock<Option<std::sync::Arc<dyn LifecycleReads>>>);
-impl std::fmt::Debug for TerminalReadSlot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("TerminalReadSlot")
-    }
-}
-
-#[derive(Default)]
 struct AttentionSlot(std::sync::RwLock<Option<std::sync::Arc<dyn flotilla_resources::attentions::Attentions>>>);
 impl std::fmt::Debug for AttentionSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,9 +52,6 @@ impl std::fmt::Debug for AttentionSlot {
 pub struct ResourceBackend {
     store: std::sync::Arc<dyn crate::Store>,
     engines: EngineSlot,
-    terminal_reads: std::sync::Arc<TerminalReadSlot>,
-    terminal_launches:
-        std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<dyn flotilla_resources::terminal_launches::TerminalLaunches>>>>,
     attentions: std::sync::Arc<AttentionSlot>,
 }
 impl ResourceBackend {
@@ -70,13 +59,7 @@ impl ResourceBackend {
         store.into()
     }
     pub fn from_arc(store: std::sync::Arc<dyn crate::Store>) -> Self {
-        Self {
-            store,
-            engines: EngineSlot::default(),
-            terminal_reads: Default::default(),
-            terminal_launches: Default::default(),
-            attentions: Default::default(),
-        }
+        Self { store, engines: EngineSlot::default(), attentions: Default::default() }
     }
     /// Serves the kinds `records` names from it, the engine's, behind `[primitives]`: every handle
     /// cloned or derived from this backend reads and writes them there. A daemon runtime restarted
@@ -95,12 +78,6 @@ impl ResourceBackend {
     /// The engine port serving `kind`, when one is installed.
     pub(crate) fn engine_records(&self, kind: &str) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>> {
         self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).ports.get(kind).cloned()
-    }
-    pub fn install_terminal_readings(&self, reads: std::sync::Arc<dyn LifecycleReads>) {
-        *self.terminal_reads.0.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reads);
-    }
-    pub fn terminal_readings(&self) -> Option<std::sync::Arc<dyn LifecycleReads>> {
-        self.terminal_reads.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// Installs the engine's attentions behind `[primitives]`. A daemon runtime restarted over the
@@ -122,47 +99,11 @@ impl ResourceBackend {
         }
     }
 
-    /// Installed with the local engine; every clone shares the same launch writer.
-    pub fn install_terminal_launches(&self, launches: std::sync::Arc<dyn flotilla_resources::terminal_launches::TerminalLaunches>) {
-        *self.terminal_launches.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(launches);
-    }
-
-    /// Record restart intent before resetting runtime observations. The captured predecessor
-    /// survives delayed actuation, so applying an old plan cannot request a second replacement.
-    /// A writer without a captured launch is refused: the terminal controller establishes an
-    /// unheld session's first request before runtime work; a later plan can name that launch.
-    pub async fn request_terminal_replacement(
-        &self,
-        obj: &ResourceObject<crate::TerminalSession>,
-        replaces: Option<&str>,
-        at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), ResourceError> {
-        let writer = self.terminal_launches.read().map_err(|_| ResourceError::other("terminal launch writer lock poisoned"))?.clone();
-        match (writer, replaces) {
-            (Some(writer), Some(replaces)) => {
-                let (obj, replaces) = (obj.clone(), replaces.to_owned());
-                tokio::task::spawn_blocking(move || writer.replace(&obj, &replaces, at))
-                    .await
-                    .map_err(|error| ResourceError::other(error.to_string()))?
-                    .map_err(ResourceError::other)?;
-                Ok(())
-            }
-            (None, None) => Ok(()),
-            _ => Err(ResourceError::other("terminal restart requires a captured engine launch and its local writer")),
-        }
-    }
-
     pub fn store(&self) -> &dyn crate::Store {
         &*self.store
     }
     pub fn with_read_observer(self, observer: std::sync::Arc<dyn crate::ReadObserver>) -> Self {
-        Self {
-            store: self.store.with_read_observer(observer),
-            engines: self.engines.clone(),
-            terminal_reads: self.terminal_reads.clone(),
-            terminal_launches: self.terminal_launches.clone(),
-            attentions: self.attentions.clone(),
-        }
+        Self { store: self.store.with_read_observer(observer), engines: self.engines.clone(), attentions: self.attentions.clone() }
     }
     pub fn read_observer(&self) -> Option<&dyn crate::ReadObserver> {
         self.store.read_observer()
@@ -174,13 +115,7 @@ impl ResourceBackend {
         Some(self.store.hierarchy_admission()?.lock_owned().await)
     }
     pub fn with_local_root(self, root: NodeId) -> Self {
-        Self {
-            store: self.store.with_local_root(root),
-            engines: self.engines.clone(),
-            terminal_reads: self.terminal_reads.clone(),
-            terminal_launches: self.terminal_launches.clone(),
-            attentions: self.attentions.clone(),
-        }
+        Self { store: self.store.with_local_root(root), engines: self.engines.clone(), attentions: self.attentions.clone() }
     }
     pub fn local_root(&self) -> Result<NodeId, ResourceError> {
         self.store.local_root()

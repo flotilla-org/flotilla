@@ -21,18 +21,19 @@ use flotilla_agent::adapter::{
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading, PlacementDecision};
 use flotilla_resources::{
-    address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
-    repository_workspace_slugs, Artifact, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, Convoy, CrewSource, CrewWorkPhase,
-    DockerEnvironmentSpec, EnvironmentMount, EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind,
-    FulfilmentKindSpec, FulfilmentRealisation, PlacementImageSource, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError,
-    ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
-    Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
+    address::artifact_slot_record_name,
+    canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot, repository_workspace_slugs,
+    terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords},
+    Artifact, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, Convoy, CrewSource, CrewWorkPhase, DockerEnvironmentSpec, EnvironmentMount,
+    EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
+    PlacementImageSource, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance,
+    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND,
+    VESSEL_REF_LABEL,
 };
 use flotilla_resources::{clone_records::CloneRecords, realisation_settings, BRIEF_ARTIFACTS_ANNOTATION};
 use flotilla_store::{
-    controller::{delete_lifecycle_owned_matching, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
+    controller::{LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use sha2::{Digest, Sha256};
@@ -86,7 +87,6 @@ pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     kinds: TypedResolver<FulfilmentKind>,
-    terminal_sessions: TypedResolver<TerminalSession>,
     artifacts: ReplicaReadResolver<Artifact>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     federated_kinds: Option<ReplicaReadResolver<FulfilmentKind>>,
@@ -112,7 +112,6 @@ impl VesselReconciler {
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             kinds: backend.clone().using::<FulfilmentKind>(namespace),
-            terminal_sessions: backend.clone().using::<TerminalSession>(namespace),
             artifacts: backend.including_replicas::<Artifact>(namespace),
             federated_convoys: None,
             federated_kinds: None,
@@ -170,6 +169,17 @@ impl VesselReconciler {
     /// The engine's clones (#3108).
     fn clones(&self) -> Result<&dyn CloneRecords, ResourceError> {
         self.lifecycle_reads.clones().map_err(ResourceError::other)
+    }
+
+    /// The engine's terminal sessions (#3108).
+    fn terminals(&self) -> Result<&dyn TerminalRecords, ResourceError> {
+        self.lifecycle_reads.terminals().map_err(ResourceError::other)
+    }
+
+    /// Session `name`'s newest launch at this home, the vessel's.
+    fn terminal_session(&self, name: &str) -> Result<ResourceObject<TerminalSession>, ResourceError> {
+        let record = self.terminals()?.get(name, None).map_err(ResourceError::other)?.ok_or_else(|| ResourceError::not_found(name))?;
+        Ok(record.read_view(&self.namespace, None, None))
     }
 
     /// The environment `name`, at whichever home holds it: environment names are fleet-unique.
@@ -521,10 +531,7 @@ impl VesselPrepared {
         Self { phase: None, patch: PlannedPatch::Failed { message: message.into() }, actuations: Vec::new() }
     }
 
-    fn interrupted(role: String, terminal_name: &str, restart: bool, replaces: Option<String>, mut actuations: Vec<Actuation>) -> Self {
-        if restart {
-            actuations.push(Actuation::RestartTerminalSession { name: terminal_name.to_string(), replaces });
-        }
+    fn interrupted(role: String, terminal_name: &str, actuations: Vec<Actuation>) -> Self {
         Self {
             phase: None,
             patch: PlannedPatch::Interrupted {
@@ -1158,10 +1165,8 @@ impl VesselReconciler {
                 .labels(process.labels.clone())
                 .build();
             let terminal_name = identity.name();
-            match self.terminal_sessions.get(&terminal_name).await {
+            match self.terminal_session(&terminal_name) {
                 Ok(existing) => {
-                    let (existing, launch) =
-                        flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), &existing, None).await?;
                     terminal_refs.push(terminal_name.clone());
                     let phase = existing.status.as_ref().map(|status| status.phase);
                     if phase == Some(TerminalSessionPhase::Failed) {
@@ -1189,13 +1194,11 @@ impl VesselReconciler {
                             if !active {
                                 continue;
                             }
-                            return Ok(VesselPrepared::interrupted(
-                                process.role.clone(),
-                                &terminal_name,
-                                work_phase == Some(WorkPhase::Interrupted),
-                                launch,
-                                actuations,
-                            ));
+                            // A resumed crew's exited agent starts its next launch.
+                            if work_phase == Some(WorkPhase::Interrupted) {
+                                self.terminals()?.renew(&terminal_name).map_err(ResourceError::other)?;
+                            }
+                            return Ok(VesselPrepared::interrupted(process.role.clone(), &terminal_name, actuations));
                         }
                         let message = existing
                             .status
@@ -1203,6 +1206,16 @@ impl VesselReconciler {
                             .and_then(|status| status.message.clone())
                             .unwrap_or_else(|| format!("terminal session {terminal_name} stopped"));
                         return Ok(VesselPrepared::failed(message));
+                    }
+                    // A launch its pool lost is never revived: the next launch replaces it.
+                    if phase == Some(TerminalSessionPhase::Lost) {
+                        self.terminals()?.renew(&terminal_name).map_err(ResourceError::other)?;
+                        return Ok(VesselPrepared::provisioning(
+                            &placement,
+                            placement_decision.clone(),
+                            format!("terminal session {terminal_name} to relaunch"),
+                            actuations,
+                        ));
                     }
                     if phase == Some(TerminalSessionPhase::Starting) || (should_start && phase != Some(TerminalSessionPhase::Running)) {
                         return Ok(VesselPrepared::provisioning(
@@ -1223,7 +1236,7 @@ impl VesselReconciler {
                         return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), reason, actuations));
                     }
                     let source = match &process.source {
-                        CrewSource::Tool { command } => flotilla_resources::TerminalSessionSource::Tool { command: command.clone() },
+                        CrewSource::Tool { command } => TerminalLaunchSource::Tool { command: command.clone() },
                         CrewSource::Agent { selector, prompt, brief_template } => {
                             let context = flotilla_resources::TerminalCrewContext {
                                 namespace: self.namespace.clone(),
@@ -1311,54 +1324,28 @@ impl VesselReconciler {
                                 brief
                             };
                             brief.copies = brief_copies.clone();
-                            flotilla_resources::TerminalSessionSource::Agent {
-                                selector: selector.clone(),
+                            TerminalLaunchSource::Agent {
+                                capability: selector.capability.clone(),
+                                adapter: selector.adapter.clone(),
+                                model: selector.model.clone(),
                                 brief,
-                                context: Box::new(context),
-                                message: None,
                             }
                         }
                     };
-                    let mut terminal_meta = identity.input_meta();
-                    if let Some(revision) = convoy
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.workflow_snapshot.as_ref())
-                        .and_then(|workflow| workflow.cascade.as_ref())
-                        .and_then(|cascade| cascade.charter_commit.as_ref())
-                    {
-                        terminal_meta.annotations.insert(flotilla_messaging::BRIEF_CHARTER_REVISION_ANNOTATION.into(), revision.clone());
-                    }
-                    terminal_meta.annotations.extend(actuator_annotations(obj));
-                    if !requirement.credential_refs.is_empty() {
-                        terminal_meta.annotations.insert(
-                            CREDENTIAL_REFS_ANNOTATION.to_string(),
-                            serde_json::to_string(&requirement.credential_refs).expect("credential names serialize"),
-                        );
-                    }
-                    if !requirement.credential_scopes.is_empty() {
-                        terminal_meta.annotations.insert(
-                            CREDENTIAL_SCOPES_ANNOTATION.to_string(),
-                            serde_json::to_string(&requirement.credential_scopes).expect("credential scopes serialize"),
-                        );
-                    }
-                    if !requirement.credential_permissions.is_empty() {
-                        terminal_meta.annotations.insert(
-                            CREDENTIAL_PERMISSIONS_ANNOTATION.to_string(),
-                            serde_json::to_string(&requirement.credential_permissions).expect("credential permissions serialize"),
-                        );
-                    }
-                    actuations.push(Actuation::CreateTerminalSession {
-                        meta: terminal_meta,
-                        spec: Box::new(TerminalSessionSpec {
-                            env_ref: resolved_environment_ref.clone(),
+                    // Its credentials are delivered at launch from the vessel's requirement, never
+                    // stored with the request.
+                    self.terminals()?
+                        .request(TerminalLaunchRequest {
+                            session: terminal_name.clone(),
+                            environment: resolved_environment_ref.clone(),
+                            vessel: Some(obj.metadata.name.clone()),
                             role: process.role.clone(),
-                            source,
+                            pool: strategy.pool().to_string(),
                             cwd: terminal_cwd.clone(),
                             env: Default::default(),
-                            pool: strategy.pool().to_string(),
-                        }),
-                    });
+                            source,
+                        })
+                        .map_err(ResourceError::other)?;
                     return Ok(VesselPrepared::provisioning(
                         &placement,
                         placement_decision.clone(),
@@ -1375,7 +1362,7 @@ impl VesselReconciler {
             .and_then(|environment| environment.launch)
             .and_then(|launch| launch.configured_limits);
         for terminal_ref in &terminal_refs {
-            if let Some(limits) = self.terminal_sessions.get(terminal_ref).await?.status.and_then(|status| status.configured_limits) {
+            if let Some(limits) = self.terminal_session(terminal_ref)?.status.and_then(|status| status.configured_limits) {
                 // Only host-direct launches record terminal limits today. Merge
                 // known fields so future launch caps cannot erase a container quota.
                 configured_limits = Some(configured_limits.take().unwrap_or_default().with_overrides(limits));
@@ -1500,9 +1487,9 @@ impl Reconciler for VesselReconciler {
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
-        let selector = BTreeMap::from([(VESSEL_REF_LABEL.to_string(), obj.metadata.name.clone())]);
-
-        delete_lifecycle_owned_matching(&self.terminal_sessions, &selector).await?;
+        // Its terminal sessions are held for its lease, which ends with this teardown; their
+        // controller then releases them.
+        let _ = obj;
         // Checkouts are convoy-owned and are removed by the convoy finalizer's
         // ownership cascade, independently of vessel teardown. The environment is held for the
         // vessel's lease, which ends with this teardown; its controller then releases it.
@@ -1603,6 +1590,16 @@ pub fn launch_env(requirement: &flotilla_resources::VesselRequirement) -> BTreeM
 /// The launch env of vessel `vessel`'s environment ([`launch_env`]), read from its convoy's
 /// frozen requirement.
 pub async fn vessel_launch_env(backend: &ResourceBackend, namespace: &str, vessel: &str) -> Result<BTreeMap<String, String>, String> {
+    Ok(launch_env(&vessel_requirement(backend, namespace, vessel).await?))
+}
+
+/// Vessel `vessel`'s requirement in its convoy's frozen workflow snapshot: what its crews run with,
+/// their credential grants among it.
+pub async fn vessel_requirement(
+    backend: &ResourceBackend,
+    namespace: &str,
+    vessel: &str,
+) -> Result<flotilla_resources::VesselRequirement, String> {
     let vessel = backend.using::<Vessel>(namespace).get(vessel).await.map_err(|error| format!("read vessel {vessel}: {error}"))?;
     let convoy = backend
         .including_replicas::<Convoy>(namespace)
@@ -1610,13 +1607,13 @@ pub async fn vessel_launch_env(backend: &ResourceBackend, namespace: &str, vesse
         .await
         .map_err(|error| format!("read convoy {}: {error}", vessel.spec.convoy_ref))?
         .object;
-    let requirement = convoy
+    convoy
         .status
         .as_ref()
         .and_then(|status| status.workflow_snapshot.as_ref())
         .and_then(|snapshot| snapshot.vessels.iter().find(|requirement| requirement.name == vessel.spec.vessel_name))
-        .ok_or_else(|| format!("vessel {} missing from convoy {}'s snapshot", vessel.spec.vessel_name, convoy.metadata.name))?;
-    Ok(launch_env(requirement))
+        .cloned()
+        .ok_or_else(|| format!("vessel {} missing from convoy {}'s snapshot", vessel.spec.vessel_name, convoy.metadata.name))
 }
 
 fn environment_with_credentials(
@@ -1770,13 +1767,6 @@ fn vessel_clone_path(workspace_root: &str, vessel: &str) -> String {
 
 fn environment_provider_labels(placement: &Placement) -> BTreeMap<String, String> {
     placement.instance.iter().map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.clone())).collect()
-}
-
-fn actuator_annotations(workspace: &ResourceObject<Vessel>) -> BTreeMap<String, String> {
-    [ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION]
-        .into_iter()
-        .filter_map(|key| workspace.metadata.annotations.get(key).map(|value| (key.to_string(), value.clone())))
-        .collect()
 }
 
 impl PlacementStrategy {

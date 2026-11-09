@@ -22,6 +22,9 @@ use crate::{
 
 const DELETION_FIELD: &str = "$deleted";
 
+/// Watch events an engine watch holds for a watcher that has not yet taken them.
+const ENGINE_WATCH_BUFFER: usize = 64;
+
 #[derive(Debug)]
 struct DefinitionSource<T: Resource> {
     object: ResourceObject<T>,
@@ -114,29 +117,41 @@ impl<T: Resource> DefinitionResolver<T> {
         };
         let previous: BTreeMap<String, ReadResourceObject<T>> =
             initial.iter().map(|read| (read.object.metadata.name.clone(), clone_read(read))).collect();
+        // Driven by its own task, not by the watcher's polls: a read parked between a watcher's
+        // polls would hold whatever store lock it was granted until the watcher polled again.
         let resolver = Self::new(self.backend.clone(), self.namespace.clone());
-        let state = (resolver, records, changes, previous, std::collections::VecDeque::new());
-        let stream = futures::stream::unfold(state, |(resolver, records, mut changes, mut previous, mut pending)| async move {
+        let (events, received) = tokio::sync::mpsc::channel(ENGINE_WATCH_BUFFER);
+        tokio::spawn(async move {
+            let (mut changes, mut previous) = (changes, previous);
             loop {
-                if let Some(event) = pending.pop_front() {
-                    return Some((Ok(event), (resolver, records, changes, previous, pending)));
+                let changed = tokio::select! {
+                    changed = changes.next() => changed,
+                    () = events.closed() => None,
+                };
+                if changed.is_none() {
+                    return;
                 }
-                changes.next().await?;
                 let current = match resolver.read_all(&*records).await {
                     Ok(current) => current,
-                    Err(error) => return Some((Err(error), (resolver, records, changes, previous, pending))),
+                    Err(error) => {
+                        if events.send(Err(error)).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                 };
+                let mut pending = Vec::new();
                 let mut next = BTreeMap::new();
                 for read in current {
                     let name = read.object.metadata.name.clone();
                     match previous.remove(&name) {
-                        None => pending.push_back(ReadWatchEvent::Added(clone_read(&read))),
+                        None => pending.push(ReadWatchEvent::Added(clone_read(&read))),
                         Some(before)
                             if before.object.metadata.resource_version != read.object.metadata.resource_version
                                 || before.object.metadata.labels != read.object.metadata.labels
                                 || before.object.metadata.annotations != read.object.metadata.annotations =>
                         {
-                            pending.push_back(ReadWatchEvent::Modified(clone_read(&read)))
+                            pending.push(ReadWatchEvent::Modified(clone_read(&read)))
                         }
                         Some(_) => {}
                     }
@@ -144,9 +159,15 @@ impl<T: Resource> DefinitionResolver<T> {
                 }
                 pending.extend(previous.into_values().map(ReadWatchEvent::Deleted));
                 previous = next;
+                for event in pending {
+                    if events.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
             }
-        })
-        .boxed();
+        });
+        let stream =
+            futures::stream::unfold(received, |mut received| async move { received.recv().await.map(|event| (event, received)) }).boxed();
         Some(Ok((initial, stream)))
     }
 

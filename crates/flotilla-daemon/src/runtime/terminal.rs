@@ -1,11 +1,6 @@
 //! Terminal resource runtime and confirmed input delivery.
 
-use std::{
-    collections::{BTreeSet, HashMap},
-    path::Path,
-    sync::{Arc, Mutex as StdMutex},
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -16,23 +11,21 @@ use flotilla_agent::adapter::CapabilityTable;
 use flotilla_agent::{CLAUDE_CODE_HOOK_TOKEN_ENV, CLAUDE_CODE_HOOK_URL_ENV};
 use flotilla_capability_contract::SessionCapabilitySource;
 use flotilla_credentials::crew_git_identity_environment;
-use flotilla_crew::reconcilers::terminal_session::{
-    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime,
-    TerminalRuntimeState,
-};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_environment::environment::VesselAgent;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_protocol::{ConfiguredResourceLimits, TerminalStatus};
+use flotilla_protocol::TerminalStatus;
 use flotilla_provider_runtime::execution_context::BoundLayer;
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
+use flotilla_provisioning::engine::terminal_actuator::{ScreenReading, TerminalLaunched, TerminalLiveness, TerminalProvider};
 use flotilla_resources::{
+    terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalRecord},
     Convoy, FulfilmentKind, ResourceObject, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionTarget, Vessel, CREDENTIAL_PERMISSIONS_SESSION_TAG,
-    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_SESSION_TAG,
+    TerminalSessionSource, TerminalSessionTarget, Vessel, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REF_SESSION_TAG,
+    CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
 };
 use flotilla_state_machines::machines::agent_session::Activity;
-use flotilla_store::ResourceBackend;
+use flotilla_store::{ResourceBackend, TerminalViews};
 use flotilla_terminal::{drafts::ComposerDrafts, ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize, TerminalSubmission};
 use flotilla_vcs::vcs::CheckoutVcsResolver as _;
 use tokio::task::JoinHandle;
@@ -48,9 +41,22 @@ use crate::blob_store::BlobStore;
 use crate::server::HookLaunch;
 use flotilla_agent::adapter::{CLAUDE_CODE_SHELL_ENV, FLOTILLA_ENVIRONMENT_ID_ENV};
 
+/// What one turn's typing into a crew's terminal came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalDeliveryOutcome {
+    Deferred(&'static str),
+    Confirmed,
+    Unconfirmed(TerminalDeliveryFailure),
+}
+
+/// Why a typed turn's submission was not confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalDeliveryFailure {
+    SubmissionUnconfirmed,
+}
+
 pub(super) struct PendingTerminalDelivery {
     pub(super) message_batch: Option<String>,
-    pub(super) message: String,
     pub(super) task: JoinHandle<Result<TerminalDeliveryOutcome, String>>,
     /// Present for an engine turn, which owns its receipt (#3894).
     pub(super) engine_turn: Option<EngineTurn>,
@@ -68,26 +74,6 @@ pub(super) struct EngineTurn {
 impl EngineTurn {
     pub(super) fn new(stop: tokio_util::sync::CancellationToken) -> Self {
         Self { stop, teardown_since: None }
-    }
-}
-
-pub(super) enum TerminalDeliveryLookup {
-    InFlight,
-    Vacant,
-    Taken(PendingTerminalDelivery),
-}
-
-pub(super) fn lookup_terminal_delivery(
-    deliveries: &StdMutex<HashMap<String, PendingTerminalDelivery>>,
-    session_id: &str,
-    message: &str,
-) -> TerminalDeliveryLookup {
-    let mut deliveries = deliveries.lock().expect("terminal deliveries lock poisoned");
-    match deliveries.get(session_id) {
-        Some(delivery) if delivery.message_batch.is_some() => TerminalDeliveryLookup::InFlight,
-        Some(delivery) if delivery.message == message && !delivery.task.is_finished() => TerminalDeliveryLookup::InFlight,
-        Some(_) => TerminalDeliveryLookup::Taken(deliveries.remove(session_id).expect("observed terminal delivery")),
-        None => TerminalDeliveryLookup::Vacant,
     }
 }
 
@@ -114,7 +100,7 @@ pub(super) async fn observe_terminal_screen(
     adapter: Option<&dyn AgentAdapter>,
     session_id: &str,
     now: chrono::DateTime<Utc>,
-) -> Result<Option<TerminalObservation>, String> {
+) -> Result<Option<ScreenReading>, String> {
     Ok(read_terminal_screen(pool, adapter, session_id, now).await?.map(|(observation, _)| observation))
 }
 
@@ -125,7 +111,7 @@ async fn read_terminal_screen(
     adapter: Option<&dyn AgentAdapter>,
     session_id: &str,
     now: chrono::DateTime<Utc>,
-) -> Result<Option<(TerminalObservation, Option<TerminalAttentionState>)>, String> {
+) -> Result<Option<(ScreenReading, Option<TerminalAttentionState>)>, String> {
     let Some(session) = pool.list_sessions().await?.into_iter().find(|session| session.session_name == session_id) else {
         return Ok(None);
     };
@@ -155,7 +141,7 @@ async fn read_terminal_screen(
         })
     });
     Ok(Some((
-        TerminalObservation {
+        ScreenReading {
             output_digest,
             obstruction,
             attention: state.map(|state| flotilla_resources::TerminalAttention {
@@ -181,7 +167,7 @@ fn screen_activity(state: TerminalAttentionState) -> Option<Activity> {
 
 impl TerminalControllerRuntime {
     /// Records the agent's screen-read activity on its AgentSession, named by
-    /// the TerminalSession record. Another observer: its errors are logged and
+    /// its launch. Another observer: its errors are logged and
     /// never fail the terminal's own observation.
     async fn observe_agent_screen(&self, record: &str, activity: Activity, now: chrono::DateTime<Utc>) {
         let Some(primitives) = self.state.daemon.message_primitives() else { return };
@@ -229,19 +215,6 @@ pub(super) async fn session_busy_after_delivery_grace(
         }
         tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
     }
-}
-
-pub(super) async fn deliver_and_confirm(
-    pool: &dyn TerminalPool,
-    drafts: &ComposerDrafts,
-    adapter: Option<&dyn AgentAdapter>,
-    session_id: &str,
-    message: &str,
-    _readiness: TerminalDeliveryReadiness,
-) -> Result<TerminalDeliveryOutcome, String> {
-    // All writes are gated atomically by cleat, including startup deliveries.
-    // Adapter observations remain acceptance evidence only.
-    submit_and_confirm(pool, drafts, adapter, session_id, message).await
 }
 
 pub(super) async fn submit_and_confirm(
@@ -317,35 +290,22 @@ pub(super) fn terminal_liveness_for_source(source: &TerminalSessionSource, liven
     }
 }
 
-#[async_trait]
-impl TerminalRuntime for TerminalControllerRuntime {
-    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
-        let checkouts = self.state.daemon.held_checkouts(convoy).await?;
-        self.state.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, &checkouts, false).await
-    }
-
-    async fn brief_ready(&self, spec: TerminalSessionTarget<'_>) -> Result<bool, String> {
+impl TerminalControllerRuntime {
+    async fn brief_ready_for(&self, spec: TerminalSessionTarget<'_>) -> Result<bool, String> {
         let TerminalSessionSource::Agent { brief, .. } = &spec.source else { return Ok(true) };
         let Some(digest) = &brief.artifact_digest else { return Ok(true) };
         let store = self.state.blob_store.as_ref().ok_or("brief blob store unavailable")?;
         Ok(store.get(&BlobDigest::parse(digest)?).await?.is_some())
     }
 
-    async fn cleat_endpoint(
-        &self,
-        session_id: &str,
-        spec: TerminalSessionTarget<'_>,
-    ) -> Result<Option<flotilla_protocol::result_set::CleatEndpoint>, String> {
-        let pool = self.pool_for_spec(spec).await?;
-        pool.cleat_endpoint(session_id).await
-    }
-
-    async fn ensure_session(
+    /// Starts launch `launch` of session `name`: the crew's id is its launch name (#3108).
+    pub(super) async fn ensure_session(
         &self,
         name: &str,
+        launch: &str,
         spec: TerminalSessionTarget<'_>,
         tags: &[flotilla_terminal::TerminalSessionTag],
-    ) -> Result<TerminalRuntimeState, String> {
+    ) -> Result<TerminalLaunched, String> {
         // #3792: a crew on an SSH host runs in its vessel's own agent:
         // its providers, files and commands all go through that agent.
         let ssh_host = self.state.ssh_host.get(&spec.env_ref);
@@ -553,13 +513,10 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     environment: credential_env.clone(),
                     fulfilment_grants,
                 })?;
-                let crew_id = uuid::Uuid::new_v4().to_string();
-                let crew = flotilla_resources::CrewSessionStatus::builder()
-                    .id(crew_id.clone())
-                    .adapter(requirement.adapter)
-                    .maybe_model(requirement.model)
-                    .stance(plan.stance)
-                    .build();
+                // A crew's id is its launch name, unique and ordered within this home; a lookup
+                // of the crew by it also takes the home (owner's ruling, #3108).
+                let crew_id = launch.to_owned();
+                let crew = AgentLaunch { adapter: requirement.adapter, model: requirement.model, stance: plan.stance };
                 let mut env = plan.env;
                 let git_identity = crew_git_identity_environment();
                 env.retain(|(key, _)| !git_identity.iter().any(|(identity_key, _)| identity_key == key));
@@ -572,7 +529,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     ("FLOTILLA_NAMESPACE".to_string(), context.namespace.clone()),
                     ("FLOTILLA_TERMINAL_SESSION".to_string(), name.to_string()),
                 ]);
-                (flotilla_agent::process::monitored_command(&plan.command, &crew.id), env, Some(crew))
+                (flotilla_agent::process::monitored_command(&plan.command, launch), env, Some(crew))
             }
         };
         // Crews rebuild one checkout across edits, rebases and review fixes. Set this explicitly: Cargo turns
@@ -585,12 +542,11 @@ impl TerminalRuntime for TerminalControllerRuntime {
         } else {
             self.state.ssh_host.get(&spec.env_ref).map(|profile| profile.provisioning.host_id.as_str())
         };
-        let mut configured_limits = None;
+        let mut build_jobs = None;
         if let Some(host_ref) = host_ref {
             let vessel_runner = vessel.as_ref().map(|access| access.runner());
             let jobs = self.state.rust_build_jobs_through(host_ref, vessel_runner.as_deref()).await?;
-            configured_limits =
-                Some(ConfiguredResourceLimits { cpus: None, cpu_shares: None, build_jobs: Some(jobs), linker_threads: Some(jobs) });
+            build_jobs = Some(jobs as u64);
             let wrapper = self.state.rustc_wrapper_for_environment(&spec.env_ref, vessel_runner.as_deref()).await?;
             // The fulfilment cap owns the workspace wrapper for host-direct
             // terminals, including Tool sessions that can run Cargo. It
@@ -631,18 +587,18 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 tracing::warn!(%error, session = name, "retain old cleat recording after recovery failed");
             }
         }
-        Ok(TerminalRuntimeState::builder()
-            .maybe_configured_limits(configured_limits)
-            .session_id(session_id)
-            .maybe_pid(None)
-            .started_at(Utc::now())
-            .maybe_crew(crew)
-            .launch_command(command)
-            .maybe_delivered_message_id(None)
-            .build())
+        // Where a direct attach connects, fixed for the launch; a pool without one has none.
+        let endpoint = match pool.cleat_endpoint(&session_id).await {
+            Ok(endpoint) => endpoint.map(|endpoint| (endpoint.runtime_root, endpoint.daemon)),
+            Err(error) => {
+                warn!(session = %session_id, %error, "cleat endpoint discovery failed at launch");
+                None
+            }
+        };
+        Ok(TerminalLaunched { session_id, facts: TerminalLaunchFacts { endpoint, agent: crew, build_jobs }, launch_command: command })
     }
 
-    async fn session_liveness(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<TerminalLiveness, String> {
+    pub(super) async fn session_liveness(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<TerminalLiveness, String> {
         let pool = match self.pool_for_spec(spec).await {
             Ok(pool) => pool,
             Err(message) => return Ok(TerminalLiveness::Unavailable(message)),
@@ -653,11 +609,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         })
     }
 
-    async fn agent_exit_code(
-        &self,
-        spec: TerminalSessionTarget<'_>,
-        crew: &flotilla_resources::CrewSessionStatus,
-    ) -> Result<Option<i32>, String> {
+    async fn agent_exit_code(&self, spec: TerminalSessionTarget<'_>, launch: &str) -> Result<Option<i32>, String> {
         let runner = self.runner_for_spec(spec).await?;
         // Receipts are read in batches per runner: an SSH host's
         // vessels each read through their own agent.
@@ -668,39 +620,16 @@ impl TerminalRuntime for TerminalControllerRuntime {
         };
         self.state
             .exit_receipts
-            .observe(&batch, &*runner, Path::new(&spec.cwd).join(flotilla_agent::process::exit_receipt(&crew.id)), || async {
-                let sessions = self
-                    .state
-                    .daemon
-                    .resource_backend()
-                    .using::<TerminalSession>(&self.state.namespace)
-                    .list()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let mut selected = Vec::with_capacity(sessions.items.len());
-                for session in sessions.items {
-                    selected.push(
-                        flotilla_store::read_terminal_session(self.state.daemon.lifecycle_reads(), &session, None)
-                            .await
-                            .map_err(|error| error.to_string())?
-                            .0,
-                    );
-                }
-                Ok(selected
+            .observe(&batch, &*runner, Path::new(&spec.cwd).join(flotilla_agent::process::exit_receipt(launch)), || async {
+                // The batch is every running agent launch in the environment, here.
+                let terminals = self.state.daemon.lifecycle_reads();
+                let terminals = terminals.terminals()?;
+                Ok(terminals
+                    .of_environment(&spec.env_ref, terminals.home())?
                     .into_iter()
-                    .filter_map(|session| {
-                        if session.spec.env_ref != spec.env_ref
-                            || !matches!(session.spec.source, TerminalSessionSource::Agent { .. })
-                            || vessel.is_some_and(|vessel| TerminalSessionTarget::from(&session).vessel_ref != Some(vessel))
-                        {
-                            return None;
-                        }
-                        let status = session.status?;
-                        if status.phase != TerminalSessionPhase::Running {
-                            return None;
-                        }
-                        status.crew.map(|crew| Path::new(&session.spec.cwd).join(flotilla_agent::process::exit_receipt(&crew.id)))
-                    })
+                    .filter(|record| record.is_running() && record.is_agent())
+                    .filter(|record| vessel.is_none_or(|vessel| record.vessel.as_deref() == Some(vessel)))
+                    .map(|record| Path::new(&record.cwd).join(flotilla_agent::process::exit_receipt(&record.name)))
                     .collect())
             })
             .await
@@ -724,7 +653,11 @@ impl TerminalRuntime for TerminalControllerRuntime {
         }
     }
 
-    async fn observe_attention(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<Option<TerminalObservation>, String> {
+    pub(super) async fn observe_attention(
+        &self,
+        session_id: &str,
+        spec: TerminalSessionTarget<'_>,
+    ) -> Result<Option<ScreenReading>, String> {
         let pool = self.pool_for_spec(spec).await?;
         if let TerminalSessionSource::Agent { selector, .. } = &spec.source {
             let harness = match spec.harness {
@@ -774,7 +707,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         Ok(adapter.classify_exit_failure(exit_code, &screen))
     }
 
-    async fn observe_failure(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<Option<String>, String> {
+    pub(super) async fn observe_failure(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<Option<String>, String> {
         let TerminalSessionSource::Agent { selector, .. } = &spec.source else { return Ok(None) };
         let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
         let adapter = self.session_adapter(spec, &requirement.adapter).await?;
@@ -805,55 +738,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         )))
     }
 
-    async fn deliver_message(
-        &self,
-        session_id: &str,
-        spec: TerminalSessionTarget<'_>,
-        message: &str,
-        readiness: TerminalDeliveryReadiness,
-    ) -> Result<TerminalDeliveryOutcome, String> {
-        let TerminalSessionSource::Agent { .. } = &spec.source else {
-            return Err("crew message delivery requires an agent terminal".to_string());
-        };
-        match lookup_terminal_delivery(&self.state.terminal_deliveries, session_id, message) {
-            TerminalDeliveryLookup::InFlight => return Ok(TerminalDeliveryOutcome::Pending),
-            TerminalDeliveryLookup::Taken(delivery) if delivery.message == message => {
-                return match delivery.task.await {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        warn!(%session_id, %error, "delivery task failed with an ambiguous submission outcome");
-                        Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed))
-                    }
-                }
-            }
-            TerminalDeliveryLookup::Taken(delivery) => {
-                delivery.task.abort();
-                let _ = delivery.task.await;
-            }
-            TerminalDeliveryLookup::Vacant => {}
-        };
-        let pool = self.pool_for_spec(spec).await?;
-        let adapter = self.adapter_for_spec(spec).await?;
-        let session_id_owned = session_id.to_string();
-        let message_owned = message.to_string();
-        let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
-        // Recheck under the insertion lock: another controller may reserve the
-        // session while an old replacement task is being drained.
-        if deliveries.contains_key(session_id) {
-            return Ok(TerminalDeliveryOutcome::Pending);
-        }
-        let drafts = Arc::clone(&self.state.composer_drafts);
-        let task = tokio::spawn(async move {
-            deliver_and_confirm(&*pool, &drafts, adapter.as_deref(), &session_id_owned, &message_owned, readiness).await
-        });
-        deliveries.insert(
-            session_id.to_string(),
-            PendingTerminalDelivery { message_batch: None, message: message.to_string(), task, engine_turn: None },
-        );
-        Ok(TerminalDeliveryOutcome::Pending)
-    }
-
-    async fn teardown_pending(&self, session_id: &str) -> bool {
+    pub(super) async fn teardown_pending(&self, session_id: &str) -> bool {
         let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
         let Some(delivery) = deliveries.get_mut(session_id) else { return false };
         let finished = delivery.task.is_finished();
@@ -866,7 +751,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         since.elapsed() < ENGINE_TURN_SETTLE_FOR
     }
 
-    async fn kill_session(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
+    pub(super) async fn kill_session(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         {
             // A settled engine turn stays reserved: the delivery adapter records its
             // receipt. Any other reservation, or an engine turn that outlasted its
@@ -901,7 +786,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         pool.kill_session(session_id).await
     }
 
-    async fn cleanup_session_artifacts(&self, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
+    pub(super) async fn cleanup_session_artifacts(&self, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         let TerminalSessionSource::Agent { selector, brief, .. } = &spec.source else {
             return Ok(());
         };
@@ -1033,4 +918,116 @@ async fn place_bash(runner: &dyn CommandRunner, environment: &[(String, String)]
     let found = runner.run("sh", &["-c", script, "sh", path], Path::new("/"), &ChannelLabel::Default).await.ok()?;
     let found = found.trim();
     found.starts_with('/').then(|| found.to_string())
+}
+
+impl TerminalControllerRuntime {
+    /// Launch `launch` in the old session shape the runtime reads: named as its session, with its
+    /// holder's convoy.
+    async fn session_view(&self, launch: &TerminalRecord) -> Result<ResourceObject<TerminalSession>, String> {
+        let views = TerminalViews::new(self.state.daemon.resource_backend(), &self.state.namespace, self.state.daemon.lifecycle_reads());
+        views
+            .compose(vec![launch.clone()])
+            .await
+            .map_err(|error| error.to_string())?
+            .pop()
+            .map(|source| source.object)
+            .ok_or_else(|| format!("terminal launch {} has no session view", launch.name))
+    }
+
+    /// The pool tags `launch` starts with: its convoy and vessel, and its vessel's credential
+    /// grants from its convoy's frozen requirement.
+    async fn launch_tags(
+        &self,
+        view: &ResourceObject<TerminalSession>,
+        launch: &TerminalRecord,
+    ) -> Result<Vec<flotilla_terminal::TerminalSessionTag>, String> {
+        use flotilla_terminal::TerminalSessionTag;
+        let mut tags = [
+            view.metadata.labels.get(CONVOY_LABEL).map(|value| TerminalSessionTag::new("convoy", value)),
+            view.metadata.labels.get(VESSEL_REF_LABEL).map(|value| TerminalSessionTag::new("vessel", value)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let Some(vessel) = &launch.vessel else { return Ok(tags) };
+        let requirement =
+            flotilla_crew::reconcilers::vessel::vessel_requirement(&self.state.daemon.resource_backend(), &self.state.namespace, vessel)
+                .await?;
+        tags.extend(requirement.credential_refs.iter().map(|credential| TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, credential)));
+        if !requirement.credential_scopes.is_empty() {
+            let scopes = serde_json::to_string(&requirement.credential_scopes).map_err(|error| error.to_string())?;
+            tags.push(TerminalSessionTag::new(CREDENTIAL_SCOPES_SESSION_TAG, scopes));
+        }
+        if !requirement.credential_permissions.is_empty() {
+            let permissions = serde_json::to_string(&requirement.credential_permissions).map_err(|error| error.to_string())?;
+            tags.push(TerminalSessionTag::new(CREDENTIAL_PERMISSIONS_SESSION_TAG, permissions));
+        }
+        Ok(tags)
+    }
+}
+
+#[async_trait]
+impl TerminalProvider for TerminalControllerRuntime {
+    async fn brief_ready(&self, launch: &TerminalRecord) -> Result<bool, String> {
+        let view = self.session_view(launch).await?;
+        self.brief_ready_for((&view).into()).await
+    }
+
+    async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, String> {
+        let view = self.session_view(launch).await?;
+        let tags = self.launch_tags(&view, launch).await?;
+        self.ensure_session(launch.session_name(), &launch.name, (&view).into(), &tags).await
+    }
+
+    async fn liveness(&self, launch: &TerminalRecord, session_id: &str) -> Result<TerminalLiveness, String> {
+        let view = self.session_view(launch).await?;
+        self.session_liveness(session_id, (&view).into()).await
+    }
+
+    async fn exit_code(&self, launch: &TerminalRecord) -> Result<Option<i32>, String> {
+        let view = self.session_view(launch).await?;
+        self.agent_exit_code((&view).into(), &launch.name).await
+    }
+
+    async fn exit_failure(&self, launch: &TerminalRecord, session_id: &str, code: i32) -> Result<Option<String>, String> {
+        let view = self.session_view(launch).await?;
+        self.agent_exit_failure(session_id, (&view).into(), code).await
+    }
+
+    async fn screen_failure(&self, launch: &TerminalRecord, session_id: &str) -> Result<Option<String>, String> {
+        let view = self.session_view(launch).await?;
+        self.observe_failure(session_id, (&view).into()).await
+    }
+
+    async fn daemon_reach(&self, launch: &TerminalRecord) -> Result<Option<String>, String> {
+        let view = self.session_view(launch).await?;
+        TerminalControllerRuntime::daemon_reach(self, (&view).into()).await
+    }
+
+    async fn read_screen(&self, launch: &TerminalRecord, session_id: &str) -> Result<Option<ScreenReading>, String> {
+        let view = self.session_view(launch).await?;
+        self.observe_attention(session_id, (&view).into()).await
+    }
+
+    async fn settle_turn(&self, session_id: &str) {
+        // Bounded by the runtime: a typed turn that outlasts its settle bound is aborted at the kill.
+        while self.teardown_pending(session_id).await {
+            tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
+        }
+    }
+
+    async fn kill(&self, launch: &TerminalRecord, session_id: &str) -> Result<(), String> {
+        let view = self.session_view(launch).await?;
+        self.kill_session(session_id, (&view).into()).await
+    }
+
+    async fn remove_exit_receipt(&self, launch: &TerminalRecord) -> Result<(), String> {
+        let view = self.session_view(launch).await?;
+        TerminalControllerRuntime::remove_exit_receipt(self, (&view).into(), &launch.name).await
+    }
+
+    async fn cleanup_artifacts(&self, launch: &TerminalRecord) -> Result<(), String> {
+        let view = self.session_view(launch).await?;
+        self.cleanup_session_artifacts((&view).into()).await
+    }
 }

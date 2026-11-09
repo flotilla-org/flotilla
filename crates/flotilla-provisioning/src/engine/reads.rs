@@ -214,22 +214,6 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
         self.terminals.as_deref().ok_or_else(|| "this read port serves no terminal sessions".to_owned())
     }
 
-    fn try_terminal_launch(
-        &self,
-        name: &str,
-        origin: Option<&str>,
-    ) -> Result<Option<flotilla_resources::terminal_launches::TerminalLaunch>, String> {
-        self.reads
-            .terminal_session(name, origin.unwrap_or(&self.home))
-            .map(|view| {
-                view.map(|view| flotilla_resources::terminal_launches::TerminalLaunch {
-                    name: view.name,
-                    reading: view.judgement.reading(),
-                })
-            })
-            .map_err(|error| format!("engine TerminalSession/{name}: {error}"))
-    }
-
     fn try_reading(
         &self,
         kind: flotilla_resources::lifecycle_reads::ProvisioningKind,

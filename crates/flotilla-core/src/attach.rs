@@ -535,7 +535,6 @@ impl<'a> AttachResolver<'a> {
         }
         let mut candidates = Vec::new();
         for session in sessions_by_name.into_values() {
-            let (session, _) = flotilla_resources::terminal_launches::read(self.lifecycle_reads, &session, None)?;
             let convoy_address = session_convoy_address(&session, None, &convoy_addresses);
             candidates.push(AttachCandidate {
                 label: attach_reference_label(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
@@ -549,7 +548,6 @@ impl<'a> AttachResolver<'a> {
             let ResourceProvenance::Replica { origin_root, .. } = replicated.provenance else {
                 unreachable!("local durable sessions were partitioned above");
             };
-            let (session, _) = flotilla_resources::terminal_launches::read(self.lifecycle_reads, &session, Some(origin_root.as_str()))?;
             let Some(host) = self.host_registry.live_routed_host_name(&origin_root).await else {
                 continue;
             };
@@ -1393,15 +1391,13 @@ mod tests {
 
     use chrono::Utc;
     use flotilla_protocol::{Command, CommandAction, CommandValue};
-    use flotilla_resources::{
-        ConvoyPhase, ConvoySpec, ConvoyStatus, Host as ResourceHost, HostSpec, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    };
+    use flotilla_resources::{ConvoyPhase, ConvoySpec, ConvoyStatus, Host as ResourceHost, HostSpec};
 
     use super::*;
     use crate::in_process::tests::create_identity_convoy;
-    use crate::in_process::tests::create_running_session;
     use crate::in_process::tests::test_meta;
-    use crate::in_process::tests::{create_test_environment, test_environments};
+    use crate::in_process::tests::{create_running_session, ensure_vessel};
+    use crate::in_process::tests::{create_test_environment, test_engine};
     use crate::in_process::InProcessDaemon;
     use crate::testkits::discovery::fake_discovery;
     use flotilla_config::ConfigStore;
@@ -1812,9 +1808,9 @@ mod tests {
                 ..spec.clone()
             },
         };
-        let engine = flotilla_provisioning_testkit::EnvironmentFixture::default();
-        engine.put_ready("pre-agent", &held_spec, None, "backing", Default::default());
-        daemon.install_lifecycle_reads(engine.reads.clone()).expect("engine reads");
+        let engine = flotilla_provisioning_testkit::EngineFixture::default();
+        engine.environments.put_ready("pre-agent", &held_spec, None, "backing", Default::default());
+        daemon.install_lifecycle_reads(engine.reads()).expect("engine reads");
         // An old record's copied status beside it, which attach never reads or writes.
         let environments = backend.using::<flotilla_resources::Environment>("flotilla");
         let environment = environments.create(&test_meta("pre-agent"), &spec).await.unwrap();
@@ -1830,16 +1826,36 @@ mod tests {
             )
             .await
             .unwrap();
-        create_running_session(&daemon, "pre-agent", "crew", "convoy", "coder").await;
-        let terminals = backend.using::<ResourceTerminalSession>("flotilla");
-        let mut session = terminals.get("crew").await.unwrap();
         let endpoint = real.as_ref().map(|real| real.endpoint.clone()).unwrap_or(flotilla_protocol::result_set::CleatEndpoint {
             runtime_root: "/tmp/cleat".into(),
             daemon: "crew@7".into(),
             session: "session-crew".into(),
         });
-        session.status.as_mut().unwrap().cleat_endpoint = Some(endpoint.clone());
-        terminals.update_status("crew", &session.metadata.resource_version, session.status.as_ref().unwrap()).await.unwrap();
+        ensure_vessel(&backend, "convoy-work", "convoy", "work").await;
+        let request = flotilla_resources::terminal_records::TerminalLaunchRequest {
+            session: "crew".into(),
+            environment: "pre-agent".into(),
+            vessel: Some("convoy-work".into()),
+            role: "coder".into(),
+            pool: "passthrough".into(),
+            cwd: "/repo".into(),
+            env: Default::default(),
+            source: flotilla_resources::terminal_records::TerminalLaunchSource::Tool { command: "bash".into() },
+        };
+        // The session's next launch, running at `endpoint`: each launch's endpoint is fixed.
+        let run_at = |endpoint: &flotilla_protocol::result_set::CleatEndpoint| {
+            let mut launch = engine.terminals.request(&request);
+            if engine.terminals.record(&launch).is_running() {
+                engine.terminals.lost(&launch, "relaunched");
+                launch = engine.terminals.request(&request);
+            }
+            let facts = flotilla_resources::terminal_records::TerminalLaunchFacts {
+                endpoint: Some((endpoint.runtime_root.clone(), endpoint.daemon.clone())),
+                ..Default::default()
+            };
+            engine.terminals.ready(&launch, &endpoint.session, &facts);
+        };
+        run_at(&endpoint);
 
         for round in 0..2 {
             if round > 0 {
@@ -1852,7 +1868,7 @@ mod tests {
                     Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
                 )
                 .await;
-                daemon.install_lifecycle_reads(engine.reads.clone()).expect("engine reads");
+                daemon.install_lifecycle_reads(engine.reads()).expect("engine reads");
             }
             let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
             let runner = Arc::new(Inventory(real.clone(), available.clone()));
@@ -1923,12 +1939,15 @@ mod tests {
                 fn environments(&self) -> Result<&dyn flotilla_resources::environment_records::EnvironmentRecords, String> {
                     self.1.environments()
                 }
+                fn terminals(&self) -> Result<&dyn flotilla_resources::terminal_records::TerminalRecords, String> {
+                    self.1.terminals()
+                }
             }
-            let ready = BackingReading("backing", engine.reads.clone());
+            let ready = BackingReading("backing", engine.reads());
             let mut held = daemon.attach_resolver();
             held.lifecycle_reads = &ready;
             held.resolve_attach("crew", None, false, AttachMode::Default, None).await.expect("current engine identity");
-            let current = BackingReading("current-backing", engine.reads.clone());
+            let current = BackingReading("current-backing", engine.reads());
             let mut resolver = daemon.attach_resolver();
             resolver.lifecycle_reads = &current;
             let error = resolver.resolve_attach("crew", None, false, AttachMode::Default, None).await.unwrap_err();
@@ -1949,14 +1968,10 @@ mod tests {
                 flotilla_protocol::result_set::CleatEndpoint { daemon: "crew@6".into(), ..endpoint.clone() },
                 flotilla_protocol::result_set::CleatEndpoint { runtime_root: "/another/root".into(), ..endpoint.clone() },
             ] {
-                let mut current = terminals.get("crew").await.unwrap();
-                current.status.as_mut().unwrap().cleat_endpoint = Some(wrong);
-                terminals.update_status("crew", &current.metadata.resource_version, current.status.as_ref().unwrap()).await.unwrap();
+                run_at(&wrong);
                 assert!(daemon.attach_resolver().resolve_attach("crew", None, false, AttachMode::Default, None).await.is_err());
             }
-            let mut current = terminals.get("crew").await.unwrap();
-            current.status.as_mut().unwrap().cleat_endpoint = Some(endpoint.clone());
-            terminals.update_status("crew", &current.metadata.resource_version, current.status.as_ref().unwrap()).await.unwrap();
+            run_at(&endpoint);
 
             // The same authorization, binding and seat contract applies with a
             // separately unreachable resident and with a healthy preferred route.
@@ -2186,10 +2201,10 @@ mod tests {
             )
             .await
             .expect("local host resource");
-        let environments = test_environments(&daemon);
-        let environment = create_test_environment(&environments, "governor-env", &local_host);
-        create_running_session(&daemon, &environment, "governor-session", "convoy-andamento", "governor").await;
-        create_running_session(&daemon, &environment, "flotilla-governor-session", "convoy-flotilla", "governor").await;
+        let engine = test_engine(&daemon);
+        let environment = create_test_environment(&engine.environments, "governor-env", &local_host);
+        create_running_session(&engine, &backend, &environment, "governor-session", "convoy-andamento", "governor").await;
+        create_running_session(&engine, &backend, &environment, "flotilla-governor-session", "convoy-flotilla", "governor").await;
 
         let resolver = daemon.attach_resolver();
 
@@ -2252,9 +2267,9 @@ mod tests {
             )
             .await
             .expect("local host resource");
-        let environments = test_environments(&daemon);
-        let environment = create_test_environment(&environments, "coder-env", &host);
-        create_running_session(&daemon, &environment, "coder-session", "convoy-failed", "coder").await;
+        let engine = test_engine(&daemon);
+        let environment = create_test_environment(&engine.environments, "coder-env", &host);
+        create_running_session(&engine, &backend, &environment, "coder-session", "convoy-failed", "coder").await;
         let convoys = backend.using::<ResourceConvoy>("flotilla");
         let convoy = convoys.get("convoy-failed").await.expect("convoy");
         convoys
@@ -2265,11 +2280,6 @@ mod tests {
             )
             .await
             .expect("failed convoy status");
-        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-        let session = sessions.get("coder-session").await.expect("session");
-        let mut status = session.status.expect("session status");
-        status.phase = ResourceTerminalSessionPhase::Lost;
-        sessions.update_status("coder-session", &session.metadata.resource_version, &status).await.expect("stale session status");
 
         let resolver = daemon.attach_resolver();
         for reference in ["coder", "coder@flotilla", "convoy-failed", "coder-session"] {
@@ -2305,10 +2315,10 @@ mod tests {
             )
             .await
             .expect("local host resource");
-        let environments = test_environments(&daemon);
-        let environment = create_test_environment(&environments, "coder-env", &host);
-        create_running_session(&daemon, &environment, "terminal-old", "convoy-old", "coder").await;
-        create_running_session(&daemon, &environment, "terminal-new", "convoy-new", "coder").await;
+        let engine = test_engine(&daemon);
+        let environment = create_test_environment(&engine.environments, "coder-env", &host);
+        create_running_session(&engine, &backend, &environment, "terminal-old", "convoy-old", "coder").await;
+        let newer = create_running_session(&engine, &backend, &environment, "terminal-new", "convoy-new", "coder").await;
 
         let resolver = daemon.attach_resolver();
         let resolved = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect("newest generation");
@@ -2317,24 +2327,27 @@ mod tests {
         assert_eq!(old.binding.and_then(|binding| binding.session), Some("terminal-old".to_string()));
 
         backend.using::<ResourceConvoy>("flotilla").create(&test_meta("convoy-peer"), &successor).await.expect("peer generation");
-        create_running_session(&daemon, &environment, "terminal-peer", "convoy-peer", "coder").await;
+        let peer = create_running_session(&engine, &backend, &environment, "terminal-peer", "convoy-peer", "coder").await;
         let error =
             resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect_err("same generation is ambiguous");
         assert!(error.contains("ambiguous"), "{error}");
 
-        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-        sessions.delete("terminal-peer").await.expect("remove peer endpoint");
-        let newest = sessions.get("terminal-new").await.expect("newest session");
-        let mut unreachable_spec = newest.spec;
-        unreachable_spec.pool = "missing-pool".to_string();
-        sessions
-            .update(
-                &flotilla_resources::InputMeta::builder().name("terminal-new".to_string()).labels(newest.metadata.labels.clone()).build(),
-                &newest.metadata.resource_version,
-                &unreachable_spec,
-            )
-            .await
-            .expect("make newer endpoint unreachable");
+        // The peer's launch ends; the newest generation's next launch runs in a pool nothing serves.
+        engine.terminals.release(&peer);
+        let mut unreachable = engine.terminals.record(&newer);
+        engine.terminals.lost(&newer, "relaunched elsewhere");
+        unreachable.pool = "missing-pool".to_string();
+        let relaunched = engine.terminals.request(&flotilla_resources::terminal_records::TerminalLaunchRequest {
+            session: "terminal-new".to_string(),
+            environment: unreachable.environment,
+            vessel: unreachable.vessel,
+            role: unreachable.role,
+            pool: unreachable.pool,
+            cwd: unreachable.cwd,
+            env: unreachable.env,
+            source: unreachable.source,
+        });
+        engine.terminals.ready(&relaunched, "session-terminal-new", &Default::default());
         let fallback = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect("older reachable generation");
         assert_eq!(fallback.binding.and_then(|binding| binding.session), Some("terminal-old".to_string()));
     }
@@ -2363,9 +2376,9 @@ mod tests {
                 .create(&test_meta(&host), &HostSpec { display_name: "host".into(), connection: Default::default(), ..Default::default() })
                 .await
                 .expect("host");
-            let environments = test_environments(&daemon);
-            let environment = create_test_environment(&environments, "env-main", &host);
-            create_running_session(&daemon, &environment, "terminal-main", "convoy-main", "coder").await;
+            let engine = test_engine(&daemon);
+            let environment = create_test_environment(&engine.environments, "env-main", &host);
+            create_running_session(&engine, &backend, &environment, "terminal-main", "convoy-main", "coder").await;
             for n in 0..unrelated {
                 create_identity_convoy(&backend, &format!("unrelated-{n}"), "other", Some("other")).await;
                 backend
@@ -2404,7 +2417,9 @@ mod tests {
             let convoy_calls = if reference.starts_with("terminal-") { 2 } else { 1 };
             assert_eq!(reads.calls_by_kind().get("Convoy"), Some(&convoy_calls));
             assert_eq!(reads.objects_by_kind().get("Convoy"), Some(&1));
-            assert_eq!(reads.calls_by_kind().get("TerminalSession"), Some(&1));
+            // Terminal sessions are read from the engine's launches through keyed reads, never
+            // from this counted store.
+            assert_eq!(reads.calls_by_kind().get("TerminalSession"), None);
             // #3078: reachability checks and final planning share one Host
             // catalog snapshot for this request. The store counts its local
             // and replica source lists separately.
@@ -2412,8 +2427,6 @@ mod tests {
                 &ReadBudget::new()
                     .objects("Convoy", ReadOperation::Query, 1, 1)
                     .objects("Convoy", ReadOperation::Get, 1, 1)
-                    .objects("TerminalSession", ReadOperation::Query, 1, 1)
-                    .objects("TerminalSession", ReadOperation::Get, 1, 1)
                     .objects("Environment", ReadOperation::Get, 2, 2)
                     .calls("Host", ReadOperation::List, 2),
                 reference,
@@ -2453,26 +2466,19 @@ mod tests {
             )
             .await
             .expect("local host resource");
-        let environments = test_environments(&daemon);
-        let environment = create_test_environment(&environments, "coder-env", &host);
-        create_running_session(&daemon, &environment, "terminal-gone", "convoy-gone", "coder").await;
-        backend.using::<ResourceTerminalSession>("flotilla").delete("terminal-gone").await.expect("delete terminal session");
+        let engine = test_engine(&daemon);
+        let environment = create_test_environment(&engine.environments, "coder-env", &host);
+        let gone = create_running_session(&engine, &backend, &environment, "terminal-gone", "convoy-gone", "coder").await;
+        // Its launch ended and was released.
+        engine.terminals.release(&gone);
 
         let resolver = daemon.attach_resolver();
         let error = resolver.resolve_attach("terminal-gone", None, false, AttachMode::Default, None).await.expect_err("gone session");
         assert_eq!(error, format!("session terminal-gone no longer exists on {}", daemon.host_name));
-        let error = resolver.resolve_attach("convoy-gone", None, false, AttachMode::Default, None).await.expect_err("gone convoy session");
-        assert_eq!(
-            error,
-            format!("no session available for convoy-gone on {}; the crew has not started yet or its session has ended", daemon.host_name)
-        );
-        let error = resolver.resolve_attach("coder@flotilla", None, false, AttachMode::Default, None).await.expect_err("gone role session");
-        assert_eq!(
-            error,
-            format!(
-                "no session available for coder@flotilla on {}; the crew has not started yet or its session has ended",
-                daemon.host_name
-            )
-        );
+        // The ended launch is kept, so the convoy and its role name the session that ended.
+        for reference in ["convoy-gone", "coder@flotilla"] {
+            let error = resolver.resolve_attach(reference, None, false, AttachMode::Default, None).await.expect_err(reference);
+            assert_eq!(error, format!("session terminal-gone no longer exists on {}", daemon.host_name));
+        }
     }
 }

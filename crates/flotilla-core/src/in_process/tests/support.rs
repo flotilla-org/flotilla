@@ -18,18 +18,16 @@ use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
+    terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords},
     Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, CrewWorkPhase, CrewWorkState,
     EnvironmentSpec as ResourceEnvironmentSpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec,
     FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostDirectEnvironmentSpec, HostSpec, HostStatus, InputMeta, ResourceObject,
-    Selector, TerminalAttention, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
-    VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
-    VESSEL_LABEL, VESSEL_REF_LABEL,
+    TerminalAttention, TerminalSession as ResourceTerminalSession, Vessel, VesselRequirement, VesselSpec, WorkflowTemplateSpec,
+    AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
 use crate::in_process::dispatch_board_tests::tests::board;
-use crate::in_process::input_meta_from_resource;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_crew::ports::WorkCredentialReconciler;
@@ -79,31 +77,20 @@ pub(super) struct SessionStagingProbe {
     pub(super) session: String,
     pub(super) environment: String,
     pub(super) fail_next: std::sync::atomic::AtomicBool,
-    pub(super) invalidate_next: std::sync::atomic::AtomicBool,
     pub(super) staged: std::sync::atomic::AtomicUsize,
+    /// The engine whose launches the daemon reads: the session's launches are stepped here.
+    pub(super) engine: TestEngine,
 }
 
 #[async_trait]
 impl WorkCredentialReconciler for SessionStagingProbe {
     async fn reconcile(&self, namespace: &str, environment_ref: &str) -> Result<(), String> {
         assert_eq!(environment_ref, self.environment);
-        let sessions = self.backend.clone().using::<ResourceTerminalSession>(namespace);
-        let session = sessions.get(&self.session).await.map_err(|error| error.to_string())?;
-        let TerminalSessionSource::Agent { message, .. } = &session.spec.source else { return Err("expected agent session".to_string()) };
-        assert!(message.is_none(), "message became deliverable before credential staging");
+        self.backend.clone().using::<ResourceTerminalSession>(namespace).get(&self.session).await.map_err(|error| error.to_string())?;
         if self.fail_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
             return Err("credential staging failed".to_string());
         }
         self.staged.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.invalidate_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            let mut changed_spec = session.spec.clone();
-            let TerminalSessionSource::Agent { brief, .. } = &mut changed_spec.source else { unreachable!("checked above") };
-            brief.content.push_str(" (concurrent edit)");
-            sessions
-                .update(&input_meta_from_resource(&session), &session.metadata.resource_version, &changed_spec)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
         Ok(())
     }
 }
@@ -134,7 +121,7 @@ pub(super) async fn resume_staging_fixture_with_clock(
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    test_engine(&daemon);
+    let engine = test_engine(&daemon);
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let convoy = convoys
         .create(
@@ -170,53 +157,63 @@ pub(super) async fn resume_staging_fixture_with_clock(
         )
         .await
         .expect("convoy status");
-    backend
-        .clone()
-        .using::<ResourceTerminalSession>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("resume-staging-session".to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "resume-staging".to_string()),
-                    (VESSEL_LABEL.to_string(), "work".to_string()),
-                    (ROLE_LABEL.to_string(), "coder".to_string()),
-                ]))
-                .build(),
-            &ResourceTerminalSessionSpec {
-                env_ref: "resume-env".to_string(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector { capability: "code".to_string(), adapter: None, model: None },
-                    brief: flotilla_resources::TerminalBrief {
-                        artifact_digest: None,
-                        path: "brief.md".to_string(),
-                        content: "original".to_string(),
-                        copies: vec![],
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".to_string(),
-                        convoy: "resume-staging".to_string(),
-                        vessel_ref: "resume-vessel".to_string(),
-                    }),
-                    message: None,
-                },
-                cwd: "/repo".to_string(),
-                env: Default::default(),
-                pool: "passthrough".to_string(),
+    ensure_vessel(&backend, "resume-vessel", "resume-staging", "work").await;
+    engine.terminals.request(&TerminalLaunchRequest {
+        session: "resume-staging-session".to_string(),
+        environment: "resume-env".to_string(),
+        vessel: Some("resume-vessel".to_string()),
+        role: "coder".to_string(),
+        pool: "passthrough".to_string(),
+        cwd: "/repo".to_string(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Agent {
+            capability: "code".to_string(),
+            adapter: None,
+            model: None,
+            brief: flotilla_resources::TerminalBrief {
+                artifact_digest: None,
+                path: "brief.md".to_string(),
+                content: "original".to_string(),
+                copies: vec![],
             },
-        )
-        .await
-        .expect("session");
+        },
+    });
     let probe = Arc::new(SessionStagingProbe {
         backend: backend.clone(),
         session: "resume-staging-session".to_string(),
         environment: "resume-env".to_string(),
         fail_next: std::sync::atomic::AtomicBool::new(true),
-        invalidate_next: std::sync::atomic::AtomicBool::new(false),
         staged: std::sync::atomic::AtomicUsize::new(0),
+        engine,
     });
     daemon.set_work_credential_reconciler(probe.clone()).await;
     (daemon, backend, probe)
+}
+
+/// Vessel `vessel_ref`, named `vessel` in convoy `convoy`: what a crew's sessions are held for,
+/// whose convoy and name their readers see.
+pub(in crate::in_process) async fn ensure_vessel(backend: &ResourceBackend, vessel_ref: &str, convoy: &str, vessel: &str) {
+    let vessels = backend.clone().using::<Vessel>("flotilla");
+    if vessels.get(vessel_ref).await.is_ok() {
+        return;
+    }
+    vessels
+        .create(
+            &test_meta(vessel_ref),
+            &VesselSpec {
+                convoy_ref: convoy.to_string(),
+                vessel_name: vessel.to_string(),
+                fulfilment_kind_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("vessel");
+}
+
+/// Records `attention` as what this home observes of launch `launch`, as its hooks or screen reads do.
+pub(in crate::in_process) fn observe_attention(engine: &TestEngine, launch: &str, attention: TerminalAttention) {
+    engine.terminals.terminals.observations().update(launch, |observation| observation.attention = Some(attention));
 }
 
 pub(super) struct ForgeAwareTestChangeRequestFactory(pub(super) Arc<dyn ChangeRequestTracker>);
@@ -523,10 +520,6 @@ pub(super) fn trusted_codex_workflow() -> WorkflowTemplateSpec {
 
 /// The engine's environments for `daemon`'s tests, installed with its clones and checkouts (none
 /// held) as its lifecycle reads, as the daemon's runtime installs them.
-pub(in crate::in_process) fn test_environments(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EnvironmentFixture {
-    test_engine(daemon).environments
-}
-
 /// The engine's environments, clones and checkouts on one store, as a daemon's runtime has them.
 pub(in crate::in_process) use flotilla_provisioning_testkit::EngineFixture as TestEngine;
 
@@ -556,42 +549,30 @@ pub(in crate::in_process) fn create_test_environment(
     name.to_string()
 }
 
-pub(in crate::in_process) async fn create_running_session(daemon: &InProcessDaemon, env_ref: &str, name: &str, convoy: &str, role: &str) {
-    let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
-    let created = terminals
-        .create(
-            &InputMeta::builder()
-                .name(name.to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), convoy.to_string()),
-                    (VESSEL_LABEL.to_string(), "work".to_string()),
-                    (VESSEL_REF_LABEL.to_string(), format!("{convoy}-work")),
-                    (ROLE_LABEL.to_string(), role.to_string()),
-                ]))
-                .build(),
-            &ResourceTerminalSessionSpec {
-                env_ref: env_ref.to_string(),
-                role: role.to_string(),
-                source: TerminalSessionSource::Tool { command: "bash".to_string() },
-                cwd: "/repo".to_string(),
-                env: Default::default(),
-                pool: "passthrough".to_string(),
-            },
-        )
-        .await
-        .expect("terminal session");
-    terminals
-        .update_status(
-            name,
-            &created.metadata.resource_version,
-            &ResourceTerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                session_id: Some(format!("session-{name}")),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("running session");
+/// Session `name`, a tool running in environment `env_ref` for convoy `convoy`'s `work` vessel
+/// as `role`, under pool session `session-<name>`. Its launch.
+pub(in crate::in_process) async fn create_running_session(
+    engine: &TestEngine,
+    backend: &ResourceBackend,
+    env_ref: &str,
+    name: &str,
+    convoy: &str,
+    role: &str,
+) -> String {
+    let vessel_ref = format!("{convoy}-work");
+    ensure_vessel(backend, &vessel_ref, convoy, "work").await;
+    let launch = engine.terminals.request(&TerminalLaunchRequest {
+        session: name.to_string(),
+        environment: env_ref.to_string(),
+        vessel: Some(vessel_ref),
+        role: role.to_string(),
+        pool: "passthrough".to_string(),
+        cwd: "/repo".to_string(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Tool { command: "bash".to_string() },
+    });
+    engine.terminals.ready(&launch, &format!("session-{name}"), &Default::default());
+    launch
 }
 
 /// A ready Docker host and a literal-image Docker kind on it whose image the
@@ -663,13 +644,13 @@ pub(super) async fn set_host_credential_expiry<'a>(at: impl Into<HostsAt<'a>>, h
     put_host(at, host_ref, &host.spec, &status).await;
 }
 
-pub(super) async fn stall_test_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir, tokio::task::JoinHandle<()>) {
+pub(super) type StallTestDaemon = (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir, tokio::task::JoinHandle<()>, TestEngine);
+
+pub(super) async fn stall_test_daemon() -> StallTestDaemon {
     stall_test_daemon_with_clock(Arc::new(flotilla_resources::SystemClock)).await
 }
 
-pub(super) async fn stall_test_daemon_with_clock(
-    clock: Arc<dyn flotilla_resources::Clock>,
-) -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir, tokio::task::JoinHandle<()>) {
+pub(super) async fn stall_test_daemon_with_clock(clock: Arc<dyn flotilla_resources::Clock>) -> StallTestDaemon {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"stall-test\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -683,7 +664,7 @@ pub(super) async fn stall_test_daemon_with_clock(
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    test_engine(&daemon);
+    let engine = test_engine(&daemon);
     let (sender, mut receiver) = flotilla_store::controller::WorkQueueSender::channel();
     let watch = daemon.reconciler_wake_watch();
     let watch_backend = backend.clone();
@@ -692,7 +673,7 @@ pub(super) async fn stall_test_daemon_with_clock(
         watch.spawn(watch_backend, "flotilla".to_string(), sender).await.expect("stall watch");
         drain.abort();
     });
-    (daemon, backend, temp, task)
+    (daemon, backend, temp, task, engine)
 }
 
 /// The daemon's AgentSessions, where its harness hooks and screen reads record a crew's activity
@@ -751,41 +732,31 @@ pub(super) fn claim_crew(role: &str) -> flotilla_resources::CrewSpec {
         .build()
 }
 
-pub(super) async fn stall_test_session(backend: &ResourceBackend, convoy: &str, name: &str, role: &str, attention: TerminalAttention) {
-    let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name(name.into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), convoy.into()),
-                    (VESSEL_LABEL.into(), "work".into()),
-                    (ROLE_LABEL.into(), role.into()),
-                ]))
-                .build(),
-            &ResourceTerminalSessionSpec {
-                env_ref: "env".into(),
-                role: role.into(),
-                source: TerminalSessionSource::Tool { command: "test".into() },
-                cwd: "/tmp".into(),
-                env: Default::default(),
-                pool: "test".into(),
-            },
-        )
-        .await
-        .expect("session");
-    sessions
-        .update_status(
-            name,
-            &session.metadata.resource_version,
-            &ResourceTerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                attention: Some(attention),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("attention");
+/// Session `name`, a tool running for convoy `convoy`'s `work` vessel as `role`, whose home
+/// observes `attention`. Its launch.
+pub(super) async fn stall_test_session(
+    engine: &TestEngine,
+    backend: &ResourceBackend,
+    convoy: &str,
+    name: &str,
+    role: &str,
+    attention: TerminalAttention,
+) -> String {
+    let vessel_ref = format!("{convoy}-work");
+    ensure_vessel(backend, &vessel_ref, convoy, "work").await;
+    let launch = engine.terminals.request(&TerminalLaunchRequest {
+        session: name.into(),
+        environment: "env".into(),
+        vessel: Some(vessel_ref),
+        role: role.into(),
+        pool: "test".into(),
+        cwd: "/tmp".into(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Tool { command: "test".into() },
+    });
+    engine.terminals.ready(&launch, &format!("session-{name}"), &Default::default());
+    observe_attention(engine, &launch, attention);
+    launch
 }
 
 pub(super) struct SuspendedBoardProvider {

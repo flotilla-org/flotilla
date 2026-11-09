@@ -531,47 +531,11 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let resolver = backend.using::<crate::Repository>(namespace);
                 crate::ensure_repository(&resolver, &key, &spec).await.map(|_| ())
             }
-            Actuation::CreateTerminalSession { meta, spec } => {
-                let resolver = backend.using::<crate::TerminalSession>(namespace);
-                Self::create_if_missing(&resolver, meta, *spec).await
-            }
             Actuation::RaiseAttention { attention } => {
                 backend.attentions().raise(namespace, &attention).await.map_err(ResourceError::other)
             }
             Actuation::ClearAttention { sender, subject } => {
                 backend.attentions().clear(namespace, sender, &subject).await.map_err(ResourceError::other)
-            }
-            Actuation::PruneTerminalMessages { name } => {
-                let resolver = backend.using::<crate::TerminalSession>(namespace);
-                // Re-read the acknowledgment and pending queue together on every
-                // conflict: never erase a concurrently enqueued operator brief.
-                for _ in 0..8 {
-                    let current =
-                        crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.get(&name)).await?;
-                    let mut spec = current.spec.clone();
-                    let crate::TerminalSessionSource::Agent { message: Some(head), .. } = &mut spec.source else {
-                        return Ok(());
-                    };
-                    if !head.prune_acknowledged(current.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
-                        return Ok(());
-                    }
-                    match resolver.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await {
-                        Ok(_) => return Ok(()),
-                        Err(ResourceError::Conflict { .. }) => continue,
-                        Err(error) => return Err(error),
-                    }
-                }
-                Err(ResourceError::other("terminal message pruning contention persisted"))
-            }
-            Actuation::RestartTerminalSession { name, replaces } => {
-                let resolver = backend.using::<crate::TerminalSession>(namespace);
-                let obj = resolver.get(&name).await?;
-                backend.request_terminal_replacement(&obj, replaces.as_deref(), Utc::now()).await?;
-                crate::apply_status_patch(&resolver, &name, &crate::TerminalSessionStatusPatch::MarkStarting).await.map(|_| ())
-            }
-            Actuation::DeleteTerminalSession { name } => {
-                let resolver = backend.using::<crate::TerminalSession>(namespace);
-                Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
             Actuation::CreateVessel { meta, spec } => {
                 let resolver = backend.using::<crate::Vessel>(namespace);
@@ -590,14 +554,6 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let resolver = backend.using::<crate::Vessel>(namespace);
                 Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
-        }
-    }
-
-    async fn create_if_missing<T: Resource>(resolver: &TypedResolver<T>, mut meta: InputMeta, spec: T::Spec) -> Result<(), ResourceError> {
-        meta.set_lifecycle_authority(LifecycleAuthority::Managed);
-        match resolver.create(&meta, &spec).await {
-            Ok(_) | Err(ResourceError::Conflict { .. }) => Ok(()),
-            Err(err) => Err(err),
         }
     }
 

@@ -45,14 +45,16 @@ fn namespace_messages(source: &Source, namespace: &str, target: &mut Import, car
         }
     };
     let terminals = source.context::<TerminalSession>("terminalsessions", Some(namespace));
+    // A delivered message's receiver is the launch its session imported as, which names the
+    // crew's consumer now. A session another home imports keeps its name: those messages are that
+    // home's to write.
     let sessions = terminals
         .iter()
         .filter_map(|terminal| {
             let status = terminal.object.status.as_ref()?;
-            Some((
-                (status.crew.as_ref()?.id.clone(), status.session_id.clone()?),
-                (terminal.object.metadata.name.clone(), terminal.home.clone()),
-            ))
+            let key = (terminal.home.clone(), terminal.object.metadata.name.clone());
+            let launch = carried.launches.get(&key).cloned().unwrap_or_else(|| terminal.object.metadata.name.clone());
+            Some(((status.crew.as_ref()?.id.clone(), status.session_id.clone()?), (launch, terminal.home.clone())))
         })
         .collect();
     let records = old_store_records(source, namespace, terminals.into_iter().map(|terminal| terminal.object).collect());

@@ -123,8 +123,8 @@ pub use flotilla_resources::agent_activity::SCREEN_CAUSE;
 /// How long a hook's activity stands over a screen read that disagrees.
 pub const HOOK_STANDS_FOR: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The minimal AgentSession records at this home (#3317): one per live crew
-/// session, named by its TerminalSession record, holding the receipts.
+/// The minimal AgentSession records at this home (#3317): one per crew
+/// launch, named by the launch (`<session>#<n>`), holding the receipts.
 pub struct Sessions {
     home: Mutex<Home<AgentSession, StoreLog>>,
 }
@@ -185,7 +185,7 @@ impl Sessions {
         };
         let mut home = self.home.lock().map_err(|_| "session home lock poisoned".to_string())?;
         // A hook may precede the delivery adapter's first consumer registration.
-        // Materialize the same minimal record here, named by the validated terminal;
+        // Materialize the same minimal record here, named by the validated launch;
         // the terminal and delivery adapter still own its lifecycle, not the hook.
         if home.get(name).is_none() {
             home.create(name, (), &MemoryAgentSessionWorld::default(), now).map_err(|error| format!("AgentSession `{name}`: {error:?}"))?;
@@ -420,9 +420,13 @@ pub struct MessagePrimitives {
     home_reads: std::sync::OnceLock<Arc<dyn ports::HomeReads>>,
     /// Old record names to their engine id and home, filled as messages are seen.
     located: Mutex<BTreeMap<String, (String, String)>>,
-    /// Old-store records, reread at most once a second per namespace. Goes
-    /// with Convoy and Vessel when they leave the old store (see `view_of`).
+    /// Records held between commits that could change them; see [`Self::read_records`].
     records: tokio::sync::Mutex<BTreeMap<String, RecordsRead>>,
+    /// Counts the commits that may have changed the records: one that writes or applies a kind
+    /// they could read, on any home, or makes followers look again.
+    records_moved: Arc<std::sync::atomic::AtomicU64>,
+    /// Bumps `records_moved`; the service holds it weakly.
+    _records_listener: Arc<flotilla_schema_sqlite::stream::CommitListener>,
     /// Signalled after an attention here is raised, cleared or acknowledged, and after another
     /// home's Messages are applied.
     attention_changes: tokio::sync::broadcast::Sender<()>,
@@ -473,6 +477,24 @@ impl MessagePrimitives {
         let convoys = Arc::new(convoys::Convoys::open(home, &service)?);
         let convoy_engine = Arc::new(convoy_engine::ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), Arc::clone(&clock)));
         let awaiting = Arc::new(awaiting::AwaitingReplies::open(home, &service)?);
+        let records_moved = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let records_listener: Arc<flotilla_schema_sqlite::stream::CommitListener> = {
+            let moved = Arc::clone(&records_moved);
+            // The message path's own kinds: the records read none of them.
+            let unread = BTreeSet::from([
+                <Resource<Message> as StoredKind>::CODE,
+                <Resource<AgentSession> as StoredKind>::CODE,
+                <Resource<Person> as StoredKind>::CODE,
+                <Resource<ServiceMachine> as StoredKind>::CODE,
+                <Resource<flotilla_state_machines::machines::awaiting_reply::AwaitingReply> as StoredKind>::CODE,
+            ]);
+            Arc::new(move |committed: &flotilla_schema_sqlite::stream::Committed<'_>| {
+                if committed.rescan || !committed.kinds.is_subset(&unread) {
+                    moved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        };
+        service.on_commit(Arc::downgrade(&records_listener));
         // Attentions homed elsewhere arrive with their homes' entries; their readers read again then.
         let attention_changes = tokio::sync::broadcast::channel(16).0;
         let replicated = attention_changes.clone();
@@ -502,6 +524,8 @@ impl MessagePrimitives {
             home_reads: std::sync::OnceLock::new(),
             located: Mutex::new(BTreeMap::new()),
             records: tokio::sync::Mutex::new(BTreeMap::new()),
+            records_moved,
+            _records_listener: records_listener,
             attention_changes,
             acknowledgements: tokio::sync::broadcast::channel(16).0,
             backend,
@@ -562,18 +586,26 @@ impl MessagePrimitives {
         Ok(self.read_records(namespace, false).await?.records)
     }
 
-    /// The held read of the records, or, when `reread` or the held one is a
-    /// second old, a read made now. A read made to judge a miss again is
-    /// marked `rechecked`.
+    /// The held read of the records, or, when `reread`, an engine commit has
+    /// landed since, or the held one is a second old, a read made now. A read
+    /// made to judge a miss again is marked `rechecked`.
+    ///
+    /// Engine records (launches, repositories, and whatever moves next) are
+    /// fresh until a commit that could change them, including another home's
+    /// entries applied by the follower. The second bounds only the kinds
+    /// still in the old store, which signal no commits; it goes with Convoy
+    /// and Vessel when they leave it (see `view_of`).
     async fn read_records(&self, namespace: &str, reread: bool) -> Result<RecordsRead, ResourceError> {
-        const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(1);
+        const OLD_STORE_FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(1);
         let mut cache = self.records.lock().await;
-        if let Some(read) = cache.get(namespace).filter(|read| !reread && read.at.elapsed() < FRESH_FOR) {
+        // Taken before the load, so a commit during it makes the next read load again.
+        let moved = self.records_moved.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(read) = cache.get(namespace).filter(|read| !reread && read.moved == moved && read.at.elapsed() < OLD_STORE_FRESH_FOR) {
             return Ok(read.clone());
         }
         let world_at = self.world.now();
         let records = Arc::new(OldStoreRecords::load(&self.backend, namespace).await?);
-        let read = RecordsRead { at: std::time::Instant::now(), world_at, rechecked: reread, records };
+        let read = RecordsRead { at: std::time::Instant::now(), moved, world_at, rechecked: reread, records };
         cache.insert(namespace.to_owned(), read.clone());
         Ok(read)
     }
@@ -1476,6 +1508,8 @@ impl flotilla_messaging::CharterNotices for EngineCharterNotices {
 #[derive(Clone)]
 struct RecordsRead {
     at: std::time::Instant,
+    /// `records_moved` when it was read.
+    moved: u64,
     world_at: Timestamp,
     rechecked: bool,
     records: Arc<OldStoreRecords>,
@@ -1681,8 +1715,13 @@ impl ViewLookups for OldStoreRecords {
                     .map(|vessel| vessel.name.clone())
             })
     }
+    /// A receiver names its launch, read from the session's view only while it shows that launch.
     fn session(&self, receiver: &Receiver) -> Option<(String, String)> {
-        let status = self.terminals.get(&receiver.id)?.status.as_ref()?;
+        let terminal = self.terminals.get(flotilla_resources::terminal_records::launched(&receiver.id))?;
+        if flotilla_resources::terminal_records::launch_of(terminal) != Some(receiver.id.as_str()) {
+            return None;
+        }
+        let status = terminal.status.as_ref()?;
         Some((status.crew.as_ref()?.id.clone(), status.session_id.clone()?))
     }
     fn record(&self, address: &Address, revision: &str) -> Option<OldReference> {

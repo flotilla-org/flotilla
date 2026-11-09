@@ -187,6 +187,9 @@ struct Carried {
     /// Each imported engine Convoy's version as written, by home and engine name: the checkouts
     /// held for it are created under it.
     convoys: BTreeMap<(String, String), u64>,
+    /// The launch each imported TerminalSession became, by home and old name: a message delivered
+    /// to the session names that launch's consumer.
+    launches: BTreeMap<(String, String), String>,
 }
 
 /// One importer: the old kinds it imports, by plural, and its writes.
@@ -208,6 +211,7 @@ pub const STEPS: &[Step] = &[
     Step { name: "forge observations", kinds: &observations::KINDS, run: observations::observations },
     Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },
     Step { name: "accounts", kinds: &records::ACCOUNT_KINDS, run: records::accounts },
+    Step { name: "terminal sessions", kinds: &["terminalsessions"], run: lifecycle::terminal_sessions },
     Step { name: "messages", kinds: &["messages"], run: messages::messages },
     Step { name: "attentions", kinds: &["demands"], run: attentions::attentions },
     Step { name: "convoys", kinds: &["convoys"], run: convoys::convoys },

@@ -9,7 +9,7 @@ mod auth;
 mod commands;
 #[cfg(test)]
 mod hook_tests;
-mod hooks;
+pub(in crate::server) mod hooks;
 mod login;
 pub(in crate::server) mod metrics;
 mod resource_api;

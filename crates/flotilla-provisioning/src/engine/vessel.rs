@@ -2,7 +2,9 @@
 //! on its pinned host.
 //!
 //! Until a capacity model is ruled, a vessel's lease is the host pinned at convoy admission,
-//! recorded as granted: the engine judges no capacity, class or priority. [`PlacementLifecycles`]
+//! recorded as granted: the engine judges no capacity, class or priority. A vessel admitted with
+//! no placement is leased on the host whose reconciler provisions it, this home, so every vessel
+//! reconciled here holds a lease and its teardown releases what is held for it. [`PlacementLifecycles`]
 //! is the Vessel kind's home behind the engine's [`Lifecycles`] port. A request queues the lease
 //! at the [`Placements`] ledger and places it on its pinned host at once, which the ledger
 //! admits: the host joins with no capacity dimensions, the lease has no shape, and its convoy is
@@ -11,7 +13,7 @@
 //!
 //! | Old Vessel patch | Engine |
 //! |---|---|
-//! | `MarkProvisioning`, first, with its pinned host | Request and Place: the lease is granted, Requested |
+//! | `MarkProvisioning`, first, with or without its pinned host | Request and Place: the lease is granted, Requested |
 //! | `MarkReady`, first | Realise, under the environment it runs in |
 //! | `MarkLost` / `MarkFailed`, once realised | Vanish: Gone |
 //! | `MarkLost` / `MarkFailed`, before it was realised | Attempted then GiveUp: the cause is retained, the lease returned |
@@ -48,7 +50,7 @@ pub struct VesselBinding;
 
 impl VesselBinding {
     /// The host `obj` was pinned to at admission, once its provisioning recorded the placement:
-    /// its lease's host. A vessel with none was never placed.
+    /// its lease's host. A vessel with none was never placed, and is leased at its home.
     pub fn pinned_host(obj: &ResourceObject<OldVessel>) -> Option<&str> {
         obj.status.as_ref().and_then(|status| status.placement_decision.as_ref()).map(|decision| decision.target_host.reference.as_str())
     }
@@ -59,7 +61,8 @@ impl Binding for VesselBinding {
     type Kind = VesselKind;
 
     fn request(obj: &ResourceObject<OldVessel>, home: &str) -> Result<VesselSpec, String> {
-        let host = Self::pinned_host(obj).ok_or("the vessel has no pinned host yet")?;
+        // An unplaced vessel is provisioned by this home's reconciler: its lease is here.
+        let host = Self::pinned_host(obj).unwrap_or(home);
         // The convoy is homed where it was admitted: the root a federated convoy's vessel records,
         // or this home.
         let convoy_home = obj.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map_or(home, String::as_str);
@@ -77,7 +80,7 @@ impl Binding for VesselBinding {
     }
 
     fn requests(_obj: &ResourceObject<OldVessel>, patch: &VesselStatusPatch) -> bool {
-        matches!(patch, VesselStatusPatch::MarkProvisioning { placement_decision: Some(_), .. })
+        matches!(patch, VesselStatusPatch::MarkProvisioning { .. })
     }
 
     fn steps(obj: &ResourceObject<OldVessel>, patch: &VesselStatusPatch) -> Vec<Step> {

@@ -127,7 +127,7 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
         seed_pinned_harness(&root.join("vessel"), "claude-code");
     }
     TerminalControllerRuntime { state: Arc::clone(&stand_in.state) }
-        .ensure_session("terminal-demo-work-coder", (&session).into(), &[])
+        .ensure_session("terminal-demo-work-coder", &first_launch("terminal-demo-work-coder"), (&session).into(), &[])
         .await
         .expect("launch");
 

@@ -104,3 +104,43 @@ fn a_session_never_requested_here_cannot_be_renewed() {
     assert!(fixture.terminals.renew("terminal-v9-lead").is_err());
     assert!(fixture.terminals.get("terminal-v9-lead", None).expect("read").is_none());
 }
+
+// Behaviour (#3108): the old store's TerminalSession reads are served from the launches. Each
+// session reads as its newest launch, with the engine's identity, phase and ending reason, and
+// its writes are refused: sessions are requested and renewed through the terminal port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_store_reads_see_each_sessions_newest_launch() {
+    use std::sync::Arc;
+
+    use flotilla_resources::{TerminalSession, TerminalSessionPhase};
+    use flotilla_store::{ResourceBackend, TerminalViews};
+
+    let fixture = TerminalsFixture::default();
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    backend.install_engine_records(Arc::new(TerminalViews::new(backend.clone(), "flotilla", fixture.reads.clone())));
+    backend.serve_engine_in("flotilla");
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    let request = TerminalsFixture::agent("v1", "lead", "env-a");
+    let read = || async { sessions.get(&request.session).await.expect("session").status.expect("status") };
+
+    let first = fixture.request(&request);
+    assert_eq!(read().await.phase, TerminalSessionPhase::Starting);
+    fixture.ready(&first, "engine identity", &facts());
+    let running = read().await;
+    assert_eq!(running.phase, TerminalSessionPhase::Running);
+    assert_eq!(running.session_id.as_deref(), Some("engine identity"));
+    fixture.exited(&first, "agent exited with code 0");
+    assert_eq!(read().await.phase, TerminalSessionPhase::Stopped, "an exited agent waits for its resume");
+
+    let TerminalRenewal::Started(second) = fixture.terminals.renew(&request.session).expect("renew") else { panic!("next launch") };
+    assert_eq!(read().await.phase, TerminalSessionPhase::Starting, "the newest launch is read");
+    fixture.ready(&second, "s2", &facts());
+    fixture.failed(&second, "engine ending reason");
+    let failed = read().await;
+    assert_eq!(failed.phase, TerminalSessionPhase::Failed);
+    assert!(failed.message.expect("reason").contains("engine ending reason"));
+
+    let listed = sessions.list().await.expect("list").items;
+    assert_eq!(listed.iter().map(|session| session.metadata.name.as_str()).collect::<Vec<_>>(), [request.session.as_str()]);
+    assert!(sessions.delete(&request.session).await.is_err(), "a session ends with its holder; it is not deleted");
+}

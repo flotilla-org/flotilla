@@ -1,4 +1,5 @@
 use super::*;
+use crate::testkits::engine::runtime_terminals;
 use flotilla_resources::attentions::Subject;
 use flotilla_store_memory::InMemoryBackend;
 
@@ -534,7 +535,7 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
     };
 
     TerminalControllerRuntime { state: Arc::clone(&state) }
-        .ensure_session("terminal-demo-work-coder", (&spec).into(), &[])
+        .ensure_session("terminal-demo-work-coder", &first_launch("terminal-demo-work-coder"), (&spec).into(), &[])
         .await
         .expect("launch");
 
@@ -902,6 +903,9 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"slow-credentials-test\"\n").expect("daemon identity");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let daemon = in_memory_daemon(Vec::new(), config.clone()).await;
+    let env_id = EnvironmentId::new("env-work");
+    // The live crew's launch, running before this start as the last run's controller left it.
+    create_credential_test_session(&runtime_terminals(&daemon), "live-crew", "credential-work-vessel", env_id.as_str());
     let runtime = DaemonRuntime::start_with_options(
         daemon.clone(),
         config.clone(),
@@ -937,7 +941,6 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
         runner.clone(),
         temp.path().to_path_buf(),
     ));
-    let env_id = EnvironmentId::new("env-work");
     daemon
         .register_provisioned_environment(
             env_id.clone(),
@@ -1005,7 +1008,6 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
         )
         .await
         .expect("placed vessel");
-    create_credential_test_session(&backend, "live-crew", "credential-work", "credential-work-vessel", env_id.as_str()).await;
     let state = Arc::new(
         ControllerRuntimeState::new(daemon.clone(), config, passthrough_registry(), None, "test-host".into(), "host-direct-test".into())
             .with_credential_store(store.clone()),

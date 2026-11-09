@@ -7,18 +7,17 @@ use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{CrewCommandContext, DaemonEvent, HostName, NodeId};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, TerminalAttention,
+    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, Vessel, VesselSpec,
 };
 use flotilla_store::ResourceBackend;
 
 use flotilla_state_machines::machines::agent_session::Activity;
 
 use super::support::{
-    agent_sessions, claim_crew, engine_at, resume_staging_fixture, stall_test_daemon, stall_test_session, stall_workflow_snapshot,
-    test_meta, wait_for_stall,
+    agent_sessions, claim_crew, engine_at, observe_attention, resume_staging_fixture, stall_test_daemon, stall_test_session,
+    stall_workflow_snapshot, test_meta, wait_for_stall,
 };
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
@@ -27,7 +26,7 @@ use flotilla_store_testkit::cr_name;
 
 #[tokio::test]
 async fn crew_fail_requires_operator_force() {
-    let (daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let (daemon, backend, _temp, watch, _engine) = stall_test_daemon().await;
     let error = daemon
         .crew_fail_internal(&CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() }, "blocked".into(), false, None)
         .await
@@ -98,7 +97,7 @@ async fn crew_fail_requires_operator_force() {
 
 #[tokio::test]
 async fn active_idle_crew_stalls_and_working_crew_clears() {
-    let (daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let (daemon, backend, _temp, watch, engine) = stall_test_daemon().await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created =
         convoys.create(&test_meta("idle-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
@@ -130,49 +129,20 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
         )
         .await
         .expect("active status");
-    let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("idle-session".into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "idle-crew".into()),
-                    (VESSEL_LABEL.into(), "work".into()),
-                    (ROLE_LABEL.into(), "coder".into()),
-                ]))
-                .build(),
-            &ResourceTerminalSessionSpec {
-                env_ref: "env".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Tool { command: "test".into() },
-                cwd: "/tmp".into(),
-                env: Default::default(),
-                pool: "test".into(),
-            },
-        )
-        .await
-        .expect("session");
     // The screen read Idle six seconds ago: quiet from a second ago, after the screen debounce,
     // so the three-second grace runs out two seconds from now.
     let idle_at = Utc::now() - chrono::Duration::seconds(6);
-    let idle = sessions
-        .update_status(
-            "idle-session",
-            &session.metadata.resource_version,
-            &ResourceTerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                attention: Some(TerminalAttention {
-                    state: TerminalAttentionState::Idle,
-                    as_of: idle_at,
-                    source: TerminalAttentionSource::Screen,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("idle attention");
+    let launch = stall_test_session(
+        &engine,
+        &backend,
+        "idle-crew",
+        "idle-session",
+        "coder",
+        TerminalAttention { state: TerminalAttentionState::Idle, as_of: idle_at, source: TerminalAttentionSource::Screen },
+    )
+    .await;
     let agents = agent_sessions(&daemon);
-    agents.observe_screen("idle-session", Activity::Idle, engine_at(idle_at)).expect("idle activity");
+    agents.observe_screen(&launch, Activity::Idle, engine_at(idle_at)).expect("idle activity");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(convoys.get("idle-crew").await.expect("convoy").status.expect("status").stalled.is_none());
     let status = wait_for_stall(&backend, "idle-crew", true).await;
@@ -206,18 +176,19 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     })
     .await
     .expect("stalled leaf fires");
-    let mut working = idle.status.expect("session status");
-    working.attention =
-        Some(TerminalAttention { state: TerminalAttentionState::Working, as_of: Utc::now(), source: TerminalAttentionSource::Screen });
-    sessions.update_status("idle-session", &idle.metadata.resource_version, &working).await.expect("working attention");
-    agents.observe_screen("idle-session", Activity::Working, engine_at(Utc::now())).expect("working activity");
+    observe_attention(
+        &engine,
+        &launch,
+        TerminalAttention { state: TerminalAttentionState::Working, as_of: Utc::now(), source: TerminalAttentionSource::Screen },
+    );
+    agents.observe_screen(&launch, Activity::Working, engine_at(Utc::now())).expect("working activity");
     assert!(wait_for_stall(&backend, "idle-crew", false).await.stalled.is_none());
     watch.abort();
 }
 
 #[tokio::test]
 async fn stale_working_attention_does_not_stall_crew() {
-    let (_daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let (_daemon, backend, _temp, watch, engine) = stall_test_daemon().await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created =
         convoys.create(&test_meta("stale-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
@@ -242,6 +213,7 @@ async fn stale_working_attention_does_not_stall_crew() {
         .await
         .expect("active status");
     stall_test_session(
+        &engine,
         &backend,
         "stale-crew",
         "stale-session",
@@ -260,7 +232,7 @@ async fn stale_working_attention_does_not_stall_crew() {
 
 #[tokio::test]
 async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
-    let (daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let (daemon, backend, _temp, watch, engine) = stall_test_daemon().await;
     let repository = flotilla_resources::RepositoryKey("repo".into());
     let spec = ConvoySpec::builder()
         .workflow_ref("test".into())
@@ -345,6 +317,7 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
         .await
         .expect("fresh observation");
     stall_test_session(
+        &engine,
         &backend,
         "landed-claim",
         "idle-landing-session",
@@ -359,7 +332,7 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
 
 #[tokio::test]
 async fn landing_without_armed_exit_rows_stalls() {
-    let (_daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let (_daemon, backend, _temp, watch, _engine) = stall_test_daemon().await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created =
         convoys.create(&test_meta("unarmed-landing"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
@@ -393,7 +366,7 @@ async fn landing_without_armed_exit_rows_stalls() {
 // then attributes unrecovered evidence to observer lag after its deadline.
 async fn stale_change_request_observation_stalls_landing_convoy() {
     let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(Utc::now()));
-    let (daemon, backend, _temp, watch) = super::support::stall_test_daemon_with_clock(clock.clone()).await;
+    let (daemon, backend, _temp, watch, _engine) = super::support::stall_test_daemon_with_clock(clock.clone()).await;
     let repository = flotilla_resources::RepositoryKey("repo".into());
     let spec = ConvoySpec::builder()
         .workflow_ref("test".into())
@@ -493,7 +466,7 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
 #[tokio::test]
 async fn idle_standing_role_without_obligation_never_stalls_convoy() {
     let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(Utc::now()));
-    let (daemon, backend, _temp, watch) = super::support::stall_test_daemon_with_clock(clock.clone()).await;
+    let (daemon, backend, _temp, watch, engine) = super::support::stall_test_daemon_with_clock(clock.clone()).await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys.create(&test_meta("standing"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
     convoys
@@ -519,46 +492,19 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
         )
         .await
         .expect("active status");
-    let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-    for (name, role, state) in [("governor-session", "governor", TerminalAttentionState::Idle)] {
-        let session = sessions
-            .create(
-                &InputMeta::builder()
-                    .name(name.into())
-                    .labels(BTreeMap::from([
-                        (CONVOY_LABEL.into(), "standing".into()),
-                        (VESSEL_LABEL.into(), "work".into()),
-                        (ROLE_LABEL.into(), role.into()),
-                    ]))
-                    .build(),
-                &ResourceTerminalSessionSpec {
-                    env_ref: "env".into(),
-                    role: role.into(),
-                    source: TerminalSessionSource::Tool { command: "test".into() },
-                    cwd: "/tmp".into(),
-                    env: Default::default(),
-                    pool: "test".into(),
-                },
-            )
-            .await
-            .expect("session");
-        sessions
-            .update_status(
-                name,
-                &session.metadata.resource_version,
-                &ResourceTerminalSessionStatus {
-                    phase: ResourceTerminalSessionPhase::Running,
-                    attention: Some(TerminalAttention {
-                        state,
-                        as_of: Utc::now() - chrono::Duration::seconds(10),
-                        source: TerminalAttentionSource::Screen,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("attention");
-    }
+    stall_test_session(
+        &engine,
+        &backend,
+        "standing",
+        "governor-session",
+        "governor",
+        TerminalAttention {
+            state: TerminalAttentionState::Idle,
+            as_of: Utc::now() - chrono::Duration::seconds(10),
+            source: TerminalAttentionSource::Screen,
+        },
+    )
+    .await;
     daemon.reconcile_crew_stalls_once("flotilla").await.expect("initial judgement");
     clock.advance(chrono::Duration::hours(1));
     daemon.reconcile_crew_stalls_once("flotilla").await.expect("past idle grace");
@@ -636,18 +582,10 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
         let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
         let session = sessions.get("resume-staging-session").await.expect("session");
         let original_cwd = session.spec.cwd.clone();
-        sessions
-            .update_status(
-                &session.metadata.name,
-                &session.metadata.resource_version,
-                &ResourceTerminalSessionStatus {
-                    phase: ResourceTerminalSessionPhase::Stopped,
-                    inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("agent exited");
+        let terminals = &probe.engine.terminals;
+        let exited = terminals.record("resume-staging-session").name;
+        terminals.ready(&exited, "resume-staging-pool-session", &Default::default());
+        terminals.exited(&exited, "exit 0");
         daemon
             .convoy_resume_internal(
                 "flotilla",
@@ -662,7 +600,7 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
         let session = sessions.get("resume-staging-session").await.expect("same session");
         assert_eq!(session.spec.cwd, original_cwd);
         assert_eq!(session.status.expect("session status").phase, ResourceTerminalSessionPhase::Starting);
-        assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
+        assert_ne!(terminals.record("resume-staging-session").name, exited, "the resume starts the session's next launch");
         assert!(backend
             .using::<flotilla_resources::Message>("flotilla")
             .list()
@@ -683,7 +621,7 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
 async fn promise_retractions_and_named_completion_advisory() {
     use flotilla_protocol::commands::CrewPromiseOperation;
     use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState};
-    let (daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let (daemon, backend, _temp, watch, _engine) = stall_test_daemon().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let created = convoys.create(&test_meta("promise-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.unwrap();
     let mut status = ConvoyStatus {

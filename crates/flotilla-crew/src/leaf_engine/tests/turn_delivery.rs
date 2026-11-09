@@ -218,6 +218,7 @@ async fn silent_working_turn_reaches_supervision() {
         .create(
             &InputMeta::builder()
                 .name("governor-session".into())
+                .annotations(launch_annotations("governor-session"))
                 .labels(BTreeMap::from([
                     (CONVOY_LABEL.into(), "governor".into()),
                     (VESSEL_LABEL.into(), "govern".into()),

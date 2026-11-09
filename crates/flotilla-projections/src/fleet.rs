@@ -196,11 +196,6 @@ impl FleetService {
 
         let session_list =
             backend.including_replicas::<ResourceTerminalSession>(namespace).list().await.map_err(|err| err.to_string())?.items;
-        let session_list = if let Some(reads) = backend.terminal_readings() {
-            flotilla_store::read_terminal_sources(reads, session_list).await.map_err(|error| error.to_string())?
-        } else {
-            session_list
-        };
         let host_sources = backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|err| err.to_string())?;
         let result_sets = vec![self.aggregator_projection_state.result_set().await];
         let placement_by_convoy = result_sets
@@ -276,8 +271,9 @@ impl FleetService {
                 None => role.clone(),
             };
             let origin = remote_origin.map(|(origin_root, _)| origin_root.as_str());
-            let agent = match lifecycles.agent_sessions().and_then(|reads| reads.read(&session.metadata.name, origin)) {
-                Ok(agent) => agent,
+            let launch = flotilla_resources::terminal_records::launch_of(&session);
+            let agent = match launch.map(|launch| lifecycles.agent_sessions().and_then(|reads| reads.read(launch, origin))).transpose() {
+                Ok(agent) => agent.flatten(),
                 Err(error) => {
                     debug!(session = %session.metadata.name, %error, "fleet row shows no agent activity");
                     None

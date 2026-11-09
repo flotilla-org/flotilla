@@ -37,15 +37,6 @@ pub trait LifecycleReads: Send + Sync {
         origin: Option<&str>,
     ) -> Result<Option<flotilla_protocol::LifecycleReading>, String>;
 
-    /// Current launch identity alongside its checked judgement. Adapters serving terminal
-    /// lifecycles must provide the key; synthesising one could restart the wrong launch.
-    fn try_terminal_launch(&self, name: &str, origin: Option<&str>) -> Result<Option<crate::terminal_launches::TerminalLaunch>, String> {
-        match self.try_reading(ProvisioningKind::TerminalSession, name, origin)? {
-            None => Ok(None),
-            Some(_) => Err("terminal lifecycle reader does not provide launch identity".into()),
-        }
-    }
-
     /// The engine's environments (#3108): every environment reader and requester goes through
     /// them. Unavailable where no engine is installed.
     fn environments(&self) -> Result<&dyn crate::environment_records::EnvironmentRecords, String> {
@@ -128,10 +119,6 @@ impl LateLifecycleReads {
 impl LifecycleReads for LateLifecycleReads {
     fn is_disabled(&self) -> bool {
         self.installed.get().is_none_or(|reads| reads.is_disabled())
-    }
-
-    fn try_terminal_launch(&self, name: &str, origin: Option<&str>) -> Result<Option<crate::terminal_launches::TerminalLaunch>, String> {
-        self.installed.get().map_or(Ok(None), |reads| reads.try_terminal_launch(name, origin))
     }
 
     fn environments(&self) -> Result<&dyn crate::environment_records::EnvironmentRecords, String> {

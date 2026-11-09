@@ -282,10 +282,6 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
     }
     let (inbound_peer_tx, inbound_peer_rx) = mpsc::channel(256);
     let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
-    {
-        let router = remote_command_router.clone();
-        tokio::spawn(async move { router.resume_pending_crew_completions().await });
-    }
     let (handle, _peer_connected_tx) = spawn_peer_networking_runtime(
         daemon,
         peer_manager,
@@ -683,11 +679,6 @@ impl DaemonServer {
         let remote_command_router = self.remote_command_router;
         let peer_resource_socket_dir = self.peer_resource_socket_dir;
         let http_router = self.http_router;
-
-        // This only reads local pending records and registers asynchronous retry
-        // workers. Keep the snapshot before admission so replay cannot replace a
-        // newer client retry with stale completion data.
-        phase("resume_pending_crew_completions", remote_command_router.resume_pending_crew_completions()).await;
 
         let idle_client_count = Arc::clone(&client_count);
         let idle_shutdown_request_tx = shutdown_request_tx.clone();

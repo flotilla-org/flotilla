@@ -122,7 +122,8 @@ pub struct TerminalSessionTarget<'a> {
     pub vessel_ref: Option<&'a str>,
     /// Actual running harness, which can differ from a newly resolved selector.
     pub harness: Option<&'a str>,
-    /// The TerminalSession record's name, which also names its AgentSession; absent for a bare spec.
+    /// The launch the session's read view shows, which also names its AgentSession; absent for a
+    /// bare spec.
     pub record: Option<&'a str>,
 }
 
@@ -142,7 +143,7 @@ impl<'a> From<&'a ResourceObject<TerminalSession>> for TerminalSessionTarget<'a>
     fn from(session: &'a ResourceObject<TerminalSession>) -> Self {
         let mut target = Self::from(&session.spec);
         target.harness = session.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str());
-        target.record = Some(session.metadata.name.as_str());
+        target.record = crate::terminal_records::launch_of(session);
         if matches!(session.spec.source, TerminalSessionSource::Tool { .. }) {
             target.vessel_ref = session.metadata.labels.get(VESSEL_REF_LABEL).map(String::as_str).filter(|value| !value.is_empty());
         }

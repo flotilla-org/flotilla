@@ -1913,11 +1913,14 @@ impl Aggregator {
         }
     }
 
-    /// The convoys with a crew member running in the TerminalSession that `key` names.
+    /// The convoys with a crew member running in the launch that `key` names.
     fn convoys_running_in(&self, key: &AgentSessionKey) -> Vec<ConvoyKey> {
         self.terminal_sessions
             .values()
-            .filter(|session| session.object.metadata.name == key.name && self.agent_session_home_of(session).as_ref() == Some(&key.home))
+            .filter(|session| {
+                flotilla_resources::terminal_records::launch_of(&session.object) == Some(key.name.as_str())
+                    && self.agent_session_home_of(session).as_ref() == Some(&key.home)
+            })
             .filter_map(|session| {
                 Some((session.object.metadata.namespace.clone(), session.object.metadata.labels.get(CONVOY_LABEL)?.clone()))
             })
@@ -1934,13 +1937,14 @@ impl Aggregator {
     }
 
     /// The AgentSession of the crew member running in `session`, the one its home holds under the
-    /// TerminalSession record's name, as this home reads it at `now`: this home's own are always
+    /// launch the session's view shows, as this home reads it at `now`: this home's own are always
     /// current, another home's while that home is heard from.
     fn agent_view(&self, session: &ReadResourceObject<TerminalSession>, now: chrono::DateTime<chrono::Utc>) -> Option<AgentActivityView> {
         let home = self.agent_session_home_of(session)?;
         let current = Some(&home) == self.agent_session_home.as_ref()
             || agent_activity::home_current(self.agent_session_heard.get(&home).copied(), now);
-        let reading = self.agent_sessions.get(&AgentSessionKey { home, name: session.object.metadata.name.clone() })?.clone();
+        let name = flotilla_resources::terminal_records::launch_of(&session.object)?.to_owned();
+        let reading = self.agent_sessions.get(&AgentSessionKey { home, name })?.clone();
         Some(AgentActivityView { reading, current, progress: None })
     }
 
@@ -2247,7 +2251,6 @@ impl Aggregator {
             .terminal_sessions
             .iter()
             .filter_map(|(key, session)| {
-                let session = self.terminal_view(session)?;
                 let status = session.object.status.as_ref()?;
                 if status.phase != TerminalSessionPhase::Running {
                     return None;
@@ -2398,7 +2401,7 @@ impl Aggregator {
         let attention = sessions
             .into_iter()
             .flat_map(|source| {
-                let Some(session) = self.terminal_view(source) else { return Vec::new() };
+                let session = source;
                 let Some(session_host) = self.read_host(&session.provenance) else { return Vec::new() };
                 let session = &session.object;
                 let Some(convoy) = session.metadata.labels.get(CONVOY_LABEL) else { return Vec::new() };
@@ -2545,10 +2548,9 @@ impl Aggregator {
         session: &ReadResourceObject<TerminalSession>,
         attachable_sessions: &HashSet<SessionKey>,
     ) -> Option<IndependentRow> {
-        let session = self.terminal_view(session)?;
-        let resource = self.terminal_session_ref(&session)?;
+        let resource = self.terminal_session_ref(session)?;
         let host = resource.host.clone().expect("terminal session read reference is host-qualified");
-        let key = session_key(&session);
+        let key = session_key(session);
         let session = &session.object;
         if !is_independent_session(session) {
             return None;
@@ -2652,21 +2654,8 @@ impl Aggregator {
         }
     }
 
-    /// Whether a terminal session is running: behind `[primitives]` the engine's reading of its
-    /// current launch (#3629 layer 8), else its old phase.
-    fn terminal_view(&self, source: &ReadResourceObject<TerminalSession>) -> Option<ReadResourceObject<TerminalSession>> {
-        match flotilla_resources::terminal_launches::read_source(self.lifecycle_reads.as_ref(), source) {
-            Ok((selected, _)) => Some(selected),
-            Err(error) => {
-                tracing::warn!(resource = %source.object.metadata.name, %error, "terminal lifecycle view unavailable");
-                None
-            }
-        }
-    }
-
     fn session_running(&self, session: &ReadResourceObject<TerminalSession>) -> bool {
-        self.terminal_view(session)
-            .is_some_and(|session| session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running))
+        session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running)
     }
 
     pub(super) fn vessel_phase_from_reading(
@@ -3034,10 +3023,7 @@ impl Aggregator {
                 }
             })
             .collect();
-        let selected_sessions = self
-            .convoy_sessions(&convoy_ref.namespace, &convoy_ref.name)
-            .filter_map(|source| self.terminal_view(source))
-            .collect::<Vec<_>>();
+        let selected_sessions = self.convoy_sessions(&convoy_ref.namespace, &convoy_ref.name).cloned().collect::<Vec<_>>();
         let matching_sessions = || {
             selected_sessions.iter().filter(|session| {
                 session.object.metadata.namespace == convoy_ref.namespace
@@ -3388,8 +3374,14 @@ mod tests {
     /// This aggregator's own home, once a test has an agent report on it.
     const OWN_HOME: &str = "local-node-id";
 
-    /// The crew in TerminalSession `session` reports `activity` on its AgentSession at `home`
-    /// (`None`: this home), as the decided store's follow delivers it.
+    /// The launch a test session's view shows: its first. Its AgentSession is named by it.
+    fn test_launch(session: &str) -> String {
+        format!("{session}#1")
+    }
+
+    /// The crew in TerminalSession `session` reports `activity` on its AgentSession, named by the
+    /// session's [`test_launch`], at `home` (`None`: this home), as the decided store's follow
+    /// delivers it.
     async fn agent_reports(
         aggregator: &mut Aggregator,
         home: Option<&str>,
@@ -3407,7 +3399,10 @@ mod tests {
             stale: false,
         };
         aggregator
-            .agent_sessions_changed(AgentSessionUpdate::Changed(vec![(AgentSessionKey { home, name: session.into() }, Some(reading))]))
+            .agent_sessions_changed(AgentSessionUpdate::Changed(vec![(
+                AgentSessionKey { home, name: test_launch(session) },
+                Some(reading),
+            )]))
             .await;
     }
 
@@ -5260,7 +5255,10 @@ mod tests {
         let resolver = backend.using::<TerminalSession>("flotilla");
         let created = resolver
             .create(
-                &InputMeta::builder().name(name.to_string()).build(),
+                &InputMeta::builder()
+                    .name(name.to_string())
+                    .annotations(BTreeMap::from([(flotilla_resources::terminal_records::LAUNCH_ANNOTATION.to_string(), test_launch(name))]))
+                    .build(),
                 &TerminalSessionSpec::builder()
                     .env_ref("local".to_string())
                     .role("observer".to_string())
@@ -7095,15 +7093,6 @@ mod tests {
     }
 
     impl crate::ports::LifecycleReads for ScriptedReadings {
-        fn try_terminal_launch(
-            &self,
-            name: &str,
-            origin: Option<&str>,
-        ) -> Result<Option<flotilla_resources::terminal_launches::TerminalLaunch>, String> {
-            self.try_reading(crate::ports::ProvisioningKind::TerminalSession, name, origin).map(|reading| {
-                reading.map(|reading| flotilla_resources::terminal_launches::TerminalLaunch { name: format!("{name}#1"), reading })
-            })
-        }
         fn reading(
             &self,
             kind: crate::ports::ProvisioningKind,
@@ -7367,77 +7356,6 @@ mod tests {
         );
         let reads = reads.reads.lock().expect("reads").clone();
         assert!(reads.contains(&(ProvisioningKind::Clone, "ops-clone".into(), Some("kiwi".into()))), "{reads:?}");
-    }
-
-    // Behaviour (#3629 layer 8): behind `[primitives]` a session materializes its vessel only while
-    // the engine reads its current launch as running; an ended launch is not, whatever its old
-    // phase says. Without a reading the old phase decides.
-    #[tokio::test]
-    async fn the_engine_reading_decides_whether_a_session_runs() {
-        use flotilla_protocol::LifecycleReading;
-        use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatus};
-
-        use crate::ports::ProvisioningKind;
-        let reads = Arc::new(ScriptedReadings::default());
-        let (events, _) = broadcast::channel(8);
-        let aggregator =
-            Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads.clone());
-        let mut session = session_object("terminal-ops-coder").await;
-        session.status = Some(TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() });
-        let session = ReadResourceObject { object: session, provenance: ResourceProvenance::Local };
-        assert!(aggregator.session_running(&session), "no reading: the old phase");
-        reads.set(ProvisioningKind::TerminalSession, "terminal-ops-coder", Some(LifecycleReading::Released));
-        assert!(!aggregator.session_running(&session), "its launch ended");
-        reads.set(ProvisioningKind::TerminalSession, "terminal-ops-coder", Some(LifecycleReading::Ready { identity: "s2".into() }));
-        assert!(aggregator.session_running(&session));
-    }
-
-    // The same SQLite view contract serves local and foreign-origin rows without status copies.
-    #[tokio::test]
-    async fn terminal_views_use_engine_identity_latest_launch_and_ending() {
-        use flotilla_provisioning_testkit::{terminal_session, Ending, TerminalFixture};
-        for replica in [false, true] {
-            let fixture = TerminalFixture::new(replica);
-            let obj = terminal_session(TerminalSessionPhase::Running);
-            fixture.request(&obj);
-            let (events, _) = broadcast::channel(8);
-            let aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("reader"), events)
-                .with_lifecycle_reads(fixture.reads.clone());
-            let source = ReadResourceObject {
-                object: obj.clone(),
-                provenance: if replica {
-                    ResourceProvenance::Replica {
-                        origin_root: flotilla_protocol::NodeId::new("home"),
-                        last_synced_at: chrono::DateTime::UNIX_EPOCH,
-                    }
-                } else {
-                    ResourceProvenance::Local
-                },
-            };
-            assert!(!aggregator.session_running(&source));
-            fixture.finish(&obj, Ending::Ready("engine identity"));
-            let selected = aggregator.terminal_view(&source).expect("view");
-            assert_eq!(selected.object.status.expect("status").session_id.as_deref(), Some("engine identity"));
-            assert!(aggregator.session_running(&source));
-            fixture.finish(&obj, Ending::Released);
-            assert_eq!(
-                aggregator.terminal_view(&source).expect("view").object.status.expect("status").phase,
-                TerminalSessionPhase::Stopped
-            );
-            let first = fixture.name(&obj);
-            assert_ne!(fixture.replace(&obj, &first).expect("replacement"), first);
-            assert_eq!(
-                aggregator.terminal_view(&source).expect("view").object.status.expect("status").phase,
-                TerminalSessionPhase::Starting
-            );
-            fixture.finish(&obj, Ending::Failed("engine ending reason"));
-            let selected = aggregator.terminal_view(&source).expect("view").object.status.expect("status");
-            assert_eq!(selected.phase, TerminalSessionPhase::Failed);
-            assert!(selected.message.expect("reason").contains("engine ending reason"));
-            assert_eq!(obj.status.as_ref().expect("raw").phase, TerminalSessionPhase::Running);
-            fixture.poison();
-            assert!(aggregator.terminal_view(&source).is_none(), "read errors never select stale Running");
-        }
     }
 
     // Engine readings decide readiness despite stale lifecycle phase/message; interrupted roles remain observations.

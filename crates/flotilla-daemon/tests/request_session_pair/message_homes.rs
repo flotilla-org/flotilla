@@ -10,10 +10,9 @@ use flotilla_core::{in_process::InProcessDaemon, primitives::MessagePrimitives};
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
-    Convoy, ConvoySpec, CrewSessionStatus, FleetDesignation, FleetDesignationSpec, Host, InputMeta, MessageExpectation, MessageReference,
-    MessageRelation, MessageSpec, Project, ProjectSpec, Resource, ResourceProvenance, Selector, SystemClock, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, CONVOY_LABEL,
-    FLEET_DESIGNATION_NAME, ROLE_LABEL, VESSEL_LABEL,
+    Convoy, ConvoySpec, FleetDesignation, FleetDesignationSpec, Host, InputMeta, MessageExpectation, MessageReference, MessageRelation,
+    MessageSpec, Project, ProjectSpec, Resource, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, FLEET_DESIGNATION_NAME,
 };
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::{Follower, Service};
@@ -174,28 +173,61 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     // Convoy X, the subject, is homed at A; the crew it asks about lives at B.
     let convoy = |project: &str| ConvoySpec::builder().workflow_ref("w".into()).project_ref(project.into()).build();
     a.resource_backend().using::<Convoy>(NS).create(&InputMeta::builder().name("subject-x".into()).build(), &convoy(NS)).await.expect("X");
-    b.resource_backend().using::<Convoy>(NS).create(&InputMeta::builder().name("crew-b".into()).build(), &convoy(NS)).await.expect("crew");
-    let sessions = b.resource_backend().using::<TerminalSession>(NS);
-    let labels =
-        BTreeMap::from([(CONVOY_LABEL.into(), "crew-b".into()), (VESSEL_LABEL.into(), "work".into()), (ROLE_LABEL.into(), "coder".into())]);
-    let session = sessions
-        .create(&InputMeta::builder().name("crew-b-session".into()).labels(labels).build(), &crew_session("crew-b"))
+    let crew = b
+        .resource_backend()
+        .using::<Convoy>(NS)
+        .create(&InputMeta::builder().name("crew-b".into()).build(), &convoy(NS))
         .await
-        .expect("crew session");
-    sessions
+        .expect("crew");
+    // The crew convoy's frozen workflow names the vessel holding its coder, for homes that do not
+    // follow B's terminal launches.
+    b.resource_backend()
+        .using::<Convoy>(NS)
         .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: flotilla_resources::TerminalSessionPhase::Running,
-                session_id: Some("sess-b".into()),
-                crew: Some(CrewSessionStatus { id: "crew-b-id".into(), adapter: "codex".into(), model: None, stance: "coder".into() }),
+            "crew-b",
+            &crew.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus {
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    vessels: vec![flotilla_resources::VesselRequirement::builder()
+                        .name("work".into())
+                        .crew(vec![flotilla_resources::CrewSpec::builder()
+                            .role("coder".into())
+                            .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
+                            .build()])
+                        .build()],
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                }),
                 ..Default::default()
             },
         )
         .await
-        .expect("running");
-    // The old-store replicas each router reads to find a home.
+        .expect("crew workflow");
+    // The crew's session is B's engine launch, held for its vessel.
+    b.resource_backend()
+        .using::<Vessel>(NS)
+        .create(
+            &InputMeta::builder().name("work".into()).build(),
+            &VesselSpec {
+                convoy_ref: "crew-b".into(),
+                vessel_name: "work".into(),
+                fulfilment_kind_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("crew vessel");
+    let terminals = &flotilla_daemon_testkit::engine::engine(b).terminals;
+    let launch = terminals.request(&flotilla_daemon_testkit::engine::session_request("crew-b-session", &crew_session("crew-b")));
+    let facts = flotilla_resources::terminal_records::TerminalLaunchFacts {
+        agent: Some(flotilla_resources::terminal_records::AgentLaunch { adapter: "codex".into(), model: None, stance: "coder".into() }),
+        ..Default::default()
+    };
+    terminals.ready(&launch, "sess-b", &facts);
+    // The old-store replicas each router reads to find a home: the convoys, and the holder vessels.
     let replicate = |from: &Arc<InProcessDaemon>, to: &Arc<InProcessDaemon>| {
         let (from, to) = (Arc::clone(from), Arc::clone(to));
         async move {
@@ -205,10 +237,10 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
                 .await
                 .expect("convoy replica");
             to.resource_backend()
-                .replica_writer::<TerminalSession>(from.node_id().clone(), NS)
-                .replace(&from.resource_backend().using::<TerminalSession>(NS).list().await.expect("sessions"), Utc::now())
+                .replica_writer::<Vessel>(from.node_id().clone(), NS)
+                .replace(&from.resource_backend().using::<Vessel>(NS).list().await.expect("vessels"), Utc::now())
                 .await
-                .expect("session replica");
+                .expect("vessel replica");
         }
     };
     replicate(b, a).await;
@@ -235,7 +267,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     assert!(homed(&engine_a, &request).is_none(), "the sender's home authors nothing");
 
     // B delivers it to the crew's AgentSession, receipt first.
-    let consumer = engine_b.register("crew-b-session", Timestamp(1)).await.expect("consumer");
+    let consumer = engine_b.register(&launch, Timestamp(1)).await.expect("consumer");
     let inbox_b = engine_b.inbox();
     inbox_b.bind(sent.spec().inbox.clone(), consumer.clone()).await.expect("bind");
     use futures::StreamExt;

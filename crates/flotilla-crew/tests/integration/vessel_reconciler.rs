@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use common::{
     create_convoy_with_single_task, create_docker_kind, create_host_direct_kind, create_kind, create_ready_checkout, create_ready_clone,
-    create_ready_docker_environment, create_ready_host_direct_environment, create_stopped_terminal, create_workspace, labeled_meta, meta,
-    vessel_meta, work_state, DockerKindFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
+    create_ready_docker_environment, create_ready_host_direct_environment, create_workspace, meta, vessel_meta, work_state,
+    DockerKindFixture, ReadyCheckoutFixture,
 };
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
@@ -21,11 +21,10 @@ use flotilla_resources::{
     canonicalize_repo_url, clone_key, interactive_single_workflow_spec, Artifact, ArtifactSpec, BoundChangeRequest, CheckoutSpec,
     CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
     ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DockerEnvironmentSpec, DockerImagePullPolicy,
-    EnvironmentSpec, ExitDeclaration, FulfilmentKindSpec, FulfilmentRealisation, InnerCommandStatus, InputMeta, IssueSnapshot,
-    ObservedCheckoutSpec, Repository, RepositorySpec, ResourceError, Selector, Stance, StatusPatch, TerminalBrief, TerminalCrewContext,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase,
-    VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
-    CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    EnvironmentSpec, ExitDeclaration, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, IssueSnapshot, ObservedCheckoutSpec,
+    Repository, RepositorySpec, ResourceError, Selector, Stance, StatusPatch, Vessel, VesselPhase, VesselRequirement, VesselSpec,
+    VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
@@ -38,6 +37,7 @@ use tokio::time::Duration;
 use crate::common;
 use flotilla_provisioning_testkit::{Ending, VesselFixture};
 use flotilla_resources::checkout_records::{latest_launches, CheckoutHolder, CheckoutRecord, CheckoutRecords as _};
+use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecord, TerminalRecords as _};
 
 const NAMESPACE: &str = "flotilla";
 const REPO_URL: &str = "https://github.com/flotilla-org/flotilla.git";
@@ -231,13 +231,13 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
 
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
-    let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
+    reconciler.reconcile(&vessel, &deps, Utc::now());
 
     assert!(requested_checkouts(lease_engine).is_empty(), "a repositoryless vessel requests no checkout");
     assert!(requested_clones(lease_engine).is_empty(), "a repositoryless vessel requests no clone");
-    assert!(outcome.actuations.iter().any(|actuation| {
-        matches!(actuation, Actuation::CreateTerminalSession { spec, .. }
-            if spec.cwd == "/Users/alice/dev/flotilla-repos" && spec.source == TerminalSessionSource::Tool { command: "bash".to_string() })
+    assert!(requested_terminals(lease_engine).iter().any(|terminal| {
+        terminal.cwd == "/Users/alice/dev/flotilla-repos"
+            && matches!(&terminal.source, TerminalLaunchSource::Tool { command } if command == "bash")
     }));
 }
 
@@ -281,8 +281,7 @@ async fn ready_vessel_records_requested_and_effective_stance() {
             .build(),
     );
     create_running_terminal(
-        &backend,
-        NAMESPACE,
+        lease_engine,
         "terminal-workspace-stance-coder",
         &host_direct_env_name(),
         "coder",
@@ -643,13 +642,13 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
 
     let current = backend.clone().using::<Vessel>(NAMESPACE).get("workspace-multi").await.expect("vessel should exist");
     let deps = reconciler.prepare(&current).await.expect("deps should reload");
-    let outcome = reconciler.reconcile(&current, &deps, Utc::now());
-    assert!(outcome.actuations.iter().any(|actuation| {
+    reconciler.reconcile(&current, &deps, Utc::now());
+    assert!(requested_terminals(lease_engine).iter().any(|terminal| {
         matches!(
-            actuation,
-            Actuation::CreateTerminalSession { spec, .. }
-                if spec.cwd == "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi"
-                    && matches!(&spec.source, TerminalSessionSource::Agent { brief, .. }
+            terminal,
+            TerminalRecord { cwd, source, .. }
+                if cwd == "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi"
+                    && matches!(source, TerminalLaunchSource::Agent { brief, .. }
                         if brief.path == ".flotilla/briefs/coder.md"
                             && brief.copies == [
                                 "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/cleat",
@@ -664,17 +663,8 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         )
     }));
 
-    create_running_terminal(
-        &backend,
-        NAMESPACE,
-        "terminal-workspace-multi-coder",
-        &host_direct_env_name(),
-        "coder",
-        "cargo test",
-        "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi",
-        "cleat",
-    )
-    .await;
+    let coder = requested_terminal(lease_engine, "coder").expect("coder requested");
+    lease_engine.terminals.ready(&coder.name, "session-coder", &Default::default());
     let current = backend.clone().using::<Vessel>(NAMESPACE).get("workspace-multi").await.expect("vessel should exist");
     let deps = reconciler.prepare(&current).await.expect("deps should reload");
     let outcome = reconciler.reconcile(&current, &deps, Utc::now());
@@ -882,46 +872,19 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     put_checkouts(legacy_engine);
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, legacy_engine);
     let environment = create_ready_docker_environment(&legacy_engine.environments, "env-workspace-multi-docker", legacy);
-    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
-    let session = sessions
-        .create(
-            &meta("existing-crew"),
-            &TerminalSessionSpec {
-                env_ref: environment.name.clone(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Tool { command: "codex".into() },
-                cwd: "/workspace".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
-            },
-        )
-        .await
-        .expect("running crew");
-    let session = sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus { phase: TerminalSessionPhase::Running, session_id: Some("running-crew".into()), ..Default::default() },
-        )
-        .await
-        .expect("running status");
+    create_running_terminal(legacy_engine, "existing-crew", &environment.name, "coder", "codex", "/workspace", "cleat").await;
+    let session = requested_terminal(legacy_engine, "coder").expect("running crew");
     let mut running = vessel.clone();
     running.status = Some(VesselStatus {
         phase: VesselPhase::Ready,
         environment_ref: Some(environment.name.clone()),
-        terminal_session_refs: vec![session.metadata.name.clone()],
+        terminal_session_refs: vec![session.session_name().to_owned()],
         ..Default::default()
     });
     let before = running.status.clone().expect("ready status");
     let prepared = reconciler.prepare(&running).await.expect("legacy rollout");
     let rollout = reconciler.reconcile(&running, &prepared, Utc::now());
-    assert!(
-        rollout.actuations.iter().all(|actuation| !matches!(
-            actuation,
-            Actuation::CreateTerminalSession { .. } | Actuation::RestartTerminalSession { .. } | Actuation::DeleteTerminalSession { .. }
-        )),
-        "rollout must not interrupt or launch crews"
-    );
+    assert_eq!(requested_terminals(legacy_engine), vec![session.clone()], "rollout must not interrupt or launch crews");
     rollout.patch.expect("visible recreation message").apply(running.status.as_mut().expect("ready status"));
     let after = running.status.as_ref().expect("ready status");
     assert_eq!(after.phase, VesselPhase::Ready);
@@ -931,7 +894,6 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         .message
         .as_deref()
         .is_some_and(|message| message.contains("stop crews and recreate") && message.contains("environment env-workspace-multi-docker")));
-    assert_eq!(sessions.get(&session.metadata.name).await.expect("existing crew").status, session.status);
 
     let mut stale = docker.clone();
     stale.mounts.pop();
@@ -943,10 +905,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     create_ready_docker_environment(&stale_engine.environments, "env-workspace-multi-docker", stale);
     let deps = reconciler.prepare(&vessel).await.expect("stale environment");
     let blocked = reconciler.reconcile(&vessel, &deps, Utc::now());
-    assert!(
-        blocked.actuations.iter().all(|actuation| !matches!(actuation, Actuation::CreateTerminalSession { .. })),
-        "stale overlays must not launch crews"
-    );
+    assert!(requested_terminals(stale_engine).is_empty(), "stale overlays must not launch crews");
     assert!(
         matches!(blocked.patch, Some(flotilla_resources::VesselStatusPatch::MarkProvisioning { ref message, .. }) if message.as_deref().is_some_and(|message| message.contains("recreate the environment")))
     );
@@ -964,11 +923,8 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, reordered_engine);
     create_ready_docker_environment(&reordered_engine.environments, "env-workspace-multi-docker", reordered);
     let deps = reconciler.prepare(&vessel).await.expect("matching membership");
-    let unblocked = reconciler.reconcile(&vessel, &deps, Utc::now());
-    assert!(
-        unblocked.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateTerminalSession { .. })),
-        "matching overlays allow crew launch"
-    );
+    reconciler.reconcile(&vessel, &deps, Utc::now());
+    assert!(!requested_terminals(reordered_engine).is_empty(), "matching overlays allow crew launch");
 
     let mixed = backend
         .clone()
@@ -1177,8 +1133,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
         docker_worktree_environment("workspace-docker-stance", Default::default()),
     );
     create_running_terminal(
-        &backend,
-        NAMESPACE,
+        lease_engine,
         "terminal-workspace-docker-stance-coder",
         environment_ref,
         "coder",
@@ -1363,14 +1318,11 @@ async fn a_cloud_vessel_clones_below_the_workspace_root_and_crews_run_at_the_rec
             .build(),
     );
     let outcome = reconcile(&vessel).await;
-    let cwd = outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateTerminalSession { spec, .. } => Some(spec.cwd.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("a terminal session should be created: {:?}", outcome.patch));
+    let cwd = requested_terminals(lease_engine)
+        .into_iter()
+        .map(|terminal| terminal.cwd)
+        .next()
+        .unwrap_or_else(|| panic!("a terminal session should be requested: {:?}", outcome.patch));
     assert_eq!(cwd, "/vessels");
 }
 
@@ -1887,20 +1839,18 @@ async fn child_failure_propagates_to_workspace_failure() {
             )))
             .build(),
     );
-    create_stopped_terminal(
-        &backend,
-        NAMESPACE,
-        StoppedTerminalFixture::builder()
-            .name("terminal-workspace-f-coder".to_string())
-            .env_ref(host_direct_env_name())
-            .role("coder".to_string())
-            .command("cargo test".to_string())
-            .cwd("/workspace".to_string())
-            .pool("cleat".to_string())
-            .message("boom".to_string())
-            .build(),
-    )
-    .await;
+    let stopped = lease_engine.terminals.request(&flotilla_resources::terminal_records::TerminalLaunchRequest {
+        session: "terminal-workspace-f-coder".to_string(),
+        environment: host_direct_env_name(),
+        vessel: Some("workspace-f".to_string()),
+        role: "coder".to_string(),
+        pool: "cleat".to_string(),
+        cwd: "/workspace".to_string(),
+        env: Default::default(),
+        source: flotilla_resources::terminal_records::TerminalLaunchSource::Tool { command: "cargo test".to_string() },
+    });
+    lease_engine.terminals.ready(&stopped, "session-terminal-workspace-f-coder", &Default::default());
+    lease_engine.terminals.failed(&stopped, "boom");
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-f", "convoy-f", "implement", "policy-f", REPO_URL).await;
 
     let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
@@ -1920,7 +1870,6 @@ async fn child_failure_propagates_to_workspace_failure() {
 async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_restart(
     #[case] work_phase: WorkPhase,
     #[case] crew_phase: CrewWorkPhase,
-    #[values(false, true)] engine: bool,
 ) {
     let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
@@ -1964,66 +1913,14 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
     ready_checkout(&lease_engine.checkouts);
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-recover", "convoy-recover", "implement", "policy-recover", REPO_URL).await;
-    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
     let terminal_name = "terminal-workspace-recover-coder";
-    let terminal = sessions
-        .create(
-            &meta(terminal_name),
-            &TerminalSessionSpec {
-                env_ref: host_direct_env_name(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("coding"),
-                    brief: TerminalBrief {
-                        artifact_digest: None,
-                        path: ".flotilla/briefs/coder.md".to_string(),
-                        content: "Finish the issue.".to_string(),
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: NAMESPACE.to_string(),
-                        convoy: "convoy-recover".to_string(),
-                        vessel_ref: "workspace-recover".to_string(),
-                    }),
-                    message: None,
-                },
-                cwd: checkout_path.to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("terminal create");
-    sessions
-        .update_status(
-            terminal_name,
-            &terminal.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Stopped,
-                session_id: Some(terminal_name.to_string()),
-                message: Some("session missing from cleat".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("terminal stopped");
-
-    let lifecycle = flotilla_provisioning_testkit::LifecycleFixture::<
-        flotilla_provisioning::engine::terminal_session::TerminalSessionBinding,
-    >::new(false);
-    let reconciler = if engine {
-        let terminal = backend.using::<TerminalSession>(NAMESPACE).get(terminal_name).await.expect("terminal");
-        lifecycle.request(&terminal);
-        lifecycle.finish(&terminal, flotilla_provisioning_testkit::Ending::Released);
-        // These reads replace the lease engine's, so they hold the vessel's environment, clone and
-        // checkout too.
-        create_ready_host_direct_environment(&lifecycle.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
-        create_ready_clone(&lifecycle.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone");
-        ready_checkout(&lifecycle.checkouts);
-        test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine).with_lifecycle_reads(lifecycle.reads.clone())
-    } else {
-        test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine)
-    };
+    let mut request = flotilla_provisioning_testkit::TerminalsFixture::agent("workspace-recover", "coder", &host_direct_env_name());
+    request.session = terminal_name.to_string();
+    request.cwd = checkout_path.to_string();
+    let first = lease_engine.terminals.request(&request);
+    lease_engine.terminals.ready(&first, terminal_name, &Default::default());
+    lease_engine.terminals.exited(&first, "agent exited with code 0");
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -2056,12 +1953,10 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
     let deps = reconciler.prepare(&workspace).await.expect("recovery deps should load");
     let recovery = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
-    use flotilla_provisioning::engine::Lifecycles as _;
-    let launch = lifecycle.home.newest_launch(terminal_name).map(|held| held.name().to_owned());
-    assert!(matches!(
-        recovery.actuations.as_slice(),
-        [Actuation::RestartTerminalSession { name, replaces }] if name == terminal_name && *replaces == engine.then_some(launch).flatten()
-    ));
+    assert!(recovery.actuations.is_empty(), "the next launch is requested of the engine, not actuated");
+    let newest = lease_engine.terminals.record(terminal_name);
+    assert_ne!(newest.name, first, "the interrupted crew's next launch is requested");
+    assert_eq!(newest.reading, flotilla_protocol::LifecycleReading::InProgress);
 }
 
 #[tokio::test]
@@ -2090,18 +1985,12 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
 
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
-    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+    reconciler.reconcile(&workspace, &deps, Utc::now());
 
     assert_eq!(requested_checkouts(lease_engine).len(), 1, "an adopted checkout requests no checkout");
     assert!(requested_clones(lease_engine).is_empty(), "an adopted checkout requests no clone");
-    assert!(outcome.actuations.iter().any(|actuation| {
-        matches!(
-            actuation,
-            Actuation::CreateTerminalSession { spec, .. }
-                if spec.env_ref == host_direct_env_name()
-                    && spec.pool == "cleat"
-                    && spec.cwd == "/Users/alice/dev/flotilla-existing"
-        )
+    assert!(requested_terminals(lease_engine).iter().any(|terminal| {
+        terminal.environment == host_direct_env_name() && terminal.pool == "cleat" && terminal.cwd == "/Users/alice/dev/flotilla-existing"
     }));
 
     let adopted = requested_checkouts(lease_engine).remove("adopted-checkout-convoy-adopted").expect("adopted checkout");
@@ -2173,20 +2062,13 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
 
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps");
-    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+    reconciler.reconcile(&workspace, &deps, Utc::now());
 
-    let spec = outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateTerminalSession { spec, .. } => Some(spec),
-            _ => None,
-        })
-        .expect("coder session actuation");
-    let TerminalSessionSource::Agent { selector, brief, context, message } = &spec.source else {
+    let coder = requested_terminal(lease_engine, "coder").expect("coder session requested");
+    let TerminalLaunchSource::Agent { capability, brief, .. } = &coder.source else {
         panic!("expected structured agent launch");
     };
-    assert_eq!(selector.capability, "coding");
+    assert_eq!(capability, "coding");
     assert_eq!(brief.path, ".flotilla/briefs/coder.md");
     assert!(brief.content.contains("You are `coder` in convoy `convoy-crew`"));
     assert!(brief.content.contains("- `coder`: active"));
@@ -2197,34 +2079,12 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     assert!(brief.content.contains(&format!("  - `github-app`:\n    - `{repo_ref}` — {REPO_URL}")));
     assert!(brief.content.contains("park the verified commit"));
     assert!(brief.content.contains("## Assignment\n\nImplement issue 668.\n"));
-    assert_eq!(context.namespace, NAMESPACE);
-    assert_eq!(context.vessel_ref, "workspace-crew");
-    assert_eq!(message, &None);
-    assert!(outcome
-        .actuations
-        .iter()
-        .all(|actuation| { !matches!(actuation, Actuation::CreateTerminalSession { spec, .. } if spec.role == "reviewer") }));
+    assert_eq!(coder.vessel.as_deref(), Some("workspace-crew"));
+    assert!(requested_terminal(lease_engine, "reviewer").is_none(), "a latent reviewer is not requested");
 
     // A cross-vessel handoff activates work before publishing its Message. The Vessel
     // controller must then provision the formerly latent receiver without embedding input.
-    let (meta, spec) = outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateTerminalSession { meta, spec } => Some((meta, spec)),
-            _ => None,
-        })
-        .expect("coder actuation");
-    let sessions = backend.using::<TerminalSession>(NAMESPACE);
-    let coder = sessions.create(meta, spec).await.expect("materialize coder");
-    sessions
-        .update_status(
-            &coder.metadata.name,
-            &coder.metadata.resource_version,
-            &TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() },
-        )
-        .await
-        .expect("running coder");
+    lease_engine.terminals.ready(&coder.name, "session-coder", &Default::default());
     flotilla_store::apply_status_patch(
         &backend.using::<Convoy>(NAMESPACE),
         "convoy-crew",
@@ -2240,20 +2100,12 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     .await
     .expect("handoff activation");
     let deps = reconciler.prepare(&workspace).await.expect("activated deps");
-    let activated = reconciler.reconcile(&workspace, &deps, Utc::now());
-    let reviewer = activated
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateTerminalSession { spec, .. } if spec.role == "reviewer" => Some(spec),
-            _ => None,
-        })
-        .expect("activated reviewer must be provisioned");
-    let TerminalSessionSource::Agent { brief, message, .. } = &reviewer.source else {
+    reconciler.reconcile(&workspace, &deps, Utc::now());
+    let reviewer = requested_terminal(lease_engine, "reviewer").expect("activated reviewer must be provisioned");
+    let TerminalLaunchSource::Agent { brief, .. } = &reviewer.source else {
         panic!("reviewer agent launch");
     };
     assert!(brief.content.contains("- `reviewer`: active"));
-    assert_eq!(message, &None, "receiver input remains owned by Message delivery");
 }
 
 #[tokio::test]
@@ -2293,11 +2145,8 @@ async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
         .expect("vessel");
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let waiting = reconciler.prepare(&vessel).await.expect("wait for artifact");
-    assert!(reconciler
-        .reconcile(&vessel, &waiting, Utc::now())
-        .actuations
-        .iter()
-        .all(|actuation| !matches!(actuation, Actuation::CreateTerminalSession { .. })));
+    reconciler.reconcile(&vessel, &waiting, Utc::now());
+    assert!(requested_terminals(lease_engine).is_empty(), "no session before its brief envelope");
 
     let name = flotilla_resources::address::record_name(
         &flotilla_resources::address::artifact_address("convoy-artifact", "coder", "brief", "convoy-artifact").expect("artifact address"),
@@ -2322,18 +2171,9 @@ async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
         .await
         .expect("replicated brief envelope");
     let prepared = reconciler.prepare(&vessel).await.expect("artifact available");
-    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
-    let brief = outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateTerminalSession { spec, .. } => match &spec.source {
-                TerminalSessionSource::Agent { brief, .. } => Some(brief),
-                TerminalSessionSource::Tool { .. } => None,
-            },
-            _ => None,
-        })
-        .expect("session created from brief artifact");
+    reconciler.reconcile(&vessel, &prepared, Utc::now());
+    let coder = requested_terminal(lease_engine, "coder").expect("session requested from brief artifact");
+    let TerminalLaunchSource::Agent { brief, .. } = &coder.source else { panic!("agent session") };
     assert_eq!(brief.path, ".flotilla/briefs/coder.md");
     assert_eq!(brief.artifact_digest.as_deref(), Some(digest.as_str()));
     assert!(brief.content.is_empty());
@@ -2391,12 +2231,10 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
 
     let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps");
-    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+    reconciler.reconcile(&workspace, &deps, Utc::now());
 
-    let Actuation::CreateTerminalSession { spec, .. } = outcome.actuations.first().expect("coder session actuation") else {
-        panic!("expected terminal session actuation");
-    };
-    let TerminalSessionSource::Agent { brief, .. } = &spec.source else {
+    let coder = requested_terminal(lease_engine, "coder").expect("coder session requested");
+    let TerminalLaunchSource::Agent { brief, .. } = &coder.source else {
         panic!("expected agent source");
     };
     assert!(brief.content.contains("Repo-local delivery gate: stop after the fixture proves the override."));
@@ -2497,12 +2335,10 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
 
     let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps");
-    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+    reconciler.reconcile(&workspace, &deps, Utc::now());
 
-    let Actuation::CreateTerminalSession { spec, .. } = outcome.actuations.first().expect("coder session actuation") else {
-        panic!("expected terminal session actuation");
-    };
-    let TerminalSessionSource::Agent { brief, .. } = &spec.source else {
+    let coder = requested_terminal(lease_engine, "coder").expect("coder session requested");
+    let TerminalLaunchSource::Agent { brief, .. } = &coder.source else {
         panic!("expected structured agent launch");
     };
     assert!(brief.content.contains("## Assignment\n\nYour assignment is the issue snapshot section below."));
@@ -2543,7 +2379,7 @@ async fn observed_checkout_at_managed_name_marks_workspace_failed() {
 }
 
 #[tokio::test]
-async fn run_finalizer_deletes_vessel_owned_children_but_preserves_checkout() {
+async fn run_finalizer_preserves_checkout() {
     let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-finalize", "convoy-a", "implement", "policy-a", REPO_URL).await;
@@ -2560,7 +2396,6 @@ async fn run_finalizer_deletes_vessel_owned_children_but_preserves_checkout() {
             .worktree(worktree_checkout_spec(&host_direct_env_name(), GIT_REF, path, "clone-placeholder"))
             .build(),
     );
-    create_labeled_terminal(&backend, NAMESPACE, "terminal-workspace-finalize-coder", "workspace-finalize").await;
 
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
@@ -2569,10 +2404,6 @@ async fn run_finalizer_deletes_vessel_owned_children_but_preserves_checkout() {
         requested_checkouts(lease_engine)["checkout-workspace-finalize"].is_ready(),
         "the convoy's ending releases its checkout, not the vessel's finalizer"
     );
-    assert!(matches!(
-        backend.clone().using::<TerminalSession>(NAMESPACE).get("terminal-workspace-finalize-coder").await,
-        Err(ResourceError::NotFound { .. })
-    ));
 }
 
 #[tokio::test]
@@ -2581,7 +2412,6 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
-    let terminals = backend.clone().using::<TerminalSession>(NAMESPACE);
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-finalizer", "implement", REPO_URL, GIT_REF).await;
 
     let mut status = convoy.status.expect("convoy status");
@@ -2606,7 +2436,6 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
         .update(&vessel_meta, &vessel.metadata.resource_version, &vessel.spec)
         .await
         .expect("vessel finalizer and convoy label should be recorded");
-    create_labeled_terminal(&backend, NAMESPACE, "terminal-convoy-finalizer-implement-coder", "convoy-finalizer-implement").await;
 
     let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
         .with_vessels(vessels.clone())
@@ -2635,7 +2464,7 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
     );
 
     let vessel_reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
-    vessel_reconciler.run_finalizer(&pending_vessel).await.expect("vessel finalizer should delete terminal children");
+    vessel_reconciler.run_finalizer(&pending_vessel).await.expect("vessel finalizer should complete");
     let clear_finalizer = InputMeta::from(&pending_vessel.metadata).without_finalizer("flotilla.work/vessel-workspace-teardown");
     vessels
         .update(&clear_finalizer, &pending_vessel.metadata.resource_version, &pending_vessel.spec)
@@ -2643,7 +2472,6 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
         .expect("clearing the vessel finalizer should complete deletion");
 
     assert!(matches!(vessels.get("convoy-finalizer-implement").await, Err(ResourceError::NotFound { .. })));
-    assert!(matches!(terminals.get("terminal-convoy-finalizer-implement-coder").await, Err(ResourceError::NotFound { .. })));
 }
 
 #[tokio::test]
@@ -2653,17 +2481,12 @@ async fn run_finalizer_preserves_adopted_checkout() {
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-adopted", "convoy-a", "implement", "policy-a", REPO_URL).await;
 
     create_ready_adopted_checkout(lease_engine, "checkout-workspace-adopted", "/Users/alice/dev/flotilla-repos/workspace-adopted");
-    create_labeled_terminal(&backend, NAMESPACE, "terminal-workspace-adopted-coder", "workspace-adopted").await;
 
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
 
     let checkout = requested_checkouts(lease_engine).remove("checkout-workspace-adopted").expect("adopted checkout should be preserved");
     assert!(checkout.is_ready() && matches!(checkout.spec, CheckoutSpec::Observed(_)), "{checkout:?}");
-    assert!(matches!(
-        backend.clone().using::<TerminalSession>(NAMESPACE).get("terminal-workspace-adopted-coder").await,
-        Err(ResourceError::NotFound { .. })
-    ));
 }
 
 #[tokio::test]
@@ -2677,7 +2500,7 @@ async fn run_finalizer_ignores_missing_children_and_cleans_partial_workspace() {
 }
 
 #[tokio::test]
-async fn terminal_session_actuation_includes_system_and_user_labels() {
+async fn terminal_session_request_names_its_vessel_and_credential_scopes() {
     let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_labeled_processes(&backend, NAMESPACE, "convoy-labels", REPO_URL, GIT_REF).await;
@@ -2704,8 +2527,7 @@ async fn terminal_session_actuation_includes_system_and_user_labels() {
             .build(),
     );
     create_running_terminal(
-        &backend,
-        NAMESPACE,
+        lease_engine,
         "terminal-workspace-labels-build",
         &host_direct_env_name(),
         "build",
@@ -2716,33 +2538,17 @@ async fn terminal_session_actuation_includes_system_and_user_labels() {
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-labels", "convoy-labels", "review", "policy-labels", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
-    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+    reconciler.reconcile(&workspace, &deps, Utc::now());
 
-    let terminal = outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateTerminalSession { meta, spec } => Some((meta, spec)),
-            _ => None,
-        })
-        .expect("terminal actuation should be created");
-
-    assert_eq!(terminal.1.role, "test");
-    assert_eq!(terminal.0.labels.get("service").map(String::as_str), Some("api"));
-    assert_eq!(terminal.0.labels.get("team").map(String::as_str), Some("platform"));
-    assert_eq!(terminal.0.labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-labels"));
-    assert_eq!(terminal.0.labels.get(VESSEL_LABEL).map(String::as_str), Some("review"));
-    assert_eq!(terminal.0.labels.get(VESSEL_REF_LABEL).map(String::as_str), Some("workspace-labels"));
-    assert_eq!(terminal.0.labels.get(ROLE_LABEL).map(String::as_str), Some("test"));
-    assert_eq!(terminal.0.labels.get(VESSEL_ORDINAL_LABEL).map(String::as_str), Some("001"));
-    assert_eq!(terminal.0.labels.get(CREW_ORDINAL_LABEL).map(String::as_str), Some("001"));
-    let encoded_scopes = terminal.0.annotations.get(CREDENTIAL_SCOPES_ANNOTATION).expect("credential scopes annotation");
-    let scopes = serde_json::from_str::<BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>>(encoded_scopes)
-        .expect("credential scopes should decode");
+    let terminal = requested_terminal(lease_engine, "test").expect("terminal session should be requested");
+    assert_eq!(terminal.vessel.as_deref(), Some("workspace-labels"));
+    // Its credentials are delivered at launch from its vessel's requirement.
+    let requirement =
+        flotilla_crew::reconcilers::vessel::vessel_requirement(&backend, NAMESPACE, "workspace-labels").await.expect("requirement");
     assert_eq!(
-        scopes,
+        requirement.credential_scopes,
         BTreeMap::from([("github-app".to_string(), BTreeSet::from([RepositorySpec::remote(REPO_URL).expect("repository spec").key()]),)])
     );
 }
@@ -2787,17 +2593,10 @@ async fn assert_terminal_cwd_for_strategy(
 
     let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
-    let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
+    reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
-    let cwd = outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateTerminalSession { spec, .. } => Some(spec.cwd.as_str()),
-            _ => None,
-        })
-        .expect("terminal actuation should be created");
-    assert_eq!(cwd, expected_cwd);
+    let terminal = requested_terminals(lease_engine).into_iter().next().expect("terminal session should be requested");
+    assert_eq!(terminal.cwd, expected_cwd);
 }
 
 fn host_direct_env_name() -> String {
@@ -2925,64 +2724,29 @@ async fn create_convoy_with_labeled_processes(
     convoys.get(name).await.expect("convoy get should succeed")
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn create_running_terminal(
-    backend: &ResourceBackend,
-    namespace: &str,
-    name: &str,
-    env_ref: &str,
-    role: &str,
-    command: &str,
-    cwd: &str,
-    pool: &str,
-) -> flotilla_resources::ResourceObject<TerminalSession> {
-    let sessions = backend.clone().using::<TerminalSession>(namespace);
-    let created = sessions
-        .create(
-            &meta(name),
-            &TerminalSessionSpec {
-                env_ref: env_ref.to_string(),
-                role: role.to_string(),
-                source: flotilla_resources::TerminalSessionSource::Tool { command: command.to_string() },
-                cwd: cwd.to_string(),
-                env: Default::default(),
-                pool: pool.to_string(),
-            },
-        )
-        .await
-        .expect("terminal create should succeed");
-    sessions
-        .update_status(
-            name,
-            &created.metadata.resource_version,
-            &TerminalSessionStatus {
-                codex_native_hooks: false,
-                configured_limits: None,
-                turn_delivery_hold: None,
-                phase: TerminalSessionPhase::Running,
-                session_id: Some(format!("session-{name}")),
-                cleat_endpoint: None,
-                pid: Some(42),
-                started_at: Some(Utc::now()),
-                stopped_at: None,
-                inner_command_status: Some(InnerCommandStatus::Running),
-                inner_exit_code: None,
-                message: None,
-                crew: None,
-                retired_launches: Default::default(),
-                launch_command: Some(command.to_string()),
-                delivered_message_id: None,
-                attention: None,
-                screen_obstruction: None,
-                occupancy: Default::default(),
-                completion_pending: None,
-                degraded: None,
-                daemon_unreachable: None,
-            },
-        )
-        .await
-        .expect("terminal status update should succeed");
-    sessions.get(name).await.expect("terminal get should succeed")
+/// A tool session `name` the engine holds running in `env_ref`.
+async fn create_running_terminal(engine: &VesselFixture, name: &str, env_ref: &str, role: &str, command: &str, cwd: &str, pool: &str) {
+    let launch = engine.terminals.request(&TerminalLaunchRequest {
+        session: name.to_string(),
+        environment: env_ref.to_string(),
+        vessel: None,
+        role: role.to_string(),
+        pool: pool.to_string(),
+        cwd: cwd.to_string(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Tool { command: command.to_string() },
+    });
+    engine.terminals.ready(&launch, &format!("session-{name}"), &Default::default());
+}
+
+/// The terminal sessions `engine` holds, each launch requested of it.
+fn requested_terminals(engine: &VesselFixture) -> Vec<TerminalRecord> {
+    engine.terminals.terminals.at("home").expect("terminals read")
+}
+
+/// The launch requested of `engine` for `role`, the first if several.
+fn requested_terminal(engine: &VesselFixture, role: &str) -> Option<TerminalRecord> {
+    requested_terminals(engine).into_iter().find(|record| record.role == role)
 }
 
 /// An adopted checkout the engine holds ready at `path`, as adoption left it, held for no convoy.
@@ -2998,25 +2762,6 @@ fn create_ready_adopted_checkout(engine: &VesselFixture, name: &str, path: &str)
         }),
         None,
     );
-}
-
-async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, name: &str, workspace_name: &str) {
-    backend
-        .clone()
-        .using::<TerminalSession>(namespace)
-        .create(
-            &labeled_meta(name, [(VESSEL_REF_LABEL.to_string(), workspace_name.to_string())]),
-            &TerminalSessionSpec {
-                env_ref: host_direct_env_name(),
-                role: "coder".to_string(),
-                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("terminal create should succeed");
 }
 
 // ADR 0062: a composed placement's Environment names the per-identity
@@ -3067,17 +2812,8 @@ async fn composed_placement_records_identity_then_digest() {
         environment_ref,
         DockerEnvironmentSpec { image: digest.clone(), image_build_ref: Some(image_build_ref), ..environment },
     );
-    create_running_terminal(
-        &backend,
-        NAMESPACE,
-        "terminal-vessel-composed-coder",
-        environment_ref,
-        "coder",
-        "cargo test",
-        "/workspace",
-        "cleat",
-    )
-    .await;
+    create_running_terminal(lease_engine, "terminal-vessel-composed-coder", environment_ref, "coder", "cargo test", "/workspace", "cleat")
+        .await;
     let vessel = create_workspace(&backend, NAMESPACE, "vessel-composed", "convoy-composed", "implement", "kind-composed", REPO_URL).await;
     let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");

@@ -23,7 +23,7 @@ use flotilla_transport::message::{unix_message_session, MessageSession};
 use tokio::{net::UnixListener, task::JoinHandle};
 
 use super::super::DaemonServer;
-use super::{ok_response, place_crew, read_session_message, test_config_store, PlacedCrew};
+use super::{launch_of, ok_response, place_crew, read_session_message, test_config_store, PlacedCrew};
 use crate::server::environment_sockets::EnvironmentSocketService;
 use flotilla_discovery_testkit::fake_discovery;
 
@@ -188,9 +188,8 @@ async fn promised(daemon: &flotilla_core::in_process::InProcessDaemon, convoy: &
         .any(|promise| promise.id == promise_id)
 }
 
-const OWN: PlacedCrew<'static> = PlacedCrew { convoy: "own", vessel: "own-vessel", session: "own-session", crew: "own-crew" };
-const SECOND: PlacedCrew<'static> =
-    PlacedCrew { convoy: "second", vessel: "second-vessel", session: "second-session", crew: "second-crew" };
+const OWN: PlacedCrew<'static> = PlacedCrew { convoy: "own", vessel: "own-vessel", session: "own-session" };
+const SECOND: PlacedCrew<'static> = PlacedCrew { convoy: "second", vessel: "second-vessel", session: "second-session" };
 
 /// The scenario the mutation check targets: nothing outside the crew
 /// allowlist crosses the forwarded socket.
@@ -260,7 +259,8 @@ async fn two_crews_on_one_host_are_distinguished_by_in_band_claims() {
     assert!(refusal(request(&anonymous, 1, Request::ArtifactList { convoy: None, kind: None, subject: None }).await)
         .starts_with("CallerIdentityAmbiguous:"));
 
-    let own = fixture.connect(&fixture.guest, &[("FLOTILLA_CREW_ID", OWN.crew), ("FLOTILLA_CONVOY", OWN.convoy)]).await;
+    let own_crew = launch_of(&fixture.daemon, OWN.session);
+    let own = fixture.connect(&fixture.guest, &[("FLOTILLA_CREW_ID", own_crew.as_str()), ("FLOTILLA_CONVOY", OWN.convoy)]).await;
     let second = fixture.connect(&fixture.guest, &[("FLOTILLA_TERMINAL_SESSION", SECOND.session)]).await;
     promise(&own, 2, "from-own").await;
     promise(&second, 3, "from-second").await;

@@ -11,6 +11,8 @@ use super::*;
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
+use crate::testkits::engine::engine;
+use crate::testkits::engine::request_session;
 use flotilla_provider_runtime::host_environment::{HostEnvironment, HostSupply};
 #[cfg(target_os = "linux")]
 use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
@@ -449,8 +451,9 @@ impl SshHostRuntime {
     async fn launch(&self) -> Result<LaunchedSession, String> {
         let SshHostRuntime { state, pool, agents, vessel, spec, .. } = self;
         let before = pool.ensured.lock().await.len();
-        let launched =
-            TerminalControllerRuntime { state: Arc::clone(state) }.ensure_session("terminal-demo-work-coder", spec.into(), &[]).await;
+        let launched = TerminalControllerRuntime { state: Arc::clone(state) }
+            .ensure_session("terminal-demo-work-coder", &first_launch("terminal-demo-work-coder"), spec.into(), &[])
+            .await;
         let ensured = pool.ensured.lock().await;
         if let Err(error) = launched {
             assert_eq!(ensured.len(), before, "a refused launch started a session");
@@ -1062,8 +1065,10 @@ async fn bound_ssh_host_crew_with(
         None => bind_account(&runtime.daemon, "demo", "coder", "claude-box-a", "box-a@example.com").await,
         Some((home, ahead)) => bind_account_from_home(&runtime.daemon, home, "demo", "coder", "claude-box-a", ahead).await,
     }
-    backend.using::<TerminalSession>(NAMESPACE).create(&empty_meta("terminal-demo-work-coder"), &runtime.spec).await.expect("session");
+    let launch = request_session(&runtime.daemon, "terminal-demo-work-coder", &runtime.spec);
     runtime.launch().await.expect("bound launch");
+    let session_id = runtime.pool.ensured.lock().await.last().expect("launched").session_name.clone();
+    engine(&runtime.daemon).terminals.ready(&launch, &session_id, &Default::default());
     (runtime, host, runtime_dir)
 }
 
@@ -1131,7 +1136,6 @@ async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
-    let backend = runtime.daemon.resource_backend();
     let bound = binding(&runtime.daemon).await;
     let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
     let revoked = flotilla_resources::account_access::BindingState::Revoked {
@@ -1144,10 +1148,7 @@ async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
 
     assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), None, "the delivered copy is deleted");
     assert!(provision(&runtime.daemon).await.is_none(), "the provision record is removed");
-    assert!(
-        matches!(backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await, Err(ResourceError::NotFound { .. })),
-        "the harness session is stopped"
-    );
+    assert_eq!(*runtime.pool.killed.lock().await, ["terminal-demo-work-coder"], "the harness session is stopped");
     let refused = runtime.launch().await.expect_err("a revoked requester waits");
     assert_eq!(refused, "crew `coder` waits: binding revoked: no authorizing grant; `flotilla convoy rebind` opens a new binding");
 }
@@ -1160,7 +1161,6 @@ async fn a_rebound_requester_loses_its_old_copy_and_session() {
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
-    let backend = runtime.daemon.resource_backend();
     rebind(&runtime.daemon).await;
 
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
@@ -1169,10 +1169,7 @@ async fn a_rebound_requester_loses_its_old_copy_and_session() {
     // A rebind closes the old binding and opens a new one under its own name, so the old
     // binding's provision goes with its copy; a relaunch records the new binding's afresh.
     assert_eq!(provision(&runtime.daemon).await, None, "the closed binding's provision is removed");
-    assert!(matches!(
-        backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await,
-        Err(ResourceError::NotFound { .. })
-    ));
+    assert_eq!(*runtime.pool.killed.lock().await, ["terminal-demo-work-coder"], "the old session is stopped");
 }
 
 // Acceptance (#3907 sticky): a harness restart re-reads the same binding and redelivers the
@@ -1233,7 +1230,6 @@ async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew_with(&token, Some(("udder-root", chrono::Duration::hours(1)))).await;
-    let backend = runtime.daemon.resource_backend();
     let delivered = provision(&runtime.daemon).await.expect("provision recorded at launch");
     assert_eq!(delivered.binding.home, "udder-root", "the provision names the binding's home");
 
@@ -1241,7 +1237,7 @@ async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
 
     assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
     assert_eq!(provision(&runtime.daemon).await, Some(delivered));
-    assert!(backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await.is_ok(), "the session keeps running");
+    assert!(runtime.pool.killed.lock().await.is_empty(), "the session keeps running");
 }
 
 // Review #3933: a withdrawal waits for a delivery of the same binding at the place to finish,

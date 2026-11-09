@@ -29,6 +29,10 @@ use flotilla_protocol::{result_set::CleatEndpoint, LifecycleReading};
 pub use crate::clone_records::launched;
 use crate::{ScreenObstruction, TerminalAttention, TerminalBrief, TerminalOccupancy};
 
+/// How the reason a launch was lost begins when its process exited, rather than its pool losing
+/// it: a crew's exited agent waits for a person to resume it, while a lost one is relaunched.
+pub const PROCESS_EXITED: &str = "process exited";
+
 /// What a launch runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalLaunchSource {
@@ -130,6 +134,11 @@ impl TerminalRecord {
         self.ended().then_some(self.since)
     }
 
+    /// Whether it ended because its process exited ([`PROCESS_EXITED`]).
+    pub fn exited(&self) -> bool {
+        matches!(&self.reading, LifecycleReading::Lost { reason: Some(reason) } if reason.starts_with(PROCESS_EXITED))
+    }
+
     /// The cleat endpoint a direct attach connects to, while it runs in a cleat pool.
     pub fn cleat_endpoint(&self) -> Option<CleatEndpoint> {
         let session = self.session_id()?;
@@ -145,6 +154,134 @@ impl TerminalRecord {
     /// Its launch number, ordered within its home.
     pub fn launch_number(&self) -> u64 {
         self.name.rsplit_once('#').and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
+    }
+}
+
+/// The read view's annotation naming the launch it shows: one per launch, so a reader that holds
+/// it can tell a session's next launch from this one.
+pub const LAUNCH_ANNOTATION: &str = "flotilla.work/launch";
+
+/// The launch read view `session` shows, which also names its crew's AgentSession; none for a
+/// view that was not read from a launch.
+pub fn launch_of(session: &crate::ResourceObject<crate::TerminalSession>) -> Option<&str> {
+    session.metadata.annotations.get(LAUNCH_ANNOTATION).map(String::as_str)
+}
+
+/// What a launch's holder Vessel says about it, joined in for readers of the old shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalHolderView {
+    pub convoy: String,
+    /// The vessel's name within its convoy (its requirement key).
+    pub vessel_name: String,
+    /// The actuator annotations the vessel carries.
+    pub annotations: BTreeMap<String, String>,
+}
+
+impl TerminalRecord {
+    /// This launch in the old TerminalSession shape, for readers not yet converted to records: a
+    /// read view only, never written. It is named as its session, its resource version is the
+    /// launch, and its holder's convoy and labels come from `holder`; what its home observes of
+    /// it, from `observation`, which only its home has.
+    pub fn read_view(
+        &self,
+        namespace: &str,
+        holder: Option<&TerminalHolderView>,
+        observation: Option<&TerminalObservation>,
+    ) -> crate::ResourceObject<crate::TerminalSession> {
+        use crate::{
+            CrewSessionStatus, ObjectMeta, OwnerReference, Resource, TerminalCrewContext, TerminalSessionPhase, TerminalSessionSource,
+            TerminalSessionSpec, TerminalSessionStatus, Vessel, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+        };
+        let phase = match &self.reading {
+            LifecycleReading::Ready { .. } => TerminalSessionPhase::Running,
+            LifecycleReading::InProgress | LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. } => {
+                TerminalSessionPhase::Starting
+            }
+            LifecycleReading::Released => TerminalSessionPhase::Stopped,
+            LifecycleReading::Lost { .. } if self.exited() => TerminalSessionPhase::Stopped,
+            LifecycleReading::Lost { .. } => TerminalSessionPhase::Lost,
+            LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. } => TerminalSessionPhase::Failed,
+        };
+        let mut labels = BTreeMap::from([(ROLE_LABEL.to_owned(), self.role.clone())]);
+        let mut annotations = BTreeMap::from([(LAUNCH_ANNOTATION.to_owned(), self.name.clone())]);
+        let mut owner_references = Vec::new();
+        if let Some(vessel) = &self.vessel {
+            labels.insert(VESSEL_REF_LABEL.to_owned(), vessel.clone());
+            owner_references.push(OwnerReference {
+                api_version: format!("{}/{}", Vessel::API_PATHS.group, Vessel::API_PATHS.version),
+                kind: Vessel::API_PATHS.kind.to_owned(),
+                name: vessel.clone(),
+                controller: true,
+            });
+        }
+        if let Some(holder) = holder {
+            labels.insert(CONVOY_LABEL.to_owned(), holder.convoy.clone());
+            labels.insert(VESSEL_LABEL.to_owned(), holder.vessel_name.clone());
+            annotations.extend(holder.annotations.clone());
+        }
+        let source = match &self.source {
+            TerminalLaunchSource::Tool { command } => TerminalSessionSource::Tool { command: command.clone() },
+            TerminalLaunchSource::Agent { capability, adapter, model, brief } => TerminalSessionSource::Agent {
+                selector: crate::Selector { capability: capability.clone(), adapter: adapter.clone(), model: model.clone() },
+                brief: brief.clone(),
+                context: Box::new(TerminalCrewContext {
+                    namespace: namespace.to_owned(),
+                    convoy: holder.map(|holder| holder.convoy.clone()).unwrap_or_default(),
+                    vessel_ref: self.vessel.clone().unwrap_or_default(),
+                }),
+                message: None,
+            },
+        };
+        let observation = observation.cloned().unwrap_or_default();
+        let facts = self.facts.clone().unwrap_or_default();
+        crate::ResourceObject {
+            metadata: ObjectMeta {
+                name: self.session_name().to_owned(),
+                namespace: namespace.to_owned(),
+                resource_version: self.name.clone(),
+                labels,
+                annotations,
+                owner_references,
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: self.requested_at,
+                merge: None,
+            },
+            spec: TerminalSessionSpec {
+                env_ref: self.environment.clone(),
+                role: self.role.clone(),
+                source,
+                cwd: self.cwd.clone(),
+                pool: self.pool.clone(),
+                env: self.env.clone(),
+            },
+            status: Some(TerminalSessionStatus {
+                codex_native_hooks: observation.codex_native_hooks,
+                configured_limits: facts.build_jobs.map(|jobs| flotilla_protocol::ConfiguredResourceLimits {
+                    build_jobs: Some(jobs as usize),
+                    linker_threads: Some(jobs as usize),
+                    ..Default::default()
+                }),
+                phase,
+                session_id: self.session_id().map(str::to_owned),
+                cleat_endpoint: self.cleat_endpoint(),
+                started_at: self.started_at(),
+                stopped_at: self.ended_at(),
+                message: self.reading.reason().filter(|_| !self.is_running()),
+                crew: self.agent().map(|agent| CrewSessionStatus {
+                    id: self.name.clone(),
+                    adapter: agent.adapter.clone(),
+                    model: agent.model.clone(),
+                    stance: agent.stance.clone(),
+                }),
+                launch_command: observation.launch_command,
+                attention: observation.attention,
+                screen_obstruction: observation.screen_obstruction,
+                occupancy: observation.occupancy,
+                daemon_unreachable: observation.daemon_unreachable,
+                ..Default::default()
+            }),
+        }
     }
 }
 
@@ -226,6 +363,8 @@ pub trait TerminalRecords: Send + Sync {
     fn changes(&self) -> tokio::sync::broadcast::Receiver<TerminalChange> {
         tokio::sync::broadcast::channel(1).1
     }
+    /// What this home observes of its own running launches, in memory.
+    fn observations(&self) -> &TerminalObservations;
 }
 
 /// What this home observes of one of its running launches: local observations, never replicated
@@ -244,6 +383,49 @@ pub struct TerminalObservation {
     pub launch_command: Option<String>,
     /// Whether its Codex harness reports native lifecycle hooks.
     pub codex_native_hooks: bool,
+}
+
+impl TerminalObservation {
+    /// Whether `incoming` adds to what is held: fresh hook readings take precedence over the
+    /// screen, identical readings are rate-limited, and a Codex harness without native hooks has
+    /// every newer completion counted (its notify hook reports only turn completion). `adapter`
+    /// is the harness the launch resolved to.
+    pub fn should_record_attention(&self, incoming: &TerminalAttention, adapter: Option<&str>) -> bool {
+        use crate::{TerminalAttentionSource, TerminalAttentionState};
+        self.attention.as_ref().is_none_or(|previous| {
+            previous.should_replace_with(incoming)
+                || (!self.codex_native_hooks
+                    && adapter == Some("codex")
+                    && incoming.source == TerminalAttentionSource::Hook
+                    && incoming.state == TerminalAttentionState::Idle
+                    && incoming.as_of > previous.as_of)
+        })
+    }
+
+    /// Records a hook's or screen's `attention` if it adds to what is held.
+    pub fn observe_attention(&mut self, attention: TerminalAttention, adapter: Option<&str>) {
+        if self.should_record_attention(&attention, adapter) {
+            self.attention = Some(attention);
+        }
+    }
+
+    /// Records one screen-and-seat reading: `occupancy`, `attention` if it adds to what is held,
+    /// and the screen's obstruction when the screen was read (`Some`).
+    pub fn observe(
+        &mut self,
+        attention: Option<TerminalAttention>,
+        obstruction: Option<Option<ScreenObstruction>>,
+        occupancy: TerminalOccupancy,
+        adapter: Option<&str>,
+    ) {
+        self.occupancy = occupancy;
+        if let Some(obstruction) = obstruction {
+            self.screen_obstruction = obstruction;
+        }
+        if let Some(attention) = attention {
+            self.observe_attention(attention, adapter);
+        }
+    }
 }
 
 /// This home's observations of its launches, by launch name, held in memory. A change wakes the

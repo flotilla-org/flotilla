@@ -6,42 +6,16 @@ use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, Selector, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, TurnDeliveryRung, VesselRequirement, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    terminal_records::{TerminalLaunchRequest, TerminalLaunchSource},
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TurnDeliveryRung, VesselRequirement,
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{resume_staging_fixture, test_meta, RecordingWorkCredentials};
-use crate::in_process::{input_meta_from_resource, InProcessDaemon};
+use super::support::{ensure_vessel, observe_attention, resume_staging_fixture, test_meta, RecordingWorkCredentials};
+use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
-
-#[tokio::test]
-async fn turn_delivery_accepts_intent_when_terminal_changes_during_staging() {
-    let (daemon, backend, probe) = resume_staging_fixture().await;
-    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
-    probe.invalidate_next.store(true, std::sync::atomic::Ordering::SeqCst);
-    let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
-        .namespace("flotilla".to_string())
-        .convoy("resume-staging".to_string())
-        .source("review".to_string())
-        .vessel("work".to_string())
-        .role("coder".to_string())
-        .brief("continue".to_string())
-        .subject_revision("new-head".to_string())
-        .sender("system:turn-rules".into())
-        .build();
-    daemon.deliver_standing_turn(&request).await.expect("durable intent accepted after concurrent terminal edit");
-    let status = backend.using::<ResourceConvoy>("flotilla").get("resume-staging").await.expect("convoy").status.expect("status");
-    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
-    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
-    let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items;
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].spec.body, "continue");
-    let session = backend.using::<ResourceTerminalSession>("flotilla").get("resume-staging-session").await.expect("session");
-    assert!(matches!(&session.spec.source, TerminalSessionSource::Agent { brief, .. } if brief.content.ends_with(" (concurrent edit)")));
-}
 
 // A fresh turn is durable intent independent of the boot brief; it waits for
 // the replacement holder's readiness and transport acceptance evidence.
@@ -50,23 +24,11 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.get("resume-staging-session").await.expect("session");
-    let mut spec = session.spec.clone();
-    let TerminalSessionSource::Agent { brief, .. } = &mut spec.source else { panic!("agent session") };
-    brief.artifact_digest = Some("a".repeat(64));
-    brief.content.clear();
-    let session = sessions
-        .update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec)
-        .await
-        .expect("digest-backed session");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Stopped, ..Default::default() },
-        )
-        .await
-        .expect("stopped session");
+    // The agent's process exited, ending its launch.
+    let terminals = &probe.engine.terminals;
+    let exited = terminals.record("resume-staging-session");
+    terminals.ready(&exited.name, "resume-staging-pool-session", &Default::default());
+    terminals.exited(&exited.name, "exit 0");
     let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
         .convoy("resume-staging".to_string())
@@ -79,10 +41,10 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
         .build();
     daemon.deliver_standing_turn(&request).await.expect("deliver fresh turn");
     let session = sessions.get("resume-staging-session").await.expect("updated session");
-    let TerminalSessionSource::Agent { brief, message, .. } = session.spec.source else { panic!("agent session") };
-    assert!(brief.content.is_empty());
-    assert_eq!(brief.artifact_digest, Some("a".repeat(64)));
-    assert!(message.is_none());
+    // The session's next launch boots with the same brief; the turn is not written into it.
+    let relaunched = terminals.record("resume-staging-session");
+    assert_ne!(relaunched.name, exited.name);
+    assert_eq!(relaunched.source, exited.source);
     let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items;
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].spec.body, "fresh turn");
@@ -124,15 +86,10 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
     .await
     .expect("receipt");
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.get("resume-staging-session").await.expect("session");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Lost, ..Default::default() },
-        )
-        .await
-        .expect("lost after delivery");
+    let terminals = &probe.engine.terminals;
+    let lost = terminals.record("resume-staging-session").name;
+    terminals.ready(&lost, "resume-staging-pool-session", &Default::default());
+    terminals.lost(&lost, "pool lost the session");
     assert_eq!(daemon.deliver_standing_turn(&request).await.expect("duplicate already accepted"), TurnDeliveryRung::FreshAgent);
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(messages.list().await.expect("messages").items.len(), 1);
@@ -140,6 +97,7 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
         sessions.get("resume-staging-session").await.expect("session").status.expect("status").phase,
         ResourceTerminalSessionPhase::Lost
     );
+    assert_eq!(terminals.record("resume-staging-session").name, lost, "no next launch was started");
 }
 
 #[tokio::test]
@@ -158,7 +116,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
         )
         .await;
         // The engine's readings, which a running daemon always has.
-        super::test_engine(&daemon);
+        let engine = super::test_engine(&daemon);
         let credentials = Arc::new(RecordingWorkCredentials {
             backend: backend.clone(),
             delivered: tokio::sync::Mutex::new(BTreeSet::new()),
@@ -202,49 +160,35 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             .await
             .expect("admitted claim");
         let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-        let session = sessions
-            .create(
-                &InputMeta::builder()
-                    .name("turn-credential-session".to_string())
-                    .labels(BTreeMap::from([
-                        (CONVOY_LABEL.to_string(), "turn-credential-work".to_string()),
-                        (VESSEL_LABEL.to_string(), "work".to_string()),
-                        (ROLE_LABEL.to_string(), "coder".to_string()),
-                    ]))
-                    .build(),
-                &ResourceTerminalSessionSpec {
-                    env_ref: "credential-env".to_string(),
-                    role: "coder".to_string(),
-                    source: TerminalSessionSource::Agent {
-                        selector: Selector { capability: "code".to_string(), adapter: None, model: None },
-                        brief: flotilla_resources::TerminalBrief {
-                            artifact_digest: None,
-                            path: "brief.md".to_string(),
-                            content: "original".to_string(),
-                            copies: vec![],
-                        },
-                        context: Box::new(flotilla_resources::TerminalCrewContext {
-                            namespace: "flotilla".to_string(),
-                            convoy: "turn-credential-work".to_string(),
-                            vessel_ref: "turn-credential-vessel".to_string(),
-                        }),
-                        message: None,
-                    },
-                    cwd: "/repo".to_string(),
-                    env: Default::default(),
-                    pool: "passthrough".to_string(),
+        ensure_vessel(&backend, "turn-credential-vessel", "turn-credential-work", "work").await;
+        let launch = engine.terminals.request(&TerminalLaunchRequest {
+            session: "turn-credential-session".to_string(),
+            environment: "credential-env".to_string(),
+            vessel: Some("turn-credential-vessel".to_string()),
+            role: "coder".to_string(),
+            pool: "passthrough".to_string(),
+            cwd: "/repo".to_string(),
+            env: Default::default(),
+            source: TerminalLaunchSource::Agent {
+                capability: "code".to_string(),
+                adapter: None,
+                model: None,
+                brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
+                    path: "brief.md".to_string(),
+                    content: "original".to_string(),
+                    copies: vec![],
                 },
-            )
-            .await
-            .expect("session");
-        sessions
-            .update_status(
-                &session.metadata.name,
-                &session.metadata.resource_version,
-                &ResourceTerminalSessionStatus { phase, ..Default::default() },
-            )
-            .await
-            .expect("session phase");
+            },
+        });
+        match phase {
+            ResourceTerminalSessionPhase::Running => engine.terminals.ready(&launch, "pool-session", &Default::default()),
+            ResourceTerminalSessionPhase::Stopped => {
+                engine.terminals.ready(&launch, "pool-session", &Default::default());
+                engine.terminals.exited(&launch, "exit 0");
+            }
+            _ => {}
+        }
         let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
             .namespace("flotilla".to_string())
             .convoy("turn-credential-work".to_string())
@@ -306,14 +250,13 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         );
         convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("active convoy");
         let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-        let session = sessions.get("resume-staging-session").await.expect("session");
-        let mut session_status = ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() };
-        session_status.attention =
-            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: clock.now(), source: TerminalAttentionSource::Hook });
-        sessions.update_status("resume-staging-session", &session.metadata.resource_version, &session_status).await.expect("idle session");
+        let launch = probe.engine.terminals.record("resume-staging-session").name;
+        probe.engine.terminals.ready(&launch, "resume-staging-pool-session", &Default::default());
+        let idle = |as_of| TerminalAttention { state: TerminalAttentionState::Idle, as_of, source: TerminalAttentionSource::Hook };
+        observe_attention(&probe.engine, &launch, idle(clock.now()));
         let agents = super::support::agent_sessions(&daemon);
         let hook = |activity, cause: &str, at| {
-            agents.observe("resume-staging-session", activity, cause.into(), super::support::engine_at(at)).expect("hook activity");
+            agents.observe(&launch, activity, cause.into(), super::support::engine_at(at)).expect("hook activity");
         };
         hook(Activity::Idle, "Stop", clock.now());
         let expected_rung = if limit == 0 { StallRung::Operator } else { StallRung::Nudge };
@@ -356,15 +299,11 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
                 // First observe delivery; only a later idle observation is a reply
                 // to that turn. Coalescing both writes would erase that ordering.
                 daemon.reconcile_crew_stalls_once("flotilla").await.expect("observe delivered nudge");
-                let session = sessions.get("resume-staging-session").await.expect("session");
                 // The agent takes the nudge and stops again: its next turn ends after the delivery.
                 hook(Activity::Working, "UserPromptSubmit", clock.now());
-                session_status.attention.as_mut().expect("attention").as_of = clock.advance(chrono::Duration::seconds(cooldown_seconds));
+                let idle_again = clock.advance(chrono::Duration::seconds(cooldown_seconds));
                 hook(Activity::Idle, "Stop", clock.now());
-                sessions
-                    .update_status("resume-staging-session", &session.metadata.resource_version, &session_status)
-                    .await
-                    .expect("idle again");
+                observe_attention(&probe.engine, &launch, idle(idle_again));
                 daemon.reconcile_crew_stalls_once("flotilla").await.expect("next idle episode judgement");
                 let stalled = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
                 assert_eq!(stalled.nudge_history.len(), 2);

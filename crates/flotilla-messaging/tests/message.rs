@@ -1260,14 +1260,25 @@ async fn custom_charter_renderer_uses_structured_revision_and_does_not_lock_admi
     let backend = ResourceBackend::new(InMemoryBackend::default());
     routing_project(&backend, "root", None).await;
     routing_holder(&backend, "root", "one").await;
+    // The holder's brief was rendered from its convoy's frozen cascade, pinned at "initial".
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys.get("root-one").await.expect("holder convoy");
+    let mut convoy_status = convoy.status.clone().unwrap_or_default();
+    convoy_status.workflow_snapshot = Some(WorkflowSnapshot {
+        cascade: Some(Box::new(ResolvedCascade { charter_commit: Some("initial".into()), ..Default::default() })),
+        vessels: Vec::new(),
+        exit: None,
+        turn_delivery: Default::default(),
+        stall_nudges: Default::default(),
+        supervision: None,
+    });
+    convoys.update_status("root-one", &convoy.metadata.resource_version, &convoy_status).await.expect("initial evidence");
     let terminals = backend.using::<TerminalSession>("flotilla");
     let terminal = terminals.get("terminal-root-one").await.expect("holder");
-    let mut meta = InputMeta::from(&terminal.metadata);
-    meta.annotations.insert(BRIEF_CHARTER_REVISION_ANNOTATION.into(), "initial".into());
     let mut terminal_spec = terminal.spec;
     let TerminalSessionSource::Agent { brief, .. } = &mut terminal_spec.source else { panic!("agent") };
     brief.content = "User prose: Charter revision: `changed`".into();
-    terminals.update(&meta, &terminal.metadata.resource_version, &terminal_spec).await.expect("initial evidence");
+    terminals.update(&InputMeta::from(&terminal.metadata), &terminal.metadata.resource_version, &terminal_spec).await.expect("brief prose");
     let inbox = MessageInbox::new(backend.clone(), "flotilla");
     let renderer = Renderer { inbox: inbox.clone(), calls: Default::default() };
     let projects = backend.definitions::<Project>("flotilla");

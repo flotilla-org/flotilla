@@ -8,8 +8,10 @@ use flotilla_core::primitives::ensures::import_ensures;
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::{
     image_build::ImageBuildBinding,
-    import::{import_checkouts, import_clones, import_environments, import_records, import_vessels, ImportRefusal, ImportReport},
-    terminal_session::TerminalSessionBinding,
+    import::{
+        import_checkouts, import_clones, import_environments, import_records, import_terminal_sessions, import_vessels, ImportRefusal,
+        ImportReport,
+    },
 };
 use flotilla_resources::{
     convoy::engine::engine_name, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure, Environment, ImageBuild, TerminalSession, Vessel,
@@ -20,7 +22,20 @@ use flotilla_state_machines::{machines::convoy::Convoy as EngineConvoy, Resource
 
 use super::{Carried, Source};
 
-pub(super) const KINDS: [&str; 7] = ["environments", "imagebuilds", "clones", "checkouts", "terminalsessions", "vessels", "convoyensures"];
+pub(super) const KINDS: [&str; 6] = ["environments", "imagebuilds", "clones", "checkouts", "vessels", "convoyensures"];
+
+/// TerminalSessions import before the messages delivered to them, so each delivery names the
+/// launch its session became: a launch's number is its home's sequence when it is written.
+pub(super) fn terminal_sessions(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
+    for namespace in source.namespaces(&["terminalsessions"]) {
+        let sessions: Vec<_> = source
+            .owned::<TerminalSession>("terminalsessions", Some(namespace), "TerminalSession", target, report)
+            .into_iter()
+            .map(|record| (record.object, record.home))
+            .collect();
+        carried.launches.extend(import_terminal_sessions(&sessions, target, report));
+    }
+}
 
 pub(super) fn lifecycles(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
     for namespace in source.namespaces(&KINDS) {
@@ -80,7 +95,6 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
         }
         import_checkouts(std::slice::from_ref(&record), &holder, &clone_launches, target, report);
     }
-    records!(TerminalSession, "terminalsessions", "TerminalSession", TerminalSessionBinding);
     let mut vessels: Vec<_> = source
         .owned::<Vessel>("vessels", namespace, "Vessel", target, report)
         .into_iter()

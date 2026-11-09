@@ -95,7 +95,7 @@ fn convoy_branch_refresh_reuses_repository_results(tc: hegel::TestCase) {
 // a completion claim. Another crew's artifact never keeps that promise.
 #[tokio::test]
 async fn prless_decision_ledger_promise_settles_without_a_claim() {
-    let (daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let (daemon, backend, _temp, watch, _engine) = stall_test_daemon().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let created = convoys
         .create(

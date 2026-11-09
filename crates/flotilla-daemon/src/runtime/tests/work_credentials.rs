@@ -1,4 +1,5 @@
 use super::*;
+use crate::testkits::engine::engine;
 use flotilla_resources::ResumeIntent;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -111,7 +112,8 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         )
         .await
         .expect("place vessel");
-    create_credential_test_session(&backend, "credential-work-session", "credential-work", "credential-work-vessel", env_id.as_str()).await;
+    let live =
+        create_credential_test_session(&engine(&daemon).terminals, "credential-work-session", "credential-work-vessel", env_id.as_str());
     engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
@@ -215,14 +217,12 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         )
         .await
         .expect("place unavailable vessel");
-    create_credential_test_session(
-        &backend,
+    let unavailable = create_credential_test_session(
+        &engine(&daemon).terminals,
         "unavailable-work-session",
-        "unavailable-credential-work",
         "unavailable-work-vessel",
         "aaa-unavailable",
-    )
-    .await;
+    );
     // The start pass stages the target environment despite the unrelated environment's failure.
     let mut delivery = CredentialDelivery::new(Arc::clone(&state)).expect("a credential store");
     let error = delivery.start().await.expect_err("the unavailable environment fails");
@@ -238,7 +238,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
     assert!(scoped_error.contains("aaa-unavailable"), "{scoped_error}");
     deliver(env).await.expect("target environment stages despite unrelated failure");
     vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");
-    backend.clone().using::<TerminalSession>(NAMESPACE).delete("unavailable-work-session").await.expect("remove unavailable session");
+    engine(&daemon).terminals.release(&unavailable);
 
     engine_environments(&daemon).request(
         env_id.as_str(),
@@ -308,20 +308,14 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         )
         .await
         .expect("place second vessel in shared environment");
-    create_credential_test_session(
-        &backend,
-        "conflicting-work-session",
-        "conflicting-credential-work",
-        "conflicting-work-vessel",
-        env_id.as_str(),
-    )
-    .await;
+    let conflicting =
+        create_credential_test_session(&engine(&daemon).terminals, "conflicting-work-session", "conflicting-work-vessel", env_id.as_str());
     let error = deliver(env).await.expect_err("shared environment must reject differing permissions");
     assert!(error.contains("different minted permissions for `work-token`"), "{error}");
     let repeated_error = deliver(env).await.expect_err("a persistent conflict keeps failing");
     assert!(repeated_error.contains("different minted permissions for `work-token`"), "{repeated_error}");
     vessels.delete("conflicting-work-vessel").await.expect("remove second vessel");
-    backend.clone().using::<TerminalSession>(NAMESPACE).delete("conflicting-work-session").await.expect("remove second session");
+    engine(&daemon).terminals.release(&conflicting);
 
     deliver(env).await.expect("the resolved conflict stages the running crew's credentials");
     assert!(can_fill_git_credential().await);
@@ -379,16 +373,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
     assert!(can_fill_git_credential().await);
 
     // The last crew session stopping is the event that withdraws its credentials: no request.
-    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
-    let session = sessions.get("credential-work-session").await.expect("live crew session");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus { phase: TerminalSessionPhase::Stopped, ..TerminalSessionStatus::default() },
-        )
-        .await
-        .expect("stop last crew session");
+    engine(&daemon).terminals.exited(&live, "the crew stopped");
     tokio::time::timeout(Duration::from_secs(10), async {
         while can_fill_git_credential().await {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -397,7 +382,6 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
     .await
     .expect("the session's stop withdraws its credentials");
 
-    sessions.delete("credential-work-session").await.expect("tear down crew session");
     vessels.delete("credential-work-vessel").await.expect("tear down vessel");
     deliver(env).await.expect("nothing to deliver after vessel teardown");
     assert!(!can_fill_git_credential().await);
@@ -498,7 +482,7 @@ async fn a_missing_credential_declaration_is_delivered_once_it_arrives() {
         )
         .await
         .expect("place vessel");
-    create_credential_test_session(&backend, "late-session", "late-work", "late-vessel", env_id.as_str()).await;
+    create_credential_test_session(&engine(&daemon).terminals, "late-session", "late-vessel", env_id.as_str());
     engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(

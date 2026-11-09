@@ -573,6 +573,7 @@ async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
         .create(
             &InputMeta::builder()
                 .name("resumed-coder".into())
+                .annotations(launch_annotations("resumed-coder"))
                 .labels(BTreeMap::from([
                     (CONVOY_LABEL.into(), "stalled-work".into()),
                     (VESSEL_LABEL.into(), "work".into()),
@@ -1902,7 +1903,14 @@ fn pending_launch_progress_is_bounded_and_recovers(tc: hegel::TestCase) {
         }
         // Session creation is real launch progress even after a long queue wait.
         let session = sessions
-            .create(&InputMeta::builder().name("resumed-coder".into()).labels(saved.metadata.labels).build(), &saved.spec)
+            .create(
+                &InputMeta::builder()
+                    .name("resumed-coder".into())
+                    .annotations(launch_annotations("resumed-coder"))
+                    .labels(saved.metadata.labels)
+                    .build(),
+                &saved.spec,
+            )
             .await
             .expect("new launch");
         assert!(judge(899).await.attention.is_none());

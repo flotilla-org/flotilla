@@ -34,11 +34,10 @@ use flotilla_protocol::{
 };
 use flotilla_replication::{replicate_kind_direct, ReplicationStore};
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, FulfilmentFacts,
-    FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceError, ResourceList, ResourceProvenance, Selector, StatusPatch,
-    TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTarget, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, FulfilmentFacts, FulfilmentKind,
+    FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    ResourceError, ResourceList, ResourceProvenance, Selector, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
 };
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, ResourceBackend};
 use flotilla_test_support::TestSocketDir;
@@ -83,6 +82,10 @@ use super::HELLO_HANDSHAKE_TIMEOUT;
 use crate::peer::ConnectionDirection;
 use crate::peer::ConnectionMeta;
 use crate::startup::test_support::GatedCredentialPreflight;
+use crate::testkits::engine::request_session;
+use crate::testkits::engine::run_session;
+use crate::testkits::engine::runtime_terminals;
+use crate::testkits::engine::session_request;
 use crate::testkits::server::apply_convoy_replica_feed;
 use crate::testkits::server::seed_trusted_remote_convoy_project;
 
@@ -1354,32 +1357,15 @@ async fn dispatch_agent_hook_started_updates_existing_session_entry() {
 async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
     let (_tmp, daemon) = empty_daemon().await;
     let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
-    let created = sessions
-        .create(
-            &InputMeta::builder().name("terminal-demo-coder".to_string()).build(),
-            &TerminalSessionSpec {
-                env_ref: "host-direct".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Tool { command: "claude".into() },
-                cwd: "/repo".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
-            },
-        )
-        .await
-        .expect("terminal create");
-    let mut status = TerminalSessionStatus::default();
-    TerminalSessionStatusPatch::MarkRunning {
-        configured_limits: None,
-        session_id: "terminal-demo-coder".into(),
-        pid: None,
-        started_at: chrono::Utc::now(),
-        crew: None,
-        launch_command: "claude".into(),
-        delivered_message_id: None,
-    }
-    .apply(&mut status);
-    sessions.update_status("terminal-demo-coder", &created.metadata.resource_version, &status).await.expect("running status");
+    let spec = TerminalSessionSpec {
+        env_ref: "host-direct".into(),
+        role: "coder".into(),
+        source: TerminalSessionSource::Tool { command: "claude".into() },
+        cwd: "/repo".into(),
+        env: Default::default(),
+        pool: "cleat".into(),
+    };
+    run_session(&daemon, "terminal-demo-coder", &spec, &Default::default());
     let agent_state_store = flotilla_agent::shared_in_memory_agent_state_store();
 
     let response = dispatch_request_with_state(
@@ -1495,55 +1481,51 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             .await
             .expect("convoy status");
         let name = format!("terminal-{harness_name}");
-        let created = sessions
+        let vessel = format!("{convoy_name}-work");
+        daemon
+            .resource_backend()
+            .using::<Vessel>("flotilla")
             .create(
-                &InputMeta::builder()
-                    .name(name.clone())
-                    .labels(BTreeMap::from([
-                        (flotilla_resources::CONVOY_LABEL.into(), convoy_name.clone()),
-                        (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
-                        (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
-                    ]))
-                    .build(),
-                &TerminalSessionSpec {
-                    env_ref: "contained-vessel".into(),
-                    role: "coder".into(),
-                    source: TerminalSessionSource::Agent {
-                        selector: Selector::for_capability("coding"),
-                        brief: TerminalBrief {
-                            artifact_digest: None,
-                            path: ".flotilla/briefs/coder.md".into(),
-                            content: "fix".into(),
-                            copies: Vec::new(),
-                        },
-                        context: Box::new(TerminalCrewContext {
-                            namespace: "flotilla".into(),
-                            convoy: convoy_name.clone(),
-                            vessel_ref: "work".into(),
-                        }),
-                        message: None,
-                    },
-                    cwd: "/repo".into(),
-                    env: Default::default(),
-                    pool: "cleat".into(),
+                &InputMeta::builder().name(vessel.clone()).build(),
+                &flotilla_resources::VesselSpec {
+                    convoy_ref: convoy_name.clone(),
+                    vessel_name: "work".into(),
+                    fulfilment_kind_ref: "policy".into(),
+                    adopted_checkout_refs: Default::default(),
                 },
             )
             .await
-            .expect("terminal create");
-        let mut status = TerminalSessionStatus::default();
-        TerminalSessionStatusPatch::MarkRunning {
-            configured_limits: None,
-            session_id: name.clone(),
-            pid: None,
-            started_at: chrono::Utc::now() - chrono::Duration::minutes(20),
-            crew: Some(
-                CrewSessionStatus::builder().id("crew".into()).adapter(harness_name.into()).stance("trusted-implicit".into()).build(),
-            ),
-            launch_command: harness_name.into(),
-            delivered_message_id: None,
-        }
-        .apply(&mut status);
-        sessions.update_status(&name, &created.metadata.resource_version, &status).await.expect("running status");
+            .expect("crew vessel");
+        let spec = TerminalSessionSpec {
+            env_ref: "contained-vessel".into(),
+            role: "coder".into(),
+            source: TerminalSessionSource::Agent {
+                selector: Selector::for_capability("coding"),
+                brief: TerminalBrief {
+                    artifact_digest: None,
+                    path: ".flotilla/briefs/coder.md".into(),
+                    content: "fix".into(),
+                    copies: Vec::new(),
+                },
+                context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: convoy_name.clone(), vessel_ref: vessel }),
+                message: None,
+            },
+            cwd: "/repo".into(),
+            env: Default::default(),
+            pool: "cleat".into(),
+        };
+        let facts = flotilla_resources::terminal_records::TerminalLaunchFacts {
+            agent: Some(flotilla_resources::terminal_records::AgentLaunch {
+                adapter: harness_name.into(),
+                model: None,
+                stance: "trusted-implicit".into(),
+            }),
+            ..Default::default()
+        };
+        // Running for twenty minutes without a turn hook.
+        let launch = request_session(&daemon, &name, &spec);
+        let started = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() - chrono::Duration::minutes(20)));
+        install_engine(&daemon).terminals.ready_at(&launch, &name, &facts, started);
         let store = flotilla_agent::shared_in_memory_agent_state_store();
         if harness_name == "codex" {
             // Upgrade from a pre-fix notification stored under a random candidate.
@@ -1587,17 +1569,13 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             (idle_event, idle_payload, TerminalAttentionState::Idle),
         ] {
             if harness_name == "codex" && expected == TerminalAttentionState::Working {
-                let current = sessions.get(&name).await.expect("terminal for screen observation");
-                let mut status = current.status.expect("running status");
-                TerminalSessionStatusPatch::ObserveAttention {
-                    attention: flotilla_resources::TerminalAttention {
-                        state: TerminalAttentionState::Working,
-                        as_of: chrono::Utc::now(),
-                        source: flotilla_resources::TerminalAttentionSource::Screen,
-                    },
-                }
-                .apply(&mut status);
-                sessions.update_status(&name, &current.metadata.resource_version, &status).await.expect("screen working status");
+                let attention = flotilla_resources::TerminalAttention {
+                    state: TerminalAttentionState::Working,
+                    as_of: chrono::Utc::now(),
+                    source: flotilla_resources::TerminalAttentionSource::Screen,
+                };
+                flotilla_resources::terminal_records::TerminalRecords::observations(install_engine(&daemon).terminals.terminals.as_ref())
+                    .update(&launch, |observation| observation.observe_attention(attention, Some(harness_name)));
                 // The terminal runtime records the same screen read on the crew's AgentSession.
                 daemon
                     .message_primitives()
@@ -1988,7 +1966,7 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
 }
 
 #[tokio::test]
-async fn crew_completion_partition_is_persisted_and_names_the_unreachable_authority() {
+async fn crew_completion_partition_is_queued_and_names_the_unreachable_authority() {
     let (_tmp, daemon) = empty_daemon().await;
     let home = HostName::new("feta");
     apply_convoy_replica_feed(&daemon, "flotilla", "stranded", home.clone()).await;
@@ -2004,49 +1982,43 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         )
         .await;
 
-    let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
-    let created = sessions
+    daemon
+        .resource_backend()
+        .using::<Vessel>("flotilla")
         .create(
-            &InputMeta::builder().name("terminal-stranded-work-coder".to_string()).build(),
-            &TerminalSessionSpec {
-                env_ref: "local".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("code"),
-                    brief: TerminalBrief {
-                        artifact_digest: None,
-                        path: ".flotilla/briefs/coder.md".into(),
-                        content: String::new(),
-                        copies: vec![],
-                    },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "stranded".into(),
-                        vessel_ref: "stranded-work".into(),
-                    }),
-                    message: None,
-                },
-                cwd: "/repo".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
+            &InputMeta::builder().name("stranded-work".into()).build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "stranded".into(),
+                vessel_name: "work".into(),
+                fulfilment_kind_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
             },
         )
         .await
-        .expect("terminal create");
-    let mut status = TerminalSessionStatus::default();
-    TerminalSessionStatusPatch::MarkRunning {
-        configured_limits: None,
-        session_id: "terminal-stranded-work-coder".into(),
-        pid: None,
-        started_at: chrono::Utc::now(),
-        crew: Some(
-            CrewSessionStatus::builder().id("crew-coder".to_string()).adapter("codex".to_string()).stance("trusted".to_string()).build(),
-        ),
-        launch_command: "codex".into(),
-        delivered_message_id: None,
-    }
-    .apply(&mut status);
-    sessions.update_status(&created.metadata.name, &created.metadata.resource_version, &status).await.expect("running terminal");
+        .expect("crew vessel");
+    let spec = TerminalSessionSpec {
+        env_ref: "local".into(),
+        role: "coder".into(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector::for_capability("code"),
+            brief: TerminalBrief {
+                artifact_digest: None,
+                path: ".flotilla/briefs/coder.md".into(),
+                content: String::new(),
+                copies: vec![],
+            },
+            context: Box::new(TerminalCrewContext {
+                namespace: "flotilla".into(),
+                convoy: "stranded".into(),
+                vessel_ref: "stranded-work".into(),
+            }),
+            message: None,
+        },
+        cwd: "/repo".into(),
+        env: Default::default(),
+        pool: "cleat".into(),
+    };
+    let crew = run_session(&daemon, "terminal-stranded-work-coder", &spec, &codex_crew_facts());
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     {
@@ -2060,7 +2032,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         .dispatch_execute(
             Command::builder()
                 .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                    context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() },
                     message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
                     disposition: None,
                     decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1300#issuecomment-1".into()),
@@ -2075,16 +2047,15 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         error,
         "completion pending: authority unreachable for stranded at feta: connect to feta at ssh://feta.example: outbound channel closed"
     );
-    let terminal = sessions.get("terminal-stranded-work-coder").await.expect("terminal");
-    let pending = terminal.status.expect("terminal status").completion_pending.expect("durable completion intent");
-    assert_eq!(pending.authority, "feta");
-    assert!(pending.last_error.contains("authority unreachable for stranded"));
+    // Waiting on CrewCompletion (owner look-over pending): the queued intent's durable record names
+    // authority `feta` and an error containing "authority unreachable for stranded". It lived on
+    // the retired TerminalSessionStatus.completion_pending; restore these asserts against it.
 
     router
         .dispatch_execute(
             Command::builder()
                 .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                    context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() },
                     message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
                     disposition: None,
                     decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1301#issuecomment-2".into()),
@@ -2094,16 +2065,8 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         )
         .await
         .expect_err("corrected completion should remain queued during the partition");
-    let pending = sessions
-        .get("terminal-stranded-work-coder")
-        .await
-        .expect("terminal after corrected completion")
-        .status
-        .expect("terminal status")
-        .completion_pending
-        .expect("corrected durable completion intent");
-    assert_eq!(pending.message.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/1301"));
-    assert_eq!(pending.decision_ledger_ref.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/1301#issuecomment-2"));
+    // Waiting on CrewCompletion (owner look-over pending): the queued intent's durable record carries
+    // the corrected message (pull/1301) and decision ledger ref (pull/1301#issuecomment-2).
 
     let delivered = Arc::new(StdMutex::new(Vec::new()));
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(CapturePeerSender(Arc::clone(&delivered))));
@@ -2130,25 +2093,16 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         other => panic!("expected retried crew completion, got {other:?}"),
     };
     router.complete_remote_command(request_id, node("feta"), CommandValue::Error { message: "crew work no longer exists".into() }).await;
-    assert!(
-        sessions
-            .get("terminal-stranded-work-coder")
-            .await
-            .expect("terminal after acknowledgement")
-            .status
-            .expect("terminal status")
-            .completion_pending
-            .is_none(),
-        "authority rejection should retire the acknowledged durable intent"
-    );
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_eq!(delivered.lock().expect("delivered lock").len(), 1, "permanent authority rejection must not retry");
+    // Waiting on CrewCompletion (owner look-over pending): the queued intent's durable record is retired
+    // by the authority's rejection.
 
     router
         .dispatch_execute(
             Command::builder()
                 .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                    context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() },
                     message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
                     disposition: None,
                     decision_ledger_ref: None,
@@ -2163,24 +2117,15 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         other => panic!("expected fresh crew completion, got {other:?}"),
     };
     router.complete_remote_command(request_id, node("feta"), CommandValue::CrewCompletionAdvisory { pending: vec![] }).await;
-    assert!(
-        sessions
-            .get("terminal-stranded-work-coder")
-            .await
-            .expect("terminal after successful acknowledgement")
-            .status
-            .expect("terminal status")
-            .completion_pending
-            .is_none(),
-        "successful authority acknowledgement should retire the durable completion intent"
-    );
+    // Waiting on CrewCompletion (owner look-over pending): the queued intent's durable record is retired
+    // by the authority's successful acknowledgement.
 
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(FailingPeerSender));
     // Both live crew queries route to the authority and report partitions;
     // contacts must not silently answer from a stale follower projection.
     for action in [
-        CommandAction::QueryCrewList { context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() } },
-        CommandAction::QueryMessageContacts { context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() } },
+        CommandAction::QueryCrewList { context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() } },
+        CommandAction::QueryMessageContacts { context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() } },
     ] {
         let query_error = router
             .dispatch_query(Command::builder().action(action).build(), uuid::Uuid::nil())
@@ -2395,23 +2340,17 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
         }
         .run(),
     );
-    let terminal_task = tokio::spawn(
-        ControllerLoop {
-            primary: placed.using::<TerminalSession>("flotilla"),
-            secondaries: Vec::new(),
-            reconciler: flotilla_crew::reconcilers::terminal_session::TerminalSessionReconciler::new(
-                Arc::new(RunningTerminalRuntime),
-                placed.clone(),
-                "flotilla",
-            )
-            .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
-            resync_interval: Duration::from_millis(20),
-            backend: placed.clone(),
-        }
-        .run(),
-    );
+    // Stands in for the placement's TerminalSession controller, whose own tests cover it: each
+    // session its vessel requested is realised.
+    let terminals = &install_engine(&remote_daemon).terminals;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
+            use flotilla_resources::terminal_records::TerminalRecords as _;
+            for record in terminals.terminals.at(&terminals.home).expect("placement launches") {
+                if !record.ended() && !record.is_running() {
+                    terminals.ready(&record.name, &format!("session-{}", record.session_name()), &Default::default());
+                }
+            }
             let sessions = placed.using::<TerminalSession>("flotilla").list().await.expect("placement sessions");
             if sessions.items.iter().any(|session| {
                 session.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::TerminalSessionPhase::Running)
@@ -2425,7 +2364,6 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     .await
     .expect("placement session reaches Running");
     vessel_task.abort();
-    terminal_task.abort();
     assert!(daemon.resource_backend().using::<TerminalSession>("flotilla").list().await.expect("dispatcher sessions").items.is_empty());
 
     let disconnected_peers = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -2621,29 +2559,6 @@ async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement()
         .await
         .expect_err("statusless placement still requires a connected route");
     assert_eq!(error, "peer host statusless-host-id is not connected");
-}
-
-struct RunningTerminalRuntime;
-
-#[async_trait::async_trait]
-impl flotilla_crew::reconcilers::terminal_session::TerminalRuntime for RunningTerminalRuntime {
-    async fn ensure_session(
-        &self,
-        name: &str,
-        _spec: TerminalSessionTarget<'_>,
-        _tags: &[flotilla_terminal::TerminalSessionTag],
-    ) -> Result<flotilla_crew::reconcilers::terminal_session::TerminalRuntimeState, String> {
-        Ok(flotilla_crew::reconcilers::terminal_session::TerminalRuntimeState::builder()
-            .session_id(format!("session-{name}"))
-            .pid(42)
-            .started_at(chrono::Utc::now())
-            .launch_command("test terminal".to_string())
-            .build())
-    }
-
-    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
-        Ok(())
-    }
 }
 
 #[tokio::test]
@@ -5293,8 +5208,7 @@ impl flotilla_discovery_api::Factory for GatedStartupEnvironmentFactory {
 async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() {
     use flotilla_resources::{
         ConvoyPhase, ConvoyStatus, CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
-        CredentialSpec, CredentialSpecSpec, TerminalSessionPhase, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
-        WorkflowSnapshot,
+        CredentialSpec, CredentialSpecSpec, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkflowSnapshot,
     };
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -5405,43 +5319,32 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
         )
         .await
         .expect("placed vessel");
-    let sessions = backend.using::<TerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder().name("live-crew".into()).build(),
-            &TerminalSessionSpec {
-                env_ref,
-                role: "coder".into(),
-                cwd: "/workspace".into(),
-                env: Default::default(),
-                pool: "passthrough".into(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector { capability: "code".into(), adapter: None, model: None },
-                    brief: TerminalBrief {
-                        artifact_digest: None,
-                        path: ".flotilla/briefs/coder.md".into(),
-                        content: "test".into(),
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "live-credential-work".into(),
-                        vessel_ref: "live-work-vessel".into(),
-                    }),
-                    message: None,
-                },
+    // The live crew's launch, running before this start as the last run's controller left it.
+    let spec = TerminalSessionSpec {
+        env_ref,
+        role: "coder".into(),
+        cwd: "/workspace".into(),
+        env: Default::default(),
+        pool: "passthrough".into(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector { capability: "code".into(), adapter: None, model: None },
+            brief: TerminalBrief {
+                artifact_digest: None,
+                path: ".flotilla/briefs/coder.md".into(),
+                content: "test".into(),
+                copies: Vec::new(),
             },
-        )
-        .await
-        .expect("live crew");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..TerminalSessionStatus::default() },
-        )
-        .await
-        .expect("running crew");
+            context: Box::new(TerminalCrewContext {
+                namespace: "flotilla".into(),
+                convoy: "live-credential-work".into(),
+                vessel_ref: "live-work-vessel".into(),
+            }),
+            message: None,
+        },
+    };
+    let terminals = runtime_terminals(&daemon);
+    let launch = terminals.request(&session_request("live-crew", &spec));
+    terminals.ready(&launch, "live-crew", &Default::default());
     let runtime = tokio::time::timeout(
         StdDuration::from_secs(2),
         crate::runtime::DaemonRuntime::start_with_options(
@@ -5773,8 +5676,7 @@ pub(super) use crate::testkits::engine::engine_environments;
 
 pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     let (_tmp, daemon) = empty_daemon().await;
-    place_crew(&daemon, environment, PlacedCrew { convoy: "own", vessel: "placed-vessel", session: "placed-session", crew: "placed-crew" })
-        .await;
+    place_crew(&daemon, environment, PlacedCrew { convoy: "own", vessel: "placed-vessel", session: "placed-session" }).await;
     (_tmp, daemon)
 }
 
@@ -5783,7 +5685,15 @@ pub(super) struct PlacedCrew<'a> {
     pub convoy: &'a str,
     pub vessel: &'a str,
     pub session: &'a str,
-    pub crew: &'a str,
+}
+
+/// The newest launch of session `session` at `daemon`'s engine: the crew id of its crew.
+pub(super) fn launch_of(daemon: &InProcessDaemon, session: &str) -> String {
+    let engine = install_engine(daemon);
+    flotilla_resources::terminal_records::TerminalRecords::get(engine.terminals.terminals.as_ref(), session, None)
+        .expect("read launch")
+        .expect("a launch")
+        .name
 }
 
 pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, placed: PlacedCrew<'_>) {
@@ -5835,43 +5745,36 @@ pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, plac
         )
         .await
         .expect("placed vessel");
-    let sessions = backend.using::<TerminalSession>("flotilla");
-    let created = sessions
-        .create(
-            &InputMeta::builder().name(placed.session.into()).build(),
-            &TerminalSessionSpec {
-                env_ref: environment.into(),
-                role: "coder".into(),
-                cwd: "/workspace".into(),
-                pool: "cleat".into(),
-                env: Default::default(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("coding"),
-                    brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: placed.convoy.into(),
-                        vessel_ref: placed.vessel.into(),
-                    }),
-                    message: None,
-                },
-            },
-        )
-        .await
-        .expect("placed session");
-    sessions
-        .update_status(
-            placed.session,
-            &created.metadata.resource_version,
-            &TerminalSessionStatus {
-                crew: Some(
-                    CrewSessionStatus::builder().id(placed.crew.into()).adapter("codex".into()).stance("trusted-implicit".into()).build(),
-                ),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("crew identity");
+    let spec = TerminalSessionSpec {
+        env_ref: environment.into(),
+        role: "coder".into(),
+        cwd: "/workspace".into(),
+        pool: "cleat".into(),
+        env: Default::default(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector::for_capability("coding"),
+            brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
+            context: Box::new(TerminalCrewContext {
+                namespace: "flotilla".into(),
+                convoy: placed.convoy.into(),
+                vessel_ref: placed.vessel.into(),
+            }),
+            message: None,
+        },
+    };
+    run_session(daemon, placed.session, &spec, &codex_crew_facts());
+}
+
+/// The facts of a Codex crew's launch that runs trusted.
+fn codex_crew_facts() -> flotilla_resources::terminal_records::TerminalLaunchFacts {
+    flotilla_resources::terminal_records::TerminalLaunchFacts {
+        agent: Some(flotilla_resources::terminal_records::AgentLaunch {
+            adapter: "codex".into(),
+            model: None,
+            stance: "trusted-implicit".into(),
+        }),
+        ..Default::default()
+    }
 }
 
 mod ssh_host_forward;
@@ -5914,7 +5817,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         ("FLOTILLA_CONVOY".into(), "own".into()),
         ("FLOTILLA_VESSEL".into(), "placed-vessel".into()),
         ("FLOTILLA_CREW_ROLE".into(), "coder".into()),
-        ("FLOTILLA_CREW_ID".into(), "placed-crew".into()),
+        ("FLOTILLA_CREW_ID".into(), launch_of(&daemon, "placed-session")),
         ("FLOTILLA_TERMINAL_SESSION".into(), "placed-session".into()),
     ]);
     let resolved = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&mounts)).await.unwrap();
@@ -6101,54 +6004,25 @@ pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
             .await
             .unwrap();
     }
-    let sessions = backend.using::<TerminalSession>("flotilla");
-    let created = sessions
-        .create(
-            &InputMeta::builder()
-                .name("supervisor-session".into())
-                .labels(BTreeMap::from([
-                    (flotilla_resources::CONVOY_LABEL.into(), "supervisor".into()),
-                    (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
-                    (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
-                ]))
-                .build(),
-            &TerminalSessionSpec {
-                env_ref: "supervisor-environment".into(),
-                role: "coder".into(),
-                cwd: "/workspace".into(),
-                pool: "cleat".into(),
-                env: Default::default(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("coding"),
-                    brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "supervisor".into(),
-                        vessel_ref: "supervisor-vessel".into(),
-                    }),
-                    message: None,
-                },
-            },
-        )
-        .await
-        .unwrap();
-    sessions
-        .update_status(
-            "supervisor-session",
-            &created.metadata.resource_version,
-            &TerminalSessionStatus {
-                crew: Some(
-                    CrewSessionStatus::builder()
-                        .id("supervisor-crew".into())
-                        .adapter("codex".into())
-                        .stance("trusted-implicit".into())
-                        .build(),
-                ),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let spec = TerminalSessionSpec {
+        env_ref: "supervisor-environment".into(),
+        role: "coder".into(),
+        cwd: "/workspace".into(),
+        pool: "cleat".into(),
+        env: Default::default(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector::for_capability("coding"),
+            brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
+            context: Box::new(TerminalCrewContext {
+                namespace: "flotilla".into(),
+                convoy: "supervisor".into(),
+                vessel_ref: "supervisor-vessel".into(),
+            }),
+            message: None,
+        },
+    };
+    let launch = request_session(&daemon, "supervisor-session", &spec);
+    install_engine(&daemon).terminals.ready(&launch, "supervisor-session", &codex_crew_facts());
     let ensures = backend.using::<ConvoyEnsure>("flotilla");
     ensures
         .create(
@@ -6334,13 +6208,13 @@ pub(super) fn caller_mountinfo(environment: &EnvironmentId, bound: bool) -> supe
     }
 }
 
-fn placed_caller_claims() -> HashMap<String, String> {
+fn placed_caller_claims(daemon: &InProcessDaemon) -> HashMap<String, String> {
     HashMap::from([
         ("FLOTILLA_NAMESPACE".into(), "flotilla".into()),
         ("FLOTILLA_CONVOY".into(), "own".into()),
         ("FLOTILLA_VESSEL".into(), "placed-vessel".into()),
         ("FLOTILLA_CREW_ROLE".into(), "coder".into()),
-        ("FLOTILLA_CREW_ID".into(), "placed-crew".into()),
+        ("FLOTILLA_CREW_ID".into(), launch_of(daemon, "placed-session")),
         ("FLOTILLA_TERMINAL_SESSION".into(), "placed-session".into()),
     ])
 }
@@ -6429,15 +6303,15 @@ async fn host_direct_caller_keeps_crew_completion_and_stall() {
     let mut contained = evidence.clone();
     contained.process.as_mut().unwrap().container = Some("stale-container".into());
     let mounts = caller_mountinfo(&EnvironmentId::new("host-direct-fixture"), true);
-    for claims in [Default::default(), placed_caller_claims()] {
+    for claims in [Default::default(), placed_caller_claims(&daemon)] {
         assert_eq!(
             super::caller::resolve_main_caller(&daemon, contained.clone(), &claims, Some(&mounts)).await.unwrap_err(),
             "CallerIdentityUnavailable: container has no placed environment"
         );
     }
-    let resolution = super::caller::resolve_main_caller(&daemon, evidence, &placed_caller_claims(), None).await.unwrap();
+    let resolution = super::caller::resolve_main_caller(&daemon, evidence, &placed_caller_claims(&daemon), None).await.unwrap();
     assert!(!resolution.transport_bound);
-    assert_eq!(resolution.caller.crew.as_ref().unwrap().crew_id, "placed-crew");
+    assert_eq!(resolution.caller.crew.as_ref().unwrap().crew_id, launch_of(&daemon, "placed-session"));
     caller_can_stall_and_complete(&daemon, resolution.caller).await;
 }
 
@@ -6460,7 +6334,7 @@ async fn legacy_mount_caller_keeps_working_until_vessel_ends() {
         process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).container("kernel-container".into()).build()),
         crew: None,
     };
-    let claims = placed_caller_claims();
+    let claims = placed_caller_claims(&daemon);
     let environment = EnvironmentId::new("placed-environment");
     let old_mounts = caller_mountinfo(&environment, false);
     let legacy = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&old_mounts)).await.unwrap();
@@ -6561,20 +6435,15 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
                 let name = format!("{harness_name}-{http}");
                 let terminal = flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() };
                 let terminals = daemon.resource_backend().using::<TerminalSession>("flotilla");
-                terminals
-                    .create(
-                        &InputMeta::builder().name(name.clone()).build(),
-                        &TerminalSessionSpec {
-                            env_ref: "host-direct".into(),
-                            role: "coder".into(),
-                            source: TerminalSessionSource::Tool { command: harness_name.into() },
-                            cwd: "/repo".into(),
-                            env: Default::default(),
-                            pool: "test".into(),
-                        },
-                    )
-                    .await
-                    .unwrap();
+                let spec = TerminalSessionSpec {
+                    env_ref: "host-direct".into(),
+                    role: "coder".into(),
+                    source: TerminalSessionSource::Tool { command: harness_name.into() },
+                    cwd: "/repo".into(),
+                    env: Default::default(),
+                    pool: "test".into(),
+                };
+                let launch = run_session(&daemon, &name, &spec, &Default::default());
                 let router = HttpRouter::for_daemon(
                     Arc::clone(&daemon),
                     Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))),
@@ -6583,7 +6452,7 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
                 .into_router()
                 .layer(Extension(CallerAuth::Hook {
                     terminal: terminal.clone(),
-                    generation: terminals.get(&name).await.expect("terminal").metadata.creation_timestamp.to_rfc3339(),
+                    generation: super::http::hooks::launch_generation(&terminals.get(&name).await.expect("terminal")),
                 }));
                 let (harness, parser) = flotilla_agent::parser_for_harness(harness_name).unwrap();
                 let interrupt =
@@ -6636,9 +6505,9 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
                         .await;
                         assert!(matches!(ok_response(response, 1), Response::AgentHook));
                     }
-                    // A single name lookup returns this session, and another session stays unchanged.
+                    // A single name lookup returns this launch's session, and another session stays unchanged.
                     assert_eq!(primitives.sessions().get("other-session").unwrap(), other);
-                    let current = primitives.sessions().get(&name);
+                    let current = primitives.sessions().get(&launch);
                     if !enabled {
                         assert!(current.is_none());
                         continue;
@@ -6674,7 +6543,9 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
     }
 }
 
-async fn activity_failure_test_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>, Arc<flotilla_core::primitives::MessagePrimitives>) {
+/// A daemon whose session `agent` runs, and the launch its AgentSession is named by.
+async fn activity_failure_test_daemon(
+) -> (tempfile::TempDir, Arc<InProcessDaemon>, Arc<flotilla_core::primitives::MessagePrimitives>, String) {
     let (tmp, daemon) = empty_daemon().await;
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(
@@ -6694,23 +6565,17 @@ async fn activity_failure_test_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
         .unwrap(),
     );
     daemon.install_message_primitives(Arc::clone(&primitives)).unwrap();
-    daemon
-        .resource_backend()
-        .using::<TerminalSession>("flotilla")
-        .create(
-            &InputMeta::builder().name("agent".to_string()).build(),
-            &TerminalSessionSpec {
-                env_ref: "host-direct".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Tool { command: "agent".into() },
-                cwd: "/repo".into(),
-                env: Default::default(),
-                pool: "test".into(),
-            },
-        )
-        .await
-        .unwrap();
-    (tmp, daemon, primitives)
+    let spec = TerminalSessionSpec {
+        env_ref: "host-direct".into(),
+        role: "coder".into(),
+        source: TerminalSessionSource::Tool { command: "agent".into() },
+        cwd: "/repo".into(),
+        env: Default::default(),
+        pool: "test".into(),
+    };
+    let launch = request_session(&daemon, "agent", &spec);
+    install_engine(&daemon).terminals.ready(&launch, "agent", &Default::default());
+    (tmp, daemon, primitives, launch)
 }
 
 // Activity-store errors must leave the pre-existing hook attention path working.
@@ -6722,20 +6587,20 @@ async fn agent_activity_store_failure_preserves_legacy_attention() {
         machines::agent_session::{Activity, AgentSession},
         Resource,
     };
-    let (_tmp, daemon, primitives) = activity_failure_test_daemon().await;
-    primitives.sessions().ensure("agent", Timestamp(0)).unwrap();
+    let (_tmp, daemon, primitives, launch) = activity_failure_test_daemon().await;
+    primitives.sessions().ensure(&launch, Timestamp(0)).unwrap();
     primitives
         .service()
         .with_store(|store| {
             let mut write = store.write()?;
-            let id = write.resolve(Resource::<AgentSession>::CODE, "agent", "home")?.unwrap();
+            let id = write.resolve(Resource::<AgentSession>::CODE, &launch, "home")?.unwrap();
             let loaded = write.load::<Resource<AgentSession>>(id)?.unwrap();
             write.delete::<Resource<AgentSession>>(loaded.stamp(), &NewChange::new("test", Timestamp(1)))?;
             write.commit()
         })
         .unwrap();
     assert!(
-        primitives.sessions().observe("agent", Activity::Working, "UserPromptSubmit".into(), Timestamp(2)).is_err(),
+        primitives.sessions().observe(&launch, Activity::Working, "UserPromptSubmit".into(), Timestamp(2)).is_err(),
         "the store write really fails"
     );
     for harness in [AgentHarness::ClaudeCode, AgentHarness::Codex] {
@@ -6752,22 +6617,22 @@ async fn agent_activity_store_failure_preserves_legacy_attention() {
         let terminal = daemon.resource_backend().using::<TerminalSession>("flotilla").get("agent").await.unwrap();
         assert_eq!(terminal.status.unwrap().attention.unwrap().state, TerminalAttentionState::Working);
         assert!(
-            primitives.sessions().get("agent").unwrap().state().observation().is_none(),
+            primitives.sessions().get(&launch).unwrap().state().observation().is_none(),
             "failed activity writes leave the cached value unchanged"
         );
     }
 }
 
-// Duplicate observations bypass terminal reads and the blocking writer entirely.
-// A missing terminal would fail the observer if it did any backend lookup.
+// Duplicate observations never reach the AgentSession writer; a changed one still finds the
+// session's launch here, and a session with none records nothing. The launch is read first now:
+// the AgentSession is named by it (#3108).
 #[tokio::test]
-async fn agent_activity_duplicates_skip_terminal_reads() {
+async fn agent_activity_duplicates_skip_the_writer() {
     use flotilla_schema::Timestamp;
     use flotilla_state_machines::machines::agent_session::Activity;
-    let (_tmp, daemon, primitives) = activity_failure_test_daemon().await;
-    primitives.sessions().observe("agent", Activity::Working, "UserPromptSubmit".into(), Timestamp(1)).unwrap();
-    let before = primitives.sessions().get("agent").unwrap();
-    let empty_backend = ResourceBackend::new(InMemoryBackend::default());
+    let (_tmp, daemon, primitives, launch) = activity_failure_test_daemon().await;
+    primitives.sessions().observe(&launch, Activity::Working, "UserPromptSubmit".into(), Timestamp(1)).unwrap();
+    let before = primitives.sessions().get(&launch).unwrap();
     let mut event = AgentHookEvent::builder()
         .attachable_id(AttachableId::new("candidate"))
         .harness(AgentHarness::ClaudeCode)
@@ -6775,14 +6640,15 @@ async fn agent_activity_duplicates_skip_terminal_reads() {
         .hook_event("PreToolUse".to_string())
         .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "agent".into() })
         .build();
-    super::request_dispatch::record_hook_activity(&empty_backend, &primitives, &event).await.unwrap();
-    assert_eq!(primitives.sessions().get("agent").unwrap(), before);
+    super::request_dispatch::record_hook_activity(Some(daemon.lifecycle_reads()), &primitives, &event).await.unwrap();
+    assert_eq!(primitives.sessions().get(&launch).unwrap(), before);
     event.event_type = AgentEventType::Idle;
+    event.terminal = Some(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "gone".into() });
     assert!(
-        super::request_dispatch::record_hook_activity(&empty_backend, &primitives, &event).await.is_err(),
-        "changed activity still validates the terminal"
+        super::request_dispatch::record_hook_activity(Some(daemon.lifecycle_reads()), &primitives, &event).await.is_err(),
+        "changed activity still validates the session's launch"
     );
-    assert_eq!(primitives.sessions().get("agent").unwrap(), before);
+    assert_eq!(primitives.sessions().get(&launch).unwrap(), before);
     drop(daemon);
 }
 

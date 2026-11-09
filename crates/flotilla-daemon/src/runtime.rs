@@ -29,14 +29,11 @@ use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::{codex_central_auth_path, AgentMaterialRegistry, CodexCentralRefresher, CredentialStore};
 use flotilla_crew::convoy::ConvoyReconciler;
-use flotilla_crew::reconcilers::terminal_session::TerminalSessionReconciler;
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
-use flotilla_provisioning::engine::{
-    image_build::ImageBuildBinding, terminal_session::TerminalSessionBinding, vessel::VesselBinding, Engine,
-};
+use flotilla_provisioning::engine::{image_build::ImageBuildBinding, vessel::VesselBinding, Engine};
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
@@ -885,29 +882,6 @@ fn spawn_controller_loops(
                 (RepositoryReconciler::secondary_watches(observed_backend, &namespace_string, decided.clone()), reconciler)
             }
         }),
-        controller!(TerminalSession, {
-            let state = Arc::clone(&state);
-            move |backend: ResourceBackend, namespace_string: String| {
-                let local_host_ref = state.local_host_ref.clone();
-                let additional_host_refs = state.ssh_host_refs();
-                let state = Arc::clone(&state);
-                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.terminal_sessions));
-                let reads = state.daemon.lifecycle_reads();
-                let progress = state.daemon.crew_progress();
-                (
-                    vec![],
-                    Engine::<_, TerminalSessionBinding>::new(
-                        TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
-                            .with_lifecycle_reads(reads)
-                            .with_progress(progress)
-                            .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
-                            .with_additional_host_refs(additional_host_refs)
-                            .with_federated_convoys(&backend, &namespace_string),
-                        lifecycles,
-                    ),
-                )
-            }
-        }),
         controller!(Vessel, {
             let state = Arc::clone(&state);
             let config_dir = state.config.base_path().as_path().to_path_buf();
@@ -981,6 +955,7 @@ fn spawn_controller_loops(
     controllers.extend(spawn_environment_controller(&state));
     controllers.extend(spawn_clone_controller(&state));
     controllers.extend(spawn_checkout_controller(&state));
+    controllers.extend(spawn_terminal_controller(&state));
     if let Some(distributor) = &state.image_inventory {
         let distributor = Arc::clone(distributor);
         controllers.push(tokio::spawn(async move {
@@ -1239,6 +1214,50 @@ fn spawn_clone_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHan
     }
 }
 
+/// The TerminalSession controller (#3108): the single writer of this home's terminal launches,
+/// starting each in its environment's terminal pool and killing it once its holder has ended. This
+/// host's probe looks at the running launches at an interval, pushing each one it finds ended.
+fn spawn_terminal_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHandle<()>> {
+    use flotilla_provisioning::engine::{
+        controller::Controller,
+        reads::StoreReads,
+        terminal_actuator::{TerminalActuator, TerminalProbe, TERMINAL_PROBE_EVERY},
+    };
+    let engine = state.provisioning.as_ref()?;
+    let service = match state.daemon.decided_store() {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "the TerminalSession controller has no decided store; terminal sessions will not launch");
+            return None;
+        }
+    };
+    let home = service.home().to_owned();
+    let provider = Arc::new(TerminalControllerRuntime { state: Arc::clone(state) });
+    let records = Arc::clone(&engine.terminal_records) as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>;
+    let actuator = TerminalActuator::new(
+        Arc::clone(&provider),
+        Arc::clone(&records),
+        StoreReads::new(service.store()),
+        home,
+        engine.terminal_facts.clone(),
+    );
+    let briefs = actuator.awaited_briefs();
+    match Controller::start(Arc::clone(&engine.terminal_sessions), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
+        Ok(controller) => {
+            let (backings, backing_events) = tokio::sync::mpsc::channel(64);
+            let (rechecks, recheck_events) = tokio::sync::mpsc::channel(64);
+            let probe =
+                TerminalProbe::new(provider, records, backings).with_progress(state.daemon.crew_progress()).with_briefs(briefs, rechecks);
+            tokio::spawn(probe.run(TERMINAL_PROBE_EVERY));
+            Some(tokio::spawn(controller.run_with(backing_events, recheck_events)))
+        }
+        Err(error) => {
+            error!(%error, "the TerminalSession controller could not start; terminal sessions will not launch");
+            None
+        }
+    }
+}
+
 /// The Checkout controller (#3108): the single writer of this home's checkout launches, making
 /// each in its environment for its holder Convoy and removing it once that convoy has ended. The
 /// observed-checkout refresh names the launches whose paths it saw change, and each is observed
@@ -1329,12 +1348,9 @@ async fn open_provisioning_lifecycles(
     };
     let store = daemon.decided_store()?.store();
     let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
-    daemon.install_vessel_seats(Arc::new(EngineVesselSeats {
-        reads: StoreReads::new(Arc::clone(&store)),
-        backend: daemon.resource_backend(),
-    }))?;
-    let backend = daemon.resource_backend();
+    daemon.install_vessel_seats(Arc::new(EngineVesselSeats { backend: daemon.resource_backend(), reads: daemon.lifecycle_reads() }))?;
     let opened = Arc::clone(&store);
+    let service = daemon.decided_store()?;
     let lifecycles = tokio::task::spawn_blocking(move || {
         let store = opened;
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
@@ -1352,10 +1368,11 @@ async fn open_provisioning_lifecycles(
             open_home_with(&log(), LaunchLog::new(log(), checkout_facts.clone()).with_inputs(checkout_inputs.clone()))?,
         ));
         let checkout_records = Arc::new(EngineCheckouts::new(Arc::clone(&checkouts), Arc::clone(&store), checkout_inputs));
-        let terminal_sessions = Arc::new(LifecycleHome::new(&home, open_home(log())?));
-        backend.install_terminal_launches(Arc::new(flotilla_provisioning::engine::terminal_session::EngineTerminalLaunches {
-            lifecycles: terminal_sessions.clone(),
-        }));
+        // A terminal launch's facts are written in the transaction that realises it.
+        let terminal_facts = StagedFacts::default();
+        let terminal_sessions: Arc<dyn flotilla_provisioning::engine::Lifecycles<_>> =
+            Arc::new(LifecycleHome::new(&home, open_home_with(&log(), LaunchLog::new(log(), terminal_facts.clone()))?));
+        let terminal_records = Arc::new(EngineTerminals::over(Arc::clone(&terminal_sessions), service));
         Ok::<_, String>(ProvisioningLifecycles {
             environments: Arc::new(LifecycleHome::new(&home, open_home_with(&log(), LaunchLog::new(log(), environment_facts.clone()))?)),
             environment_facts,
@@ -1366,6 +1383,8 @@ async fn open_provisioning_lifecycles(
             checkout_facts,
             checkout_records,
             terminal_sessions,
+            terminal_facts,
+            terminal_records,
             vessels: Arc::new(PlacementLifecycles::new(&home, open_home(log())?)?),
         })
     })
@@ -1379,8 +1398,8 @@ async fn open_provisioning_lifecycles(
     let clone_changes = clones.follow(daemon.decided_store()?)?;
     // Every checkout reader and requester goes through the engine's checkouts.
     let checkout_changes = lifecycles.checkout_records.follow(daemon.decided_store()?)?;
-    // Terminal-session readers read the engine's launches.
-    let terminals = Arc::new(EngineTerminals::over(Arc::clone(&lifecycles.terminal_sessions) as _, daemon.decided_store()?));
+    // Every terminal-session reader and requester goes through the engine's launches.
+    let terminals = Arc::clone(&lifecycles.terminal_records);
     let terminal_changes = terminals.follow(daemon.decided_store()?)?;
     daemon.install_lifecycle_reads(Arc::new(
         LifecycleReadPort::new(StoreReads::new(store), home)
@@ -1394,15 +1413,12 @@ async fn open_provisioning_lifecycles(
     Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes, terminal_changes]))
 }
 
-/// Which seats a vessel serves (#3629 layer 8): its sessions by their vessel label, with each role
-/// the engine holds a launch for (`terminal_session.by_holder`, the vessel as holder) served by
-/// that launch's old session record instead. During the switch a vessel can hold launches the
-/// engine decided beside sessions only the old store knows (from before the switch, or homed
-/// elsewhere), so the labels are the base and the engine overlays them; an engine launch whose
-/// record is gone leaves the labels' answer.
+/// Which seats a vessel serves (#3629 layer 8): the newest launch of each session the engine holds
+/// for it, by role. A role launched at more than one home (a vessel placed anew) is served by its
+/// most recently requested launch.
 struct EngineVesselSeats {
-    reads: flotilla_provisioning::engine::reads::StoreReads,
     backend: ResourceBackend,
+    reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
 }
 
 #[async_trait::async_trait]
@@ -1413,32 +1429,14 @@ impl flotilla_resources::vessel_seats::VesselSeats for EngineVesselSeats {
         vessel_ref: &str,
     ) -> Result<std::collections::BTreeMap<String, flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>>, String>
     {
-        use flotilla_provisioning::{
-            engine::{launched, reads::ProvisioningReads},
-            stored::Holder,
-        };
-        let sessions = self.backend.including_replicas::<flotilla_resources::TerminalSession>(namespace);
-        let labelled = sessions
-            .list_matching_labels(&std::collections::BTreeMap::from([(
-                flotilla_resources::VESSEL_REF_LABEL.to_string(),
-                vessel_ref.to_owned(),
-            )]))
-            .await
-            .map_err(|error| error.to_string())?
-            .items;
-        let views = self.reads.held_sessions(&Holder::vessel(vessel_ref)).map_err(|error| error.to_string())?;
-        let mut names: Vec<String> = views.iter().map(|view| launched(&view.name).to_owned()).collect();
-        names.sort();
-        names.dedup();
-        let mut seats: std::collections::BTreeMap<_, _> =
-            labelled.into_iter().map(|session| (session.object.spec.role.clone(), session)).collect();
-        for name in names {
-            match sessions.get(&name).await {
-                Ok(session) => {
-                    seats.insert(session.object.spec.role.clone(), session);
-                }
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error.to_string()),
+        let views = flotilla_store::TerminalViews::new(self.backend.clone(), namespace, Arc::clone(&self.reads));
+        let mut seats = std::collections::BTreeMap::<String, flotilla_resources::ReadResourceObject<_>>::new();
+        for view in views.of_vessel(vessel_ref).await.map_err(|error| error.to_string())? {
+            let newer = seats
+                .get(&view.object.spec.role)
+                .is_none_or(|held| held.object.metadata.creation_timestamp < view.object.metadata.creation_timestamp);
+            if newer {
+                seats.insert(view.object.spec.role.clone(), view);
             }
         }
         Ok(seats)

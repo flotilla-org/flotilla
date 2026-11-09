@@ -109,30 +109,6 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
                 .await
                 .expect("unrelated PR");
         }
-        if request == "pending" {
-            let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-            let session = sessions.get("session").await.expect("session");
-            sessions
-                .update_status(
-                    "session",
-                    &session.metadata.resource_version,
-                    &flotilla_resources::TerminalSessionStatus {
-                        completion_pending: Some(flotilla_resources::CrewCompletionPending {
-                            message: None,
-                            disposition: None,
-                            decision_ledger_ref: None,
-                            force: false,
-                            principal_ref: None,
-                            attempted_at: chrono::Utc::now(),
-                            authority: "host".into(),
-                            last_error: "waiting".into(),
-                        }),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("pending status");
-        }
         let context = CrewCommandContext {
             crew_id: None,
             namespace: Some("flotilla".into()),
@@ -156,9 +132,6 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
             }
             "withdraw" => {
                 assert_eq!(crew.withdraw_pending_brief("flotilla", "crew").await.expect("withdraw"), None);
-            }
-            "pending" => {
-                assert_eq!(crew.pending_crew_completions().await.expect("pending").len(), 1);
             }
             _ => unreachable!(),
         }
@@ -191,7 +164,6 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
         ),
         ("teardown", ReadBudget::new().calls("Checkout", Query, 1).objects("Convoy", Get, 1, 1)),
         ("withdraw", ReadBudget::new().objects("Convoy", Get, 4, 3).calls("Message", Query, 1)),
-        ("pending", ReadBudget::new().objects("TerminalSession", Query, 1, 1)),
     ];
     for (request, budget) in budgets {
         // Unrelated resources cannot increase reads or decoding, per kind and operation.

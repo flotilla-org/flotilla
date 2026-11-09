@@ -10,9 +10,9 @@ use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
     api_version,
     attentions::{Attention, Attentions, Fact, OpenAttention, Sender, Subject},
-    delivery_hold::{delivery_demand, delivery_fact, DELIVERY_HOLD_REASON_ANNOTATION},
-    Convoy, ConvoyEnsure, Demand, DemandKind, DemandSpec, DemandState, InputMeta, Resource, ResourceError, ResourceObject, TerminalSession,
-    Vessel, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION,
+    delivery_hold::{delivery_demand, DELIVERY_HOLD_CONVOY_ANNOTATION, DELIVERY_HOLD_REASON_ANNOTATION, DELIVERY_HOLD_ROLE_ANNOTATION},
+    Convoy, ConvoyEnsure, Demand, DemandKind, DemandSpec, DemandState, InputMeta, Resource, ResourceError, ResourceObject, Vessel,
+    CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION,
     ENSURE_DRIFT_ATTENTION_PREFIX, ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION,
 };
 
@@ -75,15 +75,10 @@ impl OldStoreAttentions {
                     })
                     .collect()
             }
-            Fact::DeliveryHeld { session, .. } => {
-                let terminal = self
-                    .backend
-                    .including_replicas::<TerminalSession>(namespace)
-                    .get(session)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .object;
-                let (mut meta, spec) = delivery_demand(&terminal);
+            Fact::DeliveryHeld { session, convoy, role } => {
+                let (mut meta, spec) = delivery_demand(namespace, session);
+                meta.annotations.insert(DELIVERY_HOLD_CONVOY_ANNOTATION.to_owned(), convoy.clone());
+                meta.annotations.insert(DELIVERY_HOLD_ROLE_ANNOTATION.to_owned(), role.clone());
                 // The old Message controller keeps an open hold's reason current as its batch changes.
                 match self.demands(namespace).get(&meta.name).await {
                     Ok(current) if is_open(&current) => meta.annotations = current.metadata.annotations,
@@ -163,11 +158,13 @@ impl OldStoreAttentions {
             };
         }
         if let Some(session) = name.strip_prefix(DELIVERY) {
-            return match self.backend.including_replicas::<TerminalSession>(namespace).get(session).await {
-                Ok(terminal) => Ok(delivery_fact(&terminal.object).map(|fact| (fact.sender(), fact.subject()))),
-                Err(ResourceError::NotFound { .. }) => Ok(None),
-                Err(error) => Err(error.to_string()),
+            let annotation = |key| demand.metadata.annotations.get(key).cloned();
+            let (Some(convoy), Some(role)) = (annotation(DELIVERY_HOLD_CONVOY_ANNOTATION), annotation(DELIVERY_HOLD_ROLE_ANNOTATION))
+            else {
+                return Ok(None);
             };
+            let fact = Fact::DeliveryHeld { session: session.to_owned(), convoy, role };
+            return Ok(Some((fact.sender(), fact.subject())));
         }
         Ok(None)
     }

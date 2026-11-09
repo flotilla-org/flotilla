@@ -6,16 +6,16 @@ use async_trait::async_trait;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    external_patches as convoy_external_patches, Clock, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState,
-    InputMeta, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus as ResourceTerminalSessionStatus,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    external_patches as convoy_external_patches,
+    terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest},
+    Clock, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionSource,
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
 
 use flotilla_state_machines::machines::agent_session::Activity;
 
-use super::support::{resume_staging_fixture, resume_staging_fixture_with_backend, test_meta};
+use super::support::{ensure_vessel, observe_attention, resume_staging_fixture, resume_staging_fixture_with_backend, test_meta};
 use crate::in_process::{input_meta_from_resource, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_crew::crew_ops::{ConvoyResumeOutcome, CrewSupervisionRequest};
@@ -72,31 +72,6 @@ async fn resume_stages_credentials_before_message_and_retries_failure() {
     // Native Message attribution is separate from its unframed body.
     assert_eq!(records[0].spec.body, "continue");
     assert_eq!(records[0].spec.sender, "principal:implicit");
-}
-
-#[tokio::test]
-async fn resume_retries_a_racing_session_write_after_staging() {
-    let (daemon, backend, probe) = resume_staging_fixture().await;
-    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
-    probe.invalidate_next.store(true, std::sync::atomic::Ordering::SeqCst);
-    let outcome = daemon
-        .convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"), ResumeIntent::Reopen)
-        .await
-        .expect("stale session write retried");
-    assert_eq!(outcome, ConvoyResumeOutcome::Queued { displaced: None });
-    let status = backend.using::<ResourceConvoy>("flotilla").get("resume-staging").await.expect("convoy").status.expect("status");
-    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
-    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
-    let session = backend.using::<ResourceTerminalSession>("flotilla").get("resume-staging-session").await.expect("session");
-    assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
-    assert!(backend
-        .using::<flotilla_resources::Message>("flotilla")
-        .list()
-        .await
-        .expect("inbox")
-        .items
-        .iter()
-        .any(|message| message.spec.body.contains("continue")));
 }
 
 /// System time plus an offset the test only ever moves forward.
@@ -206,58 +181,30 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         )
         .await
         .expect("governor status");
-    let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-    let source_session = sessions.get("resume-staging-session").await.expect("source session");
-    let mut session_status = ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() };
-    session_status.attention = Some(TerminalAttention {
-        state: TerminalAttentionState::Working,
-        as_of: chrono::Utc::now(),
-        source: TerminalAttentionSource::Hook,
+    let terminals = &probe.engine.terminals;
+    let source_launch = terminals.record("resume-staging-session").name;
+    terminals.ready(&source_launch, "resume-staging-pool-session", &Default::default());
+    let working = |as_of| TerminalAttention { state: TerminalAttentionState::Working, as_of, source: TerminalAttentionSource::Hook };
+    observe_attention(&probe.engine, &source_launch, working(chrono::Utc::now()));
+    ensure_vessel(&backend, "governor-watch", "governor", "watch").await;
+    let mut governor_request = terminals.record(&source_launch);
+    governor_request.role = "governor".to_string();
+    let governor_launch = terminals.request(&TerminalLaunchRequest {
+        session: "governor-session".to_string(),
+        environment: governor_request.environment,
+        vessel: Some("governor-watch".to_string()),
+        role: governor_request.role,
+        pool: governor_request.pool,
+        cwd: governor_request.cwd,
+        env: governor_request.env,
+        source: governor_request.source,
     });
-    sessions
-        .update_status("resume-staging-session", &source_session.metadata.resource_version, &session_status)
-        .await
-        .expect("source working");
-    let mut governor_spec = source_session.spec.clone();
-    governor_spec.role = "governor".to_string();
-    let TerminalSessionSource::Agent { context, .. } = &mut governor_spec.source else { panic!("agent session") };
-    context.convoy = "governor".to_string();
-    let governor_session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("governor-session".to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "governor".to_string()),
-                    (VESSEL_LABEL.to_string(), "watch".to_string()),
-                    (ROLE_LABEL.to_string(), "governor".to_string()),
-                ]))
-                .build(),
-            &governor_spec,
-        )
-        .await
-        .expect("governor session");
-    sessions
-        .update_status(
-            "governor-session",
-            &governor_session.metadata.resource_version,
-            &ResourceTerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                crew: Some(flotilla_resources::CrewSessionStatus {
-                    id: "governor-crew".to_string(),
-                    adapter: "codex".to_string(),
-                    model: None,
-                    stance: "governor".to_string(),
-                }),
-                attention: Some(TerminalAttention {
-                    state: TerminalAttentionState::Working,
-                    as_of: chrono::Utc::now(),
-                    source: TerminalAttentionSource::Hook,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("governor working");
+    let governor_facts = TerminalLaunchFacts {
+        agent: Some(AgentLaunch { adapter: "codex".to_string(), model: None, stance: "governor".to_string() }),
+        ..Default::default()
+    };
+    terminals.ready(&governor_launch, "governor-pool-session", &governor_facts);
+    observe_attention(&probe.engine, &governor_launch, working(chrono::Utc::now()));
     let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
     let mut task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     let patch = convoy_external_patches::mark_crew_stalled(
@@ -342,7 +289,8 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    super::test_engine(&daemon);
+    // The restarted daemon reads the same engine's launches.
+    daemon.install_lifecycle_reads(probe.engine.reads()).expect("engine reads");
     daemon.set_work_credential_reconciler(probe.clone()).await;
     daemon.crew.set_turn_delivery_actuator(supervision.clone()).await;
     let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
@@ -370,7 +318,8 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
                 .role("coder")
                 .operation(flotilla_protocol::CrewSupervisionAction::Resume)
                 .message("continue with access")
-                .actor_crew_id("governor-crew")
+                // The governor's crew id is its launch's name.
+                .actor_crew_id(&governor_launch)
                 .build(),
         )
         .await
@@ -391,29 +340,17 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         .expect("guidance Message");
     assert_eq!(guidance.spec.sender, "project/governor/watch/governor");
     assert_eq!(guidance.spec.relation, flotilla_resources::MessageRelation::Supervisor);
-    let governor_session = sessions.get("governor-session").await.expect("governor session");
-    sessions
-        .update_status(
-            "governor-session",
-            &governor_session.metadata.resource_version,
-            &ResourceTerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                attention: Some(TerminalAttention {
-                    state: TerminalAttentionState::Idle,
-                    as_of: clock.now(),
-                    source: TerminalAttentionSource::Hook,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("governor idle");
-    // Each hook is recorded on the session's AgentSession too, which stall judgement reads.
+    observe_attention(
+        &probe.engine,
+        &governor_launch,
+        TerminalAttention { state: TerminalAttentionState::Idle, as_of: clock.now(), source: TerminalAttentionSource::Hook },
+    );
+    // Each hook is recorded on the launch's AgentSession too, which stall judgement reads.
     let agents = super::support::agent_sessions(&daemon);
     let hook = |session: &str, activity, cause: &str| {
         agents.observe(session, activity, cause.into(), super::support::engine_at(clock.now())).expect("hook activity");
     };
-    hook("governor-session", Activity::Idle, "Stop");
+    hook(&governor_launch, Activity::Idle, "Stop");
     let patch = convoy_external_patches::mark_crew_stalled(
         "resume-staging".to_string(),
         "work".to_string(),
@@ -455,42 +392,14 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     )
     .await
     .expect("reset crew to working");
-    let governor_session = sessions.get("governor-session").await.expect("governor session");
-    sessions
-        .update_status(
-            "governor-session",
-            &governor_session.metadata.resource_version,
-            &ResourceTerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                attention: Some(TerminalAttention {
-                    state: TerminalAttentionState::Working,
-                    as_of: clock.now(),
-                    source: TerminalAttentionSource::Hook,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("governor working");
-    hook("governor-session", Activity::Working, "UserPromptSubmit");
-    let source_session = sessions.get("resume-staging-session").await.expect("source session");
-    sessions
-        .update_status(
-            "resume-staging-session",
-            &source_session.metadata.resource_version,
-            &ResourceTerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                attention: Some(TerminalAttention {
-                    state: TerminalAttentionState::NeedsInput,
-                    as_of: clock.now(),
-                    source: TerminalAttentionSource::Hook,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("source needs input");
-    hook("resume-staging-session", Activity::NeedsInput, "PermissionRequest");
+    observe_attention(&probe.engine, &governor_launch, working(clock.now()));
+    hook(&governor_launch, Activity::Working, "UserPromptSubmit");
+    observe_attention(
+        &probe.engine,
+        &source_launch,
+        TerminalAttention { state: TerminalAttentionState::NeedsInput, as_of: clock.now(), source: TerminalAttentionSource::Hook },
+    );
+    hook(&source_launch, Activity::NeedsInput, "PermissionRequest");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let status = convoys.get("resume-staging").await.expect("source").status.expect("status");
@@ -506,24 +415,8 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     })
     .await
     .expect("NeedsInput routes to governor");
-    let source_session = sessions.get("resume-staging-session").await.expect("source session");
-    sessions
-        .update_status(
-            "resume-staging-session",
-            &source_session.metadata.resource_version,
-            &ResourceTerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                attention: Some(TerminalAttention {
-                    state: TerminalAttentionState::Working,
-                    as_of: clock.now(),
-                    source: TerminalAttentionSource::Hook,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("source resumes work");
-    hook("resume-staging-session", Activity::Working, "PostToolUse");
+    observe_attention(&probe.engine, &source_launch, working(clock.now()));
+    hook(&source_launch, Activity::Working, "PostToolUse");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if convoys.get("resume-staging").await.expect("source").status.expect("status").stalled.is_none() {
@@ -553,9 +446,11 @@ async fn claimed_resume_delivers_information_without_reopening() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].spec.body, "please complete");
     assert_eq!(messages[0].spec.expectation, flotilla_resources::MessageExpectation::None);
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.get("resume-staging-session").await.unwrap();
-    sessions.delete(&session.metadata.name).await.unwrap();
+    // No launch of its session remains intact.
+    let terminals = &probe.engine.terminals;
+    let launch = terminals.record("resume-staging-session").name;
+    terminals.ready(&launch, "resume-staging-pool-session", &Default::default());
+    terminals.failed(&launch, "pool lost the session");
     daemon.convoy_resume_internal("flotilla", "resume-staging", "duplicate reminder", None, None, ResumeIntent::Reminder).await.unwrap();
     assert_eq!(convoys.get("resume-staging").await.unwrap().status.unwrap(), claimed);
 }

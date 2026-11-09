@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_imports, clippy::empty_line_after_outer_attr)]
 
 use crate::common::cr_name;
+use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords as _};
 use flotilla_resources::ResumeIntent;
 
 use flotilla_store_sqlite::SqliteBackend;
@@ -824,6 +825,12 @@ fn symlinked_fixture() -> (tempfile::TempDir, PathBuf) {
 }
 
 async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
+    let (temp, repo, daemon, _engine) = daemon_for_cwd_with_engine().await;
+    (temp, repo, daemon)
+}
+
+/// [`daemon_for_cwd`], with the engine its readings serve.
+async fn daemon_for_cwd_with_engine() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, flotilla_provisioning_testkit::EngineFixture) {
     let (temp, fixture) = symlinked_fixture();
     let repo = fixture.join("repo");
     init_git_repo(&repo);
@@ -837,8 +844,8 @@ async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) 
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let _engine = install_engine_reads(&daemon);
-    (temp, repo, daemon)
+    let engine = install_engine(&daemon);
+    (temp, repo, daemon, engine)
 }
 
 async fn daemon_for_plain_dir() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
@@ -860,6 +867,14 @@ async fn daemon_for_plain_dir() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
 }
 
 async fn daemon_for_plain_dir_with_discovery(discovery: DiscoveryRuntime) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
+    let (temp, repo, daemon, _engine) = daemon_for_plain_dir_with_engine(discovery).await;
+    (temp, repo, daemon)
+}
+
+/// [`daemon_for_plain_dir_with_discovery`], with the engine its readings serve.
+async fn daemon_for_plain_dir_with_engine(
+    discovery: DiscoveryRuntime,
+) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, flotilla_provisioning_testkit::EngineFixture) {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
@@ -873,9 +888,9 @@ async fn daemon_for_plain_dir_with_discovery(discovery: DiscoveryRuntime) -> (te
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let _engine = install_engine_reads(&daemon);
+    let engine = install_engine(&daemon);
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
-    (temp, repo, daemon)
+    (temp, repo, daemon, engine)
 }
 
 fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
@@ -884,16 +899,50 @@ fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
     Arc::new(ConfigStore::with_base(config_dir))
 }
 
-/// Installs the engine's readings on `daemon`, as the daemon's runtime does (#3108): its
-/// environments, clones and checkouts, homed here, with none held to start with.
-fn install_engine_reads(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::CheckoutFixture {
-    let store = flotilla_provisioning_testkit::CheckoutFixture::default().store;
-    let environments = flotilla_provisioning_testkit::EnvironmentFixture::over("home", Arc::clone(&store));
-    let clones = flotilla_provisioning_testkit::CloneFixture::over("home", Arc::clone(&store));
-    let engine = flotilla_provisioning_testkit::CheckoutFixture::over("home", store)
-        .serving(Arc::clone(&environments.environments) as _, Arc::clone(&clones.clones) as _);
-    daemon.install_lifecycle_reads(engine.reads.clone()).expect("engine reads");
+/// Installs the engine over `daemon`'s decided store as its readings, as the daemon's runtime
+/// does: its terminal sessions are read at every home the store holds, so another daemon's
+/// arrive as that daemon's log is replicated in.
+fn install_decided_engine(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EngineFixture {
+    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&daemon.decided_store().expect("decided store"));
+    daemon.install_lifecycle_reads(engine.reads()).expect("engine reads");
     engine
+}
+
+/// Installs the engine's readings on `daemon`, as the daemon's runtime does (#3108): its
+/// environments, clones, checkouts and terminal sessions, homed here, with none held to start with.
+fn install_engine_reads(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::CheckoutFixture {
+    install_engine(daemon).checkouts
+}
+
+/// [`install_engine_reads`], keeping the whole engine.
+fn install_engine(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EngineFixture {
+    let engine = flotilla_provisioning_testkit::EngineFixture::default();
+    daemon.install_lifecycle_reads(engine.reads()).expect("engine reads");
+    engine
+}
+
+/// Crew `role`'s agent session in `environment`, held by `vessel`, as its vessel requests it.
+fn crew_session_request(session: &str, vessel: &str, role: &str, capability: &str, environment: &str, pool: &str) -> TerminalLaunchRequest {
+    TerminalLaunchRequest {
+        session: session.to_string(),
+        environment: environment.to_string(),
+        vessel: Some(vessel.to_string()),
+        role: role.to_string(),
+        pool: pool.to_string(),
+        cwd: "/workspace".to_string(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Agent {
+            capability: capability.to_string(),
+            adapter: None,
+            model: None,
+            brief: flotilla_resources::TerminalBrief {
+                artifact_digest: None,
+                path: format!(".flotilla/briefs/{role}.md"),
+                content: "Initial turn".to_string(),
+                copies: Vec::new(),
+            },
+        },
+    }
 }
 
 #[tokio::test]
@@ -5077,7 +5126,7 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
 }
 
 #[tokio::test]
-async fn convoy_delete_reaps_a_landed_pre_identity_record_and_its_terminal_sessions() {
+async fn convoy_delete_reaps_a_landed_pre_identity_record() {
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -5097,24 +5146,6 @@ async fn convoy_delete_reaps_a_landed_pre_identity_record_and_its_terminal_sessi
         .await
         .expect("mark pre-identity convoy landed");
 
-    let sessions = backend.clone().using::<TerminalSession>("flotilla");
-    sessions
-        .create(
-            &InputMeta::builder()
-                .name("legacy-session".to_string())
-                .labels(BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), "command-builder".to_string())]))
-                .build(),
-            &TerminalSessionSpec::builder()
-                .env_ref("legacy-environment".to_string())
-                .role("coder".to_string())
-                .source(TerminalSessionSource::Tool { command: "legacy-agent".to_string() })
-                .cwd("/workspace".to_string())
-                .pool("cleat".to_string())
-                .build(),
-        )
-        .await
-        .expect("create legacy terminal session");
-
     let mut events = daemon.subscribe();
     let delete_id = daemon
         .execute(
@@ -5127,7 +5158,6 @@ async fn convoy_delete_reaps_a_landed_pre_identity_record_and_its_terminal_sessi
 
     assert_eq!(recv_command_finished(&mut events, delete_id).await, CommandValue::Ok);
     assert!(matches!(convoys.get("command-builder").await, Err(ResourceError::NotFound { .. })));
-    assert!(matches!(sessions.get("legacy-session").await, Err(ResourceError::NotFound { .. })));
     drop(temp);
 }
 
@@ -8956,7 +8986,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let _engine = install_engine_reads(&authority);
+    let _engine = install_decided_engine(&authority);
     let terminal_host = InProcessDaemon::new(
         vec![],
         test_config_store(terminal_temp.path().join("config")),
@@ -8966,7 +8996,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let _engine = install_engine_reads(&terminal_host);
+    let terminal_engine = install_decided_engine(&terminal_host);
     let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
         Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
@@ -9048,46 +9078,46 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
             .build()
             .name()
     };
-    let sessions = terminal_host.resource_backend().using::<TerminalSession>("flotilla");
-    let create_session = |role: &str, index| {
-        let name = session_name(role, index);
-        let labels = BTreeMap::from([
-            (CONVOY_LABEL.to_string(), "handoff-convoy".to_string()),
-            (VESSEL_LABEL.to_string(), "work".to_string()),
-            (ROLE_LABEL.to_string(), role.to_string()),
-            (flotilla_resources::VESSEL_REF_LABEL.to_string(), "work-vessel".to_string()),
-        ]);
-        let spec = TerminalSessionSpec::builder()
-            .env_ref("remote-environment".to_string())
-            .role(role.to_string())
-            .source(TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector::for_capability("coding"),
+    // The vessel's convoy reaches the session's home as the authority's records replicate there.
+    let replicate_vessel = || async {
+        let vessels = authority.resource_backend().using::<flotilla_resources::Vessel>("flotilla").list().await.expect("vessels");
+        terminal_host
+            .resource_backend()
+            .replica_writer::<flotilla_resources::Vessel>(authority.node_id().clone(), "flotilla")
+            .replace(&vessels, chrono::Utc::now())
+            .await
+            .expect("replicate vessel");
+    };
+    replicate_vessel().await;
+    // Each crew session is launched at the terminal host, and its log reaches the authority.
+    let start_session = |role: &str, index| {
+        let launch = terminal_engine.terminals.request(&TerminalLaunchRequest {
+            session: session_name(role, index),
+            environment: "remote-environment".to_string(),
+            vessel: Some("work-vessel".to_string()),
+            role: role.to_string(),
+            pool: "fake-terminals".to_string(),
+            cwd: "/workspace".to_string(),
+            env: Default::default(),
+            source: TerminalLaunchSource::Agent {
+                capability: "coding".to_string(),
+                adapter: None,
+                model: None,
                 brief: flotilla_resources::TerminalBrief {
                     artifact_digest: None,
                     path: "brief".to_string(),
                     content: "Initial".to_string(),
                     copies: Vec::new(),
                 },
-                context: Box::new(flotilla_resources::TerminalCrewContext {
-                    namespace: "flotilla".to_string(),
-                    convoy: "handoff-convoy".to_string(),
-                    vessel_ref: "work-vessel".to_string(),
-                }),
-                message: None,
-            })
-            .cwd("/workspace".to_string())
-            .pool("fake-terminals".to_string())
-            .build();
-        (name, labels, spec)
+            },
+        });
+        terminal_engine.terminals.ready(&launch, &format!("{role}-sid"), &Default::default());
+        flotilla_provisioning_testkit::replicate_home(
+            &terminal_host.decided_store().expect("terminal host store"),
+            terminal_host.decided_store().expect("terminal host store").home(),
+            &authority.decided_store().expect("authority store"),
+        );
     };
-    let (reviewer_name, labels, spec) = create_session("reviewer", 1);
-    sessions.create(&InputMeta::builder().name(reviewer_name.clone()).labels(labels).build(), &spec).await.expect("remote reviewer");
-    authority
-        .resource_backend()
-        .replica_writer::<TerminalSession>(terminal_host.node_id().clone(), "flotilla")
-        .replace(&sessions.list().await.expect("reviewer snapshot"), chrono::Utc::now())
-        .await
-        .expect("replicate reviewer");
     let context = flotilla_protocol::CrewCommandContext {
         crew_id: None,
         namespace: Some("flotilla".to_string()),
@@ -9095,6 +9125,17 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         vessel_ref: Some("work-vessel".to_string()),
         role: Some("coder".to_string()),
     };
+
+    // Only a remote anchor: the target cannot be created here.
+    start_session("coder", 0);
+    let error = authority
+        .crew_handoff_internal(&context, "reviewer", "Review again")
+        .await
+        .expect_err("remote anchor cannot create a local target");
+    assert!(error.contains(terminal_host.node_id().as_str()), "refusal must name the anchor origin: {error}");
+    assert_eq!(convoys.get("handoff-convoy").await.expect("convoy after refusal").status, Some(initial_status.clone()));
+
+    start_session("reviewer", 1);
     struct FailedHandoffPublisher;
     #[async_trait::async_trait]
     impl flotilla_crew::leaf_engine::ResourceIntentPublisher for FailedHandoffPublisher {
@@ -9119,31 +9160,10 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         .await
         .expect("replicate handoff");
     terminal_host.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver handoff at session origin");
-    let reviewer = sessions.get(&reviewer_name).await.expect("reviewer after delivery");
-    let TerminalSessionSource::Agent { message, .. } = reviewer.spec.source else { panic!("agent session expected") };
-    assert!(message.is_none());
     let inbox = terminal_host.resource_backend().using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
     assert_eq!(inbox.items.len(), 1);
     assert!(inbox.items[0].spec.body.contains("Review this"));
     assert_eq!(inbox.items[0].spec.sender, "flotilla/handoff-convoy/work/coder");
-
-    sessions.delete(&reviewer_name).await.expect("remove target session");
-    let (coder_name, labels, spec) = create_session("coder", 0);
-    sessions.create(&InputMeta::builder().name(coder_name).labels(labels).build(), &spec).await.expect("remote coder anchor");
-    authority
-        .resource_backend()
-        .replica_writer::<TerminalSession>(terminal_host.node_id().clone(), "flotilla")
-        .replace(&sessions.list().await.expect("coder snapshot"), chrono::Utc::now())
-        .await
-        .expect("replicate coder anchor");
-    let current = convoys.get("handoff-convoy").await.expect("convoy before refusal");
-    convoys.update_status("handoff-convoy", &current.metadata.resource_version, &initial_status).await.expect("reset crew status");
-    let error = authority
-        .crew_handoff_internal(&context, "reviewer", "Review again")
-        .await
-        .expect_err("remote anchor cannot create a local target");
-    assert!(error.contains(terminal_host.node_id().as_str()), "refusal must name the anchor origin: {error}");
-    assert_eq!(convoys.get("handoff-convoy").await.expect("convoy after refusal").status, Some(initial_status));
 }
 
 #[tokio::test]
@@ -9159,7 +9179,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let _engine = install_engine_reads(&authority);
+    let _engine = install_decided_engine(&authority);
     let terminal_host = InProcessDaemon::new(
         vec![],
         test_config_store(terminal_temp.path().join("config")),
@@ -9169,7 +9189,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let _engine = install_engine_reads(&terminal_host);
+    let terminal_engine = install_decided_engine(&terminal_host);
     let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
         Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
@@ -9199,47 +9219,55 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         )
         .await
         .expect("mark stalled crew work");
-    let sessions = terminal_host.resource_backend().using::<TerminalSession>("flotilla");
-    sessions
+    // The crew's vessel, held at the authority, reaches the terminal host as its records replicate.
+    let vessel_ref = flotilla_resources::vessel_resource_name("split-convoy", "work");
+    let vessels = authority.resource_backend().using::<flotilla_resources::Vessel>("flotilla");
+    vessels
         .create(
-            &InputMeta::builder()
-                .name("split-session".to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "split-convoy".to_string()),
-                    (VESSEL_LABEL.to_string(), "work".to_string()),
-                    (ROLE_LABEL.to_string(), "coder".to_string()),
-                ]))
-                .build(),
-            &TerminalSessionSpec::builder()
-                .env_ref("remote-environment".to_string())
-                .role("coder".to_string())
-                .source(TerminalSessionSource::Agent {
-                    selector: flotilla_resources::Selector::for_capability("coding"),
-                    brief: flotilla_resources::TerminalBrief {
-                        artifact_digest: None,
-                        path: "brief".to_string(),
-                        content: "Initial".to_string(),
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".to_string(),
-                        convoy: "split-convoy".to_string(),
-                        vessel_ref: "work-vessel".to_string(),
-                    }),
-                    message: None,
-                })
-                .cwd("/workspace".to_string())
-                .pool("fake-terminals".to_string())
-                .build(),
+            &InputMeta::builder().name(vessel_ref.clone()).build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "split-convoy".to_string(),
+                vessel_name: "work".to_string(),
+                fulfilment_kind_ref: "host-direct".to_string(),
+                adopted_checkout_refs: Default::default(),
+            },
         )
         .await
-        .expect("create terminal at placement host");
-    authority
+        .expect("create vessel");
+    terminal_host
         .resource_backend()
-        .replica_writer::<TerminalSession>(terminal_host.node_id().clone(), "flotilla")
-        .replace(&sessions.list().await.expect("session snapshot"), chrono::Utc::now())
+        .replica_writer::<flotilla_resources::Vessel>(authority.node_id().clone(), "flotilla")
+        .replace(&vessels.list().await.expect("vessel snapshot"), chrono::Utc::now())
         .await
-        .expect("replicate terminal session");
+        .expect("replicate vessel");
+    // The crew's session is launched at the terminal host, and its log reaches the authority.
+    let launch = terminal_engine.terminals.request(&TerminalLaunchRequest {
+        session: "split-session".to_string(),
+        environment: "remote-environment".to_string(),
+        vessel: Some(vessel_ref),
+        role: "coder".to_string(),
+        pool: "fake-terminals".to_string(),
+        cwd: "/workspace".to_string(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Agent {
+            capability: "coding".to_string(),
+            adapter: None,
+            model: None,
+            brief: flotilla_resources::TerminalBrief {
+                artifact_digest: None,
+                path: "brief".to_string(),
+                content: "Initial".to_string(),
+                copies: Vec::new(),
+            },
+        },
+    });
+    terminal_engine.terminals.ready(&launch, "coder-sid", &Default::default());
+    let terminal_store = terminal_host.decided_store().expect("terminal host store");
+    flotilla_provisioning_testkit::replicate_home(
+        &terminal_store,
+        terminal_store.home(),
+        &authority.decided_store().expect("authority store"),
+    );
 
     let outcome = authority
         .convoy_resume_internal("flotilla", "split-convoy", "Continue", Some("work"), Some("coder"), ResumeIntent::Reminder)
@@ -9256,9 +9284,6 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         .await
         .expect("replicate pending turn");
     terminal_host.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver at session origin");
-    let session = sessions.get("split-session").await.expect("session after delivery");
-    let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("agent session expected") };
-    assert!(message.is_none());
     let inbox = terminal_host.resource_backend().using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
     assert_eq!(inbox.items.len(), 1);
     assert!(inbox.items[0].spec.body.contains("Continue"));
@@ -9351,7 +9376,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     let discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&terminal_pool) as Arc<dyn TerminalPool>),
     );
-    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let (_temp, _repo, daemon, engine) = daemon_for_plain_dir_with_engine(discovery).await;
     let backend = daemon.resource_backend();
     let local_host_ref = daemon.local_host_id().expect("local host identity").to_string();
     backend
@@ -9415,104 +9440,45 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         )
         .await
         .expect("mark crew working");
-    let sessions = backend.clone().using::<TerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("idle-coder-session".to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "idle-convoy".to_string()),
-                    (VESSEL_LABEL.to_string(), "work".to_string()),
-                    (ROLE_LABEL.to_string(), "coder".to_string()),
-                ]))
-                .build(),
-            &TerminalSessionSpec::builder()
-                .env_ref("idle-environment".to_string())
-                .role("coder".to_string())
-                .source(TerminalSessionSource::Agent {
-                    selector: flotilla_resources::Selector::for_capability("coding"),
-                    brief: flotilla_resources::TerminalBrief {
-                        artifact_digest: None,
-                        path: ".flotilla/briefs/coder.md".to_string(),
-                        content: "Initial turn".to_string(),
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".to_string(),
-                        convoy: "idle-convoy".to_string(),
-                        vessel_ref: "work-vessel".to_string(),
-                    }),
-                    message: None,
-                })
-                .cwd("/workspace".to_string())
-                .pool("fake-terminals".to_string())
-                .build(),
-        )
-        .await
-        .expect("create idle crew session");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("idle-coder".to_string()),
-                attention: Some(TerminalAttention {
-                    state: TerminalAttentionState::Working,
-                    as_of: chrono::Utc::now() - chrono::Duration::minutes(2),
-                    source: TerminalAttentionSource::Screen,
-                }),
-                ..Default::default()
+    // Each crew's vessel holds its session, launched and running.
+    let vessels = backend.clone().using::<flotilla_resources::Vessel>("flotilla");
+    let mut launches = BTreeMap::new();
+    for (vessel, role, capability, session_id) in [("work", "coder", "coding", "idle-coder"), ("review", "qa", "review", "idle-review")] {
+        let vessel_ref = flotilla_resources::vessel_resource_name("idle-convoy", vessel);
+        vessels
+            .create(
+                &InputMeta::builder().name(vessel_ref.clone()).build(),
+                &flotilla_resources::VesselSpec {
+                    convoy_ref: "idle-convoy".to_string(),
+                    vessel_name: vessel.to_string(),
+                    fulfilment_kind_ref: "host-direct".to_string(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
+            .await
+            .expect("create crew vessel");
+        let launch = engine.terminals.request(&crew_session_request(
+            &format!("idle-{role}-session"),
+            &vessel_ref,
+            role,
+            capability,
+            "idle-environment",
+            "fake-terminals",
+        ));
+        engine.terminals.ready(&launch, session_id, &Default::default());
+        launches.insert(role, launch);
+    }
+    let observations = engine.terminals.terminals.observations();
+    observations.update(&launches["coder"], |observation| {
+        observation.observe_attention(
+            TerminalAttention {
+                state: TerminalAttentionState::Working,
+                as_of: chrono::Utc::now() - chrono::Duration::minutes(2),
+                source: TerminalAttentionSource::Screen,
             },
+            None,
         )
-        .await
-        .expect("observe working crew session");
-    let review_session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("idle-review-session".to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "idle-convoy".to_string()),
-                    (VESSEL_LABEL.to_string(), "review".to_string()),
-                    (ROLE_LABEL.to_string(), "qa".to_string()),
-                ]))
-                .build(),
-            &TerminalSessionSpec::builder()
-                .env_ref("idle-environment".to_string())
-                .role("qa".to_string())
-                .source(TerminalSessionSource::Agent {
-                    selector: flotilla_resources::Selector::for_capability("review"),
-                    brief: flotilla_resources::TerminalBrief {
-                        artifact_digest: None,
-                        path: ".flotilla/briefs/qa.md".to_string(),
-                        content: "Initial turn".to_string(),
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".to_string(),
-                        convoy: "idle-convoy".to_string(),
-                        vessel_ref: "review-vessel".to_string(),
-                    }),
-                    message: None,
-                })
-                .cwd("/workspace".to_string())
-                .pool("fake-terminals".to_string())
-                .build(),
-        )
-        .await
-        .expect("create review crew session");
-    sessions
-        .update_status(
-            &review_session.metadata.name,
-            &review_session.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("idle-review".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark review crew session running");
+    });
 
     let queued = daemon
         .convoy_resume_internal("flotilla", "idle-convoy", "Finish the current turn", Some("work"), Some("coder"), ResumeIntent::Reminder)
@@ -9528,19 +9494,16 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
     let first = backend.using::<flotilla_resources::Message>("flotilla").get(&reference.name).await.unwrap();
     assert_eq!(first.spec.body, "Finish the current turn");
-    apply_status_patch(
-        &sessions,
-        "idle-coder-session",
-        &TerminalSessionStatusPatch::ObserveAttention {
-            attention: TerminalAttention {
+    observations.update(&launches["coder"], |observation| {
+        observation.observe_attention(
+            TerminalAttention {
                 state: TerminalAttentionState::Idle,
                 as_of: chrono::Utc::now() - chrono::Duration::minutes(1),
                 source: TerminalAttentionSource::Screen,
             },
-        },
-    )
-    .await
-    .expect("observe idle crew session");
+            None,
+        )
+    });
 
     // #2755: a fresh idle observation from before queuing is sufficient when
     // there is no terminal turn in flight; an idle transition is unnecessary.
@@ -9548,14 +9511,6 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     assert!(convoys.get("idle-convoy").await.expect("convoy").status.expect("status").pending_brief().is_none());
 
     assert!(terminal_pool.delivered.lock().await.is_empty(), "agent messages should await reconciled delivery confirmation");
-    let review_session = sessions.get("idle-review-session").await.expect("read queued review session");
-    let TerminalSessionSource::Agent { message: review_message, .. } = review_session.spec.source else {
-        panic!("review session should remain agent-backed")
-    };
-    assert!(review_message.is_none());
-    let coder_session = sessions.get("idle-coder-session").await.unwrap();
-    let TerminalSessionSource::Agent { message: coder_message, .. } = coder_session.spec.source else { panic!("agent expected") };
-    assert!(coder_message.is_none());
     let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap().items;
     assert!(records.iter().any(|message| message.spec.receiver.ends_with("/review/qa") && message.spec.body.ends_with("Start the review")));
     assert!(records.iter().any(|message| message.spec.receiver.ends_with("/work/coder") && message.spec.body == "Finish the current turn"));
@@ -9591,7 +9546,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
 
 #[tokio::test]
 async fn crew_completion_advisory_does_not_claim_or_consume_a_follow_up() {
-    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let (_temp, _repo, daemon, engine) = daemon_for_cwd_with_engine().await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys
@@ -9634,34 +9589,7 @@ async fn crew_completion_advisory_does_not_claim_or_consume_a_follow_up() {
         )
         .await
         .expect("create vessel");
-    let sessions = backend.clone().using::<TerminalSession>("flotilla");
-    sessions
-        .create(
-            &InputMeta::builder().name("coder-session".to_string()).build(),
-            &TerminalSessionSpec::builder()
-                .env_ref("test-env".to_string())
-                .role("coder".to_string())
-                .source(TerminalSessionSource::Agent {
-                    selector: flotilla_resources::Selector::for_capability("coding"),
-                    brief: flotilla_resources::TerminalBrief {
-                        artifact_digest: None,
-                        path: ".flotilla/briefs/coder.md".to_string(),
-                        content: "Initial turn".to_string(),
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".to_string(),
-                        convoy: "turn-boundary".to_string(),
-                        vessel_ref: "work-vessel".to_string(),
-                    }),
-                    message: None,
-                })
-                .cwd("/workspace".to_string())
-                .pool("cleat".to_string())
-                .build(),
-        )
-        .await
-        .expect("create crew session");
+    engine.terminals.request(&crew_session_request("coder-session", "work-vessel", "coder", "coding", "test-env", "cleat"));
     daemon
         .convoy_resume_internal(
             "flotilla",

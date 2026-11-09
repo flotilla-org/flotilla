@@ -72,6 +72,16 @@ impl EnvironmentFixture {
         self
     }
 
+    /// The same fixture whose [`Self::reads`] serve `terminals` too, as a daemon's readings do.
+    pub fn serving_terminals(mut self, terminals: Arc<dyn flotilla_resources::terminal_records::TerminalRecords>) -> Self {
+        self.reads = Arc::new(
+            LifecycleReadPort::new(StoreReads::new(Arc::clone(&self.store)), self.home.clone())
+                .with_environments(Arc::clone(&self.environments) as Arc<dyn EnvironmentRecords>)
+                .with_terminals(terminals),
+        );
+        self
+    }
+
     /// Readings that serve this fixture's environments and `agent_sessions`.
     pub fn reads_with_agent_sessions(
         &self,

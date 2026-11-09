@@ -311,7 +311,14 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     if matches!(completion_action, CompletionAction::Delete) {
         wait_until(|| {
             let terminals = backend.using::<TerminalSession>(NAMESPACE);
-            async move { terminals.list().await.is_ok_and(|list| list.items.is_empty()) }
+            // Ended launches stay as history: each session's newest launch is released.
+            async move {
+                terminals.list().await.is_ok_and(|list| {
+                    list.items.iter().all(|session| {
+                        session.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::TerminalSessionPhase::Stopped)
+                    })
+                })
+            }
         })
         .await;
     }

@@ -266,7 +266,7 @@ impl AgentActivityView {
 /// Keyed reads of the AgentSessions the decided store holds: this home's, and the replicas of
 /// every home it follows.
 pub trait AgentSessionReads: Send + Sync {
-    /// The AgentSession named `name` (its TerminalSession record's name) homed at `origin` (a
+    /// The AgentSession named `name` (its crew's launch name) homed at `origin` (a
     /// replica's origin root; `None` for this home), or `None` when none is held.
     fn read(&self, name: &str, origin: Option<&str>) -> Result<Option<AgentActivityView>, String>;
 }

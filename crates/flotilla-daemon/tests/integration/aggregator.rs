@@ -14,6 +14,7 @@ use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_daemon_testkit::engine::session_request;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::fake_discovery_with_provider_set;
 use flotilla_discovery_testkit::FakeDiscoveryProviders;
@@ -30,11 +31,11 @@ use flotilla_protocol::QueryCursor;
 use flotilla_protocol::QueryScope;
 use flotilla_protocol::TerminalStatus;
 use flotilla_protocol_testkit::TestIssue;
+use flotilla_resources::{terminal_records::TerminalLaunchRequest, Vessel, VesselSpec};
 use flotilla_resources::{
     Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment, EnvironmentSpec,
     HostDirectEnvironmentSpec, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement,
-    WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
+    TerminalSessionSource, TerminalSessionSpec, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_terminal::{TerminalSession as PoolTerminalSession, TerminalSessionLiveness};
@@ -611,39 +612,35 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .create(&InputMeta::builder().name(environment_name.clone()).build(), &environment_spec)
         .await
         .expect("create attach environment");
-    let sessions = daemon.observed_resource_backend().using::<TerminalSession>("flotilla");
-    let convoy_session = sessions
+    // The sessions are the engine's launches, written at the daemon's home before its runtime
+    // starts; the convoy-bound one is held for vessel `coder` of convoy `convoy-a`.
+    backend
+        .using::<Vessel>("flotilla")
         .create(
-            &InputMeta::builder()
-                .name("terminal-convoy-coder".to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-                    (VESSEL_LABEL.to_string(), "coder".to_string()),
-                ]))
-                .build(),
-            &TerminalSessionSpec {
-                env_ref: environment_name.clone(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Tool { command: "bash".to_string() },
-                cwd: "/repo".to_string(),
-                env: Default::default(),
-                pool: "fake-terminals".to_string(),
+            &InputMeta::builder().name("convoy-a-coder".to_string()).build(),
+            &VesselSpec {
+                convoy_ref: "convoy-a".to_string(),
+                vessel_name: "coder".to_string(),
+                fulfilment_kind_ref: "host-direct".to_string(),
+                adopted_checkout_refs: Default::default(),
             },
         )
         .await
-        .expect("create convoy terminal session");
-    sessions
-        .update_status(
-            &convoy_session.metadata.name,
-            &convoy_session.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("cleat-convoy-coder".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark convoy terminal session running");
+        .expect("create convoy vessel");
+    let terminals = flotilla_daemon_testkit::engine::runtime_terminals(&daemon);
+    let tool = |env_ref: &str, role: &str, pool: &str| TerminalSessionSpec {
+        env_ref: env_ref.to_string(),
+        role: role.to_string(),
+        source: TerminalSessionSource::Tool { command: "bash".to_string() },
+        cwd: "/repo".to_string(),
+        env: Default::default(),
+        pool: pool.to_string(),
+    };
+    let convoy_launch = terminals.request(&TerminalLaunchRequest {
+        vessel: Some("convoy-a-coder".to_string()),
+        ..session_request("terminal-convoy-coder", &tool(&environment_name, "coder", "fake-terminals"))
+    });
+    terminals.ready(&convoy_launch, "cleat-convoy-coder", &Default::default());
     let convoys = backend.using::<Convoy>("flotilla");
     let convoy = convoys.create(&convoy_meta("convoy-a"), &convoy_spec("scratch")).await.expect("create convoy for bound terminal session");
     convoys
@@ -666,32 +663,8 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         )
         .await
         .expect("mark convoy vessel running");
-    let unresolvable = sessions
-        .create(
-            &InputMeta::builder().name("terminal-unresolvable".to_string()).build(),
-            &TerminalSessionSpec {
-                env_ref: "missing-environment".to_string(),
-                role: "observer".to_string(),
-                source: TerminalSessionSource::Tool { command: "bash".to_string() },
-                cwd: "/repo".to_string(),
-                env: Default::default(),
-                pool: "fake".to_string(),
-            },
-        )
-        .await
-        .expect("create unresolvable terminal session");
-    sessions
-        .update_status(
-            &unresolvable.metadata.name,
-            &unresolvable.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("cleat-unresolvable".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark unresolvable terminal session running");
+    let unresolvable = terminals.request(&session_request("terminal-unresolvable", &tool("missing-environment", "observer", "fake")));
+    terminals.ready(&unresolvable, "cleat-unresolvable", &Default::default());
     let options = RuntimeOptions {
         namespace: "flotilla".to_string(),
         heartbeat_interval: Duration::from_secs(300),
@@ -707,38 +680,10 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .and_then(|records| records.request(&environment_name, &environment_spec, None))
         .expect("request attach environment");
 
-    let created = sessions
-        .create(
-            &InputMeta::builder()
-                .name("terminal-yeoman".to_string())
-                .labels(BTreeMap::from([
-                    (REPO_KEY_LABEL.to_string(), repository_key.to_string()),
-                    (REPO_LABEL.to_string(), "flotilla-org/flotilla".to_string()),
-                ]))
-                .build(),
-            &TerminalSessionSpec {
-                env_ref: environment_name.clone(),
-                role: "yeoman".to_string(),
-                source: TerminalSessionSource::Tool { command: "bash".to_string() },
-                cwd: "/repo".to_string(),
-                env: Default::default(),
-                pool: "fake-terminals".to_string(),
-            },
-        )
-        .await
-        .expect("create terminal session");
-    sessions
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("cleat-yeoman".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark terminal session running");
+    // A launch carries no repository: no writer ever labels an engine session with one, so the
+    // independent row's repository is not asserted here (#3108).
+    let yeoman = terminals.request(&session_request("terminal-yeoman", &tool(&environment_name, "yeoman", "fake-terminals")));
+    terminals.ready(&yeoman, "cleat-yeoman", &Default::default());
 
     // Resource rows publish before terminal capability I/O finishes. Wait for
     // the enrichment event, then read a full snapshot: a delta only carries
@@ -822,8 +767,9 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     assert_eq!(vessel.materialize.as_deref(), Some("terminal-convoy-coder"));
 
     let row = rows.iter().find(|row| row.name == "terminal-yeoman").expect("attachable session row");
-    assert_eq!(row.repo.as_ref().map(|repo| repo.0.as_str()), Some("flotilla-org/flotilla"));
-    assert_eq!(row.repository_key.as_ref(), Some(&repository_key));
+    // A standalone launch carries no repository, as no production writer ever gave a session one.
+    assert_eq!(row.repo, None);
+    assert_eq!(row.repository_key, None);
     assert_eq!(row.host, HostName::new("local"));
     assert_eq!(row.attach.as_deref(), Some("terminal-yeoman"));
     assert_eq!(row.phase, flotilla_protocol::SessionPhase::Running);
@@ -848,6 +794,16 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     let unresolvable = replayed.iter().find(|row| row.name == "terminal-unresolvable").expect("unresolvable session row");
     assert_eq!(unresolvable.attach, None);
 
+    let local_sets = daemon.aggregator_projection_state().await.local_result_sets().await;
+    let local_independents = local_sets
+        .iter()
+        .find(|result_set| result_set.query() == (QueryId::Independents { scope: None }))
+        .map(independent_rows)
+        .expect("local independents result set");
+    assert_eq!(local_independents.len(), 2);
+    // Withdrawal when the environment ends: test_daemon.rs a_lost_environment_withdraws_its_sessions_attach.
+
+    // With no repository, a standalone launch is in no project's scope.
     let scope = QueryScope::new("flotilla", "flotilla");
     let scoped = daemon
         .subscribe_queries(
@@ -865,51 +821,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
             _ => None,
         })
         .expect("project independents replay result set");
-    assert!(matches!(scoped_rows, [row] if row.name == "terminal-yeoman"));
-
-    let local_sets = daemon.aggregator_projection_state().await.local_result_sets().await;
-    let local_independents = local_sets
-        .iter()
-        .find(|result_set| result_set.query() == (QueryId::Independents { scope: None }))
-        .map(independent_rows)
-        .expect("local independents result set");
-    assert_eq!(local_independents.len(), 2);
-    // Withdrawal when the environment ends: test_daemon.rs a_lost_environment_withdraws_its_sessions_attach.
-
-    let running = sessions.get("terminal-yeoman").await.expect("running terminal session");
-    sessions
-        .update(
-            &InputMeta::builder()
-                .name(running.metadata.name.clone())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-                    (VESSEL_LABEL.to_string(), "yeoman".to_string()),
-                ]))
-                .build(),
-            &running.metadata.resource_version,
-            &running.spec,
-        )
-        .await
-        .expect("adopt terminal session into convoy");
-    let removed = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match rx.recv().await {
-                Ok(DaemonEvent::ResultDelta(delta))
-                    if delta.query() == (QueryId::Independents { scope: None })
-                        && delta.changes.removed_resources().is_some_and(|removed| !removed.is_empty()) =>
-                {
-                    return delta;
-                }
-                Ok(_) => continue,
-                Err(err) => panic!("broadcast receive error: {err}"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for adopted session removal");
-    let removed = removed.changes.removed_resources().expect("independent removals");
-    assert_eq!(removed.len(), 1);
-    assert_eq!(removed[0].name, "terminal-yeoman");
+    assert!(scoped_rows.is_empty(), "{scoped_rows:?}");
 
     pool.remove_session("cleat-yeoman").await;
     let error = daemon.resolve_attach_command_internal("terminal-yeoman").await.expect_err("missing endpoint");

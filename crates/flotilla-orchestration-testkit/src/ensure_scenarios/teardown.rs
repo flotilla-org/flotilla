@@ -8,7 +8,6 @@ pub async fn refused_convoy_reclaim_leaves_runtime_children_untouched(factory: &
     let repository = RepositoryKey("github.com-acme-standing".to_string());
     let convoy_name = "failed-before-checkout";
     let vessel_name = "failed-before-checkout-work";
-    let terminal_name = "terminal-failed-before-checkout-work-coder";
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys
         .create(
@@ -45,35 +44,12 @@ pub async fn refused_convoy_reclaim_leaves_runtime_children_untouched(factory: &
         )
         .await
         .expect("vessel");
-    backend
-        .clone()
-        .using::<ResourceTerminalSession>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name(terminal_name.to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
-                .build(),
-            &ResourceTerminalSessionSpec {
-                env_ref: "environment-still-live".to_string(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("terminal session");
 
     let refusal = daemon.reap_convoy_internal("flotilla", convoy_name, false).await.expect_err("unsafe reclaim must be refused");
 
     assert!(refusal.contains("missing checkout integration evidence"));
     assert!(convoys.get(convoy_name).await.is_ok(), "refusal must retain the convoy");
     assert!(backend.clone().using::<Vessel>("flotilla").get(vessel_name).await.is_ok(), "refusal must retain the vessel");
-    assert!(
-        backend.clone().using::<ResourceTerminalSession>("flotilla").get(terminal_name).await.is_ok(),
-        "refusal must retain the terminal session"
-    );
 
     let principal = PrincipalRef::implicit_for_namespace("flotilla");
     daemon
@@ -455,8 +431,8 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
         .status
         .and_then(|status| status.convoy_ref)
         .expect("convoy ref");
-    // Step 3 removes only the retired Presentation cascade. Managed Vessel
-    // and TerminalSession children must still be cascaded by convoy teardown.
+    // Step 3 removes only the retired Presentation cascade. Managed Vessel children must still be
+    // cascaded by convoy teardown; its sessions are the engine's, released once their vessel ends.
     let meta = InputMeta::builder()
         .name("quartermaster-work".to_string())
         .labels(BTreeMap::from([
@@ -477,21 +453,6 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
         )
         .await
         .expect("vessel");
-    let sessions = backend.using::<flotilla_resources::TerminalSession>("flotilla");
-    sessions
-        .create(
-            &meta,
-            &flotilla_resources::TerminalSessionSpec {
-                env_ref: "old-environment".into(),
-                role: "tool".into(),
-                source: flotilla_resources::TerminalSessionSource::Tool { command: "true".into() },
-                cwd: "/tmp".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
-            },
-        )
-        .await
-        .expect("session");
     // Attentions about the convoy, its vessel and its role, every one acknowledged, end with them.
     let attentions = backend.attentions();
     let now = chrono::Utc::now();
@@ -519,7 +480,6 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
     assert!(demands.list().await.expect("demands").items.is_empty(), "no attention is left about the reaped convoy");
 
     assert!(matches!(vessels.get("quartermaster-work").await, Err(ResourceError::NotFound { .. })));
-    assert!(matches!(sessions.get("quartermaster-work").await, Err(ResourceError::NotFound { .. })));
     assert!(matches!(backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await, Err(ResourceError::NotFound { .. })));
 }
 

@@ -58,7 +58,7 @@ pub(crate) mod provenance;
 pub mod reads;
 pub mod repositories;
 pub mod repository_import;
-pub mod terminal_session;
+pub mod terminal_actuator;
 pub mod terminals;
 #[cfg(test)]
 mod tests;
@@ -87,6 +87,7 @@ use crate::stored::{
     clone::{CloneFacts, CloneKind},
     environment::EnvironmentKind,
     image_build::ImageBuildKind,
+    terminal_facts::TerminalLaunchFacts,
     terminal_session::TerminalSessionKind,
 };
 
@@ -107,6 +108,10 @@ pub struct ProvisioningLifecycles {
     pub checkout_records: Arc<checkouts::EngineCheckouts>,
     /// TerminalSession, each launch a resource (layer 7).
     pub terminal_sessions: Arc<dyn Lifecycles<TerminalSessionKind>>,
+    /// The facts the TerminalSession controller stages for each launch's Realise edge.
+    pub terminal_facts: launch_log::StagedFacts<TerminalLaunchFacts>,
+    /// The terminal port every terminal session reader and requester goes through.
+    pub terminal_records: Arc<terminals::EngineTerminals>,
     /// Vessel, its lease placed on its pinned host (layer 7, Q6).
     pub vessels: Arc<dyn Lifecycles<VesselKind>>,
 }
@@ -389,11 +394,6 @@ pub trait Binding: Send + Sync + 'static {
     type Old: flotilla_resources::Resource<Status: Default>;
     type Kind: LifecycleKind;
 
-    /// Whether each launch of an old object is a resource of its own (`<name>#<n>`): an old
-    /// reconciler that restarts an ended thing in place starts a new launch, never revives the
-    /// old one (#3629 Q2). Otherwise the engine resource takes the old object's name.
-    const LAUNCHES: bool = false;
-
     /// The engine request for `obj` at `home`, or why it cannot be one.
     fn request(obj: &ResourceObject<Self::Old>, home: &str) -> Result<<Self::Kind as LifecycleKind>::Request, String>;
 
@@ -404,11 +404,6 @@ pub trait Binding: Send + Sync + 'static {
     /// is granted as its provisioning starts (#3629 Q6). Otherwise a resource is requested with
     /// its first step.
     fn requests(_obj: &ResourceObject<Self::Old>, _patch: &Patch<Self::Old>) -> bool {
-        false
-    }
-
-    /// Observation housekeeping permitted after this frame explicitly requested a successor.
-    fn launch_reset(_patch: &Patch<Self::Old>) -> bool {
         false
     }
 
@@ -434,21 +429,14 @@ fn at(now: DateTime<Utc>) -> Timestamp {
     Timestamp::from_datetime(&now)
 }
 
-/// The engine resource `obj` writes to now, and what the engine holds under that name: the old
-/// object's own name, or for a kind with launches its newest launch (the old name before any,
-/// which the request's log numbers).
+/// The engine resource `obj` writes to, its old object's own name, and what the engine holds
+/// under that name.
 pub fn current<B: Binding>(
     lifecycles: &dyn Lifecycles<B::Kind>,
     obj: &ResourceObject<B::Old>,
 ) -> (String, Option<Resource<Lifecycle<B::Kind>>>) {
     let name = &obj.metadata.name;
-    if !B::LAUNCHES {
-        return (name.clone(), lifecycles.get(name));
-    }
-    match lifecycles.newest_launch(name) {
-        Some(held) => (held.name().to_owned(), Some(held)),
-        None => (name.clone(), None),
-    }
+    (name.clone(), lifecycles.get(name))
 }
 
 /// The old object a launch key (`<old>#<n>`) is of, split at the last `#`, so an old name
@@ -581,20 +569,8 @@ where
         // wait for a write, so they run off the async workers.
         let owned = ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
         let home = Arc::clone(lifecycles);
-        let (prepared_launch, terminal) = tokio::task::spawn_blocking(move || {
-            let (mut name, mut held) = current::<B>(home.as_ref(), &owned);
-            // The first launch is ordinary intent, not a predecessorless restart. Establish it
-            // before the reader runs, so a legacy Stopped/Lost observation cannot strand it.
-            if B::LAUNCHES && held.is_none() {
-                let request = B::request(&owned, home.home()).map_err(ResourceError::other)?;
-                let launched = home.request(&name, request, at(Utc::now())).map_err(|error| ResourceError::other(error.to_string()))?;
-                name = launched.name().to_owned();
-                held = Some(launched);
-            }
-            if B::LAUNCHES && held.as_ref().is_some_and(|resource| matches!(resource.state(), LifecycleState::Requested { .. })) {
-                home.finish_launch_request(&name, at(Utc::now()))
-                    .map_err(|error| ResourceError::other(format!("engine predecessor recovery: {error}")))?;
-            }
+        let terminal = tokio::task::spawn_blocking(move || {
+            let (name, mut held) = current::<B>(home.as_ref(), &owned);
             // A committed failed attempt must finish before any provider work resumes.
             if let Some(reads::Judgement::Exhausted { last }) = held.as_ref().map(|resource| reads::judge::<B::Kind>(resource.state())) {
                 held = Some(
@@ -602,7 +578,7 @@ where
                         .map_err(|error| ResourceError::other(format!("engine GiveUp recovery: {error}")))?,
                 );
             }
-            Ok::<_, ResourceError>((name, held.as_ref().is_some_and(ended)))
+            Ok::<_, ResourceError>(held.as_ref().is_some_and(ended))
         })
         .await
         .map_err(|error| ResourceError::other(format!("engine read: {error}")))??;
@@ -620,16 +596,6 @@ where
         let (lifecycles, patch) = (Arc::clone(lifecycles), outcome.patch.take());
         let decision = tokio::task::spawn_blocking(move || {
             let (name, held) = current::<B>(lifecycles.as_ref(), &owned);
-            if B::LAUNCHES && name != prepared_launch {
-                // A newly Requested launch may still need its runtime observations reset.
-                // This carries no lifecycle evidence and cannot create another launch.
-                if held.as_ref().is_some_and(|resource| matches!(resource.state(), LifecycleState::Requested { .. }))
-                    && patch.as_ref().is_some_and(B::launch_reset)
-                {
-                    return Some(Decision { patch, ended: false });
-                }
-                return None;
-            }
             Some(decide_launch::<B>(lifecycles.as_ref(), &owned, patch, now, name, held))
         })
         .await

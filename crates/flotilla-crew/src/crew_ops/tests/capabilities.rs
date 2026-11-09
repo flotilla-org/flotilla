@@ -5,13 +5,11 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::CrewCommandContext;
 use flotilla_resources::{
-    CrewWorkPhase, InputMeta, ResourceObject, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase,
+    CrewWorkPhase, InputMeta, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
 };
 use tokio::sync::RwLock;
 
 use super::fixture;
-use flotilla_resources::CREDENTIAL_REFS_ANNOTATION;
 
 #[tokio::test]
 async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
@@ -70,34 +68,32 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
         .vessel_ref("vessel".into())
         .role("coder".into())
         .build();
+    // The vessel's grants come from its convoy's frozen requirement.
+    let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
+    let convoy = convoys.get("crew").await.expect("convoy");
+    let mut convoy_status = convoy.status.clone().expect("convoy status");
+    convoy_status.workflow_snapshot.as_mut().expect("snapshot").vessels[0].credential_refs = BTreeSet::from(["github".into()]);
+    convoys.update_status("crew", &convoy.metadata.resource_version, &convoy_status).await.expect("vessel grant references");
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.get("session").await.expect("session");
-    let mut meta = InputMeta::from(&session.metadata);
-    meta.annotations.insert(CREDENTIAL_REFS_ANNOTATION.into(), "[\"github\"]".into());
-    sessions.update(&meta, &session.metadata.resource_version, &session.spec).await.expect("session grant references");
     let healthy = sessions.get("session").await.expect("healthy session");
     let mut status = healthy.status.clone().unwrap_or_default();
     status.phase = ResourceTerminalSessionPhase::Running;
     sessions.update_status("session", &healthy.metadata.resource_version, &status).await.expect("running healthy session");
-    // A malformed running session sorts before the healthy session and must
+    // A running session whose grants can't be read sorts before the healthy session and must
     // not starve it of observations. Its different role cannot receive this card.
     let mut broken_spec = healthy.spec.clone();
     broken_spec.role = "broken".into();
-    let broken = sessions
-        .create(
-            &InputMeta::builder()
-                .name("000-malformed".into())
-                .annotations(BTreeMap::from([(CREDENTIAL_REFS_ANNOTATION.into(), "not json".into())]))
-                .build(),
-            &broken_spec,
-        )
-        .await
-        .expect("broken session");
+    let flotilla_resources::TerminalSessionSource::Agent { context: broken_context, .. } = &mut broken_spec.source else {
+        panic!("agent session")
+    };
+    broken_context.vessel_ref = "missing-vessel".into();
+    let broken = sessions.create(&InputMeta::builder().name("000-malformed".into()).build(), &broken_spec).await.expect("broken session");
     sessions.update_status("000-malformed", &broken.metadata.resource_version, &status).await.expect("running broken session");
     let first = crew.query_capabilities(&context).await.expect("first live card");
     assert!(first.contains("You can push `.github/workflows`"));
-    let session = sessions.get("session").await.expect("session");
-    crate::crew_capabilities::observe_card(&backend, "flotilla", &session, &first, &crew.capability_cards).await.expect("launch baseline");
+    crate::crew_capabilities::observe_launch_card(&backend, "flotilla", "session", &first, &crew.capability_cards)
+        .await
+        .expect("launch baseline");
     assert!(backend.using::<Message>("flotilla").list().await.expect("messages").items.is_empty());
     for (index, permissions) in [BTreeMap::from([("contents".into(), "read".into())]), BTreeMap::new()].into_iter().enumerate() {
         source.0.write().await[0].permissions = Some(permissions);
@@ -105,13 +101,9 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
         assert!(!card.contains("You can push `.github/workflows`"));
         let session = sessions.get("session").await.expect("session");
         if index == 0 {
-            // A concurrent holder status write can race successful publication.
-            // Change the source again before retrying: recover the published
-            // revision, then supersede it rather than collide or deliver twice.
-            let mut status = session.status.clone().unwrap_or_default();
-            status.session_id = Some("concurrent-terminal-observation".into());
-            sessions.update_status("session", &session.metadata.resource_version, &status).await.expect("concurrent status");
-            assert!(crate::crew_capabilities::observe_card(&backend, "flotilla", &session, &card, &crew.capability_cards).await.is_err());
+            crate::crew_capabilities::observe_card(&backend, "flotilla", &session, &card, &crew.capability_cards)
+                .await
+                .expect("first change notified");
             continue;
         }
         let error = crate::crew_capabilities::refresh_cards(
@@ -125,15 +117,8 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
         .await
         .expect_err("aggregate error");
         assert!(error.contains("000-malformed"));
-        assert!(error.contains("invalid session credential references"));
-        assert_eq!(
-            sessions.get("session").await.expect("healthy refresh").metadata.annotations["flotilla.work/capabilities-revision"],
-            "2"
-        );
-        let session = sessions.get("session").await.expect("session");
-        crate::crew_capabilities::observe_card(&backend, "flotilla", &session, &card, &crew.capability_cards)
-            .await
-            .expect("supersede recovered revision");
+        assert!(error.contains("read vessel missing-vessel"));
+        assert_eq!(backend.using::<Message>("flotilla").list().await.expect("messages").items.len(), 2, "the healthy session is notified");
         crate::crew_capabilities::observe_card(
             &backend,
             "flotilla",
@@ -170,19 +155,18 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     .expect("revocation notification");
     let messages = backend.using::<Message>("flotilla").list().await.expect("messages").items;
     assert_eq!(messages.len(), 4);
-    let latest_revision = |message: &&ResourceObject<Message>| {
-        let Some(MessageReference::ControlRecord { revision, .. }) = &message.spec.subject else { return false };
-        revision == "capabilities@5"
-    };
-    let latest = messages.iter().find(latest_revision).expect("superseding delta");
+    // Each notice supersedes the one before: the latest is the one nothing supersedes.
+    let latest = messages
+        .iter()
+        .find(|message| !messages.iter().any(|other| other.spec.supersedes.as_ref() == Some(&message.metadata.name)))
+        .expect("superseding delta");
     assert!(messages.iter().any(|message| Some(&message.metadata.name) == latest.spec.supersedes.as_ref()));
+    let Some(MessageReference::ControlRecord { revision: latest_revision, .. }) = &latest.spec.subject else { panic!("revision subject") };
     assert_eq!(latest.spec.sender, "system:capabilities");
     assert_eq!(latest.spec.body, crate::crew_capabilities::card_delta(&first, &card));
     // The latest revision is traceable through the stored subject, not a JSON header (#2923), and
     // its turn text names it.
-    assert!(
-        matches!(&latest.spec.subject, Some(flotilla_resources::MessageReference::ControlRecord { revision, .. }) if revision == "capabilities@5")
-    );
+    assert!(latest_revision.starts_with("capabilities@"));
     assert_eq!(
         flotilla_messaging::frame_message(&latest.spec),
         format!("[from flotilla (system) · capabilities · re TerminalSession session]\n\n{}", latest.spec.body)
@@ -193,12 +177,12 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
 // Generated scenarios cover local and remote receiver homes, latent and completed work,
 // duplicate text, and invalid targets. The receiver has no terminal in either initial phase.
 
-// Old annotations remain readable and receive one full card; receipt then establishes a delta baseline.
+// A session launched before this tracker started holds a card it never saw: its first change is
+// a full card, and that card's receipt establishes a delta baseline. A restart starts again so.
 #[tokio::test]
-async fn previous_generation_gets_full_card_once_then_delivered_deltas() {
+async fn an_unseen_session_gets_a_full_card_once_then_delivered_deltas() {
     use crate::crew_capabilities::{card_delta, observe_card, CapabilityCardTracker};
     use flotilla_resources::{Message, MessagePhase, Vessel, VesselSpec};
-    use sha2::{Digest, Sha256};
     let (_, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
     backend
         .using::<Vessel>("flotilla")
@@ -215,16 +199,13 @@ async fn previous_generation_gets_full_card_once_then_delivered_deltas() {
         .expect("vessel");
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let session = sessions.get("session").await.expect("session");
+    let unseen = "## Your capabilities\n### Credentials\n- unseen\n";
     let first = "## Your capabilities\n### Credentials\n- known\n";
-    let mut meta = InputMeta::from(&session.metadata);
-    meta.annotations.insert("flotilla.work/capabilities-digest".into(), format!("{:x}", Sha256::digest(first.as_bytes())));
-    meta.annotations.insert("flotilla.work/capabilities-revision".into(), "6".into());
-    sessions.update(&meta, &session.metadata.resource_version, &session.spec).await.expect("old annotations");
     let tracker = CapabilityCardTracker::default();
+    observe_card(&backend, "flotilla", &session, unseen, &tracker).await.expect("baseline");
     for _ in 0..2 {
-        observe_card(&backend, "flotilla", &sessions.get("session").await.expect("session"), first, &tracker).await.expect("upgrade");
+        observe_card(&backend, "flotilla", &session, first, &tracker).await.expect("full card");
     }
-    assert_eq!(sessions.get("session").await.expect("session").metadata.annotations["flotilla.work/capabilities-revision"], "7");
     let messages = backend.using::<Message>("flotilla");
     let all = messages.list().await.expect("messages").items;
     assert_eq!(all.len(), 1);
@@ -241,20 +222,20 @@ async fn previous_generation_gets_full_card_once_then_delivered_deltas() {
     });
     messages.update_status(&all[0].metadata.name, &all[0].metadata.resource_version, &status).await.expect("receipt");
     let second = "## Your capabilities\n### Credentials\n- known\n- added\n";
-    observe_card(&backend, "flotilla", &sessions.get("session").await.expect("session"), second, &tracker).await.expect("delta");
+    observe_card(&backend, "flotilla", &session, second, &tracker).await.expect("delta");
     let all = messages.list().await.expect("messages").items;
     let latest = all.iter().find(|message| message.spec.supersedes.is_some()).expect("delta message");
     assert_eq!(latest.spec.body, card_delta(first, second));
     assert!(!latest.spec.body.contains("known"));
-    // Restart without an ephemeral baseline must send a full card on a change,
-    // even when an unchanged refresh precedes it and the prior notice is pending.
+    // A restarted tracker has no baseline: an unchanged refresh records one, and a change sends a
+    // full card under a revision no earlier Message holds.
     let restarted = CapabilityCardTracker::default();
-    observe_card(&backend, "flotilla", &sessions.get("session").await.expect("session"), second, &restarted).await.expect("unchanged");
+    observe_card(&backend, "flotilla", &session, second, &restarted).await.expect("unchanged");
     let third = "## Your capabilities\n### Credentials\n- changed after restart\n";
-    observe_card(&backend, "flotilla", &sessions.get("session").await.expect("session"), third, &restarted).await.expect("restart full");
-    let session = sessions.get("session").await.expect("session");
-    let latest = messages.get(&session.metadata.annotations["flotilla.work/capabilities-message"]).await.expect("latest");
-    assert_eq!(latest.spec.body, third);
+    observe_card(&backend, "flotilla", &session, third, &restarted).await.expect("restart full");
+    let all = messages.list().await.expect("messages").items;
+    assert_eq!(all.len(), 3);
+    assert!(all.iter().any(|message| message.spec.body == third && message.spec.supersedes.is_none()));
 }
 
 // Reaping a pending Message loses the receipt baseline, so production refresh must publish
@@ -330,13 +311,47 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
         &flotilla_store::OldStoreAccounts::new(backend.clone()),
     )
     .await
-    .expect("pending delta");
-    let session = sessions.get("session").await.expect("session");
+    .expect("first change");
+    // A session first seen by a refresh holds a card this tracker never saw: its first change is
+    // a full card, whose receipt sets the delta baseline.
     let messages = backend.using::<Message>("flotilla");
-    let reaped = &session.metadata.annotations["flotilla.work/capabilities-message"];
-    assert!(messages.get(reaped).await.expect("delta").spec.body.starts_with("## Capability changes"));
-    messages.delete(reaped).await.expect("reap Message");
+    let published = messages.list().await.expect("messages").items;
+    let [full] = published.as_slice() else { panic!("one full card: {published:?}") };
+    assert!(full.spec.body.starts_with("## Your capabilities"));
+    let mut status = full.status.clone().expect("status");
+    status.phase = flotilla_resources::MessagePhase::Delivered;
+    status.resolved_receiver = Some(flotilla_resources::ResolvedMessageReceiver {
+        role_address: None,
+        crew_id: "crew-id".into(),
+        session: "terminal".into(),
+        delivered_at: Utc::now(),
+        evidence: "in-memory transport receipt".into(),
+        transport: None,
+    });
+    messages.update_status(&full.metadata.name, &full.metadata.resource_version, &status).await.expect("receipt");
     source.0.write().await.insert("API".into(), "127.0.0.1:2".into());
+    refresh_cards(
+        &backend,
+        "flotilla",
+        &source,
+        &tracker,
+        environments.reads.clone(),
+        &flotilla_store::OldStoreAccounts::new(backend.clone()),
+    )
+    .await
+    .expect("pending delta");
+    let delta = messages
+        .list()
+        .await
+        .expect("messages")
+        .items
+        .into_iter()
+        .find(|message| message.spec.supersedes.is_some())
+        .expect("pending delta");
+    assert!(delta.spec.body.starts_with("## Capability changes"));
+    messages.delete(&delta.metadata.name).await.expect("reap Message");
+    messages.delete(&full.metadata.name).await.expect("reap delivered Message");
+    source.0.write().await.insert("API".into(), "127.0.0.1:3".into());
     refresh_cards(
         &backend,
         "flotilla",
@@ -357,12 +372,10 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
     )
     .await
     .expect("unchanged refresh");
-    let session = sessions.get("session").await.expect("session");
-    assert_eq!(session.metadata.annotations["flotilla.work/capabilities-revision"], "3");
     let all = messages.list().await.expect("messages").items;
     assert_eq!(all.len(), 1);
     assert!(all[0].spec.body.starts_with("## Your capabilities"));
-    assert!(all[0].spec.body.contains("127.0.0.1:2"));
+    assert!(all[0].spec.body.contains("127.0.0.1:3"));
     assert!(all[0].spec.supersedes.is_none());
 }
 
@@ -432,10 +445,6 @@ async fn failing_source_never_publishes_an_empty_card() {
     )
     .await
     .expect("initial baseline");
-    let revision = |session: &flotilla_resources::ResourceObject<ResourceTerminalSession>| {
-        session.metadata.annotations["flotilla.work/capabilities-revision"].clone()
-    };
-    let before = revision(&sessions.get("session").await.expect("session"));
     source.1.store(true, std::sync::atomic::Ordering::SeqCst);
     refresh_cards(
         &backend,
@@ -447,7 +456,6 @@ async fn failing_source_never_publishes_an_empty_card() {
     )
     .await
     .expect_err("reconstruction gap");
-    assert_eq!(revision(&sessions.get("session").await.expect("session")), before);
     let messages = backend.using::<Message>("flotilla").list().await.expect("messages").items;
     assert!(messages.is_empty());
 }

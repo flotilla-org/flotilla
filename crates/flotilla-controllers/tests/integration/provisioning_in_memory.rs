@@ -13,23 +13,18 @@ use common::{
     controller_meta, create_convoy_with_single_task, create_host_direct_kind, create_ready_host_direct_environment, create_workspace,
     ControllerLoopHarness,
 };
-use flotilla_crew::reconcilers::terminal_session::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_protocol::LifecycleReading;
 use flotilla_provisioning::{engine::checkouts::CheckoutVesselWake, reconcilers::CloneRuntime};
-use flotilla_provisioning_testkit::{
-    clones::{MadeCheckouts, RunningClones},
-    EnvironmentFixture,
-};
+use flotilla_provisioning_testkit::clones::{MadeCheckouts, RunningClones};
 use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecords as _};
 use flotilla_resources::clone_records::CloneRecords;
-use flotilla_resources::lifecycle_reads::LifecycleReads;
+use flotilla_resources::terminal_records::{TerminalLaunchFacts, TerminalRecords as _};
 use flotilla_resources::{
     canonicalize_repo_url, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
     CrewSource, CrewSpec, Host, HostSpec, HostStatus, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
-    Repository, RepositorySpec, ResourceError, TerminalSession, TerminalSessionPhase, TerminalSessionTarget, Vessel, VesselPhase,
-    VesselRequirement, VESSEL_REF_LABEL,
+    Repository, RepositorySpec, ResourceError, Vessel, VesselPhase, VesselRequirement,
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
@@ -75,38 +70,6 @@ impl CloneRuntime for RefusingFirstCloneRuntime {
     }
 }
 
-#[derive(Default)]
-struct FakeTerminalRuntime;
-
-#[async_trait]
-impl TerminalRuntime for FakeTerminalRuntime {
-    async fn ensure_session(
-        &self,
-        name: &str,
-        _spec: TerminalSessionTarget<'_>,
-        _tags: &[flotilla_terminal::TerminalSessionTag],
-    ) -> Result<TerminalRuntimeState, String> {
-        Ok(TerminalRuntimeState {
-            configured_limits: Some(ConfiguredResourceLimits {
-                cpus: None,
-                cpu_shares: None,
-                build_jobs: Some(4),
-                linker_threads: Some(4),
-            }),
-            session_id: format!("session-{name}"),
-            pid: Some(42),
-            started_at: Utc::now(),
-            crew: None,
-            launch_command: "bash".to_string(),
-            delivered_message_id: None,
-        })
-    }
-
-    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn controller_loops_drive_host_direct_workspace_to_ready() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
@@ -133,6 +96,7 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
     let workspaces = backend.clone().using::<Vessel>(NAMESPACE);
     harness
         .wait_until(Duration::from_secs(3), || {
+            start_requested_terminals(&engine);
             let workspaces = workspaces.clone();
             async move {
                 matches!(
@@ -207,6 +171,7 @@ async fn a_project_gaining_a_member_leaves_a_running_convoys_checkouts_unchanged
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     harness
         .wait_until(Duration::from_secs(3), || {
+            start_requested_terminals(&engine);
             let vessels = vessels.clone();
             async move {
                 matches!(
@@ -344,6 +309,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     harness
         .wait_until(Duration::from_secs(3), || {
+            start_requested_terminals(&engine);
             let vessels = vessels.clone();
             async move {
                 matches!(
@@ -457,47 +423,7 @@ async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
 }
 
 #[tokio::test]
-async fn terminal_session_controller_marks_session_running() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let environments = EnvironmentFixture::default();
-    create_ready_host_direct_environment(&environments, "01HXYZ", "/Users/alice/dev/flotilla-repos");
-    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
-    sessions
-        .create(
-            &controller_meta().name("term-a").call(),
-            &flotilla_resources::TerminalSessionSpec {
-                env_ref: "host-direct-01HXYZ".to_string(),
-                role: "coder".to_string(),
-                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("session create should succeed");
-
-    let harness = terminal_harness(backend.clone(), environments.reads.clone());
-    harness
-        .wait_until(Duration::from_secs(1), || {
-            let sessions = sessions.clone();
-            async move {
-                matches!(
-                    sessions.get("term-a").await.ok().and_then(|session| session.status),
-                    Some(status)
-                        if status.phase == TerminalSessionPhase::Running
-                            && status.session_id.as_deref() == Some("session-term-a")
-                            && status.pid == Some(42)
-                )
-            }
-        })
-        .await;
-
-    harness.shutdown().await;
-}
-
-#[tokio::test]
-async fn vessel_controller_finalizer_deletes_vessel_owned_children_but_preserves_the_convoys_checkout() {
+async fn vessel_controller_finalizer_preserves_the_convoys_checkout() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_workspace(
         &backend,
@@ -525,28 +451,7 @@ async fn vessel_controller_finalizer_deletes_vessel_owned_children_but_preserves
         }),
         Some(&CheckoutHolder::Convoy("convoy-delete".to_string())),
     );
-    backend
-        .clone()
-        .using::<TerminalSession>(NAMESPACE)
-        .create(
-            &controller_meta()
-                .name("terminal-workspace-delete-coder")
-                .labels([(VESSEL_REF_LABEL.to_string(), "workspace-delete".to_string())].into_iter().collect())
-                .call(),
-            &flotilla_resources::TerminalSessionSpec {
-                env_ref: "host-direct-01HXYZ".to_string(),
-                role: "coder".to_string(),
-                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/Users/alice/dev/flotilla-repos/workspace-delete".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("terminal create should succeed");
-
     let workspaces = backend.clone().using::<Vessel>(NAMESPACE);
-    let terminals = backend.clone().using::<TerminalSession>(NAMESPACE);
     let mut harness = ControllerLoopHarness::new(backend.clone());
     harness.spawn(
         ControllerLoop {
@@ -576,11 +481,7 @@ async fn vessel_controller_finalizer_deletes_vessel_owned_children_but_preserves
     harness
         .wait_until(Duration::from_secs(1), || {
             let workspaces = workspaces.clone();
-            let terminals = terminals.clone();
-            async move {
-                matches!(workspaces.get("workspace-delete").await, Err(ResourceError::NotFound { .. }))
-                    && matches!(terminals.get("terminal-workspace-delete-coder").await, Err(ResourceError::NotFound { .. }))
-            }
+            async move { matches!(workspaces.get("workspace-delete").await, Err(ResourceError::NotFound { .. })) }
         })
         .await;
     assert!(engine.record(&checkout).is_ready(), "the vessel's finalizer leaves the convoy's checkout to the convoy");
@@ -588,39 +489,25 @@ async fn vessel_controller_finalizer_deletes_vessel_owned_children_but_preserves
     harness.shutdown().await;
 }
 
-fn terminal_harness(backend: ResourceBackend, reads: Arc<dyn LifecycleReads>) -> ControllerLoopHarness {
-    let mut harness = ControllerLoopHarness::new(backend.clone());
-    harness.spawn(
-        ControllerLoop {
-            primary: backend.clone().using::<TerminalSession>(NAMESPACE),
-            secondaries: vec![],
-            reconciler: TerminalSessionReconciler::new(Arc::new(FakeTerminalRuntime), backend.clone(), NAMESPACE)
-                .with_lifecycle_reads(reads),
-            resync_interval: Duration::from_millis(50),
-            backend,
+/// Stands in for the TerminalSession controller, whose own tests cover it: each requested launch
+/// is realised, given four build jobs as a host-direct launch is.
+fn start_requested_terminals(engine: &RunningClones) {
+    let facts = TerminalLaunchFacts { build_jobs: Some(4), ..Default::default() };
+    for record in engine.terminals.terminals.at(&engine.terminals.home).expect("terminal sessions") {
+        if !record.ended() && !record.is_running() {
+            engine.terminals.ready(&record.name, &format!("session-{}", record.session_name()), &facts);
         }
-        .run(),
-    );
-    harness
+    }
 }
 
-/// The old-store controllers over the engine's environments, clones and checkouts, which
-/// `engine` serves; the engine's Clone and Checkout controllers run beside them, and a checkout's
-/// change wakes its convoy's vessels.
+/// The Vessel controller over the engine's environments, clones, checkouts and terminal
+/// sessions, which `engine` serves; the engine's Clone and Checkout controllers run beside it, a
+/// checkout's change wakes its convoy's vessels, and a terminal session's change its vessel.
 fn full_controller_harness(backend: ResourceBackend, engine: &RunningClones) -> ControllerLoopHarness {
     let reads = engine.reads.clone();
+    backend.install_engine_records(Arc::new(flotilla_store::TerminalViews::new(backend.clone(), NAMESPACE, Arc::clone(&reads))));
+    backend.serve_engine_in(NAMESPACE);
     let mut harness = ControllerLoopHarness::new(backend.clone());
-    harness.spawn(
-        ControllerLoop {
-            primary: backend.clone().using::<TerminalSession>(NAMESPACE),
-            secondaries: vec![],
-            reconciler: TerminalSessionReconciler::new(Arc::new(FakeTerminalRuntime), backend.clone(), NAMESPACE)
-                .with_lifecycle_reads(Arc::clone(&reads)),
-            resync_interval: Duration::from_millis(50),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
     let mut secondaries = VesselReconciler::secondary_watches();
     secondaries.push(Box::new(CheckoutVesselWake::new(Arc::clone(&engine.service))));
     harness.spawn(

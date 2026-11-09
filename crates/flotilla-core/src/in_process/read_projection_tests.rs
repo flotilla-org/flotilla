@@ -1503,16 +1503,19 @@ mod tests {
                 let reads = memory.read_snapshot().since(&before);
                 // At most one indexed read per kind. The whole-kind lists are the
                 // Project definition catalog, which scoping consults, and this
-                // host's attentions, which never replicate.
+                // host's attentions, which never replicate. A crew scope reads the
+                // crew's session first to find its convoy, since no store relation
+                // joins the engine's sessions to convoys; then its convoy's sessions.
+                let session_reads = if crew.is_some() { 2 } else { 1 };
                 let budget = ["Checkout", "Environment", "FleetDesignation", "Host"]
                     .into_iter()
                     .fold(ReadBudget::new(), |budget, kind| budget.calls(kind, ReadOperation::Query, 1))
                     .objects("Convoy", ReadOperation::Query, 1, 1)
-                    .objects("TerminalSession", ReadOperation::Query, 1, 1)
+                    .objects("TerminalSession", ReadOperation::Query, session_reads, session_reads)
                     .calls("Project", ReadOperation::List, 1)
                     .calls("Demand", ReadOperation::List, 1);
                 reads.assert_within(&budget, "scoped fleet listing");
-                assert_eq!(reads.objects_by_kind().get("TerminalSession"), Some(&1));
+                assert_eq!(reads.objects_by_kind().get("TerminalSession"), Some(&session_reads));
                 assert_eq!(reads.objects_by_kind().get("Message").copied().unwrap_or_default(), 0);
                 measurements.push(reads);
             }

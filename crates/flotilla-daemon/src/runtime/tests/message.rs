@@ -162,16 +162,9 @@ async fn hookless_submission_needing_permission_is_confirmed_without_retry() {
         &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
         Arc::new(DiscoveryMockRunner::builder().build()),
     );
-    let outcome = deliver_and_confirm(
-        &pool,
-        &ComposerDrafts::default(),
-        adapters.get("codex").map(|a| &**a),
-        "agent",
-        "review wake",
-        TerminalDeliveryReadiness::TurnBoundary,
-    )
-    .await
-    .expect("submit");
+    let outcome = submit_and_confirm(&pool, &ComposerDrafts::default(), adapters.get("codex").map(|a| &**a), "agent", "review wake")
+        .await
+        .expect("submit");
     assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
     assert_eq!(pool.inner.delivered.lock().await.len(), 1);
 }
@@ -196,15 +189,7 @@ async fn hookless_submission_waits_for_delayed_working_evidence_with_composer_vi
     let adapter = adapters.get("codex").expect("adapter").clone();
     let submit_pool = pool.clone();
     let submit = tokio::spawn(async move {
-        deliver_and_confirm(
-            &*submit_pool,
-            &ComposerDrafts::default(),
-            Some(&*adapter),
-            "agent",
-            "review wake",
-            TerminalDeliveryReadiness::TurnBoundary,
-        )
-        .await
+        submit_and_confirm(&*submit_pool, &ComposerDrafts::default(), Some(&*adapter), "agent", "review wake").await
     });
     tokio::task::yield_now().await;
     assert_eq!(pool.inner.delivered.lock().await.len(), 1);
@@ -241,16 +226,10 @@ fn flickering_codex_confirmation_never_resends(tc: hegel::TestCase) {
             &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
             Arc::new(DiscoveryMockRunner::builder().build()),
         );
-        let outcome = deliver_and_confirm(
-            &pool,
-            &ComposerDrafts::default(),
-            adapters.get("codex").map(|adapter| &**adapter),
-            "agent",
-            "wake",
-            TerminalDeliveryReadiness::Startup,
-        )
-        .await
-        .expect("uncertain submission");
+        let outcome =
+            submit_and_confirm(&pool, &ComposerDrafts::default(), adapters.get("codex").map(|adapter| &**adapter), "agent", "wake")
+                .await
+                .expect("uncertain submission");
         assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
         assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
@@ -261,77 +240,11 @@ fn flickering_codex_confirmation_never_resends(tc: hegel::TestCase) {
 async fn accepted_but_unconfirmed_delivery_is_never_retyped() {
     let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
 
-    let outcome =
-        deliver_and_confirm(&pool, &ComposerDrafts::default(), None, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup)
-            .await
-            .expect("delivery outcome");
+    let outcome = submit_and_confirm(&pool, &ComposerDrafts::default(), None, "agent", "stuck handoff").await.expect("delivery outcome");
 
     assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
     assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn terminal_delivery_lookup_deduplicates_same_message_and_replaces_a_different_one() {
-    let deliveries = StdMutex::new(HashMap::new());
-    let pending_task = tokio::spawn(async {
-        std::future::pending::<()>().await;
-        Ok(TerminalDeliveryOutcome::Confirmed)
-    });
-    deliveries.lock().expect("delivery lock").insert(
-        "agent".to_string(),
-        PendingTerminalDelivery { message_batch: None, message: "first".to_string(), task: pending_task, engine_turn: None },
-    );
-
-    assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", "first"), TerminalDeliveryLookup::InFlight));
-    let TerminalDeliveryLookup::Taken(replaced) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
-        panic!("different message should replace the in-flight delivery")
-    };
-    assert_eq!(replaced.message, "first");
-    replaced.task.abort();
-    assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", "second"), TerminalDeliveryLookup::Vacant));
-
-    let completed_task = tokio::spawn(async { Ok(TerminalDeliveryOutcome::Confirmed) });
-    while !completed_task.is_finished() {
-        tokio::task::yield_now().await;
-    }
-    deliveries.lock().expect("delivery lock").insert(
-        "agent".to_string(),
-        PendingTerminalDelivery { message_batch: None, message: "second".to_string(), task: completed_task, engine_turn: None },
-    );
-    let TerminalDeliveryLookup::Taken(completed) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
-        panic!("finished delivery should be drained")
-    };
-    assert_eq!(completed.task.await.expect("delivery task").expect("delivery result"), TerminalDeliveryOutcome::Confirmed);
-}
-
-// Legacy queue work cannot drain or replace a Message batch's task,
-// whether it is still pending or has finished awaiting its durable receipt.
-#[tokio::test]
-async fn message_batch_owns_its_task_until_the_receiver_releases_it() {
-    for completed in [false, true] {
-        let deliveries = StdMutex::new(HashMap::new());
-        let task = tokio::spawn(async move {
-            if !completed {
-                std::future::pending::<()>().await;
-            }
-            Ok(TerminalDeliveryOutcome::Confirmed)
-        });
-        if completed {
-            while !task.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        }
-        deliveries.lock().expect("pending transport tasks").insert(
-            "agent".into(),
-            PendingTerminalDelivery { message_batch: Some("batch".into()), message: "framed input".into(), task, engine_turn: None },
-        );
-        for text in ["framed input", "legacy follow-up"] {
-            assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", text), TerminalDeliveryLookup::InFlight));
-            assert_eq!(deliveries.lock().expect("pending transport tasks").len(), 1);
-        }
-        deliveries.lock().expect("pending transport tasks").remove("agent").expect("retained in-flight task").task.abort();
-    }
 }
 
 // Environment boundary fixture: retain the same interior runner while exposing

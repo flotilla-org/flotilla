@@ -3,7 +3,7 @@
 //!
 //! Each pass reads today's role routing through the bindings port
 //! (`MessageReceiverSnapshot`), keeps one minimal AgentSession per live crew
-//! session bound to the inboxes it holds, and types each session's pending
+//! launch, named by the launch, bound to the inboxes its session holds, and types each session's pending
 //! turns through the terminal transport. Once the transport confirms the
 //! turn, it writes `Receive { message, transport }` on the session's record
 //! and the inbox records the message's `deliver`. The same pass settles and
@@ -30,6 +30,7 @@ use std::{
     time::Duration,
 };
 
+use super::terminal::{TerminalDeliveryFailure, TerminalDeliveryOutcome};
 use chrono::Utc;
 use flotilla_address::Address;
 use flotilla_core::primitives::{
@@ -37,9 +38,8 @@ use flotilla_core::primitives::{
     view::old_view,
     MessagePrimitives,
 };
-use flotilla_crew::reconcilers::terminal_session::{TerminalDeliveryFailure, TerminalDeliveryOutcome};
 use flotilla_inbox::{InboxBackend, Rules};
-use flotilla_resources::{ResourceError, TerminalSession, TerminalSessionPhase};
+use flotilla_resources::TerminalSession;
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{agent_session::EndReason, consumer::Receiver, message::Deliver},
@@ -269,7 +269,12 @@ impl MessageDelivery {
         let roles = self.primitives.roles(&self.namespace).await?;
         let mut holders = BTreeMap::new();
         for holder in self.primitives.bindings().holders(&self.namespace, &roles).await? {
-            let consumer = self.primitives.register(&holder.terminal.metadata.name, now).await?;
+            // One AgentSession per launch, named by it (#3108).
+            let Some(launch) = flotilla_resources::terminal_records::launch_of(&holder.terminal) else {
+                debug!(session = %holder.terminal.metadata.name, "a live session's view names no launch");
+                continue;
+            };
+            let consumer = self.primitives.register(launch, now).await?;
             holders.insert(
                 holder.session_id.clone(),
                 Holder { terminal: holder.terminal, session_id: holder.session_id, consumer, inboxes: holder.inboxes },
@@ -316,26 +321,21 @@ impl MessageDelivery {
                 Err(_) => debug!(%address, consumer = %consumer.id, "binding waits for an earlier receipt's delivery"),
             }
         }
-        let live: BTreeSet<_> = holders.values().map(|holder| holder.terminal.metadata.name.clone()).collect();
-        let backend = self.state.daemon.resource_backend();
+        let live: BTreeSet<_> = holders.values().map(|holder| holder.consumer.id.clone()).collect();
         for name in self.sessions.difference(&live).cloned().collect::<Vec<_>>() {
             // A turn still settling ends its session only once its receipt is recorded.
             if self.inflight.values().any(|turn| turn.consumer.id == name) {
                 continue;
             }
-            let terminal = match backend.using::<TerminalSession>(&self.namespace).get(&name).await {
-                Ok(terminal) => Some(
-                    flotilla_store::read_terminal_session(self.state.daemon.lifecycle_reads(), &terminal, None)
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .0,
-                ),
-                Err(ResourceError::NotFound { .. }) => None,
-                Err(error) => return Err(error.to_string()),
-            };
+            let reads = self.state.daemon.lifecycle_reads();
+            let launch = name.clone();
+            // A store read: off the async workers.
+            let terminal =
+                tokio::task::spawn_blocking(move || reads.terminals()?.get(&launch, None)).await.map_err(|error| error.to_string())??;
             let reason = match terminal {
-                Some(terminal) if terminal.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running) => continue,
-                Some(terminal) if terminal.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Stopped) => {
+                Some(launch) if launch.is_running() => continue,
+                // Stopped, as its view reads: released, or its process exited.
+                Some(launch) if launch.exited() || matches!(launch.reading, flotilla_protocol::LifecycleReading::Released) => {
                     EndReason::Completed
                 }
                 _ => EndReason::Lost,
@@ -396,25 +396,8 @@ impl MessageDelivery {
                     self.held.hold(turn.members.iter().cloned(), until);
                     self.held_turns.push(turn);
                 }
-                Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable)) => {
-                    let Some(message_id) = turn.members.first() else {
-                        warn!(%session, "empty turn cannot record a controller fence delivery failure");
-                        continue;
-                    };
-                    let terminals = self.state.daemon.resource_backend().using::<TerminalSession>(&self.namespace);
-                    let patch = flotilla_resources::TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
-                        message_id: message_id.clone(),
-                        message: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into(),
-                        observed_at: Utc::now(),
-                    };
-                    if let Err(error) = flotilla_store::apply_status_patch(&terminals, &turn.consumer.id, &patch).await {
-                        warn!(%session, %error, "could not record controller fence failure");
-                    }
-                }
-                // Never typed (the terminal was not ready in time): nothing to hold; the next pass retries.
-                Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady))
-                | Ok(TerminalDeliveryOutcome::Pending | TerminalDeliveryOutcome::Deferred(_) | TerminalDeliveryOutcome::BatchSuperseded) => {
-                }
+                // Never typed (cleat refused it): nothing to hold; the next pass retries.
+                Ok(TerminalDeliveryOutcome::Deferred(_)) => {}
                 Err(error) => debug!(%session, %error, "engine turn delivery did not complete"),
             }
         }
@@ -455,10 +438,16 @@ impl MessageDelivery {
                 }
             };
             let took_up = agent.as_ref().is_some_and(|agent| agent.took_up_after(turn.submitted_at));
+            // The session's view, while it still shows the launch the turn was typed in.
+            let session = flotilla_resources::terminal_records::launched(&turn.consumer.id);
             let completed = !took_up
-                && match self.state.daemon.resource_backend().using::<TerminalSession>(&self.namespace).get(&turn.consumer.id).await {
+                && match self.state.daemon.resource_backend().using::<TerminalSession>(&self.namespace).get(session).await {
                     Ok(terminal) => {
-                        terminal.status.as_ref().is_some_and(|status| status.codex_completed_after(agent.as_ref(), turn.submitted_at))
+                        flotilla_resources::terminal_records::launch_of(&terminal) == Some(turn.consumer.id.as_str())
+                            && terminal
+                                .status
+                                .as_ref()
+                                .is_some_and(|status| status.codex_completed_after(agent.as_ref(), turn.submitted_at))
                     }
                     Err(error) => {
                         debug!(session = %turn.consumer.id, %error, "a held turn's session could not be read");
@@ -510,27 +499,6 @@ impl MessageDelivery {
     /// Types one session's pending turns as one turn, through the same
     /// terminal reservation every other turn takes.
     async fn start_turn(&mut self, holder: &Holder) -> Result<(), String> {
-        // A fence failure is scoped to this child activation; MarkRunning on
-        // an operator's resume clears it. No receipts or timed retries here.
-        // `holders` was read before collect_turns persisted any newly completed
-        // failures in this pass. Re-read so that stale snapshot cannot resubmit
-        // a just-refused turn before the next tick.
-        let terminal = self
-            .state
-            .daemon
-            .resource_backend()
-            .using::<TerminalSession>(&self.namespace)
-            .get(&holder.terminal.metadata.name)
-            .await
-            .map_err(|error| error.to_string())?;
-        if terminal
-            .status
-            .as_ref()
-            .and_then(|status| status.degraded.as_ref())
-            .is_some_and(|condition| condition.is_controller_fence_unverifiable())
-        {
-            return Ok(());
-        }
         let inbox = self.primitives.inbox();
         let mut turns = Vec::new();
         let mut held = Vec::new();
@@ -618,12 +586,7 @@ impl MessageDelivery {
         );
         deliveries.insert(
             holder.session_id.clone(),
-            PendingTerminalDelivery {
-                message_batch: Some(ENGINE_BATCH.into()),
-                message: text,
-                task,
-                engine_turn: Some(EngineTurn::new(stop)),
-            },
+            PendingTerminalDelivery { message_batch: Some(ENGINE_BATCH.into()), task, engine_turn: Some(EngineTurn::new(stop)) },
         );
         self.inflight.insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members, submitted_at });
         Ok(())

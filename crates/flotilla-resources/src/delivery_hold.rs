@@ -1,83 +1,28 @@
 //! Acceptance policy for terminal inputs and engine turns.
 //! A possible write is held and never retyped while held; fresh receiver
 //! evidence settles it. Time alone is not receipt evidence.
-use std::time::Duration;
-
 use flotilla_protocol::{PrincipalRef, ResourceRef};
 
-use crate::{api_version, DemandKind, DemandSpec, InputMeta, OwnerReference, Resource, ResourceObject, TerminalSession};
+use crate::{api_version, DemandKind, DemandSpec, InputMeta, Resource, TerminalSession};
 
-pub const DELIVERY_MAX_ATTEMPTS: u32 = 3;
-pub const DELIVERY_WORKING_DEBOUNCE_FOR: chrono::Duration = crate::TerminalAttention::DEBOUNCE_FOR;
 pub const DELIVERY_HOLD_FOR: chrono::Duration = chrono::Duration::minutes(5);
-
-pub fn delivery_retry_delay(failures: u32) -> Duration {
-    Duration::from_secs(60 * (1_u64 << failures.saturating_sub(1).min(2)))
-}
-
-pub fn delivery_retry_exhausted(failures: u32) -> bool {
-    failures >= DELIVERY_MAX_ATTEMPTS
-}
 
 /// Names the held batch, why it is held and the command that clears it, so
 /// convoy attention can say more than "needs you" (#3455).
 pub const DELIVERY_HOLD_REASON_ANNOTATION: &str = "flotilla.work/delivery-hold-reason";
 
-/// The held turns of a crew session's convoy role, for a person to rule on.
-pub fn delivery_fact(session: &ResourceObject<TerminalSession>) -> Option<crate::attentions::Fact> {
-    let convoy = match (session.metadata.labels.get(crate::CONVOY_LABEL), &session.spec.source) {
-        (Some(convoy), _) => convoy.clone(),
-        (None, crate::TerminalSessionSource::Agent { context, .. }) => context.convoy.clone(),
-        (None, _) => return None,
-    };
-    let role = session.metadata.labels.get(crate::ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
-    Some(crate::attentions::Fact::DeliveryHeld { session: session.metadata.name.clone(), convoy, role })
+/// The convoy and role a held delivery's Demand concerns, beside its reason.
+pub const DELIVERY_HOLD_CONVOY_ANNOTATION: &str = "flotilla.work/delivery-hold-convoy";
+pub const DELIVERY_HOLD_ROLE_ANNOTATION: &str = "flotilla.work/delivery-hold-role";
+
+pub fn delivery_demand_name(session: &str) -> String {
+    format!("terminal-delivery-{session}")
 }
 
-pub fn delivery_demand_name(session: &ResourceObject<TerminalSession>) -> String {
-    format!("terminal-delivery-{}", session.metadata.name)
-}
-
-/// One operator gate per receiver, regardless of which input representation
-/// owns the unresolved write. Both delivery paths use this same identity.
-pub fn delivery_demand(session: &ResourceObject<TerminalSession>) -> (InputMeta, DemandSpec) {
-    let target =
-        ResourceRef::new(api_version(TerminalSession::API_PATHS), "TerminalSession", &session.metadata.namespace, &session.metadata.name);
-    let meta = InputMeta::builder()
-        .name(delivery_demand_name(session))
-        .owner_references(vec![OwnerReference {
-            api_version: api_version(TerminalSession::API_PATHS),
-            kind: "TerminalSession".into(),
-            name: session.metadata.name.clone(),
-            controller: true,
-        }])
-        .build();
-    let spec = DemandSpec::for_dispatching_principal(
-        target,
-        DemandKind::HumanGate,
-        PrincipalRef::implicit_for_namespace(&session.metadata.namespace),
-    );
+/// One operator gate per receiver session, named for it and targeting it.
+pub fn delivery_demand(namespace: &str, session: &str) -> (InputMeta, DemandSpec) {
+    let target = ResourceRef::new(api_version(TerminalSession::API_PATHS), "TerminalSession", namespace, session);
+    let meta = InputMeta::builder().name(delivery_demand_name(session)).build();
+    let spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, PrincipalRef::implicit_for_namespace(namespace));
     (meta, spec)
-}
-
-/// Whether the legacy representation still owns the receiver's operator gate.
-/// The cursor must identify the held head; stale degraded history cannot retain it.
-pub fn legacy_delivery_gate_needed(session: &ResourceObject<TerminalSession>) -> bool {
-    let Some(status) = session.status.as_ref() else {
-        return false;
-    };
-    let Some(condition) = status.degraded.as_ref() else {
-        return false;
-    };
-    if status.phase != crate::TerminalSessionPhase::Running {
-        return false;
-    }
-    if condition.is_controller_fence_unverifiable() {
-        return true;
-    }
-    let held = condition.reason == crate::TERMINAL_DELIVERY_EXPIRED_REASON
-        || condition.reason == crate::TERMINAL_DELIVERY_UNCONFIRMED_REASON
-        || (condition.reason == crate::TERMINAL_DELIVERY_NOT_SUBMITTED_REASON && delivery_retry_exhausted(condition.consecutive_failures));
-    held && matches!(&session.spec.source, crate::TerminalSessionSource::Agent { message: Some(head), .. }
-        if head.next_after(status.delivered_message_id.as_deref()).is_some_and(|message| condition.message_id.as_deref() == Some(message.id.as_str())))
 }

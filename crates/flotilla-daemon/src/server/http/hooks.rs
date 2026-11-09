@@ -56,7 +56,7 @@ use flotilla_agent::{
     HarnessHookParser,
 };
 use flotilla_protocol::{AgentHarness, AgentHookEvent, AgentHookTerminalRef, EnvironmentId};
-use flotilla_resources::{ResourceError, TerminalSession};
+use flotilla_resources::{ResourceError, TerminalSession, TerminalSessionPhase};
 use flotilla_store::ResourceBackend;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -282,8 +282,7 @@ impl HookEndpoint {
                 return None;
             }
         };
-        // Instance generations must round-trip losslessly through every backing store.
-        let generation = session.metadata.creation_timestamp.to_rfc3339();
+        let generation = launch_generation(&session);
         Some(HookLaunch { base_url: format!("{origin}{HOOKS_PATH}/claude-code"), token: key.mint(&terminal, &generation) })
     }
 }
@@ -378,7 +377,7 @@ async fn handle(
         .native_codex_hook(parsed.native_codex_hook)
         .maybe_terminal(terminal)
         .build();
-    match handle_agent_hook(&state.backend, agent_state_store, policy, state.daemon.clone(), event).await {
+    match handle_agent_hook(agent_state_store, policy, state.daemon.clone(), event).await {
         // An empty 2xx is a command hook that exited 0 and printed nothing.
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => {
@@ -395,7 +394,13 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     (values.next().is_none() && scheme.eq_ignore_ascii_case("Bearer")).then_some(token)
 }
 
-/// Whether a token's terminal instance still exists, undeleted, and runs in
+/// The generation a hook token binds: the launch the session's read view shows, so the
+/// session's next launch refuses this launch's tokens.
+pub(in crate::server) fn launch_generation(session: &flotilla_resources::ResourceObject<TerminalSession>) -> String {
+    flotilla_resources::terminal_records::launch_of(session).map(str::to_owned).unwrap_or_default()
+}
+
+/// Whether a token's terminal launch still exists, has not ended, and runs in
 /// `environment` when the caller is one. Revocation checks the live instance once per
 /// event. A deletion after this read can race an already-admitted event; subsequent
 /// events are refused.
@@ -407,8 +412,9 @@ async fn live_terminal(
 ) -> bool {
     match state.backend.clone().using::<TerminalSession>(&terminal.namespace).get(&terminal.session_name).await {
         Ok(session) => {
-            session.metadata.creation_timestamp.to_rfc3339() == generation
+            launch_generation(&session) == generation
                 && session.metadata.deletion_timestamp.is_none()
+                && session.status.as_ref().is_none_or(|status| status.phase != TerminalSessionPhase::Stopped)
                 && environment.is_none_or(|environment| session.spec.env_ref == environment.as_str())
         }
         Err(ResourceError::NotFound { .. }) => false,

@@ -31,10 +31,6 @@ use flotilla_credentials::CredentialStore;
 use flotilla_credentials::CONTAINER_CODEX_HOME;
 use flotilla_credentials::FLOTILLA_SKILLS_DIR_ENV;
 use flotilla_crew::convoy::ConvoyReconciler;
-use flotilla_crew::reconcilers::terminal_session::{
-    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalRuntime,
-    TerminalSessionReconciler,
-};
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::registry::ProviderRegistry;
@@ -68,8 +64,8 @@ use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_provisioning::checkout_runtime::{CheckoutControllerRuntime, CheckoutRemoval, CheckoutRemovalOutcome};
+use flotilla_provisioning::engine::terminal_actuator::TerminalLiveness;
 use flotilla_provisioning::reconcilers::{CloneRuntime, EnvironmentRuntime};
-use flotilla_provisioning_testkit::EnvironmentFixture;
 use flotilla_replay_testkit::Masks;
 use flotilla_replay_testkit::ReplayHttpClient;
 use flotilla_replay_testkit::Session;
@@ -80,20 +76,15 @@ use flotilla_resources::{
     ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CredentialConsumer, CredentialGrant, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, Demand, EnvironmentSpec,
     Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec,
-    HostSpec, HostStatus, HostStatusPatch, InputMeta, LifecycleAuthority, ModelProbeState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementStatus, Project, Repository, RepositoryKey, RepositorySpec,
-    RepositoryTrust, Resource, ResourceError, Selector, StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, VesselRequirement, VesselSpec,
-    VesselStatus, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
+    HostSpec, HostStatus, HostStatusPatch, InputMeta, ModelProbeState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    PlacementStatus, Project, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceError, Selector,
+    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement,
+    VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
     CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
 };
-use flotilla_store::{
-    controller::{ControllerLoop, Reconciler},
-    watch_resource_kind_including_replicas, ResourceBackend,
-};
+use flotilla_store::{controller::Reconciler, watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_terminal::{
     ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession as ProviderTerminalSession, TerminalSessionLiveness, TerminalSessionTag,
-    TerminalSize,
 };
 use futures::StreamExt;
 use serde_json::json;

@@ -1,7 +1,7 @@
 use flotilla_resources::ResumeIntent;
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -400,7 +400,7 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
     }
 }
 
-// #2758: holds persist convoy/session facts and admit exactly one plain supervisor
+// #2758: holds persist on the convoy and admit exactly one plain supervisor
 // Message, plus one notice to the held crew (#3565), across retries, with no forge
 // collaborator available. Cover local and project supervisors, no PR binding, and
 // retries carrying newer head identities.
@@ -438,8 +438,6 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
         }
         let convoy = convoys.get("crew").await.expect("convoy");
         assert_eq!(convoy.status.expect("status").attention.expect("attention").reason, "episode limit");
-        let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
-        assert_eq!(session.status.expect("status").turn_delivery_hold.expect("hold").reason, "episode limit");
         let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages");
         assert_eq!(messages.items.len(), 2, "retries cannot duplicate the supervisor signal or the crew notice");
         // #3565: the held crew is told why its wakes stopped.
@@ -453,100 +451,6 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
         assert!(message.spec.body.contains("episode limit"));
         assert!(matches!(message.spec.references.last(), Some(flotilla_resources::MessageReference::ControlRecord { resource, .. }) if resource.name == "crew"));
     });
-}
-
-// #2758: the convoy keeps its hold through a receiver-home outage; session state
-// is patched at its authority before the single supervisor signal is published.
-#[tokio::test]
-async fn remote_session_hold_retries_through_existing_mutation_router() {
-    use crate::leaf_engine::{CrewTurnIntent, ResourceIntentPublisher};
-    // Stand-in for the inter-host command channel; both endpoint stores and inbox
-    // admission are real in-memory collaborators, including version validation.
-    struct Router {
-        source: ResourceBackend,
-        receiver: ResourceBackend,
-        fail: AtomicBool,
-    }
-    #[async_trait]
-    impl ResourceIntentPublisher for Router {
-        async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<ResourceRef, String> {
-            let spec: flotilla_resources::MessageSpec = serde_json::from_value(document["spec"].clone()).expect("Message intent");
-            let name = document["metadata"]["name"].as_str().expect("Message name");
-            flotilla_messaging::MessageInbox::new(self.source.clone(), namespace)
-                .accept(&InputMeta::builder().name(name.into()).build(), &spec, Utc::now())
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, name))
-        }
-        async fn patch_status(
-            self: Arc<Self>,
-            namespace: &str,
-            kind: &str,
-            name: &str,
-            status: serde_json::Value,
-            expected: &str,
-        ) -> Result<(), String> {
-            assert_eq!(kind, "TerminalSession");
-            if self.fail.swap(false, Ordering::SeqCst) {
-                return Err("receiver unavailable".into());
-            }
-            flotilla_store::patch_resource_status_if_version(&self.receiver, namespace, kind, name, status, expected)
-                .await
-                .map_err(|error| error.to_string())?;
-            self.source
-                .replica_writer::<ResourceTerminalSession>(flotilla_protocol::NodeId::new("receiver"), namespace)
-                .replace(
-                    &self.receiver.using::<ResourceTerminalSession>(namespace).list().await.map_err(|error| error.to_string())?,
-                    Utc::now(),
-                )
-                .await
-                .map_err(|error| error.to_string())
-        }
-    }
-    let (crew, backend, _, _dir) = fixture(CrewWorkPhase::Done).await;
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let source = sessions.get("session").await.expect("source session");
-    let receiver = ResourceBackend::new(InMemoryBackend::default());
-    let remote = receiver
-        .using::<ResourceTerminalSession>("flotilla")
-        .create(&InputMeta::from(&source.metadata), &source.spec)
-        .await
-        .expect("remote session");
-    receiver
-        .using::<ResourceTerminalSession>("flotilla")
-        .update_status("session", &remote.metadata.resource_version, &source.status.clone().unwrap_or_default())
-        .await
-        .expect("remote status");
-    sessions.delete("session").await.expect("retire local record");
-    backend
-        .replica_writer::<ResourceTerminalSession>(flotilla_protocol::NodeId::new("receiver"), "flotilla")
-        .replace(&receiver.using::<ResourceTerminalSession>("flotilla").list().await.expect("remote snapshot"), Utc::now())
-        .await
-        .expect("replica");
-    let router: Arc<dyn ResourceIntentPublisher> =
-        Arc::new(Router { source: backend.clone(), receiver: receiver.clone(), fail: AtomicBool::new(true) });
-    crew.set_resource_intent_publisher(Arc::downgrade(&router));
-    let request = CrewTurnIntent::builder()
-        .namespace("flotilla".into())
-        .convoy("crew".into())
-        .source("checks-settled".into())
-        .vessel("work".into())
-        .role("coder".into())
-        .brief("continue".into())
-        .subject_revision("head".into())
-        .sender("system:turn-rules".into())
-        .build();
-    assert_eq!(crew.execute_turn_delivery_hold(&request, &HoldAct::State, "limit").await.expect_err("outage"), "receiver unavailable");
-    let held = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
-    let raised_at = held.status.expect("status").turn_delivery_holds()[0].raised_at;
-    assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items.is_empty());
-    for _ in 0..2 {
-        crew.execute_turn_delivery_hold(&request, &HoldAct::State, "limit").await.expect("retry hold");
-    }
-    let session = receiver.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
-    assert_eq!(session.status.expect("status").turn_delivery_hold.expect("hold").raised_at, raised_at);
-    // One supervisor signal and one crew notice, however many retries.
-    assert_eq!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items.len(), 2);
 }
 
 // All terminal convoy outcomes refuse resume and turn admission with an explicit

@@ -564,6 +564,55 @@ fn messages_import_by_state_drop_what_nobody_can_act_on_and_name_each_refusal() 
     assert_eq!(summary.refusals.iter().filter(|refusal| refusal.name == "FleetDesignation").count(), 1);
 }
 
+// A message in flight to a crew (delivered, its reply awaited) names the launch its session
+// imported as, so the crew's consumer, named by that launch, is the one that settles it.
+#[test]
+fn an_in_flight_message_names_the_launch_its_crew_session_imported_as() {
+    let convoy = document(
+        "Convoy",
+        "live",
+        serde_json::to_value(flotilla_resources::ConvoySpec::builder().workflow_ref("w".into()).project_ref("flotilla".into()).build())
+            .expect("spec"),
+        json!({"phase": "Active"}),
+    );
+    let session = document(
+        "TerminalSession",
+        "terminal-live-work-coder",
+        json!({"env_ref": "env", "role": "coder", "cwd": "/repo", "pool": "cleat",
+            "source": {"kind": "agent", "selector": {"capability": "code"}, "brief": {"path": "brief.md", "content": ""},
+                "context": {"namespace": NS, "convoy": "live", "vessel_ref": "live-work"}}}),
+        json!({"phase": "Running", "session_id": "s-coder", "crew": {"id": "crew-coder", "adapter": "claude", "stance": "trusted"}}),
+    );
+    let mut in_flight = message("in-flight");
+    in_flight["spec"]["receiver"] = json!("flotilla/live/work/coder");
+    in_flight["spec"]["expectation"] = json!({"kind": "reply"});
+    in_flight["status"]["phase"] = json!("delivered");
+    in_flight["status"]["resolved_receiver"] =
+        json!({"crew_id": "crew-coder", "session": "s-coder", "delivered_at": "2026-10-19T00:00:00Z", "evidence": "turn confirmed"});
+    let source = rows(vec![designation(), convoy, session, in_flight]);
+
+    let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&source, &mut target);
+    assert_eq!(summary.kinds["Message"].imported, 1, "{summary:?}");
+    assert_eq!(summary.kinds["TerminalSession"].imported, 1, "{summary:?}");
+    let mut read = target.store().read().expect("read");
+    let launch = {
+        use flotilla_provisioning::stored::Launches as _;
+        let key = flotilla_provisioning::stored::terminal_session::TerminalSessionKind::by_launch("terminal-live-work-coder");
+        let numbers = read.integer_index_keys_before(&key, HERE, i64::MAX, 1).expect("launches");
+        format!("terminal-live-work-coder#{}", numbers.first().expect("the session's launch").1)
+    };
+    let inbox: flotilla_address::Address = "project:flotilla/convoy:live/role:coder".parse().expect("inbox");
+    let name = flotilla_core::primitives::import::imported_name(&inbox, "in-flight").expect("name");
+    let id = read.resolve(<MessageResource as Kind>::CODE, &name, HERE).expect("resolve").expect("message");
+    let message = read.load::<MessageResource>(id).expect("load").expect("message").value;
+    let flotilla_state_machines::machines::message::MessageState::Awaiting { receiver } = message.state() else {
+        panic!("still awaiting its reply: {:?}", message.state())
+    };
+    assert_eq!(receiver.id, launch, "the crew's consumer is named by its launch");
+    assert_eq!(receiver.host, HERE);
+}
+
 #[test]
 fn lifecycle_records_import_by_state_and_name_what_they_cannot_map() {
     let summary = rehearse(

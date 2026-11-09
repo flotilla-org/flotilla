@@ -16,8 +16,8 @@
 //! Per-event cost on the local home, one transaction each: a vessel's placement (the lease's
 //! grant and the vessel's create), its realise, a session's create and realise, and an Ensure's
 //! failed attempt. The placement ledger's rebuild from the stored live vessels, as a restart does
-//! it, is timed too. The engine's write paths (layer 7) are timed through `decide`: a session's
-//! launches, an Ensure's patches, and a pinned vessel's lease granted, realised and lost (Q6).
+//! it, is timed too. The engine's write paths (layer 7) are timed: a session's launches through
+//! the terminal port, and through `decide` an Ensure's patches, and a pinned vessel's lease granted, realised and lost (Q6).
 //!
 //! Per-query reads, on a read connection, each statement's VM steps and full-scan steps counted by
 //! SQLite: a convoy's vessels (`vessel.by_convoy`), a host's live vessels (`vessel.live_by_host`,
@@ -38,9 +38,9 @@ use flotilla_provisioning::{
     engine::{
         decide,
         reads::ProvisioningReads,
-        terminal_session::TerminalSessionBinding,
+        terminals::EngineTerminals,
         vessel::{PlacementLifecycles, VesselBinding},
-        LifecycleHome, Lifecycles,
+        LifecycleHome, Lifecycles, Step,
     },
     stored::{
         self,
@@ -48,14 +48,17 @@ use flotilla_provisioning::{
         Holder,
     },
 };
-use flotilla_resources::{ConvoyEnsureStatusPatch, StatusPatch, TerminalSessionStatusPatch, VesselStatusPatch};
+use flotilla_resources::{
+    terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords, TerminalRenewal, PROCESS_EXITED},
+    ConvoyEnsureStatusPatch, StatusPatch, VesselStatusPatch,
+};
 use flotilla_schema::{Address, KindRegistry, Ref as StoredRef, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
         ensure::{Attempted as EnsureAttempted, Create, Ensure, EnsureSpec, Fulfiller, MemoryEnsureWorld, Record},
-        lifecycle::{LifecycleState, MemoryLifecycleWorld, Observed, Realise},
+        lifecycle::{LifecycleState, MemoryLifecycleWorld, Observed, Realise, VanishCause},
         vessel::{Vessel, VesselKind},
     },
     placement::{Dimension, Host, Placements, Request, VesselId},
@@ -179,19 +182,17 @@ fn inbox(role: usize) -> Address {
     format!("project:p{role}/role:standing").parse().expect("inbox")
 }
 
-/// Convoy `n`'s crew session as the old store holds it, starting.
-fn old_session(n: usize) -> flotilla_resources::ResourceObject<flotilla_resources::TerminalSession> {
-    flotilla_resources::ResourceObject {
-        metadata: meta(&format!("terminal-vessel-{n}-coder")),
-        spec: flotilla_resources::TerminalSessionSpec {
-            env_ref: format!("env-{n}"),
-            role: "coder".into(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "claude".into() },
-            cwd: "/workspace".into(),
-            pool: "cleat".into(),
-            env: BTreeMap::new(),
-        },
-        status: None,
+/// Convoy `n`'s crew session, as its vessel requests it.
+fn crew_session(n: usize) -> TerminalLaunchRequest {
+    TerminalLaunchRequest {
+        session: format!("terminal-vessel-{n}-coder"),
+        environment: format!("env-{n}"),
+        vessel: Some(format!("vessel-{n}")),
+        role: "coder".into(),
+        pool: "cleat".into(),
+        cwd: "/workspace".into(),
+        env: BTreeMap::new(),
+        source: TerminalLaunchSource::Tool { command: "claude".into() },
     }
 }
 
@@ -341,11 +342,21 @@ fn crew_load() {
     let mut after = 0;
     let mut replicated = 0;
     loop {
-        let events = remote.lock().expect("remote").read().expect("read").changes_since("remote", after, 1_000).expect("changes");
+        let (events, changes) = {
+            let mut remote = remote.lock().expect("remote");
+            let mut read = remote.read().expect("read");
+            let events = read.changes_since("remote", after, 1_000).expect("changes");
+            let changes = read.changes_of(&events).expect("their changes");
+            (events, changes)
+        };
         let Some(last) = events.last() else { break };
         after = last.home_seq;
         let mut store = local.lock().expect("local");
         let mut write = store.write().expect("write");
+        // A receiver records each entry's change before the entry (#4024).
+        for change in &changes {
+            write.record_change(change).expect("change");
+        }
         for event in &events {
             write.apply(event).expect("replicated");
         }
@@ -423,62 +434,47 @@ fn crew_load() {
     }
     per_event("ensure attempt, one transaction", ROLES, started, "the tally and the log entry");
 
-    // The crew reconcilers' write path (#3629 layer 7): each local convoy's crew session run,
-    // stopped and resumed through the engine as TerminalSession decides it, a new launch each run.
+    // The crew sessions' write path (#3629 layer 7): each local convoy's crew session requested
+    // and realised as the TerminalSession controller steps it, its process exited, and renewed
+    // into its next launch, realised.
     let launches: Arc<dyn Lifecycles<TerminalSessionKind>> =
         Arc::new(LifecycleHome::new("local", Home::with_log("local", StoreLog::new(local.clone())).expect("declaration")));
-    let mut objects: Vec<_> = locals.iter().map(|n| old_session(*n)).collect();
+    let terminals = EngineTerminals::new(Arc::clone(&launches), local.clone(), || vec!["local".to_owned()]);
+    let requests: Vec<_> = locals.iter().map(|n| crew_session(*n)).collect();
     let started = Instant::now();
-    for (round, id) in [(0, "s1"), (1, "s2")] {
-        for obj in objects.iter_mut() {
-            let running = TerminalSessionStatusPatch::MarkRunning {
-                configured_limits: None,
-                session_id: format!("{}-{id}", obj.metadata.name),
-                pid: None,
-                started_at: chrono::DateTime::UNIX_EPOCH,
-                crew: None,
-                launch_command: "claude".into(),
-                delivered_message_id: None,
-            };
-            let decided =
-                decide::<TerminalSessionBinding>(launches.as_ref(), obj, Some(running), chrono::Utc::now()).patch.expect("running");
-            decided.apply(obj.status.get_or_insert_with(Default::default));
-            if round == 0 {
-                let stopped = TerminalSessionStatusPatch::MarkStopped {
-                    stopped_at: chrono::DateTime::UNIX_EPOCH,
-                    inner_command_status: None,
-                    inner_exit_code: Some(0),
-                    message: None,
-                };
-                let decided =
-                    decide::<TerminalSessionBinding>(launches.as_ref(), obj, Some(stopped), chrono::Utc::now()).patch.expect("stopped");
-                decided.apply(obj.status.get_or_insert_with(Default::default));
-                TerminalSessionStatusPatch::MarkStarting.apply(obj.status.get_or_insert_with(Default::default));
-            }
-        }
+    for request in &requests {
+        let first = terminals.request(request.clone()).expect("requested");
+        launches.step(&first, &Step::Realised { identity: format!("{first}-s1") }, Timestamp(20)).expect("realised");
+        let exited = VanishCause::Lost { reason: Some(format!("{PROCESS_EXITED}: exit 0")) };
+        launches.step(&first, &Step::Vanished { cause: exited }, Timestamp(21)).expect("exited");
+        let TerminalRenewal::Started(second) = terminals.renew(&request.session).expect("renewed") else { panic!("the launch ended") };
+        launches.step(&second, &Step::Realised { identity: format!("{second}-s2") }, Timestamp(22)).expect("realised");
     }
     per_event(
-        "session run, stop, resumed run",
-        objects.len() * 3,
+        "session run, exit, renewed run",
+        requests.len() * 3,
         started,
-        "launch #1 requested and realised, released; launch #2 requested and realised",
+        "launch #1 requested and realised, vanished; launch #2 requested and realised",
     );
-    assert!(objects.iter().all(|obj| launches.newest_launch(&obj.metadata.name).is_some()));
 
-    // The read ports (#3629 layer 8): a session's current launch by its record name, and a
-    // vessel's sessions (which seats it serves) through the index.
-    let reads = flotilla_provisioning::engine::reads::StoreReads::new(local.clone());
+    // The read ports (#3629 layer 8): a session's current launch by its name, and a vessel's
+    // sessions (which seats it serves) through the index.
     let started = Instant::now();
-    for obj in &objects {
-        let view = reads.terminal_session(&obj.metadata.name, "local").expect("read").expect("held");
-        assert_eq!(Some(view.name), launches.newest_launch(&obj.metadata.name).map(|held| held.name().to_owned()), "the current launch");
+    for request in &requests {
+        let view = terminals.get(&request.session, None).expect("read").expect("held");
+        assert_eq!(Some(view.name), launches.newest_launch(&request.session).map(|held| held.name().to_owned()), "the current launch");
     }
-    eprintln!("{:>40}: {:>8.1} µs/query", "port: a session's current launch", started.elapsed().as_secs_f64() * 1e6 / objects.len() as f64);
+    eprintln!(
+        "{:>40}: {:>8.1} µs/query",
+        "port: a session's current launch",
+        started.elapsed().as_secs_f64() * 1e6 / requests.len() as f64
+    );
     let started = Instant::now();
     for n in &locals {
-        assert!(reads.held_sessions(&Holder::vessel(&format!("vessel-{n}"))).expect("index").len() >= 2);
+        assert!(terminals.of_vessel(&format!("vessel-{n}")).expect("index").len() >= 2);
     }
     eprintln!("{:>40}: {:>8.1} µs/query", "port: a vessel's served sessions", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
+    let reads = flotilla_provisioning::engine::reads::StoreReads::new(local.clone());
 
     // Standing roles' Ensures decided through the engine: a convoy bound, failed, a replacement bound.
     let ensures = flotilla_core::primitives::ensures::EngineEnsurePath::open(local.clone(), Arc::new(flotilla_resources::SystemClock))

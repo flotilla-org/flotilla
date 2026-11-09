@@ -25,7 +25,7 @@
 //! | | Failed | GaveUp |
 //! | | Gone | Gone(Released) |
 //! | TerminalSession (as launch `#1`) | Starting | Requested |
-//! | | Running, Lost (unobservable is a judgement, #3629 Q2) | Realised (its session id) |
+//! | | Running, Lost (unobservable is a judgement, #3629 Q2) | Realised (its session id), with its launch facts |
 //! | | Stopped | Gone(Released) |
 //! | | Failed | GaveUp |
 //! | Vessel, placed (a lease granted on its pinned host, #3629 Q6) | Pending, Provisioning | Requested |
@@ -59,15 +59,14 @@ use flotilla_resources::{
     CONVOY_LABEL,
 };
 
-use super::{
-    checkouts, clones, environments, image_build::ImageBuildBinding, terminal_session::TerminalSessionBinding, vessel::VesselBinding,
-    Binding,
-};
+use super::{checkouts, clones, environments, image_build::ImageBuildBinding, terminals, vessel::VesselBinding, Binding};
 use crate::stored::{
     checkout::{CheckoutFacts, CheckoutKind},
     clone::{CloneFacts, CloneKind},
     environment::EnvironmentKind,
     launch_facts::EnvironmentLaunchFacts,
+    terminal_facts::{AgentLaunch, TerminalEndpoint, TerminalLaunchFacts},
+    terminal_session::TerminalSessionKind,
 };
 
 /// A kind whose old records the import maps.
@@ -555,21 +554,82 @@ pub fn import_checkout(
     ))
 }
 
-impl Imported for TerminalSessionBinding {
-    fn imported_state(obj: &ResourceObject<OldTerminalSession>) -> Result<LifecycleState, String> {
-        let status = obj.status.as_ref();
-        Ok(match status.map(|status| status.phase).unwrap_or_default() {
-            TerminalSessionPhase::Starting => LifecycleState::requested(),
-            // Lost is only unobservable: still Realised (#3629 Q2).
-            TerminalSessionPhase::Running | TerminalSessionPhase::Lost => {
-                realised(status.and_then(|status| status.session_id.clone()), "session id")?
+/// Imports old TerminalSession `records` into `target`, each as its session's first launch. A
+/// realised launch keeps what it was given (its harness, its cleat endpoint, its build
+/// parallelism) as its launch facts, written beside it. The retired status fields (delivery
+/// holds, queued messages, a pending completion, observations) are not carried. Returns the
+/// launch each imported as, by home and old name, for the messages delivered to it.
+pub fn import_terminal_sessions(
+    records: &[(ResourceObject<OldTerminalSession>, String)],
+    target: &mut impl ImportTarget,
+    report: &mut ImportReport,
+) -> BTreeMap<(String, String), String> {
+    let mut launches = BTreeMap::new();
+    for (session, home) in records {
+        if !target.imports(home) {
+            continue;
+        }
+        let refuse = |reason: String| ImportRefusal { kind: TerminalSessionKind::NAME, record: session.metadata.name.clone(), reason };
+        let result = import_terminal_session(session, home).and_then(|mut imported| {
+            let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+            write_imported(target, &mut imported, &change).map_err(refuse)?;
+            if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
+                target.write(home, imported.resource.name(), &change, &terminal_launch_facts(session)).map_err(refuse)?;
             }
-            // A legacy stopped launch imports as released; it carries no more detailed ending.
-            TerminalSessionPhase::Stopped => LifecycleState::Gone { ending: Ending::Released },
-            TerminalSessionPhase::Failed => {
-                LifecycleState::GaveUp { cause: failed_by(status.and_then(|status| status.message.as_deref()), "the session failed") }
-            }
-        })
+            Ok(imported)
+        });
+        if let Ok(imported) = &result {
+            launches.insert((home.clone(), session.metadata.name.clone()), imported.resource.name().to_owned());
+        }
+        report.record(&result);
+    }
+    launches
+}
+
+/// Maps old TerminalSession `obj`, homed at `home`, onto its first launch.
+pub fn import_terminal_session(
+    obj: &ResourceObject<OldTerminalSession>,
+    home: &str,
+) -> Result<ImportedResource<TerminalSessionKind>, ImportRefusal> {
+    let refuse = |reason: String| ImportRefusal { kind: TerminalSessionKind::NAME, record: obj.metadata.name.clone(), reason };
+    let request = terminals::request_of_old(obj, home).map_err(refuse)?;
+    let status = obj.status.as_ref();
+    let state = match status.map(|status| status.phase).unwrap_or_default() {
+        TerminalSessionPhase::Starting => LifecycleState::requested(),
+        // Lost is only unobservable: still Realised (#3629 Q2).
+        TerminalSessionPhase::Running | TerminalSessionPhase::Lost => {
+            realised(status.and_then(|status| status.session_id.clone()), "session id").map_err(refuse)?
+        }
+        // A legacy stopped launch imports as released; it carries no more detailed ending.
+        TerminalSessionPhase::Stopped => LifecycleState::Gone { ending: Ending::Released },
+        TerminalSessionPhase::Failed => {
+            LifecycleState::GaveUp { cause: failed_by(status.and_then(|status| status.message.as_deref()), "the session failed") }
+        }
+    };
+    let since = Timestamp::from_datetime(&obj.metadata.creation_timestamp);
+    Ok(ImportedResource {
+        record: obj.metadata.name.clone(),
+        home: home.to_owned(),
+        resource: Resource::stored(obj.metadata.name.clone(), request, State::new(state, since), Version(1)),
+    })
+}
+
+/// What old TerminalSession `obj` recorded its launch was given.
+fn terminal_launch_facts(obj: &ResourceObject<OldTerminalSession>) -> TerminalLaunchFacts {
+    let status = obj.status.as_ref();
+    TerminalLaunchFacts {
+        endpoint: status
+            .and_then(|status| status.cleat_endpoint.as_ref())
+            .map(|endpoint| TerminalEndpoint { runtime_root: endpoint.runtime_root.clone(), daemon: endpoint.daemon.clone() }),
+        agent: status.and_then(|status| status.crew.as_ref()).map(|crew| AgentLaunch {
+            adapter: crew.adapter.clone(),
+            model: crew.model.clone(),
+            stance: crew.stance.clone(),
+        }),
+        build_jobs: status
+            .and_then(|status| status.configured_limits.as_ref())
+            .and_then(|limits| limits.build_jobs)
+            .map(|jobs| jobs as u64),
     }
 }
 

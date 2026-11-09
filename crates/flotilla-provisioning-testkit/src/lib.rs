@@ -29,12 +29,13 @@ use flotilla_state_machines::{
     Cause, CauseCategory, Home, Log, Outcome,
 };
 
-/// The engine's environments, clones and checkouts homed at one home on one store, each fixture's
-/// `reads` serving all three, as a daemon's lifecycle reads do.
+/// The engine's environments, clones, checkouts and terminal sessions homed at one home on one
+/// store, each fixture's `reads` serving all four, as a daemon's lifecycle reads do.
 pub struct EngineFixture {
     pub environments: EnvironmentFixture,
     pub clones: CloneFixture,
     pub checkouts: CheckoutFixture,
+    pub terminals: TerminalsFixture,
 }
 
 impl Default for EngineFixture {
@@ -51,16 +52,34 @@ impl EngineFixture {
 
     /// An engine over `store`, whose home is `home`: a daemon's decided store, say.
     pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
-        let mut environments = EnvironmentFixture::over(home, Arc::clone(&store));
-        let mut clones = CloneFixture::over(home, Arc::clone(&store));
-        let checkouts =
-            CheckoutFixture::over(home, store).serving(Arc::clone(&environments.environments) as _, Arc::clone(&clones.clones) as _);
-        environments.reads = checkouts.reads.clone();
-        clones.reads = checkouts.reads.clone();
-        Self { environments, clones, checkouts }
+        Self::with_terminals(home, Arc::clone(&store), TerminalsFixture::over(home, store))
     }
 
-    /// The readings serving all three.
+    /// An engine over a daemon's decided store `service`, whose terminal sessions are read at every
+    /// home it holds: another daemon's arrive as its log is replicated in.
+    pub fn over_service(service: &Arc<flotilla_schema_sqlite::stream::Service>) -> Self {
+        Self::with_terminals(service.home(), service.store(), TerminalsFixture::over_service(service))
+    }
+
+    fn with_terminals(home: &str, store: Arc<Mutex<Store>>, mut terminals: TerminalsFixture) -> Self {
+        let mut environments = EnvironmentFixture::over(home, Arc::clone(&store));
+        let mut clones = CloneFixture::over(home, Arc::clone(&store));
+        let mut checkouts = CheckoutFixture::over(home, Arc::clone(&store));
+        let reads: Arc<dyn LifecycleReads> = Arc::new(
+            LifecycleReadPort::new(StoreReads::new(store), home.to_owned())
+                .with_environments(Arc::clone(&environments.environments) as Arc<dyn EnvironmentRecords>)
+                .with_clones(Arc::clone(&clones.clones) as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
+                .with_checkouts(Arc::clone(&checkouts.checkouts) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
+                .with_terminals(Arc::clone(&terminals.terminals) as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>),
+        );
+        environments.reads = reads.clone();
+        clones.reads = reads.clone();
+        checkouts.reads = reads.clone();
+        terminals.reads = reads;
+        Self { environments, clones, checkouts, terminals }
+    }
+
+    /// The readings serving all four.
     pub fn reads(&self) -> Arc<dyn LifecycleReads> {
         self.checkouts.reads.clone()
     }
@@ -91,6 +110,8 @@ where
     /// The checkouts its readers find, and the engine Convoys they are held for, homed at `home`
     /// on the same store.
     pub checkouts: CheckoutFixture,
+    /// The terminal sessions its readers find, homed at `home` on the same store.
+    pub terminals: TerminalsFixture,
 }
 
 impl<B: Binding> LifecycleFixture<B>
@@ -99,18 +120,24 @@ where
     StoreLog: Log<Lifecycle<B::Kind>>,
 {
     pub fn new(replica: bool) -> Self {
-        let store = Arc::new(Mutex::new(memory_store("home")));
+        Self::over(Arc::new(Mutex::new(memory_store("home"))), replica)
+    }
+
+    /// A fixture homed at "home" over `store`, read from "reader" when `replica`.
+    pub fn over(store: Arc<Mutex<Store>>, replica: bool) -> Self {
         let home = Arc::new(LifecycleHome::new("home", Home::with_log("home", StoreLog::new(Arc::clone(&store))).expect("home")));
         let environments = EnvironmentFixture::over("home", Arc::clone(&store));
         let clones = CloneFixture::over("home", Arc::clone(&store));
         let checkouts = CheckoutFixture::over("home", Arc::clone(&store));
+        let terminals = TerminalsFixture::over("home", Arc::clone(&store));
         let reads = Arc::new(
             LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), if replica { "reader" } else { "home" }.into())
                 .with_environments(Arc::clone(&environments.environments) as Arc<dyn EnvironmentRecords>)
                 .with_clones(Arc::clone(&clones.clones) as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
-                .with_checkouts(Arc::clone(&checkouts.checkouts) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>),
+                .with_checkouts(Arc::clone(&checkouts.checkouts) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
+                .with_terminals(Arc::clone(&terminals.terminals) as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>),
         );
-        Self { home, reads, store, environments, clones, checkouts }
+        Self { home, reads, store, environments, clones, checkouts, terminals }
     }
 
     pub fn name(&self, obj: &ResourceObject<B::Old>) -> String {
@@ -229,7 +256,7 @@ pub type VesselFixture = LifecycleFixture<flotilla_provisioning::engine::vessel:
 impl VesselFixture {
     /// Holds the lease of `vessel`, of `convoy`, pinned to `host`, as its placement does: the
     /// environment requested for it waits on this.
-    pub fn lease(&self, vessel: &str, convoy: &str, host: &str) {
+    pub fn lease(&self, vessel: &str, convoy: &str, host: &str) -> ResourceObject<flotilla_resources::Vessel> {
         use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
         use flotilla_resources::{Vessel, VesselSpec, VesselStatus};
         let placed = object::<Vessel>(
@@ -251,6 +278,7 @@ impl VesselFixture {
             },
         );
         self.request(&placed);
+        placed
     }
 }
 
@@ -292,102 +320,4 @@ pub fn image_build(phase: flotilla_resources::ImageBuildPhase) -> ResourceObject
             ..Default::default()
         },
     )
-}
-
-/// Contradictory terminal observations; launch identity is selected separately from the engine.
-pub fn terminal_session(phase: flotilla_resources::TerminalSessionPhase) -> ResourceObject<flotilla_resources::TerminalSession> {
-    use flotilla_resources::{TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus};
-    object(
-        "terminal-a",
-        TerminalSessionSpec {
-            env_ref: "env".into(),
-            role: "coder".into(),
-            source: TerminalSessionSource::Tool { command: "bash".into() },
-            cwd: "/work".into(),
-            pool: "cleat".into(),
-            env: Default::default(),
-        },
-        TerminalSessionStatus {
-            phase,
-            session_id: Some("old".into()),
-            message: Some("stale reason".into()),
-            stopped_at: Some(chrono::DateTime::UNIX_EPOCH),
-            ..Default::default()
-        },
-    )
-}
-
-pub type TerminalFixture = LifecycleFixture<flotilla_provisioning::engine::terminal_session::TerminalSessionBinding>;
-
-impl TerminalFixture {
-    pub fn replace(&self, obj: &ResourceObject<flotilla_resources::TerminalSession>, predecessor: &str) -> Result<String, String> {
-        use flotilla_resources::terminal_launches::TerminalLaunches;
-        flotilla_provisioning::engine::terminal_session::EngineTerminalLaunches { lifecycles: self.home.clone() }.replace(
-            obj,
-            predecessor,
-            chrono::DateTime::UNIX_EPOCH + chrono::Duration::seconds(10),
-        )
-    }
-}
-
-impl TerminalFixture {
-    /// Inject a storage-boundary failure, forwarding every successful write to the actual SQLite log.
-    pub fn replacement_write_failures(
-        &self,
-        obj: &ResourceObject<flotilla_resources::TerminalSession>,
-        create: bool,
-        count: usize,
-    ) -> Arc<dyn Lifecycles<flotilla_provisioning::stored::terminal_session::TerminalSessionKind>> {
-        use flotilla_state_machines::machines::lifecycle::LifecycleEdgeKind;
-        use flotilla_state_machines::{EdgeEventOf, InputRead, LogError, Resource, StoredState, Version};
-        type Machine = Lifecycle<flotilla_provisioning::stored::terminal_session::TerminalSessionKind>;
-        struct FailedWrites {
-            inner: StoreLog,
-            create: bool,
-            remaining: usize,
-        }
-        impl Log<Machine> for FailedWrites {
-            fn create(
-                &mut self,
-                writer: &str,
-                at: Timestamp,
-                resource: &Resource<Machine>,
-                reads: &[InputRead],
-            ) -> Result<Version, LogError> {
-                self.inner.create(writer, at, resource, reads)
-            }
-            // A launch is created, and numbered, here.
-            fn create_resource(
-                &mut self,
-                writer: &str,
-                at: Timestamp,
-                resource: Resource<Machine>,
-                reads: &[InputRead],
-            ) -> Result<Resource<Machine>, LogError> {
-                if self.create && self.remaining > 0 {
-                    self.remaining -= 1;
-                    return Err(LogError::new("injected successor create failure"));
-                }
-                self.inner.create_resource(writer, at, resource, reads)
-            }
-            fn edge(
-                &mut self,
-                writer: &str,
-                previous: &StoredState<Machine>,
-                next: &Resource<Machine>,
-                event: &EdgeEventOf<Machine>,
-            ) -> Result<Version, LogError> {
-                if !self.create && self.remaining > 0 && matches!(&event.edge, LifecycleEdgeKind::Vanish) {
-                    self.remaining -= 1;
-                    return Err(LogError::new("injected predecessor ending failure"));
-                }
-                self.inner.edge(writer, previous, next, event)
-            }
-        }
-        let mut home =
-            Home::<Machine, _>::with_log("home", FailedWrites { inner: StoreLog::new(self.store.clone()), create, remaining: count })
-                .expect("home");
-        home.restore(self.home.get(&self.name(obj)).expect("predecessor")).expect("restore");
-        Arc::new(LifecycleHome::new("home", home))
-    }
 }

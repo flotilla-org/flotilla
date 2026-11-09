@@ -24,18 +24,18 @@ use flotilla_protocol::{
 };
 use flotilla_resources::checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id};
 use flotilla_resources::checkout_records::{latest_launches, CheckoutHolder, CheckoutRecord};
+use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords};
 use flotilla_resources::{
     address::{
         leaf_address, leaf_record_name, record_name, remote_change_request_address, repository_address, subject_address,
         submission_subject_text, AddressKind,
     },
     expected_change_request_leaves, external_patches as convoy_external_patches, ChangeRequest as ResourceChangeRequest, Clock,
-    Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionPending, CrewMessageSender, CrewSource, CrewWorkPhase, Forge,
-    HoldAct, InputMeta, ObservedChangeRequestState, Project, Repository, RepositoryKey, ResourceError, ResourceObject, ResourceProvenance,
+    Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewMessageSender, CrewSource, CrewWorkPhase, Forge, HoldAct, InputMeta,
+    ObservedChangeRequestState, Project, Repository, RepositoryKey, ResourceError, ResourceObject, ResourceProvenance,
     TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, Vessel,
-    WorkCompletionAuthority, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
-    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TurnDeliveryRung, Vessel, WorkCompletionAuthority,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{CrewMessageDelivery, TerminalCrewMessage};
@@ -459,7 +459,7 @@ enum PreparedTurn {
 }
 
 /// A turn receiver's terminal session, its launch, and the admission rung it observes.
-type TurnReceiverSession = (Option<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>, Option<String>, TurnDeliveryRung);
+type TurnReceiverSession = (Option<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>, TurnDeliveryRung);
 
 /// A new crew turn's message and the session that receives it.
 struct CrewTurn {
@@ -467,7 +467,6 @@ struct CrewTurn {
     intent: flotilla_resources::MessageSpec,
     name: String,
     holder: Option<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>,
-    holder_launch: Option<String>,
     rung: TurnDeliveryRung,
 }
 
@@ -493,14 +492,12 @@ impl ResumeSelection {
 /// The selected crew member's terminal session as a resume read it.
 struct ResumeSession {
     session: Result<Option<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>, String>,
-    session_launch: Option<String>,
     queue_until_boundary: bool,
 }
 
 /// A resume whose crew work is reopened, ready to publish.
 struct ResumeDelivery {
     session: flotilla_resources::ReadResourceObject<ResourceTerminalSession>,
-    session_launch: Option<String>,
     resume_intent: flotilla_resources::MessageSpec,
     message_name: String,
     reopened: ResourceObject<ResourceConvoy>,
@@ -534,28 +531,6 @@ type WeakConvoyMessageLock = Weak<Mutex<()>>;
 
 fn crew_handoff_address_error(target: &str, vessel: &str) -> String {
     format!("no such crew target; handoff requires a different crew member (target `{target}`, vessel `{vessel}`)")
-}
-
-pub fn terminal_meta_with_vessel_credentials(mut meta: InputMeta, requirement: &flotilla_resources::VesselRequirement) -> InputMeta {
-    if !requirement.credential_refs.is_empty() {
-        meta.annotations.insert(
-            CREDENTIAL_REFS_ANNOTATION.to_string(),
-            serde_json::to_string(&requirement.credential_refs).expect("credential names serialize"),
-        );
-    }
-    if !requirement.credential_scopes.is_empty() {
-        meta.annotations.insert(
-            CREDENTIAL_SCOPES_ANNOTATION.to_string(),
-            serde_json::to_string(&requirement.credential_scopes).expect("credential scopes serialize"),
-        );
-    }
-    if !requirement.credential_permissions.is_empty() {
-        meta.annotations.insert(
-            CREDENTIAL_PERMISSIONS_ANNOTATION.to_string(),
-            serde_json::to_string(&requirement.credential_permissions).expect("credential permissions serialize"),
-        );
-    }
-    meta
 }
 
 // Legacy fixture seeding only; remove after the first fleet roll deploying #2710.
@@ -717,12 +692,7 @@ impl CrewService {
         };
         let session_list =
             self.resource_backend.query_declared::<ResourceTerminalSession>(&namespace, &query).await.map_err(|err| err.to_string())?.items;
-        let session_list = flotilla_store::read_terminal_sources(Arc::clone(&self.lifecycle_reads), session_list)
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|source| source.object)
-            .collect::<Vec<_>>();
+        let session_list = session_list.into_iter().map(|source| source.object).collect::<Vec<_>>();
 
         if let Some(crew_id) = requested.crew_id.as_deref() {
             let session = session_list
@@ -818,65 +788,6 @@ impl CrewService {
         self.resolved_crew_context(namespace, convoy, vessel_ref, role, caller).await
     }
 
-    pub async fn mark_crew_completion_pending(
-        &self,
-        namespace: &str,
-        session_name: &str,
-        pending: CrewCompletionPending,
-    ) -> Result<(), String> {
-        apply_resource_status_patch(
-            &self.resource_backend.clone().using::<ResourceTerminalSession>(namespace),
-            session_name,
-            &TerminalSessionStatusPatch::MarkCompletionPending { pending },
-        )
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-    }
-
-    pub async fn clear_crew_completion_pending(&self, namespace: &str, session_name: &str) -> Result<(), String> {
-        apply_resource_status_patch(
-            &self.resource_backend.clone().using::<ResourceTerminalSession>(namespace),
-            session_name,
-            &TerminalSessionStatusPatch::ClearCompletionPending,
-        )
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-    }
-
-    pub async fn pending_crew_completions(&self) -> Result<Vec<(String, CrewCompletionPending, CrewCommandContext)>, String> {
-        let namespace = self.provisioning_namespace().await;
-        let sessions = self
-            .resource_backend
-            .query_declared::<ResourceTerminalSession>(
-                &namespace,
-                &StoreQuery { present: vec!["status.completion_pending.authority".into()], ..Default::default() },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(sessions
-            .items
-            .into_iter()
-            .filter_map(|session| {
-                let session = session.object;
-                let pending = session.status.as_ref()?.completion_pending.clone()?;
-                let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return None };
-                Some((
-                    session.metadata.name,
-                    pending,
-                    CrewCommandContext {
-                        crew_id: None,
-                        namespace: Some(context.namespace.clone()),
-                        convoy: Some(context.convoy.clone()),
-                        vessel_ref: Some(context.vessel_ref.clone()),
-                        role: Some(session.spec.role),
-                    },
-                ))
-            })
-            .collect())
-    }
-
     async fn resolved_crew_context(
         &self,
         namespace: String,
@@ -904,7 +815,9 @@ impl CrewService {
         let context = self.resolve_crew_context(requested).await?;
         let session = context.caller_session.as_ref().ok_or("capabilities requires a live crew session")?;
         let source = self.capability_source.read().await.clone().ok_or("session capability source unavailable")?;
-        let credentials = source.credentials(&session.spec.env_ref, &credential_references(session)?).await?;
+        let credentials = source
+            .credentials(&session.spec.env_ref, &credential_references(&self.resource_backend, &context.namespace, session).await?)
+            .await?;
         session_card(
             &self.resource_backend,
             &context.namespace,
@@ -1009,41 +922,19 @@ impl CrewService {
         };
         let mut selected = BTreeMap::new();
         for (role, source) in sources {
-            selected.insert(role, self.terminal_source(source).await?.0);
+            selected.insert(role, source);
         }
         Ok(selected)
     }
 
-    async fn terminal_source(
-        &self,
-        mut source: flotilla_resources::ReadResourceObject<ResourceTerminalSession>,
-    ) -> Result<(flotilla_resources::ReadResourceObject<ResourceTerminalSession>, Option<String>), String> {
-        let origin = match &source.provenance {
-            ResourceProvenance::Local => None,
-            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str()),
-        };
-        let (object, launch) = flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), &source.object, origin)
-            .await
-            .map_err(|error| error.to_string())?;
-        source.object = object;
-        Ok((source, launch))
+    /// The engine's terminal sessions (#3108).
+    fn terminals(&self) -> Result<&dyn TerminalRecords, String> {
+        self.lifecycle_reads.terminals()
     }
 
-    async fn restart_terminal(
-        &self,
-        namespace: &str,
-        obj: &ResourceObject<ResourceTerminalSession>,
-        replaces: Option<&str>,
-    ) -> Result<(), String> {
-        self.resource_backend.request_terminal_replacement(obj, replaces, self.clock.now()).await.map_err(|error| error.to_string())?;
-        apply_resource_status_patch(
-            &self.resource_backend.using::<ResourceTerminalSession>(namespace),
-            &obj.metadata.name,
-            &TerminalSessionStatusPatch::MarkStarting,
-        )
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    /// Starts the next launch of session `obj`, whose newest launch here has ended.
+    fn restart_terminal(&self, obj: &ResourceObject<ResourceTerminalSession>) -> Result<(), String> {
+        self.terminals()?.renew(&obj.metadata.name).map(|_| ())
     }
 
     // Crew handoff consumes process state independently of the live island charter.
@@ -1115,7 +1006,8 @@ impl CrewService {
                 };
                 let crew = session.and_then(|session| session.status.as_ref()).and_then(|status| status.crew.as_ref());
                 let agent = session.and_then(|session| {
-                    match self.lifecycle_reads.agent_sessions().and_then(|reads| reads.read(&session.metadata.name, origin)) {
+                    let launch = flotilla_resources::terminal_records::launch_of(session)?;
+                    match self.lifecycle_reads.agent_sessions().and_then(|reads| reads.read(launch, origin)) {
                         Ok(agent) => agent,
                         Err(error) => {
                             tracing::debug!(session = %session.metadata.name, %error, "crew list shows no agent activity");
@@ -1435,9 +1327,6 @@ impl CrewService {
         )
         .await
         .map_err(|error| error.to_string())?;
-        if let Some(session_name) = routing.session_name {
-            self.clear_crew_completion_pending(namespace, &session_name).await?;
-        }
         Ok(CommandValue::Ok)
     }
 
@@ -1816,11 +1705,8 @@ impl CrewService {
         delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<Vessel>(namespace), &selector)
             .await
             .map_err(|error| error.to_string())?;
-        delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<ResourceTerminalSession>(namespace), &selector)
-            .await
-            .map_err(|error| error.to_string())?;
-        // The convoy's checkouts are the engine's: the Checkout controller releases them once its
-        // engine Convoy has ended.
+        // The convoy's checkouts and terminal sessions are the engine's: their controllers release
+        // them once the engine Convoy, and the Vessels holding the sessions, have ended.
         Ok(())
     }
 
@@ -2224,10 +2110,6 @@ impl CrewService {
             let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &context.namespace, &receiver)
                 .await
                 .map_err(|error| error.to_string())?;
-            let holder = match holder {
-                Some(holder) => Some(self.terminal_source(holder).await?.0),
-                None => None,
-            };
             if holder.as_ref().is_some_and(|holder| {
                 holder.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed)
             }) {
@@ -2308,13 +2190,6 @@ impl CrewService {
                 Err(ResourceError::NotFound { .. }) => None,
                 Err(error) => return Err(error.to_string()),
             };
-        let (target_source, target_launch) = match target_source {
-            Some(source) => {
-                let (source, launch) = self.terminal_source(source).await?;
-                (Some(source), launch)
-            }
-            None => (None, None),
-        };
         let target_origin = target_source.as_ref().and_then(|session| match &session.provenance {
             ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
             ResourceProvenance::Local => None,
@@ -2420,22 +2295,17 @@ impl CrewService {
                     Ok(existing) if existing.spec.env_ref != environment_ref => {
                         Err(format!("crew target `{target}` moved to another environment during credential staging"))
                     }
-                    Ok(existing) => {
-                        let (existing, _) = flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), &existing, None)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        match existing.status.as_ref().map(|status| status.phase) {
-                            Some(ResourceTerminalSessionPhase::Running) => send().await.map(|_| ()),
-                            Some(ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost) => {
-                                send().await.map(|_| ())?;
-                                self.restart_terminal(&context.namespace, &existing, target_launch.as_deref()).await
-                            }
-                            Some(ResourceTerminalSessionPhase::Failed) => {
-                                Err(format!("crew target `{target}` failed provisioning and cannot be revived"))
-                            }
-                            Some(ResourceTerminalSessionPhase::Starting) | None => send().await.map(|_| ()),
+                    Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
+                        Some(ResourceTerminalSessionPhase::Running) => send().await.map(|_| ()),
+                        Some(ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost) => {
+                            send().await.map(|_| ())?;
+                            self.restart_terminal(&existing)
                         }
-                    }
+                        Some(ResourceTerminalSessionPhase::Failed) => {
+                            Err(format!("crew target `{target}` failed provisioning and cannot be revived"))
+                        }
+                        Some(ResourceTerminalSessionPhase::Starting) | None => send().await.map(|_| ()),
+                    },
                     Err(ResourceError::NotFound { .. }) => {
                         let anchor = anchor.ok_or_else(|| format!("crew target `{target}` disappeared during credential staging"))?;
                         let current_convoy = convoys.get(&context.convoy).await.map_err(|error| error.to_string())?;
@@ -2498,58 +2368,33 @@ impl CrewService {
                             );
                             brief.content.clear();
                         }
-                        let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);
-                        let anchor_environment = anchor.spec.env_ref.clone();
-                        let created = sessions
-                            .create(
-                                &terminal_meta,
-                                &flotilla_resources::TerminalSessionSpec {
-                                    env_ref: anchor.spec.env_ref,
-                                    role: target.to_string(),
-                                    source: TerminalSessionSource::Agent {
-                                        selector: selector.clone(),
-                                        brief,
-                                        context: Box::new(TerminalCrewContext {
-                                            namespace: context.namespace.clone(),
-                                            convoy: context.convoy.clone(),
-                                            vessel_ref: context.vessel_ref.clone(),
-                                        }),
-                                        message: None,
-                                    },
-                                    cwd: anchor.spec.cwd,
-                                    env: anchor.spec.env,
-                                    pool: anchor.spec.pool,
-                                },
-                            )
-                            .await;
-                        match created {
-                            Ok(_) => {}
-                            // Reopening the target's work above lets the vessel controller
-                            // create its session concurrently. A session that now exists in
-                            // the same environment receives the message like a starting one;
-                            // one without a status yet is that session, before its first launch.
-                            Err(error @ ResourceError::Conflict { .. }) => {
-                                let existing = match sessions.get(&terminal_name).await {
-                                    Ok(existing) => Some(
-                                        flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), &existing, None)
-                                            .await
-                                            .map_err(|error| error.to_string())?
-                                            .0,
-                                    ),
-                                    Err(_) => None,
-                                };
-                                if !existing.is_some_and(|existing| {
-                                    existing.spec.env_ref == anchor_environment
-                                        && existing
-                                            .status
-                                            .as_ref()
-                                            .is_none_or(|status| status.phase != ResourceTerminalSessionPhase::Failed)
-                                }) {
-                                    return Err(error.to_string());
-                                }
+                        // The vessel may have requested the target meanwhile: a launch it gave up
+                        // is not revived by a handoff.
+                        if let Some(current) = self.terminals()?.get(&terminal_name, None)? {
+                            if matches!(
+                                current.reading,
+                                flotilla_protocol::LifecycleReading::Failed { .. } | flotilla_protocol::LifecycleReading::GaveUp { .. }
+                            ) {
+                                return Err(format!("crew target `{target}` failed provisioning and cannot be revived"));
                             }
-                            Err(error) => return Err(error.to_string()),
                         }
+                        // Its credentials are delivered at launch from the vessel's requirement.
+                        let _ = task;
+                        self.terminals()?.request(TerminalLaunchRequest {
+                            session: terminal_name.clone(),
+                            environment: anchor.spec.env_ref,
+                            vessel: Some(context.vessel_ref.clone()),
+                            role: target.to_string(),
+                            pool: anchor.spec.pool,
+                            cwd: anchor.spec.cwd,
+                            env: anchor.spec.env,
+                            source: TerminalLaunchSource::Agent {
+                                capability: selector.capability.clone(),
+                                adapter: selector.adapter.clone(),
+                                model: selector.model.clone(),
+                                brief,
+                            },
+                        })?;
                         send().await.map(|_| ())
                     }
                     Err(err) => Err(err.to_string()),
@@ -2725,17 +2570,8 @@ impl CrewService {
             .await
             .map_err(|err| err.to_string())
             .map(|list| list.items.into_iter().next());
-        let mut session_launch = None;
-        let session = match session {
-            Ok(Some(source)) => {
-                let (source, launch) = self.terminal_source(source).await?;
-                session_launch = launch;
-                Ok(Some(source))
-            }
-            other => other,
-        };
         let queue_until_boundary = self.resume_decision(name, sender, vessel, role, crew_phase, &session);
-        Ok(ResumeSession { session, session_launch, queue_until_boundary })
+        Ok(ResumeSession { session, queue_until_boundary })
     }
 
     /// Whether a resume of a crew member in `crew_phase` waits for its turn boundary, logged.
@@ -2853,7 +2689,7 @@ impl CrewService {
     ) -> Result<ResumeDelivery, String> {
         let MessageAttribution { sender, in_reply_to } = attribution;
         let (vessel, role) = (&selected.vessel, &selected.role);
-        let ResumeSession { session, session_launch, .. } = session;
+        let ResumeSession { session, .. } = session;
         let pending_ref =
             selected.status().crew_work.get(vessel).and_then(|crew| crew.get(role)).and_then(|state| state.pending_follow_up.as_ref());
         let pending_message = if let Some(reference) = pending_ref {
@@ -2907,7 +2743,7 @@ impl CrewService {
         if reopened.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             return Err(terminal_convoy_refusal(name, "became terminal"));
         }
-        Ok(ResumeDelivery { session, session_launch, resume_intent, message_name, reopened, displaced })
+        Ok(ResumeDelivery { session, resume_intent, message_name, reopened, displaced })
     }
 
     /// Publishes a reopened resume: from the session's home for a replica session, after
@@ -2921,7 +2757,7 @@ impl CrewService {
         intent: ResumeIntent,
         delivery: ResumeDelivery,
     ) -> Result<ConvoyResumeOutcome, String> {
-        let ResumeDelivery { session, session_launch, resume_intent, message_name, reopened, displaced } = delivery;
+        let ResumeDelivery { session, resume_intent, message_name, reopened, displaced } = delivery;
         let (vessel, role, convoys, status) = (&selected.vessel, &selected.role, &selected.convoys, selected.status());
         if intent == ResumeIntent::Reminder && reopened.status.as_ref().is_some_and(|status| status.crew_claim_is_settled(vessel, role)) {
             // The claim guard made the patch a no-op; only the message is published.
@@ -2940,7 +2776,7 @@ impl CrewService {
         self.reconcile_or_restore_crew_work(namespace, &session.spec.env_ref, convoys, name, status.clone(), &reopened).await?;
         let delivery_result: Result<(), String> = async {
             if session.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped) {
-                self.restart_terminal(namespace, &session, session_launch.as_deref()).await?;
+                self.restart_terminal(&session)?;
             }
             self.publish_message_intent(namespace, &message_name, &resume_intent).await?;
             Ok(())
@@ -3269,11 +3105,11 @@ impl CrewService {
             &sender,
             &turn_message_producer_key(&request.source, &request.subject_revision),
         );
-        let (holder, holder_launch, rung) = off_frame(|| self.turn_receiver_session(request, &receiver)).await?;
+        let (holder, rung) = off_frame(|| self.turn_receiver_session(request, &receiver)).await?;
         if let Some(admission) = off_frame(|| self.earlier_turn_admission(request, &intent, &name, rung)).await? {
             return Ok(PreparedTurn::Admitted(admission));
         }
-        Ok(PreparedTurn::New(Box::new(CrewTurn { target, intent, name, holder, holder_launch, rung })))
+        Ok(PreparedTurn::New(Box::new(CrewTurn { target, intent, name, holder, rung })))
     }
 
     /// The receiver's terminal session, its launch, and the admission rung it observes.
@@ -3281,13 +3117,6 @@ impl CrewService {
         let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
             .await
             .map_err(|error| error.to_string())?;
-        let (holder, holder_launch) = match holder {
-            Some(holder) => {
-                let (holder, launch) = self.terminal_source(holder).await?;
-                (Some(holder), launch)
-            }
-            None => (None, None),
-        };
         // This is the observed admission rung, not a transport or session receipt.
         let rung = if holder
             .as_ref()
@@ -3297,7 +3126,7 @@ impl CrewService {
         } else {
             TurnDeliveryRung::FreshAgent
         };
-        Ok((holder, holder_launch, rung))
+        Ok((holder, rung))
     }
 
     /// The admission that already answers a turn: the same intent sent before, or an open
@@ -3392,7 +3221,7 @@ impl CrewService {
         turn: &CrewTurn,
         activation: &mut Option<(flotilla_resources::ConvoyStatus, flotilla_resources::ConvoyStatus)>,
     ) -> Result<(), String> {
-        let CrewTurn { target, name, holder, holder_launch, .. } = turn;
+        let CrewTurn { target, name, holder, .. } = turn;
         if matches!(target.provenance, ResourceProvenance::Local) {
             if let Some(previous) = target.object.status.as_ref().filter(|_| holder.is_some() || request.source == "handoff") {
                 let convoys = self.resource_backend.using::<ResourceConvoy>(&request.namespace);
@@ -3420,7 +3249,7 @@ impl CrewService {
                             matches!(status.phase, ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost)
                         })
                     {
-                        self.restart_terminal(&request.namespace, &holder.object, holder_launch.as_deref()).await?;
+                        self.restart_terminal(&holder.object)?;
                     }
                 }
             }
@@ -3825,43 +3654,6 @@ impl CrewService {
             }
             return Err("turn-delivery hold was cleared before supervisor publication".into());
         };
-        let sessions = self.resource_backend.using::<ResourceTerminalSession>(&request.namespace);
-        let sources = self
-            .resource_backend
-            .including_replicas::<ResourceTerminalSession>(&request.namespace)
-            .list_matching_labels(&BTreeMap::from([
-                (CONVOY_LABEL.into(), request.convoy.clone()),
-                (VESSEL_LABEL.into(), request.vessel.clone()),
-                (ROLE_LABEL.into(), request.role.clone()),
-            ]))
-            .await
-            .map_err(|error| error.to_string())?;
-        for source in sources.items {
-            let session = source.object;
-            let patch = TerminalSessionStatusPatch::HoldTurnDelivery { hold: attention.clone() };
-            if matches!(source.provenance, ResourceProvenance::Local) {
-                flotilla_store::apply_status_patch(&sessions, &session.metadata.name, &patch).await.map_err(|error| error.to_string())?;
-            } else {
-                let mut next = session.status.clone().unwrap_or_default();
-                flotilla_resources::StatusPatch::apply(&patch, &mut next);
-                let publisher = self
-                    .resource_intent_publisher
-                    .read()
-                    .expect("publisher lock")
-                    .as_ref()
-                    .and_then(Weak::upgrade)
-                    .ok_or("resource status mutation router unavailable")?;
-                publisher
-                    .patch_status(
-                        &request.namespace,
-                        "TerminalSession",
-                        &session.metadata.name,
-                        serde_json::to_value(next).expect("session hold"),
-                        &session.metadata.resource_version,
-                    )
-                    .await?;
-            }
-        }
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace);
         let project_policy =
             match self.resource_backend.including_replicas::<flotilla_resources::Project>(&request.namespace).get(project).await {

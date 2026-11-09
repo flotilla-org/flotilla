@@ -14,21 +14,24 @@ use flotilla_resources::lifecycle_reads::{LifecycleReads, ProvisioningKind};
 use flotilla_resources::{
     message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, ImageBuild, ImageBuildPhase,
     InputMeta, Message, MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceProvenance, ResourceRef,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
 };
 use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::warn;
 
-pub fn credential_references(session: &ResourceObject<TerminalSession>) -> Result<BTreeSet<String>, String> {
-    session
-        .metadata
-        .annotations
-        .get(CREDENTIAL_REFS_ANNOTATION)
-        .map(|encoded| serde_json::from_str(encoded).map_err(|error| format!("invalid session credential references: {error}")))
-        .transpose()
-        .map(|references| references.unwrap_or_default())
+use crate::reconcilers::vessel::vessel_requirement;
+
+/// The credentials a crew session is granted: its vessel's requirement in its convoy's frozen
+/// workflow snapshot. A session held for no vessel is granted none.
+pub async fn credential_references(
+    backend: &ResourceBackend,
+    namespace: &str,
+    session: &ResourceObject<TerminalSession>,
+) -> Result<BTreeSet<String>, String> {
+    let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return Ok(BTreeSet::new()) };
+    Ok(vessel_requirement(backend, namespace, &context.vessel_ref).await?.credential_refs)
 }
 
 /// Verify image capabilities from the selected origin's checked lifecycle reading.
@@ -312,15 +315,23 @@ impl CapabilityCardTracker {
     }
 }
 
+/// What this daemon has told one session's agent about its capabilities. Held in memory only:
+/// after a restart the first reading of a running session is a baseline the agent may not have
+/// seen, so the next change it hears of is a full card.
 #[derive(Default)]
 struct CardObservation {
     delivered: Option<String>,
     pending: BTreeMap<u64, (String, String)>,
+    /// The digest of the newest card observed.
+    digest: Option<String>,
+    /// The newest published revision. Revisions are milliseconds since the epoch at least, so a
+    /// restarted daemon's revisions never name an earlier daemon's Messages.
+    revision: u64,
+    /// The newest published revision's Message, which the next one supersedes.
+    message: Option<String>,
 }
 
 const DIGEST_ANNOTATION: &str = "flotilla.work/capabilities-digest";
-const REVISION_ANNOTATION: &str = "flotilla.work/capabilities-revision";
-const MESSAGE_ANNOTATION: &str = "flotilla.work/capabilities-message";
 
 fn card_digest(card: &str) -> String {
     format!(
@@ -332,7 +343,7 @@ fn card_digest(card: &str) -> String {
     )
 }
 
-/// Persist the launch observation without submitting another turn. Later
+/// Record the observation without submitting another turn. Later
 /// changes publish a superseding system Message through the existing inbox.
 /// Relaunches retain the chain: a changed inline card may also arrive as a Message.
 pub async fn observe_card(
@@ -344,14 +355,14 @@ pub async fn observe_card(
 ) -> Result<(), String> {
     let observation = tracker.observation(namespace, &session.metadata.name).await;
     let mut observation = observation.lock().await;
-    let previous = session.metadata.annotations.get(DIGEST_ANNOTATION).cloned();
-    if previous.as_ref().is_some_and(|previous| previous == &card_digest(card)) {
-        if observation.delivered.is_none()
-            && observation.pending.is_empty()
-            && !session.metadata.annotations.contains_key(MESSAGE_ANNOTATION)
-        {
-            observation.delivered = Some(card.to_string());
-        }
+    let observed = card_digest(card);
+    let Some(previous) = observation.digest.clone() else {
+        // The first reading since this daemon started: a launch it sends with the card sets
+        // `delivered` afterwards; a session launched earlier holds a card this daemon never saw.
+        observation.digest = Some(observed);
+        return Ok(());
+    };
+    if previous == observed {
         return Ok(());
     }
     // Pending notices supersede one another. Promote only snapshots the inbox delivered.
@@ -379,36 +390,18 @@ pub async fn observe_card(
     for revision in retired {
         observation.pending.remove(&revision);
     }
-    let revision = session
-        .metadata
-        .annotations
-        .get(REVISION_ANNOTATION)
-        .map(|value| value.parse::<u64>().map_err(|error| format!("invalid {REVISION_ANNOTATION} value {value:?}: {error}")))
-        .transpose()?
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or("capabilities revision overflow")?;
-    let mut meta = InputMeta::from(&session.metadata);
-    let observed_digest = if previous.is_some() {
-        let body = observation.delivered.as_ref().map(|baseline| card_delta(baseline, card)).unwrap_or_else(|| card.to_string());
-        let (name, digest) = publish_card_revision(backend, namespace, session, revision, card, &body, tracker).await?;
-        if digest == card_digest(card) {
-            observation.pending.insert(revision, (name.clone(), card.to_string()));
-        }
-        meta.annotations.insert(MESSAGE_ANNOTATION.into(), name);
-        digest
-    } else {
-        observation.delivered = Some(card.to_string());
-        card_digest(card)
-    };
-    meta.annotations.insert(DIGEST_ANNOTATION.into(), observed_digest);
-    meta.annotations.insert(REVISION_ANNOTATION.into(), revision.to_string());
-    backend
-        .clone()
-        .using::<TerminalSession>(namespace)
-        .update(&meta, &session.metadata.resource_version, &session.spec)
-        .await
-        .map_err(|error| error.to_string())?;
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+    let revision = observation.revision.checked_add(1).ok_or("capabilities revision overflow")?.max(now);
+    let body = observation.delivered.as_ref().map(|baseline| card_delta(baseline, card)).unwrap_or_else(|| card.to_string());
+    let supersedes = observation.message.clone();
+    let published = CardRevision { revision, card, body: &body, supersedes };
+    let (name, digest) = publish_card_revision(backend, namespace, session, published, tracker).await?;
+    if digest == observed {
+        observation.pending.insert(revision, (name.clone(), card.to_string()));
+    }
+    observation.digest = Some(digest);
+    observation.revision = revision;
+    observation.message = Some(name);
     Ok(())
 }
 
@@ -445,13 +438,20 @@ async fn recover_published_revision(
     }
 }
 
+/// One revision of a session's capability card: the card, the body sent for it (the card or its
+/// delta) and the revision it supersedes.
+struct CardRevision<'a> {
+    revision: u64,
+    card: &'a str,
+    body: &'a str,
+    supersedes: Option<String>,
+}
+
 async fn publish_card_revision(
     backend: &ResourceBackend,
     namespace: &str,
     session: &ResourceObject<TerminalSession>,
-    revision: u64,
-    card: &str,
-    body: &str,
+    CardRevision { revision, card, body, supersedes }: CardRevision<'_>,
     tracker: &CapabilityCardTracker,
 ) -> Result<(String, String), String> {
     let TerminalSessionSource::Agent { context, .. } = &session.spec.source else {
@@ -472,9 +472,9 @@ async fn publish_card_revision(
         resource: ResourceRef::new("flotilla.work/v1", "TerminalSession", namespace, &session.metadata.name),
         revision: format!("capabilities@{revision}"),
     };
-    let supersedes = match session.metadata.annotations.get(MESSAGE_ANNOTATION) {
-        Some(name) => match message_by_name(backend, namespace, name, tracker).await {
-            Ok(_) => Some(name.clone()),
+    let supersedes = match supersedes {
+        Some(name) => match message_by_name(backend, namespace, &name, tracker).await {
+            Ok(_) => Some(name),
             Err(ResourceError::NotFound { .. }) => None, // Reaped audit data cannot be a predecessor.
             Err(error) => return Err(error.to_string()),
         },
@@ -526,7 +526,7 @@ async fn message_by_name(
     }
 }
 
-/// Advisory launch persistence: callers can warn and still launch with the card.
+/// Advisory launch observation: callers can warn and still launch with the card.
 pub async fn observe_launch_card(
     backend: &ResourceBackend,
     namespace: &str,
@@ -553,7 +553,7 @@ async fn refresh_session_card(
     accounts: &dyn AccountRecords,
 ) -> Result<(), String> {
     let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return Ok(()) };
-    let credentials = source.credentials(&session.spec.env_ref, &credential_references(session)?).await?;
+    let credentials = source.credentials(&session.spec.env_ref, &credential_references(backend, namespace, session).await?).await?;
     let card = session_card(
         backend,
         namespace,
@@ -577,10 +577,7 @@ pub async fn refresh_cards(
     accounts: &dyn AccountRecords,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
-    let mut sessions = backend.clone().using::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?;
-    for session in &mut sessions.items {
-        *session = flotilla_store::read_terminal_session(Arc::clone(&reads), session, None).await.map_err(|error| error.to_string())?.0;
-    }
+    let sessions = backend.clone().using::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?;
     let live = sessions
         .items
         .iter()

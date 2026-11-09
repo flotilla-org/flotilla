@@ -447,11 +447,11 @@ struct RowsVerdict<'a> {
 }
 
 impl ReconcilerWake {
-    /// A crew session's AgentSession at the home its record came from; none when it cannot be
-    /// read, which judges nothing.
+    /// A crew session's AgentSession, named by the launch its view shows, at the home its record
+    /// came from; none when it cannot be read, which judges nothing.
     fn agent_view(&self, session: &ResourceObject<TerminalSession>) -> Option<AgentActivityView> {
         self.agent_view_at(
-            &session.metadata.name,
+            flotilla_resources::terminal_records::launch_of(session)?,
             session.metadata.annotations.get(flotilla_resources::ORIGIN_ROOT_ANNOTATION).map(String::as_str),
         )
     }
@@ -576,14 +576,7 @@ impl ReconcilerWake {
         let available_convoys = views.convoys.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
         let available_ensures = views.ensures.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
         let sessions_snapshot = views.sessions.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
-        let sessions_list = Arc::new(flotilla_resources::ReadResourceList {
-            items: flotilla_store::read_terminal_sources(
-                Arc::clone(&self.subscriptions.inner.lifecycle_reads),
-                sessions_snapshot.items.clone(),
-            )
-            .await
-            .map_err(|error| error.to_string())?,
-        });
+        let sessions_list = sessions_snapshot;
         let observation_list = views.change_requests.shared_list().await.map_err(|error| error.to_string())?;
         let forges =
             views.forges.definitions().await.map_err(|error| error.to_string())?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
@@ -1238,7 +1231,7 @@ impl ReconcilerWake {
                     flotilla_resources::ResourceProvenance::Local => None,
                     flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str()),
                 };
-                self.agent_view_at(&source.object.metadata.name, origin)
+                self.agent_view_at(flotilla_resources::terminal_records::launch_of(&source.object)?, origin)
             });
             match agent.as_ref().map(|agent| (agent, agent.live_activity())) {
                 Some((agent, _)) if !agent.current => {

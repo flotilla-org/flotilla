@@ -28,7 +28,9 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_agent::account_access::{AccountProvisioner, AccountProvisioners, EnvironmentKind};
 use flotilla_core::in_process::InProcessDaemon;
+use flotilla_protocol::LifecycleReading;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provisioning::engine::terminal_actuator::TerminalProvider;
 use flotilla_resources::{
     account_access::{
         binding_name, material_generation, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords,
@@ -217,7 +219,7 @@ impl Reconciler for AccountBindingReconciler {
 
 /// Reconciles one provision at its place against its binding.
 /// - A binding revoked, closed or gone: the delivered copy is deleted, the requester's harness
-///   session is stopped (its TerminalSession is deleted, so it waits), and the record removed.
+///   session's process is stopped, and the record removed.
 ///   No launch can record a delivery meanwhile: launch refuses a binding that is not open.
 /// - A binding reopened by a rebind since the delivery: the copy is deleted, the session
 ///   stopped so a fresh one starts, and the record's delivery cleared only at the version
@@ -320,12 +322,19 @@ async fn withdraw(
     };
     let runner = place_runner(state, &sessions, &spec.place).await?;
     implementation.remove(&spec.home, &*runner).await?;
-    let terminal_sessions = state.daemon.resource_backend().using::<TerminalSession>(namespace);
+    // Stopping a launch held here ends its process; the engine reads it ended at the next probe.
+    let reads = state.daemon.lifecycle_reads();
+    let terminals = reads.terminals()?;
+    let runtime = super::terminal::TerminalControllerRuntime { state: Arc::clone(state) };
     for session in sessions {
-        match terminal_sessions.delete(&session.metadata.name).await {
-            Ok(_) | Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(format!("stop harness session `{}`: {error}", session.metadata.name)),
+        let Some(record) = terminals.get(&session.metadata.name, None)? else { continue };
+        let Some(session_id) = record.session_id().map(str::to_owned) else { continue };
+        if !matches!(record.reading, LifecycleReading::Ready { .. }) {
+            continue;
         }
+        TerminalProvider::kill(&runtime, &record, &session_id)
+            .await
+            .map_err(|error| format!("stop harness session `{}`: {error}", record.name))?;
     }
     Ok(())
 }

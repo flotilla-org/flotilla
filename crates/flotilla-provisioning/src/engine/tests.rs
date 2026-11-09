@@ -491,10 +491,10 @@ fn session_object(phase: flotilla_resources::TerminalSessionPhase) -> ResourceOb
 fn a_crew_session_is_held_for_its_vessel() {
     use flotilla_resources::{Selector, TerminalBrief, TerminalCrewContext, TerminalSessionPhase, TerminalSessionSource};
 
-    use super::terminal_session::TerminalSessionBinding;
+    use super::terminals::request_of_old;
     use crate::stored::Holder;
     let tool = session_object(TerminalSessionPhase::Starting);
-    assert_eq!(TerminalSessionBinding::request(&tool, HOME).expect("request").holder, None);
+    assert_eq!(request_of_old(&tool, HOME).expect("request").holder, None);
     let mut agent = tool;
     agent.spec.source = TerminalSessionSource::Agent {
         selector: Selector { capability: "coding".into(), adapter: None, model: None },
@@ -502,118 +502,7 @@ fn a_crew_session_is_held_for_its_vessel() {
         context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: "convoy-a".into(), vessel_ref: "vessel-a".into() }),
         message: None,
     };
-    assert_eq!(TerminalSessionBinding::request(&agent, HOME).expect("request").holder, Some(Holder::vessel("vessel-a")));
-}
-
-// Behaviour (#3629 Q2, layer 7): each launch of a terminal session is a resource of its own. The
-// first runs; stopped, it is released; resumed in place by the old path, the next run is a second
-// launch, and the first stays Gone. A lost session stays Realised (unobservable is a judgement);
-// when the old path relaunches it, the lost launch is observed absent and the relaunch is a third.
-#[tokio::test]
-async fn each_launch_of_a_session_is_its_own_resource() {
-    use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatusPatch};
-
-    use super::terminal_session::TerminalSessionBinding;
-    let running = |id: &str| TerminalSessionStatusPatch::MarkRunning {
-        configured_limits: None,
-        session_id: id.into(),
-        pid: None,
-        started_at: DateTime::UNIX_EPOCH,
-        crew: None,
-        launch_command: "bash".into(),
-        delivered_message_id: None,
-    };
-    let stopped = TerminalSessionStatusPatch::MarkStopped {
-        stopped_at: DateTime::UNIX_EPOCH,
-        inner_command_status: None,
-        inner_exit_code: Some(0),
-        message: None,
-    };
-    let lost = TerminalSessionStatusPatch::MarkLost { reason: "daemon generation dead".into(), lost_at: DateTime::UNIX_EPOCH };
-    let home = lifecycles::<TerminalSessionBinding>();
-    let engine = Engine::<_, TerminalSessionBinding>::new(
-        Scripted::<flotilla_resources::TerminalSession>::new([
-            Some(running("s1")),
-            Some(stopped),
-            Some(running("s2")),
-            Some(lost),
-            Some(TerminalSessionStatusPatch::MarkStarting),
-            Some(running("s3")),
-        ]),
-        Some(home.clone()),
-    );
-    let name = "terminal-vessel-a-coder";
-    let state = |launch: &str| home.get(launch).map(|resource| resource.state().clone());
-    let newest = || home.newest_launch(name).expect("a launch").name().to_owned();
-
-    let mut obj = session_object(TerminalSessionPhase::Starting);
-    reconcile(&engine, &mut obj).await;
-    let first = newest();
-    assert_eq!(state(&first), Some(LifecycleState::Realised { identity: "s1".into() }));
-    reconcile(&engine, &mut obj).await;
-    assert_eq!(
-        state(&first),
-        Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }),
-        "stopped: released"
-    );
-    assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(TerminalSessionPhase::Stopped));
-    // Ended, and not starting again: the old reconciler is not asked, and nothing is written.
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
-    assert_eq!(state(&first), Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }));
-
-    // Stale Starting is not restart intent; only an explicit predecessor request creates a launch.
-    TerminalSessionStatusPatch::MarkStarting.apply(obj.status.as_mut().expect("status"));
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
-    assert_eq!(newest(), first);
-    let second = home
-        .replace_launch(name, &first, TerminalSessionBinding::request(&obj, HOME).expect("request"), flotilla_schema::Timestamp(10))
-        .expect("next requested");
-    reconcile(&engine, &mut obj).await;
-    assert_eq!(
-        state(&first),
-        Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }),
-        "never revived"
-    );
-    assert_eq!(state(&second), Some(LifecycleState::Realised { identity: "s2".into() }));
-
-    reconcile(&engine, &mut obj).await;
-    assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(TerminalSessionPhase::Lost));
-    assert_eq!(state(&second), Some(LifecycleState::Realised { identity: "s2".into() }), "unobservable stays Realised");
-    let third = home
-        .replace_launch(name, &second, TerminalSessionBinding::request(&obj, HOME).expect("request"), flotilla_schema::Timestamp(20))
-        .expect("replacement requested");
-    reconcile(&engine, &mut obj).await;
-    assert_eq!(
-        state(&second),
-        Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost }),
-        "relaunched: the lost launch observed absent"
-    );
-    reconcile(&engine, &mut obj).await;
-    assert_eq!(state(&third), Some(LifecycleState::Realised { identity: "s3".into() }));
-}
-
-// Behaviour (layer 7): a launch that fails before it runs gives up at once; a later start of the
-// same old session is a new launch.
-#[tokio::test]
-async fn a_failed_launch_gives_up_and_does_not_restart_from_status() {
-    use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatusPatch};
-
-    use super::terminal_session::TerminalSessionBinding;
-    let home = lifecycles::<TerminalSessionBinding>();
-    let failed = TerminalSessionStatusPatch::MarkFailed { message: "cleat refused".into(), stopped_at: None };
-    let engine = Engine::<_, TerminalSessionBinding>::new(
-        Scripted::<flotilla_resources::TerminalSession>::new([Some(failed.clone())]),
-        Some(home.clone()),
-    );
-    let mut obj = session_object(TerminalSessionPhase::Starting);
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(failed));
-    let first = home.newest_launch("terminal-vessel-a-coder").expect("launched");
-    assert!(matches!(first.state(), LifecycleState::GaveUp { .. }));
-    // Neither a stale initial phase nor a lost status write is another launch request.
-    TerminalSessionStatusPatch::MarkStarting.apply(obj.status.as_mut().expect("status"));
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
-    assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), 1);
-    assert_eq!(home.newest_launch("terminal-vessel-a-coder").expect("launched").name(), first.name());
+    assert_eq!(request_of_old(&agent, HOME).expect("request").holder, Some(Holder::vessel("vessel-a")));
 }
 
 // Behaviour (#3629 layer 9): every old phase of each kind maps to a stored state, as the import's
@@ -630,8 +519,7 @@ fn every_old_phase_imports_and_rehearses() {
 
     use super::{
         image_build::ImageBuildBinding,
-        import::{import, import_environment, label, rehearse, ImportReport},
-        terminal_session::TerminalSessionBinding,
+        import::{import, import_environment, import_terminal_session, label, rehearse, ImportReport},
     };
     let mut report = ImportReport::default();
 
@@ -645,7 +533,7 @@ fn every_old_phase_imports_and_rehearses() {
     ] {
         let mut obj = session_object(phase);
         obj.status = Some(TerminalSessionStatus { phase, session_id: Some("s1".into()), ..Default::default() });
-        let result = import::<TerminalSessionBinding>(&obj, HOME);
+        let result = import_terminal_session(&obj, HOME);
         report.record(&result);
         let imported = result.expect("imports");
         assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
@@ -658,12 +546,12 @@ fn every_old_phase_imports_and_rehearses() {
     }
     // Two records importing under one name: the rehearsal refuses the second, named.
     let twice = [session_object(TerminalSessionPhase::Starting), session_object(TerminalSessionPhase::Starting)]
-        .map(|obj| import::<TerminalSessionBinding>(&obj, HOME).expect("imports"));
+        .map(|obj| import_terminal_session(&obj, HOME).expect("imports"));
     let refused = rehearse(&twice);
     assert_eq!(refused.keys().collect::<Vec<_>>(), [&1], "the second, by its index");
     assert!(refused[&1].reason.contains("already exists"), "{refused:?}");
     // One name at two homes is two resources; the rehearsal's own home is no record's.
-    let homed = |home: &str| import::<TerminalSessionBinding>(&session_object(TerminalSessionPhase::Starting), home).expect("imports");
+    let homed = |home: &str| import_terminal_session(&session_object(TerminalSessionPhase::Starting), home).expect("imports");
     assert_eq!(rehearse(&[homed("feta"), homed("kiwi")]), BTreeMap::new(), "told apart by home");
     let refused = rehearse(&[homed(flotilla_engine_store::REHEARSAL_HOME)]);
     assert!(refused[&0].reason.contains("rehearsal's own home"), "{refused:?}");
@@ -839,28 +727,6 @@ fn the_import_maps_live_cloud_sandboxes_and_drops_deleted_gone_ones() {
     }
 }
 
-// Behaviour (#3747 review): the latest launch is found by the index however many there are, and
-// a launch key parses at its last `#`, so an old name holding a `#` of its own is kept whole.
-#[test]
-fn the_latest_launch_is_found_and_an_old_name_may_hold_a_hash() {
-    use flotilla_resources::TerminalSessionPhase;
-
-    use super::{at, current, launched, terminal_session::TerminalSessionBinding};
-    let home = lifecycles::<TerminalSessionBinding>();
-    let mut obj = session_object(TerminalSessionPhase::Starting);
-    obj.metadata.name = "odd#5".into();
-    let request = TerminalSessionBinding::request(&obj, HOME).expect("request");
-    assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, "odd#5", "none launched: the record's own name");
-    let mut latest = home.request("odd#5", request.clone(), at(DateTime::UNIX_EPOCH)).expect("request").name().to_owned();
-    for _ in 0..13 {
-        assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, latest);
-        assert_eq!(launched(&latest), "odd#5");
-        home.step(&latest, &Step::Released, at(DateTime::UNIX_EPOCH)).expect("release");
-        latest = home.replace_launch("odd#5", &latest, request.clone(), at(DateTime::UNIX_EPOCH)).expect("next launch");
-    }
-    assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, latest);
-}
-
 fn vessel_object() -> ResourceObject<flotilla_resources::Vessel> {
     use flotilla_resources::VesselSpec;
     ResourceObject {
@@ -960,10 +826,11 @@ async fn a_vessel_lease_is_granted_on_its_pinned_host_and_ends_gone() {
     home.with_placements(|placements| assert!(placements.ledger().vessel(&VesselId::new(name)).is_none(), "the lease is freed"));
 }
 
-// A vessel that fails before readiness returns its lease and gives up with the cause;
-// one with no pinned host yet is no engine request, and the old path keeps it.
+// A vessel that fails before readiness returns its lease and gives up with the cause; one
+// admitted with no placement is leased at this home, the host whose reconciler provisions it, so
+// its teardown releases what is held for it.
 #[tokio::test]
-async fn a_vessel_failing_before_ready_returns_its_lease_and_an_unpinned_one_stays_old() {
+async fn a_vessel_failing_before_ready_returns_its_lease_and_an_unplaced_one_is_leased_here() {
     use flotilla_resources::VesselStatusPatch;
 
     use super::vessel::VesselBinding;
@@ -1003,7 +870,10 @@ async fn a_vessel_failing_before_ready_returns_its_lease_and_an_unpinned_one_sta
         let mut obj = vessel_object();
         obj.metadata.name = "convoy-b-implement".into();
         assert_eq!(reconcile(&unpinned, &mut obj).await.patch, Some(provisioning(None)));
-        assert!(home.get("convoy-b-implement").is_none());
+        let lease = home.get("convoy-b-implement").expect("leased").spec().lease();
+        assert_eq!(lease.host, flotilla_state_machines::placement::Host::new(HOME));
+        assert!(lease.request.shape.is_empty(), "no capacity judged");
+        assert_eq!(home.get("convoy-b-implement").map(|vessel| vessel.state().clone()), Some(LifecycleState::requested()));
     }
 }
 
