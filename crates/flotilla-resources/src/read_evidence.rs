@@ -1,6 +1,4 @@
-use crate::{
-    ResourceObject, TerminalSession, TerminalSessionPhase, TerminalSessionSource, UnmetSettlementExpectation, ROLE_LABEL, VESSEL_LABEL,
-};
+use crate::{Message, ResourceObject, TerminalSession, TerminalSessionPhase, UnmetSettlementExpectation, ROLE_LABEL, VESSEL_LABEL};
 use flotilla_protocol::ExplainedUnmetExpectation;
 use std::collections::BTreeMap;
 pub fn queued_turn_session<'a>(
@@ -13,24 +11,26 @@ pub fn queued_turn_session<'a>(
             && session.metadata.labels.get(ROLE_LABEL).is_some_and(|label| label == role)
     })
 }
-pub fn queued_turn_evidence(session: Option<&ResourceObject<TerminalSession>>, message_id: &str) -> (bool, String) {
+/// Whether a queued turn's message reached its receiver, and if not, what holds it: the
+/// Message's own delivery evidence when its record is held, else what the receiving session shows.
+pub fn queued_turn_evidence(
+    message: Option<&ResourceObject<Message>>,
+    session: Option<&ResourceObject<TerminalSession>>,
+) -> (bool, String) {
+    if let Some(message) = message {
+        return match &message.status {
+            Some(status) if status.phase.has_delivery_evidence() => (true, String::new()),
+            Some(status) => {
+                (false, format!("message {:?}: {}", status.phase, status.reason.as_deref().unwrap_or("waiting for receiver evidence")))
+            }
+            None => (false, "message Accepted: waiting for receiver resolution".into()),
+        };
+    }
     let Some(session) = session else { return (false, "terminal session unavailable".into()) };
-    let status = session.status.as_ref();
-    if status.and_then(|status| status.delivered_message_id.as_deref()) == Some(message_id) {
-        return (true, String::new());
-    }
-    if let TerminalSessionSource::Agent { message: Some(message), .. } = &session.spec.source {
-        if message.delivered_through(status.and_then(|status| status.delivered_message_id.as_deref()), message_id) {
-            return (true, String::new());
+    match session.status.as_ref() {
+        Some(status) if status.delivery_unconfirmed_since.is_some() => {
+            (false, "a turn typed into the session is held unconfirmed; waiting for the agent's record to confirm it".into())
         }
-        if message.next_after(status.and_then(|status| status.delivered_message_id.as_deref())).is_some_and(|next| next.id != message_id) {
-            return (false, "waiting behind an earlier terminal message".into());
-        }
-    }
-    if let Some(condition) = status.and_then(|status| status.degraded.as_ref()) {
-        return (false, format!("{}: {}", condition.reason, condition.message));
-    }
-    match status {
         Some(status) if status.phase == TerminalSessionPhase::Running => match &status.attention {
             Some(attention) => (false, format!("attention {:?}; waiting for turn readiness or submission evidence", attention.state)),
             None => (false, "waiting for startup readiness or submission evidence".into()),

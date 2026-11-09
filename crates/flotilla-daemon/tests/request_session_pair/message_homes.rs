@@ -114,7 +114,6 @@ fn crew_session(convoy: &str) -> TerminalSessionSpec {
             selector: Selector::for_capability("coding"),
             brief: TerminalBrief { path: "brief.md".into(), content: "brief".into(), artifact_digest: None, copies: Vec::new() },
             context: Box::new(TerminalCrewContext { namespace: NS.into(), convoy: convoy.into(), vessel_ref: "work".into() }),
-            message: None,
         },
     }
 }

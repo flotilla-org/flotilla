@@ -229,7 +229,6 @@ impl TerminalRecord {
                     convoy: holder.map(|holder| holder.convoy.clone()).unwrap_or_default(),
                     vessel_ref: self.vessel.clone().unwrap_or_default(),
                 }),
-                message: None,
             },
         };
         let observation = observation.cloned().unwrap_or_default();
@@ -267,6 +266,7 @@ impl TerminalRecord {
                 cleat_endpoint: self.cleat_endpoint(),
                 started_at: self.started_at(),
                 stopped_at: self.ended_at(),
+                inner_command_status: self.exited().then_some(crate::InnerCommandStatus::Exited),
                 message: self.reading.reason().filter(|_| !self.is_running()),
                 crew: self.agent().map(|agent| CrewSessionStatus {
                     id: self.name.clone(),
@@ -279,7 +279,7 @@ impl TerminalRecord {
                 screen_obstruction: observation.screen_obstruction,
                 occupancy: observation.occupancy,
                 daemon_unreachable: observation.daemon_unreachable,
-                ..Default::default()
+                delivery_unconfirmed_since: observation.delivery_unconfirmed_since,
             }),
         }
     }
@@ -383,6 +383,8 @@ pub struct TerminalObservation {
     pub launch_command: Option<String>,
     /// Whether its Codex harness reports native lifecycle hooks.
     pub codex_native_hooks: bool,
+    /// When the turn this home typed and holds unconfirmed was submitted (#3108).
+    pub delivery_unconfirmed_since: Option<DateTime<Utc>>,
 }
 
 impl TerminalObservation {
@@ -454,6 +456,22 @@ impl TerminalObservations {
         let changed = {
             let mut held = self.lock();
             let observation = held.entry(name.to_owned()).or_default();
+            let before = observation.clone();
+            change(observation);
+            *observation != before
+        };
+        if changed {
+            let _ = self.changes.send(name.to_owned());
+        }
+        changed
+    }
+
+    /// Changes launch `name`'s observation with `change` only while it is observed: an ended,
+    /// forgotten launch is not observed again. Whether it changed.
+    pub fn amend(&self, name: &str, change: impl FnOnce(&mut TerminalObservation)) -> bool {
+        let changed = {
+            let mut held = self.lock();
+            let Some(observation) = held.get_mut(name) else { return false };
             let before = observation.clone();
             change(observation);
             *observation != before

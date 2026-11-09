@@ -6,16 +6,15 @@ use tracing::instrument::WithSubscriber;
 
 use crate::leaf_engine::turn_delivery::{DeliveryError, FailureWriter, PendingFailureMap};
 
-// #2684: queue acceptance remains queued for every attention state. Only an
-// exact terminal receipt confirms submission; age raises advisory attention.
+// #2684: queue acceptance remains queued for every attention state. Only the
+// queued Message's delivery confirms it; age raises advisory attention.
 #[hegel::test]
 fn queued_turn_waits_for_receipt_and_exposes_bound(tc: hegel::TestCase) {
     use hegel::generators as gs;
-    // All attention states, FIFO/receipt positions, missing sessions and ages
+    // All attention states, missing sessions and ages
     // across the bound; pin the boundary cases too so shrinking cannot hide them.
     let rung = if tc.draw(gs::booleans()) { TurnDeliveryRung::WarmSession } else { TurnDeliveryRung::FreshAgent };
     let state = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
-    let receipt_kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
     let age = tc.draw(gs::integers::<i64>().min_value(-1).max_value(601));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
@@ -53,22 +52,9 @@ fn queued_turn_waits_for_receipt_and_exposes_bound(tc: hegel::TestCase) {
             // Stored episodes, including their original age, survive daemon restoration.
             let status: ConvoyStatus = serde_json::from_value(serde_json::to_value(status).unwrap()).unwrap();
             convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.unwrap();
+            message_to_coder(&backend, "turn", "review wake").await;
             let sessions = backend.using::<TerminalSession>("flotilla");
             let session = sessions.get("resumed-coder").await.unwrap();
-            let mut spec = session.spec;
-            let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent") };
-            let make_message = |id: &str| flotilla_resources::TerminalCrewMessage {
-                id: id.into(),
-                text: "review wake".into(),
-                sender: Default::default(),
-                delivery: flotilla_resources::CrewMessageDelivery::Queued,
-                following: Vec::new(),
-                acknowledged: Default::default(),
-            };
-            let mut head = make_message("turn");
-            head.append(make_message("later"));
-            *message = Some(head);
-            let session = sessions.update(&InputMeta::from(&session.metadata), &session.metadata.resource_version, &spec).await.unwrap();
             sessions
                 .update_status(
                     "resumed-coder",
@@ -112,7 +98,7 @@ fn queued_turn_waits_for_receipt_and_exposes_bound(tc: hegel::TestCase) {
                     panic!("queued")
                 };
                 assert_eq!(*queued_at, start);
-                assert!(blocking_reason.contains("attention"));
+                assert!(blocking_reason.contains("waiting for receiver"), "{blocking_reason}");
             }
             // Terminal settlement can race a submission receipt. It must neither
             // strand the episode nor retain its queued-turn advisory.
@@ -121,26 +107,7 @@ fn queued_turn_waits_for_receipt_and_exposes_bound(tc: hegel::TestCase) {
             let terminal_phase = [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned][state % 3];
             status.phase = terminal_phase;
             convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.unwrap();
-            let session = sessions.get("resumed-coder").await.unwrap();
-            if receipt_kind == 2 {
-                let mut spec = session.spec.clone();
-                let TerminalSessionSource::Agent { message: Some(message), .. } = &mut spec.source else { panic!("message") };
-                message.prune_acknowledged(Some("later"));
-                sessions.update(&InputMeta::from(&session.metadata), &session.metadata.resource_version, &spec).await.unwrap();
-            } else if receipt_kind == 3 {
-                let mut spec = session.spec.clone();
-                let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent") };
-                *message = None;
-                let session =
-                    sessions.update(&InputMeta::from(&session.metadata), &session.metadata.resource_version, &spec).await.unwrap();
-                let mut status = session.status.unwrap();
-                status.delivered_message_id = Some("turn".into());
-                sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.unwrap();
-            } else {
-                let mut status = session.status.unwrap();
-                status.delivered_message_id = Some(if receipt_kind == 0 { "turn" } else { "later" }.into());
-                sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.unwrap();
-            }
+            deliver_to_coder(&backend, "turn", now).await;
             let convoy = convoys.get("stalled-work").await.unwrap();
             wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.unwrap();
             let status = convoys.get("stalled-work").await.unwrap().status.unwrap();
@@ -150,7 +117,7 @@ fn queued_turn_waits_for_receipt_and_exposes_bound(tc: hegel::TestCase) {
             assert!(status.attention.is_none());
             assert_eq!(status.phase, terminal_phase, "receipt observations must preserve the terminal outcome");
             assert_eq!(status.turn_deliveries["review"].episodes.len(), 1);
-            assert_eq!(queued_turn_evidence(None, "turn"), (false, "terminal session unavailable".into()));
+            assert_eq!(queued_turn_evidence(None, None), (false, "terminal session unavailable".into()));
         }
     });
 }

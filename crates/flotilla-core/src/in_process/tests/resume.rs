@@ -9,7 +9,7 @@ use flotilla_resources::{
     external_patches as convoy_external_patches,
     terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest},
     Clock, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionSource,
+    TerminalAttentionState,
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
 
@@ -48,7 +48,6 @@ async fn working_resume_uses_message_delivery_instead_of_pending_brief_release()
 async fn resume_stages_credentials_before_message_and_retries_failure() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
     let resume =
         || daemon.convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"), ResumeIntent::Reopen);
     assert!(resume().await.expect_err("staging should fail").contains("credential staging failed"));
@@ -57,16 +56,8 @@ async fn resume_stages_credentials_before_message_and_retries_failure() {
         CrewWorkPhase::Done
     );
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
-    let TerminalSessionSource::Agent { message, .. } = sessions.get("resume-staging-session").await.expect("session").spec.source else {
-        panic!("agent")
-    };
-    assert!(message.is_none());
     resume().await.expect("retry resume");
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
-    let TerminalSessionSource::Agent { message, .. } = sessions.get("resume-staging-session").await.expect("session").spec.source else {
-        panic!("agent")
-    };
-    assert!(message.is_none());
     let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
     assert_eq!(records.len(), 1);
     // Native Message attribution is separate from its unframed body.
@@ -273,7 +264,6 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     drop(daemon);
     backend = ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(&database_path).expect("reopen stored resources"));
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let restart_config = tempfile::tempdir().expect("restart config");
     std::fs::write(restart_config.path().join("daemon.toml"), "machine_id = \"resume-staging-test\"\n").expect("daemon config");
     // The restarted daemon's wall clock runs ahead on demand, so attention
@@ -327,8 +317,6 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     let resumed = convoys.get("resume-staging").await.expect("source").status.expect("status");
     assert_eq!(resumed.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     assert!(resumed.stalled.is_none());
-    let source_session = sessions.get("resume-staging-session").await.expect("resumed source session");
-    assert!(matches!(source_session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
     let guidance = backend
         .using::<flotilla_resources::Message>("flotilla")
         .list()

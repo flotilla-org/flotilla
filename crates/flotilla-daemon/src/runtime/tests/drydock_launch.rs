@@ -117,7 +117,6 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
                 convoy: stand_in.convoy.clone(),
                 vessel_ref: "demo-work".to_string(),
             }),
-            message: None,
         },
         cwd: root.join("skill-source").display().to_string(),
         env: BTreeMap::new(),

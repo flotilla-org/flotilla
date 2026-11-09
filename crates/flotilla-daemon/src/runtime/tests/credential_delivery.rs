@@ -527,7 +527,6 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
                 convoy: "demo".to_string(),
                 vessel_ref: "demo-work".to_string(),
             }),
-            message: None,
         },
         cwd: temp.path().display().to_string(),
         env: BTreeMap::new(),

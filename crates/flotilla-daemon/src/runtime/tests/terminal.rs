@@ -220,7 +220,6 @@ async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtim
                 convoy: "demo".to_string(),
                 vessel_ref: "demo-implement".to_string(),
             }),
-            message: None,
         },
         cwd: session_cwd.display().to_string(),
         env: BTreeMap::from([
@@ -371,7 +370,6 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
                 convoy: "demo".to_string(),
                 vessel_ref: "demo-work".to_string(),
             }),
-            message: None,
         },
         cwd: "/workspace".to_string(),
         env: Default::default(),
@@ -694,7 +692,6 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
                     convoy: "demo".to_string(),
                     vessel_ref: "demo-work".to_string(),
                 }),
-                message: None,
             },
             cwd: session_cwd.display().to_string(),
             // A declared environment claim never makes the daemon host's own session contained.

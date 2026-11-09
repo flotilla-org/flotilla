@@ -500,7 +500,6 @@ fn a_crew_session_is_held_for_its_vessel() {
         selector: Selector { capability: "coding".into(), adapter: None, model: None },
         brief: TerminalBrief { path: "/w/brief.md".into(), content: "# brief".into(), artifact_digest: None, copies: vec![] },
         context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: "convoy-a".into(), vessel_ref: "vessel-a".into() }),
-        message: None,
     };
     assert_eq!(request_of_old(&agent, HOME).expect("request").holder, Some(Holder::vessel("vessel-a")));
 }

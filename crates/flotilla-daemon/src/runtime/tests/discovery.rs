@@ -351,7 +351,6 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
             convoy: "ssh-crew".into(),
             vessel_ref: String::new(),
         }),
-        message: None,
     };
     let error = terminal
         .ensure_session("unowned-agent", &first_launch("unowned-agent"), (&unowned_agent).into(), &[])

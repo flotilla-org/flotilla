@@ -150,7 +150,6 @@ async fn agent_terminal_session_preserves_structured_launch_and_canonical_brief(
                 convoy: "demo".into(),
                 vessel_ref: "demo-implement".into(),
             }),
-            message: None,
         },
         cwd: "/workspace".into(),
         env: [("DECLARED_VALUE".into(), "hello declared crew".into())].into_iter().collect(),

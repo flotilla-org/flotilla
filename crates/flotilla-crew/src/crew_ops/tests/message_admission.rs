@@ -508,7 +508,7 @@ async fn replica_withdraw_preserves_receiver_submission_on_race() {
 
 #[tokio::test]
 async fn fresh_idle_admission_keeps_delivery_evidence_receiver_owned() {
-    for degraded in [false, true] {
+    for held in [false, true] {
         let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
         probe.fail.store(false, Ordering::SeqCst);
         let sessions = backend.using::<ResourceTerminalSession>("flotilla");
@@ -522,13 +522,7 @@ async fn fresh_idle_admission_keeps_delivery_evidence_receiver_owned() {
                 as_of: now,
                 source: flotilla_resources::TerminalAttentionSource::Screen,
             }),
-            degraded: degraded.then(|| flotilla_resources::TerminalSessionDegradedCondition {
-                reason: flotilla_resources::TERMINAL_DELIVERY_UNCONFIRMED_REASON.into(),
-                message: "held earlier input".into(),
-                message_id: Some("earlier".into()),
-                consecutive_failures: 1,
-                observed_at: now,
-            }),
+            delivery_unconfirmed_since: held.then_some(now),
             ..Default::default()
         };
         sessions.update_status("session", &holder.metadata.resource_version, &status).await.expect("fresh idle with legacy obligations");

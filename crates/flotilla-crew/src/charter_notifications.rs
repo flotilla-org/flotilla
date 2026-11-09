@@ -170,7 +170,6 @@ mod tests {
                     convoy: "guide".into(),
                     vessel_ref: "guide-work".into(),
                 }),
-                message: None,
             })
             .build();
         backend

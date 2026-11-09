@@ -1353,21 +1353,16 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         for delivery in &explanation.crew_deliveries {
             let _ = writeln!(
                 output,
-                "  - {} role={} last_rung={} delivered_message={} sender={}",
+                "  - {} role={} last_rung={}",
                 delivery.session,
                 delivery.role,
-                delivery.last_delivery_rung.as_deref().unwrap_or("not recorded"),
-                delivery.delivered_message_id.as_deref().unwrap_or("-"),
-                delivery.sender.as_deref().unwrap_or("-")
+                delivery.last_delivery_rung.as_deref().unwrap_or("not recorded")
             );
             if let Some(condition) = &delivery.terminal_condition {
                 let _ = writeln!(output, "    {condition}");
             }
             if let Some(obstruction) = &delivery.obstruction {
                 let _ = writeln!(output, "    blocked: {obstruction}");
-            }
-            for brief in &delivery.pending_briefs {
-                let _ = writeln!(output, "    pending brief: {brief}");
             }
         }
     }

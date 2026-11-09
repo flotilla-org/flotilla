@@ -350,7 +350,7 @@ mod wake;
 
 pub use stalls::NO_EXIT_STALL_EVIDENCE;
 pub(crate) use stalls::{crew_role_address, supervision_message_source};
-pub(crate) use turn_delivery::{durable_message_evidence, turn_message_producer_key};
+pub(crate) use turn_delivery::turn_message_producer_key;
 
 #[cfg(test)]
 mod tests;

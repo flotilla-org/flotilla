@@ -720,13 +720,3 @@ pub(super) fn compose_subject_turn_brief(
         repositories,
     )
 }
-
-pub(crate) fn durable_message_evidence(message: &ResourceObject<flotilla_resources::Message>) -> (bool, String) {
-    match &message.status {
-        Some(status) if status.phase.has_delivery_evidence() => (true, String::new()),
-        Some(status) => {
-            (false, format!("message {:?}: {}", status.phase, status.reason.as_deref().unwrap_or("waiting for receiver evidence")))
-        }
-        None => (false, "message Accepted: waiting for receiver resolution".into()),
-    }
-}

@@ -131,7 +131,7 @@ impl ReconcilerWake {
                         diagnostics.push(format!(
                             "launch progress stalled for {key}: Pending since {began}; no lifecycle progress since {}; vessel {:?}, session {:?}; retry evidence {:?}; inspect the launcher and retry or resume the crew after repair",
                             stage.since, vessel_status.map(|status| status.phase), session_status.map(|status| status.phase),
-                            session_status.and_then(|status| status.degraded.as_ref())
+                            session_status.and_then(|status| status.message.as_deref())
                         ));
                     }
                 }
@@ -1047,12 +1047,7 @@ impl ReconcilerWake {
                     (message.object.status.as_ref().and_then(|status| status.accepted_sequence), message.object.metadata.creation_timestamp)
                 });
             let session_status = session.and_then(|session| session.status.as_ref());
-            let message_id = current_message.map(|message| message.object.metadata.name.clone()).or_else(|| {
-                session.and_then(|session| match &session.spec.source {
-                    TerminalSessionSource::Agent { message, .. } => message.as_ref().map(|message| message.id.clone()),
-                    _ => None,
-                })
-            });
+            let message_id = current_message.map(|message| message.object.metadata.name.clone());
             let delivered_id = messages
                 .iter()
                 .filter(|message| {
@@ -1067,8 +1062,7 @@ impl ReconcilerWake {
                         .and_then(|status| status.resolved_receiver.as_ref())
                         .map(|receiver| receiver.delivered_at)
                 })
-                .map(|message| message.object.metadata.name.clone())
-                .or_else(|| session_status.and_then(|status| status.delivered_message_id.clone()));
+                .map(|message| message.object.metadata.name.clone());
             if message_id != obligation.message_id || delivered_id != obligation.delivered_message_id {
                 if message_id.is_some() || delivered_id.is_some() {
                     obligation.reply_after = Some(now);
@@ -1080,11 +1074,6 @@ impl ReconcilerWake {
             let pending_message = messages.iter().any(|message| {
                 message.object.spec.receiver == receiver_address
                     && message.object.status.as_ref().is_none_or(|status| status.phase.is_waiting())
-            }) || session.is_some_and(|session| match &session.spec.source {
-                TerminalSessionSource::Agent { message: Some(message), .. } => {
-                    !message.delivered_through(session_status.and_then(|status| status.delivered_message_id.as_deref()), &message.id)
-                }
-                _ => false,
             });
             // The agent's own record says when it went idle (#3108). A delivered message's reply
             // is consumed once the agent goes idle after it; until then the quiet clock counts
@@ -1486,10 +1475,6 @@ impl ReconcilerWake {
                     let operator_brief_delivered = messages.iter().any(|message| {
                         message.object.metadata.name == brief_id
                             && message.object.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence())
-                    }) || session.is_some_and(|session| {
-                        let delivered_id = session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
-                        matches!(&session.spec.source, TerminalSessionSource::Agent { message: Some(message), .. }
-                                    if message.delivered_through(delivered_id, brief_id))
                     });
                     !operator_brief_delivered || idle_at.is_none_or(|idle_at| idle_at <= resumed_at)
                 });

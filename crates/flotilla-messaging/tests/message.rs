@@ -309,7 +309,6 @@ fn holder_spec(convoy: &str) -> flotilla_resources::TerminalSessionSpec {
                 convoy: convoy.into(),
                 vessel_ref: format!("{convoy}-work"),
             }),
-            message: None,
         })
         .build()
 }

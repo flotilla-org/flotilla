@@ -126,7 +126,6 @@ fn running_crew_terminal_in(daemon: &InProcessDaemon, session_name: &str, env_re
             selector: Selector { capability: "code".into(), adapter: None, model: None },
             brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: "work".into(), copies: Vec::new() },
             context: Box::new(TerminalCrewContext { namespace: NAMESPACE.into(), convoy: "c".into(), vessel_ref: "v".into() }),
-            message: None,
         },
         cwd: "/workspace".into(),
         env: Default::default(),

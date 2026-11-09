@@ -489,7 +489,6 @@ async fn pr_submission_observation_case(rate_limited: bool, missing_artifact: bo
                         convoy: "refused-claim".to_string(),
                         vessel_ref: "refused-claim-vessel".to_string(),
                     }),
-                    message: None,
                 },
                 cwd: "/repo".to_string(),
                 env: Default::default(),

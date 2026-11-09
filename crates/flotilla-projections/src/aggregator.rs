@@ -3810,7 +3810,7 @@ mod tests {
         assert_eq!(row.subjects.len(), 3);
     }
 
-    // The TUI vessel message exposes provider degradation and confirmed loss;
+    // The TUI vessel message exposes an unreachable daemon and confirmed loss;
     // neither is hidden behind raw-resource inspection, and recovery clears it.
     #[tokio::test]
     async fn vessel_projection_surfaces_terminal_degradation_loss_and_recovery() {
@@ -3821,13 +3821,7 @@ mod tests {
         let mut session = session_object("health-session").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "health-convoy".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        session.status.as_mut().expect("status").degraded = Some(flotilla_resources::TerminalSessionDegradedCondition {
-            reason: "ReconcileDegraded".into(),
-            message: "provider offline".into(),
-            message_id: None,
-            consecutive_failures: 100,
-            observed_at: Utc::now(),
-        });
+        session.status.as_mut().expect("status").daemon_unreachable = Some("daemon forward down: provider offline".into());
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
         let rows = state.result_set().await;
         let vessel = &rows.rows.as_convoys().expect("convoys")[0].vessels[0];
@@ -3845,7 +3839,7 @@ mod tests {
         let status = session.status.as_mut().expect("status");
         status.phase = flotilla_resources::TerminalSessionPhase::Running;
         status.message = None;
-        status.degraded = None;
+        status.daemon_unreachable = None;
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session)).await;
         let rows = state.result_set().await;
         let vessel = &rows.rows.as_convoys().expect("convoys")[0].vessels[0];

@@ -2,7 +2,7 @@ use crate::crew_ops::MessageAttribution;
 use flotilla_resources::ResumeIntent;
 use std::sync::atomic::Ordering;
 
-use flotilla_resources::{Convoy as ResourceConvoy, CrewWorkPhase, TerminalSession as ResourceTerminalSession, TerminalSessionSource};
+use flotilla_resources::{Convoy as ResourceConvoy, CrewWorkPhase};
 
 use super::fixture;
 use crate::crew_ops::ConvoyResumeOutcome;
@@ -37,8 +37,6 @@ async fn resume_restores_work_until_credentials_are_staged() {
         .expect("retry"),
         ConvoyResumeOutcome::Queued { displaced: None }
     );
-    let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
-    assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
     let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].spec.body, "continue");
@@ -93,8 +91,6 @@ fn queued_resume_replaces_and_withdraws_without_staging(tc: hegel::TestCase) {
             assert_eq!(pending.first().map(|message| message.spec.body.clone()), expected);
             assert!(pending.len() <= 1, "replacement and withdrawal leave at most one pending operator message");
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
-            let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
-            assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
         }
     });
 }

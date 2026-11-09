@@ -445,9 +445,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         session: "terminal-ledger-work-coder".into(),
         role: "coder".into(),
         last_delivery_rung: None,
-        delivered_message_id: None,
-        sender: None,
-        pending_briefs: Vec::new(),
     });
     let output = format_convoy_explanation_human(&obstructed);
     assert!(output.contains(

@@ -677,7 +677,6 @@ fn crew_spec(vessel: &str) -> TerminalSessionSpec {
             selector: Selector { capability: "code".into(), adapter: None, model: None },
             brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: String::new(), copies: Vec::new() },
             context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: "convoy-9".into(), vessel_ref: vessel.into() }),
-            message: None,
         })
         .cwd("/work".to_string())
         .pool("cleat".to_string())

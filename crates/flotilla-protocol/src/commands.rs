@@ -317,12 +317,22 @@ pub struct ExplainedSubscription {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExplainedTerminalCondition {
-    ProviderUnavailable { message: String },
-    SessionLost { message: String },
-    ProcessExited { exit_code: Option<i32> },
-    ProcessFailed { message: String },
-    DeliveryUnconfirmed { message: String },
-    ControllerFenceUnverifiable { message: String },
+    ProviderUnavailable {
+        message: String,
+    },
+    SessionLost {
+        message: String,
+    },
+    /// The process ended; `message` is the ending's reason, as the session's home recorded it.
+    ProcessExited {
+        message: String,
+    },
+    ProcessFailed {
+        message: String,
+    },
+    DeliveryUnconfirmed {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for ExplainedTerminalCondition {
@@ -332,15 +342,8 @@ impl std::fmt::Display for ExplainedTerminalCondition {
                 write!(f, "terminal provider unavailable: {message}; retrying without failing the crew")
             }
             Self::SessionLost { message } => write!(f, "terminal session lost: {message}; recovering from the durable brief"),
-            Self::ProcessExited { exit_code } => {
-                f.write_str("crew process exited")?;
-                if let Some(code) = exit_code {
-                    write!(f, " with code {code}")?;
-                }
-                f.write_str("; resume relaunches it in the existing checkout")
-            }
+            Self::ProcessExited { message } => write!(f, "crew {message}"),
             Self::ProcessFailed { message } => write!(f, "crew process failed: {message}"),
-            Self::ControllerFenceUnverifiable { message } => f.write_str(message),
             Self::DeliveryUnconfirmed { message } => write!(f, "terminal message delivery unconfirmed: {message}"),
         }
     }
@@ -357,12 +360,6 @@ pub struct ExplainedCrewDelivery {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_delivery_rung: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivered_message_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_briefs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

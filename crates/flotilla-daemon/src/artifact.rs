@@ -464,7 +464,6 @@ mod tests {
                             convoy: "demo".into(),
                             vessel_ref: "demo-work".into(),
                         }),
-                        message: None,
                     })
                     .cwd("/work".to_string())
                     .pool("cleat".to_string())

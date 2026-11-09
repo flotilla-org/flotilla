@@ -422,27 +422,12 @@ async fn operator_message_reply_restarts_clock_without_replenishing_budget() {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
-    let sessions = backend.using::<TerminalSession>("flotilla");
-    let session = sessions.get("resumed-coder").await.expect("session");
-    let mut spec = session.spec.clone();
-    let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent") };
-    *message = Some(flotilla_resources::TerminalCrewMessage {
-        id: "owner-guidance".into(),
-        text: "Keep working on the fix".into(),
-        sender: flotilla_resources::CrewMessageSender::OperatorResume { principal: None },
-        delivery: flotilla_resources::CrewMessageDelivery::Queued,
-        acknowledged: Default::default(),
-        following: Vec::new(),
-    });
-    sessions.update(&InputMeta::from(&session.metadata), &session.metadata.resource_version, &spec).await.expect("owner guidance");
+    message_to_coder(&backend, "owner-guidance", "Keep working on the fix").await;
     for second in [240, 300, 360, 420] {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "pending owner guidance is never displaced");
-    let session = sessions.get("resumed-coder").await.expect("session");
-    let mut status = session.status.expect("status");
-    status.delivered_message_id = Some("owner-guidance".into());
-    sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("deliver guidance");
+    deliver_to_coder(&backend, "owner-guidance", start + chrono::Duration::seconds(421)).await;
     // Judge delivery without replacing its receipt with the scenario helper.
     let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
     wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), start + chrono::Duration::seconds(421))
@@ -596,14 +581,6 @@ async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
                         convoy: "stalled-work".into(),
                         vessel_ref: "work".into(),
                     }),
-                    message: Some(flotilla_resources::TerminalCrewMessage {
-                        id: "resume-brief".into(),
-                        text: "Continue with the operator's guidance".into(),
-                        sender: flotilla_resources::CrewMessageSender::OperatorResume { principal: None },
-                        delivery: flotilla_resources::CrewMessageDelivery::Queued,
-                        acknowledged: Default::default(),
-                        following: Vec::new(),
-                    }),
                 },
                 cwd: "/workspace".into(),
                 env: Default::default(),
@@ -612,6 +589,7 @@ async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
         )
         .await
         .expect("crew session");
+    message_to_coder(&backend, "resume-brief", "Continue with the operator's guidance").await;
     let idle_before_delivery = TerminalAttention {
         state: TerminalAttentionState::Idle,
         as_of: Utc::now(),
@@ -633,9 +611,9 @@ async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
     let convoy = convoys.get("stalled-work").await.expect("resumed convoy");
     wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), convoy)])).await.expect("judge before delivery");
     assert!(delivery.requests.lock().expect("nudge requests").is_empty());
+    deliver_to_coder(&backend, "resume-brief", Utc::now()).await;
     let session = sessions.get("resumed-coder").await.expect("session");
     let mut status = session.status.expect("status");
-    status.delivered_message_id = Some("resume-brief".into());
     status.attention = None;
     sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("brief delivered");
     observe_agent("resumed-coder", TerminalAttentionState::Working, TerminalAttentionSource::Hook, Utc::now());
@@ -1936,16 +1914,19 @@ fn pending_launch_progress_is_bounded_and_recovers(tc: hegel::TestCase) {
         update_convoy(&backend, "stalled-work", |status| status.attention = Some(other.clone())).await;
         assert_eq!(judge(2799).await.attention, Some(other), "launch health must preserve unrelated attention");
         update_convoy(&backend, "stalled-work", |status| status.attention = None).await;
-        // Retry failures are diagnostic evidence, not successful progress.
+        // Retry failures are diagnostic evidence, not successful progress: a launch that is
+        // retrying shows its reading's reason, as the session view does.
         let session = sessions.get("resumed-coder").await.expect("session");
         let mut status = session.status.expect("starting");
-        status.degraded = Some(flotilla_resources::TerminalSessionDegradedCondition {
-            reason: "launch".into(),
-            message: "launcher retry failed".into(),
-            message_id: None,
-            consecutive_failures: 3,
-            observed_at: start + chrono::Duration::seconds(2800),
-        });
+        status.message = Some(
+            flotilla_protocol::LifecycleReading::Retrying {
+                failures: 3,
+                next: start + chrono::Duration::seconds(2860),
+                cause: "launcher retry failed".into(),
+            }
+            .reason()
+            .expect("retrying has a reason"),
+        );
         sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("retry evidence");
         assert!(judge(2800).await.attention.expect("retry stays overdue").reason.contains("launcher retry failed"));
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(2801)).await;

@@ -1817,7 +1817,6 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
                     convoy: convoy.into(),
                     vessel_ref: "artifact-demo-work".into(),
                 }),
-                message: None,
             })
             .cwd(workspace.path().to_string_lossy().into_owned())
             .pool("cleat".to_string())
@@ -2089,7 +2088,6 @@ async fn artifact_environment_reference_contract() {
                         convoy: convoy.into(),
                         vessel_ref: "artifact-demo-work".into(),
                     }),
-                    message: None,
                 })
                 .cwd(if environment_kind == ArtifactEnvironment::LocalHostDirect {
                     workspace.path().to_string_lossy().into_owned()
@@ -3952,8 +3950,6 @@ async fn check_supervision_escalation_pass(a: &InProcessDaemon, b: &InProcessDae
     let messages = b_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver inbox");
     assert_eq!(messages.items.len(), 1, "repeat passes must not publish duplicates");
     assert!(a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source inbox").items.is_empty());
-    let session = b_backend.using::<TerminalSession>("flotilla").get("governor-session").await.expect("governor session");
-    assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }), "escalation uses durable Message intent");
     let message = &messages.items[0];
     assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::Supervisor);
     assert_eq!(message.spec.sender, "project/stalled-work/work/coder");
@@ -4162,8 +4158,6 @@ async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {
     let session = sessions.get("exited-session").await.expect("same terminal");
     assert_eq!(session.status.expect("status").phase, flotilla_resources::TerminalSessionPhase::Starting);
     assert_eq!(session.spec.cwd, "/warm/checkout");
-    let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("agent expected") };
-    assert!(message.is_none());
     let inbox = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
     assert_eq!(inbox.items.len(), 1);
     assert!(inbox.items[0].spec.body.contains("finish the review"));

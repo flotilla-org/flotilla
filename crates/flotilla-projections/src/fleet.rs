@@ -554,23 +554,15 @@ mod tests {
 
     use super::*;
 
-    // Either delivery reason holds the crew as unconfirmed whether or not its agent has
-    // reported; a stopped session shows none.
+    // A held turn shows the crew as unconfirmed whether or not its agent has reported; a
+    // stopped session shows none.
     #[test]
     fn crew_attention_keeps_monitoring_distinct_from_lifecycle_state() {
         let now = Utc::now();
         let mut status = TerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() };
         assert_eq!(crew_attention(Some(&status), None), None);
 
-        status.degraded = Some(flotilla_resources::TerminalSessionDegradedCondition {
-            reason: "DeliveryUnconfirmed".to_string(),
-            message: "composer retained delivery".to_string(),
-            message_id: Some("handoff-1".to_string()),
-            consecutive_failures: 1,
-            observed_at: now,
-        });
-        assert_eq!(crew_attention(Some(&status), None), Some(CrewAttention::DeliveryUnconfirmed));
-        status.degraded.as_mut().expect("condition").reason = "DeliveryNotSubmitted".into();
+        status.delivery_unconfirmed_since = Some(now);
         assert_eq!(crew_attention(Some(&status), None), Some(CrewAttention::DeliveryUnconfirmed));
 
         status.phase = ResourceTerminalSessionPhase::Stopped;

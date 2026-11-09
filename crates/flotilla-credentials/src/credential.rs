@@ -2853,7 +2853,6 @@ mod tests {
                                 convoy: "crew".into(),
                                 vessel_ref: "vessel".into(),
                             }),
-                            message: None,
                         },
                     },
                 )

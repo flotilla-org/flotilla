@@ -276,10 +276,7 @@ pub trait AgentSessionReads: Send + Sync {
 /// that is not running, or has no AgentSession yet, has none.
 pub fn crew_attention(status: Option<&TerminalSessionStatus>, agent: Option<&AgentActivityView>) -> Option<CrewAttention> {
     let status = status.filter(|status| status.phase == TerminalSessionPhase::Running)?;
-    if status.degraded.as_ref().is_some_and(|condition| condition.is_controller_fence_unverifiable()) {
-        return Some(CrewAttention::ControllerFenceUnverifiable);
-    }
-    if status.degraded.as_ref().is_some_and(|condition| condition.is_delivery()) {
+    if status.delivery_unconfirmed_since.is_some() {
         return Some(CrewAttention::DeliveryUnconfirmed);
     }
     match status.idle_obstruction() {
@@ -308,8 +305,7 @@ mod tests {
 
     use super::{crew_attention, home_current, AgentActivityView, HOME_HEARD_WITHIN};
     use crate::{
-        ScreenObstruction, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSessionDegradedCondition,
-        TerminalSessionPhase, TerminalSessionStatus, TERMINAL_DELIVERY_UNCONFIRMED_REASON,
+        ScreenObstruction, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSessionPhase, TerminalSessionStatus,
     };
 
     fn agent(activity: AgentActivity, current: bool) -> AgentActivityView {
@@ -362,13 +358,7 @@ mod tests {
     fn holds_and_obstructions_come_first_and_absence_is_none() {
         let working = agent(AgentActivity::Working, true);
         let mut status = running();
-        status.degraded = Some(TerminalSessionDegradedCondition {
-            reason: TERMINAL_DELIVERY_UNCONFIRMED_REASON.into(),
-            message: "unsent".into(),
-            message_id: Some("turn".into()),
-            consecutive_failures: 1,
-            observed_at: Utc::now(),
-        });
+        status.delivery_unconfirmed_since = Some(Utc::now());
         assert_eq!(crew_attention(Some(&status), Some(&working)), Some(CrewAttention::DeliveryUnconfirmed));
 
         let mut status = running();

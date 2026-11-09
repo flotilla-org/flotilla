@@ -9,7 +9,7 @@ use flotilla_resources::{
     terminal_records::{TerminalLaunchRequest, TerminalLaunchSource},
     Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, TerminalAttention, TerminalAttentionSource,
     TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TurnDeliveryRung, VesselRequirement,
+    TurnDeliveryRung, VesselRequirement,
 };
 use flotilla_store::ResourceBackend;
 
@@ -205,14 +205,9 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
         assert_eq!(after_failure.work["work"].phase, flotilla_resources::WorkPhase::Complete);
         assert_eq!(after_failure.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
         assert!(credentials.delivered.lock().await.is_empty());
-        let undelivered = sessions.get("turn-credential-session").await.expect("undelivered session");
-        let TerminalSessionSource::Agent { message, .. } = undelivered.spec.source else { panic!("agent session expected") };
-        assert!(message.is_none());
         daemon.deliver_standing_turn(&request).await.expect("retry conflicting turn");
         let delivered = sessions.get("turn-credential-session").await.expect("delivered session");
         assert_eq!(*credentials.delivered.lock().await, BTreeSet::from(["github-crew-pr".to_string()]));
-        let TerminalSessionSource::Agent { message, .. } = delivered.spec.source else { panic!("agent session expected") };
-        assert!(message.is_none());
         let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("accepted messages").items;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].spec.body, "rebase the PR");
@@ -249,7 +244,6 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             flotilla_resources::StallNudgePolicy { max_per_episode: limit, max_refusals: None, idle_grace_seconds: Some(0) },
         );
         convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("active convoy");
-        let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
         let launch = probe.engine.terminals.record("resume-staging-session").name;
         probe.engine.terminals.ready(&launch, "resume-staging-pool-session", &Default::default());
         let idle = |as_of| TerminalAttention { state: TerminalAttentionState::Idle, as_of, source: TerminalAttentionSource::Hook };
@@ -264,13 +258,9 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         let first = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
         assert_eq!(first.rung, expected_rung);
         assert_eq!(first.nudge_history.len(), limit.min(1) as usize);
-        let session = sessions.get("resume-staging-session").await.expect("session");
-        let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("agent") };
         if limit == 0 {
-            assert!(message.is_none());
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
         } else {
-            assert!(message.is_none());
             let messages = backend.using::<flotilla_resources::Message>("flotilla");
             let nudge = messages.list().await.expect("nudges").items.remove(0);
             assert!(nudge.spec.body.contains("You owe deliverables for work/coder"));

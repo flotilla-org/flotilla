@@ -238,10 +238,8 @@ pub use terminal_session::{
     looks_like_terminal_reply, terminal_session_attach_target, terminal_session_attach_target_with_stale_status, CrewMessageDelivery,
     CrewMessageSender, CrewSessionStatus, InnerCommandStatus, ScreenObstruction, TerminalAttention, TerminalAttentionSource,
     TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalOccupancy, TerminalSession,
-    TerminalSessionAttachTarget, TerminalSessionDegradedCondition, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionTarget, CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE,
-    CONTROLLER_FENCE_UNVERIFIABLE_REASON, TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON,
-    TERMINAL_DELIVERY_UNCONFIRMED_REASON,
+    TerminalSessionAttachTarget, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, TerminalSessionTarget,
 };
 pub use vessel::{
     vessel_resource_name, Vessel, VesselImage, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION,

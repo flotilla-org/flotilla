@@ -412,7 +412,6 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
                 convoy: "demo".to_string(),
                 vessel_ref: "demo-work".to_string(),
             }),
-            message: None,
         },
         cwd: checkout,
         env: session_env,

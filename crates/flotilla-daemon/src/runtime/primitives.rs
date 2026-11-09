@@ -99,6 +99,8 @@ pub(super) struct MessageDelivery {
     held_turns: Vec<InFlight>,
     /// Whether any turn is held: only then does a tool call or prompt submit wake a pass.
     holding: Arc<std::sync::atomic::AtomicBool>,
+    /// The launches whose observation shows a held turn.
+    showing_held: BTreeSet<String>,
     /// This home's open messages, followed incrementally from the log.
     open: OpenMessages,
     /// Wakes a pass: every event source notifies it.
@@ -123,6 +125,7 @@ impl MessageDelivery {
             held: TurnHolds::default(),
             held_turns: Vec::new(),
             holding: Arc::default(),
+            showing_held: BTreeSet::new(),
             open: OpenMessages::default(),
             wake: Arc::new(tokio::sync::Notify::new()),
         }
@@ -246,6 +249,7 @@ impl MessageDelivery {
         if !expired.is_empty() {
             debug!(namespace = %self.namespace, ?expired, "awaiting-reply records expired");
         }
+        self.show_held_turns();
         let until = |at: Timestamp| Duration::from_micros(u64::try_from(at.since(now)).unwrap_or(0));
         let held = self.held.next_expiry().map(|at| at.saturating_duration_since(std::time::Instant::now()));
         Ok([report.next_due.map(until), awaiting_next.map(until), held].into_iter().flatten().min())
@@ -402,6 +406,37 @@ impl MessageDelivery {
             }
         }
         self.held.expire(std::time::Instant::now());
+    }
+
+    /// Shows on each launch's observation when the turn it holds unconfirmed was submitted, and
+    /// clears it once no turn is held there: the session view explains the hold (#3108).
+    fn show_held_turns(&mut self) {
+        let mut held = BTreeMap::<String, chrono::DateTime<Utc>>::new();
+        for turn in self.held_turns.iter().filter(|turn| turn.members.iter().any(|message| self.held.is_held(message))) {
+            let since = held.entry(turn.consumer.id.clone()).or_insert(turn.submitted_at);
+            *since = (*since).min(turn.submitted_at);
+        }
+        let reads = self.state.daemon.lifecycle_reads();
+        let terminals = match reads.terminals() {
+            Ok(terminals) => terminals,
+            Err(error) => {
+                debug!(%error, "held turns cannot be shown without the terminal sessions");
+                return;
+            }
+        };
+        // A held turn was typed into a running launch. One that ended meanwhile was forgotten, and
+        // is observed again only while its turn is held: clearing the hold forgets it again.
+        for launch in self.showing_held.iter().filter(|launch| !held.contains_key(*launch)) {
+            let observations = terminals.observations();
+            observations.amend(launch, |observation| observation.delivery_unconfirmed_since = None);
+            if observations.get(launch).is_some_and(|observation| observation == Default::default()) {
+                observations.forget(launch);
+            }
+        }
+        for (launch, since) in &held {
+            terminals.observations().update(launch, |observation| observation.delivery_unconfirmed_since = Some(*since));
+        }
+        self.showing_held = held.into_keys().collect();
     }
 
     /// Records a confirmed turn: each message's receipt, then its deliver.

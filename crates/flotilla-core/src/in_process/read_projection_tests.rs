@@ -1053,7 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn convoy_explanation_reports_terminal_provider_loss_and_recovery() {
         use flotilla_protocol::ExplainedTerminalCondition;
-        use flotilla_resources::{TerminalSessionDegradedCondition, TerminalSessionPhase, TerminalSessionStatus};
+        use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatus};
 
         let fixture = ProjectionFixture::new();
         fixture
@@ -1092,17 +1092,7 @@ mod tests {
             }
         };
         let running = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
-        set_status(TerminalSessionStatus {
-            degraded: Some(TerminalSessionDegradedCondition {
-                reason: "ReconcileDegraded".into(),
-                message: "provider offline".into(),
-                message_id: None,
-                consecutive_failures: 100,
-                observed_at: Utc::now(),
-            }),
-            ..running.clone()
-        })
-        .await;
+        set_status(TerminalSessionStatus { daemon_unreachable: Some("provider offline".into()), ..running.clone() }).await;
         let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("explanation");
         assert!(
             matches!(&explanation.crew_deliveries[0].terminal_condition, Some(ExplainedTerminalCondition::ProviderUnavailable { message }) if message == "provider offline")
@@ -1452,7 +1442,6 @@ mod tests {
                                     convoy: name.clone(),
                                     vessel_ref: format!("{name}-work"),
                                 }),
-                                message: None,
                             })
                             .build(),
                     )
@@ -1612,7 +1601,6 @@ mod tests {
                                 convoy: "target".into(),
                                 vessel_ref: "target-work".into(),
                             }),
-                            message: None,
                         })
                         .build(),
                 )
@@ -1802,7 +1790,6 @@ mod tests {
                         convoy: "attending".into(),
                         vessel_ref: "attending-work".into(),
                     }),
-                    message: None,
                 })
                 .build();
             let meta = InputMeta::builder()

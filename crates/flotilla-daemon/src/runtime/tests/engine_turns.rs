@@ -127,6 +127,14 @@ impl EngineCrew {
         self.phase(name).await.is_some_and(|phase| phase.has_delivery_evidence())
     }
 
+    /// The crew's session as its view reads here, with what this home observes of it.
+    fn session_status(&self) -> flotilla_resources::TerminalSessionStatus {
+        let reads = self.daemon.lifecycle_reads();
+        let terminals = reads.terminals().expect("terminal sessions");
+        let record = terminals.get(&self.launch, None).expect("read the launch").expect("the launch");
+        record.read_view(NAMESPACE, None, terminals.observations().get(&self.launch).as_ref()).status.expect("status")
+    }
+
     fn at(time: chrono::DateTime<Utc>) -> Timestamp {
         Timestamp::from_datetime(&time)
     }
@@ -193,6 +201,10 @@ async fn held_turn_confirmed(adapter: &str, evidence: Evidence) -> bool {
     passes(&mut delivery, 20).await;
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1, "a held turn is typed once");
     assert!(!crew.delivered("held-turn").await, "nothing yet confirms the held turn");
+    // The session's view shows the held turn, so the crew reads as delivery unconfirmed.
+    let held = crew.session_status();
+    assert!(held.delivery_unconfirmed_since.is_some(), "the view shows the held turn");
+    assert_eq!(flotilla_resources::crew_attention(Some(&held), None), Some(flotilla_protocol::CrewAttention::DeliveryUnconfirmed));
     let after = Utc::now() + chrono::Duration::milliseconds(1);
     match evidence {
         Evidence::Working => {
@@ -207,7 +219,11 @@ async fn held_turn_confirmed(adapter: &str, evidence: Evidence) -> bool {
     }
     delivery.pass().await.expect("delivery pass");
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1, "a confirmed turn is never retyped");
-    crew.delivered("held-turn").await
+    let confirmed = crew.delivered("held-turn").await;
+    if confirmed {
+        assert_eq!(crew.session_status().delivery_unconfirmed_since, None, "a confirmed turn is no longer shown held");
+    }
+    confirmed
 }
 
 // A session's pending messages are typed as one turn, each framed with its own header, in arrival

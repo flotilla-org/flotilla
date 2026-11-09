@@ -1508,7 +1508,6 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                     copies: Vec::new(),
                 },
                 context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: convoy_name.clone(), vessel_ref: vessel }),
-                message: None,
             },
             cwd: "/repo".into(),
             env: Default::default(),
@@ -2012,7 +2011,6 @@ async fn crew_completion_to_an_unreachable_home_fails_and_queues_nothing() {
                 convoy: "stranded".into(),
                 vessel_ref: "stranded-work".into(),
             }),
-            message: None,
         },
         cwd: "/repo".into(),
         env: Default::default(),
@@ -5278,7 +5276,6 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
                 convoy: "live-credential-work".into(),
                 vessel_ref: "live-work-vessel".into(),
             }),
-            message: None,
         },
     };
     let terminals = runtime_terminals(&daemon);
@@ -5698,7 +5695,6 @@ pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, plac
                 convoy: placed.convoy.into(),
                 vessel_ref: placed.vessel.into(),
             }),
-            message: None,
         },
     };
     run_session(daemon, placed.session, &spec, &codex_crew_facts());
@@ -5957,7 +5953,6 @@ pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
                 convoy: "supervisor".into(),
                 vessel_ref: "supervisor-vessel".into(),
             }),
-            message: None,
         },
     };
     let launch = request_session(&daemon, "supervisor-session", &spec);

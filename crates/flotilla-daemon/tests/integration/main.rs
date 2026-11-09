@@ -12,7 +12,6 @@ mod overlay_replication;
 mod peer_connect_flow;
 mod project_cli;
 mod reconciled_remote_turn;
-mod terminal_message_history;
 mod test_daemon;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;

@@ -10,18 +10,6 @@ use crate::{
     Selector, Vessel, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
-/// A pre-write refusal that cannot recover before the agent activation ends.
-pub const CONTROLLER_FENCE_UNVERIFIABLE_REASON: &str = "ControllerFenceUnverifiable";
-pub const CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE: &str = "ControllerFenceUnverifiable: no message input was sent because cleat could not verify the controller fence; the turn stays queued and is not retried; resuming the session clears this and delivery resumes";
-
-/// An ambiguous write whose confirmation deadline elapsed; never retried.
-/// Later consumption evidence can still acknowledge the held message.
-pub const TERMINAL_DELIVERY_EXPIRED_REASON: &str = "DeliveryExpired";
-/// Stored degradation reason shared by writers, controllers and surfaces.
-pub const TERMINAL_DELIVERY_UNCONFIRMED_REASON: &str = "DeliveryUnconfirmed";
-/// An attempt known to have sent no input; safe to retry within its budget.
-pub const TERMINAL_DELIVERY_NOT_SUBMITTED_REASON: &str = "DeliveryNotSubmitted";
-
 define_resource!(
     TerminalSession,
     "terminalsessions",
@@ -179,16 +167,8 @@ pub struct TerminalSessionSpec {
 // interfaces for a local layout optimization; the stored wire shape is unchanged.
 #[allow(clippy::large_enum_variant)]
 pub enum TerminalSessionSource {
-    Tool {
-        command: String,
-    },
-    Agent {
-        selector: Selector,
-        brief: TerminalBrief,
-        context: Box<TerminalCrewContext>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        message: Option<TerminalCrewMessage>,
-    },
+    Tool { command: String },
+    Agent { selector: Selector, brief: TerminalBrief, context: Box<TerminalCrewContext> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,97 +216,6 @@ pub struct TerminalCrewMessage {
     pub acknowledged: BTreeSet<String>,
 }
 
-impl TerminalCrewMessage {
-    pub fn contains_id(&self, id: &str) -> bool {
-        self.acknowledged.contains(id) || self.id == id || self.following.iter().any(|message| message.id == id)
-    }
-
-    pub fn next_after(&self, delivered_id: Option<&str>) -> Option<&Self> {
-        match delivered_id {
-            Some(id) if id == self.id || self.acknowledged.contains(id) => self.following.first(),
-            Some(id) => self.following.iter().position(|message| message.id == id).map_or_else(
-                || if self.acknowledged.contains(&self.id) { self.following.first() } else { Some(self) },
-                |index| self.following.get(index + 1),
-            ),
-            None if self.acknowledged.contains(&self.id) => self.following.first(),
-            None => Some(self),
-        }
-    }
-
-    pub fn pending_after(&self, delivered_id: Option<&str>) -> Vec<&Self> {
-        if self.acknowledged.contains(&self.id) && delivered_id.is_none_or(|id| !self.following.iter().any(|message| message.id == id)) {
-            return self.following.iter().collect();
-        }
-        let messages = std::iter::once(self).chain(self.following.iter()).collect::<Vec<_>>();
-        let start = delivered_id.and_then(|id| messages.iter().position(|message| message.id == id).map(|index| index + 1)).unwrap_or(0);
-        messages[start..].to_vec()
-    }
-
-    pub fn append(&mut self, message: Self) {
-        if !self.contains_id(&message.id) {
-            self.following.push(message);
-        }
-    }
-
-    pub fn mark_next_for_launch(&mut self, delivered_id: Option<&str>) -> Option<String> {
-        let next_index = match delivered_id {
-            Some(id) if id == self.id || self.acknowledged.contains(id) => Some(0),
-            Some(id) => self
-                .following
-                .iter()
-                .position(|message| message.id == id)
-                .map(|index| index + 1)
-                .or_else(|| self.acknowledged.contains(&self.id).then_some(0)),
-            None if self.acknowledged.contains(&self.id) => Some(0),
-            None => None,
-        };
-        if self.delivery == CrewMessageDelivery::LaunchBrief {
-            self.delivery = CrewMessageDelivery::Queued;
-        }
-        for message in self.following.iter_mut() {
-            if message.delivery == CrewMessageDelivery::LaunchBrief {
-                message.delivery = CrewMessageDelivery::Queued;
-            }
-        }
-        let next = if let Some(index) = next_index { self.following.get_mut(index) } else { Some(self) }?;
-        next.delivery = CrewMessageDelivery::LaunchBrief;
-        Some(next.text.clone())
-    }
-
-    /// Drop acknowledged payloads while retaining exact, payload-free receipts.
-    /// Pending operator briefs and nudges retain their order and attribution.
-    pub fn prune_acknowledged(&mut self, delivered_id: Option<&str>) -> bool {
-        let Some(id) = delivered_id else { return false };
-        if self.acknowledged.contains(id) {
-            return false;
-        }
-        let count = if id == self.id {
-            0
-        } else if let Some(index) = self.following.iter().position(|message| message.id == id) {
-            index + 1
-        } else {
-            return false;
-        };
-        self.acknowledged.insert(self.id.clone());
-        self.text.clear();
-        for message in self.following.drain(..count) {
-            self.acknowledged.insert(message.id);
-        }
-        true
-    }
-
-    pub fn delivered_through(&self, delivered_id: Option<&str>, target_id: &str) -> bool {
-        if self.acknowledged.contains(target_id) {
-            return true;
-        }
-        let messages = std::iter::once(self).chain(self.following.iter()).collect::<Vec<_>>();
-        let Some(delivered_index) = messages.iter().position(|message| Some(message.id.as_str()) == delivered_id) else {
-            return false;
-        };
-        messages[..=delivered_index].iter().any(|message| message.id == target_id)
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalSessionPhase {
     #[default]
@@ -360,27 +249,17 @@ pub struct TerminalSessionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleat_endpoint: Option<flotilla_protocol::result_set::CleatEndpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pid: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inner_command_status: Option<InnerCommandStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inner_exit_code: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crew: Option<CrewSessionStatus>,
-    /// Old launches retained across resume until replacement succeeds and cleanup
-    /// is confirmed. Remove the decoder default after one fleet roll (ADR 0047).
-    #[serde(default)]
-    pub retired_launches: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivered_message_id: Option<String>,
     /// A fresh observation of what the terminal's harness appears to be doing.
     /// This deliberately does not participate in the session lifecycle phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -390,34 +269,21 @@ pub struct TerminalSessionStatus {
     /// stays because absence is also the steady state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_obstruction: Option<ScreenObstruction>,
-    /// Automatic turn delivery hold. Remove the decoder default one roll after #2758.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_delivery_hold: Option<crate::ConvoyAttention>,
     /// Whether the principal currently occupies the terminal's controller
     /// seat. Cleat's attachment state is authoritative for this observation.
     #[serde(default)]
     pub occupancy: TerminalOccupancy,
-    /// Set when the controller exhausts its budget for one repeated reconcile
-    /// error. The controller may either park or continue retrying with backoff,
-    /// according to its error policy.
+    /// When the turn this home typed into the session and holds unconfirmed was submitted
+    /// (#3108): typed, but no busy signal followed, so it is never retyped until the agent's
+    /// record confirms it or the hold runs out. Observed at the delivering home, in memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub degraded: Option<TerminalSessionDegradedCondition>,
+    pub delivery_unconfirmed_since: Option<DateTime<Utc>>,
     /// Why this session's crew cannot currently reach its controlling daemon,
     /// observed by the actuator (an SSH host's forward is down, #3618).
     /// The session itself keeps running. Remove the decoder default one fleet
     /// roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_unreachable: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TerminalSessionDegradedCondition {
-    pub reason: String,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<String>,
-    pub consecutive_failures: u32,
-    pub observed_at: DateTime<Utc>,
 }
 
 impl TerminalSessionStatus {
@@ -432,23 +298,6 @@ impl TerminalSessionStatus {
             && self.crew.as_ref().is_some_and(|crew| crew.adapter == "codex")
             && self.started_at.is_some_and(|started| submitted_at >= started)
             && agent.is_some_and(|agent| agent.completed_after(submitted_at))
-    }
-}
-
-impl TerminalSessionDegradedCondition {
-    /// Guarded input was refused as definitely unsent; keep the hold visible while rechecking.
-    pub fn is_controller_fence_unverifiable(&self) -> bool {
-        self.reason == CONTROLLER_FENCE_UNVERIFIABLE_REASON
-    }
-
-    /// Delivery evidence is cleared only by an explicit delivery or lifecycle
-    /// transition, never by an unrelated observation or provider recovery.
-    pub fn is_delivery(&self) -> bool {
-        self.is_controller_fence_unverifiable()
-            || matches!(
-                self.reason.as_str(),
-                TERMINAL_DELIVERY_UNCONFIRMED_REASON | TERMINAL_DELIVERY_NOT_SUBMITTED_REASON | TERMINAL_DELIVERY_EXPIRED_REASON
-            )
     }
 }
 
@@ -858,5 +707,41 @@ mod tests {
         }))
         .expect("decodes");
         assert_eq!(status.phase, TerminalSessionPhase::Running);
+    }
+
+    /// The old store's statuses and specs carry fields the engine view never sets; they decode
+    /// and are dropped (#3108).
+    #[test]
+    fn session_with_retired_delivery_fields_still_decodes() {
+        let status: TerminalSessionStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Running",
+            "pid": 42,
+            "inner_command_status": "Exited",
+            "inner_exit_code": 1,
+            "retired_launches": ["terminal-a-coder#1"],
+            "delivered_message_id": "turn-1",
+            "turn_delivery_hold": {
+                "source": "turn-delivery",
+                "reason": "episode limit",
+                "raised_at": "2026-08-01T12:00:00Z"
+            },
+            "degraded": {
+                "reason": "DeliveryUnconfirmed",
+                "message": "held",
+                "consecutive_failures": 1,
+                "observed_at": "2026-08-01T12:00:00Z"
+            }
+        }))
+        .expect("status decodes");
+        assert_eq!(status.phase, TerminalSessionPhase::Running);
+        let source: TerminalSessionSource = serde_json::from_value(serde_json::json!({
+            "kind": "agent",
+            "selector": { "capability": "coding" },
+            "brief": { "path": "brief.md", "content": "work" },
+            "context": { "namespace": "flotilla", "convoy": "c", "vessel_ref": "v" },
+            "message": { "id": "turn-1", "text": "hello", "following": [], "acknowledged": [] }
+        }))
+        .expect("source decodes");
+        assert!(matches!(source, TerminalSessionSource::Agent { .. }));
     }
 }

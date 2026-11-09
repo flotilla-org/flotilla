@@ -64,8 +64,6 @@ struct StagingProbe {
 impl WorkCredentialReconciler for StagingProbe {
     async fn reconcile(&self, namespace: &str, environment: &str) -> Result<(), String> {
         assert_eq!(environment, "resume-env");
-        let session = self.backend.using::<ResourceTerminalSession>(namespace).get("session").await.expect("session");
-        assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
         let convoy = self.backend.using::<ResourceConvoy>(namespace).get("crew").await.expect("convoy");
         assert_eq!(convoy.status.expect("status").crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -185,7 +183,6 @@ async fn fixture_with_message_path(
                         convoy: "crew".into(),
                         vessel_ref: "vessel".into(),
                     }),
-                    message: None,
                 },
                 cwd: "/repo".into(),
                 env: Default::default(),

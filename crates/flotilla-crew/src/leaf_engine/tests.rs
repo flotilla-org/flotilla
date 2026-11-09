@@ -351,6 +351,40 @@ async fn project_supervision_case(governors: &[(&str, u64, ConvoyPhase)]) -> (Re
 
 // Exercise the actor-row scenario through resource observations and the
 // recording delivery collaborator, with explicit time rather than sleeps.
+/// An operator's Message to the stalled crew's coder, accepted and waiting for delivery.
+async fn message_to_coder(backend: &ResourceBackend, name: &str, body: &str) {
+    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+    let receiver = format!("{}/stalled-work/work/coder", convoy.spec.project_ref.as_deref().unwrap_or("flotilla"));
+    let spec = flotilla_resources::MessageSpec::builder()
+        .sender("principal:implicit".into())
+        .receiver(receiver)
+        .body(body.into())
+        .relation(flotilla_resources::MessageRelation::Supervisor)
+        .build();
+    flotilla_messaging::MessageInbox::new(backend.clone(), "flotilla")
+        .accept(&InputMeta::builder().name(name.into()).build(), &spec, Utc::now())
+        .await
+        .expect("message accepted");
+}
+
+/// Records Message `name` delivered to the coder's session at `at`, as its delivery does.
+async fn deliver_to_coder(backend: &ResourceBackend, name: &str, at: DateTime<Utc>) {
+    let messages = backend.using::<flotilla_resources::Message>("flotilla");
+    let message = messages.get(name).await.expect("message");
+    let mut status = message.status.clone().expect("accepted status");
+    status.phase = flotilla_resources::MessagePhase::Delivered;
+    status.since = at;
+    status.resolved_receiver = Some(
+        flotilla_resources::ResolvedMessageReceiver::builder()
+            .crew_id("resumed-coder".into())
+            .session("resumed-coder".into())
+            .delivered_at(at)
+            .evidence("turn".into())
+            .build(),
+    );
+    messages.update_status(name, &message.metadata.resource_version, &status).await.expect("message delivered");
+}
+
 async fn idle_nudge_scenario() -> (ResourceBackend, ReconcilerWake, Arc<RecordingTurnDelivery>) {
     actor_nudge_scenario(&[]).await
 }
@@ -390,7 +424,6 @@ async fn actor_nudge_scenario(governors: &[(&str, u64, ConvoyPhase)]) -> (Resour
                         convoy: "stalled-work".into(),
                         vessel_ref: "work".into(),
                     }),
-                    message: None,
                 },
                 cwd: "/workspace".into(),
                 env: Default::default(),

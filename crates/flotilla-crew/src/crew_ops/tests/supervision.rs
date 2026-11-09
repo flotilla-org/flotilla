@@ -1167,7 +1167,6 @@ async fn operator_brief_survives_a_racing_nudge_until_delivery() {
                         convoy: "convoy".to_string(),
                         vessel_ref: "work".to_string(),
                     }),
-                    message: None,
                 },
                 cwd: "/workspace".to_string(),
                 env: Default::default(),

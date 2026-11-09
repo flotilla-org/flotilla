@@ -38,12 +38,12 @@ use flotilla_resources::resolve_project_issue_sources_from_inventory;
 use flotilla_resources::{
     address::{leaf_address, leaf_record_name, record_name},
     bound_change_request_address, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
-    repository_display_labels, ChangeRequestStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyStatus, CrewMessageSender,
-    CrewWorkPhase, Forge, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus,
-    IssueSourceResolution, IssueSourceUnavailable, Project, ReadResourceObject, Repository, RepositoryKey, ResourceObject,
-    ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
-    CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    repository_display_labels, ChangeRequestStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyStatus, CrewWorkPhase, Forge,
+    FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution,
+    IssueSourceUnavailable, Project, ReadResourceObject, Repository, RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode,
+    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
 use tracing::warn;
@@ -1523,6 +1523,30 @@ impl ReadProjections<'_> {
         let observed_sessions = receivers.terminals();
         let unclaimed_work = explained_unclaimed_work(convoy.status.as_ref(), observed_sessions, name);
         let selected_sessions = flotilla_resources::select_convoy_children(&convoy, observed_sessions);
+        // Each queued turn's Message: its delivery evidence says whether the turn arrived.
+        let mut queued_messages = BTreeMap::new();
+        for message_id in
+            convoy.status.iter().flat_map(|status| &status.turn_deliveries).flat_map(|(_, delivery)| &delivery.episodes).filter_map(
+                |episode| match &episode.outcome {
+                    flotilla_resources::TurnDeliveryOutcome::Queued { message_id, .. } => Some(message_id),
+                    _ => None,
+                },
+            )
+        {
+            let message = match receivers.messages() {
+                Some(messages) => {
+                    messages.iter().find(|message| message.object.metadata.name == *message_id).map(|message| message.object.clone())
+                }
+                None => match self.backend.including_replicas::<flotilla_resources::Message>(namespace).get(message_id).await {
+                    Ok(message) => Some(message.object),
+                    Err(flotilla_resources::ResourceError::NotFound { .. }) => None,
+                    Err(error) => return Err(error.to_string()),
+                },
+            };
+            if let Some(message) = message {
+                queued_messages.insert(message_id.clone(), message);
+            }
+        }
         let queued_turns = convoy
             .status
             .as_ref()
@@ -1536,7 +1560,7 @@ impl ReadProjections<'_> {
                         return None;
                     };
                     let session = flotilla_resources::queued_turn_session(&selected_sessions, vessel, role);
-                    let (confirmed, blocking_reason) = flotilla_resources::queued_turn_evidence(session, message_id);
+                    let (confirmed, blocking_reason) = flotilla_resources::queued_turn_evidence(queued_messages.get(message_id), session);
                     // A receipt can arrive between health ticks; explain must not call it blocked.
                     if confirmed {
                         return None;
@@ -1576,24 +1600,6 @@ impl ReadProjections<'_> {
                 // field explicit so recorded rungs appear without inventing
                 // one from session liveness or message delivery.
                 last_delivery_rung: None,
-                sender: match &source.object.spec.source {
-                    TerminalSessionSource::Agent { message: Some(message), .. } if message.sender != CrewMessageSender::Unknown => {
-                        Some(flotilla_resources::legacy_message_sender(&message.sender).0)
-                    }
-                    _ => None,
-                },
-                pending_briefs: match &source.object.spec.source {
-                    TerminalSessionSource::Agent { message: Some(message), .. } => message
-                        .pending_after(source.object.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()))
-                        .into_iter()
-                        .filter(|message| {
-                            matches!(message.sender, CrewMessageSender::OperatorResume { .. } | CrewMessageSender::OperatorFollowUp { .. })
-                        })
-                        .map(|message| message.text.clone())
-                        .collect(),
-                    _ => Vec::new(),
-                },
-                delivered_message_id: source.object.status.and_then(|status| status.delivered_message_id),
             })
             .collect::<Vec<_>>();
         crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));

@@ -25,7 +25,6 @@ use flotilla_store::{
 };
 use tokio::sync::{broadcast, OnceCell};
 
-use super::durable_message_evidence;
 use super::sources::{change_request_sources, freshest_change_requests};
 use super::stalls::{is_active_change_request_probe, is_merged_settlement_probe};
 use super::{EpisodeKeyFields, LeafSubscriptionRow, LeafSubscriptionTable, LeafWatcher, UnableEvidenceKey};
@@ -284,10 +283,8 @@ impl ReconcilerWake {
         for (source, delivery) in &status.turn_deliveries {
             for episode in &delivery.episodes {
                 let TurnDeliveryOutcome::Queued { vessel, role, message_id, .. } = &episode.outcome else { continue };
-                let (confirmed, blocking_reason) = match messages.iter().find(|message| message.object.metadata.name == *message_id) {
-                    Some(message) => durable_message_evidence(&message.object),
-                    None => queued_turn_evidence(queued_turn_session(sessions, vessel, role), message_id),
-                };
+                let message = messages.iter().find(|message| message.object.metadata.name == *message_id).map(|message| &message.object);
+                let (confirmed, blocking_reason) = queued_turn_evidence(message, queued_turn_session(sessions, vessel, role));
                 observations.push(flotilla_resources::QueuedTurnObservation {
                     source: source.clone(),
                     subject_revision: episode.subject_revision.clone(),

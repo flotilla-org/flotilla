@@ -260,7 +260,6 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
                 convoy: "demo".to_string(),
                 vessel_ref: "demo-work".to_string(),
             }),
-            message: None,
         },
         cwd: workspace.display().to_string(),
         env: BTreeMap::from([

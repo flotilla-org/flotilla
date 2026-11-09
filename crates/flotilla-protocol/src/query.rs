@@ -248,7 +248,6 @@ pub enum CrewAttention {
     Working,
     NeedsInput,
     DeliveryUnconfirmed,
-    ControllerFenceUnverifiable,
     Idle,
     Unobservable,
     /// Idle, but text nobody submitted sits in the composer (#3460).
@@ -262,7 +261,6 @@ impl std::fmt::Display for CrewAttention {
         formatter.write_str(match self {
             Self::Working => "working",
             Self::NeedsInput => "needs input",
-            Self::ControllerFenceUnverifiable => "waiting for cleat composer evidence",
             Self::DeliveryUnconfirmed => "delivery unconfirmed",
             Self::Idle => "idle",
             Self::Unobservable => "unobservable",

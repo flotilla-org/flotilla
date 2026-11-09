@@ -12,19 +12,18 @@ pub fn condition(status: &TerminalSessionStatus) -> Option<ExplainedTerminalCond
             message: status.message.clone().unwrap_or_else(|| "external session is absent".into()),
         }),
         TerminalSessionPhase::Stopped if status.inner_command_status == Some(InnerCommandStatus::Exited) => {
-            Some(ExplainedTerminalCondition::ProcessExited { exit_code: status.inner_exit_code })
+            Some(ExplainedTerminalCondition::ProcessExited {
+                message: status.message.clone().unwrap_or_else(|| flotilla_resources::terminal_records::PROCESS_EXITED.into()),
+            })
         }
+        // A turn this home typed and holds unconfirmed (#3108).
         _ => status
-            .degraded
-            .as_ref()
-            .map(|condition| {
-                if condition.is_controller_fence_unverifiable() {
-                    ExplainedTerminalCondition::ControllerFenceUnverifiable { message: condition.message.clone() }
-                } else if condition.is_delivery() {
-                    ExplainedTerminalCondition::DeliveryUnconfirmed { message: condition.message.clone() }
-                } else {
-                    ExplainedTerminalCondition::ProviderUnavailable { message: condition.message.clone() }
-                }
+            .delivery_unconfirmed_since
+            .map(|since| ExplainedTerminalCondition::DeliveryUnconfirmed {
+                message: format!(
+                    "a turn typed at {} is held; it is not retyped until the agent's record confirms it or the hold runs out",
+                    since.to_rfc3339()
+                ),
             })
             // #3618: a crew that cannot reach its daemon loses hooks and settlement.
             .or_else(|| {
@@ -39,10 +38,6 @@ pub fn condition(status: &TerminalSessionStatus) -> Option<ExplainedTerminalCond
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use flotilla_resources::{
-        TerminalSessionDegradedCondition, CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE, CONTROLLER_FENCE_UNVERIFIABLE_REASON,
-        TERMINAL_DELIVERY_UNCONFIRMED_REASON,
-    };
 
     use super::*;
 
@@ -50,59 +45,61 @@ mod tests {
         TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() }
     }
 
-    fn degraded(reason: &str, message: &str) -> Option<TerminalSessionDegradedCondition> {
-        Some(TerminalSessionDegradedCondition {
-            reason: reason.into(),
-            message: message.into(),
-            message_id: Some("turn".into()),
-            consecutive_failures: 1,
-            observed_at: Utc::now(),
-        })
-    }
-
     // #3618: an unreachable daemon is shown while the session keeps running,
-    // yields to a delivery condition, and is gone once reach is observed again.
+    // yields to a held turn, and is gone once reach is observed again.
     #[test]
     fn unreachable_daemon_is_a_running_condition() {
         let mut status = running();
         status.daemon_unreachable = Some("daemon forward down: ssh exited".into());
         assert!(matches!(condition(&status),
             Some(ExplainedTerminalCondition::ProviderUnavailable { message }) if message.contains("daemon forward down")));
-        status.degraded = degraded(TERMINAL_DELIVERY_UNCONFIRMED_REASON, "held");
+        status.delivery_unconfirmed_since = Some(Utc::now());
         assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::DeliveryUnconfirmed { .. })));
-        status.degraded = None;
+        status.delivery_unconfirmed_since = None;
         assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::ProviderUnavailable { .. })));
         status.daemon_unreachable = None;
         assert_eq!(condition(&status), None);
     }
 
-    // Degradation of a running session, confirmed loss and a delivery failure are each
-    // explained distinctly; a running session with no evidence has no condition.
+    // An agent whose process exited reads as Stopped with its command exited, and explains as
+    // ProcessExited, resumable in its checkout (#3108).
+    #[test]
+    fn an_exited_agent_explains_as_process_exited() {
+        use flotilla_provisioning_testkit::TerminalsFixture;
+        let terminals = TerminalsFixture::at("home");
+        let launch = terminals.request(&TerminalsFixture::agent("crew-vessel", "coder", "env"));
+        terminals.ready(&launch, "crew-session", &Default::default());
+        terminals.exited(&launch, "agent exited with code 3; resume relaunches it in the existing checkout");
+        let view = terminals.record(&launch).read_view("flotilla", None, None);
+        let status = view.status.expect("status");
+        assert_eq!(status.phase, TerminalSessionPhase::Stopped);
+        assert_eq!(status.inner_command_status, Some(InnerCommandStatus::Exited));
+        let explained = condition(&status).expect("condition");
+        assert_eq!(
+            explained,
+            ExplainedTerminalCondition::ProcessExited {
+                message: "process exited: agent exited with code 3; resume relaunches it in the existing checkout".into(),
+            }
+        );
+        assert_eq!(explained.to_string(), "crew process exited: agent exited with code 3; resume relaunches it in the existing checkout");
+
+        let other = terminals.request(&TerminalsFixture::agent("other-vessel", "coder", "env"));
+        terminals.ready(&other, "other-session", &Default::default());
+        terminals.lost(&other, "cleat daemon gone");
+        let lost = terminals.record(&other).read_view("flotilla", None, None).status.expect("status");
+        assert_eq!(lost.inner_command_status, None);
+        assert!(matches!(condition(&lost), Some(ExplainedTerminalCondition::SessionLost { .. })));
+    }
+
+    // Confirmed loss and a held turn are each explained distinctly; a running session with no
+    // evidence has no condition.
     #[test]
     fn health_conditions_follow_evidence() {
-        let mut status = running();
-        status.degraded = degraded("ReconcileDegraded", "provider offline");
-        assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::ProviderUnavailable { .. })));
         let lost = TerminalSessionStatus { phase: TerminalSessionPhase::Lost, message: Some("daemon generation dead".into()), ..running() };
         assert!(matches!(condition(&lost), Some(ExplainedTerminalCondition::SessionLost { .. })));
         assert_eq!(condition(&running()), None);
-        status.degraded = degraded(TERMINAL_DELIVERY_UNCONFIRMED_REASON, "not submitted");
-        assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::DeliveryUnconfirmed { .. })));
-    }
-
-    // A known-unsent permanent fence has its own condition and actionable crew attention.
-    #[test]
-    fn unverifiable_fence_explains_resume_recovery() {
-        let mut status = running();
-        status.degraded = degraded(CONTROLLER_FENCE_UNVERIFIABLE_REASON, CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE);
-        let explained = condition(&status).expect("condition");
-        assert!(matches!(explained, ExplainedTerminalCondition::ControllerFenceUnverifiable { .. }));
-        assert!(explained.to_string().contains("no message input was sent"));
-        assert!(explained.to_string().contains("resuming the session clears this"));
-        assert!(!explained.to_string().contains("unconfirmed"));
-        assert_eq!(
-            flotilla_resources::crew_attention(Some(&status), None),
-            Some(flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
-        );
+        let held = TerminalSessionStatus { delivery_unconfirmed_since: Some(Utc::now()), ..running() };
+        assert!(matches!(condition(&held), Some(ExplainedTerminalCondition::DeliveryUnconfirmed { .. })));
+        assert_eq!(flotilla_resources::crew_attention(Some(&held), None), Some(flotilla_protocol::CrewAttention::DeliveryUnconfirmed));
     }
 }
