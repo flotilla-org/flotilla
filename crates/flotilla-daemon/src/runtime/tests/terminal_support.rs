@@ -408,8 +408,8 @@ impl CommandRunner for ControllerCleatRunner {
                 *self.probe.draft.lock().unwrap() = None;
                 String::new()
             }
-            "send" if args.contains(&"--no-enter") => {
-                // A restored draft: typed behind the controller fence, never submitted.
+            "send" if args.contains(&"--paste") => {
+                // A restored draft: pasted behind the controller fence, never submitted.
                 assert!(!args.contains(&"--submit"));
                 assert!(args.windows(2).any(|pair| pair == ["--controller-idle", "2s"]));
                 if !quiet {

@@ -545,9 +545,9 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn type_without_submit(&self, session_name: &str, text: &str) -> Result<(), String> {
-        // Cleat's CLI paste-encodes only with --submit, so the text is written
-        // as typed bytes; the controller fence keeps it off a person's input.
-        run!(self.runner, &self.binary, &["send", "--no-enter", "--controller-idle", "2s", "--", session_name, text], Path::new("/"))?;
+        // Cleat paste-encodes the text and sends no Enter; the controller fence keeps it off a
+        // person's input.
+        run!(self.runner, &self.binary, &["send", "--paste", "--controller-idle", "2s", "--", session_name, text], Path::new("/"))?;
         Ok(())
     }
 }
@@ -1052,7 +1052,7 @@ mod tests {
         test_pool(runner.clone(), "cleat").type_without_submit("agent", "--half a thought").await.unwrap();
         let calls = logical_calls(&runner);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1, vec!["send", "--no-enter", "--controller-idle", "2s", "--", "agent", "--half a thought"]);
+        assert_eq!(calls[0].1, vec!["send", "--paste", "--controller-idle", "2s", "--", "agent", "--half a thought"]);
     }
 
     // The production host wrapper forwards every delivery operation to cleat,
@@ -1075,7 +1075,7 @@ mod tests {
         pool.operator_deliver("agent", "turn").await.unwrap();
         pool.type_without_submit("agent", "draft").await.unwrap();
         let verbs: Vec<_> = logical_calls(&runner).into_iter().map(|call| call.1[..2].join(" ")).collect();
-        assert_eq!(verbs, ["inspect agent", "clear-composer agent", "send --submit", "send --submit", "send --no-enter"]);
+        assert_eq!(verbs, ["inspect agent", "clear-composer agent", "send --submit", "send --submit", "send --paste"]);
     }
 
     // Only explicit pre-write controller refusals establish a safe retry;
