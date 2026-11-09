@@ -6,9 +6,9 @@ use flotilla_schema::{Address, Code, CodeEnum, Frozen, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
         Abandon, AbandonCause, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest,
-        ConvoySpec, ConvoyState, Declare, Deliver, Duty, DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority,
-        Progress, PromiseId, PromiseKinds, PromiseSource, Quota, Readmit, Reassign, Reject, Resupervise, RetireDuty, Retract, Seat,
-        SeatName, Submit, Terms, Unlink, VesselClass,
+        ConvoyState, Declare, Deliver, Duty, DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress,
+        PromiseId, PromiseKinds, PromiseSource, Quota, Readmit, Reassign, Reject, Resupervise, RetireDuty, Retract, Seat, SeatName, Submit,
+        Terms, Unlink, VesselClass,
     },
     Coded, Diagram, Home, InputRead, Machine, Ref, StateValue, Version, WriteError,
 };
@@ -479,34 +479,6 @@ fn readmission_only_raises_the_quota() {
     assert_eq!(apply(&mut home, readmit(&[("standard", 2), ("large", 1)], YES)), refused(ConvoyRefusal::QuotaNotIncrease));
     apply(&mut home, readmit(&[("standard", 2)], YES)).expect("readmitted");
     assert_eq!(home.get("c").expect("exists").state().quota(), &quota(&[("standard", 2)]));
-}
-
-// ADR 0047: the previous generation's stored record representation has no
-// failed/retired/replacement fields on seats, no subjects, and a promise
-// floor; new writes include the current fields and drop the floor.
-#[test]
-fn previous_seat_and_convoy_records_decode_with_growth_defaults() {
-    let row = seat_row("a", None);
-    let mut previous = serde_json::to_value(&row).expect("encode seat");
-    previous.as_object_mut().unwrap().remove("failed");
-    previous.as_object_mut().unwrap().remove("retired");
-    previous.as_object_mut().unwrap().remove("replacements");
-    let decoded: Seat = serde_json::from_value(previous).expect("N→N+1 seat");
-    assert_eq!((decoded.failed, decoded.retired, decoded.replacements), (None, false, 0));
-    let spec = ConvoySpec {
-        project: project(),
-        priority: Priority(0),
-        kinds: Frozen::new(PromiseKinds::default()).unwrap(),
-        subjects: flotilla_schema::Records::new(),
-        duties: BTreeMap::new(),
-        seats: flotilla_schema::Records::new(),
-        promises: flotilla_schema::Records::new(),
-    };
-    let mut previous = serde_json::to_value(&spec).expect("encode convoy spec");
-    previous.as_object_mut().unwrap().remove("subjects");
-    previous.as_object_mut().unwrap().insert("promise_floor".into(), serde_json::json!(3));
-    let decoded: ConvoySpec = serde_json::from_value(previous).expect("N→N+1 convoy spec");
-    assert_eq!(decoded, spec);
 }
 
 #[test]

@@ -177,8 +177,8 @@ CREATE TABLE "convoy_seats" (
   "parent_seat" INTEGER REFERENCES "strings" ("id"),
   "supervised_by" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "failed" TEXT,
-  "retired" INTEGER NOT NULL CHECK ("retired" IN (0, 1)) DEFAULT 0,
-  "replacements" INTEGER NOT NULL DEFAULT 0,
+  "retired" INTEGER NOT NULL CHECK ("retired" IN (0, 1)),
+  "replacements" INTEGER NOT NULL,
   PRIMARY KEY ("convoy", "pos"),
   FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE,
   CHECK (CASE WHEN "parent_role" IS NOT NULL

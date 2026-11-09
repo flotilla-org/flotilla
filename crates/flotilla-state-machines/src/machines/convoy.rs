@@ -117,13 +117,8 @@ pub struct Seat {
     pub supervised_by: Address,
     /// A supervisor's or operator's Fail verdict on the seat, its reason;
     /// final for the seat.
-    // ADR 0047 N→N+1: old seats have no verdict. Remove this decode default one roll after seat verdicts land.
-    #[serde(default)]
     pub failed: Option<String>,
-    // ADR 0047 N→N+1: old seats had neither field. Remove these decode defaults one roll after seat growth lands.
-    #[serde(default)]
     pub retired: bool,
-    #[serde(default)]
     pub replacements: u32,
 }
 
@@ -305,8 +300,6 @@ pub struct ConvoySpec {
     pub priority: Priority,
     #[store(frozen)]
     pub kinds: Frozen<PromiseKinds>,
-    // ADR 0047 N→N+1: older convoys link no subjects. Remove this decode default one roll after subject links land.
-    #[serde(default)]
     #[store(records)]
     pub subjects: Records<SubjectLink>,
     #[store(child)]
@@ -927,8 +920,6 @@ pub struct Convoy;
 
 impl Machine for Convoy {
     const NAME: &'static str = "Convoy";
-    // ADR 0047 N→N+1: remove one roll after seat growth lands.
-    const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = &[("seats", "retired", 0), ("seats", "replacements", 0)];
     type Request = ConvoyRequest;
     type Spec = ConvoySpec;
     type State = ConvoyState;
