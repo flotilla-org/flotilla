@@ -228,3 +228,28 @@ fn a_handed_back_member_neither_completes_nor_blocks_its_work() {
     assert_eq!(reading.crew["build"]["coder"], CrewWorkPhase::HandedBack);
     assert_eq!(reading.work["build"], WorkPhase::Running);
 }
+
+#[test]
+fn a_convoy_with_no_works_is_pending_never_landing() {
+    let mut case = Case::two_works();
+    case.snapshot = snapshot(Vec::new());
+    let reading = case.derive();
+    assert!(reading.work.is_empty());
+    assert_eq!(reading.phase, ConvoyPhase::Pending);
+}
+
+#[test]
+fn works_that_have_not_started_never_read_landing() {
+    // Nothing launched: the first work is Ready, its dependant Pending.
+    assert_eq!(Case::two_works().derive().phase, ConvoyPhase::Active);
+    // Only dependants, none of whose dependencies are complete: every work Pending.
+    let mut case = Case::two_works();
+    case.snapshot = snapshot(vec![requirement("review", &["build"], &["reviewer"])]);
+    assert_eq!(case.derive().phase, ConvoyPhase::Pending);
+    // A work whose template has no crew completes only by verdict, so it never lands unstarted.
+    let mut crewless = Case::two_works();
+    crewless.snapshot = snapshot(vec![requirement("build", &[], &[])]);
+    let reading = crewless.vessel("build", ready()).derive();
+    assert_eq!(reading.work["build"], WorkPhase::Running);
+    assert_ne!(reading.phase, ConvoyPhase::Landing);
+}
