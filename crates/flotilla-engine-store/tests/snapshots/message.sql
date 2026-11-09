@@ -164,6 +164,8 @@ FROM "agent_session";
 CREATE TABLE "convoy" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "workflow_ref" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "admission" BLOB NOT NULL REFERENCES "objects" ("hash"),
   "project" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "priority" INTEGER NOT NULL,
   "kinds" BLOB NOT NULL REFERENCES "objects" ("hash"),
@@ -319,6 +321,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "convoy_view" AS SELECT
   "convoy"."id",
   "convoy"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy"."workflow_ref") AS "workflow_ref",
+  "convoy"."admission",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy"."project") AS "project",
   "convoy"."priority",
   "convoy"."kinds",

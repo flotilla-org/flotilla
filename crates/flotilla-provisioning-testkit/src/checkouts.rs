@@ -137,6 +137,8 @@ impl CheckoutFixture {
             replacements: 0,
         };
         let request = ConvoyRequest {
+            workflow_ref: "w".into(),
+            admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
             project: Address::project(PROJECT).expect("project"),
             promises: Default::default(),
             duties: [(DUTY, Duty { owner: lead(), scope: DutyScope::Lifetime, terms: Terms::default() })].into_iter().collect(),

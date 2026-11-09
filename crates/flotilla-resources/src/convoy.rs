@@ -15,6 +15,7 @@ use crate::{
     SettlementClaimEvidence, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
 };
 
+pub mod admission;
 pub mod engine;
 pub mod promises;
 #[doc(hidden)]

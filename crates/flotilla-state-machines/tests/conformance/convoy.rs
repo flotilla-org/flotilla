@@ -216,6 +216,9 @@ fn request_of(request: &Value) -> ConvoyRequest {
     let mut seats: Vec<Seat> = named(&request["seats"]).into_iter().map(|(name, v)| seat_of(name, v)).collect();
     seats.sort_by_key(|seat| seat.parent.is_some());
     ConvoyRequest {
+        workflow_ref: "w".into(),
+        admission: flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new()))
+            .expect("freeze"),
         project: address(&request["project"]),
         promises,
         duties,

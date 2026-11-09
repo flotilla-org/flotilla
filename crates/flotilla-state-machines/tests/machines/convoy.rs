@@ -55,6 +55,8 @@ fn lifetime(owner: &str) -> Duty {
 /// A convoy whose seat `coder` owns the given promises, under `lead`.
 fn request(promises: &[(u32, PromiseSource)]) -> ConvoyRequest {
     ConvoyRequest {
+        workflow_ref: "w".into(),
+        admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project(),
         promises: promises.iter().map(|(id, source)| (PromiseId(*id), admitted(*id, *source, "coder"))).collect(),
         duties: BTreeMap::new(),

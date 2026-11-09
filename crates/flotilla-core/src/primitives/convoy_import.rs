@@ -268,7 +268,9 @@ pub fn import_convoy(
     }
     let used: BTreeSet<&str> = promises.iter().map(|row| row.record.kind.as_str()).collect();
     let kinds = Catalog::resolve(&stock(), &[]).and_then(|catalog| catalog.freeze(used)).map_err(|error| refuse(error.to_string()))?;
-    let spec = ConvoySpec { project, priority: Priority(0), kinds, subjects: Records::new(), duties, seats, promises };
+    let (workflow_ref, admission) = map::admission(convoy).map_err(refuse)?;
+    let spec =
+        ConvoySpec { workflow_ref, admission, project, priority: Priority(0), kinds, subjects: Records::new(), duties, seats, promises };
     let state = StoredState::<Convoy>::new(ConvoyState::Open { quota: BTreeMap::new(), retired: BTreeSet::new() }, since);
     let resource = Resource::stored(map::engine_name(convoy).map_err(refuse)?, spec, state, Version(1));
     check(&resource).map_err(refuse)?;
@@ -344,6 +346,8 @@ pub fn check(resource: &Resource<Convoy>) -> Result<(), String> {
     let name = resource.name();
     let mut world = MemoryConvoyWorld::default().with_project(&spec.project);
     let request = ConvoyRequest {
+        workflow_ref: spec.workflow_ref.clone(),
+        admission: spec.admission.clone(),
         project: spec.project.clone(),
         promises: spec
             .promises

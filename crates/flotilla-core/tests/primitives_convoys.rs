@@ -21,6 +21,9 @@ fn address(text: &str) -> Address {
 
 fn request() -> ConvoyRequest {
     ConvoyRequest {
+        workflow_ref: "w".into(),
+        admission: flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new()))
+            .expect("freeze"),
         project: address("fleet"),
         promises: [(
             PromiseId(0),

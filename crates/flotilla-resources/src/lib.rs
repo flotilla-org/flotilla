@@ -306,6 +306,7 @@ pub use workflow_template::{
 };
 
 pub mod role_cascade;
+pub use convoy::admission::{AdmissionDocument, AdmissionDocumentError};
 pub use convoy::promises;
 pub use credential::{HostActionSelector, HostImageAction};
 pub use fleet_designation::ImageCacheBinding;

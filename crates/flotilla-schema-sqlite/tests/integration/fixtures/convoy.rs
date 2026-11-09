@@ -6,10 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_schema::{Edge, Frozen, Records, State, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        Abandon, AbandonCause, AddSeat, Authority, Convoy, ConvoySpec, ConvoyState, ConvoyWorld, Declare, Deliver, Duty, DutyId, DutyScope,
-        FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress, Promise, PromiseId, PromiseKind, PromiseKinds,
-        PromiseSource, Readmit, Reassign, Reject, ReplaceSeat, Resupervise, RetireDuty, RetireSeat, Retract, Seat, SeatName, SubjectLink,
-        Submission, Submit, Terms, Unlink, VesselClass,
+        Abandon, AbandonCause, AddSeat, AdmissionBytes, Authority, Convoy, ConvoySpec, ConvoyState, ConvoyWorld, Declare, Deliver, Duty,
+        DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress, Promise, PromiseId, PromiseKind,
+        PromiseKinds, PromiseSource, Readmit, Reassign, Reject, ReplaceSeat, Resupervise, RetireDuty, RetireSeat, Retract, Seat, SeatName,
+        SubjectLink, Submission, Submit, Terms, Unlink, VesselClass,
     },
     Ref, Resource,
 };
@@ -104,6 +104,8 @@ pub fn spec(tc: &TestCase, pick: Pick) -> ConvoySpec {
         }
     }
     ConvoySpec {
+        workflow_ref: name(tc),
+        admission: Frozen::new(AdmissionBytes::new(name(tc).into_bytes())).expect("freeze"),
         project: address(tc),
         priority: Priority(tc.draw(gs::integers::<u32>())),
         kinds: Frozen::new(kinds).expect("freeze"),
@@ -173,6 +175,8 @@ pub fn sample() -> Resource<Convoy> {
     };
     promises.append(0, promise).expect("room");
     let spec = ConvoySpec {
+        workflow_ref: "w".into(),
+        admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: "project:p".parse().expect("address"),
         priority: Priority(1),
         kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),

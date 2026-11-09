@@ -35,6 +35,8 @@ fn retired_seats_keep_their_names_and_replicas_follow_seat_edges() {
     home.create(
         name,
         ConvoyRequest {
+            workflow_ref: "w".into(),
+            admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
             project,
             priority: Priority(0),
             kinds: Frozen::new(PromiseKinds::default()).unwrap(),

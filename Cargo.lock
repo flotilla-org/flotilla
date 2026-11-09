@@ -3630,6 +3630,7 @@ dependencies = [
  "flotilla-build-features-os",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-cbor",
  "flotilla-protocol",
  "flotilla-schema",
  "futures",

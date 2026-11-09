@@ -5,7 +5,7 @@ use flotilla_schema::{Address, Edge, Frozen, State, Timestamp};
 use flotilla_state_machines::{
     machines::{
         consumer::ConsumerKind,
-        convoy::{AdmittedPromise, ConvoyRequest, Priority, PromiseId, PromiseKinds, PromiseSource, SeatName, VesselClass},
+        convoy::{AdmissionBytes, AdmittedPromise, ConvoyRequest, Priority, PromiseId, PromiseKinds, PromiseSource, SeatName, VesselClass},
         message::{
             Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageBody, MessageReference, MessageSpec,
             MessageState, MessageWorld, Receiver, Relation, RequestBody, Settle, Settlement, Supersedes,
@@ -41,6 +41,8 @@ pub fn body(tc: &TestCase, pick: Pick) -> Frozen<MessageBody> {
     let body = match pick.variant(tc, 2, |index| index) {
         0 => MessageBody::Text(text(tc)),
         _ => MessageBody::Request(RequestBody::Convoy(Box::new(ConvoyRequest {
+            workflow_ref: name(tc),
+            admission: Frozen::new(AdmissionBytes::new(name(tc).into_bytes())).expect("freeze"),
             project: address(tc),
             promises: [(
                 PromiseId(0),

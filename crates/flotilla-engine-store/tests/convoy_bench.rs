@@ -41,8 +41,8 @@ use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
     kinds::{stock, Catalog, KindDefinition, Observation, Observations, Rule, Template},
     machines::convoy::{
-        AdmittedPromise, Convoy, ConvoyRequest, ConvoySpec, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, PromiseId,
-        PromiseKinds, PromiseSource, Seat, SeatName, Submit, Terms, VesselClass,
+        AdmissionBytes, AdmittedPromise, Convoy, ConvoyRequest, ConvoySpec, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority,
+        PromiseId, PromiseKinds, PromiseSource, Seat, SeatName, Submit, Terms, VesselClass,
     },
     Home, Ref,
 };
@@ -130,6 +130,8 @@ fn request(n: usize) -> ConvoyRequest {
         owner: seat("coder"),
     };
     ConvoyRequest {
+        workflow_ref: "w".into(),
+        admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project(n),
         promises: [(PromiseId(0), promise("template/pr")), (PromiseId(1), promise("l2-quint"))].into(),
         duties: [(DutyId(0), Duty { owner: seat("lead"), scope: DutyScope::Lifetime, terms: Terms::default() })].into(),

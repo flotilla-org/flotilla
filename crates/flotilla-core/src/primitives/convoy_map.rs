@@ -33,14 +33,14 @@ use flotilla_resources::{
     address::{artifact_address, record_name, submission_subject_text},
     convoy::reconcile::is_ensured,
     promises::{self as old, PromiseKind as OldKind, PromiseSource as OldSource, PromiseState as OldState},
-    Convoy as OldConvoy, ConvoyStatus, ForgeSpec, ResourceObject, SupervisionTarget,
+    AdmissionDocument, Convoy as OldConvoy, ConvoyStatus, ForgeSpec, ResourceObject, SupervisionTarget,
 };
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Frozen, Timestamp};
 use flotilla_state_machines::{
     kinds::{stock, Catalog},
     machines::convoy::{
-        AdmittedPromise, Convoy, ConvoyRequest, Duty, DutyId, DutyScope, Priority, Progress, Promise, PromiseId, PromiseSource, Seat,
-        SeatName, Terms,
+        AdmissionBytes, AdmittedPromise, Convoy, ConvoyRequest, Duty, DutyId, DutyScope, Priority, Progress, Promise, PromiseId,
+        PromiseSource, Seat, SeatName, Terms,
     },
     Resource,
 };
@@ -356,7 +356,10 @@ pub fn request(convoy: &ResourceObject<OldConvoy>) -> Result<ConvoyRequest, Stri
         .collect();
     let used: BTreeSet<&str> = promises.values().map(|promise: &AdmittedPromise| promise.kind.as_str()).collect();
     let kinds = Catalog::resolve(&stock(), &[]).and_then(|catalog| catalog.freeze(used)).map_err(|error| error.to_string())?;
+    let (workflow_ref, admission) = admission(convoy)?;
     Ok(ConvoyRequest {
+        workflow_ref,
+        admission,
         project: project(convoy)?,
         promises,
         duties: standing_duties(convoy, &crews)?,
@@ -365,6 +368,35 @@ pub fn request(convoy: &ResourceObject<OldConvoy>) -> Result<ConvoyRequest, Stri
         priority: Priority(0),
         kinds,
     })
+}
+
+/// The workflow an old convoy was admitted with, and its admission document:
+/// what its spec and its bootstrapped status froze that no engine column or
+/// record holds. Refused for a convoy not yet bootstrapped, which has no
+/// workflow snapshot.
+pub fn admission(convoy: &ResourceObject<OldConvoy>) -> Result<(String, Frozen<AdmissionBytes>), String> {
+    let name = &convoy.metadata.name;
+    let status = convoy.status.as_ref().ok_or_else(|| format!("convoy {name} has no status"))?;
+    let workflow_snapshot = status.workflow_snapshot.clone().ok_or_else(|| format!("convoy {name} has no workflow snapshot"))?;
+    let spec = &convoy.spec;
+    let document = AdmissionDocument {
+        workflow_snapshot,
+        placement_decision: status.placement_decision.clone(),
+        placement_policy: spec.placement_policy.clone(),
+        ensure_admission: status.ensure_admission.clone(),
+        naming: status.naming.clone(),
+        dispatching_principal_ref: spec.dispatching_principal_ref.clone(),
+        continuation: spec.continuation.clone(),
+        inputs: spec.inputs.clone(),
+        repositories: spec.repositories.clone(),
+        r#ref: spec.r#ref.clone(),
+        adopted_checkout_refs: spec.adopted_checkout_refs.clone(),
+        subjects: spec.declared_subjects()?,
+        instruction: spec.instruction.clone(),
+    };
+    let bytes = document.encode().map_err(|error| format!("convoy {name}: {error}"))?;
+    let admission = Frozen::new(AdmissionBytes::new(bytes)).map_err(|error| format!("convoy {name}: admission document: {error}"))?;
+    Ok((spec.workflow_ref.clone(), admission))
 }
 
 /// A submission's address and revision, from an old submission of `kind`

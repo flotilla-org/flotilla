@@ -10,8 +10,8 @@ use flotilla_core::primitives::convoy_import::{
 };
 use flotilla_resources::{
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict},
-    Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, LeafMaker, ObjectMeta,
-    ResourceObject, Selector, StallEvidenceSource, StallRung, StalledCondition, VesselRequirement, WorkflowSnapshot,
+    AdmissionDocument, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, LeafMaker,
+    ObjectMeta, ResourceObject, Selector, StallEvidenceSource, StallRung, StalledCondition, VesselRequirement, WorkflowSnapshot,
     ENSURED_FROM_ANNOTATION,
 };
 use flotilla_schema::Address;
@@ -177,6 +177,12 @@ fn a_convoy_with_history_imports_one_to_one() {
     assert!(coder_claim.claim.contains("\"merged\""), "{coder_claim:?}");
     check(&convoy.resource).expect("the machine reaches it");
     assert_eq!(rehearse(std::slice::from_ref(&convoy)), Vec::new());
+    // What the spec and the bootstrapped status froze rides in the admission document.
+    let spec = convoy.resource.spec();
+    assert_eq!(spec.workflow_ref, old.spec.workflow_ref);
+    let document = AdmissionDocument::decode("c", spec.admission.value().bytes()).expect("admission document");
+    assert_eq!(Some(&document.workflow_snapshot), old.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()));
+    assert_eq!(document.dispatching_principal_ref, old.spec.dispatching_principal_ref);
 }
 
 // Behaviour: a finite, unfinished convoy with no promise is the named refusal NoObligations; an ended

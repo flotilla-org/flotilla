@@ -81,6 +81,8 @@ fn promise() -> AdmittedPromise {
 /// A convoy whose seat `coder` owns promise 0 and a lifetime duty.
 fn convoy_request() -> ConvoyRequest {
     ConvoyRequest {
+        workflow_ref: "w".into(),
+        admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project(),
         promises: [(PromiseId(0), promise())].into(),
         duties: [(DutyId(0), Duty { owner: SeatName::new("coder", ""), scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
@@ -437,6 +439,8 @@ fn convoy_and_awaiting_reply_round_trip() {
     subjects.append(1, SubjectLink { subject: project(), source: LinkSource::Claim, unlinked: true }).expect("room");
     subjects.append(2, SubjectLink { subject: project(), source: LinkSource::Relay, unlinked: false }).expect("room");
     let spec = ConvoySpec {
+        workflow_ref: "w".into(),
+        admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project(),
         priority: Priority(3),
         kinds: Frozen::new(kinds).expect("frozen"),

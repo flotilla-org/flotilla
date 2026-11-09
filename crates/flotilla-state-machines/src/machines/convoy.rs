@@ -16,8 +16,10 @@
 //! [`ConvoyWrite`]s, which the home applies once the log takes the edge and a
 //! store log writes as the edge's rows. Promise ids and seat names stay
 //! reserved for the convoy's life. Nothing rolls over: each generation of a
-//! standing role is its own convoy. The project, priority and frozen promise
-//! kinds never change after admission.
+//! standing role is its own convoy. The workflow, project, priority, frozen
+//! promise kinds and admission document never change after admission. The
+//! admission document is opaque here ([`AdmissionBytes`]): the machine never
+//! reads it.
 //!
 //! Subjects linked after admission (a change request a crew claims, one an
 //! operator links, one a relay links) are records: an unlink marks its row
@@ -289,6 +291,56 @@ pub enum AbandonCause {
     Operator,
 }
 
+/// A convoy's admission document as canonical CBOR (#3108). The machine
+/// stores it and never reads it: `flotilla_resources::AdmissionDocument` owns
+/// the one encoding, and every writer and reader goes through it. Serde sees
+/// a byte string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionBytes(Vec<u8>);
+
+impl AdmissionBytes {
+    pub fn new(bytes: Vec<u8>) -> AdmissionBytes {
+        AdmissionBytes(bytes)
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Serialize for AdmissionBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AdmissionBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<AdmissionBytes, D::Error> {
+        struct Bytes;
+        impl<'de> serde::de::Visitor<'de> for Bytes {
+            type Value = AdmissionBytes;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("admission document bytes")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<AdmissionBytes, E> {
+                Ok(AdmissionBytes(bytes.to_vec()))
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<AdmissionBytes, E> {
+                Ok(AdmissionBytes(bytes))
+            }
+            // A text format such as JSON writes bytes as a list of numbers.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<AdmissionBytes, A::Error> {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(byte) = seq.next_element()? {
+                    bytes.push(byte);
+                }
+                Ok(AdmissionBytes(bytes))
+            }
+        }
+        deserializer.deserialize_bytes(Bytes)
+    }
+}
+
 /// What admission fixes, and the records edges change. It declares the
 /// stored Convoy (kind code `cv`), indexed for a project's open convoys.
 /// Subjects, seats and promises are records in the order they arrived, so a
@@ -296,6 +348,12 @@ pub enum AbandonCause {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[store(kind = "Convoy", code = "cv", state = ConvoyState, index(name = "open_by_project", eq(project), when(state in [Open])))]
 pub struct ConvoySpec {
+    /// The workflow template admission resolved.
+    #[store(intern = "wf")]
+    pub workflow_ref: String,
+    /// What else admission froze, opaque here: the machine stores it and never reads it.
+    #[store(frozen)]
+    pub admission: Frozen<AdmissionBytes>,
     pub project: Address,
     pub priority: Priority,
     #[store(frozen)]
@@ -422,6 +480,10 @@ pub struct AdmittedPromise {
 /// as lists of pairs, since a frozen document's map keys are text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyRequest {
+    /// The workflow template the caller resolved.
+    pub workflow_ref: String,
+    /// The caller's admission document, stored as given.
+    pub admission: Frozen<AdmissionBytes>,
     /// The project's address; admission refuses one that does not exist.
     pub project: Address,
     #[serde(with = "pairs")]
@@ -1123,6 +1185,8 @@ impl Machine for Convoy {
         }
         let now = admission.now();
         let mut spec = ConvoySpec {
+            workflow_ref: request.workflow_ref,
+            admission: request.admission,
             project: request.project,
             priority: request.priority,
             kinds: request.kinds,

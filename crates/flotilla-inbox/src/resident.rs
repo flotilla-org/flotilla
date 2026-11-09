@@ -101,7 +101,8 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Rec
             MessageBody::Request(RequestBody::CheckoutInspection { remote: _ }) => 0,
             MessageBody::Request(RequestBody::ChangeRequestBranch { branch }) => branch.capacity(),
             MessageBody::Request(RequestBody::Convoy(request)) => {
-                let ConvoyRequest { project, promises, duties, seats, quota, priority: _, kinds } = request.as_ref();
+                let ConvoyRequest { workflow_ref, admission, project, promises, duties, seats, quota, priority: _, kinds } =
+                    request.as_ref();
                 let nodes = |len: usize, slot: usize| if len == 0 { 0 } else { len.saturating_mul(2).max(11) * slot + (len / 5 + 1) * 96 };
                 let seat = |seat: &SeatName| seat.role.capacity() + seat.seat.capacity();
                 let scope = |duty: &Duty| match &duty.scope {
@@ -109,6 +110,7 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Rec
                     DutyScope::WhileOpen { promises } => nodes(promises.len(), size_of::<PromiseId>()),
                 };
                 size_of::<ConvoyRequest>()
+                    + workflow_ref.capacity()
                     + heap_address(project)
                     + nodes(quota.len(), size_of::<(VesselClass, u32)>())
                     + quota.keys().map(|class| class.0.capacity()).sum::<usize>()
@@ -119,11 +121,21 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Rec
                     + seats.capacity() * size_of::<Seat>()
                     + seats
                         .iter()
-                        .map(|s| s.role.capacity() + s.seat.capacity() + s.parent.as_ref().map_or(0, seat) + heap_address(&s.supervised_by))
+                        .map(|s| {
+                            s.role.capacity()
+                                + s.seat.capacity()
+                                + s.parent.as_ref().map_or(0, seat)
+                                + heap_address(&s.supervised_by)
+                                + s.failed.as_ref().map_or(0, String::capacity)
+                        })
                         .sum::<usize>()
                     // The frozen kinds keep their bytes and their value; a decoded
                     // document's heap is bounded by eight times its CBOR.
                     + kinds.bytes().len() * 9
+                    + 64
+                    // The frozen admission document keeps its CBOR and the opaque bytes inside it.
+                    + admission.bytes().len()
+                    + admission.value().bytes().len()
                     + 64
             }
         };
