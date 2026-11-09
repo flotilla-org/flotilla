@@ -8,7 +8,7 @@ use crate::{
     lifecycle_reads::{LifecycleReads, ProvisioningKind},
     resource::define_resource,
     status_patch::StatusPatch,
-    ControllerRetry, LandingCredentialScope, ReplicationClass, RepositoryKey, ResourceObject, Stance,
+    ReplicationClass, RepositoryKey, ResourceObject, Stance,
 };
 
 define_resource!(
@@ -99,14 +99,9 @@ pub struct VesselStatus {
     pub requested_stance: Option<Stance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_stance: Option<Stance>,
-    /// Landing material actually staged in this vessel. This is deliberately
-    /// status, not desired spec: absence is the pre-approval invariant.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub held_credentials: BTreeMap<String, LandingCredentialScope>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential_delivery_retry: Option<ControllerRetry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential_refresh_retry: Option<ControllerRetry>,
+    // Retired with credential delivery's controller (#3108): `held_credentials`,
+    // `credential_delivery_retry` and `credential_refresh_retry`. Earlier records
+    // carrying them still decode, as the struct accepts and drops unknown fields.
 }
 
 /// A vessel's frozen image: the composed identity, then the built digest once
@@ -135,12 +130,6 @@ pub enum VesselStatusPatch {
     },
     ObserveRuntime {
         observation: flotilla_protocol::EnvironmentRuntimeObservation,
-    },
-    CredentialDelivery {
-        retry: Option<ControllerRetry>,
-    },
-    CredentialRefresh {
-        retry: Option<ControllerRetry>,
     },
     /// Report immutable mount drift without changing the phase of running crews.
     RequireEnvironmentRecreation {
@@ -174,9 +163,6 @@ pub enum VesselStatusPatch {
     MarkInterrupted {
         roles: BTreeSet<String>,
         message: String,
-    },
-    StageLandingCredentials {
-        credentials: BTreeMap<String, LandingCredentialScope>,
     },
     MarkLost {
         message: String,
@@ -231,8 +217,6 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
             Self::RecordImage { image } => record_image(status, image),
             Self::ReplaceImage { image } => status.image = Some(image.clone()),
             Self::ObserveRuntime { observation } => status.runtime_observation.get_or_insert_with(Default::default).merge(observation),
-            Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
-            Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
             Self::RequireEnvironmentRecreation { message } => status.message = Some(message.clone()),
             Self::MarkProvisioning { observed_kind_ref, observed_kind_version, placement_decision, started_at, message, image } => {
                 if let Some(image) = image {
@@ -286,9 +270,6 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 status.phase = VesselPhase::Interrupted;
                 status.interrupted_roles = roles.clone();
                 status.message = Some(message.clone());
-            }
-            Self::StageLandingCredentials { credentials } => {
-                status.held_credentials.extend(credentials.clone());
             }
             Self::MarkLost { message } => {
                 status.phase = VesselPhase::Lost;

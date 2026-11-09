@@ -69,9 +69,6 @@ async fn vessel_metadata_and_status_roundtrip() {
                 ready_at: Some(Utc::now()),
                 requested_stance: Some(flotilla_resources::Stance::WorkspaceWrite),
                 effective_stance: Some(flotilla_resources::Stance::Contained),
-                held_credentials: Default::default(),
-                credential_delivery_retry: None,
-                credential_refresh_retry: None,
             },
         )
         .await

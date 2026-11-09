@@ -31,7 +31,6 @@ use flotilla_vcs::vcs::CheckoutRegistration;
 use flotilla_vcs::vcs::WorktreeMetadata;
 use tracing::{info, warn};
 
-use super::credentials::{reconcile_work_credentials_for_environment, record_credential_delivery_retry};
 use super::state::ControllerRuntimeState;
 use crate::resource_manifest::ResourceManifestReconciler;
 
@@ -108,8 +107,7 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                 })
             }
             "credentialdelivery" | "workcredential" | "workcredentials" => {
-                record_credential_delivery_retry(&self.state.daemon.resource_backend(), namespace, name, None, false).await?;
-                reconcile_work_credentials_for_environment(&self.state, namespace, name).await?;
+                self.state.credential_events.deliver(name).await?;
                 Ok(format!("CredentialDelivery/{name} reconciled"))
             }
             "convoy" | "convoys" => wake_controller_resource::<Convoy>(&self.state.daemon.resource_backend(), namespace, name).await,

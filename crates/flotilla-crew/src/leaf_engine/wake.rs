@@ -633,39 +633,6 @@ impl ReconcilerWake {
             }
             let convoy_vessels = select_convoy_children(convoy, &vessel_sources);
             inputs.extend(convoy_vessels.keys().cloned());
-            for vessel in convoy_vessels.values() {
-                let Some(vessel_status) = vessel.status.as_ref() else { continue };
-                let Some(environment_ref) = vessel_status.environment_ref.as_ref() else { continue };
-                for (kind, retry) in [
-                    ("CredentialDelivery", vessel_status.credential_delivery_retry.as_ref()),
-                    ("CredentialRefresh", vessel_status.credential_refresh_retry.as_ref()),
-                ] {
-                    let Some(retry) = retry else { continue };
-                    if !controller_rows.insert((kind.into(), environment_ref.clone())) {
-                        continue;
-                    }
-                    desired.push(LeafSubscriptionRow {
-                        id: uuid::Uuid::nil(),
-                        namespace: namespace.to_string(),
-                        leaves: vec![Leaf {
-                            address: LeafAddress::Convoy { name: convoy.metadata.name.clone() },
-                            field_path: ".status.phase".into(),
-                            operator: LeafOperator::Equal,
-                            literal: "Landed".into(),
-                        }],
-                        watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
-                        maker: LeafMaker::Controller {
-                            resource_kind: kind.into(),
-                            name: Some(environment_ref.clone()),
-                            retry: retry.clone(),
-                            ceiling: RetryCeiling::default(),
-                        },
-                        freshness_demand: None,
-                        created_at: Utc::now(),
-                        episode_key: EpisodeKeyFields::default(),
-                    });
-                }
-            }
             if status.phase == ConvoyPhase::Active {
                 if let Some(stalled) = status.stalled.as_ref().filter(|stalled| stalled.supervisor.is_some()) {
                     if let Some(maker @ LeafMaker::Supervisor { .. }) = &stalled.maker {

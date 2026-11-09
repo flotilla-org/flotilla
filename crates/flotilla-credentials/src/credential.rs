@@ -332,15 +332,23 @@ struct GithubAppDelivery {
     expires_at: DateTime<Utc>,
     refresh_failures: usize,
     next_refresh_attempt_at: Option<DateTime<Utc>>,
+    /// When the current run of failed refreshes began, and the latest one's error.
+    first_refresh_failure_at: Option<DateTime<Utc>>,
+    last_refresh_error: Option<String>,
     installation_repository: Option<String>,
     scope: Option<GithubAppScope>,
+    /// The scope was set to something other than the one last minted for: resolve it again.
+    scope_dirty: bool,
 }
 
 impl GithubAppDelivery {
-    fn record_refresh_failure(&mut self, now: DateTime<Utc>) -> bool {
+    /// Backs off the next attempt, never past expiry. Once the token has expired a failure
+    /// schedules nothing: only an event (a definition change, a crew resume, a person) retries it.
+    fn record_refresh_failure(&mut self, now: DateTime<Utc>, error: String) -> bool {
         self.refresh_failures += 1;
-        let inside_margin = now + GITHUB_APP_REFRESH_MARGIN >= self.expires_at;
-        if inside_margin {
+        self.first_refresh_failure_at.get_or_insert(now);
+        self.last_refresh_error = Some(error);
+        if now >= self.expires_at {
             self.next_refresh_attempt_at = None;
         } else {
             let mut delay = GITHUB_APP_INITIAL_REFRESH_BACKOFF.min(GITHUB_APP_MAX_REFRESH_BACKOFF);
@@ -350,10 +358,38 @@ impl GithubAppDelivery {
                 }
                 delay = (delay * 2).min(GITHUB_APP_MAX_REFRESH_BACKOFF);
             }
-            self.next_refresh_attempt_at = Some(now + delay);
+            self.next_refresh_attempt_at = Some((now + delay).min(self.expires_at));
         }
-        self.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || inside_margin
+        self.should_surface(now)
     }
+
+    fn should_surface(&self, now: DateTime<Utc>) -> bool {
+        self.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || now + GITHUB_APP_REFRESH_MARGIN >= self.expires_at
+    }
+
+    /// Failed, and expired with it: no attempt is scheduled until an event.
+    fn gave_up(&self) -> bool {
+        self.refresh_failures > 0 && self.next_refresh_attempt_at.is_none()
+    }
+
+    /// When the next timed attempt falls due: the backoff after a failure, otherwise the
+    /// refresh point. None once it gave up.
+    fn due_at(&self) -> Option<DateTime<Utc>> {
+        if self.refresh_failures > 0 {
+            self.next_refresh_attempt_at
+        } else {
+            Some(github_app_refresh_at(self.issued_at, self.expires_at))
+        }
+    }
+}
+
+/// What wakes a GitHub App refresh pass besides due times.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GithubAppRefreshWake {
+    /// Projects whose membership may have changed: deliveries scoped by them are resolved again.
+    pub projects: BTreeSet<String>,
+    /// A definition changed or a person asked: deliveries that gave up are tried again.
+    pub retry_given_up: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -369,6 +405,8 @@ pub struct CredentialRefreshError {
     pub credential_name: Option<String>,
     pub message: String,
     pub should_surface: bool,
+    /// When this run of failures began, where the store knows it.
+    pub first_failure_at: Option<DateTime<Utc>>,
 }
 
 const GITHUB_APP_REFRESH_FAILURE_THRESHOLD: usize = 3;
@@ -920,11 +958,14 @@ impl CredentialStore {
                         expires_at,
                         refresh_failures: 0,
                         next_refresh_attempt_at: None,
+                        first_refresh_failure_at: None,
+                        last_refresh_error: None,
                         installation_repository: match &spec.consumer {
                             CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
                             _ => None,
                         },
                         scope: None,
+                        scope_dirty: false,
                     },
                 ));
             }
@@ -1104,6 +1145,7 @@ impl CredentialStore {
             credential_name: None,
             message,
             should_surface: *failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD,
+            first_failure_at: None,
         }
     }
 
@@ -1443,69 +1485,55 @@ impl CredentialStore {
         })
     }
 
-    /// Re-mint and atomically replace GitHub App files that are approaching
-    /// expiry. The daemon calls this from its host-side periodic loop; vessels
-    /// receive only the resulting file and never the App signing material.
+    /// Re-mints and atomically replaces the GitHub App files whose refresh is due; vessels receive
+    /// only the resulting file and never the App signing material.
     pub fn refresh_due_github_app_tokens(&self) -> BoxFuture<'_, Vec<CredentialRefreshError>> {
+        Box::pin(async move { self.refresh_github_app_tokens(&GithubAppRefreshWake::default()).await })
+    }
+
+    /// One refresh pass: the deliveries whose refresh or retry is due, those whose scope `wake`
+    /// names or that were given a new scope, and, when `wake` says so, those that gave up. The
+    /// errors are this pass's failures, and late refreshes that succeeded.
+    pub fn refresh_github_app_tokens<'a>(&'a self, wake: &'a GithubAppRefreshWake) -> BoxFuture<'a, Vec<CredentialRefreshError>> {
         Box::pin(async move {
             let now = self.clock.now();
             let deliveries =
                 self.github_app_deliveries.lock().await.iter().map(|(key, delivery)| (key.clone(), delivery.clone())).collect::<Vec<_>>();
             let mut errors = Vec::new();
             for (key, delivery) in deliveries {
+                let touched = delivery.scope_dirty
+                    || delivery.scope.as_ref().is_some_and(|scope| scope.projects.iter().any(|project| wake.projects.contains(project)));
+                let waiting = if delivery.gave_up() { !wake.retry_given_up } else { delivery.due_at().is_some_and(|due| now < due) };
+                if waiting && !touched {
+                    continue;
+                }
                 let mut request = delivery.request.clone();
                 if let Some(scope) = &delivery.scope {
                     let repositories = match self.resolve_github_app_scope(scope).await {
                         Ok(repositories) => repositories,
                         Err(error) => {
-                            let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
-                            errors.push(CredentialRefreshError {
-                                environment_ref: key.0.clone(),
-                                credential_name: Some(key.1.clone()),
-                                message: self.refresh_failure_message(&key.1, delivery.expires_at, &error),
-                                should_surface,
-                            });
+                            errors.extend(self.record_refresh_failure(&key, &delivery, &error).await);
                             continue;
                         }
                     };
                     request.repositories = repositories;
                     request.permissions = scope.permissions.clone().or_else(|| delivery.request.permissions.clone());
                 }
-                let refresh_at = github_app_refresh_at(delivery.issued_at, delivery.expires_at);
-                if now < refresh_at
-                    && request.repositories == delivery.request.repositories
-                    && request.permissions == delivery.request.permissions
-                {
-                    continue;
-                }
-                if request.repositories == delivery.request.repositories
-                    && request.permissions == delivery.request.permissions
-                    && now + GITHUB_APP_REFRESH_MARGIN < delivery.expires_at
-                    && delivery.next_refresh_attempt_at.is_some_and(|next| now < next)
-                {
+                let unchanged =
+                    request.repositories == delivery.request.repositories && request.permissions == delivery.request.permissions;
+                if waiting && unchanged {
+                    self.settle_scope(&key, delivery.generation).await;
                     continue;
                 }
                 let token = match self.mint_github_app(&mut request, delivery.installation_repository.as_deref()).await {
                     Ok(token) => token,
                     Err(error) => {
-                        let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
-                        errors.push(CredentialRefreshError {
-                            environment_ref: key.0.clone(),
-                            credential_name: Some(key.1.clone()),
-                            message: self.refresh_failure_message(&key.1, delivery.expires_at, &error),
-                            should_surface,
-                        });
+                        errors.extend(self.record_refresh_failure(&key, &delivery, &error).await);
                         continue;
                     }
                 };
                 if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
-                    let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
-                    errors.push(CredentialRefreshError {
-                        environment_ref: key.0.clone(),
-                        credential_name: Some(key.1.clone()),
-                        message: self.refresh_failure_message(&key.1, delivery.expires_at, &error),
-                        should_surface,
-                    });
+                    errors.extend(self.record_refresh_failure(&key, &delivery, &error).await);
                     continue;
                 }
                 let _delivery_guard = self.github_app_delivery_lock(&key).await.lock_owned().await;
@@ -1516,13 +1544,7 @@ impl CredentialStore {
                     continue;
                 };
                 if let Err(error) = replace_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
-                    let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
-                    errors.push(CredentialRefreshError {
-                        environment_ref: key.0.clone(),
-                        credential_name: Some(key.1.clone()),
-                        message: self.refresh_failure_message(&key.1, current.expires_at, &error),
-                        should_surface,
-                    });
+                    errors.extend(self.record_refresh_failure(&key, &current, &error).await);
                     continue;
                 }
                 if self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at {
@@ -1531,6 +1553,7 @@ impl CredentialStore {
                         credential_name: Some(key.1.clone()),
                         message: self.refresh_failure_message(&key.1, current.expires_at, "refresh started inside the expiry margin"),
                         should_surface: true,
+                        first_failure_at: current.first_refresh_failure_at,
                     });
                 }
                 let mut deliveries = self.github_app_deliveries.lock().await;
@@ -1539,6 +1562,9 @@ impl CredentialStore {
                     current.issued_at = self.clock.now();
                     current.refresh_failures = 0;
                     current.next_refresh_attempt_at = None;
+                    current.first_refresh_failure_at = None;
+                    current.last_refresh_error = None;
+                    current.scope_dirty = false;
                     // Successful remints accept the explicit request when the response omits it;
                     // no request and no response still means unknown.
                     current.effective_permissions = token.permissions.or_else(|| request.permissions.clone());
@@ -1548,6 +1574,44 @@ impl CredentialStore {
                 self.record_delivered_capabilities(std::slice::from_ref(&key)).await;
             }
             errors
+        })
+    }
+
+    /// When the next GitHub App refresh or retry falls due, if any delivery has one scheduled.
+    pub fn next_github_app_refresh_at(&self) -> BoxFuture<'_, Option<DateTime<Utc>>> {
+        Box::pin(async move {
+            let now = self.clock.now();
+            self.github_app_deliveries
+                .lock()
+                .await
+                .values()
+                .filter_map(|delivery| if delivery.scope_dirty { Some(now) } else { delivery.due_at() })
+                .min()
+        })
+    }
+
+    /// Every GitHub App delivery whose refreshes are failing now, with the latest error and when
+    /// its run of failures began.
+    pub fn github_app_refresh_failures(&self) -> BoxFuture<'_, Vec<CredentialRefreshError>> {
+        Box::pin(async move {
+            let now = self.clock.now();
+            self.github_app_deliveries
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, delivery)| delivery.refresh_failures > 0)
+                .map(|((environment_ref, name), delivery)| CredentialRefreshError {
+                    environment_ref: environment_ref.clone(),
+                    credential_name: Some(name.clone()),
+                    message: self.refresh_failure_message(
+                        name,
+                        delivery.expires_at,
+                        delivery.last_refresh_error.as_deref().unwrap_or_default(),
+                    ),
+                    should_surface: delivery.should_surface(now),
+                    first_failure_at: delivery.first_refresh_failure_at,
+                })
+                .collect()
         })
     }
 
@@ -1572,7 +1636,10 @@ impl CredentialStore {
             let mut deliveries = self.github_app_deliveries.lock().await;
             for (name, scope) in scopes {
                 if let Some(delivery) = deliveries.get_mut(&(environment_ref.to_string(), name.clone())) {
-                    delivery.scope = Some(scope.clone());
+                    if delivery.scope.as_ref() != Some(scope) {
+                        delivery.scope = Some(scope.clone());
+                        delivery.scope_dirty = true;
+                    }
                 }
             }
         })
@@ -1591,12 +1658,32 @@ impl CredentialStore {
         self.github_repository_names(&repositories).await
     }
 
-    async fn record_refresh_failure(&self, key: &(String, String), generation: uuid::Uuid) -> bool {
+    /// Records a failed refresh of `delivery`, unless it was replaced meanwhile: the error to
+    /// report, if it still stands.
+    async fn record_refresh_failure(
+        &self,
+        key: &(String, String),
+        delivery: &GithubAppDelivery,
+        error: &str,
+    ) -> Option<CredentialRefreshError> {
         let mut deliveries = self.github_app_deliveries.lock().await;
-        let Some(current) = deliveries.get_mut(key).filter(|current| current.generation == generation) else {
-            return false;
-        };
-        current.record_refresh_failure(self.clock.now())
+        let current = deliveries.get_mut(key).filter(|current| current.generation == delivery.generation)?;
+        let message = self.refresh_failure_message(&key.1, current.expires_at, error);
+        let should_surface = current.record_refresh_failure(self.clock.now(), error.to_owned());
+        Some(CredentialRefreshError {
+            environment_ref: key.0.clone(),
+            credential_name: Some(key.1.clone()),
+            message,
+            should_surface,
+            first_failure_at: current.first_refresh_failure_at,
+        })
+    }
+
+    /// The scope `delivery` was given resolves to what it already holds.
+    async fn settle_scope(&self, key: &(String, String), generation: uuid::Uuid) {
+        if let Some(current) = self.github_app_deliveries.lock().await.get_mut(key).filter(|current| current.generation == generation) {
+            current.scope_dirty = false;
+        }
     }
 
     /// A bound credential's current declaration and material, for its account binding's delivery
@@ -2964,8 +3051,11 @@ mod tests {
                 expires_at: now + Duration::hours(1),
                 refresh_failures: 0,
                 next_refresh_attempt_at: None,
+                first_refresh_failure_at: None,
+                last_refresh_error: None,
                 installation_repository: None,
                 scope: None,
+                scope_dirty: false,
             },
         );
         clock.advance(Duration::minutes(29));
@@ -3033,8 +3123,11 @@ mod tests {
                 expires_at: now + Duration::hours(1),
                 refresh_failures: 0,
                 next_refresh_attempt_at: None,
+                first_refresh_failure_at: None,
+                last_refresh_error: None,
                 installation_repository: None,
                 scope: None,
+                scope_dirty: false,
             },
         );
 
@@ -3059,13 +3152,17 @@ mod tests {
         clock.advance(Duration::minutes(8) + Duration::seconds(20));
         assert_eq!(store.refresh_due_github_app_tokens().await.len(), 1);
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 7);
+        // Inside the expiry margin the backoff holds, clamped to expiry, rather than retrying at every pass.
         clock.advance(Duration::seconds(10));
+        assert!(store.refresh_due_github_app_tokens().await.is_empty(), "the margin does not cut the backoff short");
+        assert_eq!(store.next_github_app_refresh_at().await, Some(now + Duration::minutes(59) + Duration::seconds(50)));
+        clock.advance(Duration::minutes(4) + Duration::seconds(50));
         let errors = store.refresh_due_github_app_tokens().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].should_surface, "entry into expiry margin needs immediate attention");
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 8);
 
-        clock.advance(Duration::minutes(33));
+        clock.advance(Duration::minutes(30) + Duration::seconds(10));
         let errors = store.refresh_due_github_app_tokens().await;
         assert_eq!(errors.len(), 1);
         assert!(!errors[0].should_surface, "a new token starts a new failure sequence");
@@ -3074,6 +3171,76 @@ mod tests {
         clock.advance(Duration::seconds(1));
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 10, "backoff resets after a successful mint");
+    }
+
+    #[tokio::test]
+    async fn an_expired_github_app_delivery_is_retried_only_by_an_event() {
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let clock = Arc::new(VirtualClock::new(now));
+        let minter = Arc::new(FakeGithubAppTokenMinter {
+            tokens: StdMutex::new(VecDeque::from([
+                Err("outage 1".to_string()),
+                Err("outage 2".to_string()),
+                Ok(GithubAppToken { permissions: None, value: "recovered".to_string(), expires_at: now + Duration::hours(6) }),
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_github_app_minter(
+            ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
+            PathBuf::from("/state"),
+        );
+        store.github_app_deliveries.lock().await.insert(
+            ("vessel".to_string(), "github-app".to_string()),
+            GithubAppDelivery {
+                effective_permissions: None,
+                generation: uuid::Uuid::new_v4(),
+                request: GithubAppMintRequest {
+                    installation_id: 1,
+                    app_id_path: "app-id".to_string(),
+                    private_key_path: "key".to_string(),
+                    repositories: vec!["flotilla".to_string()],
+                    permissions: None,
+                },
+                runner,
+                token_file: PathBuf::from("/state/credentials/github-app/token"),
+                issued_at: now,
+                expires_at: now + Duration::hours(1),
+                refresh_failures: 0,
+                next_refresh_attempt_at: None,
+                first_refresh_failure_at: None,
+                last_refresh_error: None,
+                installation_repository: None,
+                scope: None,
+                scope_dirty: false,
+            },
+        );
+        // A failure just before expiry backs off no further than expiry; the one at expiry gives up.
+        clock.advance(Duration::minutes(59) + Duration::seconds(50));
+        assert_eq!(store.refresh_due_github_app_tokens().await.len(), 1);
+        assert_eq!(store.next_github_app_refresh_at().await, Some(now + Duration::hours(1)));
+        clock.advance(Duration::seconds(10));
+        assert_eq!(store.refresh_due_github_app_tokens().await.len(), 1);
+        assert_eq!(store.next_github_app_refresh_at().await, None, "an expired delivery schedules no attempt");
+        let failing = store.github_app_refresh_failures().await;
+        assert_eq!(failing.len(), 1);
+        assert!(failing[0].should_surface && failing[0].message.contains("expired"), "{failing:?}");
+        assert_eq!(failing[0].first_failure_at, Some(now + Duration::minutes(59) + Duration::seconds(50)));
+        clock.advance(Duration::hours(3));
+        assert!(store.refresh_due_github_app_tokens().await.is_empty(), "no timed retry after giving up");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 2);
+        let event = GithubAppRefreshWake { retry_given_up: true, ..GithubAppRefreshWake::default() };
+        let errors = store.refresh_github_app_tokens(&event).await;
+        // It recovers, reporting that the refresh came after expiry.
+        assert!(errors.len() == 1 && errors[0].message.contains("refresh started inside the expiry margin"), "{errors:?}");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 3);
+        assert!(store.github_app_refresh_failures().await.is_empty());
+        assert!(store.next_github_app_refresh_at().await.is_some());
     }
 
     #[tokio::test]

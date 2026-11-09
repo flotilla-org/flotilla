@@ -16,7 +16,7 @@
 //! | `MarkLost` / `MarkFailed`, once realised | Vanish: Gone |
 //! | `MarkLost` / `MarkFailed`, before it was realised | Attempted then GiveUp: the cause is retained, the lease returned |
 //! | a later `MarkReady` (recovered, recreated), `MarkInterrupted` | none: the lease holds |
-//! | images, observations, credentials, recreation | none |
+//! | images, observations, recreation | none |
 //!
 //! A vessel that fails before readiness gives up with its cause. An ended vessel is never
 //! provisioned again under its name; a replacement is a separate request.
@@ -94,18 +94,15 @@ impl Binding for VesselBinding {
                 // cannot recover by retrying, so the failure spends the request immediately.
                 vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })]
             }
-            // Interrupted roles, provisioning progress, images, observations and credentials are
-            // no edge of the lease.
+            // Interrupted roles, provisioning progress, images and observations are no edge of the
+            // lease.
             VesselStatusPatch::MarkProvisioning { .. }
             | VesselStatusPatch::MarkInterrupted { .. }
             | VesselStatusPatch::RecordImage { .. }
             | VesselStatusPatch::ReplaceImage { .. }
             | VesselStatusPatch::ObserveDegradation { .. }
             | VesselStatusPatch::ObserveRuntime { .. }
-            | VesselStatusPatch::CredentialDelivery { .. }
-            | VesselStatusPatch::CredentialRefresh { .. }
-            | VesselStatusPatch::RequireEnvironmentRecreation { .. }
-            | VesselStatusPatch::StageLandingCredentials { .. } => vec![],
+            | VesselStatusPatch::RequireEnvironmentRecreation { .. } => vec![],
         }
     }
 

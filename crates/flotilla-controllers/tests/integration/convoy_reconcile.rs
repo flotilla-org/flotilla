@@ -987,9 +987,6 @@ fn vessel_object_with_local_image_id(
             ready_at: (phase == VesselPhase::Ready).then(|| timestamp(18)),
             requested_stance: None,
             effective_stance: None,
-            held_credentials: Default::default(),
-            credential_delivery_retry: None,
-            credential_refresh_retry: None,
         }),
     }
 }

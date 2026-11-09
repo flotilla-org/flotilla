@@ -318,18 +318,6 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
             let Some(status) = &vessel.status else {
                 continue;
             };
-            for credential in status.held_credentials.keys() {
-                report.record(
-                    Category::Grants,
-                    &identity,
-                    &format!("{}/held/{credential}", vessel.spec.vessel_name),
-                    credentials
-                        .contains_key(credential)
-                        .then_some(())
-                        .ok_or_else(|| "held landing credential has no declared CredentialSpec".into()),
-                    waiver,
-                );
-            }
             // Environment records are host-local. A present Environment remains
             // subject to every existing check, even if a stale placement disagrees.
             let environment_is_local = status.environment_ref.as_ref().is_some_and(|reference| {
@@ -719,7 +707,7 @@ mod tests {
         // cannot be waived; absent namespaces have no invented default scope.
         let mut malformed = inventory.clone();
         malformed[0]["metadata"]["annotations"][READMISSION_ANNOTATION] = Value::String("re-admit".into());
-        malformed[vessel_index]["status"]["held_credentials"] = Value::String("invalid".into());
+        malformed[vessel_index]["status"]["phase"] = Value::String("invalid".into());
         let report = check(&malformed, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: true })
             .await
             .expect("actionable decode report");

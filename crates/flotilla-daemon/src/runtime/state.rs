@@ -99,6 +99,8 @@ pub(super) struct ControllerRuntimeState {
     pub(super) checkout_recheck_events: StdMutex<Option<tokio::sync::mpsc::Receiver<String>>>,
     /// The remotes this host's clones could not reach, published on its heartbeat (#3108).
     pub(super) remote_reachability: Arc<RemoteProbe>,
+    /// The credential delivery controller's inbox, for crew operations and people to reach it.
+    pub(super) credential_events: Arc<super::credential_delivery::CredentialEvents>,
 }
 
 impl ControllerRuntimeState {
@@ -338,6 +340,7 @@ impl ControllerRuntimeState {
             checkout_rechecks,
             checkout_recheck_events: StdMutex::new(Some(checkout_recheck_events)),
             remote_reachability: Arc::new(RemoteProbe::new(super::health::RuntimeHealth::default())),
+            credential_events: Arc::default(),
         }
     }
 

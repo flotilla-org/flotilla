@@ -131,7 +131,7 @@ impl ReconcilerWake {
                         diagnostics.push(format!(
                             "launch progress stalled for {key}: Pending since {began}; no lifecycle progress since {}; vessel {:?}, session {:?}; retry evidence {:?}; inspect the launcher and retry or resume the crew after repair",
                             stage.since, vessel_status.map(|status| status.phase), session_status.map(|status| status.phase),
-                            (vessel_status.and_then(|status| status.credential_delivery_retry.as_ref()), session_status.and_then(|status| status.degraded.as_ref()))
+                            session_status.and_then(|status| status.degraded.as_ref())
                         ));
                     }
                 }

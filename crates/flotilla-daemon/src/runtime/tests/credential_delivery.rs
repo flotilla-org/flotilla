@@ -3,55 +3,6 @@ use flotilla_resources::attentions::Subject;
 use flotilla_store_memory::InMemoryBackend;
 
 #[tokio::test]
-async fn credential_refresh_retry_waits_until_deadline_without_rewriting_status() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    // The refresh retry is held by the vessels standing on the environment.
-    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
-    let vessel = vessels
-        .create(
-            &empty_meta("refresh-vessel"),
-            &VesselSpec {
-                convoy_ref: "refresh-convoy".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create vessel");
-    vessels
-        .update_status(
-            &vessel.metadata.name,
-            &vessel.metadata.resource_version,
-            &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some("refresh-work".to_string()),
-                ..VesselStatus::default()
-            },
-        )
-        .await
-        .expect("place vessel");
-    let failure = CredentialRefreshError {
-        environment_ref: "refresh-work".into(),
-        credential_name: Some("github-app".into()),
-        message: "provider unavailable".into(),
-        should_surface: true,
-    };
-    record_credential_refresh_dispositions(&backend, NAMESPACE, std::slice::from_ref(&failure)).await.expect("record first failure");
-    let first = vessels.get("refresh-vessel").await.expect("vessel after first failure");
-    let retry = first.status.expect("status").credential_refresh_retry.expect("retry record");
-    assert_eq!(retry.attempts, 1);
-    record_credential_refresh_dispositions(&backend, NAMESPACE, std::slice::from_ref(&failure))
-        .await
-        .expect("observe failure again before deadline");
-    let second = vessels.get("refresh-vessel").await.expect("vessel after repeated failure");
-    assert_eq!(second.metadata.resource_version, first.metadata.resource_version);
-    assert_eq!(second.status.expect("status").credential_refresh_retry, Some(retry));
-    record_credential_refresh_dispositions(&backend, NAMESPACE, &[]).await.expect("clear on recovery");
-    assert!(vessels.get("refresh-vessel").await.expect("vessel after recovery").status.expect("status").credential_refresh_retry.is_none());
-}
-
-#[tokio::test]
 async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     let temp = tempfile::tempdir().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"credential-refresh-test\"\n").expect("daemon config");
@@ -85,7 +36,6 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         )
         .await
         .expect("set convoy status");
-    // The vessel's environment keeps its credential retry episode.
     engine_environments(&daemon).request(
         "standing-vessel",
         &EnvironmentSpec {
@@ -124,21 +74,32 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         credential_name: Some("github-app".to_string()),
         message: "credential `github-app`: outage; expires in 180 seconds".to_string(),
         should_surface: false,
+        first_failure_at: None,
     };
     let attentions = daemon.attentions();
     let open = || async { attentions.open(NAMESPACE, None, None).await.expect("open attentions") };
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[transient]).await.expect("ignore transient failure");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[transient])
+        .await
+        .expect("ignore transient failure");
     assert!(open().await.is_empty());
 
+    // When the vessel's current run of failures began, as the store reports it; a full fix ends it.
+    let episode = std::cell::Cell::new(chrono::Utc::now());
     let failure = |message: &str, should_surface| CredentialRefreshError {
         environment_ref: "standing-vessel".to_string(),
         credential_name: Some("github-app".to_string()),
         message: message.to_string(),
         should_surface,
+        first_failure_at: Some(episode.get()),
     };
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 120 seconds", true)])
-        .await
-        .expect("raise attention");
+    reconcile_credential_refresh_attention_in(
+        &*daemon.attentions(),
+        &backend,
+        NAMESPACE,
+        &[failure("outage; expires in 120 seconds", true)],
+    )
+    .await
+    .expect("raise attention");
     let told = open().await;
     assert_eq!(told.len(), 1);
     assert_eq!(told[0].subject, Subject::Vessel { convoy: "credential-convoy".into(), vessel: "work".into() });
@@ -152,20 +113,37 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     )
     .await
     .expect("acknowledge demand");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 60 seconds", true)])
-        .await
-        .expect("the same credential keeps failing");
+    reconcile_credential_refresh_attention_in(
+        &*daemon.attentions(),
+        &backend,
+        NAMESPACE,
+        &[failure("outage; expires in 60 seconds", true)],
+    )
+    .await
+    .expect("the same credential keeps failing");
     assert!(open().await.is_empty(), "an acknowledged attention is not raised again while the same credentials fail");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[]).await.expect("recovery");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 90 seconds", true)])
-        .await
-        .expect("a new failure");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[]).await.expect("recovery");
+    episode.set(chrono::Utc::now());
+    reconcile_credential_refresh_attention_in(
+        &*daemon.attentions(),
+        &backend,
+        NAMESPACE,
+        &[failure("outage; expires in 90 seconds", true)],
+    )
+    .await
+    .expect("a new failure");
     assert_eq!(open().await.len(), 1, "a failure after recovery is told again");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expired 5 seconds ago", false)])
-        .await
-        .expect("retain alert during retry");
+    reconcile_credential_refresh_attention_in(
+        &*daemon.attentions(),
+        &backend,
+        NAMESPACE,
+        &[failure("outage; expired 5 seconds ago", false)],
+    )
+    .await
+    .expect("retain alert during retry");
     assert_eq!(open().await.len(), 1);
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[]).await.expect("clear on recovery");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[]).await.expect("clear on recovery");
+    episode.set(chrono::Utc::now());
     assert!(open().await.is_empty());
 
     // Each change of the failing set is told: {github-app}, then {github-app, forgejo}, then {github-app}.
@@ -173,23 +151,30 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     for (failing, told) in
         [(vec![failure("outage", true)], 1), (vec![failure("outage", true), forgejo], 2), (vec![failure("outage", true)], 1)]
     {
-        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &failing).await.expect("raise attention");
+        reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &failing).await.expect("raise attention");
         let open = open().await;
         assert_eq!(open.len(), 1, "one attention per vessel");
         assert_eq!(open[0].reason.lines().count(), told, "{}", open[0].reason);
     }
     // A partial fix keeps an acknowledged attention; a full fix clears it; the next failure is told.
     let forgejo = CredentialRefreshError { credential_name: Some("forgejo".to_string()), ..failure("token refused", true) };
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true), forgejo]).await.expect("two fail");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true), forgejo])
+        .await
+        .expect("two fail");
     for demand in demands.list().await.expect("list demands").items {
         let acknowledge =
             flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "operator".to_string() };
         flotilla_store::apply_status_patch(&demands, &demand.metadata.name, &acknowledge).await.expect("acknowledge demand");
     }
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true)]).await.expect("partial fix");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true)])
+        .await
+        .expect("partial fix");
     assert!(open().await.is_empty(), "a partial fix leaves the acknowledgement standing");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[]).await.expect("full fix");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true)]).await.expect("fails again");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[]).await.expect("full fix");
+    episode.set(chrono::Utc::now());
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true)])
+        .await
+        .expect("fails again");
     assert_eq!(open().await.len(), 1, "after a full fix, a new failure is told");
 
     // Owner decision of 2026-11-02: a credential that starts failing while the attention is
@@ -202,16 +187,18 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         }
     };
     acknowledge_all().await;
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true)]).await.expect("still failing");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true)])
+        .await
+        .expect("still failing");
     assert!(open().await.is_empty(), "acknowledged while the same credential fails");
     let forgejo = CredentialRefreshError { credential_name: Some("forgejo".to_string()), ..failure("token refused", true) };
     let both = [failure("outage", true), forgejo];
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &both).await.expect("another starts failing");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &both).await.expect("another starts failing");
     let told = open().await;
     assert_eq!(told.len(), 1, "a newly failing credential is told again");
     assert_eq!(told[0].reason.lines().count(), 2, "{}", told[0].reason);
     acknowledge_all().await;
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &both).await.expect("both still failing");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &both).await.expect("both still failing");
     assert!(open().await.is_empty(), "the new episode's acknowledgement stands while both fail");
 }
 
@@ -1019,16 +1006,18 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
         .await
         .expect("placed vessel");
     create_credential_test_session(&backend, "live-crew", "credential-work", "credential-work-vessel", env_id.as_str()).await;
-    let state =
+    let state = Arc::new(
         ControllerRuntimeState::new(daemon.clone(), config, passthrough_registry(), None, "test-host".into(), "host-direct-test".into())
-            .with_credential_store(store.clone());
+            .with_credential_store(store.clone()),
+    );
+    let mut delivery = CredentialDelivery::new(state).expect("a credential store");
     let log = tempfile::NamedTempFile::new().expect("timing log");
     let subscriber = tracing_subscriber::fmt().json().with_ansi(false).with_writer(log.reopen().expect("writer")).finish();
     // The test uses Tokio's current-thread runtime, so the scoped dispatcher
     // covers both the spawned phase and its cancellation/drop path.
     let _logging = tracing::subscriber::set_default(subscriber);
     let phase_started = tokio::time::Instant::now();
-    let task = tokio::spawn(async move { phase("reconcile_work_credentials", reconcile_work_credentials(&state, NAMESPACE)).await });
+    let task = tokio::spawn(async move { phase("reconcile_work_credentials", delivery.start()).await });
     tokio::time::timeout(Duration::from_secs(1), runner.entered.notified()).await.expect("work credential preflight starts");
     tokio::time::advance(Duration::from_millis(38_650)).await;
     assert!(!task.is_finished(), "credential preflight is still pending");
@@ -1082,6 +1071,7 @@ async fn credential_attention_reads_only_live_convoys() {
         credential_name: Some("github-app".into()),
         message: "unavailable".into(),
         should_surface: true,
+        first_failure_at: None,
     };
     let (result, reads) = measure_reads(super::super::credentials::reconcile_credential_refresh_attention_in(
         &flotilla_store::OldStoreAttentions::new(backend.clone()),

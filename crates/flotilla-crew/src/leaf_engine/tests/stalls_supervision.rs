@@ -1202,7 +1202,7 @@ async fn lost_crew_session_stalls_with_dead_evidence_but_stale_busy_screen_does_
 }
 
 #[tokio::test]
-async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_and_exhausted_failures() {
+async fn clone_controller_rows_judge_transient_terminal_and_exhausted_failures() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let refresher = ChangeRequestRefresher::new(
@@ -1247,54 +1247,6 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
         )
         .await
         .expect("place vessel");
-    let now = Utc::now();
-    let backoff = flotilla_resources::RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(120) };
-    let scenarios = [
-        (ControllerRetry::retryable(None, now, backoff), None),
-        (ControllerRetry::terminal(None, now, "credential spec does not decode"), Some("credential spec does not decode")),
-        (
-            ControllerRetry {
-                attempts: RetryCeiling::default().attempts,
-                first_failure_at: now,
-                disposition: flotilla_resources::ControllerRetryDisposition::Retryable { next_attempt_at: now },
-            },
-            Some("retrying without progress"),
-        ),
-    ];
-    let mut standing_row_id = None;
-    for (retry, expected) in scenarios {
-        flotilla_store::apply_status_patch(
-            &vessels,
-            "delivery-work",
-            &flotilla_resources::VesselStatusPatch::CredentialDelivery { retry: Some(retry) },
-        )
-        .await
-        .expect("record delivery retry");
-        let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy");
-        let objects = HashMap::from([("delivery".to_string(), convoy)]);
-        wake.sync_rows("flotilla", &objects).await.expect("arm controller row");
-        let controller_row = wake
-            .subscriptions
-            .rows()
-            .await
-            .into_iter()
-            .find(|row| matches!(&row.maker, LeafMaker::Controller { resource_kind, .. } if resource_kind == "CredentialDelivery"))
-            .expect("credential delivery row");
-        if let Some(id) = standing_row_id {
-            assert_eq!(controller_row.id, id, "retry changes should update the standing row without reopening its watches");
-        }
-        standing_row_id = Some(controller_row.id);
-        wake.judge_stalls("flotilla", &objects).await.expect("judge controller row");
-        let stalled = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled;
-        assert_eq!(stalled.as_ref().map(|stalled| stalled.evidence.as_str()), expected);
-    }
-    flotilla_store::apply_status_patch(
-        &vessels,
-        "delivery-work",
-        &flotilla_resources::VesselStatusPatch::CredentialDelivery { retry: None },
-    )
-    .await
-    .expect("clear credential retry");
     let repository = flotilla_resources::RepositorySpec::remote("https://example.org/example/repo").expect("repository");
     let clone_spec = flotilla_resources::CloneSpec {
         repo_ref: repository.key(),
@@ -1336,9 +1288,24 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
     // and giving up stalls as retrying without progress (`wake::clone_retry_tests`).
     let second = clones.request(&repository, &clone_spec, false);
     assert_ne!(second, first, "a clone that gave up is requested again as its next launch");
+    let clone_row = || async {
+        wake.subscriptions
+            .rows()
+            .await
+            .into_iter()
+            .find(|row| matches!(&row.maker, LeafMaker::Controller { resource_kind, .. } if resource_kind == "Clone"))
+            .map(|row| row.id)
+    };
+    let mut standing_row_id = None;
     for _ in 0..2 {
         clones.retry(&second, "network unreachable");
         assert_eq!(judge_clone().await.as_ref().map(|stalled| stalled.evidence.as_str()), None, "retries short of the policy");
+        let id = clone_row().await.expect("clone controller row");
+        assert!(
+            standing_row_id.is_none_or(|standing| standing == id),
+            "retry changes update the standing row without reopening its watches"
+        );
+        standing_row_id = Some(id);
     }
     clones.retry(&second, "network unreachable");
     assert_eq!(judge_clone().await.as_ref().map(|stalled| stalled.evidence.as_str()), Some("network unreachable"));

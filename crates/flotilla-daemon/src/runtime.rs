@@ -4,6 +4,7 @@ mod access_layer;
 mod account_access;
 pub(crate) mod archive;
 mod checkouts;
+mod credential_delivery;
 mod credentials;
 mod discovery;
 mod docker;
@@ -47,9 +48,9 @@ use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
 
+use self::credential_delivery::CredentialDelivery;
 use self::credentials::{
-    reconcile_work_credentials, spawn_codex_central_refresh_task, spawn_codex_credential_redelivery_task, spawn_credential_refresh_task,
-    RuntimeSessionCapabilities, RuntimeWorkCredentialReconciler,
+    spawn_codex_central_refresh_task, spawn_codex_credential_redelivery_task, RuntimeSessionCapabilities, RuntimeWorkCredentialReconciler,
 };
 use self::discovery::{
     apply_ssh_host_observation, build_local_profile, discover_ssh_host_profiles, probe_local_provider_registry, register_ssh_host_resources,
@@ -354,7 +355,6 @@ impl DaemonRuntime {
                 runtime_health.clone(),
                 options.heartbeat_interval,
             ),
-            spawn_credential_refresh_task(Arc::clone(&daemon), options.namespace.clone(), Arc::clone(&credential_store)),
             spawn_host_description_projection_task(Arc::clone(&daemon), options.namespace.clone(), options.heartbeat_interval),
             spawn_codex_central_refresh_task(Arc::clone(&daemon.discovery_runtime().env), options.codex_central_refresh_interval),
             spawn_event_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
@@ -600,6 +600,9 @@ struct StartupRestoration {
     state: Option<Arc<ControllerRuntimeState>>,
     options: RuntimeOptions,
     runtime_health: RuntimeHealth,
+    /// The credential delivery controller, once its start pass has run.
+    #[builder(skip)]
+    credential_delivery: std::sync::Mutex<Option<CredentialDelivery>>,
 }
 
 impl StartupRestoration {
@@ -644,8 +647,11 @@ impl StartupRestoration {
         {
             warn!(%error, "failed to restore provisioned environments during startup; periodic reconciliation will retry");
         }
-        if let Err(error) = phase("reconcile_work_credentials", reconcile_work_credentials(state, &options.namespace)).await {
-            warn!(%error, "failed to reconcile work credentials during startup; periodic reconciliation will retry");
+        if let Some(mut delivery) = CredentialDelivery::new(Arc::clone(state)) {
+            if let Err(error) = phase("reconcile_work_credentials", delivery.start()).await {
+                warn!(%error, "failed to reconcile work credentials during startup; each environment is retried at its backoff");
+            }
+            *self.credential_delivery.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(delivery);
         }
     }
 
@@ -728,6 +734,10 @@ impl StartupRestoration {
             options.namespace.clone(),
             options.controller_resync_interval,
         )));
+        if let Some(delivery) = self.credential_delivery.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+            controller_tasks
+                .push(AbortOnDropHandle::new(tokio::spawn(delivery.run(state.controller_metrics.for_kind("CredentialDelivery")))));
+        }
         controller_tasks.push(AbortOnDropHandle::new(spawn_environment_orphan_sweep_task(Arc::clone(state))));
         controller_tasks.push(AbortOnDropHandle::new(remotes::spawn_remote_probe_task(Arc::clone(state), remotes::REMOTE_PROBE_INTERVAL)));
         controller_tasks.push(AbortOnDropHandle::new(spawn_codex_credential_redelivery_task(

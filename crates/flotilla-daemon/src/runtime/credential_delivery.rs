@@ -1,0 +1,603 @@
+//! Work-credential delivery as one controller per daemon (#3108).
+//!
+//! The controller keeps each environment's credential files in step with the crews running
+//! there, and keeps GitHub App tokens fresh. It runs on events, never on a timer: a crew
+//! session's phase changing, an environment's record changing, a project's membership or a
+//! credential definition changing, or a request from crew operations or a person. Time enters
+//! only through one deadline: the earliest GitHub App refresh or retry, or the earliest retry of
+//! a failed environment.
+//!
+//! A failed delivery is retried at a backoff a finite number of times, then waits for an event
+//! naming its environment. Failures are traced and, for refreshes, told to a person as an
+//! attention; nothing about them is stored on the vessel or the environment. A restart rebuilds
+//! everything from the start pass, which prepares the running crews' credentials again.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
+
+use flotilla_credentials::{CredentialStore, GithubAppRefreshWake, GithubAppScope};
+use flotilla_resources::{
+    environment_records::EnvironmentChange, Convoy, CredentialGrant, CredentialSpec, Project, ReadWatchEvent, Repository, RepositoryKey,
+    RepositoryTrust, TerminalSession, TerminalSessionPhase, TerminalSessionSource, Vessel, WatchEvent,
+};
+use futures::StreamExt;
+use tokio::sync::{mpsc, oneshot, Notify};
+use tracing::{debug, info, warn};
+
+use super::credentials::{github_app_scope_from_grants, reconcile_credential_refresh_attention_in};
+use super::state::ControllerRuntimeState;
+
+/// The backoff after an environment's delivery fails, doubling to the cap.
+const RETRY_INITIAL: Duration = Duration::from_secs(30);
+const RETRY_MAXIMUM: Duration = Duration::from_secs(120);
+/// Consecutive failed deliveries retried at the backoff; past it, the next event naming the
+/// environment retries it.
+const RETRY_LIMIT: u32 = 5;
+/// Consecutive failures reopening a watch before it stops; other events still wake the controller.
+const WATCH_RETRY_LIMIT: u32 = 5;
+
+/// What woke the controller since its last pass.
+#[derive(Debug, Default)]
+struct Pending {
+    /// Every environment: the start, or a watch that reopened and may have missed changes.
+    all: bool,
+    /// The environments an event named.
+    environments: BTreeSet<String>,
+    /// The projects whose membership may have changed.
+    projects: BTreeSet<String>,
+    /// A credential definition changed: every environment, and refreshes that gave up, again.
+    definitions: bool,
+}
+
+/// A request to deliver one environment now, answered once it has been tried.
+struct Request {
+    environment: String,
+    reply: oneshot::Sender<Result<(), String>>,
+}
+
+/// The controller's inbox: the events its sources record, and the requests crew operations and
+/// people send. Held by the runtime state so either can reach the controller.
+pub(super) struct CredentialEvents {
+    pending: StdMutex<Pending>,
+    wake: Notify,
+    requests: mpsc::UnboundedSender<Request>,
+    receiver: StdMutex<Option<mpsc::UnboundedReceiver<Request>>>,
+}
+
+impl Default for CredentialEvents {
+    fn default() -> Self {
+        let (requests, receiver) = mpsc::unbounded_channel();
+        Self { pending: StdMutex::default(), wake: Notify::new(), requests, receiver: StdMutex::new(Some(receiver)) }
+    }
+}
+
+impl CredentialEvents {
+    fn record(&self, change: impl FnOnce(&mut Pending)) {
+        change(&mut self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        self.wake.notify_one();
+    }
+
+    fn take(&self) -> Pending {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    /// Delivers `environment` now, whatever its backoff, and answers how that went. Fails when no
+    /// controller is running to answer.
+    pub(super) async fn deliver(&self, environment: &str) -> Result<(), String> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(Request { environment: environment.to_owned(), reply })
+            .map_err(|_| "the credential delivery controller is not running".to_string())?;
+        answer.await.map_err(|_| "the credential delivery controller stopped before answering".to_string())?
+    }
+}
+
+/// An environment's failing delivery: how many attempts in a row, and when the next timed one
+/// falls due, if any.
+#[derive(Clone, Debug)]
+struct Failure {
+    attempts: u32,
+    next_at: Option<tokio::time::Instant>,
+}
+
+/// One environment's wanted delivery, from the crews standing on it.
+#[derive(Debug, Default)]
+struct Wanted {
+    /// Every credential granted to a crew on it, running or settled: what may need withdrawing.
+    granted: BTreeSet<String>,
+    /// The credentials the running crews hold.
+    running: BTreeSet<String>,
+    scopes: BTreeMap<String, BTreeSet<RepositoryKey>>,
+    live_scopes: BTreeMap<String, GithubAppScope>,
+    permissions: BTreeMap<String, Option<BTreeMap<String, String>>>,
+    /// Running crews needing different minted permissions for one credential: a misconfiguration
+    /// no retry fixes.
+    conflict: Option<String>,
+}
+
+pub(super) struct CredentialDelivery {
+    state: Arc<ControllerRuntimeState>,
+    namespace: String,
+    store: Arc<CredentialStore>,
+    events: Arc<CredentialEvents>,
+    failures: BTreeMap<String, Failure>,
+    /// The refresh failures last told to the attention reconciler.
+    told: Vec<(String, Option<String>, bool)>,
+}
+
+impl CredentialDelivery {
+    /// The controller over `state`'s credential store; none without one.
+    pub(super) fn new(state: Arc<ControllerRuntimeState>) -> Option<Self> {
+        let store = state.credential_store.clone()?;
+        Some(Self {
+            namespace: state.namespace.clone(),
+            events: Arc::clone(&state.credential_events),
+            state,
+            store,
+            failures: BTreeMap::new(),
+            told: Vec::new(),
+        })
+    }
+
+    /// The start pass: delivers every environment some vessel stands on or this daemon delivered
+    /// to, adopting running crews' GitHub App tokens again, and tells refresh failures.
+    pub(super) async fn start(&mut self) -> Result<(), String> {
+        let result = self.deliver(None, true).await;
+        self.tell_refresh_failures().await;
+        result
+    }
+
+    /// Runs on events and the next deadline, after [`CredentialDelivery::start`].
+    pub(super) async fn run(mut self, metrics: Arc<flotilla_store::load_metrics::ControllerLoadMetrics>) {
+        let Some(mut requests) = self.events.receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() else {
+            warn!("credential delivery is already running");
+            return;
+        };
+        let mut sources = tokio::task::JoinSet::new();
+        let backend = self.state.daemon.resource_backend();
+        sources.spawn(watch_sessions(backend.clone(), self.namespace.clone(), Arc::clone(&self.events)));
+        sources.spawn(watch_environments(Arc::clone(&self.state), Arc::clone(&self.events)));
+        sources.spawn(watch_named::<Project>(backend.clone(), self.namespace.clone(), Arc::clone(&self.events), |pending, name| {
+            pending.projects.insert(name.to_owned());
+        }));
+        sources.spawn(watch_named::<CredentialSpec>(backend.clone(), self.namespace.clone(), Arc::clone(&self.events), |pending, _| {
+            pending.definitions = true;
+        }));
+        sources.spawn(watch_named::<CredentialGrant>(backend, self.namespace.clone(), Arc::clone(&self.events), |pending, _| {
+            pending.definitions = true;
+        }));
+        loop {
+            let deadline = self.next_deadline().await;
+            tokio::select! {
+                () = self.events.wake.notified() => {}
+                Some(request) = requests.recv() => {
+                    metrics.wakes.increment();
+                    let _busy = metrics.busy();
+                    self.failures.remove(&request.environment);
+                    let result = self.deliver(Some(&BTreeSet::from([request.environment.clone()])), false).await;
+                    let _ = request.reply.send(result);
+                    continue;
+                }
+                () = sleep_until(deadline) => { metrics.requeues.increment(); }
+                Some(_) = sources.join_next(), if !sources.is_empty() => { continue; }
+            }
+            metrics.wakes.increment();
+            let started = tokio::time::Instant::now();
+            {
+                let _busy = metrics.busy();
+                if let Err(error) = self.pass().await {
+                    metrics.failures.increment();
+                    debug!(%error, "credential delivery pass left failures");
+                }
+            }
+            metrics.reconcile.record(started.elapsed());
+        }
+    }
+
+    /// One pass over what woke it and what fell due.
+    async fn pass(&mut self) -> Result<(), String> {
+        let pending = self.events.take();
+        let now = tokio::time::Instant::now();
+        let mut environments = pending.environments.clone();
+        // Environments whose timed retry fell due.
+        environments.extend(
+            self.failures.iter().filter(|(_, failure)| failure.next_at.is_some_and(|next| next <= now)).map(|(name, _)| name.clone()),
+        );
+        let result = if pending.all || pending.definitions {
+            if pending.definitions {
+                self.failures.clear();
+            }
+            self.deliver(None, false).await
+        } else if !environments.is_empty() {
+            // An event retries an environment that gave up; one in backoff waits for it.
+            let due: BTreeSet<String> = environments
+                .into_iter()
+                .filter(|environment| self.failures.get(environment).is_none_or(|failure| failure.next_at.is_none_or(|next| next <= now)))
+                .collect();
+            if due.is_empty() {
+                Ok(())
+            } else {
+                self.deliver(Some(&due), false).await
+            }
+        } else {
+            Ok(())
+        };
+        let wake = GithubAppRefreshWake { projects: pending.projects, retry_given_up: pending.definitions };
+        let errors = self.store.refresh_github_app_tokens(&wake).await;
+        for error in &errors {
+            warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
+        }
+        // Cards read committed delivery observations, never the preparation index.
+        if let Err(error) = self.state.daemon.refresh_capability_cards(&self.namespace).await {
+            warn!(%error, "failed to refresh session capability cards");
+        }
+        self.tell_refresh_failures().await;
+        result
+    }
+
+    /// The earliest of the next GitHub App refresh or retry and the next environment retry.
+    async fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        let refresh = self.store.next_github_app_refresh_at().await.map(|at| {
+            let wait = (at - chrono::Utc::now()).to_std().unwrap_or_default();
+            tokio::time::Instant::now() + wait
+        });
+        self.failures.values().filter_map(|failure| failure.next_at).chain(refresh).min()
+    }
+
+    /// Tells the attention reconciler the refresh failures, when they changed.
+    async fn tell_refresh_failures(&mut self) {
+        let failing = self.store.github_app_refresh_failures().await;
+        let told: Vec<_> =
+            failing.iter().map(|error| (error.environment_ref.clone(), error.credential_name.clone(), error.should_surface)).collect();
+        if told == self.told {
+            return;
+        }
+        match reconcile_credential_refresh_attention_in(
+            &*self.state.daemon.attentions(),
+            &self.state.daemon.resource_backend(),
+            &self.namespace,
+            &failing,
+        )
+        .await
+        {
+            Ok(()) => self.told = told,
+            Err(error) => warn!(%error, "failed to reconcile credential refresh attention"),
+        }
+    }
+
+    /// Delivers `environments`, or every environment some vessel stands on or this daemon
+    /// delivered to. `adopt` prepares the running crews' GitHub App tokens again, as the start
+    /// pass does after a restart.
+    async fn deliver(&mut self, environments: Option<&BTreeSet<String>>, adopt: bool) -> Result<(), String> {
+        let wanted = match self.wanted(environments).await {
+            Ok(wanted) => wanted,
+            Err(error) => {
+                // The records could not be read: each environment named is retried at its backoff.
+                for environment in environments.into_iter().flatten() {
+                    self.fail(environment, &error, true);
+                }
+                return Err(error);
+            }
+        };
+        let mut errors = Vec::new();
+        for (environment, wanted) in wanted {
+            match self.deliver_environment(&environment, wanted, adopt).await {
+                Ok(()) => {
+                    if self.failures.remove(&environment).is_some() {
+                        info!(%environment, "credential delivery recovered");
+                    }
+                }
+                Err((error, retryable)) => {
+                    self.fail(&environment, &error, retryable);
+                    errors.push(error);
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    fn fail(&mut self, environment: &str, error: &str, retryable: bool) {
+        let failure = self.failures.entry(environment.to_owned()).or_insert(Failure { attempts: 0, next_at: None });
+        failure.attempts = failure.attempts.saturating_add(1);
+        failure.next_at = (retryable && failure.attempts <= RETRY_LIMIT).then(|| {
+            let delay = RETRY_INITIAL.saturating_mul(1 << (failure.attempts - 1).min(8)).min(RETRY_MAXIMUM);
+            tokio::time::Instant::now() + delay
+        });
+        warn!(%environment, %error, attempts = failure.attempts, retry = failure.next_at.is_some(), "credential delivery failed");
+    }
+
+    async fn deliver_environment(&self, environment: &str, wanted: Wanted, adopt: bool) -> Result<(), (String, bool)> {
+        if let Some(conflict) = wanted.conflict {
+            return Err((conflict, false));
+        }
+        let Wanted { granted, running, scopes, live_scopes, permissions, .. } = wanted;
+        let permissions = permissions.into_iter().filter_map(|(name, value)| value.map(|value| (name, value))).collect();
+        if granted.is_empty() {
+            return Ok(());
+        }
+        let runner = match self.state.daemon.command_runner_for_environment_ref(environment) {
+            Some(runner) => runner,
+            None if running.is_empty() => {
+                // The environment and its filesystem are gone: forget its registrations and material.
+                return self.store.forget_environment(environment).await.map_err(|error| (error, true));
+            }
+            None => return Err((format!("command runner unavailable for credential delivery to environment {environment}"), true)),
+        };
+        if !running.is_empty() {
+            if adopt {
+                self.store
+                    .adopt_github_app_deliveries_with_permissions(environment, &running, &scopes, &permissions, runner.clone())
+                    .await
+                    .map_err(|error| (format!("mint work credentials for environment {environment}: {}", error.message), true))?;
+            }
+            self.store.set_github_app_scopes(environment, &live_scopes).await;
+        }
+        self.store
+            .reconcile_work_delivery_with_permissions(environment, &granted, &running, &scopes, &permissions, runner)
+            .await
+            .map_err(|error| (format!("reconcile work credentials for environment {environment}: {error}"), true))
+    }
+
+    /// What each environment in `environments` (or every one) wants: the grants of the vessels on
+    /// it, and of the running crews among them, from their convoys' frozen requirements.
+    async fn wanted(&self, environments: Option<&BTreeSet<String>>) -> Result<BTreeMap<String, Wanted>, String> {
+        let namespace = self.namespace.as_str();
+        let backend = self.state.daemon.resource_backend();
+        let selected =
+            |environment: Option<&String>| environment.is_some_and(|environment| environments.is_none_or(|set| set.contains(environment)));
+        let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| format!("list credential vessels: {error}"))?;
+        let vessels = vessels
+            .items
+            .into_iter()
+            .filter(|vessel| selected(vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref())))
+            .collect::<Vec<_>>();
+        let mut live_crews = BTreeSet::new();
+        for session in backend
+            .using::<TerminalSession>(namespace)
+            .list()
+            .await
+            .map_err(|error| format!("list crew terminal sessions for credential delivery: {error}"))?
+            .items
+        {
+            if !selected(Some(&session.spec.env_ref)) {
+                continue;
+            }
+            let session = flotilla_store::read_terminal_session(self.state.daemon.lifecycle_reads(), &session, None)
+                .await
+                .map_err(|error| error.to_string())?
+                .0;
+            let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { continue };
+            let running = session
+                .status
+                .as_ref()
+                .is_none_or(|status| matches!(status.phase, TerminalSessionPhase::Starting | TerminalSessionPhase::Running));
+            if context.namespace == namespace && running {
+                live_crews.insert((context.vessel_ref.clone(), context.convoy.clone(), session.spec.env_ref.clone()));
+            }
+        }
+        let mut convoys = BTreeMap::new();
+        for name in vessels.iter().map(|vessel| &vessel.spec.convoy_ref).collect::<BTreeSet<_>>() {
+            let convoy = backend
+                .including_replicas::<Convoy>(namespace)
+                .get(name)
+                .await
+                .map_err(|error| format!("read credential convoy {name}: {error}"))?
+                .object;
+            convoys.insert(name.clone(), convoy);
+        }
+        let requirement = |vessel: &flotilla_resources::ResourceObject<Vessel>| {
+            convoys
+                .get(&vessel.spec.convoy_ref)
+                .and_then(|convoy| convoy.status.as_ref())
+                .and_then(|status| status.workflow_snapshot.as_ref())
+                .and_then(|snapshot| snapshot.vessels.iter().find(|requirement| requirement.name == vessel.spec.vessel_name))
+                .cloned()
+        };
+        let needs_grants =
+            vessels.iter().any(|vessel| requirement(vessel).is_some_and(|requirement| !requirement.credential_scopes.is_empty()));
+        let (grants, repository_trust) = if needs_grants {
+            let grants = backend
+                .including_replicas::<CredentialGrant>(namespace)
+                .list()
+                .await
+                .map_err(|error| format!("list credential grants: {error}"))?
+                .items
+                .into_iter()
+                .map(|grant| grant.object.spec)
+                .collect::<Vec<_>>();
+            let repository_trust = backend
+                .including_replicas::<Repository>(namespace)
+                .list()
+                .await
+                .map_err(|error| format!("list repositories for credential grants: {error}"))?
+                .items
+                .into_iter()
+                .map(|source| {
+                    let trust = if source.object.spec.is_fork() { RepositoryTrust::Fork } else { RepositoryTrust::Own };
+                    (RepositoryKey(source.object.metadata.name), trust)
+                })
+                .collect::<BTreeMap<_, _>>();
+            (grants, repository_trust)
+        } else {
+            (Vec::new(), BTreeMap::new())
+        };
+        let mut wanted = BTreeMap::<String, Wanted>::new();
+        for vessel in &vessels {
+            let Some(environment) = vessel.status.as_ref().and_then(|status| status.environment_ref.clone()) else { continue };
+            let Some(requirement) = requirement(vessel) else { continue };
+            let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
+            let live = live_crews.contains(&(vessel.metadata.name.clone(), vessel.spec.convoy_ref.clone(), environment.clone()));
+            let entry = wanted.entry(environment.clone()).or_default();
+            entry.granted.extend(requirement.credential_refs.iter().cloned());
+            if !live {
+                continue;
+            }
+            entry.running.extend(requirement.credential_refs.iter().cloned());
+            for name in &requirement.credential_refs {
+                let incoming = requirement.credential_permissions.get(name).cloned();
+                match entry.permissions.get(name) {
+                    Some(existing) if existing != &incoming => {
+                        entry.conflict =
+                            Some(format!("crews sharing environment `{environment}` require different minted permissions for `{name}`"));
+                    }
+                    Some(_) => {}
+                    None => {
+                        entry.permissions.insert(name.clone(), incoming);
+                    }
+                }
+            }
+            for (name, repositories) in &requirement.credential_scopes {
+                entry.scopes.entry(name.clone()).or_default().extend(repositories.iter().cloned());
+                let mut scope = github_app_scope_from_grants(
+                    name,
+                    repositories,
+                    convoy.spec.project_ref.as_deref(),
+                    &requirement.crew.iter().map(|crew| crew.role.clone()).collect(),
+                    &repository_trust,
+                    requirement.repository_refs.is_some(),
+                    &grants,
+                );
+                scope.permissions = requirement.credential_permissions.get(name).cloned();
+                let live_scope = entry.live_scopes.entry(name.clone()).or_default();
+                live_scope.fixed_repositories.extend(scope.fixed_repositories);
+                live_scope.projects.extend(scope.projects);
+                live_scope.permissions = scope.permissions;
+            }
+        }
+        // What this daemon delivered before, so a settled crew's credentials are withdrawn.
+        for (environment, delivered) in self.store.tracked_work_deliveries().await {
+            if environments.is_none_or(|set| set.contains(&environment)) {
+                wanted.entry(environment).or_default().granted.extend(delivered);
+            }
+        }
+        // An environment named but wanting nothing still answers, as delivered.
+        for environment in environments.into_iter().flatten() {
+            wanted.entry(environment.clone()).or_default();
+        }
+        Ok(wanted)
+    }
+}
+
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Names the environment of each crew session at this home whose environment or phase changed.
+async fn watch_sessions(backend: flotilla_store::ResourceBackend, namespace: String, events: Arc<CredentialEvents>) {
+    let mut seen = BTreeMap::<String, (String, Option<TerminalSessionPhase>)>::new();
+    let mut failures = 0_u32;
+    loop {
+        match backend.using::<TerminalSession>(&namespace).watch(flotilla_resources::WatchStart::Now).await {
+            Ok(mut changes) => {
+                // A reopened watch may have missed changes: deliver everything again.
+                events.record(|pending| pending.all = true);
+                while let Some(change) = changes.next().await {
+                    let change = match change {
+                        Ok(change) => change,
+                        Err(error) => {
+                            debug!(%error, "credential delivery session watch failed");
+                            break;
+                        }
+                    };
+                    failures = 0;
+                    let (name, now) = match &change {
+                        WatchEvent::Added(object) | WatchEvent::Modified(object) => (
+                            object.metadata.name.clone(),
+                            Some((object.spec.env_ref.clone(), object.status.as_ref().map(|status| status.phase))),
+                        ),
+                        WatchEvent::Deleted(object) => (object.metadata.name.clone(), None),
+                        WatchEvent::DeletedByName(tombstone) => (tombstone.name.clone(), None),
+                    };
+                    let before = match &now {
+                        Some(now) => seen.insert(name, now.clone()),
+                        None => seen.remove(&name),
+                    };
+                    if before != now {
+                        let named: BTreeSet<String> = before.into_iter().chain(now).map(|(environment, _)| environment).collect();
+                        events.record(|pending| pending.environments.extend(named));
+                    }
+                }
+            }
+            Err(error) => debug!(%error, "credential delivery session watch did not open"),
+        }
+        failures = failures.saturating_add(1);
+        if failures > WATCH_RETRY_LIMIT {
+            warn!(failures, "credential delivery stops watching crew sessions; other events still wake it");
+            return;
+        }
+        tokio::time::sleep(RETRY_INITIAL.min(Duration::from_secs(u64::from(failures)))).await;
+    }
+}
+
+/// Names each environment whose record changed, at any home.
+async fn watch_environments(state: Arc<ControllerRuntimeState>, events: Arc<CredentialEvents>) {
+    let mut changes = match state.daemon.lifecycle_reads().environments() {
+        Ok(environments) => environments.changes(),
+        Err(error) => {
+            warn!(%error, "credential delivery cannot follow environments; other events still wake it");
+            return;
+        }
+    };
+    loop {
+        match changes.recv().await {
+            Ok(EnvironmentChange::Changed(name)) => events.record(|pending| {
+                pending.environments.insert(name);
+            }),
+            Ok(EnvironmentChange::Rescanned) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                events.record(|pending| pending.all = true)
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Records each change to an `R`, local or replicated, by its name.
+async fn watch_named<R: flotilla_resources::Resource>(
+    backend: flotilla_store::ResourceBackend,
+    namespace: String,
+    events: Arc<CredentialEvents>,
+    record: fn(&mut Pending, &str),
+) {
+    let mut failures = 0_u32;
+    loop {
+        match backend.including_replicas::<R>(&namespace).watch().await {
+            Ok(mut changes) => {
+                while let Some(change) = changes.next().await {
+                    match change {
+                        Ok(change) => {
+                            failures = 0;
+                            let name = match &change {
+                                ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) | ReadWatchEvent::Deleted(read) => {
+                                    read.object.metadata.name.as_str()
+                                }
+                                ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name.as_str(),
+                            };
+                            events.record(|pending| record(pending, name));
+                        }
+                        Err(error) => {
+                            debug!(kind = R::API_PATHS.kind, %error, "credential delivery watch failed");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(error) => debug!(kind = R::API_PATHS.kind, %error, "credential delivery watch did not open"),
+        }
+        failures = failures.saturating_add(1);
+        if failures > WATCH_RETRY_LIMIT {
+            warn!(kind = R::API_PATHS.kind, failures, "credential delivery stops watching this kind; other events still wake it");
+            return;
+        }
+        tokio::time::sleep(RETRY_INITIAL.min(Duration::from_secs(u64::from(failures)))).await;
+    }
+}

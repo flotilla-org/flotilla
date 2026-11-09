@@ -1,6 +1,6 @@
 use super::*;
 use flotilla_resources::ResumeIntent;
-use flotilla_store_sqlite::SqliteBackend;
+use tokio_util::task::AbortOnDropHandle;
 
 #[tokio::test]
 async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delivery() {
@@ -113,15 +113,17 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         .expect("place vessel");
     create_credential_test_session(&backend, "credential-work-session", "credential-work", "credential-work-vessel", env_id.as_str()).await;
     engine_environments(&daemon);
-    let state = ControllerRuntimeState::new(
-        Arc::clone(&daemon),
-        config,
-        passthrough_registry(),
-        None,
-        "test-host".to_string(),
-        "host-direct-test".to_string(),
-    )
-    .with_credential_store(store);
+    let state = Arc::new(
+        ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            passthrough_registry(),
+            None,
+            "test-host".to_string(),
+            "host-direct-test".to_string(),
+        )
+        .with_credential_store(store),
+    );
     let git_config = temp.path().join("credentials/gitconfig").to_string_lossy().into_owned();
     let can_fill_git_credential = || {
         let runner = runner.clone();
@@ -221,37 +223,20 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         "aaa-unavailable",
     )
     .await;
-    reconcile_work_credentials_for_environment(&state, NAMESPACE, env_id.as_str())
-        .await
-        .expect("target environment stages despite unrelated failure");
-    assert!(can_fill_git_credential().await);
-    let scoped_error =
-        reconcile_work_credentials_for_environment(&state, NAMESPACE, "aaa-unavailable").await.expect_err("unavailable target still fails");
-    assert!(scoped_error.contains("aaa-unavailable"), "{scoped_error}");
-    // The scoped failure's retry is held by the vessel standing on the environment; once it is due
-    // the full pass meets the unavailable target again.
-    let held_retry = vessels
-        .get("unavailable-work-vessel")
-        .await
-        .expect("unavailable vessel")
-        .status
-        .expect("status")
-        .credential_delivery_retry
-        .expect("scoped failure retry");
-    flotilla_store::apply_status_patch(
-        &vessels,
-        "unavailable-work-vessel",
-        &flotilla_resources::VesselStatusPatch::CredentialDelivery {
-            retry: Some(ControllerRetry {
-                disposition: ControllerRetryDisposition::Retryable { next_attempt_at: Utc::now() - chrono::Duration::seconds(1) },
-                ..held_retry
-            }),
-        },
-    )
-    .await
-    .expect("advance retry deadline");
-    assert!(reconcile_work_credentials(&state, NAMESPACE).await.is_err());
+    // The start pass stages the target environment despite the unrelated environment's failure.
+    let mut delivery = CredentialDelivery::new(Arc::clone(&state)).expect("a credential store");
+    let error = delivery.start().await.expect_err("the unavailable environment fails");
+    assert!(error.contains("aaa-unavailable"), "{error}");
     assert!(can_fill_git_credential().await, "unavailable placement must not block another environment's delivery");
+    let _controller = AbortOnDropHandle::new(tokio::spawn(delivery.run(state.controller_metrics.for_kind("CredentialDelivery"))));
+    let deliver = |environment: &'static str| {
+        let state = Arc::clone(&state);
+        async move { state.credential_events.deliver(environment).await }
+    };
+    let env = env_id.as_str().to_owned().leak();
+    let scoped_error = deliver("aaa-unavailable").await.expect_err("unavailable target still fails");
+    assert!(scoped_error.contains("aaa-unavailable"), "{scoped_error}");
+    deliver(env).await.expect("target environment stages despite unrelated failure");
     vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");
     backend.clone().using::<TerminalSession>(NAMESPACE).delete("unavailable-work-session").await.expect("remove unavailable session");
 
@@ -331,58 +316,23 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         env_id.as_str(),
     )
     .await;
-    let error = reconcile_work_credentials(&state, NAMESPACE).await.expect_err("shared environment must reject differing permissions");
+    let error = deliver(env).await.expect_err("shared environment must reject differing permissions");
     assert!(error.contains("different minted permissions for `work-token`"), "{error}");
-    // The shared environment's retry is held by each vessel standing on it.
-    let conflict_retry = vessels
-        .get("credential-work-vessel")
-        .await
-        .expect("first vessel")
-        .status
-        .expect("status")
-        .credential_delivery_retry
-        .expect("durable conflict retry");
-    assert!(matches!(conflict_retry.disposition, ControllerRetryDisposition::Retryable { .. }));
-    let conflict_other_vessel_version = vessels.get("conflicting-work-vessel").await.expect("second vessel").metadata.resource_version;
-    let conflict_vessel_version = vessels.get("credential-work-vessel").await.expect("first vessel").metadata.resource_version;
-    let repeated_error = reconcile_work_credentials(&state, NAMESPACE).await.expect_err("persistent conflict remains retryable");
+    let repeated_error = deliver(env).await.expect_err("a persistent conflict keeps failing");
     assert!(repeated_error.contains("different minted permissions for `work-token`"), "{repeated_error}");
-    assert_eq!(
-        vessels.get("conflicting-work-vessel").await.expect("second vessel").metadata.resource_version,
-        conflict_other_vessel_version
-    );
-    assert_eq!(vessels.get("credential-work-vessel").await.expect("first vessel").metadata.resource_version, conflict_vessel_version);
     vessels.delete("conflicting-work-vessel").await.expect("remove second vessel");
     backend.clone().using::<TerminalSession>(NAMESPACE).delete("conflicting-work-session").await.expect("remove second session");
 
-    // Simulate the retry deadline elapsing while preserving the persisted
-    // episode, then verify the normal pass can recover without an operator.
-    let due_retry = ControllerRetry {
-        disposition: ControllerRetryDisposition::Retryable { next_attempt_at: Utc::now() - chrono::Duration::seconds(1) },
-        ..conflict_retry
-    };
-    flotilla_store::apply_status_patch(
-        &vessels,
-        "credential-work-vessel",
-        &flotilla_resources::VesselStatusPatch::CredentialDelivery { retry: Some(due_retry) },
-    )
-    .await
-    .expect("advance retry deadline");
-
-    reconcile_work_credentials(&state, NAMESPACE).await.expect("stage running credentials");
-    assert!(
-        vessels.get("credential-work-vessel").await.expect("first vessel").status.expect("status").credential_delivery_retry.is_none(),
-        "resolved conflict should clear durable retry"
-    );
+    deliver(env).await.expect("the resolved conflict stages the running crew's credentials");
     assert!(can_fill_git_credential().await);
     let current = convoys.get("credential-work").await.expect("read running work");
     let mut stalled = current.status.expect("work status");
     stalled.work.get_mut("work").expect("work").phase = WorkPhase::Stalled;
     convoys.update_status("credential-work", &current.metadata.resource_version, &stalled).await.expect("stall work");
-    reconcile_work_credentials(&state, NAMESPACE).await.expect("retain stalled credentials");
+    deliver(env).await.expect("retain stalled credentials");
     assert!(can_fill_git_credential().await);
     settle(ConvoyPhase::Landing).await;
-    reconcile_work_credentials(&state, NAMESPACE).await.expect("retain credentials after claim admission");
+    deliver(env).await.expect("retain credentials after claim admission");
     assert!(can_fill_git_credential().await, "live crew can act after its claim is admitted");
     flotilla_store::apply_status_patch(
         &convoys,
@@ -398,11 +348,11 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
     )
     .await
     .expect("deliver resume brief");
-    reconcile_work_credentials(&state, NAMESPACE).await.expect("retain credentials for resumed input");
+    deliver(env).await.expect("retain credentials for resumed input");
     assert!(can_fill_git_credential().await);
 
     settle(ConvoyPhase::Landing).await;
-    reconcile_work_credentials(&state, NAMESPACE).await.expect("retain credentials at review boundary");
+    deliver(env).await.expect("retain credentials at review boundary");
     assert!(can_fill_git_credential().await);
     flotilla_store::apply_status_patch(
         &convoys,
@@ -425,9 +375,10 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
     )
     .await
     .expect("deliver review turn");
-    reconcile_work_credentials(&state, NAMESPACE).await.expect("retain credentials for review turn");
+    deliver(env).await.expect("retain credentials for review turn");
     assert!(can_fill_git_credential().await);
 
+    // The last crew session stopping is the event that withdraws its credentials: no request.
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
     let session = sessions.get("credential-work-session").await.expect("live crew session");
     sessions
@@ -438,89 +389,174 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         )
         .await
         .expect("stop last crew session");
-    reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke when last session ends");
-    assert!(!can_fill_git_credential().await);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while can_fill_git_credential().await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the session's stop withdraws its credentials");
 
     sessions.delete("credential-work-session").await.expect("tear down crew session");
     vessels.delete("credential-work-vessel").await.expect("tear down vessel");
-    reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke credentials after vessel teardown");
+    deliver(env).await.expect("nothing to deliver after vessel teardown");
     assert!(!can_fill_git_credential().await);
 }
 
+// A grant whose declaration is missing fails its environment's delivery; the declaration
+// arriving is the event that delivers it, with no request and no timer.
 #[tokio::test]
-async fn undecodable_credential_spec_parks_delivery_as_a_terminal_controller_failure() {
+async fn a_missing_credential_declaration_is_delivered_once_it_arrives() {
     let temp = TempDir::new().expect("tempdir");
-    let sqlite_path = temp.path().join("resources.sqlite");
-    let backend = ResourceBackend::new(SqliteBackend::open(&sqlite_path).expect("sqlite store"));
-    // The work environment's delivery retry is held by the vessel standing on it.
-    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
+    let config_base = temp.path().join("config");
+    fs::create_dir_all(&config_base).expect("config directory");
+    fs::write(config_base.join("daemon.toml"), "machine_id = \"credential-declaration-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(config_base));
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+        HostName::new("test-host"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
+    let backend = daemon.resource_backend();
+    let runner = Arc::new(ProcessCommandRunner);
+    let store = Arc::new(CredentialStore::new(
+        backend.clone(),
+        NAMESPACE,
+        Arc::new(TestEnvVars::new([("TEST_LATE_TOKEN", "test-token")])),
+        EnvironmentBag::new(),
+        runner.clone(),
+        temp.path().to_path_buf(),
+    ));
+    let env_id = EnvironmentId::new("env-late");
+    daemon
+        .register_provisioned_environment(
+            env_id.clone(),
+            Arc::new(TestInteriorEnvironment {
+                id: env_id.clone(),
+                image: ImageId::new("test-image"),
+                runner: runner.clone(),
+                env_vars: HashMap::new(),
+                destroyed: Arc::new(AtomicBool::new(false)),
+            }),
+            EnvironmentBag::new(),
+            Some(passthrough_registry()),
+        )
+        .expect("register test environment");
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    let convoy = convoys
+        .create(&empty_meta("late-work"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
+        .await
+        .expect("create convoy");
+    convoys
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".to_string())
+                        .credential_refs(BTreeSet::from(["late-token".to_string()]))
+                        .crew(Vec::new())
+                        .build()],
+                }),
+                ..ConvoyStatus::default()
+            },
+        )
+        .await
+        .expect("mark work running");
+    let vessels = backend.using::<Vessel>(NAMESPACE);
     let vessel = vessels
         .create(
-            &empty_meta("credential-work-vessel"),
+            &empty_meta("late-vessel"),
             &VesselSpec {
-                convoy_ref: "credential-work".to_string(),
+                convoy_ref: "late-work".to_string(),
                 vessel_name: "work".to_string(),
                 fulfilment_kind_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
         .await
-        .expect("work vessel");
+        .expect("create vessel");
     vessels
         .update_status(
             &vessel.metadata.name,
             &vessel.metadata.resource_version,
             &VesselStatus {
                 phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some("credential-work".to_string()),
+                environment_ref: Some(env_id.as_str().to_string()),
                 ..VesselStatus::default()
             },
         )
         .await
         .expect("place vessel");
-    let connection = rusqlite::Connection::open(&sqlite_path).expect("raw sqlite store");
-    insert_undecodable_resource::<CredentialSpec>(&connection, "broken-spec");
-    drop(connection);
-    flotilla_store::quarantine_undecodable_stored_objects(&backend, NAMESPACE).await.expect("quarantine undecodable spec");
-    let granted = BTreeSet::from(["broken-spec".to_string()]);
-    let need = credential_quarantine_need(&backend, NAMESPACE, &granted)
-        .await
-        .expect("inspect quarantine")
-        .expect("undecodable spec needs operator");
-    assert!(need.contains("broken-spec") && need.contains("does not decode"), "{need}");
-    record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", Some(need.clone()), true)
-        .await
-        .expect("persist terminal delivery disposition");
-    let retry = vessels
-        .get("credential-work-vessel")
-        .await
-        .expect("vessel")
-        .status
-        .expect("status")
-        .credential_delivery_retry
-        .expect("delivery retry");
-    assert_eq!(retry.stall_reason(Utc::now(), flotilla_resources::RetryCeiling::default()), Some(need.clone()));
-    assert!(matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }));
-    let resource_version = vessels.get("credential-work-vessel").await.expect("vessel").metadata.resource_version;
-    record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", Some(need), true).await.expect("repeat terminal disposition");
-    // A repeated terminal failure does not churn durable status.
-    let after_repeat = vessels.get("credential-work-vessel").await.expect("vessel");
-    assert_eq!(after_repeat.metadata.resource_version, resource_version);
-    record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", None, false).await.expect("operator retry reset");
-    assert!(vessels.get("credential-work-vessel").await.expect("vessel").status.expect("status").credential_delivery_retry.is_none());
-    record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", Some("provider unavailable".into()), false)
-        .await
-        .expect("retry after operator reset");
-    assert_eq!(
-        vessels
-            .get("credential-work-vessel")
-            .await
-            .expect("vessel")
-            .status
-            .expect("status")
-            .credential_delivery_retry
-            .expect("new episode")
-            .attempts,
-        1
+    create_credential_test_session(&backend, "late-session", "late-work", "late-vessel", env_id.as_str()).await;
+    engine_environments(&daemon);
+    let state = Arc::new(
+        ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            passthrough_registry(),
+            None,
+            "test-host".to_string(),
+            "host-direct-test".to_string(),
+        )
+        .with_credential_store(store),
     );
+    let git_config = temp.path().join("credentials/gitconfig").to_string_lossy().into_owned();
+    let can_fill_git_credential = || {
+        let runner = runner.clone();
+        let git_config = git_config.clone();
+        async move {
+            runner
+                .run(
+                    "sh",
+                    &[
+                        "-c",
+                        "export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=\"$1\" GIT_TERMINAL_PROMPT=0; printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill",
+                        "credential-probe",
+                        &git_config,
+                    ],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                )
+                .await
+                .is_ok()
+        }
+    };
+    let mut delivery = CredentialDelivery::new(Arc::clone(&state)).expect("a credential store");
+    let error = delivery.start().await.expect_err("an undeclared credential cannot be delivered");
+    assert!(error.contains("late-token") && error.contains("declaration not found"), "{error}");
+    assert!(!can_fill_git_credential().await);
+    let _controller = AbortOnDropHandle::new(tokio::spawn(delivery.run(state.controller_metrics.for_kind("CredentialDelivery"))));
+    backend
+        .clone()
+        .definitions::<CredentialSpec>(NAMESPACE)
+        .create(
+            &empty_meta("late-token"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::GitHttpToken { host: "github.com".to_string(), username: "bot".to_string() },
+                source: CredentialSource::Env { name: "TEST_LATE_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Issued,
+                placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
+            },
+        )
+        .await
+        .expect("credential declaration");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !can_fill_git_credential().await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the declaration's arrival delivers the credential");
 }

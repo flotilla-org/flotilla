@@ -35,7 +35,6 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use super::credentials::reconcile_work_credentials;
 use super::discovery::{observe_fulfilment_facts, BagEnvVars, FulfilmentProbeContext, LocalProvisioningProfile, SshHostProfile};
 use super::docker::DockerControllerRuntime;
 use super::environments::reconcile_provisioned_environments;
@@ -820,9 +819,6 @@ pub(super) fn spawn_provisioned_environment_reconciliation_task(
         async move {
             if let Err(error) = reconcile_provisioned_environments(&state, &namespace).await {
                 warn!(%error, "failed to reconcile provisioned environment registrations");
-            }
-            if let Err(error) = reconcile_work_credentials(&state, &namespace).await {
-                warn!(%error, "failed to reconcile work credentials");
             }
         }
     })
