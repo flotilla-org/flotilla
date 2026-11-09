@@ -440,8 +440,8 @@ async fn two_vessels_on_one_host_each_get_their_own_agent_and_socket() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_caller_that_stops_waiting_does_not_cut_off_its_vessels_agent_upgrade() {
     let host = host(Arc::new(ProcessCommandRunner));
-    let build = (0..4 * 1024 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
-    let gate = Gate::closing_after(1024 * 1024);
+    let build = (0..256 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
+    let gate = Gate::closing_after(64 * 1024);
     let agents = Arc::new(LocalAgents::upgrading(build.clone(), Arc::clone(&gate)));
     let (sockets, _received) = recording_sockets(host.state.path());
     let vessels = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
@@ -470,8 +470,8 @@ async fn a_caller_that_stops_waiting_does_not_cut_off_its_vessels_agent_upgrade(
 #[tokio::test(flavor = "multi_thread")]
 async fn retiring_a_vessel_mid_preparation_closes_what_the_preparation_leaves() {
     let host = host(Arc::new(ProcessCommandRunner));
-    let build = (0..4 * 1024 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
-    let gate = Gate::closing_after(1024 * 1024);
+    let build = (0..256 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
+    let gate = Gate::closing_after(64 * 1024);
     let agents = Arc::new(LocalAgents::upgrading(build, Arc::clone(&gate)));
     let (sockets, _received) = recording_sockets(host.state.path());
     let vessels = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
