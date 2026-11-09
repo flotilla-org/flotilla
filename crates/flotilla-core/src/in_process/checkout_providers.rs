@@ -5,7 +5,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Weak},
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -343,6 +342,7 @@ impl InProcessDaemon {
     }
 
     async fn watch_checkout_provider_lifetimes(weak: Weak<Self>, backend: ResourceBackend, mut namespace_changes: watch::Receiver<()>) {
+        let mut restarts = super::resubscribe::Resubscribe::default();
         while let Some(daemon) = weak.upgrade() {
             // Mark the current notification before listing; changes during setup
             // stay pending and immediately restart the subscription below.
@@ -360,7 +360,9 @@ impl InProcessDaemon {
                 Err(error) => {
                     warn!(%error, "subscribe to checkout provider lifetimes failed");
                     drop(daemon);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if !restarts.after_failure(&mut namespace_changes, "checkout provider lifetimes").await {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -373,17 +375,16 @@ impl InProcessDaemon {
                 warn!(%error, "retire checkout providers failed");
             }
             drop(daemon);
-            let mut retry = false;
-            loop {
+            let failed = loop {
                 let event = tokio::select! {
                     event = watch.next() => match event {
-                        Some(Ok(event)) => event,
-                        Some(Err(error)) => { warn!(%error, "checkout provider lifetime watch failed"); retry = true; break; },
-                        None => { retry = true; break; },
+                        Some(Ok(event)) => { restarts.delivered(); event },
+                        Some(Err(error)) => { warn!(%error, "checkout provider lifetime watch failed"); break true; },
+                        None => break true,
                     },
                     changed = namespace_changes.changed() => {
                         if changed.is_err() { return; }
-                        break;
+                        break false;
                     }
                 };
                 let Some(daemon) = weak.upgrade() else {
@@ -410,9 +411,9 @@ impl InProcessDaemon {
                         warn!(%error, "retire checkout providers failed");
                     }
                 }
-            }
-            if retry {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            };
+            if failed && !restarts.after_failure(&mut namespace_changes, "checkout provider lifetimes").await {
+                return;
             }
         }
     }

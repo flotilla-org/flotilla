@@ -42,6 +42,7 @@ use flotilla_daemon_api::action_namespace;
 mod attach;
 mod checkout_providers;
 pub mod decided;
+mod resubscribe;
 use flotilla_executor::executor_actions;
 use flotilla_projections::projections_actions;
 
@@ -1495,17 +1496,27 @@ impl InProcessDaemon {
         let weak = Arc::downgrade(&daemon);
         let mut namespace_changes = daemon.checkout_namespace_changes.subscribe();
         tokio::spawn(async move {
+            let mut restarts = resubscribe::Resubscribe::default();
             while let Some(daemon) = weak.upgrade() {
                 // Mark the current namespace before listing; a change during setup stays pending
                 // and restarts the subscription below.
                 namespace_changes.borrow_and_update();
                 let namespace = daemon.provisioning_namespace().await;
                 let repositories = daemon.resource_backend.clone().using::<Repository>(&namespace);
-                let listed = match repositories.list().await {
-                    Ok(listed) => listed,
+                let setup = async {
+                    let listed = repositories.list().await?;
+                    let watch = repositories.watch(WatchStart::resuming_from(&listed)).await?;
+                    Ok::<_, flotilla_resources::ResourceError>((listed, watch))
+                }
+                .await;
+                let (listed, mut watch) = match setup {
+                    Ok(setup) => setup,
                     Err(error) => {
-                        warn!(%error, "list repositories for provider cache eviction failed");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        warn!(%error, "subscribe to repositories for provider cache eviction failed");
+                        drop(daemon);
+                        if !restarts.after_failure(&mut namespace_changes, "repository provider cache").await {
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -1516,37 +1527,29 @@ impl InProcessDaemon {
                     .lock()
                     .await
                     .retain(|(cached_namespace, key), _| cached_namespace != &namespace || live.contains(key.to_string().as_str()));
-                let mut watch = match repositories.watch(WatchStart::resuming_from(&listed)).await {
-                    Ok(watch) => watch,
-                    Err(error) => {
-                        warn!(%error, "watch repositories for provider cache eviction failed");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                };
                 drop(daemon);
-                let mut retry = false;
-                loop {
+                let failed = loop {
                     let event = tokio::select! {
                         event = watch.next() => event,
                         changed = namespace_changes.changed() => {
                             if changed.is_err() { return; }
-                            break;
+                            break false;
                         }
                     };
                     let name = match event {
-                        Some(Ok(WatchEvent::Deleted(repository))) => repository.metadata.name,
-                        Some(Ok(WatchEvent::DeletedByName(tombstone))) => tombstone.name,
-                        Some(Ok(_)) => continue,
+                        Some(Ok(event)) => {
+                            restarts.delivered();
+                            match event {
+                                WatchEvent::Deleted(repository) => repository.metadata.name,
+                                WatchEvent::DeletedByName(tombstone) => tombstone.name,
+                                _ => continue,
+                            }
+                        }
                         Some(Err(error)) => {
                             warn!(%error, "repository provider cache watch failed");
-                            retry = true;
-                            break;
+                            break true;
                         }
-                        None => {
-                            retry = true;
-                            break;
-                        }
+                        None => break true,
                     };
                     let Some(daemon) = weak.upgrade() else { return };
                     daemon.admission.repository_change_requests().write().await.retain(|key, _| key.to_string() != name);
@@ -1555,9 +1558,9 @@ impl InProcessDaemon {
                         .lock()
                         .await
                         .retain(|(cached_namespace, key), _| cached_namespace != &namespace || key.to_string() != name);
-                }
-                if retry {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                };
+                if failed && !restarts.after_failure(&mut namespace_changes, "repository provider cache").await {
+                    return;
                 }
             }
         });

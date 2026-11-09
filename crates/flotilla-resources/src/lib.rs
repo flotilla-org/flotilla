@@ -126,7 +126,10 @@ pub use checkout::{
 };
 pub use clock::{Clock, SystemClock};
 pub use clone::{Clone, CloneFailurePolicy, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
-pub use controller_retry::{ControllerRetry, ControllerRetryDisposition, RetryBackoff, RetryCeiling, PROVISIONING_RETRY_BACKOFF};
+pub use controller_retry::{
+    ControllerRetry, ControllerRetryDisposition, RetryBackoff, RetryCeiling, LOCAL_RETRY_BACKOFF, LOCAL_RETRY_LIMIT,
+    PROVISIONING_RETRY_BACKOFF,
+};
 pub use convoy::{
     active_change_request_subjects, bound_change_request_address, change_request_leaf_set, controller_patches, convoy_reference_context,
     convoy_sanctions_checkout_reclaim, convoy_subject_rows, evaluate_crew_completion, evaluate_landing_settlement,

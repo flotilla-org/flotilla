@@ -21,8 +21,6 @@ use tokio::sync::{Mutex, Notify};
 use url::Url;
 
 /// Failed fleet sync passes retried on a backoff before only a queued blob retries.
-const SYNC_RETRIES: u32 = 10;
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlobDigest(String);
 
@@ -787,8 +785,8 @@ impl TieredBlobStore {
                 }
             };
             failures = if failed { failures + 1 } else { 0 };
-            if failed && failures <= SYNC_RETRIES {
-                let delay = (Duration::from_secs(1) * 2_u32.pow(failures)).min(Duration::from_secs(300));
+            if failed && failures <= flotilla_resources::LOCAL_RETRY_LIMIT {
+                let delay = flotilla_resources::LOCAL_RETRY_BACKOFF.delay(failures);
                 tokio::select! { () = self.wake.notified() => {}, () = tokio::time::sleep(delay) => {} }
             } else {
                 if failed {

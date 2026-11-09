@@ -42,6 +42,14 @@ pub struct RetryBackoff {
 pub const PROVISIONING_RETRY_BACKOFF: RetryBackoff =
     RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(15 * 60) };
 
+/// A host-local loop's retries after a failure (a failed sync pass, a watch that fails or ends):
+/// 2 s doubling to 5 min, at most [`LOCAL_RETRY_LIMIT`] times in a row.
+pub const LOCAL_RETRY_BACKOFF: RetryBackoff = RetryBackoff { initial: Duration::from_secs(2), maximum: Duration::from_secs(5 * 60) };
+
+/// Failures in a row after which a host-local loop stops retrying on time and waits for its
+/// event alone.
+pub const LOCAL_RETRY_LIMIT: u32 = 10;
+
 impl RetryBackoff {
     pub fn delay(self, attempts: u32) -> Duration {
         self.initial.saturating_mul(1_u32 << attempts.saturating_sub(1).min(31)).min(self.maximum)
