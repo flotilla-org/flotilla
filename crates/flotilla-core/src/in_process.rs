@@ -1149,6 +1149,7 @@ impl InProcessDaemon {
                         Arc::new(flotilla_vcs::vcs::FixedVcsResolver(Arc::clone(&vcs.vcs))),
                         local_host_id.to_string(),
                     )
+                    .with_probe(discovery.blocking_probe.clone())
                     .inspect_path(&path, None)
                     .await
                 }
@@ -1690,7 +1691,8 @@ impl InProcessDaemon {
                 host_ref.to_string(),
             )
             .with_forges(forges.into_iter().map(|forge| forge.spec).collect())
-            .with_charter_cache(self.config.state_dir().join("charter-stores").into_path_buf()),
+            .with_charter_cache(self.config.state_dir().join("charter-stores").into_path_buf())
+            .with_probe(self.discovery.blocking_probe.clone()),
         ))
     }
 
@@ -2075,7 +2077,7 @@ impl InProcessDaemon {
     ) -> Result<RepositoryInspection, String> {
         if let (Some(repository_url), Some(git_ref)) = (repository_url, git_ref) {
             if let Ok(spec) = RepositorySpec::remote(repository_url) {
-                let path = flotilla_provider_runtime::probe::canonicalize(path).await?;
+                let path = self.discovery.blocking_probe.canonicalize(path).await?;
                 let (spec, replaces_prior_repository) = self.configure_inspected_repository(&path, spec).await?;
                 let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?.to_string();
                 return Ok(RepositoryInspection {
@@ -4182,8 +4184,8 @@ impl InProcessDaemon {
             Some(repo_root) => {
                 let repo_root_raw = repo_root.into_path_buf();
                 // Canonicalize to handle symlinks (e.g. /var -> /private/var on macOS).
-                let canonical_root = flotilla_provider_runtime::probe::canonicalize(&repo_root_raw).await.unwrap_or(repo_root_raw);
-                let canonical_path = flotilla_provider_runtime::probe::canonicalize(path).await.unwrap_or_else(|_| path.to_path_buf());
+                let canonical_root = self.discovery.blocking_probe.canonicalize(&repo_root_raw).await.unwrap_or(repo_root_raw);
+                let canonical_path = self.discovery.blocking_probe.canonicalize(path).await.unwrap_or_else(|_| path.to_path_buf());
                 if canonical_root != canonical_path {
                     debug!(
                         worktree = %path.display(),

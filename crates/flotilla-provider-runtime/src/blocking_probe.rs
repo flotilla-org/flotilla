@@ -1,6 +1,10 @@
 //! Execution budget for blocking probes. Production keeps Rigging's shared
 //! process budget; independent harnesses can own an equally bounded budget.
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::sync::Semaphore;
 
@@ -14,6 +18,11 @@ pub struct BlockingProbe {
 }
 
 impl BlockingProbe {
+    /// Rigging's process-wide budget, as production hosts use it.
+    pub const fn shared() -> Self {
+        Self { slots: None }
+    }
+
     /// A fresh eight-call budget, shared by clones but independent of other
     /// instances. Use for a simulated host, not for each request on one host.
     #[doc(hidden)]
@@ -43,6 +52,15 @@ impl BlockingProbe {
         })
         .await
         .map_err(|_| format!("{name} probe timed out after {timeout:?}"))?
+    }
+
+    /// `rigging_process::probe::canonicalize` within this budget.
+    pub async fn canonicalize(&self, path: &Path) -> Result<PathBuf, String> {
+        let path = path.to_path_buf();
+        self.run("canonicalize", rigging_process::probe::PROBE_TIMEOUT, move || {
+            std::fs::canonicalize(&path).map_err(|error| format!("resolve {}: {error}", path.display()))
+        })
+        .await
     }
 }
 

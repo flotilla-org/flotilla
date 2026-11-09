@@ -19,14 +19,23 @@ pub use rigging_process::{
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
-pub struct GitConfigGuard;
+/// Refuses Git commands that would change the host's shared Git config. Its reads of that
+/// config run within the host's blocking-probe budget.
+pub struct GitConfigGuard {
+    probe: blocking_probe::BlockingProbe,
+}
+impl GitConfigGuard {
+    pub const fn new(probe: blocking_probe::BlockingProbe) -> Self {
+        Self { probe }
+    }
+}
 #[async_trait::async_trait]
 impl rigging_process::CommandGuard for GitConfigGuard {
     fn scratch_namespace(&self) -> &str {
         "flotilla"
     }
     async fn check(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
-        git_config_guard::guard_host_git_config_async(cmd, args, cwd).await
+        git_config_guard::guard_host_git_config_async(&self.probe, cmd, args, cwd).await
     }
 }
 /// Guarded Rigging runner. The same-named value below preserves existing unit-struct-style call sites.
@@ -35,7 +44,11 @@ impl rigging_process::CommandGuard for GitConfigGuard {
 pub type ProcessCommandRunner = rigging_process::ProcessRunner<GitConfigGuard>;
 /// Compatibility value for callers that previously constructed the unit struct as `ProcessCommandRunner`.
 #[allow(non_upper_case_globals)]
-pub const ProcessCommandRunner: ProcessCommandRunner = rigging_process::ProcessRunner::new(GitConfigGuard);
+pub const ProcessCommandRunner: ProcessCommandRunner = process_runner_within(blocking_probe::BlockingProbe::shared());
+/// A guarded runner whose Git config reads run within `probe`, the budget of the host it serves.
+pub const fn process_runner_within(probe: blocking_probe::BlockingProbe) -> ProcessCommandRunner {
+    rigging_process::ProcessRunner::new(GitConfigGuard::new(probe))
+}
 /// Consumer-owned replay namespace; GitHub fixtures have always used endpoint-only keys.
 pub const GH_API_REPLAY_NAMESPACE: &str = "gh_api";
 

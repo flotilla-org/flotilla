@@ -430,8 +430,14 @@ pub fn fake_discovery_with_runner(_legacy_mode: bool, runner: std::sync::Arc<dyn
 
 /// Build a `DiscoveryRuntime` that allows real git commands while still
 /// avoiding ambient host-tool probes like gh, Codex, Claude, or cmux.
+/// The simulated host owns its blocking-probe budget, shared by its runner's Git config guard,
+/// so concurrent tests in one process cannot exhaust each other's.
 pub fn git_process_discovery(_legacy_mode: bool) -> flotilla_discovery::DiscoveryRuntime {
-    minimal_discovery_runtime(std::sync::Arc::new(flotilla_provider_runtime::ProcessCommandRunner))
+    let probe = flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated();
+    let runner = flotilla_provider_runtime::process_runner_within(probe.clone());
+    let mut discovery = minimal_discovery_runtime(std::sync::Arc::new(runner));
+    discovery.blocking_probe = probe;
+    discovery
 }
 
 // Process boundary: ordinary discovery fixtures model a controller with valid forge credentials.
@@ -456,7 +462,7 @@ fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> floti
         .runner(runner)
         .env(std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")])))
         .available_space_probe(fixed_available_space_probe())
-        .admission_probe(flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated())
+        .blocking_probe(flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated())
         .host_detectors(std::sync::Arc::new(vec![Box::new(flotilla_discovery_api::detectors::CommandDetector::new(
             "git",
             &["--version"],
@@ -1372,7 +1378,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         .runner(runner)
         .env(Arc::new(TestEnvVars::default()))
         .available_space_probe(fixed_available_space_probe())
-        .admission_probe(flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated())
+        .blocking_probe(flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated())
         .host_detectors(std::sync::Arc::new(vec![]))
         .repo_detectors(vec![])
         .factories(FactoryRegistry {

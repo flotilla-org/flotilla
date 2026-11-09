@@ -227,7 +227,7 @@ impl ConvoyAdmission {
         let path = self.admission_free_space_path.read().expect("admission free-space path lock poisoned").clone();
         let probe = Arc::clone(&self.discovery.available_space_probe);
         self.discovery
-            .admission_probe
+            .blocking_probe
             .run("available disk space", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || Ok(probe.measure(&path)))
             .await
     }
@@ -799,7 +799,7 @@ impl ConvoyAdmission {
         let admission_free_space_path = self.admission_free_space_path.read().expect("admission free-space path lock poisoned").clone();
         let host_name = self.host_name.to_string();
         self.discovery
-            .admission_probe
+            .blocking_probe
             .run("free-space admission", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
                 let daemon_config = config.load_daemon_config()?;
                 crate::admission::check_free_space_floor(

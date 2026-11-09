@@ -189,18 +189,24 @@ fn allowed_shared_config_key(key: &str) -> bool {
         || key.starts_with("branch.") && key.rsplit_once('.').is_some_and(|(prefix, _provider)| prefix.ends_with(".flotilla.issues"))
 }
 
-pub(crate) async fn guard_host_git_config_async(cmd: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
+pub(crate) async fn guard_host_git_config_async(
+    probe: &crate::blocking_probe::BlockingProbe,
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+) -> Result<(), String> {
     if cmd != "git" {
         return Ok(());
     }
     let cmd = cmd.to_string();
     let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
     let cwd = cwd.to_path_buf();
-    crate::probe::blocking("shared Git config", crate::probe::PROBE_TIMEOUT, move || {
-        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-        guard_host_git_config(&cmd, &args, &cwd)
-    })
-    .await
+    probe
+        .run("shared Git config", crate::probe::PROBE_TIMEOUT, move || {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            guard_host_git_config(&cmd, &args, &cwd)
+        })
+        .await
 }
 
 #[cfg(test)]
