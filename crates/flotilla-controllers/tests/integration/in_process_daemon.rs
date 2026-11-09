@@ -108,8 +108,8 @@ use flotilla_resources::{
     InputMeta, LifecycleAuthority, ModelFact, ModelFactSource, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec,
     Repository, RepositoryKey, RepositoryRelation, RepositorySpec, ResourceError, Stance, TerminalAttention, TerminalAttentionSource,
     TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-    TerminalSessionStatusPatch, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
+    HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{apply_status_patch, ResourceBackend, TypedResolver};
 use flotilla_terminal::TerminalPool;
@@ -6779,7 +6779,7 @@ async fn daemon_uses_persisted_local_environment_id() {
 }
 
 #[tokio::test]
-async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
+async fn daemon_restart_preserves_standing_convoy() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config = test_config_store(temp.path().join("config"));
     let database_path = temp.path().join("resources.sqlite");
@@ -6814,39 +6814,8 @@ async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
     .await
     .expect("mark convoy active");
 
-    let terminals = backend.clone().using::<TerminalSession>("flotilla");
-    terminals
-        .create(
-            &InputMeta::builder().name("standing-cleat-session".to_string()).build(),
-            &TerminalSessionSpec::builder()
-                .env_ref("host-direct-test".to_string())
-                .role("coder".to_string())
-                .source(TerminalSessionSource::Tool { command: "cleat attach standing".to_string() })
-                .cwd("/workspace".to_string())
-                .pool("cleat".to_string())
-                .build(),
-        )
-        .await
-        .expect("create terminal session");
-    apply_status_patch(
-        &terminals,
-        "standing-cleat-session",
-        &TerminalSessionStatusPatch::MarkRunning {
-            configured_limits: None,
-            session_id: "cleat-standing".to_string(),
-            pid: None,
-            started_at: chrono::Utc::now(),
-            crew: None,
-            launch_command: "cleat attach standing".to_string(),
-            delivered_message_id: None,
-        },
-    )
-    .await
-    .expect("mark terminal running");
-
     drop(daemon);
     drop(convoys);
-    drop(terminals);
     drop(backend);
 
     let restarted_backend = ResourceBackend::new(SqliteBackend::open(&database_path).expect("reopen resource store"));
@@ -6863,9 +6832,6 @@ async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
     let convoy =
         restarted_backend.clone().using::<ResourceConvoy>("flotilla").get("standing-convoy").await.expect("standing convoy after restart");
     assert_eq!(convoy.status.expect("convoy status").phase, ConvoyPhase::Active);
-    let terminal =
-        restarted_backend.using::<TerminalSession>("flotilla").get("standing-cleat-session").await.expect("terminal session after restart");
-    assert_eq!(terminal.status.expect("terminal status").phase, TerminalSessionPhase::Running);
 }
 
 #[tokio::test]

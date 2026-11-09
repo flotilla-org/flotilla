@@ -1185,11 +1185,12 @@ async fn lost_crew_session_stalls_with_dead_evidence_but_stale_busy_screen_does_
     wake.judge_stalls("flotilla", &objects).await.expect("judge stale screen");
     assert!(backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled.is_none());
 
-    flotilla_resources::TerminalSessionStatusPatch::MarkLost {
-        reason: "daemon generation is dead; session is recreatable".into(),
-        lost_at: Utc::now(),
-    }
-    .apply(&mut status);
+    status.phase = TerminalSessionPhase::Lost;
+    status.stopped_at = Some(Utc::now());
+    status.cleat_endpoint = None;
+    status.message = Some("daemon generation is dead; session is recreatable".into());
+    status.attention = None;
+    status.occupancy = flotilla_resources::TerminalOccupancy::Unknown;
     terminal.update_status(&created.metadata.name, &running.metadata.resource_version, &status).await.expect("lost");
     // The first judgement persisted hook health and obligations. Refresh the
     // outer convoy snapshot as its watch handler does before judging new evidence.

@@ -39,71 +39,62 @@ pub fn condition(status: &TerminalSessionStatus) -> Option<ExplainedTerminalCond
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use flotilla_resources::{StatusPatch, TerminalSessionStatusPatch};
+    use flotilla_resources::{
+        TerminalSessionDegradedCondition, CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE, CONTROLLER_FENCE_UNVERIFIABLE_REASON,
+        TERMINAL_DELIVERY_UNCONFIRMED_REASON,
+    };
 
     use super::*;
 
+    fn running() -> TerminalSessionStatus {
+        TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() }
+    }
+
+    fn degraded(reason: &str, message: &str) -> Option<TerminalSessionDegradedCondition> {
+        Some(TerminalSessionDegradedCondition {
+            reason: reason.into(),
+            message: message.into(),
+            message_id: Some("turn".into()),
+            consecutive_failures: 1,
+            observed_at: Utc::now(),
+        })
+    }
+
     // #3618: an unreachable daemon is shown while the session keeps running,
-    // yields to the reconciler's own degradation, and clears on recovery.
+    // yields to a delivery condition, and is gone once reach is observed again.
     #[test]
     fn unreachable_daemon_is_a_running_condition() {
-        let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
-        TerminalSessionStatusPatch::ObserveDaemonReach { unreachable: Some("daemon forward down: ssh exited".into()) }.apply(&mut status);
-        assert_eq!(status.phase, TerminalSessionPhase::Running);
+        let mut status = running();
+        status.daemon_unreachable = Some("daemon forward down: ssh exited".into());
         assert!(matches!(condition(&status),
             Some(ExplainedTerminalCondition::ProviderUnavailable { message }) if message.contains("daemon forward down")));
-        TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { message_id: "turn".into(), message: "held".into(), observed_at: Utc::now() }
-            .apply(&mut status);
+        status.degraded = degraded(TERMINAL_DELIVERY_UNCONFIRMED_REASON, "held");
         assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::DeliveryUnconfirmed { .. })));
-        TerminalSessionStatusPatch::MarkMessageDelivered { message_id: "turn".into() }.apply(&mut status);
+        status.degraded = None;
         assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::ProviderUnavailable { .. })));
-        TerminalSessionStatusPatch::ObserveDaemonReach { unreachable: None }.apply(&mut status);
+        status.daemon_unreachable = None;
         assert_eq!(condition(&status), None);
     }
 
-    // Transient outages remain Running regardless of duration; the same shared
-    // projection exposes degradation, confirmed loss, and recovery distinctly.
+    // Degradation of a running session, confirmed loss and a delivery failure are each
+    // explained distinctly; a running session with no evidence has no condition.
     #[test]
-    fn health_conditions_follow_evidence_and_clear_after_recovery() {
-        let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
-        for failures in [1, 5, 100, u32::MAX] {
-            TerminalSessionStatusPatch::MarkReconcileDegraded {
-                message: "provider offline".into(),
-                consecutive_failures: failures,
-                observed_at: Utc::now(),
-            }
-            .apply(&mut status);
-            assert_eq!(status.phase, TerminalSessionPhase::Running);
-            assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::ProviderUnavailable { .. })));
-        }
-        TerminalSessionStatusPatch::MarkLost { reason: "daemon generation dead".into(), lost_at: Utc::now() }.apply(&mut status);
-        assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::SessionLost { .. })));
-        TerminalSessionStatusPatch::MarkRevived.apply(&mut status);
-        TerminalSessionStatusPatch::ClearReconcileDegraded.apply(&mut status);
-        assert_eq!(condition(&status), None);
-        TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
-            message_id: "turn-1".into(),
-            message: "not submitted".into(),
-            observed_at: Utc::now(),
-        }
-        .apply(&mut status);
+    fn health_conditions_follow_evidence() {
+        let mut status = running();
+        status.degraded = degraded("ReconcileDegraded", "provider offline");
+        assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::ProviderUnavailable { .. })));
+        let lost = TerminalSessionStatus { phase: TerminalSessionPhase::Lost, message: Some("daemon generation dead".into()), ..running() };
+        assert!(matches!(condition(&lost), Some(ExplainedTerminalCondition::SessionLost { .. })));
+        assert_eq!(condition(&running()), None);
+        status.degraded = degraded(TERMINAL_DELIVERY_UNCONFIRMED_REASON, "not submitted");
         assert!(matches!(condition(&status), Some(ExplainedTerminalCondition::DeliveryUnconfirmed { .. })));
     }
 
-    // A known-unsent permanent fence has its own condition and actionable crew
-    // attention. Ordinary observations and expiry cannot turn it into a receipt.
+    // A known-unsent permanent fence has its own condition and actionable crew attention.
     #[test]
-    fn unverifiable_fence_explains_resume_recovery_and_survives_observations() {
-        let now = chrono::Utc::now();
-        let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
-        TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
-            message_id: "turn".into(),
-            message: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into(),
-            observed_at: now,
-        }
-        .apply(&mut status);
-        TerminalSessionStatusPatch::ClearReconcileDegraded.apply(&mut status);
-        TerminalSessionStatusPatch::MarkDeliveryExpired.apply(&mut status);
+    fn unverifiable_fence_explains_resume_recovery() {
+        let mut status = running();
+        status.degraded = degraded(CONTROLLER_FENCE_UNVERIFIABLE_REASON, CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE);
         let explained = condition(&status).expect("condition");
         assert!(matches!(explained, ExplainedTerminalCondition::ControllerFenceUnverifiable { .. }));
         assert!(explained.to_string().contains("no message input was sent"));
@@ -113,8 +104,5 @@ mod tests {
             flotilla_resources::crew_attention(Some(&status), None),
             Some(flotilla_protocol::CrewAttention::ControllerFenceUnverifiable)
         );
-        assert!(status.delivered_message_id.is_none());
-        TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
-        assert!(condition(&status).is_none(), "a new activation clears the fence failure");
     }
 }

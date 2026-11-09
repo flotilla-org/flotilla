@@ -308,8 +308,8 @@ mod tests {
 
     use super::{crew_attention, home_current, AgentActivityView, HOME_HEARD_WITHIN};
     use crate::{
-        ScreenObstruction, StatusPatch, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSessionPhase,
-        TerminalSessionStatus, TerminalSessionStatusPatch,
+        ScreenObstruction, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSessionDegradedCondition,
+        TerminalSessionPhase, TerminalSessionStatus, TERMINAL_DELIVERY_UNCONFIRMED_REASON,
     };
 
     fn agent(activity: AgentActivity, current: bool) -> AgentActivityView {
@@ -362,12 +362,13 @@ mod tests {
     fn holds_and_obstructions_come_first_and_absence_is_none() {
         let working = agent(AgentActivity::Working, true);
         let mut status = running();
-        TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
-            message_id: "turn".into(),
+        status.degraded = Some(TerminalSessionDegradedCondition {
+            reason: TERMINAL_DELIVERY_UNCONFIRMED_REASON.into(),
             message: "unsent".into(),
+            message_id: Some("turn".into()),
+            consecutive_failures: 1,
             observed_at: Utc::now(),
-        }
-        .apply(&mut status);
+        });
         assert_eq!(crew_attention(Some(&status), Some(&working)), Some(CrewAttention::DeliveryUnconfirmed));
 
         let mut status = running();

@@ -739,14 +739,12 @@ fn landing_session_teardown_does_not_stall(tc: hegel::TestCase) {
                     sessions.delete("resumed-coder").await.unwrap();
                     assert!(sessions.get("resumed-coder").await.unwrap().metadata.deletion_timestamp.is_some());
                 } else {
+                    // What the read view serves for an ended launch: its observations are forgotten.
                     let mut status = session.status.unwrap();
-                    flotilla_resources::TerminalSessionStatusPatch::MarkStopped {
-                        stopped_at: start + chrono::Duration::seconds(1),
-                        inner_command_status: None,
-                        inner_exit_code: None,
-                        message: None,
-                    }
-                    .apply(&mut status);
+                    status.phase = TerminalSessionPhase::Stopped;
+                    status.stopped_at = Some(start + chrono::Duration::seconds(1));
+                    status.cleat_endpoint = None;
+                    status.attention = None;
                     sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.unwrap();
                 }
                 let mut observed_stall = false;

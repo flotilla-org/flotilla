@@ -3,8 +3,8 @@ use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost,
 use flotilla_resources::{
     CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus,
     CloneStatusPatch, ConditionValue, EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, Host, HostCondition, HostSpec,
-    HostStatus, HostStatusPatch, InnerCommandStatus, InputMeta, IntegrationCondition, LandedEvidence, ResourceError, Stance, StatusPatch,
-    TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, VesselPhase, VesselStatus, VesselStatusPatch,
+    HostStatus, HostStatusPatch, InputMeta, IntegrationCondition, LandedEvidence, ResourceError, Stance, StatusPatch,
+    TerminalSessionStatus, VesselPhase, VesselStatus, VesselStatusPatch,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -241,78 +241,6 @@ fn checkout_integration_patch_absorbs_unknown_with_landed_evidence() {
 
     assert_eq!(status.integration.landed.value, ConditionValue::True);
     assert_eq!(status.integration.landed_evidence, Some(evidence));
-}
-
-#[test]
-fn terminal_session_status_patch_marks_running_and_stopped() {
-    let mut status = TerminalSessionStatus::default();
-    let started_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
-    let stopped_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
-
-    TerminalSessionStatusPatch::MarkRunning {
-        configured_limits: None,
-        session_id: "abc123".to_string(),
-        pid: Some(12345),
-        started_at,
-        crew: None,
-        launch_command: "bash".to_string(),
-        delivered_message_id: None,
-    }
-    .apply(&mut status);
-    TerminalSessionStatusPatch::MarkRunning {
-        configured_limits: None,
-        session_id: "abc123".to_string(),
-        pid: Some(12345),
-        started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
-        crew: None,
-        launch_command: "bash".to_string(),
-        delivered_message_id: None,
-    }
-    .apply(&mut status);
-    assert_eq!(status.phase, TerminalSessionPhase::Running);
-    assert_eq!(status.session_id.as_deref(), Some("abc123"));
-    assert_eq!(status.pid, Some(12345));
-    assert_eq!(status.started_at, Some(started_at));
-
-    TerminalSessionStatusPatch::MarkStopped {
-        stopped_at,
-        inner_command_status: Some(InnerCommandStatus::Exited),
-        inner_exit_code: Some(1),
-        message: Some("process exited".to_string()),
-    }
-    .apply(&mut status);
-    TerminalSessionStatusPatch::MarkStopped {
-        stopped_at: Utc.timestamp_opt(21, 0).single().expect("timestamp"),
-        inner_command_status: Some(InnerCommandStatus::Exited),
-        inner_exit_code: Some(1),
-        message: Some("process exited".to_string()),
-    }
-    .apply(&mut status);
-    assert_eq!(status.phase, TerminalSessionPhase::Stopped);
-    assert_eq!(status.inner_command_status, Some(InnerCommandStatus::Exited));
-    assert_eq!(status.inner_exit_code, Some(1));
-    assert_eq!(status.stopped_at, Some(stopped_at));
-
-    TerminalSessionStatusPatch::MarkFailed { message: "failed after stop".to_string(), stopped_at: None }.apply(&mut status);
-    assert_eq!(status.phase, TerminalSessionPhase::Failed);
-    assert_eq!(status.stopped_at, Some(stopped_at), "a later patch without a timestamp must not erase the transition time");
-}
-
-#[test]
-fn terminal_session_failure_is_distinct_from_a_stopped_crew_member_and_can_restart() {
-    let mut status = TerminalSessionStatus::default();
-
-    TerminalSessionStatusPatch::MarkFailed { message: "unknown agent capability `architect`".to_string(), stopped_at: Some(Utc::now()) }
-        .apply(&mut status);
-    assert_eq!(status.phase, TerminalSessionPhase::Failed);
-    assert_eq!(status.message.as_deref(), Some("unknown agent capability `architect`"));
-
-    TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
-    assert_eq!(status.phase, TerminalSessionPhase::Starting);
-    assert_eq!(status.session_id, None);
-    assert_eq!(status.started_at, None);
-    assert_eq!(status.stopped_at, None);
-    assert_eq!(status.message, None);
 }
 
 #[test]

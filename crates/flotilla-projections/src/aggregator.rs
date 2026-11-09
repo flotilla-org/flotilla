@@ -3850,8 +3850,6 @@ mod tests {
     // neither is hidden behind raw-resource inspection, and recovery clears it.
     #[tokio::test]
     async fn vessel_projection_surfaces_terminal_degradation_loss_and_recovery() {
-        use flotilla_resources::{StatusPatch, TerminalSessionStatusPatch};
-
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
@@ -3859,12 +3857,13 @@ mod tests {
         let mut session = session_object("health-session").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "health-convoy".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        TerminalSessionStatusPatch::MarkReconcileDegraded {
+        session.status.as_mut().expect("status").degraded = Some(flotilla_resources::TerminalSessionDegradedCondition {
+            reason: "ReconcileDegraded".into(),
             message: "provider offline".into(),
+            message_id: None,
             consecutive_failures: 100,
             observed_at: Utc::now(),
-        }
-        .apply(session.status.as_mut().expect("status"));
+        });
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
         let rows = state.result_set().await;
         let vessel = &rows.rows.as_convoys().expect("convoys")[0].vessels[0];
@@ -3872,14 +3871,17 @@ mod tests {
             .message
             .as_deref()
             .is_some_and(|message| message.contains("provider unavailable") && message.contains("provider offline")));
-        TerminalSessionStatusPatch::MarkLost { reason: "generation dead".into(), lost_at: Utc::now() }
-            .apply(session.status.as_mut().expect("status"));
+        let status = session.status.as_mut().expect("status");
+        status.phase = flotilla_resources::TerminalSessionPhase::Lost;
+        status.message = Some("generation dead".into());
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session.clone())).await;
         let rows = state.result_set().await;
         let vessel = &rows.rows.as_convoys().expect("convoys")[0].vessels[0];
         assert!(vessel.message.as_deref().is_some_and(|message| message.contains("session lost") && message.contains("generation dead")));
-        TerminalSessionStatusPatch::MarkRevived.apply(session.status.as_mut().expect("status"));
-        TerminalSessionStatusPatch::ClearReconcileDegraded.apply(session.status.as_mut().expect("status"));
+        let status = session.status.as_mut().expect("status");
+        status.phase = flotilla_resources::TerminalSessionPhase::Running;
+        status.message = None;
+        status.degraded = None;
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session)).await;
         let rows = state.result_set().await;
         let vessel = &rows.rows.as_convoys().expect("convoys")[0].vessels[0];

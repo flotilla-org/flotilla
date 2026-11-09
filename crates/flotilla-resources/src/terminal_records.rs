@@ -520,4 +520,27 @@ mod tests {
         assert_eq!(changes.try_recv().ok().as_deref(), Some("t#1"));
         assert!(changes.try_recv().is_err());
     }
+
+    // Native lifecycle hooks mark the launch that reported them; the session's next launch starts
+    // without them, and an ended launch's observations are forgotten with it.
+    #[test]
+    fn native_codex_hooks_hold_until_the_next_launch() {
+        use crate::{TerminalAttention, TerminalAttentionSource, TerminalAttentionState};
+        let observations = TerminalObservations::default();
+        let working = TerminalAttention {
+            state: TerminalAttentionState::Working,
+            as_of: DateTime::UNIX_EPOCH,
+            source: TerminalAttentionSource::Hook,
+        };
+        observations.update("t#1", |observation| {
+            observation.codex_native_hooks |= true;
+            observation.observe_attention(working.clone(), Some("codex"));
+        });
+        let held = observations.get("t#1").expect("observed");
+        assert!(held.codex_native_hooks);
+        assert_eq!(held.attention, Some(working));
+        assert!(!observations.get("t#2").unwrap_or_default().codex_native_hooks);
+        observations.forget("t#1");
+        assert_eq!(observations.get("t#1"), None);
+    }
 }

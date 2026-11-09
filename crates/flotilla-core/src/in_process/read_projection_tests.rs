@@ -1053,8 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn convoy_explanation_reports_terminal_provider_loss_and_recovery() {
         use flotilla_protocol::ExplainedTerminalCondition;
-        use flotilla_resources::{TerminalSessionStatus, TerminalSessionStatusPatch};
-        use flotilla_store::apply_status_patch;
+        use flotilla_resources::{TerminalSessionDegradedCondition, TerminalSessionPhase, TerminalSessionStatus};
 
         let fixture = ProjectionFixture::new();
         fixture
@@ -1068,7 +1067,7 @@ mod tests {
             .await
             .expect("convoy");
         let sessions = fixture.backend.clone().using::<ResourceTerminalSession>("flotilla");
-        let session = sessions
+        sessions
             .create(
                 &InputMeta::builder()
                     .name("health-session".to_string())
@@ -1085,50 +1084,43 @@ mod tests {
             )
             .await
             .expect("session");
-        sessions
-            .update_status(
-                "health-session",
-                &session.metadata.resource_version,
-                &TerminalSessionStatus { phase: flotilla_resources::TerminalSessionPhase::Running, ..Default::default() },
-            )
-            .await
-            .expect("running");
-        apply_status_patch(
-            &sessions,
-            "health-session",
-            &TerminalSessionStatusPatch::MarkReconcileDegraded {
+        let set_status = |status: TerminalSessionStatus| {
+            let sessions = sessions.clone();
+            async move {
+                let current = sessions.get("health-session").await.expect("session");
+                sessions.update_status("health-session", &current.metadata.resource_version, &status).await.expect("status");
+            }
+        };
+        let running = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
+        set_status(TerminalSessionStatus {
+            degraded: Some(TerminalSessionDegradedCondition {
+                reason: "ReconcileDegraded".into(),
                 message: "provider offline".into(),
+                message_id: None,
                 consecutive_failures: 100,
                 observed_at: Utc::now(),
-            },
-        )
-        .await
-        .expect("degradation");
+            }),
+            ..running.clone()
+        })
+        .await;
         let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("explanation");
         assert!(
             matches!(&explanation.crew_deliveries[0].terminal_condition, Some(ExplainedTerminalCondition::ProviderUnavailable { message }) if message == "provider offline")
         );
-        apply_status_patch(
-            &sessions,
-            "health-session",
-            &TerminalSessionStatusPatch::MarkLost { reason: "daemon generation dead".into(), lost_at: Utc::now() },
-        )
-        .await
-        .expect("confirmed loss");
+        set_status(TerminalSessionStatus {
+            phase: TerminalSessionPhase::Lost,
+            message: Some("daemon generation dead".into()),
+            ..Default::default()
+        })
+        .await;
         let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("explanation");
         assert!(matches!(&explanation.crew_deliveries[0].terminal_condition, Some(ExplainedTerminalCondition::SessionLost { .. })));
-        apply_status_patch(&sessions, "health-session", &TerminalSessionStatusPatch::MarkRevived).await.expect("revive");
-        apply_status_patch(&sessions, "health-session", &TerminalSessionStatusPatch::ClearReconcileDegraded).await.expect("recovered");
+        set_status(running).await;
         let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("explanation");
         assert!(explanation.crew_deliveries[0].terminal_condition.is_none());
         let diagnostic = "Codex launch usage error (exit 2): error: unexpected argument '--no-daemon' found";
-        apply_status_patch(
-            &sessions,
-            "health-session",
-            &TerminalSessionStatusPatch::MarkFailed { message: diagnostic.into(), stopped_at: Some(Utc::now()) },
-        )
-        .await
-        .expect("usage failure");
+        set_status(TerminalSessionStatus { phase: TerminalSessionPhase::Failed, message: Some(diagnostic.into()), ..Default::default() })
+            .await;
         let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("failed explanation");
         let condition = explanation.crew_deliveries[0].terminal_condition.as_ref().expect("visible failure");
         assert!(matches!(condition, ExplainedTerminalCondition::ProcessFailed { message } if message == diagnostic));

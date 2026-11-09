@@ -6,8 +6,8 @@ pub use flotilla_protocol::{CrewMessageDelivery, CrewMessageSender};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    resource::define_resource, status_patch::StatusPatch, InputMeta, OwnerReference, ReplicationClass, Resource, ResourceObject, Selector,
-    Vessel, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    resource::define_resource, status_patch::NoStatusPatch, InputMeta, OwnerReference, ReplicationClass, Resource, ResourceObject,
+    Selector, Vessel, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 /// A pre-write refusal that cannot recover before the agent activation ends.
@@ -27,7 +27,7 @@ define_resource!(
     "terminalsessions",
     TerminalSessionSpec,
     TerminalSessionStatus,
-    TerminalSessionStatusPatch,
+    NoStatusPatch,
     replication = ReplicationClass::HomeBoundRuntime,
     queryable = &[
         "metadata.name",
@@ -443,19 +443,6 @@ pub struct TerminalSessionDegradedCondition {
 }
 
 impl TerminalSessionStatus {
-    /// N→N+1: old Codex notify supplies only turn-complete (Idle), so every newer
-    /// completion timestamp is evidence even inside the screen debounce window.
-    pub fn should_record_attention(&self, incoming: &TerminalAttention) -> bool {
-        self.attention.as_ref().is_none_or(|previous| {
-            previous.should_replace_with(incoming)
-                || (!self.codex_native_hooks
-                    && self.crew.as_ref().is_some_and(|crew| crew.adapter == "codex")
-                    && incoming.source == TerminalAttentionSource::Hook
-                    && incoming.state == TerminalAttentionState::Idle
-                    && incoming.as_of > previous.as_of)
-        })
-    }
-
     /// N→N+1: notify-only fallback, disabled by the first native lifecycle hook.
     /// Remove after the next fleet roll. Whether a Codex crew without native hooks finished a
     /// turn submitted at `submitted_at`: its AgentSession went Idle after it, as its notify hook
@@ -467,15 +454,6 @@ impl TerminalSessionStatus {
             && self.crew.as_ref().is_some_and(|crew| crew.adapter == "codex")
             && self.started_at.is_some_and(|started| submitted_at >= started)
             && agent.is_some_and(|agent| agent.completed_after(submitted_at))
-    }
-
-    /// Count the next failed attempt for this message, retaining a saturated
-    /// ceiling. A different message starts a fresh delivery budget.
-    pub fn next_delivery_failure_count(&self, message_id: &str) -> u32 {
-        self.degraded
-            .as_ref()
-            .filter(|condition| condition.message_id.as_deref() == Some(message_id))
-            .map_or(1, |condition| condition.consecutive_failures.saturating_add(1))
     }
 }
 
@@ -676,282 +654,12 @@ pub struct CrewSessionStatus {
     pub stance: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TerminalSessionStatusPatch {
-    HoldTurnDelivery {
-        hold: crate::ConvoyAttention,
-    },
-    /// Starts a new attempt after a stopped session by clearing the previous attempt's status.
-    /// Failed-session retry is not currently a legal controller transition.
-    MarkStarting,
-    ClearRetiredLaunches,
-    ObserveCleatEndpoint {
-        endpoint: Option<flotilla_protocol::result_set::CleatEndpoint>,
-    },
-    ObserveDaemonReach {
-        unreachable: Option<String>,
-    },
-    MarkRunning {
-        configured_limits: Option<ConfiguredResourceLimits>,
-        session_id: String,
-        pid: Option<i64>,
-        started_at: DateTime<Utc>,
-        crew: Option<CrewSessionStatus>,
-        launch_command: String,
-        delivered_message_id: Option<String>,
-    },
-    MarkMessageDelivered {
-        message_id: String,
-    },
-    ClearMessageDeliveryHold {
-        message_id: String,
-    },
-    MarkDeliveryExpired,
-    MarkDeliveryNotSubmitted {
-        message_id: String,
-        message: String,
-        observed_at: DateTime<Utc>,
-    },
-    MarkControllerFenceUnverifiable {
-        message_id: String,
-        message: String,
-        observed_at: DateTime<Utc>,
-    },
-    MarkDeliveryUnconfirmed {
-        message_id: String,
-        message: String,
-        observed_at: DateTime<Utc>,
-    },
-    MarkStopped {
-        stopped_at: DateTime<Utc>,
-        inner_command_status: Option<InnerCommandStatus>,
-        inner_exit_code: Option<i32>,
-        message: Option<String>,
-    },
-    MarkLost {
-        reason: String,
-        lost_at: DateTime<Utc>,
-    },
-    MarkRevived,
-    MarkFailed {
-        message: String,
-        stopped_at: Option<DateTime<Utc>>,
-    },
-    MarkReconcileDegraded {
-        message: String,
-        consecutive_failures: u32,
-        observed_at: DateTime<Utc>,
-    },
-    ClearReconcileDegraded,
-    ObserveNativeCodexHook {
-        attention: TerminalAttention,
-    },
-    ObserveAttention {
-        attention: TerminalAttention,
-    },
-    Observe {
-        attention: Option<TerminalAttention>,
-        /// The screen read behind `attention`, when one was read.
-        obstruction: Option<Option<ScreenObstruction>>,
-        occupancy: TerminalOccupancy,
-    },
-    MarkCompletionPending {
-        pending: CrewCompletionPending,
-    },
-    ClearCompletionPending,
-}
-
-impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
-    fn apply(&self, status: &mut TerminalSessionStatus) {
-        match self {
-            Self::HoldTurnDelivery { hold } => status.turn_delivery_hold = Some(hold.clone()),
-            Self::MarkStarting => {
-                let completion_pending = status.completion_pending.take();
-                let turn_delivery_hold = status.turn_delivery_hold.take();
-                let mut retired_launches = std::mem::take(&mut status.retired_launches);
-                if let Some(crew) = status.crew.take() {
-                    retired_launches.insert(crew.id);
-                }
-                *status = TerminalSessionStatus { completion_pending, turn_delivery_hold, retired_launches, ..Default::default() };
-            }
-            Self::ClearRetiredLaunches => status.retired_launches.clear(),
-            Self::ObserveCleatEndpoint { endpoint } => status.cleat_endpoint = endpoint.clone(),
-            Self::ObserveDaemonReach { unreachable } => status.daemon_unreachable = unreachable.clone(),
-            Self::MarkRunning { configured_limits, session_id, pid, started_at, crew, launch_command, delivered_message_id } => {
-                status.configured_limits = configured_limits.clone();
-                status.phase = TerminalSessionPhase::Running;
-                status.session_id = Some(session_id.clone());
-                status.pid = *pid;
-                status.started_at.get_or_insert(*started_at);
-                status.inner_command_status = Some(InnerCommandStatus::Running);
-                status.message = None;
-                status.crew = crew.clone();
-                status.launch_command = Some(launch_command.clone());
-                status.delivered_message_id = delivered_message_id.clone();
-                if delivered_message_id.is_some() {
-                    status.turn_delivery_hold = None;
-                }
-                status.degraded = None;
-            }
-            Self::MarkMessageDelivered { message_id } => {
-                status.turn_delivery_hold = None;
-                status.delivered_message_id = Some(message_id.clone());
-                status.message = None;
-                status.degraded = None;
-                // A fresh idle observation must follow delivery before stall
-                // supervision treats the agent as having finished this turn.
-                status.attention = None;
-            }
-            Self::ClearMessageDeliveryHold { message_id } => {
-                if status
-                    .degraded
-                    .as_ref()
-                    .is_some_and(|condition| condition.is_delivery() && condition.message_id.as_ref() == Some(message_id))
-                {
-                    status.degraded = None;
-                    status.message = None;
-                }
-            }
-            Self::MarkDeliveryExpired => {
-                if let Some(condition) =
-                    status.degraded.as_mut().filter(|condition| condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON)
-                {
-                    condition.reason = TERMINAL_DELIVERY_EXPIRED_REASON.to_string();
-                    condition.message =
-                        "message delivery confirmation deadline expired; submission may have been accepted; explicit intervention required"
-                            .to_string();
-                    status.message = Some(condition.message.clone());
-                }
-            }
-            Self::MarkControllerFenceUnverifiable { message_id, message, observed_at }
-            | Self::MarkDeliveryUnconfirmed { message_id, message, observed_at }
-            | Self::MarkDeliveryNotSubmitted { message_id, message, observed_at } => {
-                let consecutive_failures = status.next_delivery_failure_count(message_id);
-                status.message = Some(message.clone());
-                status.degraded = Some(TerminalSessionDegradedCondition {
-                    reason: if matches!(self, Self::MarkControllerFenceUnverifiable { .. }) {
-                        CONTROLLER_FENCE_UNVERIFIABLE_REASON
-                    } else if matches!(self, Self::MarkDeliveryNotSubmitted { .. }) {
-                        TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
-                    } else {
-                        TERMINAL_DELIVERY_UNCONFIRMED_REASON
-                    }
-                    .to_string(),
-                    message: message.clone(),
-                    message_id: Some(message_id.clone()),
-                    consecutive_failures,
-                    observed_at: *observed_at,
-                });
-            }
-            Self::MarkStopped { stopped_at, inner_command_status, inner_exit_code, message } => {
-                status.phase = TerminalSessionPhase::Stopped;
-                status.cleat_endpoint = None;
-                status.stopped_at.get_or_insert(*stopped_at);
-                status.inner_command_status = *inner_command_status;
-                status.inner_exit_code = *inner_exit_code;
-                status.message = message.clone();
-                status.degraded = None;
-                if let Some(attention) = &mut status.attention {
-                    attention.state = TerminalAttentionState::Unobservable;
-                    attention.as_of = *stopped_at;
-                }
-            }
-            Self::MarkLost { reason, lost_at } => {
-                status.phase = TerminalSessionPhase::Lost;
-                status.cleat_endpoint = None;
-                status.stopped_at.get_or_insert(*lost_at);
-                status.inner_command_status = None;
-                status.inner_exit_code = None;
-                status.message = Some(reason.clone());
-                status.degraded = None;
-                status.attention = None;
-                status.occupancy = TerminalOccupancy::Unknown;
-            }
-            Self::MarkRevived => {
-                status.phase = TerminalSessionPhase::Running;
-                status.stopped_at = None;
-                status.inner_command_status = Some(InnerCommandStatus::Running);
-                status.message = None;
-            }
-            Self::MarkFailed { message, stopped_at } => {
-                status.phase = TerminalSessionPhase::Failed;
-                status.cleat_endpoint = None;
-                if let Some(stopped_at) = stopped_at {
-                    status.stopped_at.get_or_insert(*stopped_at);
-                }
-                status.message = Some(message.clone());
-                status.degraded = None;
-                if let Some(attention) = &mut status.attention {
-                    attention.state = TerminalAttentionState::Unobservable;
-                    if let Some(stopped_at) = stopped_at {
-                        attention.as_of = *stopped_at;
-                    }
-                }
-            }
-            Self::MarkReconcileDegraded { message, consecutive_failures, observed_at } => {
-                if status.degraded.as_ref().is_some_and(TerminalSessionDegradedCondition::is_delivery) {
-                    return;
-                }
-                status.message = Some(format!("reconcile backing off after {consecutive_failures} consecutive failures: {message}"));
-                status.degraded = Some(TerminalSessionDegradedCondition {
-                    reason: "ReconcileBackoff".to_string(),
-                    message: message.clone(),
-                    message_id: None,
-                    consecutive_failures: *consecutive_failures,
-                    observed_at: *observed_at,
-                });
-                if let Some(attention) = &mut status.attention {
-                    attention.state = TerminalAttentionState::Unobservable;
-                    attention.as_of = *observed_at;
-                }
-            }
-            Self::ClearReconcileDegraded => {
-                if !status.degraded.as_ref().is_some_and(TerminalSessionDegradedCondition::is_delivery) {
-                    status.message = None;
-                    status.degraded = None;
-                }
-            }
-            Self::ObserveNativeCodexHook { attention } => {
-                status.codex_native_hooks = true;
-                Self::ObserveAttention { attention: attention.clone() }.apply(status);
-            }
-            Self::ObserveAttention { attention } => {
-                let replace = status.should_record_attention(attention);
-                if replace {
-                    status.attention = Some(attention.clone());
-                }
-                if !status.degraded.as_ref().is_some_and(TerminalSessionDegradedCondition::is_delivery) {
-                    status.message = None;
-                    status.degraded = None;
-                }
-            }
-            Self::Observe { attention, obstruction, occupancy } => {
-                status.occupancy = *occupancy;
-                if let Some(obstruction) = obstruction {
-                    status.screen_obstruction = obstruction.clone();
-                }
-                if let Some(attention) = attention {
-                    let replace = status.should_record_attention(attention);
-                    if replace {
-                        status.attention = Some(attention.clone());
-                    }
-                }
-                if !status.degraded.as_ref().is_some_and(TerminalSessionDegradedCondition::is_delivery) {
-                    status.message = None;
-                    status.degraded = None;
-                }
-            }
-            Self::MarkCompletionPending { pending } => status.completion_pending = Some(pending.clone()),
-            Self::ClearCompletionPending => status.completion_pending = None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::*;
+    use crate::terminal_records::TerminalObservation;
 
     // #3460: replies to terminal queries whose `ESC [` prefix was consumed are
     // recognised; prose, placeholders and bare numbers are not.
@@ -979,15 +687,20 @@ mod tests {
         let unobservable =
             TerminalAttention { state: TerminalAttentionState::Unobservable, as_of: at, source: TerminalAttentionSource::Screen };
         let stray = ScreenObstruction::ComposerText { reply: Some("6;24;9t".into()), chars: 7 };
-        let observe = |obstruction| TerminalSessionStatusPatch::Observe {
-            attention: Some(unobservable.clone()),
-            obstruction,
-            occupancy: TerminalOccupancy::Vacant,
+        let mut observation = TerminalObservation::default();
+        let mut observe = |obstruction| {
+            observation.observe(Some(unobservable.clone()), obstruction, TerminalOccupancy::Vacant, None);
+            // What the read view serves from a running launch's observation.
+            TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                attention: observation.attention.clone(),
+                screen_obstruction: observation.screen_obstruction.clone(),
+                ..Default::default()
+            }
         };
-        let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
-        observe(Some(Some(stray.clone()))).apply(&mut status);
+        let status = observe(Some(Some(stray.clone())));
         assert_eq!(status.idle_obstruction(), Some(&stray));
-        observe(None).apply(&mut status);
+        let mut status = observe(None);
         assert_eq!(status.screen_obstruction.as_ref(), Some(&stray), "no screen read keeps it");
         assert_eq!(crate::crew_attention(Some(&status), None), Some(flotilla_protocol::CrewAttention::IdleComposerText));
         let described = stray.describe("crew-session");
@@ -1000,8 +713,7 @@ mod tests {
         status.attention =
             Some(TerminalAttention { state: TerminalAttentionState::Working, as_of: at, source: TerminalAttentionSource::Hook });
         assert_eq!(status.idle_obstruction(), None);
-        status.attention = Some(unobservable.clone());
-        observe(Some(None)).apply(&mut status);
+        let status = observe(Some(None));
         assert_eq!(status.idle_obstruction(), None, "a clear screen read clears it");
         assert_eq!(crate::crew_attention(Some(&status), None), None, "nothing obstructs and no agent has reported");
     }
@@ -1031,63 +743,6 @@ mod tests {
         status.attention.as_mut().unwrap().source = TerminalAttentionSource::Screen;
         status.attention.as_mut().unwrap().state = TerminalAttentionState::Idle;
         assert_eq!(status.attention_obstruction(), None);
-    }
-
-    // #2755: observations and repeated expiry cannot erase a delivery failure,
-    // reset its deadline, acknowledge the message, or change its attempt count.
-    #[hegel::test]
-    fn delivery_expiry_survives_observation_interleavings(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let at = Utc.with_ymd_and_hms(2026, 10, 6, 0, 0, 0).single().expect("timestamp");
-        let mut status = TerminalSessionStatus::default();
-        TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { message_id: "turn".into(), message: "held".into(), observed_at: at }
-            .apply(&mut status);
-        // Includes no observations, duplicate expiry, every attention state,
-        // both sources, observation errors, and output/tool activity updates.
-        let steps = tc.draw(gs::integers::<usize>().min_value(0).max_value(12));
-        let mut expired = false;
-        for step in 0..steps {
-            let attention = TerminalAttention {
-                state: [
-                    TerminalAttentionState::Idle,
-                    TerminalAttentionState::Working,
-                    TerminalAttentionState::NeedsInput,
-                    TerminalAttentionState::Unobservable,
-                ][tc.draw(gs::integers::<usize>().min_value(0).max_value(3))],
-                source: if tc.draw(gs::booleans()) { TerminalAttentionSource::Hook } else { TerminalAttentionSource::Screen },
-                as_of: at + chrono::Duration::seconds((step as i64 + 1) * 6),
-            };
-            let patch = match tc.draw(gs::integers::<usize>().min_value(0).max_value(4)) {
-                0 => {
-                    expired = true;
-                    TerminalSessionStatusPatch::MarkDeliveryExpired
-                }
-                1 => TerminalSessionStatusPatch::ObserveAttention { attention },
-                2 => TerminalSessionStatusPatch::ObserveNativeCodexHook { attention },
-                3 => TerminalSessionStatusPatch::Observe {
-                    obstruction: None,
-                    attention: Some(attention),
-                    occupancy: TerminalOccupancy::Vacant,
-                },
-                _ => TerminalSessionStatusPatch::MarkReconcileDegraded {
-                    message: "pool unavailable".into(),
-                    consecutive_failures: 5,
-                    observed_at: at + chrono::Duration::minutes(1),
-                },
-            };
-            patch.apply(&mut status);
-            let condition = status.degraded.as_ref().expect("durable delivery failure");
-            assert!(condition.is_delivery());
-            assert_eq!(condition.reason, if expired { TERMINAL_DELIVERY_EXPIRED_REASON } else { TERMINAL_DELIVERY_UNCONFIRMED_REASON });
-            assert_eq!(condition.observed_at, at);
-            assert_eq!(condition.consecutive_failures, 1);
-            assert_eq!(condition.message_id.as_deref(), Some("turn"));
-            assert!(status.delivered_message_id.is_none());
-        }
-        // Only consumption evidence or an explicit lifecycle transition clears it.
-        TerminalSessionStatusPatch::MarkMessageDelivered { message_id: "turn".into() }.apply(&mut status);
-        assert!(status.degraded.is_none());
-        assert_eq!(status.delivered_message_id.as_deref(), Some("turn"));
     }
 
     #[test]
@@ -1152,44 +807,13 @@ mod tests {
         restarted.started_at = Some(submitted + chrono::Duration::milliseconds(1));
         assert!(!restarted.codex_completed_after(Some(&idle), submitted), "a new launch cannot acknowledge old input");
         let mut native = status.clone();
-        TerminalSessionStatusPatch::ObserveNativeCodexHook {
-            attention: attention(TerminalAttentionState::Idle, TerminalAttentionSource::Hook, 0),
-        }
-        .apply(&mut native);
+        native.codex_native_hooks = true;
         assert!(!native.codex_completed_after(Some(&idle), submitted), "native lifecycle hooks disable the notify shim");
-    }
-
-    // Native lifecycle hooks mark the session until its next launch.
-    #[test]
-    fn native_codex_hooks_hold_until_the_next_launch() {
-        let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
-        let working = attention(TerminalAttentionState::Working, TerminalAttentionSource::Hook, 1);
-        TerminalSessionStatusPatch::ObserveNativeCodexHook { attention: working.clone() }.apply(&mut status);
-        assert!(status.codex_native_hooks);
-        assert_eq!(status.attention, Some(working));
-        TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
-        assert!(!status.codex_native_hooks);
     }
 
     fn attention(state: TerminalAttentionState, source: TerminalAttentionSource, second: u32) -> TerminalAttention {
         let base = Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).single().expect("valid timestamp");
         TerminalAttention { state, source, as_of: base + chrono::Duration::seconds(i64::from(second)) }
-    }
-
-    #[test]
-    fn attention_observation_never_changes_a_terminal_phase() {
-        let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
-        TerminalSessionStatusPatch::ObserveAttention {
-            attention: TerminalAttention {
-                state: TerminalAttentionState::Idle,
-                as_of: Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).single().expect("valid timestamp"),
-                source: TerminalAttentionSource::Hook,
-            },
-        }
-        .apply(&mut status);
-
-        assert_eq!(status.phase, TerminalSessionPhase::Running);
-        assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Idle);
     }
 
     #[test]
@@ -1240,191 +864,11 @@ mod tests {
         assert!(first.should_replace_with(&refresh));
     }
 
-    #[test]
-    fn stopping_a_session_makes_its_attention_unobservable() {
-        let stopped_at = Utc.with_ymd_and_hms(2026, 7, 22, 12, 1, 0).single().expect("valid timestamp");
-        let mut status = TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            attention: Some(attention(TerminalAttentionState::NeedsInput, TerminalAttentionSource::Hook, 0)),
-            ..Default::default()
-        };
-
-        TerminalSessionStatusPatch::MarkStopped { stopped_at, inner_command_status: None, inner_exit_code: None, message: None }
-            .apply(&mut status);
-
-        assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Unobservable);
-    }
-
-    #[test]
-    fn delivery_unconfirmed_preserves_the_specific_failure_diagnostic() {
-        let observed_at = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).single().expect("valid timestamp");
-        let message = "agent TUI did not become ready before the message delivery deadline; no text was sent";
-        let mut status = TerminalSessionStatus::default();
-
-        TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
-            message_id: "handoff-1".to_string(),
-            message: message.to_string(),
-            observed_at,
-        }
-        .apply(&mut status);
-
-        assert_eq!(status.message.as_deref(), Some(message));
-        let condition = status.degraded.expect("delivery condition");
-        assert_eq!(condition.reason, "DeliveryUnconfirmed");
-        assert_eq!(condition.message, message);
-        assert_eq!(condition.message_id.as_deref(), Some("handoff-1"));
-    }
-
-    // Delivery acknowledgement and attempt-ending lifecycle transitions release
-    // a hold. Reviving an existing process alone supplies no delivery evidence.
-    #[test]
-    fn delivery_holds_clear_when_the_attempt_is_retired_or_acknowledged() {
-        let now = Utc::now();
-        for patch in [
-            TerminalSessionStatusPatch::MarkMessageDelivered { message_id: "message".into() },
-            TerminalSessionStatusPatch::MarkStarting,
-            TerminalSessionStatusPatch::MarkStopped { stopped_at: now, inner_command_status: None, inner_exit_code: None, message: None },
-            TerminalSessionStatusPatch::MarkLost { reason: "lost".into(), lost_at: now },
-            TerminalSessionStatusPatch::MarkFailed { message: "failed".into(), stopped_at: Some(now) },
-        ] {
-            let mut status = TerminalSessionStatus::default();
-            TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { message_id: "message".into(), message: "hold".into(), observed_at: now }
-                .apply(&mut status);
-            TerminalSessionStatusPatch::MarkRevived.apply(&mut status);
-            assert!(status.degraded.is_some(), "revival alone must retain delivery evidence");
-            patch.apply(&mut status);
-            assert!(status.degraded.is_none(), "attempt retirement or acknowledgement must release the hold");
-        }
-    }
-
-    // #2705: hook/screen observations and provider recovery cannot erase a
-    // delivery hold or its retry budget. Generate both delivery outcomes and
-    // arbitrary observation/recovery sequences, checking after every patch.
-    #[hegel::test]
-    fn delivery_conditions_survive_unrelated_status_updates(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let unsent = tc.draw(gs::booleans());
-        let attempts = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
-        let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
-        let observed_at = Utc::now();
-        let mut status = TerminalSessionStatus::default();
-        for attempt in 1..=attempts {
-            let patch = if unsent {
-                TerminalSessionStatusPatch::MarkDeliveryNotSubmitted {
-                    message_id: "message".into(),
-                    message: "not sent".into(),
-                    observed_at,
-                }
-            } else {
-                TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
-                    message_id: "message".into(),
-                    message: "uncertain".into(),
-                    observed_at,
-                }
-            };
-            patch.apply(&mut status);
-            assert_eq!(status.degraded.as_ref().expect("condition").consecutive_failures, attempt as u32);
-        }
-        let held = status.degraded.clone();
-        let diagnostic = status.message.clone();
-        for _ in 0..steps {
-            let attention =
-                TerminalAttention { state: TerminalAttentionState::Working, as_of: observed_at, source: TerminalAttentionSource::Hook };
-            let patch = match tc.draw(gs::integers::<usize>().min_value(0).max_value(4)) {
-                0 => TerminalSessionStatusPatch::ObserveAttention { attention },
-                1 => TerminalSessionStatusPatch::Observe {
-                    obstruction: None,
-                    attention: Some(attention),
-                    occupancy: TerminalOccupancy::Occupied,
-                },
-                2 => TerminalSessionStatusPatch::ObserveNativeCodexHook { attention },
-                3 => TerminalSessionStatusPatch::MarkReconcileDegraded {
-                    message: "provider outage".into(),
-                    consecutive_failures: 5,
-                    observed_at,
-                },
-                _ => TerminalSessionStatusPatch::ClearReconcileDegraded,
-            };
-            patch.apply(&mut status);
-            assert_eq!(status.degraded, held);
-            assert_eq!(status.message, diagnostic);
-        }
-        TerminalSessionStatusPatch::MarkMessageDelivered { message_id: "message".into() }.apply(&mut status);
-        assert!(status.degraded.is_none());
-    }
-
-    // #2758: a terminal restart retains the automatic hold until a continuation
-    // is delivered. Generate repeated resets and both continuation delivery paths.
-    #[hegel::test]
-    fn hold_survives_terminal_restart_until_continuation(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let restarts = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
-        let launch_delivery = tc.draw(gs::booleans());
-        let hold = crate::ConvoyAttention {
-            source: "checks-settled".into(),
-            reason: "episode limit".into(),
-            raised_at: chrono::DateTime::<Utc>::UNIX_EPOCH,
-        };
-        let mut status = TerminalSessionStatus::default();
-        TerminalSessionStatusPatch::HoldTurnDelivery { hold: hold.clone() }.apply(&mut status);
-        for _ in 0..restarts {
-            TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
-            TerminalSessionStatusPatch::MarkRunning {
-                configured_limits: None,
-                session_id: "session".into(),
-                pid: None,
-                started_at: hold.raised_at,
-                crew: None,
-                launch_command: "agent".into(),
-                delivered_message_id: None,
-            }
-            .apply(&mut status);
-            assert_eq!(status.turn_delivery_hold.as_ref(), Some(&hold));
-        }
-        let continuation = if launch_delivery {
-            TerminalSessionStatusPatch::MarkRunning {
-                configured_limits: None,
-                session_id: "session".into(),
-                pid: None,
-                started_at: hold.raised_at,
-                crew: None,
-                launch_command: "agent".into(),
-                delivered_message_id: Some("resume".into()),
-            }
-        } else {
-            TerminalSessionStatusPatch::MarkMessageDelivered { message_id: "resume".into() }
-        };
-        continuation.apply(&mut status);
-        assert!(status.turn_delivery_hold.is_none());
-    }
-
     // Composer drafts are held in memory now; a stored status that saved some still decodes.
     #[test]
     fn status_with_retired_stashed_drafts_still_decodes() {
         let status: TerminalSessionStatus =
             serde_json::from_value(serde_json::json!({ "phase": "Running", "stashed_drafts": ["half a thought"] })).expect("decodes");
         assert_eq!(status.phase, TerminalSessionPhase::Running);
-    }
-
-    #[test]
-    fn pending_completion_survives_terminal_restart_until_acknowledged() {
-        let pending = CrewCompletionPending {
-            message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
-            disposition: None,
-            decision_ledger_ref: None,
-            force: false,
-            principal_ref: None,
-            attempted_at: Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).single().expect("valid timestamp"),
-            authority: "kiwi".into(),
-            last_error: "authority unreachable for convoy-a".into(),
-        };
-        let mut status =
-            TerminalSessionStatus { phase: TerminalSessionPhase::Running, completion_pending: Some(pending.clone()), ..Default::default() };
-
-        TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
-        assert_eq!(status.completion_pending, Some(pending));
-
-        TerminalSessionStatusPatch::ClearCompletionPending.apply(&mut status);
-        assert_eq!(status.completion_pending, None);
     }
 }
