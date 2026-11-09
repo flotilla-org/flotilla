@@ -1388,19 +1388,21 @@ async fn a_rotated_central_login_is_pushed_into_the_ssh_host_crew_home() {
     let launched = landed(runtime.deliveries().await);
 
     write_central_login(&runtime.daemon_home, "access-two");
-    super::super::access_layer::redeliver_central_logins(&runtime.state, NAMESPACE).await.expect("redelivery pass");
+    let retry = super::super::access_layer::redeliver_central_logins(&runtime.state, NAMESPACE, true).await.expect("redelivery pass");
 
+    assert_eq!(retry, None, "nothing left to retry");
     assert_holds_central_copy(&host, &home, "access-two");
     let rotated = landed(runtime.deliveries().await);
     assert_ne!(rotated, launched, "the access records the rotated copy");
     let writes = host.writes.lock().expect("writes").len();
-    super::super::access_layer::redeliver_central_logins(&runtime.state, NAMESPACE).await.expect("idle pass");
+    super::super::access_layer::redeliver_central_logins(&runtime.state, NAMESPACE, false).await.expect("idle pass");
     assert_eq!(host.writes.lock().expect("writes").len(), writes, "an unchanged copy is not pushed again");
     assert_eq!(host.entry(format!("{HOST_HOME}/.codex/auth.json")), Some(HostEntry::File(r#"{"tokens":"host-login"}"#.into())));
 }
 
 // #4037 contract 2: a push that fails leaves the crew on its earlier copy, is shown on its
-// access in `convoy explain` with when it is next attempted, and lands once due.
+// access in `convoy explain` with when it is next attempted, and lands once due. The pass
+// answers that time, which credential delivery takes as its deadline (#3108).
 #[tokio::test]
 async fn a_failed_login_push_is_explained_and_retried() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
@@ -1412,17 +1414,18 @@ async fn a_failed_login_push_is_explained_and_retried() {
         let [delivery] = deliveries.as_slice() else { panic!("one access: {deliveries:?}") };
         delivery.retry.clone()
     };
-    let redeliver = || super::super::access_layer::redeliver_central_logins(&runtime.state, NAMESPACE);
+    let redeliver = |rotated| super::super::access_layer::redeliver_central_logins(&runtime.state, NAMESPACE, rotated);
     host.refused.lock().expect("refused").insert(PathBuf::from(format!("{home}/auth.json")));
 
     write_central_login(&runtime.daemon_home, "access-two");
-    redeliver().await.expect("redelivery pass");
+    let next = redeliver(true).await.expect("redelivery pass");
 
     assert_holds_central_copy(&host, &home, "access-one");
     let failed = retry(runtime.deliveries().await).expect("the failed push is explained");
     assert_eq!((failed.need.as_str(), failed.attempts), ("login", 1));
     assert!(failed.error.contains("No space left on device"), "{}", failed.error);
-    redeliver().await.expect("redelivery pass");
+    assert!(next.is_some(), "the pass answers when the retry falls due");
+    assert_eq!(redeliver(false).await.expect("redelivery pass"), next, "the retry is still pending");
     assert_eq!(retry(runtime.deliveries().await), Some(failed), "no attempt before the retry is due");
 
     // The disk recovers and the recorded retry falls due.
@@ -1433,7 +1436,67 @@ async fn a_failed_login_push_is_explained_and_retried() {
     due.retry.as_mut().expect("retry").next_at = flotilla_schema::Timestamp::from_datetime(&chrono::DateTime::UNIX_EPOCH);
     let meta = InputMeta::builder().name(record.metadata.name.clone()).labels(record.metadata.labels.clone()).build();
     records.update(&meta, &record.metadata.resource_version, &due).await.expect("retry due");
-    redeliver().await.expect("redelivery pass");
+    assert_eq!(redeliver(false).await.expect("redelivery pass"), None);
     assert_holds_central_copy(&host, &home, "access-two");
     assert_eq!(retry(runtime.deliveries().await), None);
+}
+
+// #3108: a push failing ten times in a row is no longer retried on a deadline; the next
+// rotation tries it once more.
+#[tokio::test]
+async fn an_exhausted_login_push_waits_for_the_next_rotation() {
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "codex").await;
+    runtime.launch().await.expect("delivered");
+    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/codex");
+    let redeliver = |rotated| super::super::access_layer::redeliver_central_logins(&runtime.state, NAMESPACE, rotated);
+    let attempts = || async {
+        let [delivery] = runtime.deliveries().await.try_into().expect("one access");
+        delivery.retry.map(|retry| retry.attempts)
+    };
+    host.refused.lock().expect("refused").insert(PathBuf::from(format!("{home}/auth.json")));
+    write_central_login(&runtime.daemon_home, "access-two");
+    redeliver(true).await.expect("redelivery pass");
+
+    // The tenth failure, long due.
+    let records = runtime.daemon.resource_backend().using::<flotilla_resources::AccessDelivery>(NAMESPACE);
+    let [record] = records.list().await.expect("records").items.try_into().expect("one record");
+    let mut exhausted = record.spec.clone();
+    let retry = exhausted.retry.as_mut().expect("retry");
+    retry.attempts = 10;
+    retry.next_at = flotilla_schema::Timestamp::from_datetime(&chrono::DateTime::UNIX_EPOCH);
+    let meta = InputMeta::builder().name(record.metadata.name.clone()).labels(record.metadata.labels.clone()).build();
+    records.update(&meta, &record.metadata.resource_version, &exhausted).await.expect("exhausted");
+
+    assert_eq!(redeliver(false).await.expect("redelivery pass"), None, "nothing to wait for");
+    assert_eq!(attempts().await, Some(10), "no attempt without a rotation");
+    assert_eq!(redeliver(true).await.expect("redelivery pass"), None, "past the limit after another failure");
+    assert_eq!(attempts().await, Some(11), "a rotation tries once more");
+    assert_holds_central_copy(&host, &home, "access-one");
+}
+
+// #3108: the refresher's rotation wakes credential delivery, which pushes the new copy; no
+// timer stands behind it.
+#[tokio::test]
+async fn a_rotation_wakes_credential_delivery_to_push_the_new_login() {
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "codex").await;
+    runtime.launch().await.expect("delivered");
+    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/codex");
+    let delivery = super::super::credential_delivery::CredentialDelivery::new(Arc::clone(&runtime.state)).expect("a credential store");
+    let _controller = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+        delivery.run(runtime.state.controller_metrics.for_kind("CredentialDelivery")),
+    ));
+
+    write_central_login(&runtime.daemon_home, "access-two");
+    runtime.state.credential_events.codex_rotated();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while host.json(format!("{home}/auth.json"))["tokens"]["access_token"] != "access-two" {
+        assert!(tokio::time::Instant::now() < deadline, "the rotation was never pushed");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_holds_central_copy(&host, &home, "access-two");
 }

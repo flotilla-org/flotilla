@@ -1,11 +1,12 @@
 //! Work-credential delivery as one controller per daemon (#3108).
 //!
 //! The controller keeps each environment's credential files in step with the crews running
-//! there, and keeps GitHub App tokens fresh. It runs on events, never on a timer: a crew
-//! session's phase changing, an environment's record changing, a project's membership or a
-//! credential definition changing, or a request from crew operations or a person. Time enters
-//! only through one deadline: the earliest GitHub App refresh or retry, or the earliest retry of
-//! a failed environment.
+//! there, keeps GitHub App tokens fresh, and pushes the central Codex login into crews' homes
+//! after it rotates. It runs on events, never on a timer: a crew session's phase changing, an
+//! environment's record changing, a project's membership or a credential definition changing,
+//! the central Codex login rotating, or a request from crew operations or a person. Time enters
+//! only through one deadline: the earliest GitHub App refresh or retry, the earliest retry of a
+//! failed environment, or the earliest retry of a Codex login push.
 //!
 //! A failed delivery is retried at a backoff a finite number of times, then waits for an event
 //! naming its environment. Failures are traced and, for refreshes, told to a person as an
@@ -27,7 +28,8 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, info, warn};
 
-use super::credentials::{github_app_scope_from_grants, reconcile_credential_refresh_attention_in};
+use super::access_layer::redeliver_central_logins;
+use super::credentials::{github_app_scope_from_grants, reconcile_credential_refresh_attention_in, redeliver_codex_credentials};
 use super::state::ControllerRuntimeState;
 
 /// The backoff after an environment's delivery fails, doubling to the cap.
@@ -50,6 +52,8 @@ struct Pending {
     projects: BTreeSet<String>,
     /// A credential definition changed: every environment, and refreshes that gave up, again.
     definitions: bool,
+    /// The central Codex login rotated: every crew's copy follows it.
+    codex_rotated: bool,
 }
 
 /// A request to deliver one environment now, answered once it has been tried.
@@ -84,6 +88,11 @@ impl CredentialEvents {
         std::mem::take(&mut *self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 
+    /// The central Codex login changed on disk; its refresher calls this.
+    pub(super) fn codex_rotated(&self) {
+        self.record(|pending| pending.codex_rotated = true);
+    }
+
     /// Delivers `environment` now, whatever its backoff, and answers how that went. Fails when no
     /// controller is running to answer.
     pub(super) async fn deliver(&self, environment: &str) -> Result<(), String> {
@@ -101,6 +110,17 @@ impl CredentialEvents {
 struct Failure {
     attempts: u32,
     next_at: Option<tokio::time::Instant>,
+}
+
+impl Failure {
+    /// The state after `attempts` failures in a row: retried at the backoff within the limit.
+    fn after(attempts: u32, retryable: bool) -> Self {
+        let next_at = (retryable && attempts <= RETRY_LIMIT).then(|| {
+            let delay = RETRY_INITIAL.saturating_mul(1 << attempts.saturating_sub(1).min(8)).min(RETRY_MAXIMUM);
+            tokio::time::Instant::now() + delay
+        });
+        Self { attempts, next_at }
+    }
 }
 
 /// One environment's wanted delivery, from the crews standing on it.
@@ -124,6 +144,10 @@ pub(super) struct CredentialDelivery {
     store: Arc<CredentialStore>,
     events: Arc<CredentialEvents>,
     failures: BTreeMap<String, Failure>,
+    /// The Docker environments' Codex login copies failing to follow a rotation.
+    codex_failure: Option<Failure>,
+    /// When the earliest failed push of the Codex login into a crew's home is retried.
+    login_retry_at: Option<tokio::time::Instant>,
     /// The refresh failures last told to the attention reconciler.
     told: Vec<(String, Option<String>, bool)>,
 }
@@ -138,6 +162,8 @@ impl CredentialDelivery {
             state,
             store,
             failures: BTreeMap::new(),
+            codex_failure: None,
+            login_retry_at: None,
             told: Vec::new(),
         })
     }
@@ -225,6 +251,7 @@ impl CredentialDelivery {
         } else {
             Ok(())
         };
+        self.follow_codex_login(pending.codex_rotated, now).await;
         let wake = GithubAppRefreshWake { projects: pending.projects, retry_given_up: pending.definitions };
         let errors = self.store.refresh_github_app_tokens(&wake).await;
         for error in &errors {
@@ -238,13 +265,50 @@ impl CredentialDelivery {
         result
     }
 
-    /// The earliest of the next GitHub App refresh or retry and the next environment retry.
+    /// Copies a rotated central Codex login into the Docker environments that read it and
+    /// pushes it into crews' homes, or retries the copies and pushes that fell due.
+    async fn follow_codex_login(&mut self, rotated: bool, now: tokio::time::Instant) {
+        let due = |at: Option<tokio::time::Instant>| at.is_some_and(|at| at <= now);
+        if rotated || due(self.codex_failure.as_ref().and_then(|failure| failure.next_at)) {
+            match redeliver_codex_credentials(&self.state).await {
+                Ok(()) => self.codex_failure = None,
+                Err(error) => {
+                    // A rotation starts the count again.
+                    let attempts = if rotated { 0 } else { self.codex_failure.as_ref().map_or(0, |failure| failure.attempts) };
+                    self.codex_failure = Some(Failure::after(attempts + 1, true));
+                    warn!(%error, attempts = attempts + 1, "failed to copy the central Codex credential into environments");
+                }
+            }
+        }
+        if rotated || due(self.login_retry_at) {
+            self.login_retry_at = match redeliver_central_logins(&self.state, &self.namespace, rotated).await {
+                Ok(next) => next.and_then(|at| at.to_datetime()).map(|at| {
+                    let wait = (at - self.state.daemon.clock().now()).to_std().unwrap_or_default();
+                    tokio::time::Instant::now() + wait
+                }),
+                Err(error) => {
+                    // The records could not be read: try once more at the first backoff.
+                    warn!(%error, "failed to push the central Codex login into crew homes");
+                    rotated.then(|| tokio::time::Instant::now() + RETRY_INITIAL)
+                }
+            };
+        }
+    }
+
+    /// The earliest of the next GitHub App refresh or retry, the next environment retry and the
+    /// next Codex login retry.
     async fn next_deadline(&self) -> Option<tokio::time::Instant> {
         let refresh = self.store.next_github_app_refresh_at().await.map(|at| {
             let wait = (at - chrono::Utc::now()).to_std().unwrap_or_default();
             tokio::time::Instant::now() + wait
         });
-        self.failures.values().filter_map(|failure| failure.next_at).chain(refresh).min()
+        self.failures
+            .values()
+            .chain(&self.codex_failure)
+            .filter_map(|failure| failure.next_at)
+            .chain(refresh)
+            .chain(self.login_retry_at)
+            .min()
     }
 
     /// Tells the attention reconciler the refresh failures, when they changed.
@@ -304,13 +368,10 @@ impl CredentialDelivery {
     }
 
     fn fail(&mut self, environment: &str, error: &str, retryable: bool) {
-        let failure = self.failures.entry(environment.to_owned()).or_insert(Failure { attempts: 0, next_at: None });
-        failure.attempts = failure.attempts.saturating_add(1);
-        failure.next_at = (retryable && failure.attempts <= RETRY_LIMIT).then(|| {
-            let delay = RETRY_INITIAL.saturating_mul(1 << (failure.attempts - 1).min(8)).min(RETRY_MAXIMUM);
-            tokio::time::Instant::now() + delay
-        });
+        let attempts = self.failures.get(environment).map_or(0, |failure| failure.attempts).saturating_add(1);
+        let failure = Failure::after(attempts, retryable);
         warn!(%environment, %error, attempts = failure.attempts, retry = failure.next_at.is_some(), "credential delivery failed");
+        self.failures.insert(environment.to_owned(), failure);
     }
 
     async fn deliver_environment(&self, environment: &str, wanted: Wanted, adopt: bool) -> Result<(), (String, bool)> {

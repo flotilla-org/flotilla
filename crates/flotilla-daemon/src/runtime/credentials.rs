@@ -3,29 +3,22 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
-    time::Duration,
+    sync::Weak,
 };
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_capability_contract::CredentialCapability;
 use flotilla_capability_contract::SessionCapabilitySource;
-use flotilla_credentials::{
-    codex_central_auth_path, compose_agent_environment, AgentMaterialRegistry, CodexCentralRefresher, CredentialRefreshError,
-    GithubAppScope,
-};
+use flotilla_credentials::{compose_agent_environment, AgentMaterialRegistry, CredentialRefreshError, GithubAppScope};
 use flotilla_crew::ports::WorkCredentialReconciler;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::attentions::{Attention, Attentions, Sender, Subject};
 use flotilla_resources::{Convoy, RepositoryTrust, Vessel};
 use flotilla_store::ResourceBackend;
-use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use super::state::ControllerRuntimeState;
-use super::tasks::{spawn_periodic_task, PeriodicTaskStart};
 
 /// Staging and launch resolve the same adapter defaults, delivered values, and
 /// explicit home overrides. Selection metadata is carried only for staging.
@@ -157,34 +150,6 @@ pub(super) fn github_app_scope_from_grants(
     scope
 }
 
-/// Keeps this host's central Codex `auth.json` fresh forever by direct
-/// OAuth `grant_type=refresh_token` — the primitive `scripts/codex-token-refresh`
-/// also implements — against the well-known path from
-/// [`codex_central_auth_path`]. This task is the file's sole writer — crews
-/// receive read-only *copies* of it (`crates/flotilla-daemon/src/agent_material.rs`),
-/// never the file itself — which matters because Codex refresh tokens are
-/// single-use and two refreshers would invalidate each other's rotation.
-pub(super) fn spawn_codex_central_refresh_task(env: Arc<dyn EnvVars>, interval: Duration) -> JoinHandle<()> {
-    let refresher = Arc::new(CodexCentralRefresher::new(codex_central_auth_path(&*env), &*env));
-    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
-        let refresher = Arc::clone(&refresher);
-        async move {
-            match refresher.refresh_once().await {
-                Ok(success) => {
-                    info!(
-                        rotated = ?success.rotated_fields,
-                        access_token_expires_at = ?success.access_token_expires_at,
-                        "refreshed central Codex credential"
-                    );
-                }
-                Err(error) => {
-                    warn!(%error, "failed to refresh central Codex credential; retrying next tick");
-                }
-            }
-        }
-    })
-}
-
 /// The credentials an open attention names, one per line of its reason.
 fn told(reason: &str) -> BTreeSet<String> {
     reason.lines().filter_map(|line| line.split_once(": ")).map(|(credential, _)| credential.to_owned()).collect()
@@ -271,39 +236,16 @@ pub(super) async fn reconcile_credential_refresh_attention_in(
     Ok(())
 }
 
-/// Keeps every live Codex crew's read-only `auth.json` copy current with the
-/// central login this host refreshes.
-///
-/// The credential is static, so there is nothing to lease, queue for, or
-/// release — but a vessel can outlive the access token it was provisioned with,
-/// and a crew holding a read-only copy cannot refresh for itself
-/// (flotilla-org/flotilla#1906). Re-copying on the controller resync interval is
-/// what keeps "crews never refresh" true for a long-lived convoy, and replaces
-/// the reacquire-on-resume step the retired lease loop used to provide.
-pub(super) fn spawn_codex_credential_redelivery_task(
-    state: Arc<ControllerRuntimeState>,
-    namespace: String,
-    interval: Duration,
-) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
-        let state = Arc::clone(&state);
-        let namespace = namespace.clone();
-        async move {
-            if let Err(error) = redeliver_codex_credentials(&state).await {
-                warn!(%error, "failed to redeliver the central Codex credential to live crews");
-            }
-            // #4037: every crew home holding a copy, on Docker and SSH hosts alike.
-            if let Err(error) = super::access_layer::redeliver_central_logins(&state, &namespace).await {
-                warn!(%error, "failed to push the central Codex login into live crew homes");
-            }
-        }
-    })
-}
-
+/// Copies the central Codex login into every ready Docker environment whose crews read it
+/// from a delivered `auth.json`: a vessel can outlive the access token it was provisioned with,
+/// and a crew holding a read-only copy cannot refresh for itself (flotilla-org/flotilla#1906).
+/// Runs after each rotation; fails when any environment's copy could not be replaced, so the
+/// caller retries.
 pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState) -> Result<(), String> {
     let Some(registry) = state.agent_material.as_deref() else {
         return Ok(());
     };
+    let mut failed = Vec::new();
     for environment in state.live_environments().await? {
         let Some(spec) = environment.spec.docker.as_ref() else {
             continue;
@@ -312,7 +254,7 @@ pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState) 
             continue;
         }
         // A redelivery failure is never fatal to the environment: the crew keeps
-        // the copy it already has, and the next tick retries.
+        // the copy it already has until the retry replaces it.
         let mounts = state
             .daemon
             .environment_manager()
@@ -336,8 +278,15 @@ pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState) 
         match result {
             Ok(true) => info!(environment = %environment.name, "redelivered the central Codex credential"),
             Ok(false) => {}
-            Err(error) => warn!(environment = %environment.name, %error, "failed to redeliver the central Codex credential"),
+            Err(error) => {
+                warn!(environment = %environment.name, %error, "failed to redeliver the central Codex credential");
+                failed.push(format!("{}: {error}", environment.name));
+            }
         }
     }
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("; "))
+    }
 }

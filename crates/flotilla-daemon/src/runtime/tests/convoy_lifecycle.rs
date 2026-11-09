@@ -950,34 +950,6 @@ async fn daemon_startup_reaps_retained_landed_convoy_orphan() {
     assert_eq!(convoys.get("old-landed").await.expect("retained convoy").status.expect("status").phase, ConvoyPhase::Landed);
 }
 
-#[tokio::test(start_paused = true)]
-async fn codex_central_refresh_task_survives_repeated_local_failures_without_panicking() {
-    struct FixedHomeEnv(PathBuf);
-    impl EnvVars for FixedHomeEnv {
-        fn get(&self, key: &str) -> Option<String> {
-            (key == "HOME").then(|| self.0.to_string_lossy().into_owned())
-        }
-    }
-
-    let home = TempDir::new().expect("tempdir");
-    // Deliberately leave the central auth.json unprovisioned, mirroring a
-    // host before an operator has dedicated a pool slot as the central
-    // source. This must never reach the network: the task should fail
-    // locally and keep ticking, not panic the daemon.
-    let env: Arc<dyn EnvVars> = Arc::new(FixedHomeEnv(home.path().to_path_buf()));
-    let interval = Duration::from_secs(60);
-    let task = spawn_codex_central_refresh_task(env, interval);
-
-    for _ in 0..3 {
-        tokio::time::advance(interval).await;
-        tokio::task::yield_now().await;
-        assert!(!task.is_finished(), "a missing central auth.json must log a warning and retry, never panic the daemon");
-    }
-
-    task.abort();
-    let _ = task.await;
-}
-
 #[tokio::test]
 async fn in_memory_stage4a_flow_reaches_running_and_completes_convoy() {
     let temp = TempDir::new().expect("tempdir");

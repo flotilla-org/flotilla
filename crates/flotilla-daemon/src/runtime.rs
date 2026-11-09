@@ -27,7 +27,7 @@ use chrono::Utc;
 use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
+use flotilla_credentials::{codex_central_auth_path, AgentMaterialRegistry, CodexCentralRefresher, CredentialStore};
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::terminal_session::TerminalSessionReconciler;
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
@@ -49,9 +49,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
 
 use self::credential_delivery::CredentialDelivery;
-use self::credentials::{
-    spawn_codex_central_refresh_task, spawn_codex_credential_redelivery_task, RuntimeSessionCapabilities, RuntimeWorkCredentialReconciler,
-};
+use self::credentials::{RuntimeSessionCapabilities, RuntimeWorkCredentialReconciler};
 use self::discovery::{
     apply_ssh_host_observation, build_local_profile, discover_ssh_host_profiles, probe_local_provider_registry, register_ssh_host_resources,
 };
@@ -98,7 +96,6 @@ pub struct RuntimeOptions {
     pub fulfilment_probe_interval: Duration,
     pub controller_supervision: ControllerSupervision,
     pub start_controllers: bool,
-    pub codex_central_refresh_interval: Duration,
     /// Socket servers release restoration once their accept loop is ready.
     /// In-process runtimes omit the gate and restore in the background immediately.
     pub startup_ready: Option<watch::Receiver<bool>>,
@@ -124,7 +121,6 @@ impl Default for RuntimeOptions {
             // central login's access token lives far longer than that, so a
             // conservative fixed cadence comfortably inside that window
             // (rather than tracking each token's own `exp`) is sufficient.
-            codex_central_refresh_interval: Duration::from_secs(4 * 60 * 60),
         }
     }
 }
@@ -356,7 +352,6 @@ impl DaemonRuntime {
                 options.heartbeat_interval,
             ),
             spawn_host_description_projection_task(Arc::clone(&daemon), options.namespace.clone(), options.heartbeat_interval),
-            spawn_codex_central_refresh_task(Arc::clone(&daemon.discovery_runtime().env), options.codex_central_refresh_interval),
             spawn_event_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_projection_parity_task(
                 daemon.resource_backend(),
@@ -738,13 +733,14 @@ impl StartupRestoration {
             controller_tasks
                 .push(AbortOnDropHandle::new(tokio::spawn(delivery.run(state.controller_metrics.for_kind("CredentialDelivery")))));
         }
+        // The central Codex login's sole writer; each rotation wakes credential delivery.
+        let env = Arc::clone(&state.daemon.discovery_runtime().env);
+        let events = Arc::clone(&state.credential_events);
+        controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(
+            CodexCentralRefresher::new(codex_central_auth_path(&*env), &*env).run(move || events.codex_rotated()),
+        )));
         controller_tasks.push(AbortOnDropHandle::new(spawn_environment_orphan_sweep_task(Arc::clone(state))));
         controller_tasks.push(AbortOnDropHandle::new(remotes::spawn_remote_probe_task(Arc::clone(state), remotes::REMOTE_PROBE_INTERVAL)));
-        controller_tasks.push(AbortOnDropHandle::new(spawn_codex_credential_redelivery_task(
-            Arc::clone(state),
-            options.namespace.clone(),
-            options.controller_resync_interval,
-        )));
         controller_tasks.extend(
             spawn_controller_loops(
                 Arc::clone(state),

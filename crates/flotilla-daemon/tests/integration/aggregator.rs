@@ -356,7 +356,6 @@ async fn runtime_start_republishes_engine_adopted_checkouts_before_query_bootstr
         .controller_resync_interval(Duration::from_secs(300))
         .controller_supervision(Default::default())
         .start_controllers(false)
-        .codex_central_refresh_interval(Duration::from_secs(300))
         .build();
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("start runtime");
     let query = QueryId::Checkouts { scope: None };
@@ -1102,7 +1101,6 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
         .controller_resync_interval(Duration::from_secs(300))
         .controller_supervision(Default::default())
         .start_controllers(false)
-        .codex_central_refresh_interval(Duration::from_secs(300))
         .build();
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
     let repository = RepositorySpec::remote("https://github.com/widgets/api.git").expect("repository");

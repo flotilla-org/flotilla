@@ -125,7 +125,8 @@ impl AccessStatus {
 }
 
 /// Record a push of `need` outside a launch into the home `record` names (#4037): the
-/// digest that landed, or the retry a failure leaves.
+/// digest that landed, or the retry a failure leaves. Answers when that retry falls due, unless
+/// the push has failed `limit` times in a row.
 pub(in crate::runtime) async fn record_push(
     state: &ControllerRuntimeState,
     namespace: &str,
@@ -133,7 +134,8 @@ pub(in crate::runtime) async fn record_push(
     need: &str,
     digest: &str,
     pushed: Result<(), String>,
-) -> Result<(), String> {
+    limit: u32,
+) -> Result<Option<Timestamp>, String> {
     let now = state.daemon.clock().now();
     let mut spec = record.spec.clone();
     spec.retry = match pushed {
@@ -158,8 +160,8 @@ pub(in crate::runtime) async fn record_push(
         .using::<AccessDelivery>(namespace)
         .update(&meta, &record.metadata.resource_version, &spec)
         .await
-        .map(drop)
-        .map_err(|error| format!("record access delivery `{}`: {error}", record.metadata.name))
+        .map_err(|error| format!("record access delivery `{}`: {error}", record.metadata.name))?;
+    Ok(spec.retry.filter(|retry| retry.need == need && retry.attempts < limit).map(|retry| retry.next_at))
 }
 
 /// One record per (access, place). The access is opaque and may hold any character, so
