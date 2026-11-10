@@ -36,7 +36,7 @@ use flotilla_resources::environment_records::EnvironmentChange;
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
-    Demand, FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError,
+    FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError,
     ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase,
     VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
     ROLE_LABEL, VESSEL_LABEL,
@@ -81,7 +81,6 @@ const CHANGE_REQUEST_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60)
 pub struct AggregatorResolvers {
     durable_convoys: ReplicaReadResolver<Convoy>,
     durable_convoy_ensures: ReplicaReadResolver<ConvoyEnsure>,
-    durable_demands: TypedResolver<Demand>,
     durable_fulfilment_kinds: Option<ReplicaReadResolver<FulfilmentKind>>,
     durable_sessions: ReplicaReadResolver<TerminalSession>,
     durable_projects: ReplicaReadResolver<Project>,
@@ -99,7 +98,6 @@ pub struct AggregatorResolvers {
 struct AggregatorSourceRefs<'a> {
     durable_convoys: &'a dyn AggregatorReplicaWatchSource<Convoy>,
     durable_convoy_ensures: &'a dyn AggregatorReplicaWatchSource<ConvoyEnsure>,
-    durable_demands: &'a dyn AggregatorWatchSource<Demand>,
     durable_fulfilment_kinds: Option<&'a dyn AggregatorReplicaWatchSource<FulfilmentKind>>,
     durable_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
     durable_projects: &'a dyn AggregatorReplicaWatchSource<Project>,
@@ -479,7 +477,6 @@ impl Aggregator {
         let AggregatorResolvers {
             durable_convoys,
             durable_convoy_ensures,
-            durable_demands,
             durable_fulfilment_kinds,
             durable_sessions,
             durable_projects,
@@ -495,7 +492,6 @@ impl Aggregator {
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(&durable_convoys)
             .durable_convoy_ensures(&durable_convoy_ensures)
-            .durable_demands(&durable_demands)
             .maybe_durable_fulfilment_kinds(
                 durable_fulfilment_kinds.as_ref().map(|source| source as &dyn AggregatorReplicaWatchSource<FulfilmentKind>),
             )
@@ -521,7 +517,6 @@ impl Aggregator {
         let AggregatorSourceRefs {
             durable_convoys,
             durable_convoy_ensures,
-            durable_demands,
             durable_fulfilment_kinds,
             durable_sessions,
             durable_projects,
@@ -563,7 +558,8 @@ impl Aggregator {
             None => Box::pin(futures::stream::pending()) as BoxStream<'static, Result<ReadWatchEvent<FulfilmentKind>, ResourceError>>,
         };
         let mut durable_convoy_stream = self.recover_replica_convoy_watch(durable_convoys).await?;
-        let mut durable_demand_stream = self.recover_demand_watch(durable_demands).await?;
+        // The open attentions, read once here and again at each change the port signals.
+        self.read_open_attentions().await;
         let mut durable_session_stream = self.recover_replica_session_watch(durable_sessions).await?;
         let mut durable_fleet_stream = match durable_fleet_designation {
             Some(source) => self.recover_fleet_designation_watch(source).await?,
@@ -854,14 +850,6 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable convoy watch ended")),
                 },
-                event = durable_demand_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_demand_event(event).await,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        durable_demand_stream = self.recover_demand_watch(durable_demands).await?;
-                    }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator durable demand watch ended")),
-                },
                 change = environment_change => match change {
                     Ok(change) => self.environment_changed(Some(change)).await,
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -984,10 +972,6 @@ impl Aggregator {
         let (items, watch) = Self::recover_replica_watch(resolver).await?;
         self.replace_replica_convoys(items).await;
         Ok(watch)
-    }
-
-    async fn recover_demand_watch(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
-        self.list_and_watch_demands(resolver).await
     }
 
     async fn recover_observed_session_watch(
@@ -1130,13 +1114,12 @@ impl Aggregator {
         Ok(watch)
     }
 
-    /// Demands are the old store's attentions: their watch says when to read them again.
-    async fn list_and_watch_demands(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
-        let (_, watch) = recover_local_view(resolver).await?;
+    /// Reads the open attentions from the attention port, the engine's, and recomputes salience
+    /// when they changed.
+    async fn read_open_attentions(&mut self) {
         if self.read_attentions().await && self.rebuild_salience_projection().await && !self.bootstrapping {
             self.emit_awareness_result_sets().await;
         }
-        Ok(watch)
     }
 
     /// Reads the open attentions; whether they changed.
@@ -1211,10 +1194,6 @@ impl Aggregator {
             .collect();
         self.rebuild_checkout_rows().await?;
         Ok(watch)
-    }
-
-    async fn apply_demand_event(&mut self, _: WatchEvent<Demand>) {
-        self.refresh_attentions().await;
     }
 
     async fn apply_convoy_event_from(&mut self, source: LocalSource, event: WatchEvent<Convoy>) {
@@ -4332,7 +4311,6 @@ mod tests {
         AggregatorResolvers::builder()
             .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
             .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
-            .durable_demands(durable.clone().using::<Demand>("flotilla"))
             .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
             .durable_projects(durable.including_replicas::<Project>("flotilla"))
             .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
@@ -4947,7 +4925,6 @@ mod tests {
         durable_convoys: &dyn AggregatorReplicaWatchSource<Convoy>,
         observed_convoys: &dyn AggregatorWatchSource<Convoy>,
     ) -> Result<(), ResourceError> {
-        let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_projects = ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_convoy_ensures = ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -4959,7 +4936,6 @@ mod tests {
         let observed_checkout_replicas = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(durable_convoys)
-            .durable_demands(&durable_demands)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
             .durable_convoy_ensures(&durable_convoy_ensures)
@@ -5829,7 +5805,6 @@ mod tests {
             vec![ResourceList { items: vec![convoy_with_vessel("convoy-a").await], resource_version: "1".to_string(), generation: None }],
             vec![Ok(pending_watch())],
         );
-        let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_sessions = ScriptedSource::new(
             vec![ResourceList { items: vec![session], resource_version: "1".to_string(), generation: None }],
             vec![Ok(pending_watch())],
@@ -5845,7 +5820,6 @@ mod tests {
         let observed_checkout_replicas = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(&durable_convoys)
-            .durable_demands(&durable_demands)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
             .durable_convoy_ensures(&durable_convoy_ensures)
@@ -7879,7 +7853,6 @@ mod tests {
                 AggregatorResolvers::builder()
                     .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
                     .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
-                    .durable_demands(durable.clone().using::<Demand>("flotilla"))
                     .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
                     .durable_projects(durable.including_replicas::<Project>("flotilla"))
                     .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
@@ -7951,7 +7924,6 @@ mod tests {
     async fn expired_session_watch_relists_its_source_and_removes_missed_deletion() {
         let stale = session_object("deleted-while-watch-expired").await;
         let durable_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let durable_demands = Arc::new(ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_sessions = Arc::new(ScriptedSource::new(
             vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
             vec![Ok(expiring_watch()), Ok(pending_watch())],
@@ -7973,7 +7945,6 @@ mod tests {
         let task = tokio::spawn(async move {
             let sources = AggregatorSourceRefs::builder()
                 .durable_convoys(durable_convoys.as_ref())
-                .durable_demands(durable_demands.as_ref())
                 .durable_sessions(run_durable_sessions.as_ref())
                 .durable_projects(durable_projects.as_ref())
                 .durable_convoy_ensures(durable_convoy_ensures.as_ref())
@@ -8327,7 +8298,6 @@ mod tests {
         AggregatorResolvers::builder()
             .durable_convoys(d.including_replicas::<Convoy>("flotilla"))
             .durable_convoy_ensures(d.including_replicas::<ConvoyEnsure>("flotilla"))
-            .durable_demands(d.using::<Demand>("flotilla"))
             .durable_sessions(d.including_replicas::<TerminalSession>("flotilla"))
             .durable_projects(d.including_replicas::<Project>("flotilla"))
             .durable_repositories(d.including_replicas::<Repository>("flotilla"))

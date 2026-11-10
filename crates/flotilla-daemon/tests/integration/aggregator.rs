@@ -556,6 +556,80 @@ async fn aggregator_emits_result_set_events() {
     assert_eq!(rows[0].project_ref.as_deref(), Some("my-project"));
 }
 
+// Behaviour (#3108): an attention the engine holds, a Message to a person, marks its convoy's row.
+// The aggregator reads attentions from the engine and nothing else, so one raised there after
+// bootstrap reaches the result set.
+#[tokio::test]
+async fn an_attention_raised_on_the_engine_marks_its_convoys_row() {
+    use flotilla_resources::{
+        attentions::{Attention, Fact},
+        FleetDesignation, FleetDesignationSpec, FLEET_DESIGNATION_NAME,
+    };
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let mut rx = daemon.subscribe();
+    let options = RuntimeOptions {
+        namespace: "flotilla".to_string(),
+        heartbeat_interval: Duration::from_secs(300),
+        controller_resync_interval: Duration::from_secs(300),
+        start_controllers: true,
+        ..RuntimeOptions::default()
+    };
+    let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
+    let DaemonEvent::ResultSet(_) = next_convoys_event(&mut rx, "the bootstrap result set").await else {
+        panic!("the convoys query starts with a result set")
+    };
+    // An attention is addressed through the fleet's roles, so the fleet is designated.
+    backend
+        .definitions::<Project>("flotilla")
+        .create(
+            &convoy_meta("fleet"),
+            &ProjectSpec::builder().display_name("Fleet".into()).default_workflow_ref("w".into()).repositories(Vec::new()).build(),
+        )
+        .await
+        .expect("fleet project");
+    backend
+        .definitions::<FleetDesignation>("flotilla")
+        .create(
+            &convoy_meta(FLEET_DESIGNATION_NAME),
+            &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
+        )
+        .await
+        .expect("designation");
+    let mut spec = convoy_spec("w");
+    spec.project_ref = Some("flotilla".to_string());
+    backend.using::<Convoy>("flotilla").create(&convoy_meta("demo"), &spec).await.expect("create convoy");
+    let _ = next_convoys_event(&mut rx, "the convoy's row").await;
+
+    let attention = Attention::new(Fact::ReclaimRefused { convoy: "demo".into() }, "reclaim refused: backing alive", chrono::Utc::now());
+    daemon.attentions().raise("flotilla", &attention).await.expect("raise on the engine");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let set = convoys_result_set(&daemon).await;
+            if convoy_rows(&set).iter().any(|row| {
+                row.name == "demo"
+                    && row.surface_state.needs_attention()
+                    && row.message.as_deref().is_some_and(|message| message.contains("reclaim refused: backing alive"))
+            }) {
+                return;
+            }
+            let _ = next_convoys_event(&mut rx, "a convoy row change").await;
+        }
+    })
+    .await
+    .expect("the engine's attention marks the convoy's row");
+}
+
 #[tokio::test]
 async fn running_convoyless_session_emits_attachable_independent_row() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
