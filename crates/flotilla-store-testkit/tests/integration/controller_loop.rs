@@ -2127,6 +2127,7 @@ async fn a_failing_reconcile_without_a_policy_parks_after_ten_tries_and_a_change
     let failures = Arc::new(AtomicUsize::new(usize::MAX));
     let reconciled = Arc::new(AtomicUsize::new(0));
     let queue = Arc::new(Mutex::new(None));
+    let metrics = Arc::new(flotilla_store::load_metrics::ControllerLoadMetrics::default());
     let mut harness = TestLoopHarness::new();
     harness.spawn(
         ControllerLoop {
@@ -2135,7 +2136,7 @@ async fn a_failing_reconcile_without_a_policy_parks_after_ten_tries_and_a_change
             reconciler: RetriedReconciler { failures: Arc::clone(&failures), due: None, reconciled: Arc::clone(&reconciled) },
             backend,
         }
-        .run(),
+        .run_observed(Arc::clone(&metrics)),
     );
     let parked = || queue.lock().expect("queue lock").as_ref().and_then(|queue| queue.parked("alpha"));
     // Ten failures back off 1, 2, 4 ... 60 s: well within an hour.
@@ -2148,6 +2149,7 @@ async fn a_failing_reconcile_without_a_policy_parks_after_ten_tries_and_a_change
     .expect("the failing object parks");
     assert_eq!(usize::MAX - failures.load(Ordering::SeqCst), 10, "ten tries before parking");
     assert!(parked().expect("parked").contains("transient prepare failure"), "the parked error is told");
+    assert_eq!(metrics.snapshot().parked, 1, "the gauge counts the parked object");
     // Parked: nothing retries it.
     tokio::time::sleep(Duration::from_secs(3600)).await;
     assert_eq!(usize::MAX - failures.load(Ordering::SeqCst), 10, "a parked object is not retried");
@@ -2167,5 +2169,6 @@ async fn a_failing_reconcile_without_a_policy_parks_after_ten_tries_and_a_change
     .await
     .expect("the change revives the parked object");
     assert_eq!(parked(), None, "a reconciled object is no longer parked");
+    assert_eq!(metrics.snapshot().parked, 0, "the gauge drops it");
     harness.shutdown().await;
 }

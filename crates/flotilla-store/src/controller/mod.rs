@@ -261,12 +261,18 @@ impl WorkQueueSender {
         self.progress.lock().expect("controller work queue lock poisoned").parked.get(name).cloned()
     }
 
-    fn park(&self, name: &str, error: String) {
-        self.progress.lock().expect("controller work queue lock poisoned").parked.insert(name.to_owned(), error);
+    /// Returns how many objects are parked now.
+    fn park(&self, name: &str, error: String) -> usize {
+        let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
+        progress.parked.insert(name.to_owned(), error);
+        progress.parked.len()
     }
 
-    fn unpark(&self, name: &str) {
-        self.progress.lock().expect("controller work queue lock poisoned").parked.remove(name);
+    /// Returns how many objects are parked now.
+    fn unpark(&self, name: &str) -> usize {
+        let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
+        progress.parked.remove(name);
+        progress.parked.len()
     }
 
     /// Queue age alone is not a failure: a busy loop making progress is able.
@@ -775,7 +781,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                             read_failures.remove(&name);
                             object_failures.remove(&name);
                             finalizer_failures.remove(&name);
-                            sender.unpark(&name);
+                            metrics.parked.set(sender.unpark(&name) as u64);
                             continue;
                         }
                         Err(err) => {
@@ -791,7 +797,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                                     failures = *failures,
                                     "controller could not read object; parked until it changes",
                                 );
-                                sender.park(&name, format!("reading it failed {} times: {err}", *failures));
+                                metrics.parked.set(sender.park(&name, format!("reading it failed {} times: {err}", *failures)) as u64);
                                 continue;
                             }
                             let delay = ReconcileErrorPolicy::UNBUDGETED.backoff(*failures);
@@ -927,7 +933,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                     Ok(()) if attempted_reconcile => {
                         object_failures.remove(&name);
-                        sender.unpark(&name);
+                        metrics.parked.set(sender.unpark(&name) as u64);
                     }
                     Ok(()) if attempted_finalizer => {
                         finalizer_failures.remove(&name);
@@ -1002,10 +1008,11 @@ impl<R: Reconciler> ControllerLoop<R> {
                                     failures = failure.consecutive_failures,
                                     "controller parked object until it changes",
                                 );
-                                sender.park(
+                                let parked = sender.park(
                                     &name,
                                     format!("reconciling it failed {} times: {}", failure.consecutive_failures, failure.message),
                                 );
+                                metrics.parked.set(parked as u64);
                             }
                             object_failures.insert(
                                 name.clone(),

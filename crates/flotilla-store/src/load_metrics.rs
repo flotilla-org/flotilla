@@ -181,6 +181,20 @@ impl Counter {
     }
 }
 
+/// The current value.
+#[derive(Debug, Default)]
+pub struct Gauge(AtomicU64);
+
+impl Gauge {
+    pub fn set(&self, value: u64) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// The highest value observed.
 #[derive(Debug, Default)]
 pub struct Peak(AtomicU64);
@@ -436,6 +450,8 @@ pub struct ControllerLoadMetrics {
     pub resync_enqueued: Counter,
     /// Work queue length, observed as each wake starts.
     pub queue_peak: Peak,
+    /// Objects whose retries ran out, held until they change.
+    pub parked: Gauge,
 }
 
 #[derive(Debug, Default)]
@@ -480,6 +496,7 @@ impl ControllerLoadMetrics {
             resyncs: self.resyncs.get(),
             resync_enqueued: self.resync_enqueued.get(),
             queue_peak: self.queue_peak.get(),
+            parked: self.parked.get(),
         }
     }
 }
@@ -496,6 +513,8 @@ pub struct ControllerLoadSnapshot {
     pub resyncs: u64,
     pub resync_enqueued: u64,
     pub queue_peak: u64,
+    /// Current, not accumulated: `since` keeps the later value.
+    pub parked: u64,
 }
 
 impl ControllerLoadSnapshot {
@@ -511,6 +530,7 @@ impl ControllerLoadSnapshot {
             resyncs: self.resyncs.saturating_sub(earlier.resyncs),
             resync_enqueued: self.resync_enqueued.saturating_sub(earlier.resync_enqueued),
             queue_peak: self.queue_peak,
+            parked: self.parked,
         }
     }
 }

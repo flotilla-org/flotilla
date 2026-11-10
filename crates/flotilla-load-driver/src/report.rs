@@ -121,6 +121,8 @@ pub struct ControllerReport {
     pub queue_wait: LatencySummary,
     pub busy_fraction: f64,
     pub queue_peak: u64,
+    /// Objects parked at the end of the window.
+    pub parked: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -187,6 +189,7 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
                         queue_wait: phase.queue_wait.summary(),
                         busy_fraction: if seconds > 0.0 { phase.busy_micros as f64 / (seconds * 1_000_000.0) } else { 0.0 },
                         queue_peak: phase.queue_peak,
+                        parked: phase.parked,
                     };
                     (kind.clone(), report)
                 })
@@ -329,12 +332,12 @@ impl LoadReport {
             }
             let _ = writeln!(
                 out,
-                "\n| Controller | Wakes/s | Requeues/s (coalesced) | Resync enqueued/s | Reconcile | Queue wait | Busy | Queue peak | Failures |\n|---|---|---|---|---|---|---|---|---|"
+                "\n| Controller | Wakes/s | Requeues/s (coalesced) | Resync enqueued/s | Reconcile | Queue wait | Busy | Queue peak | Failures | Parked |\n|---|---|---|---|---|---|---|---|---|---|"
             );
             for (kind, controller) in &home.controllers {
                 let _ = writeln!(
                     out,
-                    "| {kind} | {:.1} | {:.1} ({}) | {:.1} | {} | {} | {:.1}% | {} | {} |",
+                    "| {kind} | {:.1} | {:.1} ({}) | {:.1} | {} | {} | {:.1}% | {} | {} | {} |",
                     controller.wakes_per_second,
                     controller.requeues_per_second,
                     controller.requeues_coalesced,
@@ -343,7 +346,8 @@ impl LoadReport {
                     latency(&controller.queue_wait),
                     controller.busy_fraction * 100.0,
                     controller.queue_peak,
-                    controller.failures
+                    controller.failures,
+                    controller.parked
                 );
             }
         }

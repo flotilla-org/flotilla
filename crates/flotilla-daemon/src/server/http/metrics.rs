@@ -115,6 +115,7 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
             }
             out.number("flotilla_controller_busy_seconds_total", "counter", &labels, snapshot.busy_micros as f64 / 1_000_000.0);
             out.number("flotilla_controller_queue_peak", "gauge", &labels, snapshot.queue_peak);
+            out.number("flotilla_controller_parked", "gauge", &labels, snapshot.parked);
         }
     }
     for ((project, workflow), histogram) in crate::dispatch_reconciler::DispatchMetrics::global().snapshot() {
@@ -349,6 +350,7 @@ mod tests {
             "flotilla_controller_reconcile_seconds_max",
             "flotilla_controller_busy_seconds_total",
             "flotilla_controller_queue_peak",
+            "flotilla_controller_parked",
             "flotilla_controller_wakes_total",
             "flotilla_controller_requeues_total",
             "flotilla_controller_requeues_coalesced_total",
