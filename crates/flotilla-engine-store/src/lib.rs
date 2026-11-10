@@ -521,6 +521,43 @@ where
         self.insert_created(&change, resource)
     }
 
+    /// An empty change: it takes the next home sequence, and replicas receive it as a change
+    /// with no entries, so the home's prefix stays whole.
+    fn reserve(&mut self, writer: &str, at: Timestamp) -> Result<u64, LogError> {
+        let mut store = lock_store(&self.store);
+        let mut write = store.write().map_err(refused)?;
+        let change = write.open_change(&NewChange::new(writer, at)).map_err(refused)?;
+        write.commit().map_err(refused)?;
+        Ok(change.0)
+    }
+
+    /// Refuses a number that is not an empty change at this home: one never given, or given to
+    /// another write.
+    fn create_reserved(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<M>,
+        n: u64,
+        reads: &[InputRead],
+    ) -> Result<Resource<M>, LogError> {
+        let change = self.change(writer, at, reads);
+        let mut store = lock_store(&self.store);
+        let mut write = store.write().map_err(refused)?;
+        let reserved = n > 0
+            && write.change(&self.home, n).map_err(refused)?.is_some()
+            && write.changes_since(&self.home, n - 1, 1).map_err(refused)?.first().is_none_or(|entry| entry.home_seq != n);
+        if !reserved {
+            return Err(LogError::new(format!("launch number {n} is not a reservation at {}", self.home)));
+        }
+        let change = write.open_change(&change).map_err(refused)?;
+        let resource = resource.numbered(n);
+        let stamp = write.insert(resource.name(), &resource, change).map_err(refused)?;
+        let stored = write.load::<Resource<M>>(stamp.id).map_err(refused)?.ok_or_else(|| LogError::new("created resource not found"))?;
+        write.commit().map_err(refused)?;
+        Ok(stored.value)
+    }
+
     fn edge(&mut self, writer: &str, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
         self.edge_with_writes(writer, previous, next, event, &[])
     }

@@ -162,6 +162,9 @@ pub enum WriteError<M: Machine> {
     Fault(Fault<Label<M>, EdgeKind<M>>),
     /// The log did not take the write; the resource is as it was.
     Log(LogError),
+    /// A launch created with a number this home did not reserve for that name, or one
+    /// already used: `(of, n)`.
+    Unreserved(String, u64),
 }
 
 impl<M: Machine> WriteError<M> {
@@ -190,6 +193,7 @@ impl<M: Machine> PartialEq for WriteError<M> {
             (WriteError::Refused(a), WriteError::Refused(b)) => a == b,
             (WriteError::Fault(a), WriteError::Fault(b)) => a == b,
             (WriteError::Log(a), WriteError::Log(b)) => a == b,
+            (WriteError::Unreserved(a, m), WriteError::Unreserved(b, n)) => a == b && m == n,
             _ => false,
         }
     }
@@ -203,6 +207,7 @@ impl<M: Machine> fmt::Debug for WriteError<M> {
             WriteError::Refused(refusal) => f.debug_tuple("Refused").field(refusal).finish(),
             WriteError::Fault(fault) => f.debug_tuple("Fault").field(fault).finish(),
             WriteError::Log(error) => f.debug_tuple("Log").field(error).finish(),
+            WriteError::Unreserved(of, n) => f.debug_tuple("Unreserved").field(of).field(n).finish(),
         }
     }
 }
@@ -216,6 +221,9 @@ pub struct Home<M: Machine, L: Log<M> = MemoryLog<M>> {
     /// The launches among `resources` by the name each is a launch of and its number
     /// ([`Machine::launch`]): a name's newest launch is its last.
     launches: BTreeMap<(String, u64), String>,
+    /// The launch numbers reserved here and not yet created, each with the name it is a launch
+    /// of. Held in memory: a restart drops them, and their creates are refused.
+    reserved: BTreeMap<u64, String>,
     log: L,
 }
 
@@ -233,7 +241,14 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
     pub fn with_log(writer: impl Into<String>, log: L) -> Result<Self, Vec<DefError>> {
         let definition = M::definition();
         definition.validate()?;
-        Ok(Home { writer: writer.into(), definition, resources: BTreeMap::new(), launches: BTreeMap::new(), log })
+        Ok(Home {
+            writer: writer.into(),
+            definition,
+            resources: BTreeMap::new(),
+            launches: BTreeMap::new(),
+            reserved: BTreeMap::new(),
+            log,
+        })
     }
 
     /// The log this home writes through: where its resources' history is read.
@@ -322,6 +337,49 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
         if resource.name != name && self.resources.contains_key(&resource.name) {
             return Err(WriteError::Exists(resource.name));
         }
+        Ok(Created { resource: self.place(resource), reads })
+    }
+
+    /// Reserves the next launch number of `of` from this home's log, so the launch's name
+    /// (`<of>#<n>`) is known before anything keyed by it is written. [`Home::create_launch`]
+    /// takes it; one never created is a gap.
+    pub fn reserve_launch(&mut self, of: &str, now: Timestamp) -> Result<u64, WriteError<M>> {
+        let n = self.log.reserve(&self.writer, now).map_err(WriteError::Log)?;
+        self.reserved.insert(n, of.to_owned());
+        Ok(n)
+    }
+
+    /// [`Home::create`] for launch `n` of `request`'s name, a number [`Home::reserve_launch`]
+    /// reserved here for that name. Refused ([`WriteError::Unreserved`]) for a number not
+    /// reserved here, reserved for another name, or already used; the reservation is taken by
+    /// the create, or kept when the machine refuses it.
+    pub fn create_launch(
+        &mut self,
+        request: M::Request,
+        world: &M::World,
+        now: Timestamp,
+        n: u64,
+    ) -> Result<Created<'_, M>, WriteError<M>> {
+        let mut admission = Admission::new(world, now);
+        let (spec, state) = M::admit(&mut admission, request).map_err(WriteError::Refused)?;
+        let Some((of, _)) = M::launch(&spec) else {
+            return Err(WriteError::Log(LogError::new("only a launch is created with a reserved number")));
+        };
+        let of = of.to_owned();
+        if self.reserved.get(&n) != Some(&of) || self.launches.contains_key(&(of.clone(), n)) {
+            return Err(WriteError::Unreserved(of, n));
+        }
+        if state.label() != self.definition.initial() {
+            return Err(WriteError::Fault(Fault::Initial { state: state.label() }));
+        }
+        let name = crate::launch_name(&of, n);
+        if self.resources.contains_key(&name) {
+            return Err(WriteError::Exists(name));
+        }
+        let resource = Resource::stored(name, spec, State::new(state, now), Version(0));
+        let reads = admission.into_reads();
+        let resource = self.log.create_reserved(&self.writer, now, resource, n, &reads).map_err(WriteError::Log)?;
+        self.reserved.remove(&n);
         Ok(Created { resource: self.place(resource), reads })
     }
 
