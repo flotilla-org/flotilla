@@ -23,10 +23,12 @@ const RETRY_CAP: Duration = Duration::from_secs(60);
 /// Failed collections of one child before it is left until its owner or it changes again.
 const RETRY_LIMIT: u32 = 10;
 
-/// Children whose collection failed, each with its failures so far and when it is next tried.
+/// Children whose collection failed, each with its failures so far and when it is next tried, and
+/// those whose retries ran out.
 #[derive(Default)]
 struct Retries {
     due: HashMap<(ChildKey, OwnerReference), (u32, tokio::time::Instant)>,
+    given_up: HashSet<(ChildKey, OwnerReference)>,
 }
 
 impl Retries {
@@ -37,6 +39,7 @@ impl Retries {
         let failures = self.due.get(&key).map_or(0, |(failures, _)| *failures) + 1;
         if failures >= RETRY_LIMIT {
             self.due.remove(&key);
+            self.given_up.insert(key.clone());
             tracing::error!(kind = %key.0 .0, name = %key.0 .1, owner = %key.1.name, %error, failures, "owner garbage collection of a child failed; left until it changes");
             return;
         }
@@ -45,9 +48,23 @@ impl Retries {
         self.due.insert(key, (failures, tokio::time::Instant::now() + delay));
     }
 
-    /// A child seen changing starts its count again.
-    fn changed(&mut self, child: &ChildKey) {
-        self.due.retain(|(held, _), _| held != child);
+    /// A child seen changing starts its count again: the owners its held collections were for,
+    /// to be tried at once.
+    fn changed(&mut self, child: &ChildKey) -> Vec<OwnerReference> {
+        let mut owners = Vec::new();
+        self.due.retain(|(held, owner), _| {
+            held != child || {
+                owners.push(owner.clone());
+                false
+            }
+        });
+        self.given_up.retain(|(held, owner)| {
+            held != child || {
+                owners.push(owner.clone());
+                false
+            }
+        });
+        owners
     }
 
     fn next(&self) -> Option<tokio::time::Instant> {
@@ -60,8 +77,11 @@ impl Retries {
         self.due.iter().filter(|(_, (_, at))| *at <= now).map(|(key, _)| key.clone()).collect()
     }
 
-    fn succeeded(&mut self, child: ChildKey, owner: OwnerReference) {
-        self.due.remove(&(child, owner));
+    /// Forgets a held collection: it succeeded, or is being tried afresh.
+    fn clear(&mut self, child: ChildKey, owner: OwnerReference) {
+        let key = (child, owner);
+        self.due.remove(&key);
+        self.given_up.remove(&key);
     }
 }
 
@@ -174,7 +194,7 @@ impl OwnerGarbageCollector {
                 () = async { match next { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
                     for ((kind, name), owner) in retries.ready() {
                         match collect_indexed_child(&self.backend, &self.namespace, &kind, &name, &owner).await {
-                            Ok(()) => retries.succeeded((kind, name), owner),
+                            Ok(()) => retries.clear((kind, name), owner),
                             Err(error) => retries.failed((kind, name), owner, &error),
                         }
                     }
@@ -189,8 +209,13 @@ impl OwnerGarbageCollector {
                         Some("ADDED" | "MODIFIED") => {
                             let kind = field(&object["kind"])?;
                             let name = field(&object["metadata"]["name"])?;
-                            retries.changed(&(kind.clone(), name.clone()));
+                            let mut owners = retries.changed(&(kind.clone(), name.clone()));
                             for owner in children.record(object)? {
+                                if !owners.contains(&owner) {
+                                    owners.push(owner);
+                                }
+                            }
+                            for owner in owners {
                                 if let Err(error) = collect_indexed_child(&self.backend, &self.namespace, &kind, &name, &owner).await {
                                     retries.failed((kind.clone(), name.clone()), owner, &error);
                                 }
@@ -205,7 +230,9 @@ impl OwnerGarbageCollector {
                             let owner = OwnerReference { api_version: field(&object["apiVersion"])?, kind, name, controller: true };
                             if let Some(affected) = children.by_owner.get(&owner) {
                                 for (kind, name) in affected.clone() {
-                                    retries.changed(&(kind.clone(), name.clone()));
+                                    // This owner's deletion is tried now; the child's other held
+                                    // collections keep their own schedules.
+                                    retries.clear((kind.clone(), name.clone()), owner.clone());
                                     if let Err(error) = collect_indexed_child(&self.backend, &self.namespace, &kind, &name, &owner).await {
                                         retries.failed((kind, name), owner.clone(), &error);
                                     }
