@@ -15,7 +15,7 @@
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Relationship, Subject};
 use flotilla_resources::address::record_name;
-use flotilla_resources::convoy::engine::{deciding, viewed, Actor, Admission, EngineConvoyPath};
+use flotilla_resources::convoy::engine::{deciding, viewed, Actor, EngineConvoyPath};
 use flotilla_resources::convoy::reconcile::*;
 use flotilla_resources::*;
 use flotilla_store::{
@@ -71,15 +71,8 @@ pub struct ConvoyPrepared {
     settlement_attention: Option<ConvoyAttention>,
     reclaim_eligible: bool,
     capacity_wait: Option<String>,
-    /// The engine refused this convoy's admission: the refusal, as the
-    /// convoy's failure message.
-    engine_refusal: Option<String>,
     /// The convoy with the engine's promises, when the engine holds it.
     viewed: Option<ResourceObject<Convoy>>,
-    /// The engine holds the convoy as this launch, yet the stored status still
-    /// has the promises bootstrap seeded or names no launch: admission's
-    /// hand-over did not land.
-    unhanded: Option<String>,
     /// A crew's derived Done waits on its undelivered turn (#3894).
     turn_hold: bool,
 }
@@ -444,28 +437,6 @@ impl ConvoyReconciler {
             .map_err(ResourceError::other)?;
         Ok(flotilla_resources::checkout_records::latest_launches(held))
     }
-
-    /// Admits a freshly bootstrapped convoy on the engine when the switch is
-    /// on; returns the engine's refusal, if it refused. A convoy the engine
-    /// skips stays on the old path.
-    async fn admit_on_engine(&self, obj: &ResourceObject<Convoy>) -> Option<String> {
-        let engine = self.engine.get()?;
-        if obj.status.as_ref().is_none_or(|status| status.phase.is_terminal()) || engine.holds(obj) {
-            return None;
-        }
-        match engine.admit(obj).await {
-            Ok(Admission::Held) => None,
-            Ok(Admission::Skipped(reason)) => {
-                tracing::debug!(convoy = %obj.metadata.name, ?reason, "convoy stays on the old path");
-                None
-            }
-            Ok(Admission::Refused(refusal)) => Some(refusal),
-            Err(error) => {
-                tracing::warn!(convoy = %obj.metadata.name, %error, "engine admission failed; retrying on the next pass");
-                None
-            }
-        }
-    }
 }
 
 impl ConvoyReconciler {
@@ -496,20 +467,12 @@ impl Reconciler for ConvoyReconciler {
     type Prepared = ConvoyPrepared;
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
-        let engine_refusal = self.admit_on_engine(obj).await;
         self.abandon_failed_on_engine(obj).await;
         // With the engine holding the convoy, every promise read below is the engine's.
         let engine = deciding(&self.engine, obj);
         let viewed = match engine {
             Some(_) => Some(viewed(&self.engine, obj).map_err(ResourceError::other)?.into_owned()),
             None => None,
-        };
-        // The hand-over has not landed while bootstrap's seeds stay, or the launch is unnamed.
-        let unhanded = match (engine, obj.status.as_ref()) {
-            (Some(engine), Some(status)) if !status.promises.is_empty() || status.engine_launch.is_none() => {
-                engine.launch(obj).map_err(ResourceError::other)?
-            }
-            _ => None,
         };
         let obj = viewed.as_ref().unwrap_or(obj);
         let capacity_wait = if obj.status.as_ref().is_none_or(|status| {
@@ -787,9 +750,7 @@ impl Reconciler for ConvoyReconciler {
             settlement_attention,
             reclaim_eligible,
             capacity_wait,
-            engine_refusal,
             viewed: viewed.clone(),
-            unhanded,
             turn_hold,
         })
     }
@@ -860,32 +821,6 @@ impl Reconciler for ConvoyReconciler {
         if !missing.is_empty() {
             return ControllerReconcileOutcome {
                 patch: Some(ConvoyStatusPatch::DiscoverSubjects { subjects: missing, source: SubjectDiscoverySource::Branch, at: now }),
-                actuations: Vec::new(),
-                requeue_after: None,
-            };
-        }
-        if let Some(refusal) = &prepared.engine_refusal {
-            // With `[primitives]` on the engine decides admission: a refused
-            // convoy is not admitted, so it fails with the refusal named.
-            return ControllerReconcileOutcome {
-                patch: Some(controller_patches::fail_convoy(
-                    obj.status
-                        .as_ref()
-                        .map(|status| {
-                            status.work.iter().filter(|(_, work)| !work.phase.is_terminal()).map(|(name, _)| (name.clone(), now)).collect()
-                        })
-                        .unwrap_or_default(),
-                    now,
-                    Some(format!("the engine refused this convoy's admission: {refusal}")),
-                )),
-                actuations: Vec::new(),
-                requeue_after: None,
-            };
-        }
-        if let Some(launch) = &prepared.unhanded {
-            // Retry the hand-over: the engine holds the promises, not the old status.
-            return ControllerReconcileOutcome {
-                patch: Some(ConvoyStatusPatch::HandPromisesToEngine { launch: launch.clone() }),
                 actuations: Vec::new(),
                 requeue_after: None,
             };

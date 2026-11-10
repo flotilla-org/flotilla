@@ -166,10 +166,12 @@ pub(crate) fn crew_role_address(project: &str, convoy: &str, vessel: &str, role:
 }
 
 fn convoy_stall_subject(project: &str, convoy: &str) -> String {
-    flotilla_address::Address::project(project)
-        .and_then(|project| project.child(flotilla_address::Kind::Convoy, convoy))
-        .expect("a stored convoy has a project and a name")
-        .to_string()
+    let project = flotilla_address::Address::project(project).expect("a stored convoy has a project");
+    match flotilla_resources::convoy::engine::split_launch(convoy) {
+        Some(_) => flotilla_resources::convoy::engine::launch_address(&project, convoy).expect("a launch has an address"),
+        None => project.child(flotilla_address::Kind::Convoy, convoy).expect("a stored convoy has a name"),
+    }
+    .to_string()
 }
 
 /// A convoy stall has a subject even when no crew caused it.

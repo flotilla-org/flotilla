@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use flotilla_protocol::{ConvoyNaming, PlacementDecision, PrincipalRef};
 use serde::{Deserialize, Serialize};
 
-use super::{ConvoyRepositorySpec, DeclaredSubject, InputValue, WorkflowSnapshot};
-use crate::{ConvoyEnsureSpec, RepositoryKey};
+use super::{ConvoyRepositorySpec, DeclaredSubject, InputValue, VesselPlacementPin, WorkflowSnapshot};
+use crate::{ConvoyEnsureSpec, ObservedCheckoutSpec, RepositoryKey};
 
 /// What admission froze about one convoy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,11 +54,28 @@ pub struct AdmissionDocument {
     pub subjects: Vec<DeclaredSubject>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
-    /// The old Convoy record this launch was admitted or imported from (a standing role's
-    /// generation, or a finite convoy's one record): its checkouts are held for this launch. Goes
-    /// with the old kind (#3108); then a decoder that drops it, one roll on (ADR 0047).
+    /// The prepared WorkflowTemplate snapshot admission pinned, for readers of the whole template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub admitted_from: Option<String>,
+    pub workflow_template: Option<String>,
+    /// The prepared FulfilmentKind snapshot admission placed the convoy by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_snapshot: Option<String>,
+    /// Each vessel's composed-image placement, when its vessels resolve to different images.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vessel_placements: BTreeMap<String, VesselPlacementPin>,
+    /// Whether admission wrote its crews' brief artifacts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub brief_artifacts: bool,
+    /// The checkout it adopts, as admission found it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_checkout: Option<ObservedCheckoutSpec>,
+    /// The provenance admission recorded with it, as annotations: a standing convoy's ensure and
+    /// the charter entry that declared it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provenance: BTreeMap<String, String>,
+    // `admitted_from` (the old record a launch was admitted from) is retired: a launch is named
+    // before admission writes anything, so nothing maps an old record to it. Unknown keys are
+    // dropped on decode, which accepts documents that carry it; nothing to remove one roll on.
 }
 
 /// An admission document that could not be encoded, or a convoy whose document does not decode.
@@ -156,7 +173,12 @@ mod tests {
                 change_request: None,
             }],
             instruction: Some("land it".into()),
-            admitted_from: None,
+            workflow_template: None,
+            placement_snapshot: None,
+            vessel_placements: BTreeMap::new(),
+            brief_artifacts: false,
+            adopted_checkout: None,
+            provenance: BTreeMap::new(),
         }
     }
 
@@ -168,8 +190,28 @@ mod tests {
         let bytes = document.encode().expect("canonical");
         assert_eq!(document.encode().expect("canonical again"), bytes);
         assert_eq!(AdmissionDocument::decode("c", &bytes).expect("decodes"), document);
-        let admitted = AdmissionDocument { admitted_from: Some("c-2".into()), ..document };
-        assert_eq!(AdmissionDocument::decode("c", &admitted.encode().expect("canonical")).expect("decodes"), admitted);
+        let pinned = AdmissionDocument {
+            workflow_template: Some("workflow-snapshot-1".into()),
+            placement_snapshot: Some("placement-snapshot-1".into()),
+            brief_artifacts: true,
+            ..document
+        };
+        assert_eq!(AdmissionDocument::decode("c", &pinned.encode().expect("canonical")).expect("decodes"), pinned);
+    }
+
+    // Behaviour (ADR 0047): a document written while launches named the old record they were
+    // admitted from still decodes, without it.
+    #[test]
+    fn a_document_naming_its_old_record_still_decodes() {
+        #[derive(serde::Serialize)]
+        struct Earlier {
+            #[serde(flatten)]
+            document: AdmissionDocument,
+            admitted_from: String,
+        }
+        let earlier = Earlier { document: document(), admitted_from: "convoy-1".into() };
+        let bytes = flotilla_cbor::to_vec(&earlier, &flotilla_cbor::DEFAULT_LIMITS).expect("encodes");
+        assert_eq!(AdmissionDocument::decode("c", &bytes).expect("decodes"), document());
     }
 
     // Behaviour (ADR 0047): bytes the first generation wrote still decode to the same document

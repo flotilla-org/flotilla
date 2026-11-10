@@ -1,7 +1,7 @@
 //! The convoy reconciler behind `[primitives]` (#3587 layer 6): with the
 //! engine holding a convoy, an observation is the engine's edge and no old
-//! promise patch is written; without it, the old path is unchanged; and an
-//! engine refusal of admission fails the convoy with the refusal named.
+//! promise patch is written; without it, the old path is unchanged. (An
+//! engine refusal of admission refuses the admission itself: no convoy exists.)
 
 use std::{
     collections::BTreeMap,
@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_resources::{
     address::{artifact_address, record_name},
-    convoy::engine::{Actor, Admission, EngineConvoyPath, EngineConvoys, OldPromises, SkipReason, VerdictScope},
+    convoy::engine::{Actor, EngineConvoyPath, EngineConvoys, OldPromises, VerdictScope},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState},
     Artifact, ArtifactSpec, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec, CrewWorkPhase,
     CrewWorkState, InputMeta, ResourceObject, StatusPatch, VesselRequirement, WorkflowSnapshot, WorkflowTemplate,
@@ -26,7 +26,6 @@ const NAMESPACE: &str = "flotilla";
 #[derive(Default)]
 struct Recording {
     holds: bool,
-    admission: Option<Admission>,
     promises: Mutex<Vec<(String, String, PromiseOperation, Actor)>>,
     views: Mutex<usize>,
     /// The engine's change feed, when the test publishes on one.
@@ -42,8 +41,11 @@ impl EngineConvoys for Recording {
     fn holds(&self, _: &ResourceObject<Convoy>) -> bool {
         self.holds
     }
-    async fn admit(&self, _: &ResourceObject<Convoy>) -> Result<Admission, String> {
-        Ok(self.admission.clone().unwrap_or(Admission::Skipped(SkipReason::NotBootstrapped)))
+    async fn reserve(&self, launch_of: &str) -> Result<String, String> {
+        Ok(format!("{launch_of}#1"))
+    }
+    async fn admit_reserved(&self, _: &ResourceObject<Convoy>) -> Result<(), String> {
+        Ok(())
     }
     async fn promise(
         &self,
@@ -70,9 +72,6 @@ impl EngineConvoys for Recording {
     }
     fn delivered(&self, _: &ResourceObject<Convoy>) -> Option<String> {
         self.delivered.clone()
-    }
-    fn launch(&self, _: &ResourceObject<Convoy>) -> Result<Option<String>, String> {
-        Ok(self.holds.then(|| "launch#1".to_owned()))
     }
     async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
         Ok(())
@@ -176,8 +175,6 @@ async fn an_engine_held_convoy_observes_through_the_engine() {
         outcome.patch
     );
     assert_eq!(*engine.views.lock().expect("views"), 1, "one keyed read of the engine's promises per pass");
-    // The stored status still holds bootstrap's seeds: the hand-over is retried.
-    assert_eq!(outcome.patch, Some(ConvoyStatusPatch::HandPromisesToEngine { launch: "launch#1".into() }));
 }
 
 // Behaviour: a convoy the engine does not hold stays on the old path: the observation is the old
@@ -195,19 +192,6 @@ async fn a_convoy_the_engine_does_not_hold_keeps_the_old_path() {
     let mut status = convoy.status.clone().expect("status");
     ConvoyStatusPatch::ObservePromise { vessel: "work".into(), role: "coder".into(), operation }.apply(&mut status);
     assert_eq!(promises::owned(&status, "work", "coder")[0].state, PromiseState::Submitted);
-}
-
-// Behaviour: an engine refusal of admission fails the convoy, naming the refusal.
-#[tokio::test]
-async fn an_engine_refusal_fails_the_convoy() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let convoy = ledger_convoy(&backend).await;
-    let engine = Arc::new(Recording { admission: Some(Admission::Refused("NoObligations".into())), ..Default::default() });
-    let reconciler = reconciler(&backend, engine);
-    let prepared = reconciler.prepare(&convoy).await.expect("prepare");
-    let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
-    let Some(ConvoyStatusPatch::FailConvoy { message, .. }) = outcome.patch else { panic!("fail: {:?}", outcome.patch) };
-    assert_eq!(message.as_deref(), Some("the engine refused this convoy's admission: NoObligations"));
 }
 
 // Behaviour (the load_driver_smoke landing race): once the engine has delivered a landing convoy,

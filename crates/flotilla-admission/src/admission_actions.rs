@@ -21,8 +21,8 @@ use flotilla_resources::WorkflowTemplate;
 use flotilla_resources::WriterIdentity;
 use flotilla_store::ResourceBackend;
 
-use crate::convoy_admission::allocate_convoy_generation;
 use crate::convoy_admission::normalize_convoy_start_intent;
+use crate::convoy_admission::refuse_live_convoy_in;
 use crate::convoy_admission::resolve_and_validate_workflow_credentials;
 use crate::convoy_admission::validate_convoy_name;
 use crate::convoy_admission::ConvoyAdmission;
@@ -179,12 +179,19 @@ impl AdmissionActions<'_> {
             // Use the admission transaction before checking identity or writing
             // adopted checkout resources. A duplicate must have no side effects.
             let admission_guard = self.admission.lock().await;
-            if let Err(message) = allocate_convoy_generation(self.resource_backend, &namespace, project_identity, &role).await {
+            if let Err(message) = refuse_live_convoy_in(self.resource_backend, &namespace, project_identity, &role).await {
                 let result = CommandValue::Error { message };
                 self.events.finish(id, empty_identity, result);
                 return Ok(id);
             }
-            let record_name = convoy_record_name();
+            // The launch is named before anything keyed by it is written.
+            let record_name = match self.admission.reserve_launch(&convoy_record_name()).await {
+                Ok(launch) => launch,
+                Err(message) => {
+                    self.events.finish(id, empty_identity, CommandValue::Error { message });
+                    return Ok(id);
+                }
+            };
             let name = &record_name;
             let mut workflow = match self
                 .resource_backend

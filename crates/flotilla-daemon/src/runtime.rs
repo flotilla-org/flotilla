@@ -1368,17 +1368,21 @@ async fn open_provisioning_lifecycles(
     // Every vessel reader goes through the engine's launches; this home's are written only here.
     let vessels = Arc::new(EngineVessels::over(Arc::clone(&lifecycles.vessels), daemon.decided_store()?));
     let vessel_changes = vessels.follow(daemon.decided_store()?)?;
+    // Every convoy reader reads the engine's launches.
+    let convoys = Arc::new(flotilla_core::primitives::convoy_records::EngineConvoyRecords::new(&home, daemon.decided_store()?));
+    let convoy_changes = convoys.follow()?;
     daemon.install_lifecycle_reads(Arc::new(
         LifecycleReadPort::new(StoreReads::new(store), home)
             .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>)
             .with_clones(clones as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
             .with_checkouts(Arc::clone(&lifecycles.checkout_records) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
             .with_terminals(terminals as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>)
-            .with_vessels(vessels as Arc<dyn flotilla_resources::vessel_records::VesselRecords>),
+            .with_vessels(vessels as Arc<dyn flotilla_resources::vessel_records::VesselRecords>)
+            .with_convoys(convoys as Arc<dyn flotilla_resources::convoy_records::ConvoyRecords>),
     ))?;
     // Cached checkout providers end with the checkout launches they belong to.
     daemon.follow_checkout_provider_lifetimes()?;
-    Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes, terminal_changes, vessel_changes]))
+    Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes, terminal_changes, vessel_changes, convoy_changes]))
 }
 
 /// Which seats a vessel serves (#3629 layer 8): the newest launch of each session the engine holds

@@ -17,7 +17,7 @@ use flotilla_store::ResourceBackend;
 use super::support::{create_docker_placement, create_identity_convoy, host_direct_kind, put_host, read_host, test_meta};
 use crate::in_process::{placement_target_host, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
-use flotilla_admission::convoy_admission::allocate_convoy_generation;
+use flotilla_admission::convoy_admission::refuse_live_convoy_in;
 use flotilla_crew::crew_ops::resolve_local_convoy_name;
 
 #[test]
@@ -116,7 +116,8 @@ async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_name
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let record = convoy_record_name();
-    let generation = allocate_convoy_generation(&backend, "flotilla", None, "worker").await.expect("projectless identity");
+    refuse_live_convoy_in(&backend, "flotilla", None, "worker").await.expect("projectless identity");
+    let generation = 1;
     let labels = BTreeMap::from([
         (PROJECT_LABEL.to_string(), String::new()),
         (ROLE_LABEL.to_string(), "worker".to_string()),
@@ -125,7 +126,7 @@ async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_name
     let spec = ConvoySpec::builder().workflow_ref("work".to_string()).role("worker".to_string()).generation(generation).build();
     convoys.create(&InputMeta::builder().name(record).labels(labels).build(), &spec).await.expect("projectless convoy");
 
-    assert!(allocate_convoy_generation(&backend, "flotilla", Some("standalone"), "worker").await.is_ok());
+    assert!(refuse_live_convoy_in(&backend, "flotilla", Some("standalone"), "worker").await.is_ok());
 }
 
 #[tokio::test]

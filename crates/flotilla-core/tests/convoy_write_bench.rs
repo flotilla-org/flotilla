@@ -23,7 +23,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use chrono::Utc;
 use flotilla_core::primitives::{convoy_engine::ConvoyEngine, convoys::Convoys};
 use flotilla_resources::{
-    convoy::engine::{Actor, Admission, EngineConvoys},
+    convoy::engine::{Actor, EngineConvoys},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict},
     Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, ResourceObject,
     SystemClock, VesselRequirement, WorkflowSnapshot,
@@ -121,8 +121,10 @@ async fn convoy_write_path_at_the_ceiling() {
     );
 
     let started = Instant::now();
-    for convoy in &local {
-        assert_eq!(engine.admit(convoy).await.expect("admit"), Admission::Held);
+    for convoy in &mut local {
+        // Each convoy is admitted as its reserved launch, and read by it from then on.
+        convoy.metadata.name = engine.reserve(&convoy.metadata.name).await.expect("reserve");
+        engine.admit_reserved(convoy).await.expect("admit");
     }
     report("admit", started, local.len());
 

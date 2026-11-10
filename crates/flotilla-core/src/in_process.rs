@@ -1440,6 +1440,7 @@ impl InProcessDaemon {
                 .host_name(host_name.clone())
                 .clock(Arc::clone(&clock))
                 .fulfilment_decider(Arc::new(StaticFulfilmentDecider))
+                .convoys(Arc::clone(&convoy_engine_path))
                 .build(),
             convoy_ensure_reconciler: RwLock::new(None),
 
@@ -2335,10 +2336,15 @@ impl InProcessDaemon {
         self.lifecycle_reads.install(Arc::clone(&reads))?;
         // The old store's Clone and Environment reads are served from the engine's records.
         self.resource_backend.install_engine_records(Arc::new(flotilla_store::LifecycleViews::new(Arc::clone(&reads))));
-        // The old store's TerminalSession and Vessel reads are served from the engine's launches.
+        // The old store's TerminalSession, Vessel and Convoy reads are served from the engine's launches.
         self.resource_backend
             .install_engine_records(Arc::new(flotilla_store::TerminalViews::new(DEFAULT_PROVISIONING_NAMESPACE, Arc::clone(&reads))));
         self.resource_backend.install_engine_records(Arc::new(flotilla_store::VesselViews::new(
+            self.resource_backend.clone(),
+            DEFAULT_PROVISIONING_NAMESPACE,
+            Arc::clone(&reads),
+        )));
+        self.resource_backend.install_engine_records(Arc::new(flotilla_store::ConvoyViews::new(
             self.resource_backend.clone(),
             DEFAULT_PROVISIONING_NAMESPACE,
             reads,

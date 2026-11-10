@@ -9,10 +9,10 @@ use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
     kinds::{stock, Catalog},
     machines::convoy::{
-        AdmittedPromise, ConvoyRefusal, ConvoyRequest, Declare, Priority, Progress, PromiseId, PromiseSource, Seat, SeatName, Submit,
-        VesselClass,
+        AdmittedPromise, Convoy, ConvoyRefusal, ConvoyRequest, Declare, Priority, Progress, PromiseId, PromiseSource, Seat, SeatName,
+        Submit, VesselClass,
     },
-    Ref, Version,
+    Ref, Version, WriteError,
 };
 
 fn address(text: &str) -> Address {
@@ -59,6 +59,13 @@ fn service(dir: &tempfile::TempDir) -> Arc<Service> {
     )
 }
 
+/// Admits `request` as admission does: reserves its launch, then creates it.
+fn admit(convoys: &Convoys, request: ConvoyRequest, at: Timestamp) -> Result<String, WriteError<Convoy>> {
+    let launch = convoys.reserve(&request.launch_of, at)?;
+    convoys.create_reserved(&launch, request, at)?;
+    Ok(launch)
+}
+
 // Behaviour: a Convoy admitted and edged at this home is in the decided store, and a reopened
 // home restores it at the version its log gave, so the next edge continues from there.
 #[test]
@@ -66,11 +73,10 @@ fn a_convoy_survives_a_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     {
         let convoys = Convoys::open("home-a", &service(&dir)).expect("open");
-        let refused = convoys.admit(request(), Timestamp(1)).expect_err("the project must exist");
+        let refused = admit(&convoys, request(), Timestamp(1)).expect_err("the project must exist");
         assert_eq!(refused.refusal(), Some(&ConvoyRefusal::UnknownProject));
         convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
-        assert!(convoys.admit(request(), Timestamp(1)).expect("admitted"));
-        assert!(!convoys.admit(request(), Timestamp(1)).expect("existing"), "a second admission is the first");
+        admit(&convoys, request(), Timestamp(1)).expect("admitted");
         convoys.world(|world| world.durable.put(&Ref::new(address("change").as_str()), true));
         let submit = Submit {
             promise: PromiseId(0),
@@ -79,12 +85,13 @@ fn a_convoy_survives_a_restart() {
             revision: "abc".into(),
             durable: Ref::new(address("change").as_str()),
         };
-        // The admission's change and entry took 1 and 2; the submission's take 3 and 4 (#4024).
-        assert_eq!(convoys.apply("c", submit, Timestamp(2)).expect("submitted"), Version(4));
+        // The refused admission's reservation took 1, a gap; the admission's reservation 2, its
+        // change and entry 3 and 4; the submission's change and entry take 5 and 6 (#4024).
+        assert_eq!(convoys.apply("c", submit, Timestamp(2)).expect("submitted"), Version(6));
     }
     let convoys = Convoys::open("home-a", &service(&dir)).expect("reopen");
     let convoy = convoys.get("c").expect("restored");
-    assert_eq!(convoy.version(), Version(4));
+    assert_eq!(convoy.version(), Version(6));
     let (_, promise) = convoy.spec().promise(PromiseId(0)).expect("promise");
     assert_eq!(promise.progress.value, Progress::Submitted);
 }
@@ -101,11 +108,11 @@ fn a_label_is_unique_within_its_convoy() {
     let mut second = twice.promises[&PromiseId(0)].clone();
     second.kind = "decision-ledger".into();
     twice.promises.insert(PromiseId(1), second);
-    let error = convoys.admit(twice, Timestamp(1)).expect_err("a taken label");
+    let error = admit(&convoys, twice, Timestamp(1)).expect_err("a taken label");
     assert_eq!(error.refusal(), None, "the store refuses it, not the machine: {error:?}");
     assert!(convoys.get("c").is_none(), "nothing was admitted");
-    assert!(convoys.admit(request(), Timestamp(1)).expect("admitted"));
-    assert!(convoys.admit(ConvoyRequest { launch_of: "d".into(), ..request() }, Timestamp(1)).expect("the same label in another convoy"));
+    admit(&convoys, request(), Timestamp(1)).expect("admitted");
+    admit(&convoys, ConvoyRequest { launch_of: "d".into(), ..request() }, Timestamp(1)).expect("the same label in another convoy");
 }
 
 // Behaviour (#3721 review): a restored home still holds labels unique, and a store refusal of an
@@ -116,7 +123,7 @@ fn a_taken_label_is_refused_after_a_restart_and_changes_nothing() {
     {
         let convoys = Convoys::open("home-a", &service(&dir)).expect("open");
         convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
-        assert!(convoys.admit(request(), Timestamp(1)).expect("admitted"));
+        admit(&convoys, request(), Timestamp(1)).expect("admitted");
     }
     let convoys = Convoys::open("home-a", &service(&dir)).expect("reopen");
     let declare = Declare {
@@ -129,18 +136,19 @@ fn a_taken_label_is_refused_after_a_restart_and_changes_nothing() {
     let error = convoys.apply("c", declare.clone(), Timestamp(2)).expect_err("a taken label");
     assert_eq!(error.refusal(), None, "the store refuses it: {error:?}");
     let convoy = convoys.get("c").expect("still there");
-    assert_eq!((convoy.version(), convoy.spec().promises.len()), (Version(2), 1), "nothing changed in memory");
+    // The reservation took 1; the admission's change and entry 2 and 3.
+    assert_eq!((convoy.version(), convoy.spec().promises.len()), (Version(3), 1), "nothing changed in memory");
     drop(convoys);
     let convoys = Convoys::open("home-a", &service(&dir)).expect("reopen again");
     assert_eq!(convoys.get("c").expect("restored").spec().promises.len(), 1, "nothing was stored");
     let free = Declare { label: "l2-quint".into(), ..declare };
-    assert_eq!(convoys.apply("c", free, Timestamp(3)).expect("a free label"), Version(4), "the refusal took no sequence");
+    assert_eq!(convoys.apply("c", free, Timestamp(3)).expect("a free label"), Version(5), "the refusal took no sequence");
 }
 
 // Behaviour (owner's ruling, #3108): each standing generation is its own convoy, the next launch
-// of the role's name. A generation is admitted only once the newest has ended; the ended one
-// stays as it ended, under its own name; a refused admission takes no launch; and a reopened home
-// reads the newest launch as the role's convoy.
+// of the role's name. The ended one stays as it ended, under its own name; a refused admission
+// takes no launch; and a reopened home reads the newest launch as the role's convoy. (That only one
+// generation is live is admission's check, under its lock.)
 #[hegel::test]
 fn each_standing_generation_is_its_own_launch(tc: hegel::TestCase) {
     use flotilla_state_machines::machines::convoy::{Abandon, AbandonCause, Authority, ConvoyLabel, Deliver, Keep};
@@ -152,9 +160,8 @@ fn each_standing_generation_is_its_own_launch(tc: hegel::TestCase) {
     let service = service(&dir);
     let mut convoys = Convoys::open("home-a", &service).expect("open");
     convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
-    assert!(convoys.admit_standing(standing(request()), Timestamp(1)).expect("initial generation"));
+    admit(&convoys, standing(request()), Timestamp(1)).expect("initial generation");
     for _ in 0..steps {
-        assert!(!convoys.admit_standing(standing(request()), Timestamp(2)).expect("duplicate active admission"));
         if tc.draw(hegel::generators::booleans()) {
             convoys
                 .apply(
@@ -191,12 +198,12 @@ fn each_standing_generation_is_its_own_launch(tc: hegel::TestCase) {
         let ended = convoys.get("standing").expect("ended generation");
         let mut invalid = standing(request());
         invalid.project = address("missing");
-        assert!(convoys.admit_standing(invalid, Timestamp(5)).is_err(), "gate refusal");
+        assert!(admit(&convoys, invalid, Timestamp(5)).is_err(), "gate refusal");
         let mut conflicting = standing(request());
         conflicting.promises.insert(PromiseId(1), conflicting.promises[&PromiseId(0)].clone());
-        assert!(convoys.admit_standing(conflicting, Timestamp(5)).is_err(), "store refusal");
+        assert!(admit(&convoys, conflicting, Timestamp(5)).is_err(), "store refusal");
         assert_eq!(convoys.get("standing").as_ref(), Some(&ended), "a refused admission takes no launch");
-        assert!(convoys.admit_standing(standing(request()), Timestamp(6)).expect("new generation"));
+        admit(&convoys, standing(request()), Timestamp(6)).expect("new generation");
         let next = convoys.get("standing").expect("fresh generation");
         assert_eq!(next.label(), ConvoyLabel::Open);
         assert!(next.spec().launch > ended.spec().launch);

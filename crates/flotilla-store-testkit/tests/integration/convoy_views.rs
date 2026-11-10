@@ -2,7 +2,16 @@
 //! with its works' Vessels and its seats' sessions, its home's notes at that home only, and every
 //! write refused.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+use futures::StreamExt;
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_protocol::{LifecycleReading, PrincipalRef};
@@ -77,7 +86,12 @@ fn launch(name: &str, home: &str) -> ConvoyRecord {
             adopted_checkout_refs: BTreeMap::new(),
             subjects: Vec::new(),
             instruction: None,
-            admitted_from: None,
+            workflow_template: None,
+            placement_snapshot: None,
+            vessel_placements: BTreeMap::new(),
+            brief_artifacts: false,
+            adopted_checkout: None,
+            provenance: BTreeMap::new(),
         },
         admitted_at: at(100),
         ended: None,
@@ -110,6 +124,8 @@ fn session(vessel: &str, role: &str, reading: LifecycleReading) -> TerminalRecor
 struct Convoys {
     records: Vec<ConvoyRecord>,
     memory: ConvoyMemory,
+    /// How many times a launch's record was read.
+    read: AtomicUsize,
 }
 
 impl ConvoyRecords for Convoys {
@@ -117,6 +133,7 @@ impl ConvoyRecords for Convoys {
         HERE
     }
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
+        self.read.fetch_add(1, Ordering::SeqCst);
         let home = home.unwrap_or(HERE);
         Ok(self.records.iter().find(|record| record.name == name && record.home == home).cloned())
     }
@@ -128,6 +145,7 @@ impl ConvoyRecords for Convoys {
         Ok(self.records.iter().filter(|record| record.home == home).cloned().collect())
     }
     fn every(&self) -> Result<Vec<ConvoyRecord>, String> {
+        self.read.fetch_add(self.records.len(), Ordering::SeqCst);
         Ok(self.records.clone())
     }
     fn memory(&self) -> &ConvoyMemory {
@@ -202,13 +220,18 @@ async fn ready_vessel(backend: &ResourceBackend, name: &str) {
 
 // Behaviour: a launch reads as a Convoy named by its launch, its work Running on its ready
 // Vessel, its eager seat working on its live session and its latent one once its home delivered
-// its task. Its home's notes show at that home; another home's launch reads without them.
+// its task. Its home's notes show at that home; another home's launch reads without them. The
+// views are held: a read reads no record, and a change reads again only the launch it touches.
 #[tokio::test]
 async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     ready_vessel(&backend, "fix-it#1-work").await;
     let reads = Arc::new(Reads {
-        convoys: Convoys { records: vec![launch("fix-it#1", HERE), launch("other#1", "home-b")], memory: ConvoyMemory::default() },
+        convoys: Convoys {
+            records: vec![launch("fix-it#1", HERE), launch("other#1", "home-b")],
+            memory: ConvoyMemory::default(),
+            read: AtomicUsize::new(0),
+        },
         terminals: Terminals {
             records: vec![
                 session("fix-it#1-work", "coder", LifecycleReading::Ready { identity: "s1".into() }),
@@ -227,11 +250,20 @@ async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Pending, "a latent seat waits for its task");
 
+    // Reads are of the views held: reading again reads no record.
+    let read = reads.convoys.read.load(Ordering::SeqCst);
+    views.get("fix-it#1").await.expect("read again");
+    assert_eq!(reads.convoys.read.load(Ordering::SeqCst), read, "a read recomposes nothing");
+
+    // A change recomposes the launch it touches, then ticks the watchers.
+    let mut ticks = EngineRecords::changes(&views).await.expect("follow");
     let (_, changed) = reads.convoys.memory.update("fix-it#1", |notes: &mut ConvoyNotes| {
         notes.attention = Some(ConvoyAttention { source: "turn".into(), reason: "queued".into(), raised_at: at(120) });
         notes.crew.entry("work".into()).or_default().insert("reviewer".into(), CrewNotes { task_assigned: true, ..CrewNotes::default() });
     });
     assert!(changed);
+    tokio::time::timeout(Duration::from_secs(5), ticks.next()).await.expect("ticked").expect("following");
+    assert_eq!(reads.convoys.read.load(Ordering::SeqCst), read + 1, "only the changed launch is read again");
     let status = views.get("fix-it#1").await.expect("read").status.expect("status");
     assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Working);
     assert_eq!(status.attention.map(|attention| attention.reason).as_deref(), Some("queued"));
@@ -239,6 +271,7 @@ async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
     reads.convoys.memory.update("other#1", |notes: &mut ConvoyNotes| {
         notes.attention = Some(ConvoyAttention { source: "turn".into(), reason: "not here".into(), raised_at: at(120) });
     });
+    tokio::time::timeout(Duration::from_secs(5), ticks.next()).await.expect("ticked").expect("following");
     let other = views.find("other#1", Some("home-b")).await.expect("read").expect("held");
     assert!(other.object.status.expect("status").attention.is_none(), "another home's launch reads without this home's notes");
     assert_eq!(views.sources().await.expect("sources").len(), 2);
@@ -250,7 +283,7 @@ async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
 async fn the_views_refuse_writes() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let reads = Arc::new(Reads {
-        convoys: Convoys { records: vec![launch("fix-it#1", HERE)], memory: ConvoyMemory::default() },
+        convoys: Convoys { records: vec![launch("fix-it#1", HERE)], memory: ConvoyMemory::default(), read: AtomicUsize::new(0) },
         terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
     });
     let views = ConvoyViews::new(backend, "flotilla", reads);

@@ -23,7 +23,7 @@ use crate::{
         promises,
         view::{self, ConvoyFacts, CrewReading, Ended, VesselReading},
         ConvoyAttention, ConvoyIssue, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, DiscoveredSubject,
-        NudgeObligation, StalledCondition, TurnDeliveryStatus, WorkCompletionAuthority, WorkPhase, WorkState, ENSURED_FROM_ANNOTATION,
+        NudgeObligation, StalledCondition, TurnDeliveryStatus, WorkCompletionAuthority, WorkPhase, WorkState,
     },
     labels::{PROJECT_LABEL, ROLE_LABEL},
     ControllerRetry, Convoy, ObjectMeta, ResourceObject,
@@ -275,17 +275,33 @@ impl ConvoyRecord {
             observed_workflow_ref: Some(self.workflow_ref.clone()),
             turn_deliveries: notes.turn_deliveries.clone(),
             attention: notes.attention.clone().filter(|_| derived.phase != ConvoyPhase::Landed),
+            engine_launch: Some(self.name.clone()),
             ..ConvoyStatus::default()
         };
 
         let mut labels =
             BTreeMap::from([(PROJECT_LABEL.to_owned(), self.project.clone()), (ROLE_LABEL.to_owned(), self.role().to_owned())]);
         labels.retain(|_, value| !value.is_empty());
-        let mut annotations = BTreeMap::new();
-        if let Some(ensure) = &self.admission.ensure_admission {
-            annotations.insert(ENSURED_FROM_ANNOTATION.to_owned(), ensure.role.clone());
-        }
         let document = &self.admission;
+        // What admission wrote for the launch, under the annotations its readers find it by.
+        let mut annotations = document.provenance.clone();
+        if let Some(workflow) = &document.workflow_template {
+            annotations.insert(crate::WORKFLOW_SNAPSHOT_ANNOTATION.to_owned(), workflow.clone());
+        }
+        if let Some(placement) = &document.placement_snapshot {
+            annotations.insert(crate::PLACEMENT_SNAPSHOT_ANNOTATION.to_owned(), placement.clone());
+        }
+        if !document.vessel_placements.is_empty() {
+            let pins = serde_json::to_string(&document.vessel_placements).expect("vessel placement pins encode as JSON");
+            annotations.insert(crate::VESSEL_PLACEMENTS_ANNOTATION.to_owned(), pins);
+        }
+        if document.brief_artifacts {
+            annotations.insert(crate::BRIEF_ARTIFACTS_ANNOTATION.to_owned(), "true".to_owned());
+        }
+        if let Some(adopted) = &document.adopted_checkout {
+            let adopted = serde_json::to_string(adopted).expect("an observed checkout encodes as JSON");
+            annotations.insert(crate::ADOPTED_CHECKOUT_ANNOTATION.to_owned(), adopted);
+        }
         let spec = ConvoySpec {
             continuation: document.continuation.clone(),
             workflow_ref: self.workflow_ref.clone(),

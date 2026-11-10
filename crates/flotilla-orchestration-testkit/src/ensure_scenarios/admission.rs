@@ -377,10 +377,10 @@ pub async fn generation_allocation_sees_live_and_terminal_replicated_convoys(fac
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let writer = backend.replica_writer::<ResourceConvoy>(NodeId::new("other-root"), "flotilla");
     writer.replace(&source.using::<ResourceConvoy>("flotilla").list().await.expect("source convoys"), Utc::now()).await.expect("replicate");
-    let error = allocate_convoy_generation(&backend, "flotilla", Some("standing-project"), "quartermaster")
+    let error = refuse_live_convoy_in(&backend, "flotilla", Some("standing-project"), "quartermaster")
         .await
         .expect_err("remote live generation blocks admission");
-    assert!(error.contains("generation 1 already exists"), "{error}");
+    assert!(error.contains("already exists"), "{error}");
     assert!(error.contains("as of root other-root, last synced"), "{error}");
     assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("local reconciliation view").items.is_empty());
 
@@ -389,10 +389,8 @@ pub async fn generation_allocation_sees_live_and_terminal_replicated_convoys(fac
         .replace(&source.using::<ResourceConvoy>("flotilla").list().await.expect("source history"), Utc::now())
         .await
         .expect("replicate terminal history");
-    assert_eq!(
-        allocate_convoy_generation(&backend, "flotilla", Some("standing-project"), "quartermaster").await.expect("next generation"),
-        2
-    );
+    // The next generation's number is its launch's, reserved at admission.
+    refuse_live_convoy_in(&backend, "flotilla", Some("standing-project"), "quartermaster").await.expect("next generation");
 }
 
 pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(factory: &dyn EnsureScenarioController) {

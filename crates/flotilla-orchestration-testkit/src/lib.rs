@@ -653,4 +653,4 @@ use flotilla_resources::{ConvoySpec, FulfilmentKind};
 use flotilla_store::apply_status_patch as apply_resource_status_patch;
 use sha2::{Digest, Sha256};
 
-use flotilla_admission::convoy_admission::allocate_convoy_generation;
+use flotilla_admission::convoy_admission::refuse_live_convoy_in;

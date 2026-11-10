@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use flotilla_address::Address;
 use flotilla_engine_store::StoreLog;
-use flotilla_resources::convoy::admission::AdmissionDocument;
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
-    machines::convoy::{Convoy, ConvoyEdge, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoySpec, MemoryConvoyWorld},
+    launch_name,
+    machines::convoy::{Convoy, ConvoyEdge, ConvoyRefusal, ConvoyRequest, ConvoySpec, MemoryConvoyWorld},
     Edge as _, Home, Resource, Version, WriteError,
 };
 
@@ -104,22 +104,6 @@ impl Convoys {
         locked(&self.home).get(name).cloned()
     }
 
-    /// The launch of `of` homed here that was admitted or imported from the old record `record`,
-    /// searched newest first: a standing role's generation is among its newest launches.
-    pub fn admitted_from(&self, of: &str, record: &str) -> Result<Option<String>, String> {
-        let home = locked(&self.home);
-        let mut before = None;
-        while let Some(launch) = home.newest_launch(of, before) {
-            let document =
-                AdmissionDocument::decode(launch.name(), launch.spec().admission.value().bytes()).map_err(|error| error.to_string())?;
-            if document.admitted_from.as_deref() == Some(record) {
-                return Ok(Some(launch.name().to_owned()));
-            }
-            before = Some(launch.spec().launch);
-        }
-        Ok(None)
-    }
-
     /// Edit the world the gates read; the next admission or edge reads the
     /// result. Projects stay (one entry per project admission named). The
     /// `durable` and `authority` tables are scoped to one edge: put them here
@@ -130,35 +114,29 @@ impl Convoys {
         edit(&mut locked(&self.world))
     }
 
-    /// Admits the first launch of `request.launch_of`, unless one is already homed here
-    /// (`Ok(false)`). A refusal is the machine's, as `Err`.
-    pub fn admit(&self, request: ConvoyRequest, now: Timestamp) -> Result<bool, WriteError<Convoy>> {
-        self.admit_launch(request, now, |_| false)
+    /// Reserves the next launch number of `of` here and returns the launch's name (`<of>#<n>`),
+    /// for admission to key what it writes by before the launch exists. One never created is a
+    /// gap in the numbers.
+    pub fn reserve(&self, of: &str, now: Timestamp) -> Result<String, WriteError<Convoy>> {
+        let n = locked(&self.home).reserve_launch(of, now)?;
+        Ok(launch_name(of, n))
     }
 
-    /// Admits a standing role's next generation: a new launch of `request.launch_of`, unless its
-    /// newest launch is still Open (`Ok(false)`). An ended generation stays as it ended.
-    pub fn admit_standing(&self, request: ConvoyRequest, now: Timestamp) -> Result<bool, WriteError<Convoy>> {
-        self.admit_launch(request, now, |newest| newest.label() != ConvoyLabel::Open)
-    }
-
-    fn admit_launch(
-        &self,
-        request: ConvoyRequest,
-        now: Timestamp,
-        follows: impl FnOnce(&Resource<Convoy>) -> bool,
-    ) -> Result<bool, WriteError<Convoy>> {
+    /// Admits the launch `launch` that [`Convoys::reserve`] reserved for `request.launch_of`.
+    /// Refused when `launch` is not such a reservation or the machine refuses the request.
+    pub fn create_reserved(&self, launch: &str, request: ConvoyRequest, now: Timestamp) -> Result<(), WriteError<Convoy>> {
+        let n = launch
+            .strip_prefix(request.launch_of.as_str())
+            .and_then(|rest| rest.strip_prefix('#'))
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| WriteError::Unreserved(request.launch_of.clone(), 0))?;
         let mut home = locked(&self.home);
         let world = locked(&self.world);
-        if home.newest_launch(&request.launch_of, None).is_some_and(|newest| !follows(newest)) {
-            return Ok(false);
-        }
-        let of = request.launch_of.clone();
-        home.create(of, request, &*world, now)?;
-        Ok(true)
+        home.create_launch(request, &*world, now, n)?;
+        Ok(())
     }
 
-    /// Applies `edge` to the newest launch of `of` through the store's log.
+    /// Applies `edge` to launch `of`, or the newest launch of `of`, through the store's log.
     pub fn apply(&self, of: &str, edge: impl Into<ConvoyEdge>, now: Timestamp) -> Result<Version, WriteError<Convoy>> {
         let mut home = locked(&self.home);
         let world = locked(&self.world);
@@ -207,9 +185,13 @@ impl Convoys {
     }
 }
 
-/// The name of the newest launch of `of` held at `home`.
-fn newest_name(home: &Home<Convoy, StoreLog>, of: &str) -> Option<String> {
-    home.newest_launch(of, None).map(|launch| launch.name().to_owned())
+/// The launch `name` names at `home`: itself when it is a launch held there, else the newest
+/// launch of it.
+fn newest_name(home: &Home<Convoy, StoreLog>, name: &str) -> Option<String> {
+    if home.get(name).is_some() {
+        return Some(name.to_owned());
+    }
+    home.newest_launch(name, None).map(|launch| launch.name().to_owned())
 }
 
 /// Why [`Convoys::edit`] wrote nothing more.

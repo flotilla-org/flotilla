@@ -14,7 +14,7 @@ use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_protocol::Relationship;
 use flotilla_resources::{
     address::subject_for,
-    convoy::admission::AdmissionDocument,
+    convoy::{admission::AdmissionDocument, engine::launch_address},
     convoy_records::{ConvoyChange, ConvoyEnd, ConvoyMemory, ConvoyRecord, ConvoyRecords, SeatRecord},
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
@@ -165,8 +165,8 @@ impl ConvoyRecords for EngineConvoyRecords {
 }
 
 /// The seat address a stall about role `role` of launch `launch` in `project` names.
-pub fn seat_address(project: &Address, launch: &str, role: &str) -> Result<Address, flotilla_address::Error> {
-    project.child(AddressKind::Convoy, launch)?.child(AddressKind::Role, role)
+pub fn seat_address(project: &Address, launch: &str, role: &str) -> Result<Address, String> {
+    launch_address(project, launch)?.child(AddressKind::Role, role).map_err(|error| error.to_string())
 }
 
 /// The launch a stall record is about, when it is about a convoy or one of its seats.

@@ -6,13 +6,15 @@
 //! with what that home observes of it. Nothing here writes: the convoy verbs write edges, and the
 //! home its notes.
 //!
-//! Installed as the backend's [`EngineRecords`] for `Convoy`, it serves the old store's typed
-//! reads, lists and watches of the kind; its writes are refused.
+//! The views are held, not composed on each read: a follower recomposes a launch's view when its
+//! record, its home's notes, one of its works' Vessels or one of its seats' sessions changes, and
+//! every read is of the views held. Installed as the backend's [`EngineRecords`] for `Convoy`, it
+//! serves the old store's typed reads, lists and watches of the kind; its writes are refused.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use futures::{stream::BoxStream, StreamExt};
@@ -20,11 +22,12 @@ use futures::{stream::BoxStream, StreamExt};
 use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     convoy::view::VesselReading,
-    convoy_records::{ConvoyJoins, ConvoyRecord, ConvoyRecords, WorkFacts},
+    convoy_records::{ConvoyChange, ConvoyJoins, ConvoyRecord, ConvoyRecords, WorkFacts},
     engine_records::{EngineObject, EngineRecords},
     lifecycle_reads::LifecycleReads,
-    terminal_records::newest_launches,
-    vessel_resource_name, Convoy, ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance, Vessel, VesselPhase,
+    terminal_records::{newest_launches, TerminalChange},
+    vessel_resource_name, Convoy, ReadResourceObject, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance, Vessel,
+    VesselPhase,
 };
 
 use crate::ResourceBackend;
@@ -37,29 +40,42 @@ pub struct ConvoyViews {
     backend: ResourceBackend,
     namespace: String,
     reads: Arc<dyn LifecycleReads>,
+    held: Arc<Held>,
 }
+
+/// The views held, by `(home, launch)`, and what each joins, kept current by one follower.
+#[derive(Default)]
+struct Held {
+    state: tokio::sync::Mutex<Option<HeldViews>>,
+    ticks: Mutex<Option<tokio::sync::broadcast::Sender<()>>>,
+}
+
+#[derive(Default)]
+struct HeldViews {
+    views: BTreeMap<(String, String), ReadResourceObject<Convoy>>,
+    /// The launches each work Vessel is joined into, by Vessel name.
+    by_vessel: BTreeMap<String, BTreeSet<(String, String)>>,
+}
+
+/// How many view changes a slow watcher may fall behind by before it reads everything again.
+const TICKS: usize = 256;
 
 impl ConvoyViews {
     pub fn new(backend: ResourceBackend, namespace: &str, reads: Arc<dyn LifecycleReads>) -> Self {
-        Self { backend, namespace: namespace.to_owned(), reads }
+        Self { backend, namespace: namespace.to_owned(), reads, held: Arc::default() }
     }
 
     /// Every launch at every home, as read sources: this home's are local, other homes' replicas
     /// of their home.
     pub async fn sources(&self) -> Result<Vec<ReadResourceObject<Convoy>>, ResourceError> {
-        let records = self.blocking(|reads| reads.convoys()?.every()).await?;
-        self.compose(records).await
+        self.with_held(|held| held.views.values().cloned().collect()).await
     }
 
     /// This home's launches.
     pub async fn here(&self) -> Result<Vec<ResourceObject<Convoy>>, ResourceError> {
-        let records = self
-            .blocking(|reads| {
-                let convoys = reads.convoys()?;
-                convoys.at(convoys.home())
-            })
-            .await?;
-        Ok(self.compose(records).await?.into_iter().map(|source| source.object).collect())
+        let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
+        self.with_held(move |held| held.views.iter().filter(|((home, _), _)| *home == here).map(|(_, view)| view.object.clone()).collect())
+            .await
     }
 
     /// Launch `name` at this home, as a resolver's `get` reads it.
@@ -69,20 +85,120 @@ impl ConvoyViews {
 
     /// Launch `name` held at `home`, or at this home when `None`.
     pub async fn find(&self, name: &str, home: Option<&str>) -> Result<Option<ReadResourceObject<Convoy>>, ResourceError> {
-        let (name, home) = (name.to_owned(), home.map(str::to_owned));
-        let record = self.blocking(move |reads| reads.convoys()?.get(&name, home.as_deref())).await?;
-        Ok(self.compose(record.into_iter().collect()).await?.pop())
+        let home = match home {
+            Some(home) => home.to_owned(),
+            None => self.convoys().map_err(ResourceError::other)?.home().to_owned(),
+        };
+        let key = (home, name.to_owned());
+        self.with_held(move |held| held.views.get(&key).cloned()).await
     }
 
     /// The newest launch of `of` in `project` held at `home`, or at this home when `None`.
     pub async fn newest(&self, of: &str, project: &str, home: Option<&str>) -> Result<Option<ReadResourceObject<Convoy>>, ResourceError> {
         let (of, project, home) = (of.to_owned(), project.to_owned(), home.map(str::to_owned));
         let record = self.blocking(move |reads| reads.convoys()?.newest(&of, &project, home.as_deref())).await?;
-        Ok(self.compose(record.into_iter().collect()).await?.pop())
+        let Some(record) = record else { return Ok(None) };
+        self.find(&record.name, Some(&record.home)).await
     }
 
-    /// `records` as read views.
-    pub async fn compose(&self, records: Vec<ConvoyRecord>) -> Result<Vec<ReadResourceObject<Convoy>>, ResourceError> {
+    /// Reads the views held, filling them on first use and starting the follower that keeps them.
+    async fn with_held<T>(&self, read: impl FnOnce(&HeldViews) -> T) -> Result<T, ResourceError> {
+        let mut state = self.held.state.lock().await;
+        if state.is_none() {
+            // Follow before filling, so no change between the fill and the first event is missed.
+            let events = self.events().await?;
+            let mut held = HeldViews::default();
+            self.refill(&mut held).await?;
+            *state = Some(held);
+            tokio::spawn(self.clone().follow(events));
+        }
+        Ok(read(state.as_ref().expect("filled above")))
+    }
+
+    /// The changes the views follow: each launch's record and notes, its seats' sessions and its
+    /// works' Vessels.
+    async fn events(&self) -> Result<BoxStream<'static, Followed>, ResourceError> {
+        let convoys = self.convoys().map_err(ResourceError::other)?;
+        let terminals = self.reads.terminals().map_err(ResourceError::other)?;
+        let vessels = self.backend.including_replicas::<Vessel>(&self.namespace).watch().await?;
+        let vessels = vessels
+            .map(|event| match event {
+                Ok(ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source)) => {
+                    Followed::Vessel(source.object.metadata.name)
+                }
+                Ok(ReadWatchEvent::DeletedByName { tombstone, .. }) => Followed::Vessel(tombstone.name),
+                Err(_) => Followed::Everything,
+            })
+            .boxed();
+        Ok(futures::stream::select_all([
+            received(convoys.changes(), |change| match change {
+                ConvoyChange::Changed { name, home } => Followed::Launch { name, home },
+                ConvoyChange::Rescanned => Followed::Everything,
+            }),
+            received(convoys.memory().subscribe(), Followed::Notes),
+            received(terminals.changes(), |change| match change {
+                TerminalChange::Changed { name, home } => Followed::Session { name, home },
+                TerminalChange::Rescanned => Followed::Everything,
+            }),
+            vessels,
+        ])
+        .boxed())
+    }
+
+    /// Recomposes the views each followed change touches, and ticks the watchers.
+    async fn follow(self, mut events: BoxStream<'static, Followed>) {
+        while let Some(event) = events.next().await {
+            let mut state = self.held.state.lock().await;
+            let Some(held) = state.as_mut() else { return };
+            if let Err(error) = self.apply(held, event).await {
+                // The views are read again in full; a failed read leaves them as they were.
+                tracing::warn!(%error, "convoy views: a change did not read; reading them all again");
+                if let Err(error) = self.refill(held).await {
+                    tracing::warn!(%error, "convoy views: reading them all again failed");
+                }
+            }
+            drop(state);
+            if let Some(ticks) = self.held.ticks.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+                let _ = ticks.send(());
+            }
+        }
+    }
+
+    async fn apply(&self, held: &mut HeldViews, event: Followed) -> Result<(), ResourceError> {
+        let launches: Vec<(String, String)> = match event {
+            Followed::Everything => return self.refill(held).await,
+            Followed::Launch { name, home } => vec![(home, name)],
+            Followed::Notes(name) => vec![(self.convoys().map_err(ResourceError::other)?.home().to_owned(), name)],
+            Followed::Vessel(vessel) => held.by_vessel.get(&vessel).into_iter().flatten().cloned().collect(),
+            Followed::Session { name, home } => {
+                let vessel =
+                    self.blocking(move |reads| Ok(reads.terminals()?.get(&name, Some(&home))?.and_then(|record| record.vessel))).await?;
+                vessel.and_then(|vessel| held.by_vessel.get(&vessel)).into_iter().flatten().cloned().collect()
+            }
+        };
+        for (home, name) in launches {
+            let (key_home, key_name) = (home.clone(), name.clone());
+            let record = self.blocking(move |reads| reads.convoys()?.get(&key_name, Some(&key_home))).await?;
+            held.remove(&(home.clone(), name.clone()));
+            if let Some(record) = record {
+                let composed = self.compose(vec![record]).await?;
+                held.insert(composed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads every launch again.
+    async fn refill(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
+        let records = self.blocking(|reads| reads.convoys()?.every()).await?;
+        let composed = self.compose(records).await?;
+        *held = HeldViews::default();
+        held.insert(composed);
+        Ok(())
+    }
+
+    /// `records` as read views, each with the Vessels its works join.
+    async fn compose(&self, records: Vec<ConvoyRecord>) -> Result<Vec<Composed>, ResourceError> {
         if records.is_empty() {
             return Ok(Vec::new());
         }
@@ -106,6 +222,7 @@ impl ConvoyViews {
                         Some((work.name.clone(), vessel.clone()))
                     })
                     .collect();
+                let joined = record.admission.workflow_snapshot.vessels.iter().map(|work| work_vessel(&record, &work.name)).collect();
                 let working = record.working(live.get(&record.name).unwrap_or(&none), notes.as_ref());
                 let object = record.read_view(&self.namespace, ConvoyJoins { works: &works, working: &working, notes: notes.as_ref() });
                 let provenance = if local {
@@ -114,7 +231,7 @@ impl ConvoyViews {
                     let synced = record.ended.as_ref().map_or(record.admitted_at, |(_, at)| *at);
                     ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: synced }
                 };
-                ReadResourceObject { object, provenance }
+                Composed { home: record.home.clone(), view: ReadResourceObject { object, provenance }, vessels: joined }
             })
             .collect())
     }
@@ -125,7 +242,7 @@ impl ConvoyViews {
         let mut held = BTreeMap::new();
         for record in records {
             for work in &record.admission.workflow_snapshot.vessels {
-                let name = vessel_resource_name(&record.name, &work.name);
+                let name = work_vessel(record, &work.name);
                 match vessels.get(&name).await {
                     Ok(source) => {
                         let object = source.object;
@@ -160,7 +277,7 @@ impl ConvoyViews {
                     .workflow_snapshot
                     .vessels
                     .iter()
-                    .map(|work| (record.name.clone(), work.name.clone(), vessel_resource_name(&record.name, &work.name)))
+                    .map(|work| (record.name.clone(), work.name.clone(), work_vessel(record, &work.name)))
             })
             .collect();
         self.blocking(move |reads| {
@@ -289,31 +406,92 @@ impl EngineRecords for ConvoyViews {
         Err(format!("convoy {name} ends on the engine; it is not deleted"))
     }
 
-    /// A tick at each launch change at any home, at each change of what this home observes of
-    /// one, and at each change of a Vessel or terminal session its works join.
+    /// A tick each time the views held change: a launch's record at any home, what this home
+    /// observes of one, or a Vessel or terminal session its works join.
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let convoys = self.convoys()?;
-        let terminals = self.reads.terminals()?;
-        let vessels = self.backend.including_replicas::<Vessel>(&self.namespace);
-        // A watch error is a tick too: the reader reads everything again.
-        let vessel_ticks = vessels.watch().await.map_err(|error| error.to_string())?.map(|_| ()).boxed();
-        Ok(futures::stream::select_all([
-            ticks(convoys.changes()),
-            ticks(convoys.memory().subscribe()),
-            ticks(terminals.changes()),
-            vessel_ticks,
-        ])
-        .boxed())
+        // Hold the views first, so the follower that ticks is running.
+        self.with_held(|_| ()).await.map_err(|error| error.to_string())?;
+        let ticks = self
+            .held
+            .ticks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(|| tokio::sync::broadcast::channel(TICKS).0)
+            .subscribe();
+        Ok(received(ticks, |_| ()))
     }
 }
 
-/// A tick per message on `changes`, and one when it lagged: a reader reads everything again.
-fn ticks<T: Clone + Send + 'static>(changes: tokio::sync::broadcast::Receiver<T>) -> BoxStream<'static, ()> {
-    futures::stream::unfold(changes, |mut changes| async move {
+/// What the views follow.
+enum Followed {
+    /// Launch `name` held at `home`, or a record about it, changed.
+    Launch { name: String, home: String },
+    /// This home's notes on launch `name` changed.
+    Notes(String),
+    /// Terminal session launch `name` held at `home` changed.
+    Session { name: String, home: String },
+    /// The Vessel of this name changed.
+    Vessel(String),
+    /// Anything may have changed, or a follower fell behind: read everything again.
+    Everything,
+}
+
+/// A launch's view and the Vessels its works join.
+struct Composed {
+    home: String,
+    view: ReadResourceObject<Convoy>,
+    vessels: Vec<String>,
+}
+
+impl HeldViews {
+    fn insert(&mut self, composed: Vec<Composed>) {
+        for Composed { home, view, vessels } in composed {
+            let key = (home, view.object.metadata.name.clone());
+            for vessel in vessels {
+                self.by_vessel.entry(vessel).or_default().insert(key.clone());
+            }
+            self.views.insert(key, view);
+        }
+    }
+
+    fn remove(&mut self, key: &(String, String)) {
+        self.views.remove(key);
+        self.by_vessel.retain(|_, launches| {
+            launches.remove(key);
+            !launches.is_empty()
+        });
+    }
+}
+
+/// The Vessel work `work` of `record` joins.
+fn work_vessel(record: &ConvoyRecord, work: &str) -> String {
+    vessel_resource_name(&record.name, work)
+}
+
+/// Each message on `changes` as `map` makes it; a lag is everything changed.
+fn received<T: Clone + Send + 'static, E: Send + 'static + From<Lagged>>(
+    changes: tokio::sync::broadcast::Receiver<T>,
+    map: impl Fn(T) -> E + Send + Sync + 'static,
+) -> BoxStream<'static, E> {
+    futures::stream::unfold((changes, map), |(mut changes, map)| async move {
         match changes.recv().await {
-            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some(((), changes)),
+            Ok(change) => Some((map(change), (changes, map))),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((E::from(Lagged), (changes, map))),
             Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
         }
     })
     .boxed()
+}
+
+/// A follower fell behind its channel.
+struct Lagged;
+
+impl From<Lagged> for Followed {
+    fn from(_: Lagged) -> Self {
+        Followed::Everything
+    }
+}
+
+impl From<Lagged> for () {
+    fn from(_: Lagged) -> Self {}
 }

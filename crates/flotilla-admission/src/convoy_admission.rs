@@ -31,23 +31,22 @@ use flotilla_protocol::{
 use flotilla_provider_runtime::{CommandRunner, ObservationError};
 use flotilla_resources::address::{record_name, remote_change_request_address};
 use flotilla_resources::checkout_path::checkout_path;
+use flotilla_resources::convoy::engine::{split_launch, standing_name, EngineConvoyPath, EngineConvoys};
+use flotilla_resources::convoy::reconcile::{admitted_snapshot, SnapshotRefusal};
 use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
 use flotilla_resources::{
     capped_github_app_permissions, is_prepared_snapshot, normalize_issue_source, AllocationDecision, BoundChangeRequest, CapabilityNeed,
     ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, Clock, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource, CrewSpec, Forge,
-    FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host as ResourceHost, InputMeta, InputValue, IssueSnapshot,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource, CrewSpec, Forge,
+    FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host as ResourceHost, InputValue, IssueSnapshot,
     IssueSourceResolution, IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, Platform, Project, ProjectSpec,
     ReadResourceObject, Repository, RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff,
     SupervisionTarget, TerminalCrewContext, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, BRIEF_ARTIFACTS_ANNOTATION,
     CODEX_CENTRAL_LOGIN_CAPABILITY, GENERATION_LABEL, PLACEMENT_SNAPSHOT_KIND, PROJECT_LABEL, ROLE_LABEL,
 };
 #[cfg(test)]
-use flotilla_resources::{HoldAct, RepositorySpec, SystemClock};
-use flotilla_store::{
-    apply_status_patch as apply_resource_status_patch, resolve_project_issue_sources, PlacementImageSourceStoreExt,
-    ResolvedCascadeStoreExt, ResourceBackend, StoreQuery,
-};
+use flotilla_resources::{HoldAct, InputMeta, RepositorySpec, SystemClock};
+use flotilla_store::{resolve_project_issue_sources, PlacementImageSourceStoreExt, ResolvedCascadeStoreExt, ResourceBackend, StoreQuery};
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
 use sha2::{Digest, Sha256};
@@ -133,6 +132,9 @@ pub struct ConvoyAdmission {
     #[builder(default = std::sync::RwLock::new(Arc::new(crate::random::SeededRandom::from_entropy())))]
     random: std::sync::RwLock<Arc<dyn crate::random::RandomSource>>,
     fulfilment_decider: Arc<dyn FulfilmentDecider>,
+    /// The engine's convoys, which admission reserves and creates launches on, installed at startup.
+    #[builder(default)]
+    convoys: EngineConvoyPath,
     /// Serializes the identity selector check with Convoy creation on the owner host.
     #[builder(default)]
     guard: Mutex<()>,
@@ -608,21 +610,6 @@ fn protocol_status(state: ObservedChangeRequestState) -> flotilla_protocol::Chan
 }
 
 impl ConvoyAdmission {
-    async fn record_admission_naming(&self, namespace: &str, name: &str, naming: Option<ConvoyNaming>) {
-        if let Some(naming) = naming {
-            finish_naming_write(namespace, name, async {
-                apply_resource_status_patch(
-                    &self.backend.using::<ResourceConvoy>(namespace),
-                    name,
-                    &ConvoyStatusPatch::RecordNaming { naming },
-                )
-                .await
-                .map(|_| ())
-            })
-            .await;
-        }
-    }
-
     pub async fn start_placement_host(
         &self,
         namespace: &str,
@@ -755,9 +742,8 @@ impl ConvoyAdmission {
         )
         .await?;
         Self::refuse_live_continuation_holder(&admission.spec, &inventory)?;
-        admission.name = convoy_record_name();
-        admission.spec.generation =
-            allocate_convoy_generation_from_inventory(&inventory, admission.spec.project_ref.as_deref(), &admission.spec.role)?;
+        refuse_live_convoy(&inventory, admission.spec.project_ref.as_deref(), &admission.spec.role)?;
+        admission.name = self.reserve_launch(&convoy_record_name()).await?;
         let bindings = self
             .choose_account_bindings(
                 namespace,
@@ -783,11 +769,13 @@ impl ConvoyAdmission {
                 vessel_placements: Some(&admission.vessel_placements),
                 image_builds: &admission.image_builds,
                 adopted_checkout: None,
+                naming: admission.naming.clone(),
+                ensure: None,
+                provenance: BTreeMap::new(),
             },
         )
         .await?;
         self.accounts.open(namespace, bindings).await?;
-        self.record_admission_naming(namespace, &admission.name, admission.naming.clone()).await;
         let address = convoy_address(&admission.spec.role, admission.spec.project_ref.as_deref());
         let warnings = admission.spec.issues.iter().flat_map(|issue| issue.placement_needs().1).collect();
         Ok((admission.name, address, admission.naming, warnings))
@@ -888,12 +876,16 @@ impl ConvoyAdmission {
             vessel_placements,
             image_builds,
             adopted_checkout,
+            naming,
+            ensure,
+            provenance,
             evidence,
         } = bundle;
         let workflow_value = serde_json::to_value(workflow).map_err(|error| error.to_string())?;
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         ensure_prepared_workflow_snapshot(&self.backend, namespace, &workflow_name, workflow).await?;
-        let mut annotations = BTreeMap::from([(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name)]);
+        let mut annotations = provenance;
+        annotations.insert(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name);
         if self.write_admission_briefs_from_inventory(namespace, name, spec, workflow, evidence, adopted_checkout).await? {
             annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
         }
@@ -911,11 +903,64 @@ impl ConvoyAdmission {
             );
         }
         let created = crate::image_build::create_planned_builds(&self.backend, namespace, image_builds).await?;
-        let result = self.create_convoy_with_annotations(namespace, name, spec, placement_decision, annotations).await;
+        let seed = ConvoyStatus { placement_decision, naming, ensure_admission: ensure.cloned(), ..ConvoyStatus::default() };
+        let result = self.admit_launch(namespace, name, spec, workflow, seed, annotations).await;
         if result.is_err() {
             crate::image_build::remove_created_builds(&self.backend, namespace, &created).await;
         }
         result
+    }
+
+    /// Reserves the next launch of `launch_of` on the engine. The launch's name keys everything
+    /// admission writes for it; a reservation never admitted is a gap in the launch numbers.
+    pub async fn reserve_launch(&self, launch_of: &str) -> Result<String, String> {
+        self.engine()?.reserve(launch_of).await
+    }
+
+    fn engine(&self) -> Result<Arc<dyn EngineConvoys>, String> {
+        self.convoys.get().cloned().ok_or_else(|| "convoys are admitted on the engine, which is not installed".to_owned())
+    }
+
+    /// Admits reserved launch `name` on the engine as admission froze it: `spec` at the launch's
+    /// number, the workflow snapshot frozen from `workflow`, the status `seed` and the
+    /// `annotations` naming what admission wrote for it. Nothing else is written for the launch.
+    async fn admit_launch(
+        &self,
+        namespace: &str,
+        name: &str,
+        spec: &ConvoySpec,
+        workflow: &WorkflowTemplateSpec,
+        seed: ConvoyStatus,
+        annotations: BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let (_, generation) = split_launch(name).ok_or_else(|| format!("`{name}` names no reserved launch"))?;
+        let workflow_snapshot = admitted_snapshot(name, namespace, spec, workflow).map_err(|refusal| match refusal {
+            SnapshotRefusal::Invalid(errors) => format!("workflow `{}` is invalid: {errors:?}", spec.workflow_ref),
+            SnapshotRefusal::MissingInput(input) => format!("workflow `{}` input `{input}` has no value", spec.workflow_ref),
+        })?;
+        let spec = ConvoySpec { generation, ..spec.clone() };
+        let labels = BTreeMap::from([
+            (PROJECT_LABEL.to_string(), spec.project_ref.clone().unwrap_or_default()),
+            (ROLE_LABEL.to_string(), spec.role.clone()),
+            (GENERATION_LABEL.to_string(), generation.to_string()),
+        ]);
+        let convoy = ResourceObject {
+            metadata: ObjectMeta {
+                name: name.to_owned(),
+                namespace: namespace.to_owned(),
+                resource_version: String::new(),
+                labels,
+                annotations,
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: self.clock.now(),
+                merge: None,
+            },
+            spec,
+            status: Some(ConvoyStatus { workflow_snapshot: Some(workflow_snapshot), ..seed }),
+        };
+        self.engine()?.admit_reserved(&convoy).await
     }
 
     async fn prepared_brief_query(&self, namespace: &str, admission: &PreparedConvoyAdmission) -> Result<Option<StoreQuery>, String> {
@@ -1327,35 +1372,6 @@ impl ConvoyAdmission {
         )]))
     }
 
-    pub async fn create_convoy_with_annotations(
-        &self,
-        namespace: &str,
-        name: &str,
-        spec: &ConvoySpec,
-        placement_decision: Option<PlacementDecision>,
-        mut annotations: BTreeMap<String, String>,
-    ) -> Result<(), String> {
-        // Publish admission inputs and initial status in one create. Publishing
-        // first and patching status later races finalization/bootstrap/roll-up.
-        if let Some(placement_decision) = placement_decision {
-            annotations.insert(
-                flotilla_resources::convoy::ADMISSION_PLACEMENT_ANNOTATION.to_string(),
-                serde_json::to_string(&placement_decision).map_err(|error| error.to_string())?,
-            );
-        }
-        let convoys = self.backend.clone().using::<ResourceConvoy>(namespace);
-        let labels = BTreeMap::from([
-            (PROJECT_LABEL.to_string(), spec.project_ref.clone().unwrap_or_default()),
-            (ROLE_LABEL.to_string(), spec.role.clone()),
-            (GENERATION_LABEL.to_string(), spec.generation.to_string()),
-        ]);
-        convoys
-            .create(&InputMeta::builder().name(name.to_string()).labels(labels).annotations(annotations).build(), spec)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
     /// Freeze each vessel's composed image for a ConvoyCreate placement. The
     /// returned per-vessel pins are non-empty only when vessels resolve to
     /// different images.
@@ -1405,7 +1421,7 @@ impl ConvoyAdmission {
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
         mut admission: PreparedConvoyAdmission,
-        mut annotations: BTreeMap<String, String>,
+        annotations: BTreeMap<String, String>,
     ) -> Result<String, String> {
         let _admission_guard = self.lock().await;
         let inventory = convoy_admission_inventory(
@@ -1438,9 +1454,8 @@ impl ConvoyAdmission {
                 convoy_address(&ensure.spec.role, Some(&ensure.spec.project_ref))
             ));
         }
-        admission.name = convoy_record_name();
-        admission.spec.generation =
-            allocate_convoy_generation_from_inventory(&inventory, admission.spec.project_ref.as_deref(), &admission.spec.role)?;
+        let launch_of = standing_name(&ensure.spec.project_ref, &ensure.spec.role)?;
+        admission.name = self.reserve_launch(&launch_of).await?;
         let bindings = self
             .choose_account_bindings(
                 namespace,
@@ -1454,42 +1469,25 @@ impl ConvoyAdmission {
                 &[],
             )
             .await?;
-        let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
-        let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
-        ensure_prepared_workflow_snapshot(&self.backend, namespace, &workflow_name, &admission.workflow).await?;
-        annotations.insert(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name);
-        if self
-            .write_admission_briefs_from_inventory(
-                namespace,
-                &admission.name,
-                &admission.spec,
-                &admission.workflow,
-                BriefEvidence { definitions: &admission.evidence, convoys: &inventory },
-                None,
-            )
-            .await?
-        {
-            annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
-        }
-        if let Some(placement) = &admission.placement_kind {
-            let placement_name = self.write_placement_snapshot(namespace, &admission.name, placement).await?;
-            annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_name);
-        }
-        annotations.extend(self.prepare_vessel_placement_annotations(namespace, &admission.name, &admission.vessel_placements).await?);
-        annotations.insert(
-            flotilla_resources::convoy::ENSURE_ADMISSION_ANNOTATION.to_string(),
-            serde_json::to_string(&ensure.spec).map_err(|error| error.to_string())?,
-        );
-        let created = crate::image_build::create_planned_builds(&self.backend, namespace, &admission.image_builds).await?;
-        let result = self
-            .create_convoy_with_annotations(namespace, &admission.name, &admission.spec, admission.placement_decision, annotations)
-            .await;
-        if result.is_err() {
-            crate::image_build::remove_created_builds(&self.backend, namespace, &created).await;
-        }
-        result?;
+        self.create_convoy_with_workflow_snapshot(
+            namespace,
+            &admission.name,
+            ConvoySnapshotBundle {
+                evidence: BriefEvidence { definitions: &admission.evidence, convoys: &inventory },
+                spec: &admission.spec,
+                workflow: &admission.workflow,
+                placement: admission.placement_kind.as_ref(),
+                placement_decision: admission.placement_decision.clone(),
+                vessel_placements: Some(&admission.vessel_placements),
+                image_builds: &admission.image_builds,
+                adopted_checkout: None,
+                naming: admission.naming.clone(),
+                ensure: Some(&ensure.spec),
+                provenance: annotations,
+            },
+        )
+        .await?;
         self.accounts.open(namespace, bindings).await?;
-        self.record_admission_naming(namespace, &admission.name, admission.naming.clone()).await;
         Ok(admission.name)
     }
 }
@@ -1521,7 +1519,7 @@ impl ConvoyAdmission {
             image_builds,
         } = request;
         let address = convoy_address(role, project_ref.as_deref());
-        let mut spec = ConvoySpec {
+        let spec = ConvoySpec {
             continuation: None,
             workflow_ref: workflow_ref.to_string(),
             role: role.to_string(),
@@ -1551,10 +1549,9 @@ impl ConvoyAdmission {
             Ok(inventory) => inventory,
             Err(message) => return CommandValue::Error { message },
         };
-        spec.generation = match allocate_convoy_generation_from_inventory(&inventory, spec.project_ref.as_deref(), role) {
-            Ok(generation) => generation,
-            Err(message) => return CommandValue::Error { message },
-        };
+        if let Err(message) = refuse_live_convoy(&inventory, spec.project_ref.as_deref(), role) {
+            return CommandValue::Error { message };
+        }
         let bindings = match self
             .choose_account_bindings(
                 namespace,
@@ -1585,6 +1582,9 @@ impl ConvoyAdmission {
                     vessel_placements: (!vessel_placements.is_empty()).then_some(&vessel_placements),
                     image_builds: &image_builds,
                     adopted_checkout: adopted_checkout.as_ref(),
+                    naming: None,
+                    ensure: None,
+                    provenance: BTreeMap::new(),
                 },
             )
             .await
@@ -3904,48 +3904,37 @@ async fn convoy_admission_inventory(
         .map_err(|error| error.to_string())
 }
 
-pub async fn allocate_convoy_generation(
-    backend: &ResourceBackend,
-    namespace: &str,
-    project: Option<&str>,
-    role: &str,
-) -> Result<u64, String> {
+/// Refuses a convoy of `role` in `project` while one is live, at any home.
+pub async fn refuse_live_convoy_in(backend: &ResourceBackend, namespace: &str, project: Option<&str>, role: &str) -> Result<(), String> {
     let generations = backend
         .query_declared::<ResourceConvoy>(namespace, &convoy_identity_query(project, role))
         .await
         .map_err(|error| error.to_string())?;
-    allocate_convoy_generation_from_inventory(&generations.items, project, role)
+    refuse_live_convoy(&generations.items, project, role)
 }
 
 /// The identity guard and continuation guard share a single selected inventory
 /// taken under the admission lock. Neither performs reads in a candidate loop.
-fn allocate_convoy_generation_from_inventory(
-    generations: &[ReadResourceObject<ResourceConvoy>],
-    project: Option<&str>,
-    role: &str,
-) -> Result<u64, String> {
-    let mut maximum = 0;
+fn refuse_live_convoy(generations: &[ReadResourceObject<ResourceConvoy>], project: Option<&str>, role: &str) -> Result<(), String> {
     for source in
         generations.iter().filter(|source| source.object.spec.project_ref.as_deref() == project && source.object.spec.role == role)
     {
         let convoy = &source.object;
-        let generation =
-            convoy.metadata.labels.get(GENERATION_LABEL).and_then(|value| value.parse::<u64>().ok()).unwrap_or(convoy.spec.generation);
-        maximum = maximum.max(generation);
-        let live = convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal());
-        if live {
+        if convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()) {
             let provenance = match &source.provenance {
                 ResourceProvenance::Local => String::new(),
                 ResourceProvenance::Replica { origin_root, last_synced_at } => {
                     format!(" (as of root {origin_root}, last synced {last_synced_at})")
                 }
             };
-            return Err(format!("live convoy {} generation {generation} already exists{provenance}", convoy_address(role, project)));
+            return Err(format!(
+                "live convoy {} generation {} already exists{provenance}",
+                convoy_address(role, project),
+                convoy.spec.generation
+            ));
         }
     }
-    let generation =
-        maximum.checked_add(1).ok_or_else(|| format!("convoy {} exhausted its generation counter", convoy_address(role, project)))?;
-    Ok(generation)
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -3970,6 +3959,12 @@ struct ConvoySnapshotBundle<'a> {
     pub image_builds: &'a [crate::image_build::PlannedImageBuild],
     /// The checkout the convoy adopts, recorded on it (#3108).
     pub adopted_checkout: Option<&'a flotilla_resources::ObservedCheckoutSpec>,
+    /// How the convoy's name was chosen.
+    pub naming: Option<ConvoyNaming>,
+    /// The ensure configuration admitting a standing convoy.
+    pub ensure: Option<&'a flotilla_resources::ConvoyEnsureSpec>,
+    /// Provenance recorded with the launch as annotations: a standing convoy's ensure and charter entry.
+    pub provenance: BTreeMap<String, String>,
     evidence: BriefEvidence<'a>,
 }
 
@@ -5001,15 +4996,6 @@ pub struct HandlerContractFixture {
 struct ProbedNamingUtility {
     name: String,
     utility: Arc<dyn AiUtility>,
-}
-
-/// Diagnostic persistence must never turn an already-created convoy into an
-/// admission error that invites a duplicate retry.
-async fn finish_naming_write(namespace: &str, name: &str, write: impl std::future::Future<Output = Result<(), ResourceError>>) {
-    if let Err(error) = write.await {
-        warn!(%namespace, %name, %error,
-            "convoy admitted; unable to persist naming provenance");
-    }
 }
 
 /// Stderr and API error bodies are untrusted and may contain credentials.
@@ -6410,34 +6396,11 @@ mod naming_tests {
             ConvoyNaming::AiUtility { utility: "Claude CLI".into() },
             ConvoyNaming::DeterministicFallback { reason: "Claude API: missing key".into() },
         ] {
-            ConvoyStatusPatch::RecordNaming { naming: naming.clone() }.apply(&mut status);
+            flotilla_resources::ConvoyStatusPatch::RecordNaming { naming: naming.clone() }.apply(&mut status);
             let decoded: flotilla_resources::ConvoyStatus =
                 serde_json::from_value(serde_json::to_value(&status).expect("encode")).expect("decode");
             assert_eq!(decoded.naming, Some(naming));
         }
-    }
-
-    // A failed diagnostic write cannot fail an admission after the convoy exists.
-    #[tokio::test]
-    async fn naming_write_failure_is_nonfatal_and_visible() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let convoys = backend.using::<ResourceConvoy>("flotilla");
-        convoys
-            .create(
-                &InputMeta::builder().name("admitted".into()).build(),
-                &ConvoySpec::builder().workflow_ref("single-agent".into()).role("admitted".into()).build(),
-            )
-            .await
-            .expect("create convoy");
-        // Inject failure at the status-write boundary; the resource store is real.
-        let (_, logs) = capture_logs(
-            tracing::Level::WARN,
-            finish_naming_write("flotilla", "admitted", async { Err(ResourceError::invalid("status write failed")) }),
-        )
-        .await;
-        assert!(logs.contains("WARN") && logs.contains("unable to persist naming provenance"), "{logs}");
-        assert_eq!(convoys.list().await.expect("convoys").items.len(), 1);
-        assert_eq!(convoys.get("admitted").await.expect("convoy remains admitted").spec.role, "admitted");
     }
 
     // Explicit refers to the convoy name, even when its missing branch uses the fallback.

@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use chrono::Utc;
 use flotilla_core::primitives::{convoy_engine::ConvoyEngine, convoy_map, convoys::Convoys};
 use flotilla_resources::{
-    convoy::engine::{Actor, Admission, EngineConvoys, VerdictScope},
+    convoy::engine::{Actor, EngineConvoys, VerdictScope},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource as OldSource, PromiseState, Submission, SubmissionVerdict},
     Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, ResourceObject,
     SystemClock, VesselRequirement, WorkflowSnapshot,
@@ -125,15 +125,24 @@ fn merged(id: &str) -> PromiseOperation {
     }
 }
 
+/// Admits `convoy` as admission does: a launch of what it is a launch of is reserved, then
+/// created as `convoy` describes it. Returns the launch as admitted.
+async fn admit(fixture: &Fixture, convoy: &ResourceObject<Convoy>) -> Result<ResourceObject<Convoy>, String> {
+    let mut launch = convoy.clone();
+    launch.metadata.name = fixture.engine.reserve(&convoy_map::engine_name(convoy)?).await?;
+    fixture.engine.admit_reserved(&launch).await?;
+    Ok(launch)
+}
+
 async fn admitted(fixture: &Fixture, name: &str, status: ConvoyStatus) -> ResourceObject<Convoy> {
     let convoy = old_convoy(&fixture.backend, name, status).await;
-    assert_eq!(fixture.engine.admit(&convoy).await.expect("admit"), Admission::Held);
+    admit(fixture, &convoy).await.expect("admit");
     reread(fixture, name).await
 }
 
 // Behaviour: a freshly bootstrapped convoy is admitted on the engine with one seat per crew and
 // its seeded promises under their old ids as labels; the engine's view reproduces the seeded old
-// promises exactly, and a second admission is the first.
+// promises exactly, and a launch is admitted once.
 #[tokio::test]
 async fn a_fresh_convoy_is_admitted_with_its_seeded_promises() {
     let fixture = fixture();
@@ -145,7 +154,9 @@ async fn a_fresh_convoy_is_admitted_with_its_seeded_promises() {
     assert_eq!(promises, vec![("template/coder/pr".to_owned(), SeatName::new("coder", ""))]);
     assert_eq!(engine.spec().seats.len(), 2);
     assert_eq!(convoy.status.as_ref().expect("status").promises, seeded, "the engine's view reproduces the seeded promises");
-    assert_eq!(fixture.engine.admit(&convoy).await.expect("again"), Admission::Held);
+    let launch = engine.name().to_owned();
+    let again = ResourceObject { metadata: flotilla_resources::ObjectMeta { name: launch, ..convoy.metadata.clone() }, ..convoy };
+    assert!(fixture.engine.admit_reserved(&again).await.is_err(), "its reservation was taken by the first");
 }
 
 // Behaviour: the crew's submission and the forge's merge observation become the engine's Submit
@@ -267,19 +278,14 @@ async fn operator_verdicts_keep_and_retract() {
     fixture.engine.deliver(&convoy).await.expect("nothing open");
 }
 
-// Behaviour: only a convoy with nothing decided is admitted; one with history, or a standing one,
-// stays on the old path for the import, and a convoy with no obligation is refused by name.
+// Behaviour: a convoy with no obligation is refused by name, and nothing is admitted. (A convoy
+// with history is the import's: admission creates only fresh launches.)
 #[tokio::test]
-async fn admission_skips_history_and_refuses_no_obligations() {
+async fn admission_refuses_no_obligations() {
     let fixture = fixture();
-    let mut history = bootstrapped(vec![("work", vec![crew("coder", true)])]);
-    promises::apply(&mut history, "work", "coder", &submit("template/pr", PR));
-    let convoy = old_convoy(&fixture.backend, "history", history).await;
-    assert!(matches!(fixture.engine.admit(&convoy).await.expect("admit"), Admission::Skipped(_)));
-    assert!(!fixture.engine.holds(&convoy));
-
     let convoy = old_convoy(&fixture.backend, "idle", bootstrapped(vec![("work", vec![crew("reviewer", false)])])).await;
-    assert_eq!(fixture.engine.admit(&convoy).await.expect("admit"), Admission::Refused("NoObligations".into()));
+    let refused = admit(&fixture, &convoy).await.expect_err("refused");
+    assert!(refused.contains("NoObligations"), "{refused}");
     assert!(!fixture.engine.holds(&convoy));
 }
 
@@ -337,7 +343,7 @@ async fn an_admission_with_a_label_clash_is_refused() {
     promises::apply(&mut status, "work", "coder", &api);
     promises::apply(&mut status, "work", "reviewer", &api);
     let convoy = old_convoy(&fixture.backend, "c", status).await;
-    let Admission::Refused(reason) = fixture.engine.admit(&convoy).await.expect("admit") else { panic!("admitted a clash") };
+    let reason = admit(&fixture, &convoy).await.expect_err("a clash is refused");
     assert!(reason.contains("`api-split`") && reason.contains("coder, reviewer"), "{reason}");
     assert!(!fixture.engine.holds(&convoy));
 }
@@ -449,7 +455,8 @@ fn a_partial_edit_reports_what_applied() {
         convoy_map::request(&tokio_block(old_convoy(&fixture.backend, "c", bootstrapped(vec![("work", vec![crew("coder", true)])]))))
             .expect("request");
     fixture.convoys.world(|world| world.projects.put(&Ref::new(request.project.as_str()), ()));
-    assert!(fixture.convoys.admit(request, flotilla_schema::Timestamp(1)).expect("admitted"));
+    let launch = fixture.convoys.reserve("c", flotilla_schema::Timestamp(1)).expect("reserved");
+    fixture.convoys.create_reserved(&launch, request, flotilla_schema::Timestamp(1)).expect("admitted");
     let owner = SeatName::new("coder", "");
     let target: flotilla_schema::Address = "project:fleet/convoy:c".parse().expect("target");
     let error = fixture
@@ -478,9 +485,12 @@ fn tokio_block<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(future)
 }
 
+// Behaviour: a standing generation is a launch of its role's address, with the role's duty; an
+// edge keeps its duties; the next generation is a launch of its own, and ending one leaves the
+// other as it was.
 #[tokio::test]
 async fn standing_admission_uses_the_ensure_role_identity() {
-    use flotilla_resources::{convoy::engine::SkipReason, Selector, ENSURED_FROM_ANNOTATION};
+    use flotilla_resources::{Selector, ENSURED_FROM_ANNOTATION};
     use flotilla_schema::Timestamp;
     use flotilla_state_machines::Ref;
     let fixture = fixture();
@@ -494,7 +504,7 @@ async fn standing_admission_uses_the_ensure_role_identity() {
     let name = "project:fleet/convoy:governor";
     assert_eq!(convoy_map::engine_name(&old).unwrap(), name);
     assert_eq!(convoy_map::address(&old).unwrap().as_str(), name);
-    assert_eq!(fixture.engine.admit(&old).await.unwrap(), Admission::Held);
+    let first = admit(&fixture, &old).await.expect("admitted");
     assert!(fixture.convoys.get("old-generation-id").is_none());
     assert_eq!(fixture.convoys.get(name).unwrap().spec().duties.len(), 1);
     let authority = Ref::new("ensure-governor");
@@ -504,7 +514,7 @@ async fn standing_admission_uses_the_ensure_role_identity() {
     fixture
         .convoys
         .apply(
-            name,
+            &first.metadata.name,
             flotilla_state_machines::machines::convoy::AddSeat {
                 seat: SeatName::new("aaa", ""),
                 parent: SeatName::new("governor", ""),
@@ -516,49 +526,20 @@ async fn standing_admission_uses_the_ensure_role_identity() {
         )
         .unwrap();
     assert_eq!(fixture.convoys.get(name).unwrap().spec().duties, duties);
-    assert!(fixture.engine.holds(&old));
-    let first = fixture.convoys.get(name).unwrap();
-    assert_eq!(first.name(), format!("{name}#{}", first.spec().launch), "a launch of the role's name");
-    // Admission names the launch on the generation's record: what its checkouts are held for.
-    let stored = fixture.backend.clone().using::<Convoy>(NAMESPACE);
-    let named = |record: ResourceObject<Convoy>| record.status.expect("status").engine_launch;
-    assert_eq!(named(stored.get("old-generation-id").await.expect("old")).as_deref(), Some(first.name()));
-    assert!(fixture.engine.promises(&old, None).unwrap().is_some());
-    // A nonterminal old-store generation must not mask an ended engine record:
-    // the next Ensure generation reaches admission under the same stable name.
-    fixture.engine.abandon(&old, "operator", "replace generation").await.expect("end engine generation");
-    assert_eq!(old.status.as_ref().expect("old status").phase, ConvoyPhase::Active);
-    assert!(!fixture.engine.holds(&old));
-    let mut next = old_convoy(&fixture.backend, "next-generation-id", old.status.clone().expect("bootstrap")).await;
-    next.spec.role = old.spec.role.clone();
-    next.metadata.annotations = old.metadata.annotations.clone();
-    assert!(!fixture.engine.holds(&next));
-    assert_eq!(fixture.engine.admit(&next).await.expect("next generation"), Admission::Held);
-    let second = fixture.convoys.get(name).expect("fresh engine generation");
-    assert_ne!(second.name(), first.name(), "the next generation is a launch of its own");
-    assert_eq!(named(stored.get("next-generation-id").await.expect("next")).as_deref(), Some(second.name()));
-    assert_eq!(fixture.engine.launch(&old).expect("read").as_deref(), Some(first.name()), "an earlier generation keeps its launch");
-    let version = second.version();
-    assert!(fixture.engine.holds(&next));
-    assert_eq!(fixture.engine.admit(&next).await.expect("duplicate generation"), Admission::Held);
-    assert_eq!(fixture.convoys.get(name).expect("same generation").version(), version);
-    // Ensure has marked the earlier generation terminal, but a controller may
-    // still hold its Active snapshot. Replaying it must not replace the newer
-    // ended engine generation.
-    let stored_old = fixture.backend.clone().using::<Convoy>(NAMESPACE).get(&old.metadata.name).await.expect("stored old generation");
-    let mut terminal = stored_old.status.expect("old status");
-    terminal.phase = ConvoyPhase::Abandoned;
-    fixture
-        .backend
-        .clone()
-        .using::<Convoy>(NAMESPACE)
-        .update_status(&old.metadata.name, &stored_old.metadata.resource_version, &terminal)
-        .await
-        .expect("retire old generation");
-    fixture.engine.abandon(&next, "operator", "end newer generation").await.expect("end newer engine generation");
-    let ended = fixture.convoys.get(name).expect("newer ended generation");
-    assert!(matches!(fixture.engine.admit(&old).await.expect("stale admission"), Admission::Skipped(SkipReason::Decided(_))));
-    assert_eq!(fixture.convoys.get(name).expect("retained newer generation").version(), ended.version());
+    assert!(fixture.engine.holds(&first));
+    let held = fixture.convoys.get(name).unwrap();
+    assert_eq!(held.name(), first.metadata.name);
+    assert_eq!(held.name(), format!("{name}#{}", held.spec().launch), "a launch of the role's name");
+    assert!(fixture.engine.promises(&first, None).unwrap().is_some());
+
+    fixture.engine.abandon(&first, "operator", "replace generation").await.expect("end engine generation");
+    let second = admit(&fixture, &old).await.expect("next generation");
+    assert_ne!(second.metadata.name, first.metadata.name, "the next generation is a launch of its own");
+    assert!(fixture.engine.holds(&second));
+    let ended = fixture.convoys.launch(&first.metadata.name).expect("first generation");
+    fixture.engine.abandon(&second, "operator", "end newer generation").await.expect("end newer engine generation");
+    assert_eq!(fixture.convoys.launch(&first.metadata.name).expect("first generation").version(), ended.version());
+    assert_ne!(fixture.convoys.get(name).expect("newest").label(), ConvoyLabel::Open);
 }
 
 #[tokio::test]
@@ -568,7 +549,7 @@ async fn invalid_standing_identity_refuses_admission_and_reads_without_legacy_fa
     old.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), "ensure".into());
     old.spec.role.clear();
     assert!(fixture.engine.holds(&old), "invalid identity must stay on the error-returning engine path");
-    assert!(fixture.engine.admit(&old).await.is_err());
+    assert!(admit(&fixture, &old).await.is_err());
     assert!(fixture.engine.promises(&old, None).is_err());
     assert!(fixture.convoys.get("invalid-standing").is_none());
     let path: flotilla_resources::convoy::engine::EngineConvoyPath = Default::default();

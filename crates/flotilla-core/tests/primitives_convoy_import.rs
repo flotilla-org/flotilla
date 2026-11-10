@@ -455,8 +455,7 @@ fn a_standing_generation_imports_as_a_launch_of_its_role() {
     assert_eq!(imported.resource.spec().promises.iter().next().unwrap().record.id.0, 0);
     // The launch names the generation it was imported from: the record whose checkouts it holds.
     assert_eq!(imported.record, "governor-2");
-    let document = AdmissionDocument::decode("governor", imported.resource.spec().admission.value().bytes()).expect("admission document");
-    assert_eq!(document.admitted_from.as_deref(), Some("governor-2"));
+    AdmissionDocument::decode("governor", imported.resource.spec().admission.value().bytes()).expect("admission document");
 
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     let mut store =

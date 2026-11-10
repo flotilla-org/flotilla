@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use flotilla_resources::{
-    convoy::engine::{Actor, Admission, EngineConvoys, OldPromises, SkipReason, VerdictScope},
+    convoy::engine::{Actor, EngineConvoys, OldPromises, VerdictScope},
     promises::{PromiseKind as OldKind, PromiseOperation, PromiseSource as OldSource},
-    Convoy as OldConvoy, ConvoyStatusPatch, Forge, ForgeSpec, ResourceObject,
+    Convoy as OldConvoy, Forge, ForgeSpec, ResourceObject,
 };
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
@@ -85,7 +85,7 @@ impl ConvoyEngine {
             + 'static,
     ) -> Result<T, String> {
         let convoys = Arc::clone(&self.convoys);
-        let name = map::engine_name(convoy)?;
+        let name = self.target(convoy)?;
         let now = self.now();
         let edited = tokio::task::spawn_blocking(move || convoys.edit(&name, now, plan)).await.map_err(|error| error.to_string())?;
         let applied = match &edited {
@@ -96,6 +96,23 @@ impl ConvoyEngine {
             self.changed(&convoy.metadata.name);
         }
         edited.map(|(_, output)| output).map_err(|error: EditError| error.to_string())
+    }
+
+    /// The launch an edit of `convoy` writes: the launch it is named by, read from the engine, else
+    /// (an old record) the newest launch of what it is a launch of.
+    fn target(&self, convoy: &ResourceObject<OldConvoy>) -> Result<String, String> {
+        if self.convoys.launch(&convoy.metadata.name).is_some() {
+            return Ok(convoy.metadata.name.clone());
+        }
+        map::engine_name(convoy)
+    }
+
+    /// The launch held here that `convoy` reads as, when one is.
+    fn held(&self, convoy: &ResourceObject<OldConvoy>) -> Option<Resource<Convoy>> {
+        if let Some(launch) = self.convoys.launch(&convoy.metadata.name) {
+            return Some(launch);
+        }
+        self.convoys.get(&map::engine_name(convoy).ok()?).filter(|current| holds_generation(convoy, current))
     }
 
     async fn forges(&self, namespace: &str) -> Result<Vec<ForgeSpec>, String> {
@@ -149,75 +166,41 @@ impl EngineConvoys for ConvoyEngine {
     fn holds(&self, convoy: &ResourceObject<OldConvoy>) -> bool {
         // Fail closed: route an invalid identity to this writer, whose edits return
         // the naming error, rather than falling back to the legacy writer.
-        map::engine_name(convoy).map_or(true, |name| self.convoys.get(&name).is_some_and(|current| holds_generation(convoy, &current)))
+        map::engine_name(convoy).is_err() || self.held(convoy).is_some()
     }
 
-    async fn admit(&self, convoy: &ResourceObject<OldConvoy>) -> Result<Admission, String> {
-        let name = map::engine_name(convoy)?;
-        let standing = flotilla_resources::convoy::reconcile::is_ensured(convoy);
-        if self.convoys.get(&name).is_some_and(|current| holds_generation(convoy, &current)) {
-            return Ok(Admission::Held);
-        }
-        if standing {
-            // Ensure only replaces terminal old generations. A controller may
-            // still hold an Active snapshot of one: consult its current source
-            // before letting it replace a newer ended engine generation.
-            let latest = self
-                .backend
-                .clone()
-                .using::<OldConvoy>(&convoy.metadata.namespace)
-                .get(&convoy.metadata.name)
-                .await
-                .map_err(|error| error.to_string())?;
-            if latest.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-                return Ok(Admission::Skipped(SkipReason::Decided("the stored standing generation has ended".into())));
-            }
-        }
-        let Some(status) = convoy.status.as_ref().filter(|status| status.workflow_snapshot.is_some()) else {
-            return Ok(Admission::Skipped(SkipReason::NotBootstrapped));
-        };
-        if let Err(history) = map::undecided(status) {
-            return Ok(Admission::Skipped(SkipReason::Decided(history)));
-        }
+    async fn reserve(&self, launch_of: &str) -> Result<String, String> {
+        let (convoys, of, now) = (Arc::clone(&self.convoys), launch_of.to_owned(), self.now());
+        tokio::task::spawn_blocking(move || convoys.reserve(&of, now))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("reserve a launch of `{launch_of}`: {error:?}"))
+    }
+
+    async fn admit_reserved(&self, convoy: &ResourceObject<OldConvoy>) -> Result<(), String> {
+        let launch = convoy.metadata.name.clone();
         let request = map::request(convoy)?;
         if let Some(clash) = map::clash(&request) {
-            return Ok(Admission::Refused(clash));
+            return Err(format!("convoy `{launch}`: {clash}"));
         }
         let project = request.project.clone();
-        let convoys = Arc::clone(&self.convoys);
-        let now = self.now();
+        let (convoys, now) = (Arc::clone(&self.convoys), self.now());
+        let named = launch.clone();
         let admitted = tokio::task::spawn_blocking(move || {
-            // Old admission read the project; the engine's gate reads that record.
+            // Admission read the project; the engine's gate reads that record.
             convoys.world(|world| world.projects.put(&Ref::new(project.as_str()), ()));
-            if standing {
-                convoys.admit_standing(request, now)
-            } else {
-                convoys.admit(request, now)
-            }
+            convoys.create_reserved(&named, request, now)
         })
         .await
         .map_err(|error| error.to_string())?;
         match admitted {
-            Ok(_) => {
-                // The engine holds the promises now: drop bootstrap's seeds from the old status, and
-                // name the launch this generation became, which its checkouts are held for.
-                let launch = self
-                    .convoys
-                    .admitted_from(&name, &convoy.metadata.name)?
-                    .ok_or_else(|| format!("convoy `{}`: no launch admitted from it", convoy.metadata.name))?;
-                let convoys = self.backend.clone().using::<OldConvoy>(&convoy.metadata.namespace);
-                if let Err(error) =
-                    flotilla_store::apply_status_patch(&convoys, &convoy.metadata.name, &ConvoyStatusPatch::HandPromisesToEngine { launch })
-                        .await
-                {
-                    tracing::warn!(convoy = %convoy.metadata.name, %error, "dropping the seeded promises from the old status failed");
-                }
-                self.changed(&convoy.metadata.name);
-                Ok(Admission::Held)
+            Ok(()) => {
+                self.changed(&launch);
+                Ok(())
             }
             Err(error) => match error.refusal() {
-                Some(refusal) => Ok(Admission::Refused(format!("{refusal:?}"))),
-                None => Err(format!("convoy `{}` engine admission: {error:?}", convoy.metadata.name)),
+                Some(refusal) => Err(format!("the engine refused convoy `{launch}`: {refusal:?}")),
+                None => Err(format!("convoy `{launch}` engine admission: {error:?}")),
             },
         }
     }
@@ -436,15 +419,10 @@ impl EngineConvoys for ConvoyEngine {
     }
 
     fn delivered(&self, convoy: &ResourceObject<OldConvoy>) -> Option<String> {
-        let current = self.convoys.get(&map::engine_name(convoy).ok()?)?;
-        match current.state() {
-            ConvoyState::Delivered { disposition, .. } if holds_generation(convoy, &current) => Some(disposition.clone()),
+        match self.held(convoy)?.state() {
+            ConvoyState::Delivered { disposition, .. } => Some(disposition.clone()),
             _ => None,
         }
-    }
-
-    fn launch(&self, convoy: &ResourceObject<OldConvoy>) -> Result<Option<String>, String> {
-        self.convoys.admitted_from(&map::engine_name(convoy)?, &convoy.metadata.name)
     }
 
     async fn abandon(&self, convoy: &ResourceObject<OldConvoy>, principal: &str, reason: &str) -> Result<(), String> {
@@ -475,7 +453,10 @@ impl EngineConvoys for ConvoyEngine {
         // This home named as the convoy's home is deliberately the local read: the in-memory
         // engine is current, and its own records are never replicas here.
         let engine = match home.filter(|home| *home != self.convoys.home()) {
-            None => self.convoys.get(&map::engine_name(convoy)?),
+            None => match self.convoys.launch(&convoy.metadata.name) {
+                Some(launch) => Some(launch),
+                None => self.convoys.get(&map::engine_name(convoy)?),
+            },
             Some(home) => self
                 .convoys
                 .replica(&map::engine_name(convoy)?, &map::project(convoy)?, home)

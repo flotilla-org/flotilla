@@ -66,7 +66,12 @@ fn document() -> AdmissionDocument {
         adopted_checkout_refs: BTreeMap::new(),
         subjects: Vec::new(),
         instruction: None,
-        admitted_from: None,
+        workflow_template: None,
+        placement_snapshot: None,
+        vessel_placements: BTreeMap::new(),
+        brief_artifacts: false,
+        adopted_checkout: None,
+        provenance: BTreeMap::new(),
     }
 }
 
@@ -117,7 +122,8 @@ fn a_launch_reads_its_seats_links_stalls_and_end() {
     let convoys = Convoys::open(HOME, &service).expect("open");
     let records = EngineConvoyRecords::new(HOME, Arc::clone(&service));
     convoys.world(|world| world.projects.put(&Ref::new(project().as_str()), ()));
-    assert!(convoys.admit(request(), Timestamp(1_000_000)).expect("admitted"));
+    let reserved = convoys.reserve("fix-it", Timestamp(1_000_000)).expect("reserved");
+    convoys.create_reserved(&reserved, request(), Timestamp(1_000_000)).expect("admitted");
     let launch = convoys.get("fix-it").expect("launch").name().to_owned();
 
     let record = records.get(&launch, None).expect("read").expect("held");
@@ -190,7 +196,8 @@ fn a_handoff_reads_as_handed_back() {
     let convoys = Convoys::open(HOME, &service).expect("open");
     let records = EngineConvoyRecords::new(HOME, Arc::clone(&service));
     convoys.world(|world| world.projects.put(&Ref::new(project().as_str()), ()));
-    assert!(convoys.admit(request(), Timestamp(1_000_000)).expect("admitted"));
+    let reserved = convoys.reserve("fix-it", Timestamp(1_000_000)).expect("reserved");
+    convoys.create_reserved(&reserved, request(), Timestamp(1_000_000)).expect("admitted");
     let (coder, reviewer) = (SeatName::new("coder", ""), SeatName::new("reviewer", "work"));
     convoys.world(|world| world.authority.put(&Ref::new("handoff"), true));
     let add = AddSeat {

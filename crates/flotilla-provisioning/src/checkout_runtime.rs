@@ -6,7 +6,6 @@ use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_resources::checkout_path::checkout_path_component;
 use flotilla_resources::{
     canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutSpec, Convoy,
     LandedEvidence,
@@ -352,7 +351,7 @@ pub async fn sweep_host_empty_convoy_directories(
                 .map_err(|error| error.to_string())?
                 .items
                 .into_iter()
-                .map(|convoy| checkout_path_component(&convoy.object.metadata.name)),
+                .map(|convoy| flotilla_resources::convoy::engine::launch_slug(&convoy.object.metadata.name)),
         );
     }
     // The host's own environments are homed here, and never released.

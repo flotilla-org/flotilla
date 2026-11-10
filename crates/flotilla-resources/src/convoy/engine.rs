@@ -47,27 +47,6 @@ pub struct VerdictScope {
     pub role: Option<String>,
 }
 
-/// What engine admission made of an old convoy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Admission {
-    /// The engine holds it, admitted now or before.
-    Held,
-    /// Not the engine's to admit; it stays on the old path.
-    Skipped(SkipReason),
-    /// The engine refused it: the machine's refusal, by name
-    /// (`NoObligations`, `UnknownProject`, ...).
-    Refused(String),
-}
-
-/// Why engine admission left a convoy on the old path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SkipReason {
-    /// Bootstrap has not frozen its workflow yet.
-    NotBootstrapped,
-    /// Something is decided already; the import maps a convoy with history.
-    Decided(String),
-}
-
 /// The engine-first Convoy writer, in the old shape.
 #[async_trait]
 pub trait EngineConvoys: Send + Sync {
@@ -75,10 +54,14 @@ pub trait EngineConvoys: Send + Sync {
     /// selects this path so an operation reports its error instead of using the old writer.
     fn holds(&self, convoy: &ResourceObject<Convoy>) -> bool;
 
-    /// Admits a freshly bootstrapped convoy, unless the engine holds it. Only
-    /// a convoy with nothing decided yet is admitted here: one with history
-    /// waits for the import pass.
-    async fn admit(&self, convoy: &ResourceObject<Convoy>) -> Result<Admission, String>;
+    /// Reserves the next launch number of `launch_of` at this home and returns the launch's name
+    /// (`<launch_of>#<n>`), so admission keys what it writes by the launch before creating it.
+    async fn reserve(&self, launch_of: &str) -> Result<String, String>;
+
+    /// Admits `convoy`, named by a launch [`EngineConvoys::reserve`] returned, as admission froze
+    /// it: its spec, the status admission seeds (workflow snapshot, placement, ensure, naming) and
+    /// the annotations naming what admission wrote for it. The machine's refusal is the `Err`.
+    async fn admit_reserved(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String>;
 
     /// One promise operation by `(vessel, role)`'s seat, as the old patch
     /// would have carried it. Refusals come back as `Err`.
@@ -114,11 +97,6 @@ pub trait EngineConvoys: Send + Sync {
     /// decided, and nothing the old path observes afterwards (a work failing as its vessels find
     /// the convoy ended) changes it. `None` while it is open, or not held here.
     fn delivered(&self, convoy: &ResourceObject<Convoy>) -> Option<String>;
-
-    /// The launch `convoy` was admitted or imported as (`<launch_of>#<n>`), found by the old record
-    /// its admission names, for a hand-over to the old status that has not landed yet: an imported
-    /// convoy's, or one whose admission patch failed. `Ok(None)` when no launch here was.
-    fn launch(&self, convoy: &ResourceObject<Convoy>) -> Result<Option<String>, String>;
 
     /// An operator's abandonment, with a reason.
     async fn abandon(&self, convoy: &ResourceObject<Convoy>, principal: &str, reason: &str) -> Result<(), String>;
@@ -205,9 +183,50 @@ pub fn standing_name(project: &str, role: &str) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Finite convoys keep their old name. Standing convoys use their ensure's
-/// frozen role and project, including old generations admitted before spec.role.
+/// What launch `name` is a launch of, and its number; `None` for a name that is no launch.
+pub fn split_launch(name: &str) -> Option<(&str, u64)> {
+    let (of, n) = name.rsplit_once('#')?;
+    Some((of, n.parse().ok()?))
+}
+
+/// What `name` is a launch of: the name less its `#<n>`, or the name itself when it is no launch.
+pub fn launch_of(name: &str) -> &str {
+    split_launch(name).map_or(name, |(of, _)| of)
+}
+
+/// Launch `launch`'s host-local, path-safe name, for worktree directories, terminal sessions and
+/// other names on a host: `<launch_of, path-safe>-<n>`. Two launches at one home never share one,
+/// because a home numbers its launches from one sequence. Records and addresses name the launch
+/// itself; a name that is no launch is made path-safe as it is.
+pub fn launch_slug(launch: &str) -> String {
+    match split_launch(launch) {
+        Some((of, n)) => format!("{}-{n}", crate::checkout_path::checkout_path_component(of)),
+        None => crate::checkout_path::checkout_path_component(launch),
+    }
+}
+
+/// The address of launch `launch` of a convoy in `project`. A standing role's launches are of its
+/// address (`project:P/convoy:R`), so the launch is that role's segment with its number
+/// (`project:P/convoy:R%234`); a finite convoy's is the launch under the project.
+pub fn launch_address(project: &flotilla_address::Address, launch: &str) -> Result<flotilla_address::Address, String> {
+    let (of, n) = split_launch(launch).ok_or_else(|| format!("`{launch}` names no launch"))?;
+    let address = match of.parse::<flotilla_address::Address>() {
+        Ok(standing) if standing.kind() == flotilla_address::Kind::Convoy => {
+            let parent = standing.parent().ok_or_else(|| format!("standing convoy `{of}` has no project"))?;
+            parent.child(flotilla_address::Kind::Convoy, &format!("{}#{n}", standing.name()))
+        }
+        _ => project.child(flotilla_address::Kind::Convoy, launch),
+    };
+    address.map_err(|error| error.to_string())
+}
+
+/// What `convoy` is a launch of. A launch read from the engine is named by its launch. An old
+/// record (the import's) keeps its name when finite; a standing one uses its ensure's frozen role
+/// and project, including old generations admitted before spec.role.
 pub fn engine_name(convoy: &ResourceObject<Convoy>) -> Result<String, String> {
+    if let Some((of, _)) = split_launch(&convoy.metadata.name) {
+        return Ok(of.to_owned());
+    }
     if !super::reconcile::is_ensured(convoy) {
         return Ok(convoy.metadata.name.clone());
     }
@@ -259,8 +278,11 @@ mod tests {
         fn holds(&self, _: &ResourceObject<Convoy>) -> bool {
             true
         }
-        async fn admit(&self, _: &ResourceObject<Convoy>) -> Result<Admission, String> {
-            Ok(Admission::Held)
+        async fn reserve(&self, launch_of: &str) -> Result<String, String> {
+            Ok(format!("{launch_of}#1"))
+        }
+        async fn admit_reserved(&self, _: &ResourceObject<Convoy>) -> Result<(), String> {
+            Ok(())
         }
         async fn promise(&self, _: &ResourceObject<Convoy>, _: &str, _: &str, _: &PromiseOperation, _: Actor) -> Result<(), String> {
             Ok(())
@@ -280,9 +302,6 @@ mod tests {
         fn delivered(&self, _: &ResourceObject<Convoy>) -> Option<String> {
             None
         }
-        fn launch(&self, _: &ResourceObject<Convoy>) -> Result<Option<String>, String> {
-            Ok(None)
-        }
         async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
             Ok(())
         }
@@ -297,6 +316,32 @@ mod tests {
         fn changes(&self) -> tokio::sync::broadcast::Receiver<String> {
             tokio::sync::broadcast::channel(1).1
         }
+    }
+
+    // Behaviour: two launches at one home have different numbers, so their slugs differ even
+    // where their launch_of slugs coincide (`project:x-convoy/convoy:y` and
+    // `project:x/convoy:convoy-y` both slug as `project-x-convoy-convoy-y`).
+    #[test]
+    fn launches_at_one_home_never_share_a_slug() {
+        let launches =
+            ["project:x-convoy/convoy:y#4", "project:x/convoy:convoy-y#5", "convoy-0f3a#6", "convoy-0f3a-6#7", "fix#8", "fix-8#9"];
+        let slugs: std::collections::BTreeSet<_> = launches.iter().map(|launch| launch_slug(launch)).collect();
+        assert_eq!(slugs.len(), launches.len(), "{slugs:?}");
+        assert_eq!(launch_slug("project:p/convoy:coder#12"), "project-p-convoy-coder-12");
+        for slug in &slugs {
+            assert!(slug.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')), "{slug}");
+        }
+    }
+
+    // Behaviour: a standing launch's address is its role's segment with the launch number; a
+    // finite one's is the launch under the project. Neither is encoded twice.
+    #[test]
+    fn a_launch_address_names_the_launch_once() {
+        let project = flotilla_address::Address::project("p").expect("project");
+        let standing = standing_name("p", "coder").expect("standing");
+        assert_eq!(launch_address(&project, &format!("{standing}#4")).expect("standing").as_str(), "project:p/convoy:coder%234");
+        assert_eq!(launch_address(&project, "convoy-0f3a#6").expect("finite").as_str(), "project:p/convoy:convoy-0f3a%236");
+        assert!(launch_address(&project, "convoy-0f3a").is_err(), "no launch");
     }
 
     fn convoy(name: &str) -> ResourceObject<Convoy> {

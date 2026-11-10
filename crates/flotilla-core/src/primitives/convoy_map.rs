@@ -371,6 +371,18 @@ pub fn request(convoy: &ResourceObject<OldConvoy>) -> Result<ConvoyRequest, Stri
     })
 }
 
+/// The annotations admission records in typed fields of the document, or as creation inputs of
+/// the old record; every other annotation is provenance, kept as it was.
+const ADMITTED: [&str; 7] = [
+    flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION,
+    flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION,
+    flotilla_resources::VESSEL_PLACEMENTS_ANNOTATION,
+    flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION,
+    flotilla_resources::ADOPTED_CHECKOUT_ANNOTATION,
+    flotilla_resources::convoy::ADMISSION_PLACEMENT_ANNOTATION,
+    flotilla_resources::convoy::ENSURE_ADMISSION_ANNOTATION,
+];
+
 /// The workflow an old convoy was admitted with, and its admission document:
 /// what its spec and its bootstrapped status froze that no engine column or
 /// record holds. Refused for a convoy not yet bootstrapped, which has no
@@ -380,6 +392,7 @@ pub fn admission(convoy: &ResourceObject<OldConvoy>) -> Result<(String, Frozen<A
     let status = convoy.status.as_ref().ok_or_else(|| format!("convoy {name} has no status"))?;
     let workflow_snapshot = status.workflow_snapshot.clone().ok_or_else(|| format!("convoy {name} has no workflow snapshot"))?;
     let spec = &convoy.spec;
+    let annotations = &convoy.metadata.annotations;
     let document = AdmissionDocument {
         workflow_snapshot,
         placement_decision: status.placement_decision.clone(),
@@ -395,7 +408,21 @@ pub fn admission(convoy: &ResourceObject<OldConvoy>) -> Result<(String, Frozen<A
         adopted_checkout_refs: spec.adopted_checkout_refs.clone(),
         subjects: spec.declared_subjects()?,
         instruction: spec.instruction.clone(),
-        admitted_from: Some(name.clone()),
+        workflow_template: annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).cloned(),
+        placement_snapshot: annotations.get(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION).cloned(),
+        vessel_placements: annotations
+            .get(flotilla_resources::VESSEL_PLACEMENTS_ANNOTATION)
+            .map(|pins| serde_json::from_str(pins))
+            .transpose()
+            .map_err(|error| format!("convoy {name}: vessel placements: {error}"))?
+            .unwrap_or_default(),
+        brief_artifacts: annotations.contains_key(flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION),
+        adopted_checkout: annotations
+            .get(flotilla_resources::ADOPTED_CHECKOUT_ANNOTATION)
+            .map(|adopted| serde_json::from_str(adopted))
+            .transpose()
+            .map_err(|error| format!("convoy {name}: adopted checkout: {error}"))?,
+        provenance: annotations.iter().filter(|(key, _)| !ADMITTED.contains(&key.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect(),
     };
     let bytes = document.encode().map_err(|error| format!("convoy {name}: {error}"))?;
     let admission = Frozen::new(AdmissionBytes::new(bytes)).map_err(|error| format!("convoy {name}: admission document: {error}"))?;
@@ -505,30 +532,6 @@ pub fn old_promises(convoy: &Resource<Convoy>, crews: &Crews) -> BTreeMap<String
         });
     }
     out
-}
-
-/// Whether an old convoy has nothing decided yet, so admitting it on the
-/// engine loses nothing: every promise Open with no submission, and no crew
-/// finished, handed back, failed or stalled. Anything else is history, the
-/// import's to map (#3587 layer 6 ruling: import stays a separate pass).
-pub fn undecided(status: &ConvoyStatus) -> Result<(), String> {
-    use flotilla_resources::CrewWorkPhase::*;
-    if status.phase.is_terminal() {
-        return Err("the convoy has ended".into());
-    }
-    if status
-        .promises
-        .values()
-        .flat_map(BTreeMap::values)
-        .flatten()
-        .any(|promise| promise.state != OldState::Open || !promise.submissions.is_empty())
-    {
-        return Err("a promise has been submitted or settled".into());
-    }
-    if status.crew_work.values().flat_map(BTreeMap::values).any(|work| matches!(work.phase, Done | HandedBack | Failed | Stalled)) {
-        return Err("a crew has finished, handed back, failed or stalled".into());
-    }
-    Ok(())
 }
 
 /// The enduring obligation for each standing agent seat, excluding tool seats.
