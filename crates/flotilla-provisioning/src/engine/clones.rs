@@ -268,9 +268,16 @@ impl flotilla_store::controller::SecondaryWatch for CloneRepositoryWake {
                 let woken = watch
                     .next(|read, followed| {
                         let mut repositories = Vec::new();
+                        let mut rescanned = false;
                         for followed in followed {
-                            // A rescan names no resource: the repositories' resync covers it.
-                            let flotilla_engine_store::follow::Followed::Changed(identity) = followed else { continue };
+                            // A rescan names no resource: which clones changed is unknown.
+                            let identity = match followed {
+                                flotilla_engine_store::follow::Followed::Changed(identity) => identity,
+                                flotilla_engine_store::follow::Followed::Rescan(_) => {
+                                    rescanned = true;
+                                    continue;
+                                }
+                            };
                             let Some(id) = read.resolve(<Resource<Clone> as Kind>::CODE, &identity.name, &identity.home)? else {
                                 continue;
                             };
@@ -278,11 +285,14 @@ impl flotilla_store::controller::SecondaryWatch for CloneRepositoryWake {
                                 repositories.push(loaded.value.spec().repository.clone());
                             }
                         }
-                        Ok(repositories)
+                        Ok((repositories, rescanned))
                     })
                     .await;
                 match woken {
-                    Ok(repositories) => {
+                    Ok((repositories, rescanned)) => {
+                        if rescanned {
+                            sender.send_every();
+                        }
                         for repository in repositories {
                             if sender.send(repository).await.is_err() {
                                 return Ok(());

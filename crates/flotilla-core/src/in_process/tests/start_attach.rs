@@ -91,7 +91,7 @@ fn start_attach_lifecycle(tc: hegel::TestCase) {
             let convoys = backend.using::<Convoy>("flotilla");
             match outcome {
                 0 => {
-                    create_running_session(&engine, &backend, &env, "terminal-slow", "convoy-slow", "coder").await;
+                    create_running_session(&engine, &env, "terminal-slow", "convoy-slow", "coder").await;
                 }
                 1 => {
                     let convoy = convoys.get("convoy-slow").await.unwrap();
@@ -143,47 +143,37 @@ fn start_attach_lifecycle(tc: hegel::TestCase) {
 // provisioning messages and rejecting a failed vessel before work rollup.
 #[tokio::test]
 async fn start_attach_stage_uses_vessel_status() {
-    use super::support::test_meta;
-    use flotilla_resources::{InputMeta, Vessel, VesselPhase, VesselSpec, VesselStatus, CONVOY_LABEL};
-    use std::collections::BTreeMap;
+    use super::support::test_engine;
+    use flotilla_resources::vessel_records::VesselStep;
     let (daemon, backend, _temp) = fixture().await;
+    let engine = test_engine(&daemon);
     create_identity_convoy(&backend, "convoy-slow", "coder", Some("flotilla")).await;
     let convoy = backend.using::<Convoy>("flotilla").get("convoy-slow").await.unwrap();
-    let vessels = backend.using::<Vessel>("flotilla");
-    let spec = VesselSpec {
-        convoy_ref: "convoy-slow".into(),
-        vessel_name: "work".into(),
-        fulfilment_kind_ref: "test".into(),
-        adopted_checkout_refs: BTreeMap::new(),
-    };
     // Unrelated vessel failures must not contaminate this convoy's start.
-    let unrelated = vessels.create(&test_meta("other"), &VesselSpec { convoy_ref: "other".into(), ..spec.clone() }).await.unwrap();
-    vessels
-        .update_status("other", &unrelated.metadata.resource_version, &VesselStatus { phase: VesselPhase::Failed, ..Default::default() })
-        .await
-        .unwrap();
-    let mut vessel = vessels
-        .create(
-            &InputMeta::builder().name("slow-work".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "convoy-slow".into())])).build(),
-            &spec,
-        )
-        .await
-        .unwrap();
-    for (phase, message, expected) in [
-        (VesselPhase::Pending, None, "placement"),
-        (VesselPhase::Provisioning, None, "environment and checkouts"),
-        (VesselPhase::Provisioning, Some("waiting for checkout work".to_string()), "waiting for checkout work"),
-        (VesselPhase::Ready, None, "terminal session"),
-        (VesselPhase::Interrupted, None, "interrupted; waiting for recovery"),
-        (VesselPhase::Lost, None, "lost; waiting for recovery"),
-        (VesselPhase::Failed, Some("placement refused".to_string()), "placement refused"),
-    ] {
-        vessel = vessels
-            .update_status("slow-work", &vessel.metadata.resource_version, &VesselStatus { phase, message, ..Default::default() })
-            .await
-            .unwrap();
+    let unrelated = engine.vessels.request("other", "work", "local");
+    engine.vessels.step(&unrelated, VesselStep::Failed { cause: "other refused".into(), retryable: false });
+    let launch = engine.vessels.request("convoy-slow", "work", "local");
+    let relaunch = || engine.vessels.request("convoy-slow", "work", "local");
+    // The engine has no Pending reading: a launch is requested in progress. Interrupted is read
+    // from the crew's terminals (vessel_records' tests), which this identity convoy has none of.
+    // An ended launch reads its reason, so Lost shows the reason written.
+    let steps: [(Option<VesselStep>, &str); 5] = [
+        (None, "environment and checkouts"),
+        (Some(VesselStep::Failed { cause: "waiting for checkout work".into(), retryable: true }), "waiting for checkout work"),
+        (Some(VesselStep::Realised { environment: "slow-env".into() }), "terminal session"),
+        (Some(VesselStep::Lost { reason: "environment disappeared".into() }), "environment disappeared"),
+        (Some(VesselStep::Failed { cause: "placement refused".into(), retryable: false }), "placement refused"),
+    ];
+    let mut failed = false;
+    for (step, expected) in steps {
+        if let Some(step) = step {
+            failed = matches!(step, VesselStep::Failed { retryable: false, .. });
+            // The lost launch is replaced before the next one fails.
+            let current = if failed { relaunch() } else { launch.clone() };
+            engine.vessels.step(&current, step);
+        }
         let stage = daemon.convoy_start_stage("flotilla", &convoy).await;
-        if phase == VesselPhase::Failed {
+        if failed {
             assert!(stage.unwrap_err().contains(expected));
         } else {
             let stage = stage.unwrap();

@@ -286,6 +286,16 @@ impl Ledger {
         Ok(())
     }
 
+    /// Moves vessel `from`'s entry to `to`, as a launch's create names the vessel it requested.
+    pub fn rename(&mut self, from: &VesselId, to: VesselId) -> Result<(), LedgerError> {
+        if self.vessels.contains_key(&to) {
+            return Err(LedgerError::DuplicateRequest(to));
+        }
+        let vessel = self.vessels.remove(from).ok_or_else(|| LedgerError::UnknownVessel(from.clone()))?;
+        self.vessels.insert(to, vessel);
+        Ok(())
+    }
+
     /// Returns vessel `id`'s lease and forgets the vessel, freeing its shape.
     /// The ledger is pure: the caller calls this when the vessel's lifecycle
     /// reaches Gone, and not before.
@@ -396,18 +406,24 @@ impl<L: Log<VesselMachine>> Placements<L> {
     }
 
     /// Places waiting vessel `id` on `host` (spec `Place`) and creates its resource at `now`,
-    /// Requested. A refusal leaves the ledger as it was; a log that does not take the create
-    /// returns the lease and queues the request again, as it waited before.
+    /// Requested, as a launch of `id`: its log names it `<id>#<n>`, and the ledger holds the lease
+    /// under that name from then on. A refusal leaves the ledger as it was; a log that does not
+    /// take the create returns the lease and queues the request again, as it waited before.
     pub fn place(&mut self, id: &VesselId, host: Host, now: Timestamp) -> Result<&Resource<VesselMachine>, PlacementError> {
         let lease = self.ledger.place(id, host).map_err(PlacementError::Ledger)?.clone();
         let world = MemoryLifecycleWorld::default();
-        if let Err(error) = self.home.create(id.0.clone(), VesselSpec::from(lease.clone()), &world, now) {
-            // Undo the grant: the lease returns and the request waits again, where it waited.
-            self.ledger.release(id).map_err(PlacementError::Ledger)?;
-            self.ledger.request(id.clone(), lease.request).map_err(PlacementError::Ledger)?;
-            return Err(PlacementError::Write(error));
-        }
-        self.home.get(&id.0).ok_or_else(|| PlacementError::Ledger(LedgerError::UnknownVessel(id.clone())))
+        let name = match self.home.create(id.0.clone(), VesselSpec::of(id.0.clone(), lease.clone()), &world, now) {
+            Ok(created) => created.resource.name().to_owned(),
+            Err(error) => {
+                // Undo the grant: the lease returns and the request waits again, where it waited.
+                self.ledger.release(id).map_err(PlacementError::Ledger)?;
+                self.ledger.request(id.clone(), lease.request).map_err(PlacementError::Ledger)?;
+                return Err(PlacementError::Write(error));
+            }
+        };
+        let launch = VesselId::new(name);
+        self.ledger.rename(id, launch.clone()).map_err(PlacementError::Ledger)?;
+        self.home.get(&launch.0).ok_or_else(|| PlacementError::Ledger(LedgerError::UnknownVessel(launch)))
     }
 
     /// A lifecycle edge on a leased vessel. Every terminal state frees its lease; a failed
@@ -460,8 +476,9 @@ mod placements_tests {
     }
 
     // Behaviour (#3629 layer 6): a waiting request is not stored; a grant creates the vessel
-    // resource Requested with the lease as its spec; a refusal (no fit) creates nothing and
-    // leaves the ledger as it was; Gone frees the lease, so a second request fits again.
+    // resource Requested with the lease as its spec, as a numbered launch of the request; a
+    // refusal (no fit) creates nothing and leaves the ledger as it was; Gone frees the lease, so a
+    // second request fits again.
     #[test]
     fn a_grant_creates_the_vessel_and_gone_frees_its_lease() {
         let mut placements = placements(Home::new("home").expect("declaration"));
@@ -471,6 +488,9 @@ mod placements_tests {
         let vessel = placements.place(&a, host(), Timestamp(1)).expect("granted");
         assert_eq!(*vessel.state(), LifecycleState::requested());
         assert_eq!(vessel.spec().lease(), Lease { request: request("c", 3), host: host() });
+        assert_eq!((vessel.name(), vessel.spec().launch_of.as_str(), vessel.spec().launch), ("a#1", "a", 1));
+        let a = VesselId::new(vessel.name());
+        assert!(matches!(placements.ledger().vessel(&a), Some(Vessel::Leased(_))), "the lease is held under the launch's name");
 
         placements.request(b.clone(), request("c", 3)).expect("request");
         assert_eq!(placements.place(&b, host(), Timestamp(2)).expect_err("no room").refusal(), Some(PlacementRefusal::DoesNotFit));
@@ -489,9 +509,8 @@ mod placements_tests {
     #[test]
     fn a_vessel_gives_up_with_its_provisioning_failure() {
         let mut placements = placements(Home::new("home").expect("declaration"));
-        let a = VesselId::new("a");
-        placements.request(a.clone(), request("c", 1)).expect("request");
-        placements.place(&a, host(), Timestamp(1)).expect("granted");
+        placements.request(VesselId::new("a"), request("c", 1)).expect("request");
+        let a = VesselId::new(placements.place(&VesselId::new("a"), host(), Timestamp(1)).expect("granted").name());
         let world = MemoryLifecycleWorld::default();
         let unrealised = placements
             .apply(&a, Vanish { cause: VanishCause::lost(), observed: Ref::new("a") }.into(), &world, Timestamp(2))
@@ -512,9 +531,8 @@ mod placements_tests {
     #[test]
     fn an_unplaced_vessel_still_ends() {
         let mut placements = placements(Home::new("home").expect("declaration"));
-        let a = VesselId::new("a");
-        placements.request(a.clone(), request("c", 3)).expect("request");
-        placements.place(&a, host(), Timestamp(1)).expect("granted");
+        placements.request(VesselId::new("a"), request("c", 3)).expect("request");
+        let a = VesselId::new(placements.place(&VesselId::new("a"), host(), Timestamp(1)).expect("granted").name());
         let mut home = Home::<VesselMachine>::new("home").expect("declaration");
         home.restore(placements.get(&a).expect("held").clone()).expect("restored");
         // The host now offers two cores: the three-core lease no longer fits.
@@ -530,29 +548,28 @@ mod placements_tests {
     // without copying the ledger: the lease is returned and the vessel waits again.
     #[test]
     fn a_refused_create_returns_the_lease_and_the_request_waits_again() {
-        let mut placements = placements(Home::new("home").expect("declaration"));
+        let mut first = placements(Home::new("home").expect("declaration"));
         let a = VesselId::new("a");
-        placements.request(a.clone(), request("c", 3)).expect("request");
-        placements.place(&a, host(), Timestamp(1)).expect("granted");
-        // A second request under the same name is granted at the ledger, but its create is refused:
-        // the name is taken. (Released first, so the ledger has room and no record of it.)
-        let mut world = MemoryLifecycleWorld::default();
-        world.teardowns.put(&Ref::new("a"), true);
-        placements.apply(&a, Release { teardown: Ref::new("a") }.into(), &world, Timestamp(2)).expect("released");
-        placements.request(a.clone(), request("c", 3)).expect("request again");
-        let refused = placements.place(&a, host(), Timestamp(3)).expect_err("the name is taken");
-        assert!(matches!(refused, PlacementError::Write(WriteError::Exists(_))));
+        first.request(a.clone(), request("c", 3)).expect("request");
+        let held = first.place(&a, host(), Timestamp(1)).expect("granted").clone();
+        // A home restored with launch a#1 over a log whose sequence starts again numbers the next
+        // launch of `a` #1 too: the log takes the create, and the home refuses the taken name.
+        let mut home = Home::<VesselMachine>::new("home").expect("declaration");
+        home.restore(held).expect("restored");
+        let mut placements = self::placements(home);
+        placements.request(a.clone(), request("c", 1)).expect("request again");
+        let refused = placements.place(&a, host(), Timestamp(3)).expect_err("the launch's name is taken");
+        assert!(matches!(refused, PlacementError::Write(WriteError::Exists(name)) if name == "a#1"));
         assert!(matches!(placements.ledger().vessel(&a), Some(Vessel::Waiting(_))), "waiting again");
-        assert_eq!(placements.ledger().available(host()), Ok([(Dimension(0), 4)].into()), "the lease was returned");
+        assert_eq!(placements.ledger().available(host()), Ok([(Dimension(0), 1)].into()), "the lease was returned");
     }
 
     // Behaviour: a restart rebuilds the ledger's leases from the live vessels its home holds.
     #[test]
     fn a_restart_rebuilds_the_leases_from_the_live_vessels() {
         let mut placements = placements(Home::new("home").expect("declaration"));
-        let a = VesselId::new("a");
-        placements.request(a.clone(), request("c", 3)).expect("request");
-        placements.place(&a, host(), Timestamp(1)).expect("granted");
+        placements.request(VesselId::new("a"), request("c", 3)).expect("request");
+        let a = VesselId::new(placements.place(&VesselId::new("a"), host(), Timestamp(1)).expect("granted").name());
         let mut world = MemoryLifecycleWorld::default();
         world.realisations.put(&Ref::new("a"), Observed { identity: "a".into() });
         placements.apply(&a, Realise { identity: "a".into(), observed: Ref::new("a") }.into(), &world, Timestamp(2)).expect("realised");
@@ -561,5 +578,6 @@ mod placements_tests {
         home.restore(placements.get(&a).expect("held").clone()).expect("restored");
         let restarted = self::placements(home);
         assert_eq!(restarted.ledger().available(host()), Ok([(Dimension(0), 1)].into()), "the lease holds its shape again");
+        assert!(matches!(restarted.ledger().vessel(&a), Some(Vessel::Leased(_))), "under the launch's name");
     }
 }

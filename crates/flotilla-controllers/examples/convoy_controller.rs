@@ -4,7 +4,6 @@ use flotilla_store_http::HttpBackend;
 use std::{env, path::PathBuf};
 
 use flotilla_crew::convoy::ConvoyReconciler;
-use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_resources::{Convoy, Vessel, WorkflowTemplate};
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tracing::info;
@@ -45,34 +44,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = ResourceBackend::new(backend);
     let convoys = backend.clone().using::<Convoy>(&namespace);
     let templates = backend.definitions::<WorkflowTemplate>(&namespace);
-    let vessels = backend.clone().using::<Vessel>(&namespace);
 
-    info!("starting vessel and convoy controller loops");
-    tokio::try_join!(
-        async {
-            ControllerLoop {
-                primary: vessels,
-                secondaries: VesselReconciler::secondary_watches(),
-                reconciler: VesselReconciler::new(backend.clone(), &namespace),
-                backend: backend.clone(),
-            }
-            .run()
-            .await
-        },
-        async {
-            let convoy_backend = backend.clone();
-            // A convoy's checkouts are the engine's (#3108), which this cluster store does not
-            // serve: a convoy that holds checkouts is not reconciled past its bootstrap here.
-            ControllerLoop {
-                primary: convoys,
-                secondaries: ConvoyReconciler::secondary_watches(),
-                reconciler: ConvoyReconciler::new(templates).with_vessels(convoy_backend.clone().using::<Vessel>(&namespace)),
-                backend: convoy_backend,
-            }
-            .run()
-            .await
-        }
-    )?;
+    // Vessels and a convoy's checkouts are the engine's (#3108), which this cluster store does not
+    // serve: no vessel is realised here, and a convoy is not reconciled past its bootstrap.
+    info!("starting the convoy controller loop");
+    ControllerLoop {
+        primary: convoys,
+        secondaries: ConvoyReconciler::secondary_watches(),
+        reconciler: ConvoyReconciler::new(templates).with_vessels(backend.clone().using::<Vessel>(&namespace)),
+        backend,
+    }
+    .run()
+    .await?;
 
     Ok(())
 }

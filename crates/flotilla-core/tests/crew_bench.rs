@@ -17,10 +17,10 @@
 //! grant and the vessel's create), its realise, a session's create and realise, and an Ensure's
 //! failed attempt. The placement ledger's rebuild from the stored live vessels, as a restart does
 //! it, is timed too. The engine's write paths (layer 7) are timed: a session's launches through
-//! the terminal port, and through `decide` an Ensure's patches, and a pinned vessel's lease granted, realised and lost (Q6).
+//! the terminal port, through `decide` an Ensure's patches, and through the vessel port a pinned vessel's lease granted, realised and lost (Q6).
 //!
 //! Per-query reads, on a read connection, each statement's VM steps and full-scan steps counted by
-//! SQLite: a convoy's vessels (`vessel.by_convoy`), a host's live vessels (`vessel.live_by_host`,
+//! SQLite: a convoy's vessels (`vessel.by_launch`, by its convoy), a host's live vessels (`vessel.live_by_host`,
 //! the ledger's view), a vessel's sessions (`terminal_session.by_holder`), a convoy's sessions
 //! (its vessels by convoy, then their sessions by holder) and a role's Ensure (`ensure.by_inbox`).
 
@@ -36,10 +36,8 @@ use std::{
 use flotilla_engine_store::{open_home, register_crew, StoreLog};
 use flotilla_provisioning::{
     engine::{
-        decide,
-        reads::ProvisioningReads,
         terminals::EngineTerminals,
-        vessel::{PlacementLifecycles, VesselBinding},
+        vessel::{EngineVessels, PlacementLifecycles},
         LifecycleHome, Lifecycles, Step,
     },
     stored::{
@@ -50,7 +48,8 @@ use flotilla_provisioning::{
 };
 use flotilla_resources::{
     terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords, TerminalRenewal, PROCESS_EXITED},
-    ConvoyEnsureStatusPatch, StatusPatch, VesselStatusPatch,
+    vessel_records::{VesselLaunchRequest, VesselRecords, VesselStep},
+    ConvoyEnsureStatusPatch, StatusPatch,
 };
 use flotilla_schema::{Address, KindRegistry, Ref as StoredRef, Timestamp};
 use flotilla_schema_sqlite::Store;
@@ -58,7 +57,7 @@ use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
         ensure::{Create, Ensure, EnsureSpec, Fulfiller, Hold, MemoryEnsureWorld, Record},
-        lifecycle::{LifecycleState, MemoryLifecycleWorld, Observed, Realise, VanishCause},
+        lifecycle::{MemoryLifecycleWorld, Observed, Realise, VanishCause},
         vessel::{Vessel, VesselKind},
     },
     placement::{Dimension, Host, Placements, Request, VesselId},
@@ -113,12 +112,13 @@ fn convoy(n: usize, home: &str) -> ConvoyId {
     ConvoyId::new(format!("convoy-{n}"), home)
 }
 
-fn session(n: usize, which: &str, home: &str) -> TerminalSessionRequest {
+/// Convoy `n`'s session `which`, held for its vessel's launch `vessel`.
+fn session(n: usize, which: &str, home: &str, vessel: &str) -> TerminalSessionRequest {
     TerminalSessionRequest {
         launch_of: format!("session-{n}-{which}"),
         launch: 0,
         environment: StoredRef::new(format!("env-{n}"), home),
-        holder: Some(Holder::vessel(&format!("vessel-{n}"))),
+        holder: Some(Holder::vessel(vessel)),
         role: which.into(),
         pool: "cleat".into(),
         cwd: "/workspace".into(),
@@ -152,8 +152,9 @@ impl Crew {
         }
     }
 
-    /// Convoy `n`'s vessel placed and realised, and its two sessions realised.
-    fn seed(&mut self, n: usize, home: &str, at: i64) {
+    /// Convoy `n`'s vessel placed and realised, and its two sessions realised. Returns the
+    /// vessel's launch name.
+    fn seed(&mut self, n: usize, home: &str, at: i64) -> String {
         let id = VesselId::new(format!("vessel-{n}"));
         let request = Request {
             convoy: convoy(n, home),
@@ -163,18 +164,20 @@ impl Crew {
         };
         self.placements.set_caps(convoy(n, home), [(VesselClass::new("crew"), 1)].into());
         self.placements.request(id.clone(), request).expect("request");
-        self.placements.place(&id, Host::new(format!("host-{}", (n as u32) % HOSTS)), Timestamp(at)).expect("placed");
+        let vessel = self.placements.place(&id, Host::new(format!("host-{}", (n as u32) % HOSTS)), Timestamp(at)).expect("placed");
+        let id = VesselId::new(vessel.name());
         self.placements
             .apply(&id, Realise { identity: id.0.clone(), observed: Ref::new(id.0.as_str()) }.into(), &realised(&id.0), Timestamp(at + 1))
             .expect("realised");
         for which in ["agent", "tool"] {
             let name = format!("session-{n}-{which}");
-            let created = self.sessions.create(&name, session(n, which, home), &MemoryLifecycleWorld::default(), Timestamp(at));
+            let created = self.sessions.create(&name, session(n, which, home, &id.0), &MemoryLifecycleWorld::default(), Timestamp(at));
             let name = created.expect("created").resource.name().to_owned();
             self.sessions
                 .apply(&name, Realise { identity: name.clone(), observed: Ref::new(name.as_str()) }, &realised(&name), Timestamp(at + 1))
                 .expect("realised");
         }
+        id.0
     }
 }
 
@@ -183,11 +186,12 @@ fn inbox(role: usize) -> Address {
 }
 
 /// Convoy `n`'s crew session, as its vessel requests it.
-fn crew_session(n: usize) -> TerminalLaunchRequest {
+/// Convoy `n`'s crew session, held for its vessel's launch `vessel`.
+fn crew_session(n: usize, vessel: &str) -> TerminalLaunchRequest {
     TerminalLaunchRequest {
         session: format!("terminal-vessel-{n}-coder"),
         environment: format!("env-{n}"),
-        vessel: Some(format!("vessel-{n}")),
+        vessel: Some(vessel.to_owned()),
         role: "coder".into(),
         pool: "cleat".into(),
         cwd: "/workspace".into(),
@@ -209,53 +213,14 @@ fn standing(role: usize) -> flotilla_resources::ResourceObject<flotilla_resource
     }
 }
 
-/// Local convoy `n`'s old Vessel, pinned to one of the hosts, before provisioning.
-fn old_vessel(n: usize) -> flotilla_resources::ResourceObject<flotilla_resources::Vessel> {
-    flotilla_resources::ResourceObject {
-        metadata: meta(&format!("pinned-{n}")),
-        spec: flotilla_resources::VesselSpec {
-            convoy_ref: format!("convoy-{n}"),
-            vessel_name: "implement".into(),
-            fulfilment_kind_ref: "docker".into(),
-            adopted_checkout_refs: BTreeMap::new(),
-        },
-        status: None,
+/// Local convoy `n`'s pinned vessel launch, on one of the hosts.
+fn pinned(n: usize) -> VesselLaunchRequest {
+    VesselLaunchRequest {
+        convoy: format!("convoy-{n}"),
+        convoy_home: "local".into(),
+        work: "implement".into(),
+        host: format!("host-{}", (n as u32) % HOSTS),
     }
-}
-
-/// The old Vessel patches of a pinned vessel's life: provisioning on its host, ready, lost.
-fn pinned_life(n: usize) -> [VesselStatusPatch; 3] {
-    use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
-    let host = format!("host-{}", (n as u32) % HOSTS);
-    let decision = PlacementDecision::builder()
-        .kind("docker".into())
-        .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host.clone()), display_name: host })
-        .build();
-    [
-        VesselStatusPatch::MarkProvisioning {
-            observed_kind_ref: "docker".into(),
-            observed_kind_version: "1".into(),
-            placement_decision: Some(decision),
-            started_at: chrono::DateTime::UNIX_EPOCH,
-            message: None,
-            image: None,
-        },
-        VesselStatusPatch::MarkReady {
-            configured_limits: None,
-            placement_decision: None,
-            environment_ref: Some(format!("env-{n}")),
-            image_ref: None,
-            local_image_id: None,
-            registry_digest: None,
-            checkout_refs: BTreeMap::new(),
-            terminal_session_refs: vec![],
-            requested_stance: Default::default(),
-            effective_stance: Default::default(),
-            ready_at: chrono::DateTime::UNIX_EPOCH,
-            image: None,
-        },
-        VesselStatusPatch::MarkLost { message: "environment disappeared".into() },
-    ]
 }
 
 fn meta(name: &str) -> flotilla_resources::ObjectMeta {
@@ -336,8 +301,10 @@ fn crew_load() {
 
     let started = Instant::now();
     let mut remote_crew = Crew::new("remote", &remote);
+    // Each convoy's vessel launch, by convoy.
+    let mut vessels = BTreeMap::new();
     for n in (0..convoys).filter(|n| n % LOCAL_ONE_IN != 0) {
-        remote_crew.seed(n, "remote", 1);
+        vessels.insert(n, remote_crew.seed(n, "remote", 1));
     }
     let mut after = 0;
     let mut replicated = 0;
@@ -367,7 +334,7 @@ fn crew_load() {
     let mut crew = Crew::new("local", &local);
     let seeding = Instant::now();
     for n in &locals {
-        crew.seed(*n, "local", 1);
+        vessels.insert(*n, crew.seed(*n, "local", 1));
     }
     eprintln!(
         "{:>40}: {convoys} convoys ({} local, {} replicated through {replicated} events) in {:.1?}",
@@ -391,9 +358,14 @@ fn crew_load() {
         crew.placements.request(id.clone(), request).expect("request");
     }
     let started = Instant::now();
-    for (n, id) in locals.iter().zip(&ids) {
-        crew.placements.place(id, Host::new(format!("host-{}", (*n as u32 + 1) % HOSTS)), Timestamp(10)).expect("placed");
-    }
+    let ids: Vec<VesselId> = locals
+        .iter()
+        .zip(&ids)
+        .map(|(n, id)| {
+            let placed = crew.placements.place(id, Host::new(format!("host-{}", (*n as u32 + 1) % HOSTS)), Timestamp(10)).expect("placed");
+            VesselId::new(placed.name())
+        })
+        .collect();
     per_event("placement, one transaction", ids.len(), started, "the lease checked at the ledger; the vessel's row and log entry");
     let started = Instant::now();
     for id in &ids {
@@ -405,7 +377,9 @@ fn crew_load() {
     let started = Instant::now();
     for n in &locals {
         let name = format!("session-{n}-review");
-        crew.sessions.create(&name, session(*n, "review", "local"), &MemoryLifecycleWorld::default(), Timestamp(12)).expect("created");
+        crew.sessions
+            .create(&name, session(*n, "review", "local", &vessels[n]), &MemoryLifecycleWorld::default(), Timestamp(12))
+            .expect("created");
     }
     per_event("session create, one transaction", locals.len(), started, "the row, its env rows, identity and log entry");
 
@@ -429,7 +403,7 @@ fn crew_load() {
     let launches: Arc<dyn Lifecycles<TerminalSessionKind>> =
         Arc::new(LifecycleHome::new("local", Home::with_log("local", StoreLog::new(local.clone())).expect("declaration")));
     let terminals = EngineTerminals::new(Arc::clone(&launches), local.clone(), || vec!["local".to_owned()]);
-    let requests: Vec<_> = locals.iter().map(|n| crew_session(*n)).collect();
+    let requests: Vec<_> = locals.iter().map(|n| crew_session(*n, &vessels[n])).collect();
     let started = Instant::now();
     for request in &requests {
         let first = terminals.request(request.clone()).expect("requested");
@@ -460,10 +434,9 @@ fn crew_load() {
     );
     let started = Instant::now();
     for n in &locals {
-        assert!(terminals.of_vessel(&format!("vessel-{n}")).expect("index").len() >= 2);
+        assert!(terminals.of_vessel(&vessels[n]).expect("index").len() >= 2);
     }
     eprintln!("{:>40}: {:>8.1} µs/query", "port: a vessel's served sessions", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
-    let reads = flotilla_provisioning::engine::reads::StoreReads::new(local.clone());
 
     // Standing roles' Ensures decided through the engine: a convoy bound, failed, a replacement bound.
     let ensures = flotilla_core::primitives::ensures::EngineEnsurePath::open(local.clone(), Arc::new(flotilla_resources::SystemClock))
@@ -482,39 +455,38 @@ fn crew_load() {
     }
     per_event("ensure patch decided", ROLES * 3, started, "its edges (record, create, bind or unbind), one transaction each");
 
-    // The Vessel write path (#3629 layer 7, Q6): each local convoy's pinned vessel granted as its
-    // provisioning starts, realised, then lost, through the engine. Its lease is freed, so the
-    // restart below holds only the seeded leases.
-    let pinned: Arc<dyn Lifecycles<VesselKind>> =
+    // The Vessel write path (#3629 layer 7, Q6): each local convoy's pinned vessel requested (its
+    // lease granted), realised, then lost, through the engine's vessel port. Its lease is freed,
+    // so the restart below holds only the seeded leases.
+    let pinned_vessels: Arc<dyn Lifecycles<VesselKind>> =
         Arc::new(PlacementLifecycles::new("local", open_home::<Vessel>(StoreLog::new(local.clone())).expect("home")).expect("placements"));
+    let records = EngineVessels::new(pinned_vessels, local.clone(), || vec!["local".to_owned()]);
     let started = Instant::now();
     for n in &locals {
-        let mut obj = old_vessel(*n);
-        for patch in pinned_life(*n) {
-            let decided = decide::<VesselBinding>(pinned.as_ref(), &obj, Some(patch), chrono::Utc::now()).patch.expect("taken");
-            decided.apply(obj.status.get_or_insert_with(Default::default));
-        }
+        let launch = records.request(&pinned(*n)).expect("requested");
+        records.step(&launch, &VesselStep::Realised { environment: format!("env-{n}") }).expect("realised");
+        records.step(&launch, &VesselStep::Lost { reason: "environment disappeared".into() }).expect("lost");
     }
     per_event(
-        "pinned vessel provisioned, ready, lost",
+        "pinned vessel requested, ready, lost",
         locals.len() * 3,
         started,
         "the lease granted on its pinned host; realised; vanished, the lease freed",
     );
 
-    // The Vessel read ports (#3629 layer 8, Vessel): a vessel's lease by its name, and a convoy's
-    // vessels through the index.
+    // The Vessel read ports (#3629 layer 8, Vessel): a vessel's launch by its name, and a work's
+    // launches through the index.
     let started = Instant::now();
     for n in &locals {
-        let view = reads.vessel(&format!("vessel-{n}"), "local").expect("read").expect("held");
-        assert!(matches!(view.state, LifecycleState::Realised { .. }));
+        let record = records.get(&vessels[n], None).expect("read").expect("held");
+        assert!(matches!(record.reading, flotilla_protocol::LifecycleReading::Ready { .. }), "{:?}", record.reading);
     }
-    eprintln!("{:>40}: {:>8.1} µs/query", "port: a vessel's lease", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
+    eprintln!("{:>40}: {:>8.1} µs/query", "port: a vessel's launch", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
     let started = Instant::now();
     for n in &locals {
-        assert!(!reads.convoy_vessels(&convoy(*n, "local")).expect("index").is_empty());
+        assert!(!records.launches(&format!("convoy-{n}"), "local", &format!("vessel-{n}"), Some("local")).expect("index").is_empty());
     }
-    eprintln!("{:>40}: {:>8.1} µs/query", "port: a convoy's vessels", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
+    eprintln!("{:>40}: {:>8.1} µs/query", "port: a work's vessels", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
 
     // A restart: the vessels' home and the ledger's leases rebuilt from the store.
     let started = Instant::now();
@@ -547,7 +519,7 @@ fn crew_load() {
     assert!(live.rows >= 1.0, "each host leases live vessels");
     assert_eq!(live.fullscan_steps, 0.0);
     report("a host's live vessels", &live);
-    let holder_keys: Vec<Vec<String>> = (0..convoys).step_by(7).map(|n| vec![format!("vessel:vessel-{n}")]).collect();
+    let holder_keys: Vec<Vec<String>> = (0..convoys).step_by(7).map(|n| vec![format!("vessel:{}", vessels[&n])]).collect();
     let sessions = measure(
         &read,
         "SELECT s.id FROM terminal_session s WHERE s.holder = (SELECT id FROM strings WHERE domain = 'hl' AND s = ?1)",

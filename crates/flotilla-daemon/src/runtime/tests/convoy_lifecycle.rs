@@ -1,4 +1,5 @@
 use super::*;
+use crate::testkits::engine::engine;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 
@@ -257,8 +258,8 @@ async fn landed_convoy_reclaim_accepts_sanctioned_checkout_absence() {
 }
 
 /// #1413: pins the cross-controller race itself — the checkout is gone
-/// before the convoy's reclaim pass, and the convoy must still reclaim its
-/// vessels instead of wedging forever on the deleted evidence.
+/// before the convoy's vessels are released, and the vessel requester must
+/// still release them instead of wedging forever on the deleted evidence.
 #[tokio::test]
 async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout_first() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -266,17 +267,9 @@ async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout
     fs::create_dir_all(&config_base).expect("config directory");
     fs::write(config_base.join("daemon.toml"), "machine_id = \"checkout-authority-collected-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
-    let daemon = InProcessDaemon::new(
-        vec![],
-        config,
-        git_process_discovery(false),
-        HostName::local(),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
+    let daemon = in_memory_daemon(Vec::new(), config).await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     let created = convoys
         .create(&InputMeta::builder().name("raced".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf-a".to_string()).build())
         .await
@@ -285,40 +278,23 @@ async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout
         .update_status("raced", &created.metadata.resource_version, &landed_status_with_placed_checkout("checkout-raced"))
         .await
         .expect("mark convoy Landed");
-    vessels
-        .create(
-            &InputMeta::builder()
-                .name("raced-implement".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "raced".to_string())]))
-                .build(),
-            &VesselSpec {
-                convoy_ref: "raced".to_string(),
-                vessel_name: "implement".to_string(),
-                fulfilment_kind_ref: "host-direct-test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create vessel");
+    let host = daemon.local_host_id().expect("local host");
+    let engine = engine(&daemon);
+    let launch = engine.vessels.request("raced", "implement", host.as_str());
 
     // The checkout authority's `OwnerTerminal` cascade already collected
-    // the managed checkout: the engine holds no checkout for this pass.
-    let engine = flotilla_provisioning_testkit::CheckoutFixture::default();
-    daemon.install_lifecycle_reads(engine.reads.clone()).expect("engine reads");
-    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
-        .with_vessels(vessels)
-        .with_lifecycle_reads(engine.reads.clone())
-        .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon))));
-    let convoy = convoys.get("raced").await.expect("get convoy");
-    let deps = reconciler.prepare(&convoy).await.expect("fetch dependencies");
-    let outcome = reconciler.reconcile(&convoy, &deps, Utc::now());
-
-    assert!(
-        outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "raced-implement")),
-        "convoy must still reclaim its vessels after the checkout was collected first: {:?}",
-        outcome.actuations
+    // the managed checkout: the engine holds no checkout for this convoy.
+    let requests = flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), NAMESPACE)),
+        daemon.lifecycle_reads(),
+        Arc::new(super::super::ports::DaemonVesselReleaseGate { daemon: Arc::clone(&daemon), namespace: NAMESPACE.to_owned() }),
+        flotilla_protocol::CanonicalHostId::resolved(host.as_str()),
+        [],
     );
-    assert_eq!(outcome.requeue_after, None, "a successful reclaim pass must not keep requeueing");
+    let pass = requests.sync_once(Utc::now()).await.expect("vessel requests");
+
+    assert_eq!(pass.released, vec![launch.clone()], "the convoy's vessels must still be released after the checkout was collected first");
+    assert_eq!(engine.vessels.vessels.get(&launch, None).expect("read").expect("launch").reading, LifecycleReading::Released);
 }
 
 #[tokio::test]

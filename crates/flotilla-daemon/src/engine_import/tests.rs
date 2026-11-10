@@ -458,6 +458,47 @@ fn rows_of_kinds_no_importer_reads_are_dropped_or_refused_here_only() {
     );
 }
 
+// Behaviour (#3108): the engine has one namespace, so an old store holding records in another is
+// refused by namespace, with its counts, whichever home wrote them, and nothing is put in place.
+#[test]
+fn records_outside_the_engines_namespace_are_refused_by_namespace() {
+    let row = |namespace: &str, plural: &str, home: &str, name: &str| Row {
+        namespace: namespace.into(),
+        plural: plural.into(),
+        home: home.into(),
+        document: json!({"metadata": {"name": name}}),
+    };
+    let source = Source::new(vec![
+        row(NS, "usages", HERE, "usage"),
+        row("other", "usages", HERE, "usage"),
+        row("other", "events", THERE, "event"),
+        row("other", "events", HERE, "event-2"),
+        row("third", "usages", THERE, "usage"),
+    ]);
+    let summary = rehearse(&source, HERE);
+    assert!(summary.refused());
+    let namespaces: Vec<_> = summary.refusals.iter().filter(|refusal| refusal.kind == "namespace").collect();
+    assert_eq!(
+        namespaces,
+        vec![
+            &Refusal {
+                kind: "namespace".into(),
+                name: "other".into(),
+                reason: "3 records outside the engine's namespace `flotilla` (2 events, 1 usages); the engine has one namespace, so \
+                         they would collide with its records of the same names"
+                    .into(),
+            },
+            &Refusal {
+                kind: "namespace".into(),
+                name: "third".into(),
+                reason: "1 record outside the engine's namespace `flotilla` (1 usages); the engine has one namespace, so they would \
+                         collide with its records of the same names"
+                    .into(),
+            },
+        ]
+    );
+}
+
 #[test]
 fn every_imported_kind_has_one_importer() {
     for (kind, plan) in plan::PLAN {
@@ -611,6 +652,75 @@ fn an_in_flight_message_names_the_launch_its_crew_session_imported_as() {
     };
     assert_eq!(receiver.id, launch, "the crew's consumer is named by its launch");
     assert_eq!(receiver.host, HERE);
+}
+
+// The first start imports a vessel as its work's first launch and holds what was held for the
+// old vessel, its environment and its crew's terminal session, for that launch: after the start
+// they keep the lease they were held under, rather than naming a vessel nothing holds (#3108).
+#[test]
+fn an_imported_environment_and_terminal_session_keep_their_lease_after_the_first_start() {
+    use flotilla_provisioning::stored::{environment::EnvironmentKind, terminal_session::TerminalSessionKind, Holder, Launches as _};
+    use flotilla_state_machines::machines::{
+        convoy::ConvoyId,
+        lifecycle::{Lifecycle, LifecycleState},
+        vessel::{Vessel as EngineVessel, VesselSpec},
+    };
+    use flotilla_state_machines::Resource as EngineResource;
+
+    let vessel = document(
+        "Vessel",
+        "live-work",
+        json!({"convoy_ref": "live", "vessel_name": "work", "fulfilment_kind_ref": "p"}),
+        json!({"phase": "Ready", "environment_ref": "env-live-work",
+            "placement_decision": {"policy_name": "p", "target_host": {"ref": HERE, "display_name": HERE}}}),
+    );
+    let spec = flotilla_resources::EnvironmentSpec {
+        host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec { host_ref: HERE.into(), repo_default_dir: "/work".into() }),
+        ..Default::default()
+    };
+    let mut environment =
+        document("Environment", "env-live-work", serde_json::to_value(&spec).expect("spec"), json!({"phase": "Ready", "ready": true}));
+    environment["metadata"]["labels"] = json!({ (flotilla_resources::VESSEL_REF_LABEL): "live-work" });
+    let session = document(
+        "TerminalSession",
+        "terminal-live-work-coder",
+        json!({"env_ref": "env-live-work", "role": "coder", "cwd": "/work", "pool": "cleat",
+            "source": {"kind": "agent", "selector": {"capability": "code"}, "brief": {"path": "brief.md", "content": ""},
+                "context": {"namespace": NS, "convoy": "live", "vessel_ref": "live-work"}}}),
+        json!({"phase": "Running", "session_id": "s-coder", "crew": {"id": "crew-coder", "adapter": "claude", "stance": "trusted"}}),
+    );
+    let source = rows(vec![vessel, environment, session]);
+
+    let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&source, &mut target);
+    for kind in ["Vessel", "Environment", "TerminalSession"] {
+        assert_eq!(summary.kinds[kind].imported, 1, "{kind}: {summary:?}");
+    }
+    let mut read = target.store().read().expect("read");
+    let (id, _) = *read
+        .integer_index_keys_before(&VesselSpec::by_launch(&ConvoyId::new("live", HERE), &"live-work".to_owned()), HERE, i64::MAX, 1)
+        .expect("launches")
+        .first()
+        .expect("the vessel's launch");
+    let launch = read.load::<EngineResource<EngineVessel>>(id).expect("load").expect("launch").value;
+    assert!(launch.name().starts_with("live-work#"), "a launch of its work: {}", launch.name());
+    assert_eq!(launch.state(), &LifecycleState::Realised { identity: "env-live-work".into() }, "the lease holds");
+    let held = Some(Holder::vessel(launch.name()));
+
+    let id = read
+        .resolve(<EngineResource<Lifecycle<EnvironmentKind>> as Kind>::CODE, "env-live-work", HERE)
+        .expect("resolve")
+        .expect("the environment");
+    let imported = read.load::<EngineResource<Lifecycle<EnvironmentKind>>>(id).expect("load").expect("environment").value;
+    assert_eq!(imported.spec().holder, held, "the environment is held for the launch");
+
+    let (id, _) = *read
+        .integer_index_keys_before(&TerminalSessionKind::by_launch("terminal-live-work-coder"), HERE, i64::MAX, 1)
+        .expect("launches")
+        .first()
+        .expect("the session's launch");
+    let imported = read.load::<EngineResource<Lifecycle<TerminalSessionKind>>>(id).expect("load").expect("session").value;
+    assert_eq!(imported.spec().holder, held, "the crew's session is held for the launch");
 }
 
 #[test]

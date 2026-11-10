@@ -1,49 +1,37 @@
-use flotilla_resources::account_access::AccountRecords;
+use flotilla_resources::account_access::{AccountChange, AccountRecords};
 use flotilla_resources::checkout_path::checkout_path_component;
-use flotilla_resources::checkout_records::{CheckoutRecords, HOLDER_NOT_OPEN};
+use flotilla_resources::checkout_records::{CheckoutRecords, HOLDER_ENDED, HOLDER_NOT_OPEN};
+use flotilla_resources::convoy::engine::EngineConvoyPath;
 use flotilla_resources::environment_records::{EnvironmentRecord, EnvironmentRecords};
-use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
-use flotilla_resources::Actuation;
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
+use flotilla_resources::vessel_planning::{Held, HeldKind, VesselPlan, VesselPlanner};
+use flotilla_resources::vessel_records::{engine_vessel, VesselRecord};
 use flotilla_store::PlacementImageSourceStoreExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    marker::PhantomData,
     path::PathBuf,
     sync::Arc,
-    time::Duration,
 };
 
-use chrono::{DateTime, Utc};
-use flotilla_agent::adapter::{
-    adapter_enabling_env, append_convoy_work_context, build_convoy_crew_brief_with_options, required_agent_adapters, CrewAssignment,
-    CrewBriefMember, CrewBriefTemplateResolver,
-};
+use chrono::Utc;
+use flotilla_agent::adapter::{adapter_enabling_env, required_agent_adapters, CrewBriefTemplateResolver};
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
-use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading, PlacementDecision};
+use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision};
 use flotilla_resources::{
-    address::artifact_slot_record_name,
     canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot, repository_workspace_slugs,
-    terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords},
-    Artifact, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, Convoy, CrewSource, CrewWorkPhase, DockerEnvironmentSpec, EnvironmentMount,
-    EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
-    PlacementImageSource, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance,
-    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND,
-    VESSEL_REF_LABEL,
+    terminal_records::TerminalRecords, Artifact, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, Convoy, CrewSource, DockerEnvironmentSpec,
+    EnvironmentMount, EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec,
+    FulfilmentRealisation, PlacementImageSource, ReadWatchEvent, Repository, RepositorySpec, Resource, ResourceError, ResourceObject,
+    ResourceProvenance, TerminalSession, Vessel, VesselImage, ACTUATOR_SOURCE_ROOT_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV,
+    CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND,
 };
-use flotilla_resources::{clone_records::CloneRecords, realisation_settings, BRIEF_ARTIFACTS_ANNOTATION};
-use flotilla_store::{
-    controller::{LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
-    ReplicaReadResolver, ResourceBackend, TypedResolver,
-};
+use flotilla_resources::{clone_records::CloneRecords, realisation_settings};
+use flotilla_store::{controller::SecondaryWatch, ReplicaReadResolver, ResourceBackend, TypedResolver};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-const VESSEL_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(5);
-const VESSEL_INTERRUPTED_REQUEUE_AFTER: Duration = Duration::from_millis(250);
 /// A vessel older than this still waiting for its convoy's snapshot is stuck, not racing admission.
 const VESSEL_SNAPSHOT_WAIT_WARN_AFTER: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
-const VESSEL_PROVISIONING_STUCK_SECONDS: i64 = 2 * 60;
 
 // Compare the grants we own, independent of serialization order and unrelated
 // policy mounts. Legacy config/hooks overlays identify old shared roots too, so
@@ -79,7 +67,7 @@ pub trait WorktreeMetadataResolver: Send + Sync {
     async fn worktree_metadata(&self, env_ref: &str, target: &str) -> Result<flotilla_vcs::vcs::WorktreeMetadata, String>;
 }
 
-pub struct VesselReconciler {
+pub struct VesselPlanning {
     backend: ResourceBackend,
     lifecycle_reads: Arc<dyn LifecycleReads>,
     /// The account kinds' records: a crew whose binding ended waits.
@@ -103,7 +91,7 @@ struct EnvironmentDependency {
     unavailable: Option<VesselPrepared>,
 }
 
-impl VesselReconciler {
+impl VesselPlanning {
     pub fn new(backend: ResourceBackend, namespace: &str) -> Self {
         Self {
             backend: backend.clone(),
@@ -187,10 +175,22 @@ impl VesselReconciler {
         self.environments()?.find(name).map_err(ResourceError::other)
     }
 
+    /// The environment launch `obj` runs in: the one held for it, else the one it would request.
+    fn own_environment_name(&self, obj: &ResourceObject<Vessel>) -> Result<String, ResourceError> {
+        let held = self.environments()?.held(&obj.metadata.name).map_err(ResourceError::other)?;
+        Ok(held.into_iter().find(|environment| !environment.ended()).map_or_else(|| environment_name(&obj.metadata.name), |held| held.name))
+    }
+
     /// Requests the vessel's environment, held for its lease: the environment's launch waits on
     /// the lease and ends with it. `Some` says what the request waits for first.
-    fn request_environment(&self, vessel: &str, name: &str, spec: &EnvironmentSpec) -> Result<Option<String>, ResourceError> {
-        if self.lifecycle_reads.try_reading(ProvisioningKind::Vessel, vessel, None).map_err(ResourceError::other)?.is_none() {
+    fn request_environment(
+        &self,
+        obj: &ResourceObject<Vessel>,
+        name: &str,
+        spec: &EnvironmentSpec,
+    ) -> Result<Option<String>, ResourceError> {
+        let vessel = &obj.metadata.name;
+        if engine_vessel(self.lifecycle_reads.as_ref(), obj, None).map_err(ResourceError::other)?.is_none() {
             return Ok(Some(format!("vessel {vessel}'s lease, which holds environment {name}")));
         }
         self.environments()?.request(name, spec, Some(vessel)).map_err(ResourceError::other)?;
@@ -264,12 +264,6 @@ impl VesselReconciler {
     pub fn with_additional_host_refs(mut self, host_refs: impl IntoIterator<Item = CanonicalHostId>) -> Self {
         self.additional_host_refs = host_refs.into_iter().collect();
         self
-    }
-
-    /// The old-store kinds a vessel follows. Its environment and checkouts are the engine's: the
-    /// daemon adds the engine's environment holder wake and checkout wake beside these.
-    pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = Vessel>>> {
-        vec![Box::new(LabelMappedWatch::<TerminalSession, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData })]
     }
 
     async fn dependency<T: Resource>(
@@ -429,54 +423,29 @@ impl PlacementStrategy {
     }
 }
 
+/// What a pass found its launch to be, which its home writes as the launch's edge.
 #[derive(Debug, Clone)]
 enum PlannedPatch {
+    /// Nothing to do: its convoy has ended.
     None,
-    /// A dependency is not ready yet; change nothing and look again.
-    Waiting,
-    Provisioning {
-        observed_kind_ref: String,
-        observed_kind_version: String,
-        placement_decision: Option<PlacementDecision>,
-        waiting_for: String,
-        image: Option<VesselImage>,
+    /// It waits for what `reason` names; that dependency's change wakes it.
+    Waiting {
+        reason: String,
     },
-    EnvironmentRecreation {
-        observed_kind_ref: String,
-        observed_kind_version: String,
-        placement_decision: Option<PlacementDecision>,
-        message: String,
-        image: Option<VesselImage>,
-    },
+    /// Ready, in the environment named; its crews are seated there.
     Ready {
-        configured_limits: Option<ConfiguredResourceLimits>,
-        placement_decision: Option<PlacementDecision>,
         environment_ref: String,
-        image: Option<ImageStamp>,
-        checkout_refs: BTreeMap<RepositoryKey, String>,
-        terminal_session_refs: Vec<String>,
-        requested_stance: Stance,
-        effective_stance: Stance,
-    },
-    Interrupted {
-        roles: BTreeSet<String>,
-        message: String,
+        seating: Box<Seating>,
     },
     Lost {
         message: String,
     },
+    /// It cannot be realised. A `retryable` failure is one try, which the kind's policy repeats up
+    /// to its limit; any other is final.
     Failed {
         message: String,
+        retryable: bool,
     },
-}
-
-#[derive(Debug, Clone)]
-struct ImageStamp {
-    image_ref: String,
-    local_image_id: String,
-    registry_digest: Option<String>,
-    /// The composed identity and the digest it provisioned from.
-    composed: Option<VesselImage>,
 }
 
 /// The composed identity a placement froze at admission (ADR 0062).
@@ -501,53 +470,86 @@ fn environment_image(image: &Option<PlacementImageSource>) -> Result<(String, Op
     }
 }
 
+/// What a pass found its launch to be, and what it holds so far.
 #[derive(Debug, Clone)]
-pub struct VesselPrepared {
-    phase: Option<VesselPhase>,
+struct VesselPrepared {
     patch: PlannedPatch,
-    actuations: Vec<Actuation>,
+    held: Vec<Held>,
 }
 
 impl VesselPrepared {
     fn none() -> Self {
-        Self { phase: None, patch: PlannedPatch::None, actuations: Vec::new() }
+        Self { patch: PlannedPatch::None, held: Vec::new() }
     }
 
     fn provisioning(
-        placement: &Placement,
+        _placement: &Placement,
         placement_decision: Option<PlacementDecision>,
         waiting_for: impl Into<String>,
-        actuations: Vec<Actuation>,
+        held: &[Held],
     ) -> Self {
-        let waiting_for = legible_waiting_for(waiting_for.into(), placement_decision.as_ref());
-        Self { phase: None, patch: provisioning_patch(placement, placement_decision, waiting_for), actuations }
+        let reason = legible_waiting_for(waiting_for.into(), placement_decision.as_ref());
+        Self { patch: PlannedPatch::Waiting { reason }, held: held.to_vec() }
     }
 
     fn waiting() -> Self {
-        Self { phase: None, patch: PlannedPatch::Waiting, actuations: Vec::new() }
+        Self { patch: PlannedPatch::Waiting { reason: "its convoy's workflow snapshot".into() }, held: Vec::new() }
     }
 
+    /// It cannot be realised: what it needs has failed for good, or was never there to use.
     fn failed(message: impl Into<String>) -> Self {
-        Self { phase: None, patch: PlannedPatch::Failed { message: message.into() }, actuations: Vec::new() }
+        Self { patch: PlannedPatch::Failed { message: message.into(), retryable: false }, held: Vec::new() }
     }
 
-    fn interrupted(role: String, terminal_name: &str, actuations: Vec<Actuation>) -> Self {
-        Self {
-            phase: None,
-            patch: PlannedPatch::Interrupted {
-                roles: BTreeSet::from([role]),
-                message: format!("crew terminal session {terminal_name} disappeared; relaunching from its durable brief"),
-            },
-            actuations,
-        }
+    /// A failed try: what it needs is not here yet, as when a replica of its convoy or fulfilment
+    /// kind has not arrived.
+    fn failed_try(message: impl Into<String>) -> Self {
+        Self { patch: PlannedPatch::Failed { message: message.into(), retryable: true }, held: Vec::new() }
     }
 }
 
-impl VesselReconciler {
+/// Checkout launch `checkout` as a holding.
+fn held_checkout(checkout: &flotilla_resources::checkout_records::CheckoutRecord) -> Held {
+    Held {
+        kind: HeldKind::Checkout,
+        launch: checkout.name.clone(),
+        home: checkout.home.clone(),
+        ready: matches!(checkout.reading, LifecycleReading::Ready { .. }),
+    }
+}
+
+/// Environment `environment` as a holding.
+fn held_environment(environment: &EnvironmentRecord) -> Held {
+    Held { kind: HeldKind::Environment, launch: environment.name.clone(), home: environment.home.clone(), ready: environment.is_ready() }
+}
+
+/// What a ready vessel's crews are seated with: read by the pass that found it ready.
+#[derive(Debug, Clone)]
+pub(crate) struct Seating {
+    convoy: ResourceObject<Convoy>,
+    requirement: flotilla_resources::VesselRequirement,
+    vessel_index: usize,
+    environment: String,
+    pool: String,
+    terminal_cwd: String,
+    brief_copies: Vec<String>,
+    checkout_paths: Vec<String>,
+    repository_refs: Vec<flotilla_resources::RepositoryKey>,
+    fork_stance: bool,
+    placement_decision: Option<PlacementDecision>,
+}
+
+mod seats;
+
+pub use seats::CrewSeats;
+
+impl VesselPlanning {
     async fn prepare_plan(&self, obj: &ResourceObject<Vessel>) -> Result<VesselPrepared, ResourceError> {
         let convoy = match Self::dependency(&self.convoys, self.federated_convoys.as_ref(), obj, &obj.spec.convoy_ref).await {
             Ok(convoy) => convoy,
-            Err(ResourceError::NotFound { .. }) => return Ok(VesselPrepared::failed(format!("convoy {} not found", obj.spec.convoy_ref))),
+            Err(ResourceError::NotFound { .. }) => {
+                return Ok(VesselPrepared::failed_try(format!("convoy {} not found", obj.spec.convoy_ref)))
+            }
             Err(err) => return Err(err),
         };
         // Convoy cleanup owns terminal vessels and their checkouts. A vessel
@@ -578,7 +580,7 @@ impl VesselReconciler {
             Ok(Ok(placement)) => placement,
             Ok(Err(message)) => return Ok(VesselPrepared::failed(message)),
             Err(ResourceError::NotFound { .. }) => {
-                return Ok(VesselPrepared::failed(format!("fulfilment kind {} not found", obj.spec.fulfilment_kind_ref)))
+                return Ok(VesselPrepared::failed_try(format!("fulfilment kind {} not found", obj.spec.fulfilment_kind_ref)))
             }
             Err(err) => return Err(err),
         };
@@ -587,7 +589,7 @@ impl VesselReconciler {
             let Some(root) = placement_decision.as_ref().and_then(|decision| decision.provider_workspace_root.as_ref()) else {
                 return Ok(VesselPrepared::failed("cloud provider workspace root missing from frozen placement"));
             };
-            *clone_path = vessel_clone_path(root, &obj.metadata.name);
+            *clone_path = vessel_clone_path(root, &launch_slug(&obj.metadata.name));
         }
         if let Some(decision) = placement_decision.as_ref() {
             strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
@@ -619,7 +621,6 @@ impl VesselReconciler {
         if composed_image(&placement, None).is_some() {
             declared_agent_adapters.clone_from(&required_adapters);
         }
-        let effective_stance = strategy.effective_stance();
 
         let repository_refs = requirement
             .repository_refs
@@ -664,7 +665,7 @@ impl VesselReconciler {
             .collect::<BTreeMap<_, _>>();
 
         let clone_env_ref = host_direct_environment_name(strategy.host_ref());
-        let mut actuations = Vec::new();
+        let mut held: Vec<Held> = Vec::new();
         let shared_clone_root = if strategy.needs_shared_clone() {
             let Some(clone_env) = self.environment(&clone_env_ref)? else {
                 return Ok(VesselPrepared::failed(self.missing_host_local_environment(&clone_env_ref, strategy.host_ref())));
@@ -673,12 +674,13 @@ impl VesselReconciler {
                 Some(spec) => spec,
                 None => return Ok(VesselPrepared::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
             };
+            held.push(held_environment(&clone_env));
             if !clone_env.is_ready() {
                 return Ok(VesselPrepared::provisioning(
                     &placement,
                     placement_decision.clone(),
                     format!("environment {clone_env_ref} to become ready"),
-                    actuations,
+                    &held,
                 ));
             }
             Some(clone_env_spec.repo_default_dir.clone())
@@ -688,20 +690,20 @@ impl VesselReconciler {
 
         let precreated_environment = match &strategy {
             PlacementStrategy::CloneInVessel { image, .. } => {
-                let env_name = environment_name(&obj.metadata.name);
-                let image = match self.environment(&env_name)? {
+                let env_name = self.own_environment_name(obj)?;
+                match self.environment(&env_name)? {
                     Some(existing) => {
+                        held.push(held_environment(&existing));
                         let dependency = self.environment_dependency(obj, &existing).await?;
                         if let Some(prepared) = dependency.unavailable {
                             return Ok(prepared);
                         }
                         if !dependency.ready {
                             let waiting_for = dependency.waiting.unwrap_or_else(|| format!("environment {env_name} to become ready"));
-                            return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, actuations));
+                            return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, &held));
                         }
-                        match image_stamp(&existing, &placement) {
-                            Ok(image) => image,
-                            Err(message) => return Ok(VesselPrepared::failed(message)),
+                        if let Err(message) = image_shown(&existing) {
+                            return Ok(VesselPrepared::failed(message));
                         }
                     }
                     None => {
@@ -717,12 +719,13 @@ impl VesselReconciler {
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
                         let waiting_for = self
-                            .request_environment(&obj.metadata.name, &env_name, &spec)?
+                            .request_environment(obj, &env_name, &spec)?
                             .unwrap_or_else(|| format!("environment {env_name} to become ready"));
-                        return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, actuations));
+                        held.extend(self.environment(&env_name)?.as_ref().map(held_environment));
+                        return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, &held));
                     }
                 };
-                Some((env_name, image))
+                Some(env_name)
             }
             _ => None,
         };
@@ -772,7 +775,11 @@ impl VesselReconciler {
                     if let Err(message) = repository_spec.verify_key(&convoy_repository.repo_ref) {
                         return Ok(VesselPrepared::failed(message));
                     }
-                    actuations.push(Actuation::CreateRepository { key: convoy_repository.repo_ref.clone(), spec: repository_spec.clone() });
+                    match flotilla_store::ensure_repository(&self.repositories, &convoy_repository.repo_ref, &repository_spec).await {
+                        Ok(_) => {}
+                        Err(ResourceError::Invalid { message }) => return Ok(VesselPrepared::failed(message)),
+                        Err(error) => return Err(error),
+                    }
                     repository_spec
                 }
                 Err(err) => return Err(err),
@@ -834,7 +841,7 @@ impl VesselReconciler {
                     checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(|_| strategy.host_ref())).as_deref(),
                 ),
                 PlacementStrategy::CloneInVessel { .. } => checkout_name(
-                    &obj.metadata.name,
+                    &launch_slug(&obj.metadata.name),
                     &convoy_repository.workspace_slug,
                     multi_repository,
                     checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(|_| strategy.host_ref())).as_deref(),
@@ -874,6 +881,7 @@ impl VesselReconciler {
                 }
                 match &existing.reading {
                     LifecycleReading::Ready { identity } => {
+                        held.push(held_checkout(existing));
                         if let Some(message) = &existing.degraded {
                             degraded.insert(checkout_name.clone(), message.clone());
                         }
@@ -904,6 +912,7 @@ impl VesselReconciler {
                     // Gone: the request below starts its next launch.
                     LifecycleReading::Lost { .. } | LifecycleReading::Released => {}
                     LifecycleReading::InProgress | LifecycleReading::Retrying { .. } => {
+                        held.push(held_checkout(existing));
                         waiting_for_checkouts.push(checkout_name);
                         continue;
                     }
@@ -924,6 +933,13 @@ impl VesselReconciler {
                             Ok(launch) => launch,
                             Err(error) => return Ok(VesselPrepared::failed(error)),
                         };
+                        let clone = self.clones()?.get(&clone_name, None).map_err(ResourceError::other)?;
+                        held.extend(clone.filter(|clone| clone.name == clone_launch).map(|clone| Held {
+                            kind: HeldKind::Clone,
+                            ready: matches!(clone.reading, LifecycleReading::Ready { .. }),
+                            launch: clone.name,
+                            home: clone.home,
+                        }));
                         CheckoutSpec::Worktree(CheckoutWorktreeSpec {
                             repo_ref: repository_key.clone(),
                             env_ref: clone_env_ref.clone(),
@@ -936,10 +952,7 @@ impl VesselReconciler {
                     PlacementStrategy::CloneInVessel { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
                         source_clone_ref: None,
                         repo_ref: repository_key.clone(),
-                        env_ref: precreated_environment
-                            .as_ref()
-                            .map(|(environment_ref, _)| environment_ref.clone())
-                            .expect("fresh-clone strategy should precreate environment"),
+                        env_ref: precreated_environment.clone().expect("fresh-clone strategy should precreate environment"),
                         r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
                         base_ref: Some(convoy_repository.source_ref.clone()),
                         target_path: checkout_target_path,
@@ -955,9 +968,18 @@ impl VesselReconciler {
                 continue;
             };
             match self.checkouts()?.request(&checkout_name, &spec, Some(&holder)) {
-                Ok(_) => waiting_for_checkouts.push(checkout_name),
+                Ok(_) => {
+                    held.extend(self.checkouts()?.get(&checkout_name, None).map_err(ResourceError::other)?.as_ref().map(held_checkout));
+                    waiting_for_checkouts.push(checkout_name);
+                }
                 // The engine has not admitted the convoy yet: its checkouts wait for it.
                 Err(error) if error.contains(HOLDER_NOT_OPEN) => waiting_for_checkouts.push(format!("{checkout_name} ({error})")),
+                // The engine ended the convoy before its old record says so: the launch is
+                // released by its requester, never failed.
+                Err(error) if error.contains(HOLDER_ENDED) => {
+                    debug!(vessel = %obj.metadata.name, %error, "the vessel's convoy has ended; it waits for its release");
+                    return Ok(VesselPrepared::none());
+                }
                 Err(error) => return Ok(VesselPrepared::failed(error)),
             }
         }
@@ -967,16 +989,8 @@ impl VesselReconciler {
                 &placement,
                 placement_decision.clone(),
                 format!("{checkout_label} {} to become ready", waiting_for_checkouts.join(", ")),
-                actuations,
+                &held,
             ));
-        }
-        if obj.status.as_ref().map_or(!degraded.is_empty(), |status| status.degraded != degraded) {
-            flotilla_store::apply_status_patch(
-                &self.backend.using::<Vessel>(&self.namespace),
-                &obj.metadata.name,
-                &VesselStatusPatch::ObserveDegradation { conditions: degraded },
-            )
-            .await?;
         }
         let has_repositories = !repository_refs.is_empty();
         let workspace_root = if multi_repository {
@@ -991,12 +1005,13 @@ impl VesselReconciler {
         } else {
             shared_clone_root.clone().unwrap_or_default()
         };
-        let (resolved_environment_ref, image) = match &strategy {
+        let resolved_environment_ref = match &strategy {
             PlacementStrategy::HostDirect { host_ref, .. } => {
                 let env_name = host_direct_environment_name(host_ref);
                 let Some(environment) = self.environment(&env_name)? else {
                     return Ok(VesselPrepared::failed(self.missing_host_local_environment(&env_name, host_ref)));
                 };
+                held.push(held_environment(&environment));
                 let dependency = self.environment_dependency(obj, &environment).await?;
                 if let Some(prepared) = dependency.unavailable {
                     return Ok(prepared);
@@ -1006,10 +1021,10 @@ impl VesselReconciler {
                         &placement,
                         placement_decision.clone(),
                         format!("environment {env_name} to become ready"),
-                        actuations,
+                        &held,
                     ));
                 }
-                (env_name, None)
+                env_name
             }
             PlacementStrategy::DockerHostCheckoutAndMount { host_ref, image, .. } => {
                 let mount_path = realisation_settings::DOCKER_WORKSPACE;
@@ -1018,9 +1033,10 @@ impl VesselReconciler {
                     Err(ResourceError::Invalid { message }) => return Ok(VesselPrepared::failed(message)),
                     Err(error) => return Err(error),
                 };
-                let env_name = environment_name(&obj.metadata.name);
-                let image = match self.environment(&env_name)? {
+                let env_name = self.own_environment_name(obj)?;
+                match self.environment(&env_name)? {
                     Some(existing) => {
+                        held.push(held_environment(&existing));
                         // Docker bind mounts cannot change in place. Refuse a stale
                         // grant set until the environment is explicitly recreated.
                         let existing_git_mounts = existing
@@ -1030,20 +1046,16 @@ impl VesselReconciler {
                             .map(|docker| docker.mounts.iter().filter(|mount| mount.target_path != mount_path).cloned().collect::<Vec<_>>())
                             .unwrap_or_default();
                         if !git_mounts_match(&existing_git_mounts, &git_mounts) {
-                            return Ok(VesselPrepared {
-                                phase: None,
-                                patch: PlannedPatch::EnvironmentRecreation {
-                                    observed_kind_ref: placement.kind.metadata.name.clone(),
-                                    observed_kind_version: placement.kind.metadata.resource_version.clone(),
-                                    placement_decision: placement_decision.clone(),
-                                    message: format!(
-                                        "environment {env_name} Git checkout membership or protection mounts changed; \
-                                         stop crews and recreate the environment before launching crews"
-                                    ),
-                                    image: composed_image(&placement, None),
-                                },
-                                actuations,
-                            });
+                            // Recreation is derived where the vessel is read; it waits here.
+                            return Ok(VesselPrepared::provisioning(
+                                &placement,
+                                placement_decision.clone(),
+                                format!(
+                                    "environment {env_name} Git checkout membership or protection mounts changed; \
+                                     stop crews and recreate the environment before launching crews"
+                                ),
+                                &held,
+                            ));
                         }
 
                         let dependency = self.environment_dependency(obj, &existing).await?;
@@ -1052,11 +1064,10 @@ impl VesselReconciler {
                         }
                         if !dependency.ready {
                             let waiting_for = dependency.waiting.unwrap_or_else(|| format!("environment {env_name} to become ready"));
-                            return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, actuations));
+                            return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, &held));
                         }
-                        match image_stamp(&existing, &placement) {
-                            Ok(image) => image,
-                            Err(message) => return Ok(VesselPrepared::failed(message)),
+                        if let Err(message) = image_shown(&existing) {
+                            return Ok(VesselPrepared::failed(message));
                         }
                     }
                     None => {
@@ -1109,16 +1120,16 @@ impl VesselReconciler {
                             }),
                         };
                         let waiting_for = self
-                            .request_environment(&obj.metadata.name, &env_name, &spec)?
+                            .request_environment(obj, &env_name, &spec)?
                             .unwrap_or_else(|| format!("environment {env_name} to become ready"));
-                        return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, actuations));
+                        held.extend(self.environment(&env_name)?.as_ref().map(held_environment));
+                        return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, &held));
                     }
                 };
-                (env_name, Some(image))
+                env_name
             }
             PlacementStrategy::CloneInVessel { .. } => {
-                let (environment_ref, image) = precreated_environment.expect("fresh-clone strategy should resolve environment first");
-                (environment_ref, Some(image))
+                precreated_environment.expect("fresh-clone strategy should resolve environment first")
             }
         };
         let terminal_cwd = strategy.terminal_cwd(&workspace_root, has_repositories);
@@ -1144,362 +1155,53 @@ impl VesselReconciler {
             })
             .collect::<Vec<_>>();
 
-        let mut terminal_refs = Vec::new();
-        let starts_active = |index: usize, process: &flotilla_resources::CrewSpec| {
-            requirement.starts_eagerly(index)
-                || convoy
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.crew_work.get(&obj.spec.vessel_name))
-                    .and_then(|crew| crew.get(&process.role))
-                    .is_some_and(|work| matches!(work.phase, CrewWorkPhase::Working | CrewWorkPhase::Interrupted))
+        let seating = Seating {
+            requirement: requirement.clone(),
+            convoy,
+            vessel_index,
+            environment: resolved_environment_ref.clone(),
+            pool: strategy.pool().to_owned(),
+            terminal_cwd,
+            brief_copies,
+            checkout_paths: checkout_paths.into_values().collect(),
+            repository_refs,
+            fork_stance,
+            placement_decision,
         };
-        for (crew_index, process) in requirement.crew.iter().enumerate() {
-            let should_start = starts_active(crew_index, process);
-            let identity = TerminalSessionIdentity::builder()
-                .vessel_ref(obj.metadata.name.clone())
-                .convoy(obj.spec.convoy_ref.clone())
-                .vessel(obj.spec.vessel_name.clone())
-                .role(process.role.clone())
-                .vessel_index(vessel_index)
-                .crew_index(crew_index)
-                .labels(process.labels.clone())
-                .build();
-            let terminal_name = identity.name();
-            match self.terminal_session(&terminal_name) {
-                Ok(existing) => {
-                    terminal_refs.push(terminal_name.clone());
-                    let phase = existing.status.as_ref().map(|status| status.phase);
-                    if phase == Some(TerminalSessionPhase::Failed) {
-                        let message = existing
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.message.clone())
-                            .unwrap_or_else(|| format!("terminal session {terminal_name} stopped"));
-                        return Ok(VesselPrepared::failed(message));
-                    }
-                    if phase == Some(TerminalSessionPhase::Stopped) {
-                        if matches!(process.source, CrewSource::Agent { .. }) {
-                            let work_phase =
-                                convoy.status.as_ref().and_then(|status| status.work.get(&obj.spec.vessel_name)).map(|work| work.phase);
-                            let crew_phase = convoy
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.crew_work.get(&obj.spec.vessel_name))
-                                .and_then(|crew| crew.get(&process.role))
-                                .map(|work| work.phase);
-                            let active = matches!(crew_phase, Some(CrewWorkPhase::Working | CrewWorkPhase::Interrupted))
-                                || (matches!(crew_phase, None | Some(CrewWorkPhase::Pending))
-                                    && should_start
-                                    && matches!(work_phase, Some(WorkPhase::Launching | WorkPhase::Running)));
-                            if !active {
-                                continue;
-                            }
-                            // A resumed crew's exited agent starts its next launch.
-                            if work_phase == Some(WorkPhase::Interrupted) {
-                                self.terminals()?.renew(&terminal_name).map_err(ResourceError::other)?;
-                            }
-                            return Ok(VesselPrepared::interrupted(process.role.clone(), &terminal_name, actuations));
-                        }
-                        let message = existing
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.message.clone())
-                            .unwrap_or_else(|| format!("terminal session {terminal_name} stopped"));
-                        return Ok(VesselPrepared::failed(message));
-                    }
-                    // A launch its pool lost is never revived: the next launch replaces it.
-                    if phase == Some(TerminalSessionPhase::Lost) {
-                        self.terminals()?.renew(&terminal_name).map_err(ResourceError::other)?;
-                        return Ok(VesselPrepared::provisioning(
-                            &placement,
-                            placement_decision.clone(),
-                            format!("terminal session {terminal_name} to relaunch"),
-                            actuations,
-                        ));
-                    }
-                    if phase == Some(TerminalSessionPhase::Starting) || (should_start && phase != Some(TerminalSessionPhase::Running)) {
-                        return Ok(VesselPrepared::provisioning(
-                            &placement,
-                            placement_decision.clone(),
-                            format!("terminal session {terminal_name} to become running"),
-                            actuations,
-                        ));
-                    }
-                }
-                Err(ResourceError::NotFound { .. }) => {
-                    if !should_start {
-                        continue;
-                    }
-                    // #3907: a requester whose binding was revoked waits with the
-                    // reason; only a rebind or a new authorization starts it again.
-                    if let Some(reason) = self.account_wait(&obj.spec.convoy_ref, process).await? {
-                        return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), reason, actuations));
-                    }
-                    let source = match &process.source {
-                        CrewSource::Tool { command } => TerminalLaunchSource::Tool { command: command.clone() },
-                        CrewSource::Agent { selector, prompt, brief_template } => {
-                            let context = flotilla_resources::TerminalCrewContext {
-                                namespace: self.namespace.clone(),
-                                convoy: obj.spec.convoy_ref.clone(),
-                                vessel_ref: obj.metadata.name.clone(),
-                            };
-                            let members = requirement
-                                .crew
-                                .iter()
-                                .enumerate()
-                                .map(|(index, member)| CrewBriefMember {
-                                    role: member.role.clone(),
-                                    state: if starts_active(index, member) { "active" } else { "latent" }.to_string(),
-                                    is_agent: matches!(member.source, CrewSource::Agent { .. }),
-                                })
-                                .collect::<Vec<_>>();
-                            let assignment = match prompt.as_deref() {
-                                Some(prompt) => CrewAssignment::Prompt(prompt),
-                                None if !convoy.spec.issues.is_empty() => CrewAssignment::CarriedIssue,
-                                None if convoy.spec.change_request.is_some() => CrewAssignment::CarriedChangeRequest,
-                                None => CrewAssignment::Unassigned,
-                            };
-                            let mut render_options = self.brief_templates.render_options_with_fork_stance(
-                                brief_template.as_deref(),
-                                convoy.spec.project_ref.as_deref(),
-                                checkout_paths.values().map(PathBuf::from),
-                                fork_stance,
-                            );
-                            render_options.apply_cascade(
-                                convoy
-                                    .status
-                                    .as_ref()
-                                    .and_then(|status| status.workflow_snapshot.as_ref())
-                                    .and_then(|workflow| workflow.cascade.as_deref()),
-                                &process.role,
-                            );
-                            render_options.has_credential_scope = !requirement.credential_scopes.is_empty();
-                            let mut brief = if convoy.metadata.annotations.contains_key(BRIEF_ARTIFACTS_ANNOTATION) {
-                                let name = artifact_slot_record_name(&context.convoy, &process.role, "brief", &context.convoy)
-                                    .map_err(ResourceError::invalid)?;
-                                let artifact = match self.artifacts.get(&name).await {
-                                    Ok(artifact) => artifact.object,
-                                    Err(ResourceError::NotFound { .. }) => {
-                                        return Ok(VesselPrepared::provisioning(
-                                            &placement,
-                                            placement_decision.clone(),
-                                            format!("brief artifact {name} to replicate"),
-                                            actuations,
-                                        ));
-                                    }
-                                    Err(error) => return Err(error),
-                                };
-                                flotilla_resources::TerminalBrief {
-                                    path: flotilla_agent::adapter::crew_brief_path(&process.role),
-                                    content: String::new(),
-                                    artifact_digest: Some(artifact.spec.digest),
-                                    copies: Vec::new(),
-                                }
-                            } else {
-                                let mut brief = match build_convoy_crew_brief_with_options(
-                                    &convoy,
-                                    &context,
-                                    &obj.spec.vessel_name,
-                                    &process.role,
-                                    assignment,
-                                    &members,
-                                    &render_options,
-                                ) {
-                                    Ok(brief) => brief,
-                                    Err(message) => return Ok(VesselPrepared::failed(message)),
-                                };
-                                append_convoy_work_context(
-                                    &mut brief.content,
-                                    &convoy,
-                                    &repository_refs,
-                                    &requirement.credential_scopes,
-                                    Some(&terminal_cwd),
-                                );
-                                if let Some(project) = convoy.spec.project_ref.as_deref() {
-                                    let address = format!("{project}/{}/{}/{}", convoy.metadata.name, obj.spec.vessel_name, process.role);
-                                    let book = flotilla_messaging::crew_address_book(&self.backend, &self.namespace, &address).await?;
-                                    brief.content.push('\n');
-                                    brief.content.push_str(&book.render());
-                                }
-                                brief
-                            };
-                            brief.copies = brief_copies.clone();
-                            TerminalLaunchSource::Agent {
-                                capability: selector.capability.clone(),
-                                adapter: selector.adapter.clone(),
-                                model: selector.model.clone(),
-                                brief,
-                            }
-                        }
-                    };
-                    // Its credentials are delivered at launch from the vessel's requirement, never
-                    // stored with the request.
-                    self.terminals()?
-                        .request(TerminalLaunchRequest {
-                            session: terminal_name.clone(),
-                            environment: resolved_environment_ref.clone(),
-                            vessel: Some(obj.metadata.name.clone()),
-                            role: process.role.clone(),
-                            pool: strategy.pool().to_string(),
-                            cwd: terminal_cwd.clone(),
-                            env: Default::default(),
-                            source,
-                        })
-                        .map_err(ResourceError::other)?;
-                    return Ok(VesselPrepared::provisioning(
-                        &placement,
-                        placement_decision.clone(),
-                        format!("terminal session {terminal_name} to become running"),
-                        actuations,
-                    ));
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        let mut configured_limits = self
-            .environment(&resolved_environment_ref)?
-            .and_then(|environment| environment.launch)
-            .and_then(|launch| launch.configured_limits);
-        for terminal_ref in &terminal_refs {
-            if let Some(limits) = self.terminal_session(terminal_ref)?.status.and_then(|status| status.configured_limits) {
-                // Only host-direct launches record terminal limits today. Merge
-                // known fields so future launch caps cannot erase a container quota.
-                configured_limits = Some(configured_limits.take().unwrap_or_default().with_overrides(limits));
-                break;
-            }
-        }
-        Ok(VesselPrepared {
-            phase: None,
-            patch: PlannedPatch::Ready {
-                configured_limits,
-                placement_decision,
-                environment_ref: resolved_environment_ref,
-                image,
-                checkout_refs,
-                terminal_session_refs: terminal_refs,
-                requested_stance: effective_stance,
-                effective_stance,
-            },
-            actuations,
-        })
+        Ok(VesselPrepared { patch: PlannedPatch::Ready { environment_ref: resolved_environment_ref, seating: Box::new(seating) }, held })
     }
 }
 
-impl Reconciler for VesselReconciler {
-    type Resource = Vessel;
-    type Prepared = VesselPrepared;
-
-    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
-        // Controllers mutate this home's Vessel records; replicas are read-only view inputs.
-        let reading = self.lifecycle_reads.try_reading(ProvisioningKind::Vessel, &obj.metadata.name, None).map_err(ResourceError::other)?;
-        let phase = VesselPhase::from_reading(reading.as_ref(), obj.status.as_ref());
-        let mut prepared =
-            if matches!(phase, VesselPhase::Failed | VesselPhase::Lost) { VesselPrepared::none() } else { self.prepare_plan(obj).await? };
-        prepared.phase = Some(phase);
-        Ok(prepared)
-    }
-
-    fn reconcile(
-        &self,
-        obj: &ResourceObject<Self::Resource>,
-        prepared: &Self::Prepared,
-        now: DateTime<Utc>,
-    ) -> ReconcileOutcome<Self::Resource> {
-        let patch =
-            match &prepared.patch {
-                PlannedPatch::None | PlannedPatch::Waiting => None,
-                PlannedPatch::Provisioning { observed_kind_ref, observed_kind_version, placement_decision, waiting_for, image } => {
-                    Some(VesselStatusPatch::MarkProvisioning {
-                        observed_kind_ref: observed_kind_ref.clone(),
-                        observed_kind_version: observed_kind_version.clone(),
-                        placement_decision: placement_decision.clone(),
-                        started_at: now,
-                        message: provisioning_stuck_message(obj, prepared.phase, waiting_for, now),
-                        image: image.clone(),
-                    })
-                }
-                PlannedPatch::EnvironmentRecreation { message, .. } if prepared.phase == Some(VesselPhase::Ready) => {
-                    (obj.status.as_ref().and_then(|status| status.message.as_deref()) != Some(message))
-                        .then(|| VesselStatusPatch::RequireEnvironmentRecreation { message: message.clone() })
-                }
-                PlannedPatch::EnvironmentRecreation { observed_kind_ref, observed_kind_version, placement_decision, message, image } => {
-                    if obj.status.as_ref().is_some_and(|status| {
-                        prepared.phase == Some(VesselPhase::Provisioning) && status.message.as_deref() == Some(message)
-                    }) {
-                        None
-                    } else {
-                        Some(VesselStatusPatch::MarkProvisioning {
-                            observed_kind_ref: observed_kind_ref.clone(),
-                            observed_kind_version: observed_kind_version.clone(),
-                            placement_decision: placement_decision.clone(),
-                            started_at: now,
-                            message: Some(message.clone()),
-                            image: image.clone(),
-                        })
+#[async_trait::async_trait]
+impl VesselPlanner for VesselPlanning {
+    /// Launch `launch` at this home as its pass finds it: what it holds, and whether it is realised
+    /// in its environment. A ready launch is checked for a crew that cannot be seated, which breaks
+    /// it; seating its crews is the crew seats' work ([`seats`]).
+    async fn plan(&self, launch: &str) -> Result<VesselPlan, String> {
+        let obj = self.backend.clone().using::<Vessel>(&self.namespace).get(launch).await.map_err(|error| error.to_string())?;
+        let realised_in = match engine_vessel(self.lifecycle_reads.as_ref(), &obj, None)?.map(|record| record.reading) {
+            Some(LifecycleReading::Ready { identity }) => Some(identity),
+            _ => None,
+        };
+        let prepared = self.prepare_plan(&obj).await.map_err(|error| error.to_string())?;
+        Ok(match prepared.patch {
+            // Its convoy has ended, or placed it elsewhere: its requester releases it.
+            PlannedPatch::None => VesselPlan::Waiting { reason: "its release".into(), held: prepared.held, realised_in },
+            PlannedPatch::Waiting { reason } => {
+                debug!(vessel = %launch, %reason, "vessel waiting");
+                VesselPlan::Waiting { reason, held: prepared.held, realised_in }
+            }
+            PlannedPatch::Ready { environment_ref, seating } => {
+                match self.seat(&obj, &seating, false).await.map_err(|error| error.to_string())? {
+                    seats::Seated::Failed(cause) => VesselPlan::Failed { cause, retryable: false },
+                    seats::Seated::All | seats::Seated::Waiting(_) => {
+                        VesselPlan::Ready { environment: environment_ref, held: prepared.held }
                     }
                 }
-                PlannedPatch::Ready {
-                    configured_limits,
-                    placement_decision,
-                    environment_ref,
-                    image,
-                    checkout_refs,
-                    terminal_session_refs,
-                    requested_stance,
-                    effective_stance,
-                } => Some(VesselStatusPatch::MarkReady {
-                    configured_limits: configured_limits.clone(),
-                    placement_decision: placement_decision.clone(),
-                    environment_ref: Some(environment_ref.clone()),
-                    image_ref: image.as_ref().map(|image| image.image_ref.clone()),
-                    local_image_id: image.as_ref().map(|image| image.local_image_id.clone()),
-                    registry_digest: image.as_ref().and_then(|image| image.registry_digest.clone()),
-                    checkout_refs: checkout_refs.clone(),
-                    terminal_session_refs: terminal_session_refs.clone(),
-                    requested_stance: *requested_stance,
-                    effective_stance: *effective_stance,
-                    ready_at: now,
-                    image: image.as_ref().and_then(|image| image.composed.clone()),
-                }),
-                PlannedPatch::Interrupted { roles, message }
-                    if obj.status.as_ref().is_none_or(|status| {
-                        prepared.phase != Some(VesselPhase::Interrupted)
-                            || status.interrupted_roles != *roles
-                            || status.message.as_deref() != Some(message.as_str())
-                    }) =>
-                {
-                    Some(VesselStatusPatch::MarkInterrupted { roles: roles.clone(), message: message.clone() })
-                }
-                PlannedPatch::Interrupted { .. } => None,
-                PlannedPatch::Lost { message } => Some(VesselStatusPatch::MarkLost { message: message.clone() }),
-                PlannedPatch::Failed { message } => Some(VesselStatusPatch::MarkFailed { message: message.clone() }),
-            };
-
-        let mut outcome = ReconcileOutcome::with_actuations(patch, prepared.actuations.clone());
-        if matches!(&prepared.patch, PlannedPatch::Provisioning { .. } | PlannedPatch::EnvironmentRecreation { .. } | PlannedPatch::Waiting)
-        {
-            outcome.requeue_after = Some(VESSEL_PROVISIONING_REQUEUE_AFTER);
-        } else if matches!(&prepared.patch, PlannedPatch::Interrupted { .. }) {
-            outcome.requeue_after = Some(VESSEL_INTERRUPTED_REQUEUE_AFTER);
-        }
-        outcome
-    }
-
-    async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
-        // Its terminal sessions are held for its lease, which ends with this teardown; their
-        // controller then releases them.
-        let _ = obj;
-        // Checkouts are convoy-owned and are removed by the convoy finalizer's
-        // ownership cascade, independently of vessel teardown. The environment is held for the
-        // vessel's lease, which ends with this teardown; its controller then releases it.
-
-        Ok(())
-    }
-
-    fn finalizer_name(&self) -> Option<&'static str> {
-        Some("flotilla.work/vessel-workspace-teardown")
+            }
+            PlannedPatch::Lost { message } => VesselPlan::Lost { reason: message },
+            PlannedPatch::Failed { message, retryable } => VesselPlan::Failed { cause: message, retryable },
+        })
     }
 }
 
@@ -1513,35 +1215,27 @@ fn environment_dependency(environment: &EnvironmentRecord, retained: &[String]) 
         // Lost is recoverable: its cause, as the backing reported it, and where the work is.
         LifecycleReading::Lost { reason } => {
             let cause = reason.clone().unwrap_or_else(|| format!("environment {} disappeared", environment.name));
-            let mut message = format!("lost, recoverable: {cause}; rehydration is not available yet (#2872)");
+            let mut message = format!("lost: {cause}; its next launch replaces it");
             if !retained.is_empty() {
                 message = format!("{message}; recover work from retained checkout(s): {}", retained.join(", "));
             }
-            Some(VesselPrepared { phase: None, patch: PlannedPatch::Lost { message }, actuations: Vec::new() })
+            Some(VesselPrepared { patch: PlannedPatch::Lost { message }, held: Vec::new() })
         }
         LifecycleReading::Released => Some(VesselPrepared {
-            phase: None,
             patch: PlannedPatch::Lost { message: format!("environment {} {}", environment.name, reading.reason().unwrap_or_default()) },
-            actuations: Vec::new(),
+            held: Vec::new(),
         }),
         _ => None,
     };
     EnvironmentDependency { ready: matches!(reading, LifecycleReading::Ready { .. }), waiting: reading.reason(), unavailable }
 }
 
-fn image_stamp(environment: &EnvironmentRecord, placement: &Placement) -> Result<ImageStamp, String> {
+/// Whether a ready environment shows the image it was made from, as readers of its vessel take it.
+fn image_shown(environment: &EnvironmentRecord) -> Result<(), String> {
     let launch = environment.launch.as_ref().ok_or_else(|| format!("environment {} awaiting image observations", environment.name))?;
-    let image_ref = launch.image_ref.clone().ok_or_else(|| format!("environment {} is missing its image ref", environment.name))?;
-    let local_image_id =
-        launch.local_image_id.clone().ok_or_else(|| format!("environment {} is missing its image digest", environment.name))?;
-    // A composed environment provisioned from its build's digest.
-    let image_build_ref = match (&environment.spec.docker, &environment.spec.cloud_sandbox) {
-        (Some(docker), _) => docker.image_build_ref.as_ref(),
-        (None, Some(cloud)) => cloud.image_build_ref.as_ref(),
-        (None, None) => None,
-    };
-    let composed = image_build_ref.and_then(|_| composed_image(placement, Some(image_ref.clone())));
-    Ok(ImageStamp { image_ref, local_image_id, registry_digest: launch.registry_digest.clone(), composed })
+    launch.image_ref.as_ref().ok_or_else(|| format!("environment {} is missing its image ref", environment.name))?;
+    launch.local_image_id.as_ref().ok_or_else(|| format!("environment {} is missing its image digest", environment.name))?;
+    Ok(())
 }
 
 /// Git's ordinary upstream writes target the common config, even with
@@ -1649,27 +1343,6 @@ fn placement_strategy(spec: &FulfilmentKindSpec) -> PlacementStrategy {
     }
 }
 
-fn provisioning_patch(placement: &Placement, placement_decision: Option<PlacementDecision>, waiting_for: String) -> PlannedPatch {
-    PlannedPatch::Provisioning {
-        observed_kind_ref: placement.kind.metadata.name.clone(),
-        observed_kind_version: placement.kind.metadata.resource_version.clone(),
-        placement_decision,
-        waiting_for,
-        image: composed_image(placement, None),
-    }
-}
-
-fn provisioning_stuck_message(
-    obj: &ResourceObject<Vessel>,
-    phase: Option<VesselPhase>,
-    waiting_for: &str,
-    now: DateTime<Utc>,
-) -> Option<String> {
-    let started_at = obj.status.as_ref().filter(|_| phase == Some(VesselPhase::Provisioning)).and_then(|status| status.started_at)?;
-    (now.signed_duration_since(started_at) >= chrono::Duration::seconds(VESSEL_PROVISIONING_STUCK_SECONDS))
-        .then(|| format!("provisioning is stalled while waiting for {waiting_for}; reconciliation will continue retrying"))
-}
-
 fn legible_waiting_for(mut waiting_for: String, placement_decision: Option<&PlacementDecision>) -> String {
     if let Some(decision) = placement_decision {
         let target_environment = host_direct_environment_name(decision.target_host.reference.as_str());
@@ -1679,8 +1352,194 @@ fn legible_waiting_for(mut waiting_for: String, placement_decision: Option<&Plac
     waiting_for
 }
 
-fn environment_name(vessel_name: &str) -> String {
-    format!("env-{vessel_name}")
+/// What woke [`ConvoyVesselWake`].
+enum ConvoyWoken {
+    /// Something of convoy `0` changed: its vessels plan again.
+    Convoy(String),
+    /// A brief artifact may have replicated: each ready vessel seats its crews again.
+    Briefs,
+    /// What changed is unknown: every vessel plans again.
+    Every,
+}
+
+/// Wakes a convoy's vessel launches at this home when what their planning reads beside the
+/// engine's records changes: the convoy (its snapshot, placement and phase), its engine record
+/// (its checkouts wait for it to open), its crews' account bindings, and, for seating their
+/// crews, the brief artifacts a crew waits to replicate (#3108). Its wakes are the Vessel
+/// controller's rechecks and the crew seats' secondary watch; neither sets timers.
+#[derive(Clone)]
+pub struct ConvoyVesselWake {
+    convoys: ReplicaReadResolver<Convoy>,
+    artifacts: ReplicaReadResolver<Artifact>,
+    reads: Arc<dyn LifecycleReads>,
+    engine: EngineConvoyPath,
+    accounts: Arc<dyn AccountRecords>,
+}
+
+impl ConvoyVesselWake {
+    pub fn new(
+        backend: &ResourceBackend,
+        namespace: &str,
+        reads: Arc<dyn LifecycleReads>,
+        engine: EngineConvoyPath,
+        accounts: Arc<dyn AccountRecords>,
+    ) -> Self {
+        Self {
+            convoys: backend.including_replicas::<Convoy>(namespace),
+            artifacts: backend.including_replicas::<Artifact>(namespace),
+            reads,
+            engine,
+            accounts,
+        }
+    }
+
+    /// Every source of wakes, merged; brief artifacts' only when `briefs`.
+    async fn woken(&self, namespace: &str, briefs: bool) -> Result<futures::stream::BoxStream<'static, ConvoyWoken>, ResourceError> {
+        use futures::StreamExt;
+
+        let convoys = self
+            .convoys
+            .watch()
+            .await?
+            .map(|event| match event {
+                Ok(ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) | ReadWatchEvent::Deleted(read)) => {
+                    ConvoyWoken::Convoy(read.object.metadata.name)
+                }
+                Ok(ReadWatchEvent::DeletedByName { tombstone, .. }) => ConvoyWoken::Convoy(tombstone.name),
+                Err(error) => {
+                    warn!(%error, "the vessels' convoy watch failed");
+                    ConvoyWoken::Every
+                }
+            })
+            .boxed();
+        let artifacts =
+            if briefs { self.artifacts.watch().await?.map(|_| ConvoyWoken::Briefs).boxed() } else { futures::stream::pending().boxed() };
+        let accounts = self
+            .accounts
+            .changes(namespace)
+            .await
+            .map_err(ResourceError::other)?
+            .filter_map(|change| async move {
+                match change {
+                    Ok(AccountChange::Binding { convoy, .. } | AccountChange::Provision { convoy, .. }) => convoy.map(ConvoyWoken::Convoy),
+                    Err(error) => {
+                        warn!(%error, "the vessels' account binding watch failed");
+                        Some(ConvoyWoken::Every)
+                    }
+                }
+            })
+            .boxed();
+        // The engine path is installed before any controller starts; empty, the switch is off.
+        let engine = match self.engine.get() {
+            Some(engine) => futures::stream::unfold(engine.changes(), |mut changes| async move {
+                match changes.recv().await {
+                    Ok(name) => Some((ConvoyWoken::Convoy(name), changes)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((ConvoyWoken::Every, changes)),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                }
+            })
+            .boxed(),
+            None => futures::stream::pending().boxed(),
+        };
+        Ok(futures::stream::select_all([convoys, artifacts, accounts, engine]).boxed())
+    }
+
+    /// This home's live vessel launches `woken` names.
+    async fn launches(&self, woken: &ConvoyWoken) -> Result<Vec<String>, String> {
+        let reads = Arc::clone(&self.reads);
+        let woken = match woken {
+            ConvoyWoken::Convoy(convoy) => Some(convoy.clone()),
+            _ => None,
+        };
+        tokio::task::spawn_blocking(move || {
+            let vessels = reads.vessels()?;
+            let here = vessels.home().to_owned();
+            let records = match &woken {
+                Some(convoy) => vessels.of_convoy(convoy)?.into_iter().filter(|record| record.home == here).collect(),
+                None => vessels.at(&here)?,
+            };
+            Ok(records.into_iter().filter(|record| !record.ended()).collect::<Vec<_>>())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|records: Vec<VesselRecord>| records.into_iter().map(|record| record.name).collect())
+    }
+
+    /// Names to the Vessel controller each launch to plan again, until it stops listening.
+    pub async fn recheck(self, namespace: String, rechecks: tokio::sync::mpsc::Sender<String>) {
+        use futures::StreamExt;
+
+        let mut woken = match self.woken(&namespace, false).await {
+            Ok(woken) => woken,
+            Err(error) => {
+                warn!(%error, "the vessel rechecks could not follow their convoys; vessels plan only on their holdings' changes");
+                return;
+            }
+        };
+        while let Some(woken) = woken.next().await {
+            match self.launches(&woken).await {
+                Ok(launches) => {
+                    for launch in launches {
+                        if rechecks.send(launch).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(error) => warn!(%error, "the vessel rechecks could not read this home's launches"),
+            }
+        }
+    }
+}
+
+impl SecondaryWatch for ConvoyVesselWake {
+    type Primary = Vessel;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        namespace: String,
+        sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            use futures::StreamExt;
+
+            let mut woken = self.woken(&namespace, true).await?;
+            while let Some(woken) = woken.next().await {
+                if matches!(woken, ConvoyWoken::Every) {
+                    sender.send_every();
+                    continue;
+                }
+                match self.launches(&woken).await {
+                    Ok(launches) => {
+                        for launch in launches {
+                            if sender.send(launch).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "the convoy vessel wake could not list the vessels; waking every vessel");
+                        sender.send_every();
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+/// A launch's name as a name segment: environment and container names take no `#`.
+fn launch_slug(launch: &str) -> String {
+    launch.replace('#', "-")
+}
+
+/// The environment a launch requests for itself: a replacement launch has its own.
+fn environment_name(launch: &str) -> String {
+    format!("env-{}", launch_slug(launch))
 }
 
 fn checkout_name(vessel_name: &str, workspace_slug: &str, multi_repository: bool, placement_scope: Option<&str>) -> String {
@@ -1771,13 +1630,6 @@ fn environment_provider_labels(placement: &Placement) -> BTreeMap<String, String
 }
 
 impl PlacementStrategy {
-    fn effective_stance(&self) -> Stance {
-        match self {
-            Self::HostDirect { .. } => Stance::Trusted,
-            Self::DockerHostCheckoutAndMount { .. } | Self::CloneInVessel { .. } => Stance::Contained,
-        }
-    }
-
     fn host_ref(&self) -> &str {
         match self {
             Self::HostDirect { host_ref, .. }
@@ -1823,7 +1675,7 @@ mod tests {
 
     use super::{
         checkout_name, checkout_placement_scope, configure_contained_tracking, environment_provider_labels, environment_with_credentials,
-        legible_waiting_for, placement_strategy, PlacementStrategy, VesselReconciler,
+        legible_waiting_for, placement_strategy, PlacementStrategy, VesselPlanning,
     };
 
     // #2682: deduplicate shared parents, retain every own-admin overlay, and
@@ -1871,7 +1723,7 @@ mod tests {
             None,
         );
         let valid = WorktreeMetadata { common_dir: "/clone/.git".into(), admin_dir: "/clone/.git/worktrees/actual".into() };
-        let reconciler = VesselReconciler::new(backend.clone(), namespace)
+        let reconciler = VesselPlanning::new(backend.clone(), namespace)
             .with_lifecycle_reads(checkouts.reads.clone())
             .with_worktree_metadata(Arc::new(Metadata(Ok(valid.clone()))));
         assert!(reconciler.contained_git_mounts(&[]).await.expect("empty").is_empty());
@@ -1891,12 +1743,12 @@ mod tests {
             Ok(WorktreeMetadata { admin_dir: "/sibling".into(), ..valid.clone() }),
             Ok(WorktreeMetadata { admin_dir: "/clone/.git/worktrees/own/nested".into(), ..valid.clone() }),
         ] {
-            let refusing = VesselReconciler::new(backend.clone(), namespace)
+            let refusing = VesselPlanning::new(backend.clone(), namespace)
                 .with_lifecycle_reads(checkouts.reads.clone())
                 .with_worktree_metadata(Arc::new(Metadata(metadata)));
             assert!(refusing.contained_git_mounts(std::slice::from_ref(&own)).await.is_err(), "invalid metadata must fail closed");
         }
-        let unavailable = VesselReconciler::new(backend, namespace).with_lifecycle_reads(checkouts.reads.clone());
+        let unavailable = VesselPlanning::new(backend, namespace).with_lifecycle_reads(checkouts.reads.clone());
         assert!(
             matches!(unavailable.contained_git_mounts(&[own]).await, Err(ResourceError::Other { .. })),
             "missing resolver must retry without guessing paths or failing the vessel"
@@ -1991,7 +1843,7 @@ mod tests {
             .replace(&kinds.list().await.expect("author kinds"), chrono::Utc::now())
             .await
             .expect("replicate kinds");
-        let reconciler = VesselReconciler::new(driver.clone(), "flotilla")
+        let reconciler = VesselPlanning::new(driver.clone(), "flotilla")
             .with_federated_dependencies(&driver, flotilla_protocol::CanonicalHostId::resolved("driver-host"));
         for (name, origin) in [("local-vessel", None), ("remote-vessel", Some("convoy-origin"))] {
             let mut meta = InputMeta::builder().name(name.to_string()).build();
@@ -2025,7 +1877,7 @@ mod tests {
     // waits for it, leaving the vessel untouched; a snapshot without the vessel fails it.
     #[tokio::test]
     async fn a_vessel_waits_for_a_replicated_convoy_snapshot() {
-        use flotilla_store::controller::Reconciler;
+        use flotilla_resources::vessel_planning::{VesselPlan, VesselPlanner as _};
         let author = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("author"));
         let driver = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("driver"));
         let kind =
@@ -2039,7 +1891,10 @@ mod tests {
             .expect("replicate kinds");
         let convoys = author.using::<Convoy>("flotilla");
         let convoy = convoys
-            .create(&InputMeta::builder().name("convoy".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .create(
+                &InputMeta::builder().name("convoy".into()).build(),
+                &ConvoySpec::builder().workflow_ref("workflow".into()).placement_policy("kind".into()).build(),
+            )
             .await
             .expect("convoy");
         let replicate = || async {
@@ -2050,29 +1905,27 @@ mod tests {
                 .expect("replicate convoys")
         };
         replicate().await;
-        let reconciler = VesselReconciler::new(driver.clone(), "flotilla")
-            .with_federated_dependencies(&driver, flotilla_protocol::CanonicalHostId::resolved("driver-host"));
-        let mut meta = InputMeta::builder().name("vessel".into()).build();
-        meta.annotations.insert(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "author".to_string());
-        let vessel = driver
-            .using::<Vessel>("flotilla")
-            .create(
-                &meta,
-                &VesselSpec {
-                    convoy_ref: "convoy".into(),
-                    vessel_name: "work".into(),
-                    fulfilment_kind_ref: "kind".into(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                },
-            )
-            .await
-            .expect("vessel");
+        // The work of the convoy homed at author is launched here, at driver.
+        let vessels = flotilla_provisioning_testkit::VesselsFixture::at("driver");
+        let launch = vessels.request_for(&flotilla_resources::vessel_records::VesselLaunchRequest {
+            convoy: "convoy".into(),
+            convoy_home: "author".into(),
+            work: "work".into(),
+            host: "driver-host".into(),
+        });
+        driver.install_engine_records(Arc::new(flotilla_store::VesselViews::new(driver.clone(), "flotilla", vessels.reads.clone())));
+        let reconciler = VesselPlanning::new(driver.clone(), "flotilla")
+            .with_federated_dependencies(&driver, flotilla_protocol::CanonicalHostId::resolved("driver-host"))
+            .with_lifecycle_reads(vessels.reads.clone());
+        let vessel = driver.using::<Vessel>("flotilla").get(&launch).await.expect("vessel");
+        assert_eq!(vessel.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map(String::as_str), Some("author"));
+        use flotilla_resources::vessel_records::VesselRecords as _;
+        let reading = || vessels.vessels.get(&launch, None).expect("read").expect("launch").reading;
 
-        let prepared = reconciler.prepare(&vessel).await.expect("prepare");
-        assert!(matches!(prepared.patch, super::PlannedPatch::Waiting), "{:?}", prepared.patch);
-        let outcome = reconciler.reconcile(&vessel, &prepared, chrono::Utc::now());
-        assert!(outcome.patch.is_none());
-        assert_eq!(outcome.requeue_after, Some(super::VESSEL_PROVISIONING_REQUEUE_AFTER));
+        // Waiting spends no try: its controller is told of the convoy's change by a recheck.
+        let plan = reconciler.plan(&launch).await.expect("plan");
+        assert!(matches!(plan, VesselPlan::Waiting { .. }), "{plan:?}");
+        assert_eq!(reading(), flotilla_protocol::LifecycleReading::InProgress, "planning leaves the launch untouched");
 
         let mut status = flotilla_store_testkit::fixtures::convoy_status(flotilla_resources::ConvoyPhase::Active);
         status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
@@ -2085,11 +1938,10 @@ mod tests {
         });
         convoys.update_status("convoy", &convoy.metadata.resource_version, &status).await.expect("freeze snapshot");
         replicate().await;
-        let prepared = reconciler.prepare(&vessel).await.expect("prepare");
-        assert!(
-            matches!(&prepared.patch, super::PlannedPatch::Failed { message } if message == "vessel work missing from convoy snapshot"),
-            "{:?}",
-            prepared.patch
+        // A frozen snapshot without its work fails the launch for good.
+        assert_eq!(
+            reconciler.plan(&launch).await.expect("plan"),
+            VesselPlan::Failed { cause: "vessel work missing from convoy snapshot".into(), retryable: false }
         );
     }
 
@@ -2109,7 +1961,7 @@ mod tests {
             )
             .await
             .expect("host");
-        let reconciler = VesselReconciler::new(backend.clone(), "flotilla");
+        let reconciler = VesselPlanning::new(backend.clone(), "flotilla");
         let kind = FulfilmentKindSpec::builder()
             .host_ref("h".into())
             .pool("cleat".into())
@@ -2403,7 +2255,7 @@ mod tests {
     #[test]
     fn missing_host_local_environment_warns_with_store_and_host_context() {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let reconciler = VesselReconciler::new(backend.clone(), "flotilla")
+        let reconciler = VesselPlanning::new(backend.clone(), "flotilla")
             .with_federated_dependencies(&backend, flotilla_protocol::CanonicalHostId::resolved("feta-host"));
         let log_output = Arc::new(Mutex::new(Vec::new()));
         let message;
@@ -2439,7 +2291,7 @@ mod tests {
             ..Default::default()
         };
         let fixture = EnvironmentFixture::default();
-        let reconciler = VesselReconciler::new(ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()), "flotilla")
+        let reconciler = VesselPlanning::new(ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()), "flotilla")
             .with_lifecycle_reads(fixture.reads.clone());
         let dependency = || reconciler.environment("env").map(|record| super::environment_dependency(&record.expect("held"), &[]));
         fixture.request("env", &spec, None);
@@ -2452,7 +2304,7 @@ mod tests {
             matches!(
                 &plan.patch,
                 super::PlannedPatch::Lost { message }
-                    if message == "lost, recoverable: environment env disappeared; rehydration is not available yet (#2872)"
+                    if message == "lost: environment env disappeared; its next launch replaces it"
             ),
             "{:?}",
             plan.patch
@@ -2460,48 +2312,6 @@ mod tests {
         fixture.poison();
         assert!(dependency().err().expect("checked read").to_string().contains("poisoned"));
     }
-    // A held lease decides terminality even while old status disagrees; read errors never fall back.
-    #[tokio::test]
-    async fn vessel_reads_its_lease_without_a_status_copy() {
-        use flotilla_protocol::CanonicalHostId;
-        use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
-        use flotilla_resources::{VesselPhase, VesselStatus};
-        use flotilla_store::controller::Reconciler;
-        let mut vessel = object::<Vessel>(
-            "vessel",
-            VesselSpec {
-                convoy_ref: "convoy".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "local".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-            VesselStatus {
-                phase: VesselPhase::Lost,
-                placement_decision: Some(
-                    PlacementDecision::builder()
-                        .kind("local".into())
-                        .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host"), display_name: "host".into() })
-                        .build(),
-                ),
-                ..Default::default()
-            },
-        );
-        let fixture = VesselFixture::new(false);
-        let reconciler = VesselReconciler::new(ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()), "flotilla")
-            .with_lifecycle_reads(fixture.reads.clone());
-        fixture.request(&vessel);
-        // A Requested lease is provisioning even beside stale ready or interrupted status.
-        for old_phase in [VesselPhase::Lost, VesselPhase::Ready, VesselPhase::Interrupted] {
-            vessel.status.as_mut().expect("status").phase = old_phase;
-            let prepared = reconciler.prepare(&vessel).await.expect("prepared");
-            assert_eq!(prepared.phase, Some(VesselPhase::Provisioning));
-            assert!(reconciler.reconcile(&vessel, &prepared, chrono::Utc::now()).patch.is_some());
-        }
-        fixture.finish(&vessel, Ending::Released);
-        vessel.status.as_mut().expect("status").phase = VesselPhase::Ready;
-        let prepared = reconciler.prepare(&vessel).await.expect("ended");
-        assert!(reconciler.reconcile(&vessel, &prepared, chrono::Utc::now()).patch.is_none());
-        fixture.poison();
-        assert!(reconciler.prepare(&vessel).await.expect_err("checked read").to_string().contains("poisoned"));
-    }
+    // Deleted vessel_reads_its_lease_without_a_status_copy: whether a launch is planned is its
+    // Vessel controller's, from its lifecycle state, and the vessel controller tests cover it (#3108).
 }

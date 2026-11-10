@@ -143,24 +143,12 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
         )
         .await
         .expect("create feta convoy");
-    // The crew's session is feta's engine launch, held for vessel `work` of the convoy.
-    feta.resource_backend()
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("feta-work".to_string()).build(),
-            &VesselSpec {
-                convoy_ref: "feta-convoy".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "host-direct".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create feta vessel");
+    // The crew's session is feta's engine launch, held for feta's launch of the convoy's work.
+    let vessel = crate::engine(&feta).vessels.request("feta-convoy", "work", &feta_host_id);
     crate::engine(&feta).terminals.request(&TerminalLaunchRequest {
         session: "feta-session".to_string(),
         environment: "feta-environment".to_string(),
-        vessel: Some("feta-work".to_string()),
+        vessel: Some(vessel),
         role: "coder".to_string(),
         pool: "passthrough".to_string(),
         cwd: "/tmp".to_string(),
@@ -1649,25 +1637,19 @@ async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
         .create(&InputMeta::builder().name("convoy-homed-on-kiwi".to_string()).build(), &spec)
         .await
         .expect("create convoy on kiwi");
-    // The crew runs on feta: its session is feta's engine launch, held for vessel `work`.
-    feta.resource_backend()
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("crew-work".to_string()).build(),
-            &VesselSpec {
-                convoy_ref: "convoy-homed-on-kiwi".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "host-direct".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create feta vessel");
+    // The crew runs on feta: its session is feta's engine launch, held for feta's launch of work
+    // `work` in the convoy homed at kiwi.
+    let vessel = crate::engine(&feta).vessels.request_for(&flotilla_resources::vessel_records::VesselLaunchRequest {
+        convoy: "convoy-homed-on-kiwi".to_string(),
+        convoy_home: kiwi.node_id().as_str().to_string(),
+        work: "work".to_string(),
+        host: feta_host_id.clone(),
+    });
     let terminals = &crate::engine(&feta).terminals;
     let launch = terminals.request(&TerminalLaunchRequest {
         session: "crew-session".to_string(),
         environment: "feta-environment".to_string(),
-        vessel: Some("crew-work".to_string()),
+        vessel: Some(vessel),
         role: "coder".to_string(),
         pool: "passthrough".to_string(),
         cwd: "/tmp".to_string(),

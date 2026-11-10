@@ -10,7 +10,7 @@ Kind tables only; the shared tables are in `crew.sql`.
 | `terminal_launch_facts` | root | 8 | – | – | – |
 | `terminal_session` | root | 27 | 8: `source` 6, `ending` 2 | `terminal_session_env` (child) | `by_environment` (environment), `by_holder` (holder), `by_launch` (launch_of, launch) |
 | `terminal_session_env` | child | 3 | – | – | – |
-| `vessel` | root | 18 | 2: `ending` 2 | `vessel_shape` (child) | `live_by_host` (host), `by_convoy` (convoy) |
+| `vessel` | root | 20 | 2: `ending` 2 | `vessel_shape` (child) | `live_by_host` (host), `by_launch` (convoy, launch_of, launch) |
 | `vessel_shape` | child | 3 | – | – | – |
 
 Tables wider than 30 columns:
@@ -35,5 +35,6 @@ Interned column domains:
 | `terminal_session` | `role` | `rl` |
 | `terminal_session` | `pool` | `tp` |
 | `terminal_session` | `source_capability` | `cp` |
+| `vessel` | `launch_of` | `ln` |
 | `vessel` | `class` | `vc` |
 | `vessel` | `host` | `hs` |

@@ -3,7 +3,7 @@
 //! delivered on host B, the reply reaches A's role inbox by its subject, and
 //! `convoy explain` on A shows B's messages from A's replica.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use chrono::Utc;
 use flotilla_core::in_process::InProcessDaemon;
@@ -12,7 +12,7 @@ use flotilla_engine_messages::MessagePrimitives;
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
     Convoy, ConvoySpec, Host, InputMeta, MessageExpectation, MessageReference, MessageRelation, MessageSpec, Resource, ResourceProvenance,
-    Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
+    Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSource, TerminalSessionSpec,
 };
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::{Follower, Service};
@@ -87,7 +87,7 @@ fn pump(from: &Service, from_home: &str, to: &Service, cursor: &mut Option<u64>)
     *cursor = Some(next);
 }
 
-fn crew_session(convoy: &str) -> TerminalSessionSpec {
+fn crew_session(convoy: &str, vessel: &str) -> TerminalSessionSpec {
     TerminalSessionSpec {
         env_ref: "test-env".into(),
         role: "coder".into(),
@@ -97,7 +97,7 @@ fn crew_session(convoy: &str) -> TerminalSessionSpec {
         source: TerminalSessionSource::Agent {
             selector: Selector::for_capability("coding"),
             brief: TerminalBrief { path: "brief.md".into(), content: "brief".into(), artifact_digest: None, copies: Vec::new() },
-            context: Box::new(TerminalCrewContext { namespace: NS.into(), convoy: convoy.into(), vessel_ref: "work".into() }),
+            context: Box::new(TerminalCrewContext { namespace: NS.into(), convoy: convoy.into(), vessel_ref: vessel.into() }),
         },
     }
 }
@@ -189,28 +189,16 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         )
         .await
         .expect("crew workflow");
-    // The crew's session is B's engine launch, held for its vessel.
-    b.resource_backend()
-        .using::<Vessel>(NS)
-        .create(
-            &InputMeta::builder().name("work".into()).build(),
-            &VesselSpec {
-                convoy_ref: "crew-b".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("crew vessel");
+    // The crew's session is B's engine launch, held for its vessel's launch at B.
+    let vessel = flotilla_daemon_testkit::engine::engine(b).vessels.request("crew-b", "work", &home_b);
     let terminals = &flotilla_daemon_testkit::engine::engine(b).terminals;
-    let launch = terminals.request(&flotilla_daemon_testkit::engine::session_request("crew-b-session", &crew_session("crew-b")));
+    let launch = terminals.request(&flotilla_daemon_testkit::engine::session_request("crew-b-session", &crew_session("crew-b", &vessel)));
     let facts = flotilla_resources::terminal_records::TerminalLaunchFacts {
         agent: Some(flotilla_resources::terminal_records::AgentLaunch { adapter: "codex".into(), model: None, stance: "coder".into() }),
         ..Default::default()
     };
     terminals.ready(&launch, "sess-b", &facts);
-    // The old-store replicas each router reads to find a home: the convoys, and the holder vessels.
+    // The old-store replicas each router reads to find a home: the convoys.
     let replicate = |from: &Arc<InProcessDaemon>, to: &Arc<InProcessDaemon>| {
         let (from, to) = (Arc::clone(from), Arc::clone(to));
         async move {
@@ -219,11 +207,6 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
                 .replace(&from.resource_backend().using::<Convoy>(NS).list().await.expect("convoys"), Utc::now())
                 .await
                 .expect("convoy replica");
-            to.resource_backend()
-                .replica_writer::<Vessel>(from.node_id().clone(), NS)
-                .replace(&from.resource_backend().using::<Vessel>(NS).list().await.expect("vessels"), Utc::now())
-                .await
-                .expect("vessel replica");
         }
     };
     replicate(b, a).await;

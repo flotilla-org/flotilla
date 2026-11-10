@@ -1,6 +1,13 @@
 //! The shared read boundary for lifecycle consumers. It belongs with resource-facing
 //! interfaces so controllers, admission and views can share it without depending on a surface.
 
+/// The changes of some records, written here or replicated in, since the cursor's last pass,
+/// read from the decided log on the caller's thread: a pass sees every commit made before it, so
+/// a reader that passes before it reads reads its own and its peers' writes.
+pub trait ChangeCursor<C>: Send {
+    fn pass(&mut self) -> Result<Vec<C>, String>;
+}
+
 /// A provisioning kind whose lifecycle the engine can hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProvisioningKind {
@@ -10,8 +17,6 @@ pub enum ProvisioningKind {
     Checkout,
     /// A terminal session's current launch, read by its record name.
     TerminalSession,
-    /// A vessel's lease on its pinned host.
-    Vessel,
 }
 
 /// Lifecycle judgements served by keyed reads of the decided store, judged at read time.
@@ -65,6 +70,12 @@ pub trait LifecycleReads: Send + Sync {
     /// through them. Unavailable where no engine is installed.
     fn terminals(&self) -> Result<&dyn crate::terminal_records::TerminalRecords, String> {
         Err("terminal sessions are not served without the engine".into())
+    }
+
+    /// The engine's vessels (#3108): every vessel reader goes through them. Unavailable where no
+    /// engine is installed.
+    fn vessels(&self) -> Result<&dyn crate::vessel_records::VesselRecords, String> {
+        Err("vessels are not served without the engine".into())
     }
 
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
@@ -139,6 +150,10 @@ impl LifecycleReads for LateLifecycleReads {
 
     fn terminals(&self) -> Result<&dyn crate::terminal_records::TerminalRecords, String> {
         self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.terminals()
+    }
+
+    fn vessels(&self) -> Result<&dyn crate::vessel_records::VesselRecords, String> {
+        self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.vessels()
     }
 
     fn try_reading(

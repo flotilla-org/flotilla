@@ -29,6 +29,9 @@ flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
+flotilla-provisioning = { path = "../flotilla-provisioning" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-state-machines = { path = "../flotilla-state-machines" }
 tempfile = { workspace = true }
 
 [lints]

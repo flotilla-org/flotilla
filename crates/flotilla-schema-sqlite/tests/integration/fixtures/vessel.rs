@@ -38,9 +38,12 @@ fn shape(tc: &TestCase, pick: Pick) -> BTreeMap<Dimension, u32> {
         .collect()
 }
 
-/// The lease, drawn or covered; its convoy is homed here or elsewhere.
+/// The launch and its lease, drawn or covered; its convoy is homed here or elsewhere.
 pub fn spec(tc: &TestCase, pick: Pick) -> VesselSpec {
     VesselSpec {
+        launch_of: name(tc),
+        // A launch number is a home sequence value, which the store holds as an INTEGER.
+        launch: tc.draw(gs::integers::<u64>().max_value(i64::MAX as u64)),
         convoy: reference(tc),
         class: VesselClass::new(name(tc)),
         shape: shape(tc, pick.nth(2)),

@@ -505,7 +505,7 @@ impl CommitSignal {
         });
     }
 
-    fn listen(&self, listener: std::sync::Weak<CommitListener>) {
+    pub(crate) fn listen(&self, listener: std::sync::Weak<CommitListener>) {
         self.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(listener);
     }
 }

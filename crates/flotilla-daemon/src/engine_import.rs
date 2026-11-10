@@ -24,6 +24,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::ImportReport;
 use flotilla_resources::{K8sResourceObject, Resource, ResourceObject};
@@ -191,6 +192,9 @@ struct Carried {
     /// The launch each imported TerminalSession became, by home and old name: a message delivered
     /// to the session names that launch's consumer.
     launches: BTreeMap<(String, String), String>,
+    /// The launch each imported Vessel became, by home and old name: what was held for the
+    /// vessel is held for that launch.
+    vessels: flotilla_provisioning::engine::import::VesselLaunches,
 }
 
 /// One importer: the old kinds it imports, by plural, and its writes.
@@ -212,6 +216,7 @@ pub const STEPS: &[Step] = &[
     Step { name: "forge observations", kinds: &observations::KINDS, run: observations::observations },
     Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },
     Step { name: "accounts", kinds: &records::ACCOUNT_KINDS, run: records::accounts },
+    Step { name: "vessels", kinds: &["vessels"], run: lifecycle::vessels },
     Step { name: "terminal sessions", kinds: &["terminalsessions"], run: lifecycle::terminal_sessions },
     Step { name: "messages", kinds: &["messages"], run: messages::messages },
     Step { name: "attentions", kinds: &["demands"], run: attentions::attentions },
@@ -288,9 +293,33 @@ fn plan_rows(source: &Source, target: &impl ImportTarget, summary: &mut Summary)
     }
 }
 
+/// Refuses each namespace other than the engine's that the old store holds rows in, every home's,
+/// naming its row count by kind. The engine has one namespace and identifies a record by kind,
+/// name and home, so a namespace's records would collide with the engine's same-named ones.
+fn namespace_rows(source: &Source, summary: &mut Summary) {
+    let mut outside = BTreeMap::<&str, BTreeMap<&str, usize>>::new();
+    for row in source.rows.iter().filter(|row| row.namespace != DEFAULT_PROVISIONING_NAMESPACE) {
+        *outside.entry(row.namespace.as_str()).or_default().entry(row.plural.as_str()).or_default() += 1;
+    }
+    for (namespace, kinds) in outside {
+        let total: usize = kinds.values().sum();
+        let counts = kinds.iter().map(|(plural, count)| format!("{count} {plural}")).collect::<Vec<_>>().join(", ");
+        summary.refuse(
+            "namespace",
+            namespace.to_owned(),
+            format!(
+                "{total} {} outside the engine's namespace `{DEFAULT_PROVISIONING_NAMESPACE}` ({counts}); the engine has one \
+                 namespace, so they would collide with its records of the same names",
+                if total == 1 { "record" } else { "records" }
+            ),
+        );
+    }
+}
+
 /// Imports `source` into `target`: every record homed at the target's home, step by step.
 pub fn import(source: &Source, target: &mut Import) -> Summary {
     let mut summary = Summary::default();
+    namespace_rows(source, &mut summary);
     plan_rows(source, target, &mut summary);
     let mut carried = Carried::default();
     for step in STEPS {

@@ -1,10 +1,10 @@
 use chrono::{TimeZone, Utc};
-use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost, SleepInhibitionHealth};
+use flotilla_protocol::SleepInhibitionHealth;
 use flotilla_resources::{
     CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus,
     CloneStatusPatch, ConditionValue, EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, Host, HostCondition, HostSpec,
-    HostStatus, HostStatusPatch, InputMeta, IntegrationCondition, LandedEvidence, ResourceError, Stance, StatusPatch,
-    TerminalSessionStatus, VesselPhase, VesselStatus, VesselStatusPatch,
+    HostStatus, HostStatusPatch, InputMeta, IntegrationCondition, LandedEvidence, ResourceError, StatusPatch, TerminalSessionStatus,
+    VesselStatus,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -243,102 +243,8 @@ fn checkout_integration_patch_absorbs_unknown_with_landed_evidence() {
     assert_eq!(status.integration.landed_evidence, Some(evidence));
 }
 
-#[test]
-fn vessel_status_patch_marks_provisioning_ready_and_failed() {
-    let mut status = VesselStatus::default();
-    let started_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
-    let ready_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
-    let placement_decision = PlacementDecision {
-        provider_instance: None,
-        provider_workspace_root: None,
-        minimal_alternatives: Vec::new(),
-        escalation_reason: None,
-        kind: "docker-on-01HXYZ".to_string(),
-        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("01HXYZ"), display_name: "kiwi".to_string() },
-        refused_candidates: Vec::new(),
-        viable_not_selected: Vec::new(),
-        allocation: None,
-    };
-
-    VesselStatusPatch::MarkProvisioning {
-        image: None,
-        placement_decision: Some(placement_decision.clone()),
-        observed_kind_ref: "docker-on-01HXYZ".to_string(),
-        observed_kind_version: "12".to_string(),
-        started_at,
-        message: None,
-    }
-    .apply(&mut status);
-    assert_eq!(status.phase, VesselPhase::Provisioning);
-    assert_eq!(status.observed_kind_ref.as_deref(), Some("docker-on-01HXYZ"));
-    assert_eq!(status.placement_decision.as_ref(), Some(&placement_decision));
-
-    VesselStatusPatch::MarkProvisioning {
-        image: None,
-        placement_decision: Some(PlacementDecision {
-            provider_instance: None,
-            provider_workspace_root: None,
-            minimal_alternatives: Vec::new(),
-            escalation_reason: None,
-            kind: "replacement-must-not-win".to_string(),
-            target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("other"), display_name: "feta".to_string() },
-            refused_candidates: Vec::new(),
-            viable_not_selected: Vec::new(),
-            allocation: None,
-        }),
-        observed_kind_ref: "docker-on-01HXYZ".to_string(),
-        observed_kind_version: "13".to_string(),
-        started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
-        message: Some("still waiting".to_string()),
-    }
-    .apply(&mut status);
-    assert_eq!(status.started_at, Some(started_at), "reconcile must not restamp an in-progress transition");
-    assert_eq!(status.message.as_deref(), Some("still waiting"));
-    assert_eq!(status.placement_decision.as_ref(), Some(&placement_decision), "placement decision is write-once");
-
-    VesselStatusPatch::MarkReady {
-        image: None,
-        configured_limits: None,
-        placement_decision: None,
-        environment_ref: Some("env-a".to_string()),
-        image_ref: Some("registry.example/crew:latest".to_string()),
-        local_image_id: Some("sha256:test-image".to_string()),
-        registry_digest: None,
-        checkout_refs: Default::default(),
-        terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
-        requested_stance: Stance::WorkspaceWrite,
-        effective_stance: Stance::Contained,
-        ready_at,
-    }
-    .apply(&mut status);
-    assert_eq!(status.phase, VesselPhase::Ready);
-    assert_eq!(status.terminal_session_refs.len(), 2);
-    assert_eq!(status.image_ref.as_deref(), Some("registry.example/crew:latest"));
-    assert_eq!(status.local_image_id.as_deref(), Some("sha256:test-image"));
-
-    VesselStatusPatch::MarkReady {
-        image: None,
-        configured_limits: None,
-        placement_decision: None,
-        environment_ref: Some("env-a".to_string()),
-        image_ref: Some("registry.example/crew:latest".to_string()),
-        local_image_id: Some("sha256:test-image".to_string()),
-        registry_digest: None,
-        checkout_refs: Default::default(),
-        terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
-        requested_stance: Stance::WorkspaceWrite,
-        effective_stance: Stance::Contained,
-        ready_at: Utc.timestamp_opt(21, 0).single().expect("timestamp"),
-    }
-    .apply(&mut status);
-    assert_eq!(status.ready_at, Some(ready_at), "reconcile must not restamp an established Ready transition");
-    assert_eq!(status.requested_stance, Some(Stance::WorkspaceWrite));
-    assert_eq!(status.effective_stance, Some(Stance::Contained));
-
-    VesselStatusPatch::MarkFailed { message: "clone failed".to_string() }.apply(&mut status);
-    assert_eq!(status.phase, VesselPhase::Failed);
-    assert_eq!(status.message.as_deref(), Some("clone failed"));
-}
+// The vessel status patches went with the vessel's move onto the engine (#3108): a launch's
+// provisioning, readiness and failure are its lifecycle edges, tested in flotilla-provisioning.
 
 // #1496: heartbeat descriptions persist with ADR 0047 defaults. Placement keys
 // supply availability; the stored description must not double-bookkeep it.

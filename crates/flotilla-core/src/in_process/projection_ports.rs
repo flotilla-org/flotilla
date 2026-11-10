@@ -218,6 +218,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for WithAgentSessions {
     fn terminals(&self) -> Result<&dyn flotilla_resources::terminal_records::TerminalRecords, String> {
         self.reads.terminals()
     }
+
+    fn vessels(&self) -> Result<&dyn flotilla_resources::vessel_records::VesselRecords, String> {
+        self.reads.vessels()
+    }
 }
 
 mod agent_sessions {

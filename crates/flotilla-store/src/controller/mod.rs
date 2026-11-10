@@ -15,7 +15,7 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use crate::{
     apply_status_patch,
@@ -571,38 +571,6 @@ impl<R: Reconciler> ControllerLoop<R> {
             Actuation::ClearAttention { sender, subject } => {
                 backend.attentions().clear(namespace, sender, &subject).await.map_err(ResourceError::other)
             }
-            Actuation::CreateVessel { meta, spec } => {
-                let resolver = backend.using::<crate::Vessel>(namespace);
-                let mut meta = meta;
-                meta.set_lifecycle_authority(LifecycleAuthority::Managed);
-                match resolver.create(&meta, &spec).await {
-                    Ok(_) => {
-                        info!(convoy = %spec.convoy_ref, vessel = %meta.name, authoring_path = "convoy_reconciler", "created Vessel");
-                        Ok(())
-                    }
-                    Err(ResourceError::Conflict { .. }) => Ok(()),
-                    Err(error) => Err(error),
-                }
-            }
-            Actuation::DeleteVessel { name } => {
-                let resolver = backend.using::<crate::Vessel>(namespace);
-                Self::delete_if_lifecycle_owned(&resolver, &name).await
-            }
-        }
-    }
-
-    async fn delete_if_lifecycle_owned<T: Resource>(resolver: &TypedResolver<T>, name: &str) -> Result<(), ResourceError> {
-        let object = match crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.get(name)).await {
-            Ok(object) => object,
-            Err(ResourceError::NotFound { .. }) => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        if !is_lifecycle_owned(object.metadata.lifecycle_authority()?) {
-            return Ok(());
-        }
-        match resolver.delete(name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
-            Err(err) => Err(err),
         }
     }
 

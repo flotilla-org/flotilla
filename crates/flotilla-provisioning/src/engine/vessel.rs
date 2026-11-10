@@ -1,152 +1,56 @@
-//! Vessel's binding: the old Vessel reconciler's patches as the placement lease's lifecycle
-//! on its pinned host.
+//! The Vessel kind's home: each launch of a convoy's work, leased on the host it is placed on.
 //!
-//! Until a capacity model is ruled, a vessel's lease is the host pinned at convoy admission,
-//! recorded as granted: the engine judges no capacity, class or priority. A vessel admitted with
-//! no placement is leased on the host whose reconciler provisions it, this home, so every vessel
-//! reconciled here holds a lease and its teardown releases what is held for it. [`PlacementLifecycles`]
-//! is the Vessel kind's home behind the engine's [`Lifecycles`] port. A request queues the lease
-//! at the [`Placements`] ledger and places it on its pinned host at once, which the ledger
-//! admits: the host joins with no capacity dimensions, the lease has no shape, and its convoy is
-//! uncapped for the one class every pinned lease takes. The vessel resource is created with the
-//! lease as its spec, and Gone frees the lease, as `vessel.qnt` composes them.
+//! Until a capacity model is ruled, a vessel's lease is the host its work was placed on at convoy
+//! admission, recorded as granted: the engine judges no capacity, class or priority. A work
+//! admitted with no placement is leased on the host of the home that admitted it.
+//! [`PlacementLifecycles`] is the Vessel kind's home behind the engine's [`Lifecycles`] port. A
+//! request queues the lease at the [`Placements`] ledger and places it on its pinned host at once,
+//! which the ledger admits: the host joins with no capacity dimensions, the lease has no shape,
+//! and its convoy is uncapped for the one class every pinned lease takes. The vessel resource is
+//! created with the lease as its spec, and Gone frees the lease, as `vessel.qnt` composes them.
 //!
-//! | Old Vessel patch | Engine |
-//! |---|---|
-//! | `MarkProvisioning`, first, with or without its pinned host | Request and Place: the lease is granted, Requested |
-//! | `MarkReady`, first | Realise, under the environment it runs in |
-//! | `MarkLost` / `MarkFailed`, once realised | Vanish: Gone |
-//! | `MarkLost` / `MarkFailed`, before it was realised | Attempted then GiveUp: the cause is retained, the lease returned |
-//! | a later `MarkReady` (recovered, recreated), `MarkInterrupted` | none: the lease holds |
-//! | images, observations, recreation | none |
+//! [`EngineVessels`] is the [`VesselRecords`] port over it: a home's vessel requester requests
+//! each launch, and its vessel planner, the single writer of its edges, steps it.
 //!
-//! A vessel that fails before readiness gives up with its cause. An ended vessel is never
-//! provisioned again under its name; a replacement is a separate request.
+//! | Planner's finding | Step | Edge |
+//! |---|---|---|
+//! | the vessel runs in its environment, first | [`VesselStep::Realised`] | Realise, under that environment |
+//! | its provisioning failed before readiness | [`VesselStep::Failed`] | Attempted; GiveUp once the attempts run out |
+//! | its environment disappeared, once realised | [`VesselStep::Lost`] | Vanish: Gone(Lost) |
+//! | it broke, once realised | [`VesselStep::Broke`] | Vanish: Gone(Failed) |
+//! | its convoy no longer needs it (the requester) | [`VesselStep::Released`] | Release |
+//!
+//! An ended launch is never provisioned again; a replacement is the work's next launch.
 
 use std::{
     collections::BTreeMap,
-    sync::{Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
 };
 
-use flotilla_resources::{ResourceObject, Vessel as OldVessel, VesselPhase, VesselStatusPatch, ACTUATOR_SOURCE_ROOT_ANNOTATION};
-use flotilla_schema::Timestamp;
+use chrono::{DateTime, Utc};
+use flotilla_engine_store::follow::Followed;
+use flotilla_resources::vessel_records::{VesselChange, VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep};
+use flotilla_schema::{Kind, Timestamp};
+use flotilla_schema_sqlite::{stream::Service, Read, Store};
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
-        lifecycle::{Attempted, Lifecycle, LifecycleEdge, LifecycleState, Realise, Release, Vanish, VanishCause},
+        lifecycle::{Attempted, Lifecycle, LifecycleEdge, Realise, Release, Vanish, VanishCause},
         vessel::{live_leases, Vessel, VesselKind, VesselSpec},
     },
     placement::{Host, LedgerError, PlacementError, Placements, Units, VesselId},
     Cause, CauseCategory, Home, Log, Outcome, Ref, Resource,
 };
 
-use super::{evidence, Binding, EngineError, Lifecycles, Step};
+use super::{
+    evidence,
+    reads::{indexed, keyed, requested_at, view, ReadError, StoreReads, View},
+    EngineError, Lifecycles, Step,
+};
 
 /// The one class every pinned lease takes: the engine judges no class until a capacity model is
 /// available.
 pub const PINNED_CLASS: &str = "pinned";
-
-pub struct VesselBinding;
-
-impl VesselBinding {
-    /// The host `obj` was pinned to at admission, once its provisioning recorded the placement:
-    /// its lease's host. A vessel with none was never placed, and is leased at its home.
-    pub fn pinned_host(obj: &ResourceObject<OldVessel>) -> Option<&str> {
-        obj.status.as_ref().and_then(|status| status.placement_decision.as_ref()).map(|decision| decision.target_host.reference.as_str())
-    }
-}
-
-impl Binding for VesselBinding {
-    type Old = OldVessel;
-    type Kind = VesselKind;
-
-    fn request(obj: &ResourceObject<OldVessel>, home: &str) -> Result<VesselSpec, String> {
-        // An unplaced vessel is provisioned by this home's reconciler: its lease is here.
-        let host = Self::pinned_host(obj).unwrap_or(home);
-        // The convoy is homed where it was admitted: the root a federated convoy's vessel records,
-        // or this home.
-        let convoy_home = obj.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map_or(home, String::as_str);
-        Ok(VesselSpec {
-            convoy: ConvoyId::new(obj.spec.convoy_ref.clone(), convoy_home),
-            class: VesselClass::new(PINNED_CLASS),
-            shape: BTreeMap::new(),
-            priority: Priority(0),
-            host: Host::new(host),
-        })
-    }
-
-    fn initial(obj: &ResourceObject<OldVessel>) -> bool {
-        matches!(phase(obj), VesselPhase::Pending | VesselPhase::Provisioning)
-    }
-
-    fn requests(_obj: &ResourceObject<OldVessel>, patch: &VesselStatusPatch) -> bool {
-        matches!(patch, VesselStatusPatch::MarkProvisioning { .. })
-    }
-
-    fn steps(obj: &ResourceObject<OldVessel>, patch: &VesselStatusPatch) -> Vec<Step> {
-        match patch {
-            // Realised under the environment it runs in; ready again later, the lease holds.
-            VesselStatusPatch::MarkReady { environment_ref, .. } if !realised(obj) => {
-                vec![Step::Realised { identity: environment_ref.clone().unwrap_or_else(|| obj.metadata.name.clone()) }]
-            }
-            VesselStatusPatch::MarkReady { .. } => vec![],
-            // An observed backing can vanish; a failed provisioning attempt retains its cause.
-            VesselStatusPatch::MarkLost { .. } | VesselStatusPatch::MarkFailed { .. } if realised(obj) => vanished(patch),
-            VesselStatusPatch::MarkLost { message } | VesselStatusPatch::MarkFailed { message } => {
-                // Both reports come from outside the machine. Before realisation the same inputs
-                // cannot recover by retrying, so the failure spends the request immediately.
-                vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })]
-            }
-            // Interrupted roles, provisioning progress, images and observations are no edge of the
-            // lease.
-            VesselStatusPatch::MarkProvisioning { .. }
-            | VesselStatusPatch::MarkInterrupted { .. }
-            | VesselStatusPatch::RecordImage { .. }
-            | VesselStatusPatch::ReplaceImage { .. }
-            | VesselStatusPatch::ObserveDegradation { .. }
-            | VesselStatusPatch::ObserveRuntime { .. }
-            | VesselStatusPatch::RequireEnvironmentRecreation { .. } => vec![],
-        }
-    }
-
-    fn steps_with_state(obj: &ResourceObject<OldVessel>, patch: &VesselStatusPatch, state: Option<&LifecycleState>) -> Vec<Step> {
-        match (patch, state) {
-            (
-                VesselStatusPatch::MarkReady { environment_ref, .. },
-                Some(LifecycleState::Requested { .. } | LifecycleState::Gone { .. } | LifecycleState::GaveUp { .. }),
-            ) => {
-                vec![Step::Realised { identity: environment_ref.clone().unwrap_or_else(|| obj.metadata.name.clone()) }]
-            }
-            (VesselStatusPatch::MarkReady { .. }, Some(LifecycleState::Realised { .. })) => vec![],
-            (VesselStatusPatch::MarkLost { .. } | VesselStatusPatch::MarkFailed { .. }, Some(LifecycleState::Realised { .. })) => {
-                vanished(patch)
-            }
-            (
-                VesselStatusPatch::MarkLost { message } | VesselStatusPatch::MarkFailed { message },
-                Some(LifecycleState::Requested { .. }),
-            ) => vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })],
-            _ => Self::steps(obj, patch),
-        }
-    }
-}
-
-/// A realised backing's observed ending has the same cause on both binding paths.
-fn vanished(patch: &VesselStatusPatch) -> Vec<Step> {
-    match patch {
-        VesselStatusPatch::MarkLost { .. } => vec![Step::Vanished { cause: VanishCause::lost() }],
-        VesselStatusPatch::MarkFailed { message } => vec![Step::Vanished { cause: VanishCause::Failed { reason: message.clone() } }],
-        _ => vec![],
-    }
-}
-
-fn phase(obj: &ResourceObject<OldVessel>) -> VesselPhase {
-    obj.status.as_ref().map(|status| status.phase).unwrap_or_default()
-}
-
-/// Whether the old vessel has been ready: its first readiness realised the lease.
-fn realised(obj: &ResourceObject<OldVessel>) -> bool {
-    obj.status.as_ref().is_some_and(|status| status.ready_at.is_some())
-}
 
 /// The Vessel kind's home as the engine's [`Lifecycles`]: each request is placed on its pinned
 /// host at once (see the module docs), and each step is a leased vessel's edge.
@@ -229,8 +133,8 @@ where
         })
     }
 
-    fn newest_launch(&self, _: &str) -> Option<Resource<Lifecycle<VesselKind>>> {
-        None
+    fn newest_launch(&self, of: &str) -> Option<Resource<Lifecycle<VesselKind>>> {
+        self.with_placements(|placements| placements.home().newest_launch(of, None).cloned())
     }
 
     fn replace_launch(&self, _: &str, _: &str, _: VesselSpec, _: Timestamp) -> Result<String, EngineError> {
@@ -284,7 +188,7 @@ impl VesselConvoyWake {
     }
 }
 
-type VesselRecord = Resource<Lifecycle<VesselKind>>;
+type VesselLifecycle = Resource<Lifecycle<VesselKind>>;
 
 impl flotilla_store::controller::SecondaryWatch for VesselConvoyWake {
     type Primary = flotilla_resources::Convoy;
@@ -303,7 +207,7 @@ impl flotilla_store::controller::SecondaryWatch for VesselConvoyWake {
         use flotilla_schema::Kind;
 
         Box::pin(async move {
-            let mut watch = super::watch::EngineWatch::start(std::sync::Arc::clone(&self.service), [<VesselRecord as Kind>::CODE])
+            let mut watch = super::watch::EngineWatch::start(std::sync::Arc::clone(&self.service), [<VesselLifecycle as Kind>::CODE])
                 .map_err(|error| flotilla_resources::ResourceError::other(error.to_string()))?;
             loop {
                 let woken = watch
@@ -312,19 +216,19 @@ impl flotilla_store::controller::SecondaryWatch for VesselConvoyWake {
                         for followed in followed {
                             match followed {
                                 Followed::Changed(identity) => {
-                                    let Some(id) = read.resolve(<VesselRecord as Kind>::CODE, &identity.name, &identity.home)? else {
+                                    let Some(id) = read.resolve(<VesselLifecycle as Kind>::CODE, &identity.name, &identity.home)? else {
                                         continue;
                                     };
-                                    if let Some(loaded) = read.load::<VesselRecord>(id)? {
+                                    if let Some(loaded) = read.load::<VesselLifecycle>(id)? {
                                         convoys.insert(loaded.value.spec().convoy.name.clone());
                                     }
                                 }
                                 Followed::Rescan(home) => {
                                     let mut after = None;
                                     loop {
-                                        let page = read.scan::<VesselRecord>(&home, after, 64)?;
+                                        let page = read.scan::<VesselLifecycle>(&home, after, 64)?;
                                         for id in page.ids {
-                                            if let Some(loaded) = read.load::<VesselRecord>(id)? {
+                                            if let Some(loaded) = read.load::<VesselLifecycle>(id)? {
                                                 convoys.insert(loaded.value.spec().convoy.name.clone());
                                             }
                                         }
@@ -352,5 +256,211 @@ impl flotilla_store::controller::SecondaryWatch for VesselConvoyWake {
                 }
             }
         })
+    }
+}
+
+/// The [`VesselRecords`] port over one decided store: this home's launches through its Vessel
+/// home, the single writer of their edges, and every home's through keyed, indexed and scanned
+/// reads.
+pub struct EngineVessels {
+    lifecycles: Arc<dyn Lifecycles<VesselKind>>,
+    reads: StoreReads,
+    homes: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    changes: tokio::sync::broadcast::Sender<VesselChange>,
+}
+
+/// How many changes a slow follower may fall behind by; one that lags rereads everything.
+const CHANGES: usize = 256;
+
+impl EngineVessels {
+    /// The port over `store`, whose homes `homes` names.
+    pub fn new(
+        lifecycles: Arc<dyn Lifecycles<VesselKind>>,
+        store: Arc<Mutex<Store>>,
+        homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self { lifecycles, reads: StoreReads::new(store), homes: Arc::new(homes), changes: tokio::sync::broadcast::channel(CHANGES).0 }
+    }
+
+    /// The port over `service`'s store and homes.
+    pub fn over(lifecycles: Arc<dyn Lifecycles<VesselKind>>, service: Arc<Service>) -> Self {
+        let store = service.store();
+        Self::new(lifecycles, store, move || service.homes())
+    }
+
+    /// Follows the vessels' records in `service`'s log, at every home, telling
+    /// [`VesselRecords::changes`] of each. It runs at the store's commits.
+    pub fn follow(&self, service: Arc<Service>) -> Result<tokio::task::JoinHandle<()>, String> {
+        let mut watch = super::watch::EngineWatch::start(service, [<Resource<Vessel> as Kind>::CODE]).map_err(|error| error.to_string())?;
+        let changes = self.changes.clone();
+        Ok(tokio::spawn(async move {
+            loop {
+                let followed = watch.next(|_, followed| Ok(followed.into_iter().map(vessel_change).collect::<Vec<_>>())).await;
+                match followed {
+                    // No follower is no reason to stop: one may subscribe later.
+                    Ok(followed) => followed.into_iter().for_each(|change| drop(changes.send(change))),
+                    Err(error) => tracing::warn!(%error, "the vessels' changes could not be read from the log; retrying"),
+                }
+            }
+        }))
+    }
+
+    fn now() -> Timestamp {
+        Timestamp::from_datetime(&Utc::now())
+    }
+
+    fn records(
+        &self,
+        what: &str,
+        views: impl FnOnce(&mut Read<'_>) -> Result<Vec<View<VesselKind>>, ReadError>,
+    ) -> Result<Vec<VesselRecord>, String> {
+        self.reads
+            .read(|read| views(read)?.into_iter().map(|view| record(read, view)).collect())
+            .map_err(|error| format!("engine vessels {what}: {error}"))
+    }
+
+    fn scan(read: &mut Read<'_>, home: &str) -> Result<Vec<View<VesselKind>>, ReadError> {
+        let mut views = Vec::new();
+        let mut after = None;
+        loop {
+            let page = read.scan::<Resource<Vessel>>(home, after, 64)?;
+            for id in page.ids {
+                views.extend(view::<VesselKind>(read, id)?);
+            }
+            after = page.next;
+            if after.is_none() {
+                return Ok(views);
+            }
+        }
+    }
+}
+
+impl VesselRecords for EngineVessels {
+    fn cursor(&self) -> Option<Box<dyn flotilla_resources::lifecycle_reads::ChangeCursor<VesselChange>>> {
+        let cursor = super::log_cursor::LogCursor::start(
+            self.reads.clone(),
+            Arc::clone(&self.homes),
+            [<Resource<Vessel> as Kind>::CODE],
+            vessel_change,
+        );
+        match cursor {
+            Ok(cursor) => Some(Box::new(cursor)),
+            Err(error) => {
+                tracing::warn!(%error, "the log could not be followed from here; readers read afresh");
+                None
+            }
+        }
+    }
+
+    fn home(&self) -> &str {
+        self.lifecycles.home()
+    }
+
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<VesselChange> {
+        self.changes.subscribe()
+    }
+
+    fn get(&self, name: &str, home: Option<&str>) -> Result<Option<VesselRecord>, String> {
+        let home = home.unwrap_or(self.home()).to_owned();
+        self.reads
+            .read(|read| keyed::<VesselKind>(read, name, &home)?.map(|view| record(read, view)).transpose())
+            .map_err(|error| format!("engine Vessel/{name}: {error}"))
+    }
+
+    fn launches(&self, convoy: &str, convoy_home: &str, launch_of: &str, home: Option<&str>) -> Result<Vec<VesselRecord>, String> {
+        let home = home.unwrap_or(self.home()).to_owned();
+        let query = VesselSpec::by_launch(&ConvoyId::new(convoy, convoy_home), &launch_of.to_owned());
+        let mut records = self.records(&format!("{launch_of} of convoy {convoy}@{convoy_home}"), |read| {
+            Ok(indexed::<VesselKind, _>(read, &query)?.into_iter().filter(|view| view.home == home).collect())
+        })?;
+        records.sort_by_key(VesselRecord::launch_number);
+        Ok(records)
+    }
+
+    fn newest(&self, convoy: &str, convoy_home: &str, launch_of: &str, home: Option<&str>) -> Result<Option<VesselRecord>, String> {
+        let home = home.unwrap_or(self.home());
+        let query = VesselSpec::by_launch(&ConvoyId::new(convoy, convoy_home), &launch_of.to_owned());
+        self.reads
+            .read(|read| match read.integer_index_keys_before(&query, home, i64::MAX, 1)?.first() {
+                Some((id, _)) => view::<VesselKind>(read, *id)?.map(|view| record(read, view)).transpose(),
+                None => Ok(None),
+            })
+            .map_err(|error| format!("engine Vessel {launch_of} of convoy {convoy}@{convoy_home}: {error}"))
+    }
+
+    fn at(&self, home: &str) -> Result<Vec<VesselRecord>, String> {
+        self.records(&format!("at {home}"), |read| Self::scan(read, home))
+    }
+
+    fn every(&self) -> Result<Vec<VesselRecord>, String> {
+        let homes = (self.homes)();
+        self.records("at every home", |read| {
+            let mut views = Vec::new();
+            for home in &homes {
+                views.extend(Self::scan(read, home)?);
+            }
+            Ok(views)
+        })
+    }
+
+    fn request(&self, request: &VesselLaunchRequest) -> Result<String, String> {
+        let launch_of = request.launch_of();
+        let held = self.newest(&request.convoy, &request.convoy_home, &launch_of, None)?;
+        if let Some(held) = held.filter(|held| !held.ended()) {
+            return Ok(held.name);
+        }
+        let spec = VesselSpec {
+            launch_of: launch_of.clone(),
+            launch: 0,
+            convoy: ConvoyId::new(request.convoy.clone(), request.convoy_home.clone()),
+            class: VesselClass::new(PINNED_CLASS),
+            shape: BTreeMap::new(),
+            priority: Priority(0),
+            host: Host::new(request.host.clone()),
+        };
+        self.lifecycles
+            .request(&launch_of, spec, Self::now())
+            .map(|launch| launch.name().to_owned())
+            .map_err(|error| format!("request vessel {launch_of}: {error}"))
+    }
+
+    fn step(&self, name: &str, step: &VesselStep) -> Result<VesselRecord, String> {
+        let step = match step {
+            VesselStep::Realised { environment } => Step::Realised { identity: environment.clone() },
+            VesselStep::Failed { cause, retryable } => {
+                Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, cause), retryable: *retryable })
+            }
+            VesselStep::Lost { reason } => Step::Vanished { cause: VanishCause::Lost { reason: Some(reason.clone()) } },
+            VesselStep::Broke { reason } => Step::Vanished { cause: VanishCause::Failed { reason: reason.clone() } },
+            VesselStep::Released => Step::Released,
+        };
+        self.lifecycles.step(name, &step, Self::now()).map_err(|error| format!("vessel {name}: {error}"))?;
+        self.get(name, None)?.ok_or_else(|| format!("vessel {name} is missing after its step"))
+    }
+}
+
+/// `view` as a reader sees it.
+fn record(read: &mut Read<'_>, view: View<VesselKind>) -> Result<VesselRecord, ReadError> {
+    let time = |at: Timestamp| at.to_datetime().unwrap_or(DateTime::UNIX_EPOCH);
+    let requested_at = requested_at::<Resource<Vessel>>(read, &view.name, &view.home)?.map(time).unwrap_or(DateTime::UNIX_EPOCH);
+    let request = view.request;
+    Ok(VesselRecord {
+        convoy: request.convoy.name,
+        convoy_home: request.convoy.home,
+        launch_of: request.launch_of,
+        host: request.host.0,
+        requested_at,
+        since: time(view.since),
+        reading: view.judgement.reading(),
+        name: view.name,
+        home: view.home,
+    })
+}
+
+/// What a followed write of the kinds tells readers.
+fn vessel_change(followed: Followed) -> VesselChange {
+    match followed {
+        Followed::Changed(identity) => VesselChange::Changed { name: identity.name, home: identity.home },
+        Followed::Rescan(_) => VesselChange::Rescanned,
     }
 }

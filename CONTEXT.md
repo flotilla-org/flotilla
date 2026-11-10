@@ -70,6 +70,10 @@ role; there is no `system` address kind (#3424).)*
 inbox, but a host's role has no artifact slots. A checkout is addressed
 under its host by name, `host:<h>/checkout:<name>`, which is valid nowhere
 else.)*
+*(ADR 0066 amendment, 2026-11-10: a convoy may also sit under its home host,
+`host:<h>/convoy:<launch>`, naming one launch of it, with the launch's `#`
+percent-encoded, as in `host:kiwi/convoy:coder%235`. A checkout's holder is
+written this way (#3108).)*
 
 **Resource**:
 A thing with its own identity that others refer to, which someone wants to
@@ -364,6 +368,15 @@ workflows (e.g. a main dev vessel that fans out to platform-test vessels and
 collates results across iterations). A Vessel may also be **free-floating** —
 attached to no Convoy at all — e.g. housing a **PersistentAgent**. The Crew
 aboard the Vessels are the dramatis personae; the Legs are the script.
+On the engine (#3108) each Vessel is a **launch**, `<launch_of>#<n>`, where
+`launch_of` is `<convoy launch_of>-<work>`: every generation of a standing
+convoy launches its work under one `launch_of`, told apart by the convoy launch
+it serves. Its home is its single writer. The engine controller realises it
+with a finite failure limit, and a work's next launch replaces one that ended.
+What a Vessel holds (its environment, terminal sessions) names the launch as
+its holder (`vessel:<launch>`); its convoy's checkouts are held for the convoy
+launch. Readers see a launch's state joined with what it holds. A Released
+launch leaves listings, but is still read by name.
 _Avoid_: Task, TaskWorkspace, workspace, container.
 
 **Vessel Delivery**:

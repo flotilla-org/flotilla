@@ -304,3 +304,78 @@ async fn delivered_convoy(daemon: &TestDaemon) {
     assert_eq!((counts.environments_provisioned, counts.environments_destroyed, counts.live_environments), (2, 2, 0), "{counts:?}");
     assert_eq!((counts.change_requests_opened, counts.crews_failed, counts.command_errors), (1, 0, 0), "{counts:?}");
 }
+
+// The resource commands read vessels from the engine's launches and refuse to write them, naming
+// where a vessel is seen; neither reaches the old store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_resource_commands_read_vessels_from_the_engine_and_refuse_writes() {
+    use flotilla_protocol::{CommandAction, CommandValue};
+    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
+    daemon.stage("vessels");
+    let listed = daemon
+        .execute(CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: "vessels".into(), include_replicas: true })
+        .await;
+    assert!(!matches!(listed, CommandValue::Error { .. }), "listed: {listed:?}");
+    let deleted = daemon
+        .execute(CommandAction::ResourceDelete {
+            namespace: "flotilla".into(),
+            kind: "Vessel".into(),
+            name: "any#1".into(),
+            replica_origin: None,
+        })
+        .await;
+    match deleted {
+        CommandValue::Error { message } => assert!(message.contains("flotilla convoy explain"), "{message}"),
+        other => panic!("not refused: {other:?}"),
+    }
+    let report = daemon.old_store_report().expect("recorded");
+    let vessels = report.split("stage vessels:").nth(1).unwrap_or_default();
+    assert!(!vessels.contains("  Vessel "), "Vessel reached the old store:\n{report}");
+}
+
+// A home's vessel and terminal session launches reach a peer by following its log: listed there
+// through the resource commands, never through the old store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vessels_and_terminal_sessions_reach_a_peer_by_log_following() {
+    use flotilla_resources::{TerminalSession, Vessel};
+    let (a, b) = tokio::join!(
+        TestDaemon::builder().settings("host_name = \"engine-a\"\n").old_store(OldStoreMode::Recording).start(),
+        TestDaemon::builder().settings("host_name = \"engine-b\"\n").old_store(OldStoreMode::Recording).start()
+    );
+    a.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (vessels, sessions) = loop {
+        let vessels = names_of(a.list::<Vessel>().await);
+        let sessions = names_of(a.list::<TerminalSession>().await);
+        if !vessels.is_empty() && !sessions.is_empty() {
+            break (vessels, sessions);
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no vessel and session listed at their home");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    a.stage("peered");
+    b.stage("peered");
+    let _peering = TestDaemon::peer(&a, &b).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let missing_vessels: Vec<_> = vessels.difference(&names_of(b.list::<Vessel>().await)).cloned().collect();
+        let missing_sessions: Vec<_> = sessions.difference(&names_of(b.list::<TerminalSession>().await)).cloned().collect();
+        if missing_vessels.is_empty() && missing_sessions.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not listed at the peer: vessels {missing_vessels:?}, sessions {missing_sessions:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    for daemon in [&a, &b] {
+        let report = daemon.old_store_report().expect("recorded");
+        let peered = report.split("stage peered:").nth(1).unwrap_or_default();
+        assert!(!peered.contains("  Vessel ") && !peered.contains("  TerminalSession "), "reached the old store:\n{report}");
+    }
+}
+
+fn names_of<T: flotilla_resources::Resource>(objects: Vec<flotilla_resources::ResourceObject<T>>) -> std::collections::BTreeSet<String> {
+    objects.into_iter().map(|object| object.metadata.name).collect()
+}

@@ -129,7 +129,6 @@ pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus
         naming: None,
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
@@ -290,7 +289,6 @@ pub fn task_provisioning_convoy_spec() -> RealConvoySpec {
 
 pub fn pending_task_state() -> WorkState {
     WorkState {
-        provisioning_retry: None,
         phase: WorkPhase::Pending,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: None,
@@ -370,7 +368,6 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
         naming: None,
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
@@ -489,7 +486,6 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
         naming: None,
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),

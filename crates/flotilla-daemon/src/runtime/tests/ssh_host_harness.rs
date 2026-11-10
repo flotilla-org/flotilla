@@ -363,7 +363,7 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
         .expect("register SSH host resources");
     let source = LocalSkillSource::new(temp.path(), "research");
     let skills = if skills { vec![source.selected.clone()] } else { Vec::new() };
-    freeze_crew(&backend, "demo", "demo-work", "coder", adapter, skills).await;
+    let launch = freeze_crew(&daemon, "demo", "coder", adapter, skills).await;
     let credential_store = Arc::new(CredentialStore::new(
         backend,
         NAMESPACE,
@@ -373,7 +373,7 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
         config.state_dir().as_path().to_path_buf(),
     ));
     let agents = RunnerVesselAgents::new(Arc::clone(&runner), registry);
-    let vessel = VesselPaths::new(&profile.env_bag, &VesselKey::new(&environment_id, "demo-work")).expect("vessel paths");
+    let vessel = VesselPaths::new(&profile.env_bag, &VesselKey::new(&environment_id, &launch)).expect("vessel paths");
     let bag = profile.env_bag.clone();
     let state = Arc::new(
         ControllerRuntimeState::new(
@@ -410,7 +410,7 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
             context: Box::new(flotilla_resources::TerminalCrewContext {
                 namespace: NAMESPACE.to_string(),
                 convoy: "demo".to_string(),
-                vessel_ref: "demo-work".to_string(),
+                vessel_ref: launch.clone(),
             }),
         },
         cwd: checkout,
@@ -602,19 +602,15 @@ async fn launched_claude_crew() -> (SshHostRuntime, Arc<FakeHost>, flotilla_test
 impl SshHostRuntime {
     // Only the Linux-only acceptance tests use this.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    /// Move the crew to `vessel_ref`, a new vessel of its convoy on the same host, as one
-    /// replacing a retired vessel is: the same home, under another vessel agent.
-    async fn move_to_vessel(&mut self, vessel_ref: &str) {
-        let vessel = flotilla_resources::VesselSpec {
-            convoy_ref: "demo".into(),
-            vessel_name: "work".into(),
-            fulfilment_kind_ref: "policy".into(),
-            adopted_checkout_refs: Default::default(),
-        };
-        self.daemon.resource_backend().using::<Vessel>(NAMESPACE).create(&empty_meta(vessel_ref), &vessel).await.expect("vessel");
-        self.vessel = VesselPaths::new(&self.bag, &VesselKey::new(&EnvironmentId::new(ENVIRONMENT), vessel_ref)).expect("vessel paths");
+    /// Move the crew to its work's next launch, a new vessel of its convoy on the same host, as
+    /// one replacing a retired vessel is: the same home, under another vessel agent.
+    async fn move_to_vessel(&mut self) {
         let TerminalSessionSource::Agent { context, .. } = &mut self.spec.source else { panic!("an agent session") };
-        context.vessel_ref = vessel_ref.into();
+        let fixture = engine(&self.daemon);
+        fixture.vessels.step(&context.vessel_ref, flotilla_resources::vessel_records::VesselStep::Released);
+        let launch = fixture.vessels.request("demo", "work", self.daemon.local_host_id().expect("local host").as_str());
+        self.vessel = VesselPaths::new(&self.bag, &VesselKey::new(&EnvironmentId::new(ENVIRONMENT), &launch)).expect("vessel paths");
+        context.vessel_ref = launch;
     }
 }
 
@@ -655,7 +651,7 @@ async fn a_home_relaunched_after_its_vessel_is_collected_receives_its_harness_an
 
     runtime.agents.collect(&runtime.vessel.agent.clone());
     assert!(runtime.agents.store().entries.is_empty(), "A held the only uses");
-    runtime.move_to_vessel("demo-work-b").await;
+    runtime.move_to_vessel().await;
     let relaunched = runtime.launch().await.expect("relaunch on vessel B");
 
     assert_eq!(relaunched.artifacts, arrived, "B receives both again, the same way");
@@ -678,7 +674,7 @@ async fn an_entry_another_vessel_holds_is_linked_again_under_the_new_vessel() {
     }
 
     runtime.agents.collect(&runtime.vessel.agent.clone());
-    runtime.move_to_vessel("demo-work-b").await;
+    runtime.move_to_vessel().await;
     let relaunched = runtime.launch().await.expect("relaunch on vessel B");
     runtime.agents.collect(&neighbour);
 
@@ -902,7 +898,9 @@ async fn ssh_host_harness_path_is_composed_and_never_the_login_profile() {
     let session_env = BTreeMap::from([("PATH".to_string(), format!("{}:{runner_path}", wrapper_dir.display()))]);
 
     // The vessel's generation layer holds the delivered CLI.
-    let vessel = VesselPaths::new(&bag, &VesselKey::new(&EnvironmentId::new(ENVIRONMENT), "demo-work")).expect("vessel paths");
+    // The crew's vessel is its work's first launch, which the runtime requests.
+    let vessel =
+        VesselPaths::new(&bag, &VesselKey::new(&EnvironmentId::new(ENVIRONMENT), &first_launch("demo-work"))).expect("vessel paths");
     let cli = vessel.cli();
     let cli_dir = cli.parent().expect("CLI directory").to_path_buf();
     write_executable(&cli, "#!/bin/sh\necho generation-cli\n");

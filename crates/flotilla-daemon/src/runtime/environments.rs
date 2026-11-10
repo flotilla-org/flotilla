@@ -13,7 +13,6 @@ use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provisioning::engine::controller::Backing;
 use flotilla_resources::environment_records::EnvironmentRecord;
-use flotilla_resources::{Vessel, VesselStatusPatch};
 use tracing::{info, warn};
 
 use super::docker::{probe_provisioned_environment, verify_declared_agent_adapters};
@@ -153,11 +152,10 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     }
     let results = futures::future::join_all(reconciliations.into_iter().map(|(environment, env_id, container_id, handle)| {
         let state = Arc::clone(state);
-        let namespace = namespace.to_string();
         async move {
             match tokio::time::timeout(
                 ENVIRONMENT_ADOPTION_TIMEOUT,
-                reconcile_provisioned_environment(&state, &namespace, environment, env_id.clone(), container_id, handle),
+                reconcile_provisioned_environment(&state, environment, env_id.clone(), container_id, handle),
             )
             .await
             {
@@ -251,7 +249,6 @@ async fn collect_cloud_reconciliations(mut jobs: tokio::task::JoinSet<Result<(),
 
 pub(super) async fn reconcile_provisioned_environment(
     state: &Arc<ControllerRuntimeState>,
-    namespace: &str,
     environment: EnvironmentRecord,
     env_id: EnvironmentId,
     container_id: Option<String>,
@@ -279,7 +276,7 @@ pub(super) async fn reconcile_provisioned_environment(
     let observed = handle.observe().await;
     let observation = observed.runtime;
     if let Some(observation) = &observation {
-        record_environment_observation(state, namespace, &env_id, observation).await?;
+        record_environment_observation(state, &env_id, observation).await?;
     }
     if let Some(termination) = observation.as_ref().and_then(|observation| observation.termination.as_ref()) {
         return mark_unavailable_environment(
@@ -422,52 +419,26 @@ async fn reconcile_cloud_environment(state: &Arc<ControllerRuntimeState>, enviro
     }
 }
 
+/// Records `observation` of environment `env_id` in this home's memory and, when it changed,
+/// reports it as a metric: a runtime observation is the home's own, never replicated (#3108 Q2).
 pub(super) async fn record_environment_observation(
     state: &ControllerRuntimeState,
-    namespace: &str,
     env_id: &EnvironmentId,
     observation: &flotilla_protocol::EnvironmentRuntimeObservation,
 ) -> Result<(), String> {
-    use flotilla_store::apply_status_patch;
-    // The runtime observation is the vessel's to show; an environment record stores none.
-    let backend = state.daemon.resource_backend();
-    let vessels = backend.using::<Vessel>(namespace);
-    for vessel in vessels.list().await.map_err(|error| error.to_string())?.items {
-        if vessel.status.as_ref().and_then(|status| status.environment_ref.as_deref()) != Some(env_id.as_str()) {
-            continue;
-        }
-        if let Some(observation) =
-            changed_runtime_observation(vessel.status.as_ref().and_then(|status| status.runtime_observation.as_ref()), observation)
-        {
-            apply_status_patch(&vessels, &vessel.metadata.name, &VesselStatusPatch::ObserveRuntime { observation })
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+    let reads = state.daemon.lifecycle_reads();
+    let environments = reads.environments()?;
+    if let Some(observed) = environments.observations().observe(env_id.as_str(), observation) {
+        tracing::info!(
+            target: "flotilla::metrics",
+            environment = %env_id,
+            container = observed.container_id.as_deref().unwrap_or_default(),
+            memory_usage_bytes = ?observed.memory_usage_bytes,
+            terminated = observed.termination.is_some(),
+            "environment runtime observed"
+        );
     }
     Ok(())
-}
-
-/// Keep a sample's original timestamp while its value is unchanged. Compare
-/// each vessel independently so newly attached vessels still get their first
-/// observation.
-pub(super) fn changed_runtime_observation(
-    current: Option<&flotilla_protocol::EnvironmentRuntimeObservation>,
-    incoming: &flotilla_protocol::EnvironmentRuntimeObservation,
-) -> Option<flotilla_protocol::EnvironmentRuntimeObservation> {
-    let mut merged = current.cloned().unwrap_or_default();
-    merged.merge(incoming);
-    if let Some(current) = current {
-        if merged.container_id == current.container_id
-            && merged.started_at == current.started_at
-            && merged.memory_usage_bytes == current.memory_usage_bytes
-        {
-            merged.memory_observed_at.clone_from(&current.memory_observed_at);
-        }
-        if &merged == current {
-            return None;
-        }
-    }
-    Some(merged)
 }
 
 pub(super) enum BackingDisposition {

@@ -626,7 +626,7 @@ impl Reconciler for ConvoyReconciler {
                 .collect(),
             _ => Vec::new(),
         };
-        let vessels = select_convoy_children(obj, &flotilla_store::read_vessel_sources(Arc::clone(&self.lifecycle_reads), vessels).await?);
+        let vessels = select_convoy_children(obj, &vessels);
 
         let checkouts = if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() {
             self.held_checkouts(obj).await?
@@ -933,16 +933,6 @@ impl Reconciler for ConvoyReconciler {
         let reclaim_refused = self.teardown_runtime.is_some()
             && obj.status.as_ref().is_some_and(|status| status.phase.is_terminal())
             && !prepared.reclaim_eligible;
-        let provisioning_requeue = obj
-            .status
-            .as_ref()
-            .into_iter()
-            .flat_map(|status| status.work.values())
-            .filter_map(|state| state.provisioning_retry.as_ref())
-            .filter_map(ControllerRetry::next_attempt_at)
-            .filter(|deadline| *deadline > now)
-            .filter_map(|deadline| (deadline - now).to_std().ok())
-            .min();
         for event in outcome.events {
             trace_convoy_event(obj, event);
         }
@@ -954,7 +944,6 @@ impl Reconciler for ConvoyReconciler {
             requeue_after: prepared
                 .turn_hold
                 .then_some(TURN_HOLD_RETRY)
-                .or(provisioning_requeue)
                 .or_else(|| reclaim_refused.then_some(self.landing_evidence_stale_after)),
         }
     }

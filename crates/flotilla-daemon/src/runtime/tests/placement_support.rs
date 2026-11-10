@@ -122,14 +122,16 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         .with_provisioning_lifecycles(Some(kiwi_provisioning)),
     );
     let feta_registry = if docker {
-        let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
-            id: EnvironmentId::new("env-remote-placement-work"),
-            image: ImageId::new("test-image"),
-            runner: Arc::new(ProcessCommandRunner),
-            env_vars: HashMap::from([("HOME".to_string(), temp.path().join("container-home").display().to_string())]),
-            destroyed: Arc::new(AtomicBool::new(false)),
-        });
-        passthrough_registry_with_environment(handle)
+        let home = temp.path().join("container-home").display().to_string();
+        passthrough_registry_with_environment(move |id| {
+            Arc::new(TestInteriorEnvironment {
+                id,
+                image: ImageId::new("test-image"),
+                runner: Arc::new(ProcessCommandRunner),
+                env_vars: HashMap::from([("HOME".to_string(), home)]),
+                destroyed: Arc::new(AtomicBool::new(false)),
+            }) as EnvironmentHandle
+        })
     } else {
         passthrough_registry()
     };
@@ -281,13 +283,25 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    let actuator = feta.resource_backend().using::<Vessel>(NAMESPACE).get("remote-placement-work").await.expect("feta actuator Vessel");
+    // The work's launch is requested at the placement host, which actuates it.
+    let feta_launch = feta
+        .lifecycle_reads()
+        .vessels()
+        .and_then(|vessels| vessels.of_convoy("remote-placement"))
+        .expect("feta launches")
+        .into_iter()
+        .find(|launch| !launch.ended())
+        .expect("feta's launch of the work");
+    let actuator = feta.resource_backend().using::<Vessel>(NAMESPACE).get(&feta_launch.name).await.expect("feta actuator Vessel");
     assert_eq!(actuator.status.as_ref().map(|status| status.phase), Some(flotilla_resources::VesselPhase::Ready));
     assert_eq!(actuator.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).map(String::as_str), Some(feta_host_ref.as_str()));
-    let owner = kiwi.resource_backend().using::<Vessel>(NAMESPACE).get("remote-placement-work").await.expect("kiwi owner Vessel");
+    // The admitting side requests no launch of its own for remote work (#3108): it has no
+    // Vessel to fail, only the placement host's replicated launch.
+    let kiwi_reads = kiwi.lifecycle_reads();
+    let kiwi_vessels = kiwi_reads.vessels().expect("kiwi vessels");
     assert!(
-        owner.status.as_ref().is_none_or(|status: &VesselStatus| status.phase != flotilla_resources::VesselPhase::Failed),
-        "the admitting-side Vessel must not attempt remote actuation"
+        kiwi_vessels.at(kiwi_vessels.home()).expect("kiwi's launches").iter().all(|launch| launch.convoy != "remote-placement"),
+        "the admitting side must not attempt remote actuation"
     );
     assert!(
         kiwi.lifecycle_reads()

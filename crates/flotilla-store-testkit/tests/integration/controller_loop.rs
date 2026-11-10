@@ -1,4 +1,3 @@
-use flotilla_resources::Actuation;
 use flotilla_store_memory::InMemoryBackend;
 use std::{
     sync::{
@@ -8,9 +7,7 @@ use std::{
     time::Duration,
 };
 
-use flotilla_resources::{
-    ApiPaths, InputMeta, LifecycleAuthority, NoStatusPatch, Resource, ResourceError, ResourceObject, StatusPatch, Vessel, VesselSpec,
-};
+use flotilla_resources::{ApiPaths, InputMeta, LifecycleAuthority, NoStatusPatch, Resource, ResourceError, ResourceObject, StatusPatch};
 use flotilla_store::{
     controller::{
         ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure,
@@ -571,41 +568,6 @@ impl flotilla_store::controller::SecondaryWatch for FailingSecondaryWatch {
         _sender: flotilla_store::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async { Err(ResourceError::other("secondary watch failed")) })
-    }
-}
-
-#[derive(Clone)]
-struct ActuatingReconciler {
-    actuation: Actuation,
-    reconciled: Option<Arc<Mutex<Vec<String>>>>,
-}
-
-impl Reconciler for ActuatingReconciler {
-    type Resource = PrimaryResource;
-    type Prepared = ();
-
-    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
-        Ok(())
-    }
-
-    fn reconcile(
-        &self,
-        obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Prepared,
-        _now: chrono::DateTime<chrono::Utc>,
-    ) -> ReconcileOutcome<Self::Resource> {
-        if let Some(reconciled) = &self.reconciled {
-            reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
-        }
-        ReconcileOutcome::with_actuations(None, vec![self.actuation.clone()])
-    }
-
-    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
-        Ok(())
-    }
-
-    fn finalizer_name(&self) -> Option<&'static str> {
-        None
     }
 }
 
@@ -1817,101 +1779,8 @@ async fn non_expiry_secondary_watch_error_still_exits_controller_loop() {
     assert_eq!(result, ResourceError::other("secondary watch failed"));
 }
 
-#[tokio::test]
-async fn controller_loop_applies_delete_actuations_idempotently() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
-    let vessels = backend.clone().using::<Vessel>("flotilla");
-    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
-    vessels
-        .create(
-            &resource_meta().name("alpha-task").call(),
-            &VesselSpec {
-                convoy_ref: "alpha".to_string(),
-                vessel_name: "implement".to_string(),
-                fulfilment_kind_ref: "local".to_string(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("task workspace create should succeed");
-
-    let mut harness = TestLoopHarness::new();
-    harness.spawn(
-        ControllerLoop {
-            primary: primaries,
-            secondaries: Vec::new(),
-            reconciler: ActuatingReconciler { actuation: Actuation::DeleteVessel { name: "alpha-task".to_string() }, reconciled: None },
-            backend: backend.clone(),
-        }
-        .run(),
-    );
-
-    timeout(Duration::from_secs(1), async {
-        loop {
-            if matches!(vessels.get("alpha-task").await, Err(ResourceError::NotFound { .. })) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("delete task workspace actuation should remove the resource");
-
-    vessels.delete("alpha-task").await.expect_err("resource should already be gone");
-
-    harness.shutdown().await;
-}
-
-#[tokio::test]
-// An adopted checkout is the engine's, never removed by its Checkout controller (#3108).
-async fn controller_loop_delete_actuations_preserve_observed_resources() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
-    let vessels = backend.clone().using::<Vessel>("flotilla");
-    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
-    vessels
-        .create(
-            &resource_meta().name("observed-task").call().with_lifecycle_authority(LifecycleAuthority::Observed),
-            &VesselSpec {
-                convoy_ref: "alpha".to_string(),
-                vessel_name: "implement".to_string(),
-                fulfilment_kind_ref: "local".to_string(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("task workspace create should succeed");
-    let reconciled = Arc::new(Mutex::new(Vec::new()));
-    let mut harness = TestLoopHarness::new();
-    harness.spawn(
-        ControllerLoop {
-            primary: primaries.clone(),
-            secondaries: Vec::new(),
-            reconciler: ActuatingReconciler {
-                actuation: Actuation::DeleteVessel { name: "observed-task".to_string() },
-                reconciled: Some(Arc::clone(&reconciled)),
-            },
-            backend: backend.clone(),
-        }
-        .run(),
-    );
-
-    timeout(Duration::from_secs(1), async {
-        loop {
-            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("delete task workspace actuation should run");
-    let vessel = vessels.get("observed-task").await.expect("observed task workspace should remain");
-    assert_eq!(vessel.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Observed));
-
-    harness.shutdown().await;
-}
+// The delete actuations went with the vessel's move onto the engine (#3108): DeleteVessel was
+// the last one, and a vessel's launch is released by its home, not deleted by a controller.
 
 /// Asks for one more pass a millisecond after each of its first passes per object.
 #[derive(Clone)]

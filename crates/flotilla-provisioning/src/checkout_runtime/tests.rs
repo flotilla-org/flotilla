@@ -293,6 +293,10 @@ impl EnvironmentRecords for LiveEnvironments {
         unreachable!("the sweep reads live environments only")
     }
 
+    fn observations(&self) -> &flotilla_resources::environment_records::EnvironmentObservations {
+        unreachable!("the sweep reads live environments only")
+    }
+
     fn live(&self) -> Result<Vec<EnvironmentRecord>, String> {
         self.0.clone()
     }

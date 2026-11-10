@@ -47,10 +47,7 @@ use flotilla_resources::RepositoryStatus;
 use flotilla_resources::Selector;
 use flotilla_resources::Vessel;
 use flotilla_resources::VesselRequirement;
-use flotilla_resources::VesselSpec;
 use flotilla_resources::WorkflowTemplateSpec;
-use flotilla_resources::AUTHORITY_LABEL;
-use flotilla_resources::CONVOY_LABEL;
 use flotilla_resources::DRIVER_ADMISSION_CONDITION_TYPE;
 use flotilla_resources::GENERATION_LABEL;
 use flotilla_resources::PROJECT_LABEL;
@@ -63,6 +60,8 @@ pub use admission::*;
 
 mod in_process;
 pub use in_process::InProcessDiscoveryExt;
+mod vessels;
+pub use vessels::{run_vessels, RunningVessels};
 #[path = "ensure_scenarios/retry.rs"]
 mod retry;
 pub use retry::*;
@@ -626,7 +625,7 @@ async fn create_docker_placement(
 use chrono::Duration as ChronoDuration;
 use flotilla_charter::ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION};
 use flotilla_protocol::PrincipalRef;
-use flotilla_resources::{ConvoySpec, FulfilmentKind, LifecycleAuthority};
+use flotilla_resources::{ConvoySpec, FulfilmentKind};
 use flotilla_store::apply_status_patch as apply_resource_status_patch;
 use sha2::{Digest, Sha256};
 

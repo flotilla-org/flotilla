@@ -31,7 +31,7 @@ use flotilla_protocol::QueryCursor;
 use flotilla_protocol::QueryScope;
 use flotilla_protocol::TerminalStatus;
 use flotilla_protocol_testkit::TestIssue;
-use flotilla_resources::{terminal_records::TerminalLaunchRequest, Vessel, VesselSpec};
+use flotilla_resources::terminal_records::TerminalLaunchRequest;
 use flotilla_resources::{
     Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment, EnvironmentSpec,
     HostDirectEnvironmentSpec, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec,
@@ -684,20 +684,12 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .await
         .expect("create attach environment");
     // The sessions are the engine's launches, written at the daemon's home before its runtime
-    // starts; the convoy-bound one is held for vessel `coder` of convoy `convoy-a`.
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("convoy-a-coder".to_string()).build(),
-            &VesselSpec {
-                convoy_ref: "convoy-a".to_string(),
-                vessel_name: "coder".to_string(),
-                fulfilment_kind_ref: "host-direct".to_string(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("create convoy vessel");
+    // starts; the convoy-bound one is held for the daemon's launch of work `coder` of `convoy-a`.
+    let vessel = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store().expect("decided store")).request(
+        "convoy-a",
+        "coder",
+        &host_id.to_string(),
+    );
     let terminals = flotilla_daemon_testkit::engine::runtime_terminals(&daemon);
     let tool = |env_ref: &str, role: &str, pool: &str| TerminalSessionSpec {
         env_ref: env_ref.to_string(),
@@ -708,7 +700,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         pool: pool.to_string(),
     };
     let convoy_launch = terminals.request(&TerminalLaunchRequest {
-        vessel: Some("convoy-a-coder".to_string()),
+        vessel: Some(vessel.clone()),
         ..session_request("terminal-convoy-coder", &tool(&environment_name, "coder", "fake-terminals"))
     });
     terminals.ready(&convoy_launch, "cleat-convoy-coder", &Default::default());

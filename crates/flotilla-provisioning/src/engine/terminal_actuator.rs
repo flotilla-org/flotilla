@@ -215,6 +215,16 @@ impl<P: ?Sized> TerminalActuator<P> {
             .map_err(|error| transient(format!("read environment {}: {error}", environment.name)))?;
         Ok(state.is_none_or(|state| !state.live()))
     }
+
+    /// Whether the vessel `request` is held for, if any, has ended.
+    fn vessel_ended(&self, request: &TerminalSessionRequest) -> Result<bool, Cause> {
+        let Some(vessel) = request.holder.as_ref().and_then(holder_vessel) else { return Ok(false) };
+        let state = self
+            .reads
+            .read(|read| Ok(state_of::<VesselKind>(read, vessel, &self.home)?))
+            .map_err(|error| transient(format!("read vessel {vessel}: {error}")))?;
+        Ok(state.is_none_or(|state| !state.live()))
+    }
 }
 
 #[async_trait]
@@ -276,10 +286,16 @@ where
             errors.push(error);
         }
         if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(failed(errors.join("; ")))
+            return Ok(());
         }
+        // A crew's session whose vessel ended goes with its environment, whose release waits
+        // for it: one that cannot be reached here, as when its environment was not adopted after
+        // a restart, is removed by that teardown.
+        if self.vessel_ended(request).map_err(|cause| ProviderFailure::new(cause, true))? {
+            warn!(session = name, errors = %errors.join("; "), "a session of an ended vessel is left to its environment's teardown");
+            return Ok(());
+        }
+        Err(failed(errors.join("; ")))
     }
 
     fn followed(&self) -> Vec<KindCode> {

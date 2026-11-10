@@ -621,6 +621,17 @@ fn host_roles_and_checkouts_round_trip(tc: hegel::TestCase) {
     assert_eq!(record_name(&role), None);
 }
 
+// A convoy at its home: the holder a checkout names, its `#` encoded, its home and name read back.
+#[test]
+fn a_convoy_sits_under_its_home() {
+    let convoy = Address::root(Kind::Host, "kiwi").and_then(|host| host.child(Kind::Convoy, "coder#5")).expect("convoy at its home");
+    assert_eq!(convoy.to_string(), "host:kiwi/convoy:coder%235");
+    let parsed = "host:kiwi/convoy:coder%235".parse::<Address>().expect("canonical");
+    assert_eq!(parsed, convoy);
+    assert_eq!((parsed.get(Kind::Host), parsed.name()), (Some("kiwi"), "coder#5"));
+    assert_eq!(record_name(&parsed), Some("coder#5".to_owned()));
+}
+
 #[test]
 fn a_checkout_sits_only_under_its_host() {
     for invalid in [

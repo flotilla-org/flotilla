@@ -6,9 +6,8 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
-    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, PlacementStatus, Stance, StatusPatch, TurnDeliveryEpisode,
-    TurnDeliveryOutcome, TurnDeliveryRung, VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority, WorkPhase, WorkState,
-    WorkflowSnapshot,
+    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, PlacementStatus, StatusPatch, TurnDeliveryEpisode,
+    TurnDeliveryOutcome, TurnDeliveryRung, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 
 #[test]
@@ -49,6 +48,8 @@ const DUPLICATE_CONTINUATION_RESETTLEMENT: &[LifecycleClass] =
 
 macro_rules! define_patch_kinds {
     ($($kind:ident => $classes:expr),+ $(,)?) => {
+        // Each kind is named for its resource and patch; only Convoy has lifecycle patches left.
+        #[allow(clippy::enum_variant_names)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
         enum PatchKind {
             $($kind),+
@@ -69,7 +70,6 @@ macro_rules! define_patch_kinds {
 define_patch_kinds! {
     ConvoyPromise => NONE,
     ConvoyRestoreTurnActivation => DUPLICATE,
-    ConvoyObserveEnvironment => NONE,
     ConvoySetStalled => NONE,
     ConvoySetNudgeObligations => NONE,
     ConvoySetTeardownWait => NONE,
@@ -90,7 +90,6 @@ define_patch_kinds! {
     ConvoyWorkLaunching => DUPLICATE,
     ConvoyWorkRunning => DUPLICATE,
     ConvoyWorkInterrupted => CONTINUATION,
-    ConvoyWorkProvisioningRetry => CONTINUATION,
     ConvoyForceWorkCompleted => DUPLICATE,
     ConvoyMarkWorkFailed => DUPLICATE,
     ConvoyMarkWorkCancelled => DUPLICATE,
@@ -109,13 +108,6 @@ define_patch_kinds! {
     ConvoyFailTurnDelivery => NONE,
     ConvoyObserveQueuedTurnDeliveries => NONE,
     ConvoyRollUpWork => DUPLICATE_CONTINUATION_RESETTLEMENT,
-    VesselObserveRuntime => NONE,
-    VesselRequireEnvironmentRecreation => NONE,
-    VesselMarkProvisioning => DUPLICATE,
-    VesselMarkReady => DUPLICATE,
-    VesselMarkInterrupted => NONE,
-    VesselMarkLost => NONE,
-    VesselMarkFailed => NONE,
 }
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
@@ -131,7 +123,6 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         | ConvoyStatusPatch::UnlinkSubject { .. } => {
             panic!("admission and subject patches are outside this lifecycle contract")
         }
-        ConvoyStatusPatch::ObserveEnvironment { .. } => PatchKind::ConvoyObserveEnvironment,
         ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
         ConvoyStatusPatch::SetNudgeObligations { .. } => PatchKind::ConvoySetNudgeObligations,
         ConvoyStatusPatch::SetTeardownWait { .. } => PatchKind::ConvoySetTeardownWait,
@@ -151,7 +142,6 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::WorkLaunching { .. } => PatchKind::ConvoyWorkLaunching,
         ConvoyStatusPatch::WorkRunning { .. } => PatchKind::ConvoyWorkRunning,
         ConvoyStatusPatch::WorkInterrupted { .. } => PatchKind::ConvoyWorkInterrupted,
-        ConvoyStatusPatch::WorkProvisioningRetry { .. } => PatchKind::ConvoyWorkProvisioningRetry,
         ConvoyStatusPatch::ForceWorkCompleted { .. } => PatchKind::ConvoyForceWorkCompleted,
         ConvoyStatusPatch::MarkWorkFailed { .. } => PatchKind::ConvoyMarkWorkFailed,
         ConvoyStatusPatch::MarkWorkCancelled { .. } => PatchKind::ConvoyMarkWorkCancelled,
@@ -172,21 +162,6 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::FailTurnDelivery { .. } => PatchKind::ConvoyFailTurnDelivery,
         ConvoyStatusPatch::ObserveQueuedTurnDeliveries { .. } => PatchKind::ConvoyObserveQueuedTurnDeliveries,
         ConvoyStatusPatch::RollUpWork { .. } => PatchKind::ConvoyRollUpWork,
-    }
-}
-
-fn vessel_patch_kind(patch: &VesselStatusPatch) -> PatchKind {
-    match patch {
-        VesselStatusPatch::ObserveDegradation { .. } | VesselStatusPatch::RecordImage { .. } | VesselStatusPatch::ReplaceImage { .. } => {
-            panic!("degradation and image status patches are outside this lifecycle contract")
-        }
-        VesselStatusPatch::ObserveRuntime { .. } => PatchKind::VesselObserveRuntime,
-        VesselStatusPatch::RequireEnvironmentRecreation { .. } => PatchKind::VesselRequireEnvironmentRecreation,
-        VesselStatusPatch::MarkProvisioning { .. } => PatchKind::VesselMarkProvisioning,
-        VesselStatusPatch::MarkReady { .. } => PatchKind::VesselMarkReady,
-        VesselStatusPatch::MarkInterrupted { .. } => PatchKind::VesselMarkInterrupted,
-        VesselStatusPatch::MarkLost { .. } => PatchKind::VesselMarkLost,
-        VesselStatusPatch::MarkFailed { .. } => PatchKind::VesselMarkFailed,
     }
 }
 
@@ -225,7 +200,6 @@ fn ts(seconds: i64) -> DateTime<Utc> {
 
 fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> WorkState {
     WorkState {
-        provisioning_retry: None,
         phase,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: Some(ts(5)),
@@ -265,7 +239,6 @@ fn active_convoy_status() -> ConvoyStatus {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
@@ -335,17 +308,6 @@ fn patch_variants_exhaustively_declare_their_lifecycle_classes() {
             message: "address review".to_string(),
         }),
         PatchKind::ConvoyHandoffCrewWork
-    );
-    assert_eq!(
-        vessel_patch_kind(&VesselStatusPatch::MarkProvisioning {
-            image: None,
-            placement_decision: None,
-            observed_kind_ref: "docker".to_string(),
-            observed_kind_version: "2".to_string(),
-            started_at: ts(30),
-            message: None,
-        }),
-        PatchKind::VesselMarkProvisioning
     );
 }
 
@@ -657,51 +619,6 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             },
         },
         LifecycleCase {
-            name: "vessel provisioning",
-            kind: PatchKind::VesselMarkProvisioning,
-            exercise: || {
-                let mut status = VesselStatus { phase: VesselPhase::Provisioning, started_at: Some(ts(10)), ..VesselStatus::default() };
-                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
-                let patch = VesselStatusPatch::MarkProvisioning {
-                    image: None,
-                    placement_decision: None,
-                    observed_kind_ref: "docker".to_string(),
-                    observed_kind_version: "2".to_string(),
-                    started_at: ts(30),
-                    message: None,
-                };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
-                (before, after)
-            },
-        },
-        LifecycleCase {
-            name: "vessel ready",
-            kind: PatchKind::VesselMarkReady,
-            exercise: || {
-                let mut status =
-                    VesselStatus { phase: VesselPhase::Ready, started_at: Some(ts(10)), ready_at: Some(ts(20)), ..VesselStatus::default() };
-                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
-                let patch = VesselStatusPatch::MarkReady {
-                    image: None,
-                    configured_limits: None,
-                    placement_decision: None,
-                    environment_ref: Some("env-a".to_string()),
-                    image_ref: Some("registry.example/crew:latest".to_string()),
-                    local_image_id: Some("sha256:test-image".to_string()),
-                    registry_digest: None,
-                    checkout_refs: Default::default(),
-                    terminal_session_refs: Vec::new(),
-                    requested_stance: Stance::WorkspaceWrite,
-                    effective_stance: Stance::Contained,
-                    ready_at: ts(30),
-                };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
-                (before, after)
-            },
-        },
-        LifecycleCase {
             name: "Message continuation queued",
             kind: PatchKind::ConvoyQueueMessageFollowUp,
             exercise: || {
@@ -754,22 +671,6 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                     phase: WorkPhase::Running,
                     transitioned_at: ts(30),
                     message: None,
-                };
-                apply_and_replay(&mut status, &patch);
-                (before, work_timestamps(&status))
-            },
-        },
-        LifecycleCase {
-            name: "work provisioning retry",
-            kind: PatchKind::ConvoyWorkProvisioningRetry,
-            exercise: || {
-                let mut status = settled_convoy_status();
-                status.phase = ConvoyPhase::Landing;
-                let before = work_timestamps(&status);
-                let patch = ConvoyStatusPatch::WorkProvisioningRetry {
-                    work: "implement".into(),
-                    retry: flotilla_resources::ControllerRetry::retryable(None, ts(30), flotilla_resources::PROVISIONING_RETRY_BACKOFF),
-                    message: "skill staging failed".into(),
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, work_timestamps(&status))

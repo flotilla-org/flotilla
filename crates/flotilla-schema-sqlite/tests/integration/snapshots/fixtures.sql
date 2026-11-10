@@ -1338,6 +1338,8 @@ FROM "terminal_session_labels";
 CREATE TABLE "vessel" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "convoy" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
   "class" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "priority" INTEGER NOT NULL,
@@ -1422,7 +1424,7 @@ CREATE TABLE "vessel_shape" (
   PRIMARY KEY ("vessel", "key"),
   FOREIGN KEY ("vessel") REFERENCES "vessel" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX "vessel_by_convoy" ON "vessel" ("convoy");
+CREATE INDEX "vessel_by_launch" ON "vessel" ("convoy", "launch_of", "launch");
 CREATE INDEX "vessel_live_by_host" ON "vessel" ("host") WHERE "state" IN ('rq', 'rl');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ve', 'state', 'go', 'Gone'),
@@ -1454,6 +1456,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "vessel_view" AS SELECT
   "vessel"."id",
   "vessel"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "vessel"."launch_of") AS "launch_of",
+  "vessel"."launch",
   "vessel"."convoy",
   (SELECT "s" FROM "strings" WHERE "id" = "vessel"."class") AS "class",
   "vessel"."priority",

@@ -117,7 +117,7 @@ async fn old_store_reads_see_each_sessions_newest_launch() {
 
     let fixture = TerminalsFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    backend.install_engine_records(Arc::new(TerminalViews::new(backend.clone(), "flotilla", fixture.reads.clone())));
+    backend.install_engine_records(Arc::new(TerminalViews::new("flotilla", fixture.reads.clone())));
     backend.serve_engine_in("flotilla");
     let sessions = backend.using::<TerminalSession>("flotilla");
     let request = TerminalsFixture::agent("v1", "lead", "env-a");
@@ -160,7 +160,7 @@ async fn a_sessions_view_explains_an_environment_that_cannot_serve_it() {
     let terminals = TerminalsFixture::over("home", Arc::clone(&environments.store));
     let environments = environments.serving_terminals(terminals.terminals.clone() as Arc<dyn TerminalRecords>);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    backend.install_engine_records(Arc::new(TerminalViews::new(backend.clone(), "flotilla", environments.reads.clone())));
+    backend.install_engine_records(Arc::new(TerminalViews::new("flotilla", environments.reads.clone())));
     let status = || async {
         let session = backend.using::<TerminalSession>("flotilla").get("terminal-work-coder").await.expect("session view");
         session.status.expect("status")
@@ -182,4 +182,83 @@ async fn a_sessions_view_explains_an_environment_that_cannot_serve_it() {
 
     environments.lose("env", "cgroup_oom");
     assert_eq!(status().await.environment_unavailable.as_deref(), Some("environment env: cgroup_oom"));
+}
+
+/// The next change a watcher of the sessions hears: what happened, to which session, and its phase.
+async fn next_session(
+    watch: &mut futures::stream::BoxStream<
+        'static,
+        Result<flotilla_resources::ReadWatchEvent<flotilla_resources::TerminalSession>, flotilla_resources::ResourceError>,
+    >,
+) -> (&'static str, String, Option<flotilla_resources::TerminalSessionPhase>) {
+    use flotilla_resources::ReadWatchEvent;
+    use futures::StreamExt;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), watch.next()).await.expect("a change").expect("watching");
+    match event.expect("read") {
+        ReadWatchEvent::Added(read) => ("added", read.object.metadata.name, read.object.status.map(|status| status.phase)),
+        ReadWatchEvent::Modified(read) => ("modified", read.object.metadata.name, read.object.status.map(|status| status.phase)),
+        ReadWatchEvent::Deleted(read) => ("deleted", read.object.metadata.name, None),
+        ReadWatchEvent::DeletedByName { tombstone, .. } => ("deleted", tombstone.name, None),
+    }
+}
+
+// Behaviour (#3108): the session listing a watcher reads keeps up with each change its passes
+// compose: a launch's edges, its environment's end, its next launch in its place, and its release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_listing_follows_each_launch_and_its_environment() {
+    use std::sync::Arc;
+
+    use flotilla_resources::{
+        environment_records::LaunchFacts, EnvironmentSpec, HostDirectEnvironmentSpec, TerminalSession, TerminalSessionPhase,
+    };
+    use flotilla_store::{ResourceBackend, TerminalViews};
+
+    let store = flotilla_provisioning_testkit::OtherHome::open("home");
+    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(store.service());
+    let _followers = [
+        engine.terminals.terminals.follow(Arc::clone(store.service())).expect("follow sessions"),
+        engine.environments.environments.follow(Arc::clone(store.service())).expect("follow environments"),
+        engine.vessels.vessels.follow(Arc::clone(store.service())).expect("follow vessels"),
+    ];
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    backend.install_engine_records(Arc::new(TerminalViews::new("flotilla", engine.reads())));
+    backend.serve_engine_in("flotilla");
+    let sessions = backend.including_replicas::<TerminalSession>("flotilla");
+    let mut watch = sessions.watch().await.expect("watch sessions");
+    let listed = || async { sessions.list().await.expect("list").items.into_iter().map(|read| read.object).collect::<Vec<_>>() };
+
+    let spec = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "home".into(), repo_default_dir: "/work".into() }),
+        ..EnvironmentSpec::default()
+    };
+    engine.environments.request("env", &spec, None);
+    engine.environments.ready("env", "backing", LaunchFacts::default());
+    let vessel = engine.vessels.request("c", "work", "host");
+    let request = TerminalsFixture::agent(&vessel, "coder", "env");
+    let first = engine.terminals.request(&request);
+    assert_eq!(next_session(&mut watch).await, ("added", request.session.clone(), Some(TerminalSessionPhase::Starting)));
+    engine.terminals.ready(&first, "sid", &facts());
+    assert_eq!(next_session(&mut watch).await, ("modified", request.session.clone(), Some(TerminalSessionPhase::Running)));
+    let shown = listed().await;
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].metadata.labels.get(flotilla_resources::VESSEL_LABEL).map(String::as_str), Some("work"), "joined with its holder");
+
+    // Its environment's end is composed into its view, though the launch did not change.
+    engine.environments.lose("env", "cgroup_oom");
+    assert_eq!(next_session(&mut watch).await.0, "modified");
+    let shown = listed().await;
+    assert_eq!(shown[0].status.as_ref().and_then(|status| status.environment_unavailable.as_deref()), Some("environment env: cgroup_oom"));
+
+    // The session's next launch is read in place of the one that exited.
+    engine.terminals.exited(&first, "agent exited");
+    assert_eq!(next_session(&mut watch).await, ("modified", request.session.clone(), Some(TerminalSessionPhase::Stopped)));
+    let TerminalRenewal::Started(second) = engine.terminals.terminals.renew(&request.session).expect("renew") else {
+        panic!("next launch")
+    };
+    assert_eq!(next_session(&mut watch).await, ("modified", request.session.clone(), Some(TerminalSessionPhase::Starting)));
+
+    // A released launch leaves the listing.
+    engine.terminals.release(&second);
+    assert_eq!(next_session(&mut watch).await, ("deleted", request.session.clone(), None));
+    assert!(listed().await.is_empty());
 }

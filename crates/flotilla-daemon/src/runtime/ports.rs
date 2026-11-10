@@ -39,6 +39,47 @@ pub(super) struct DaemonConvoyTeardownRuntime {
     pub(super) reclaim_refusals: StdMutex<HashMap<String, ReclaimRefusal>>,
 }
 
+/// The vessel requester's release gate: an ended convoy's vessels are released here once its
+/// teardown gate passes over the checkouts held for it, the same judgement its home's reclaim makes.
+pub(super) struct DaemonVesselReleaseGate {
+    pub(super) daemon: Arc<InProcessDaemon>,
+    pub(super) namespace: String,
+}
+
+#[async_trait]
+impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for DaemonVesselReleaseGate {
+    async fn may_release(&self, convoy: &str, convoy_home: &str) -> Result<(), String> {
+        // The old store's Convoy, until engine Convoy judges its own reclaim (#3108).
+        let convoys = self.daemon.resource_backend().including_replicas::<Convoy>(&self.namespace);
+        let convoy = convoys
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .find(|source| {
+                source.object.metadata.name == convoy
+                    && match &source.provenance {
+                        flotilla_resources::ResourceProvenance::Local => true,
+                        flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str() == convoy_home,
+                    }
+            })
+            .map(|source| source.object)
+            .ok_or_else(|| format!("convoy {convoy} at {convoy_home} is not read here"))?;
+        let convoy = &convoy;
+        // Held for the engine launch the convoy became; a convoy never admitted holds none.
+        let held = match flotilla_resources::convoy::engine::checkout_holder(convoy) {
+            Some(holder) => {
+                let reads = self.daemon.lifecycle_reads();
+                tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder)).await.map_err(|error| error.to_string())??
+            }
+            None => Vec::new(),
+        };
+        let checkouts = flotilla_resources::checkout_records::latest_launches(held).into_values().collect::<Vec<_>>();
+        self.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, &checkouts, false).await
+    }
+}
+
 pub(super) struct ReclaimRefusal {
     pub(super) error: String,
     pub(super) attempts: u64,

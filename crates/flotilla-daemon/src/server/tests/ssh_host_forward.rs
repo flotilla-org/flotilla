@@ -188,8 +188,8 @@ async fn promised(daemon: &flotilla_core::in_process::InProcessDaemon, convoy: &
         .any(|promise| promise.id == promise_id)
 }
 
-const OWN: PlacedCrew<'static> = PlacedCrew { convoy: "own", vessel: "own-vessel", session: "own-session" };
-const SECOND: PlacedCrew<'static> = PlacedCrew { convoy: "second", vessel: "second-vessel", session: "second-session" };
+const OWN: PlacedCrew<'static> = PlacedCrew { convoy: "own", session: "own-session" };
+const SECOND: PlacedCrew<'static> = PlacedCrew { convoy: "second", session: "second-session" };
 
 /// The scenario the mutation check targets: nothing outside the crew
 /// allowlist crosses the forwarded socket.

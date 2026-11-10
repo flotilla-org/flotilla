@@ -11,11 +11,7 @@ use flotilla_schema::{Address, IndexQuery, Kind, Ref, Timestamp};
 use flotilla_schema_sqlite::{Read, ResourceId, Store, StoreError};
 use flotilla_state_machines::{
     edge_event,
-    machines::{
-        convoy::ConvoyId,
-        lifecycle::{Ending, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState, VanishCause},
-        vessel::{VesselKind, VesselSpec},
-    },
+    machines::lifecycle::{Ending, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState, VanishCause},
     Cause, Resource,
 };
 
@@ -129,11 +125,6 @@ pub trait ProvisioningReads: Send + Sync {
     fn held_checkouts(&self, holder: &Holder) -> Result<Vec<View<CheckoutKind>>, ReadError>;
     /// The environments held for `holder` (`environment.by_holder`): a vessel finds its environment so.
     fn held_environments(&self, holder: &Holder) -> Result<Vec<View<EnvironmentKind>>, ReadError>;
-    /// A vessel's lease, by its name at its home (#3629 Q6): Requested once granted on its pinned
-    /// host, Realised once ready, Gone once it ended.
-    fn vessel(&self, name: &str, home: &str) -> Result<Option<View<VesselKind>>, ReadError>;
-    /// A convoy's vessels (`vessel.by_convoy`), every lease, live or ended.
-    fn convoy_vessels(&self, convoy: &ConvoyId) -> Result<Vec<View<VesselKind>>, ReadError>;
 }
 
 /// The read port over one decided store.
@@ -142,6 +133,7 @@ pub trait ProvisioningReads: Send + Sync {
 /// 10,000-convoy ceiling (`provisioning_bench`), so a view that reads per checkout stays well
 /// inside a frame. A write holds the same lock for one
 /// short transaction (about 0.1 to 0.4 ms), which bounds how long a read can wait for it.
+#[derive(Clone)]
 pub struct StoreReads {
     store: Arc<Mutex<Store>>,
 }
@@ -155,11 +147,12 @@ pub struct LifecycleReadPort {
     checkouts: Option<Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>>,
     agent_sessions: Option<Arc<dyn flotilla_resources::agent_activity::AgentSessionReads>>,
     terminals: Option<Arc<dyn flotilla_resources::terminal_records::TerminalRecords>>,
+    vessels: Option<Arc<dyn flotilla_resources::vessel_records::VesselRecords>>,
 }
 
 impl LifecycleReadPort {
     pub fn new(reads: StoreReads, home: String) -> Self {
-        Self { reads, home, environments: None, clones: None, checkouts: None, agent_sessions: None, terminals: None }
+        Self { reads, home, environments: None, clones: None, checkouts: None, agent_sessions: None, terminals: None, vessels: None }
     }
 
     /// Serves `sessions` as the engine's AgentSessions.
@@ -191,6 +184,12 @@ impl LifecycleReadPort {
         self.environments = Some(environments);
         self
     }
+
+    /// Serves `vessels` as the engine's vessels.
+    pub fn with_vessels(mut self, vessels: Arc<dyn flotilla_resources::vessel_records::VesselRecords>) -> Self {
+        self.vessels = Some(vessels);
+        self
+    }
 }
 
 impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
@@ -214,6 +213,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
         self.terminals.as_deref().ok_or_else(|| "this read port serves no terminal sessions".to_owned())
     }
 
+    fn vessels(&self) -> Result<&dyn flotilla_resources::vessel_records::VesselRecords, String> {
+        self.vessels.as_deref().ok_or_else(|| "this read port serves no vessels".to_owned())
+    }
+
     fn try_reading(
         &self,
         kind: flotilla_resources::lifecycle_reads::ProvisioningKind,
@@ -228,7 +231,6 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
             ProvisioningKind::Clone => self.reads.repository_clone(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::Checkout => self.reads.checkout(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::TerminalSession => self.reads.terminal_session(name, home).map(|view| view.map(|view| view.judgement)),
-            ProvisioningKind::Vessel => self.reads.vessel(name, home).map(|view| view.map(|view| view.judgement)),
         };
         judgement
             .map(|judgement| judgement.map(|judgement| judgement.reading()))
@@ -243,6 +245,12 @@ const PAGE: u32 = 256;
 impl StoreReads {
     pub fn new(store: Arc<Mutex<Store>>) -> Self {
         Self { store }
+    }
+
+    /// Calls `listener` after each commit to the store, while the caller keeps it alive.
+    pub(crate) fn on_commit(&self, listener: std::sync::Weak<flotilla_schema_sqlite::stream::CommitListener>) -> Result<(), ReadError> {
+        self.store.lock().map_err(|_| ReadError("decided store lock poisoned".into()))?.on_commit(listener);
+        Ok(())
     }
 
     pub(crate) fn read<T>(&self, read: impl FnOnce(&mut Read<'_>) -> Result<T, ReadError>) -> Result<T, ReadError> {
@@ -297,6 +305,13 @@ where
             }
         }
     }
+}
+
+/// When `name` of kind `R` homed at `home` was requested: the time of the change that created it.
+pub(crate) fn requested_at<R: Kind>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<Timestamp>, ReadError> {
+    let Some(id) = read.resolve(R::CODE, name, home)? else { return Ok(None) };
+    let Some(created) = read.changes(id, 0, 1)?.into_iter().next() else { return Ok(None) };
+    Ok(read.change(home, created.change)?.map(|change| change.at))
 }
 
 pub(crate) fn keyed<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<View<K>>, ReadError>
@@ -385,14 +400,6 @@ impl ProvisioningReads for StoreReads {
 
     fn held_environments(&self, holder: &Holder) -> Result<Vec<View<EnvironmentKind>>, ReadError> {
         self.read(|read| indexed(read, &EnvironmentRequest::by_holder(holder)))
-    }
-
-    fn vessel(&self, name: &str, home: &str) -> Result<Option<View<VesselKind>>, ReadError> {
-        self.read(|read| keyed(read, name, home))
-    }
-
-    fn convoy_vessels(&self, convoy: &ConvoyId) -> Result<Vec<View<VesselKind>>, ReadError> {
-        self.read(|read| indexed(read, &VesselSpec::by_convoy(convoy)))
     }
 }
 

@@ -6,14 +6,14 @@ use flotilla_config::ConfigStore;
 use flotilla_protocol::{CrewCommandContext, HostName};
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, RepositoryKey, Selector,
-    TerminalSession as ResourceTerminalSession, Vessel, VesselRequirement,
+    TerminalSession as ResourceTerminalSession, VesselRequirement,
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{designate_fleet, install_engine_messages, test_engine, test_meta, SessionStagingProbe};
+use super::support::{designate_fleet, install_engine_messages, test_engine, test_meta, SessionStagingProbe, TestEngine};
 use crate::in_process::{InProcessDaemon, TerminalSessionIdentity};
 use crate::testkits::discovery::fake_discovery;
-use flotilla_provisioning_testkit::{Ending, TerminalsFixture};
+use flotilla_provisioning_testkit::Ending;
 use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource};
 
 #[tokio::test]
@@ -92,26 +92,13 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         )
         .await
         .expect("active convoy");
-    backend
-        .clone()
-        .using::<Vessel>("flotilla")
-        .create(
-            &test_meta("convoy-two-crew-work"),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "convoy-two-crew".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "contained".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
+    let vessel = engine.vessels.request("convoy-two-crew", "work", "test-host");
 
     let requested = CrewCommandContext {
         crew_id: None,
         namespace: Some("flotilla".to_string()),
         convoy: Some("convoy-two-crew".to_string()),
-        vessel_ref: Some("convoy-two-crew-work".to_string()),
+        vessel_ref: Some(vessel.clone()),
         role: Some("coder".to_string()),
     };
     let error =
@@ -122,17 +109,19 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Pending);
 
     let coder_identity = TerminalSessionIdentity::builder()
-        .vessel_ref("convoy-two-crew-work".to_string())
+        .vessel_ref(vessel.clone())
         .convoy("convoy-two-crew".to_string())
         .vessel("work".to_string())
         .role("coder".to_string())
         .vessel_index(0)
         .crew_index(0)
         .build();
+    // The reviewer's session is named for the launch, as the coder's is.
+    let reviewer_session = format!("terminal-{vessel}-reviewer");
     let coder = engine.terminals.request(&TerminalLaunchRequest {
         session: coder_identity.name(),
         environment: "contained-env".to_string(),
-        vessel: Some("convoy-two-crew-work".to_string()),
+        vessel: Some(vessel.clone()),
         role: "coder".to_string(),
         pool: "contained".to_string(),
         cwd: "/workspace".to_string(),
@@ -166,14 +155,14 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     let status = convoys.get("convoy-two-crew").await.expect("convoy").status.expect("status");
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Pending);
-    assert!(sessions.get("terminal-convoy-two-crew-work-reviewer").await.is_err());
+    assert!(sessions.get(&reviewer_session).await.is_err());
 
     daemon.crew_handoff_internal(&requested, "reviewer", "Please review the implementation.").await.expect("handoff to latent reviewer");
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // The latent reviewer's launch, requested by the handoff in the coder's environment; its
     // credentials are delivered at launch from the vessel's requirement.
-    let reviewer = probe.engine.terminals.record("terminal-convoy-two-crew-work-reviewer");
+    let reviewer = probe.engine.terminals.record(&reviewer_session);
     let TerminalLaunchSource::Agent { adapter, brief, .. } = &reviewer.source else {
         panic!("reviewer must be an agent session");
     };
@@ -181,7 +170,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     assert!(brief.content.contains("- Minted credential repository scope:"));
     assert!(brief.content.contains("  - `github-crew-pr`:\n    - `github.com-flotilla-org-flotilla`"));
     assert_eq!(reviewer.environment, "contained-env");
-    assert_eq!(reviewer.vessel.as_deref(), Some("convoy-two-crew-work"));
+    assert_eq!(reviewer.vessel.as_deref(), Some(vessel.as_str()));
 
     let convoy = convoys.get("convoy-two-crew").await.expect("convoy");
     let mut terminal_status = convoy.status.expect("status");
@@ -190,13 +179,13 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     let error = daemon.crew_handoff_internal(&requested, "reviewer", "Late handoff").await.expect_err("terminal handoff");
     assert!(error.contains("terminal"), "{error}");
     assert_eq!(convoys.get("convoy-two-crew").await.expect("convoy").status.expect("status"), terminal_status);
-    assert_eq!(probe.engine.terminals.record("terminal-convoy-two-crew-work-reviewer"), reviewer);
+    assert_eq!(probe.engine.terminals.record(&reviewer_session), reviewer);
 }
 
 // Stands in for the vessel controller: when the handoff writes the target's
 // brief, the controller has already requested the target's session.
 struct ConcurrentSessionCreation {
-    terminals: Arc<TerminalsFixture>,
+    engine: Arc<TestEngine>,
     request: TerminalLaunchRequest,
     ending: Option<Ending<'static>>,
 }
@@ -204,10 +193,11 @@ struct ConcurrentSessionCreation {
 #[async_trait::async_trait]
 impl flotilla_agent::brief_artifact::BriefArtifactWriter for ConcurrentSessionCreation {
     async fn put_brief(&self, _: &str, _: &str, _: &str, _: &str, _: &[u8], _: Option<&str>) -> Result<String, String> {
-        let launch = self.terminals.request(&self.request);
+        let terminals = &self.engine.terminals;
+        let launch = terminals.request(&self.request);
         match self.ending {
-            Some(Ending::Ready(identity)) => self.terminals.ready(&launch, identity, &Default::default()),
-            Some(Ending::GaveUp(cause)) => self.terminals.give_up(&launch, cause),
+            Some(Ending::Ready(identity)) => terminals.ready(&launch, identity, &Default::default()),
+            Some(Ending::GaveUp(cause)) => terminals.give_up(&launch, cause),
             Some(_) => unreachable!("the scenarios realise or give up"),
             None => {}
         }
@@ -277,23 +267,11 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
             )
             .await
             .expect("active convoy");
-        backend
-            .clone()
-            .using::<Vessel>("flotilla")
-            .create(
-                &test_meta("convoy-concurrent-work"),
-                &flotilla_resources::VesselSpec {
-                    convoy_ref: "convoy-concurrent".to_string(),
-                    vessel_name: "work".to_string(),
-                    fulfilment_kind_ref: "contained".to_string(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                },
-            )
-            .await
-            .expect("vessel");
+        let engine = Arc::new(test_engine(&daemon));
+        let vessel = engine.vessels.request("convoy-concurrent", "work", "test-host");
         let identity = |role: &str, crew_index| {
             TerminalSessionIdentity::builder()
-                .vessel_ref("convoy-concurrent-work".to_string())
+                .vessel_ref(vessel.clone())
                 .convoy("convoy-concurrent".to_string())
                 .vessel("work".to_string())
                 .role(role.to_string())
@@ -304,7 +282,7 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
         let session_request = |name: String, role: &str, brief: &str| TerminalLaunchRequest {
             session: name,
             environment: "contained-env".to_string(),
-            vessel: Some("convoy-concurrent-work".to_string()),
+            vessel: Some(vessel.clone()),
             role: role.to_string(),
             pool: "contained".to_string(),
             cwd: "/workspace".to_string(),
@@ -321,16 +299,14 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
                 },
             },
         };
-        let terminals = Arc::new(TerminalsFixture::default());
-        daemon.install_lifecycle_reads(terminals.reads.clone()).expect("engine reads");
-        backend.install_engine_records(Arc::new(flotilla_store::TerminalViews::new(backend.clone(), "flotilla", terminals.reads.clone())));
         backend.serve_engine_in("flotilla");
+        let terminals = &engine.terminals;
         let governor = terminals.request(&session_request(identity("governor", 0).name(), "governor", "Govern."));
         terminals.ready(&governor, "governor-sid", &Default::default());
         let aide = identity("aide", 1);
         daemon
             .set_brief_artifact_writer(Arc::new(ConcurrentSessionCreation {
-                terminals: Arc::clone(&terminals),
+                engine: Arc::clone(&engine),
                 request: session_request(aide.name(), "aide", "Created by the vessel controller."),
                 ending,
             }))
@@ -340,7 +316,7 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
             crew_id: None,
             namespace: Some("flotilla".to_string()),
             convoy: Some("convoy-concurrent".to_string()),
-            vessel_ref: Some("convoy-concurrent-work".to_string()),
+            vessel_ref: Some(vessel.clone()),
             role: Some("governor".to_string()),
         };
         let handed_off = daemon.crew_handoff_internal(&requested, "aide", "Task 1.").await;

@@ -1,6 +1,6 @@
 use super::*;
 use crate::server::environment_sockets::{EnvironmentSocketRegistry, EnvironmentSocketService};
-use crate::testkits::engine::request_session;
+use crate::testkits::engine::{engine, request_session};
 
 pub(super) enum LaunchObservationRecord {
     Present,
@@ -72,18 +72,17 @@ pub(super) async fn bind_account_from_home(
     other.replicate_to(&target);
 }
 
-/// Freeze one crew aboard Vessel `vessel_ref` (within-convoy name `work`) in convoy
-/// `convoy`'s workflow snapshot, as admission does: the crew's frozen skills are what
-/// its access layer delivers.
+/// Freeze one crew aboard work `work` in convoy `convoy`'s workflow snapshot, as admission
+/// does, and request the work's launch on this daemon's host: the crew's frozen skills are
+/// what its access layer delivers. Returns the launch, which the crew's sessions name.
 pub(super) async fn freeze_crew(
-    backend: &ResourceBackend,
+    daemon: &InProcessDaemon,
     convoy: &str,
-    vessel_ref: &str,
     role: &str,
     adapter: &str,
     skills: Vec<flotilla_resources::SkillCatalogEntry>,
-) {
-    let convoys = backend.using::<Convoy>(NAMESPACE);
+) -> String {
+    let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
     let created = convoys
         .create(&empty_meta(convoy), &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build())
         .await
@@ -115,19 +114,7 @@ pub(super) async fn freeze_crew(
         )
         .await
         .expect("frozen workflow");
-    backend
-        .using::<Vessel>(NAMESPACE)
-        .create(
-            &empty_meta(vessel_ref),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: convoy.into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("vessel");
+    engine(daemon).vessels.request(convoy, "work", daemon.local_host_id().expect("local host").as_str())
 }
 
 /// A frozen selection of `name` from the generation's `mattpocock-skills` source.
@@ -244,6 +231,8 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         .lock()
         .await
         .insert(handle.backing_id().to_string(), super::super::environments::ActiveProvisionedEnvironment { handle });
+    // Managed launch cards read durable context, just as the live command does.
+    let vessel = freeze_crew(&daemon, "demo", "coder", "claude-code", Vec::new()).await;
     let spec = flotilla_resources::TerminalSessionSpec {
         env_ref: env_id.to_string(),
         role: "coder".to_string(),
@@ -258,7 +247,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
             context: Box::new(flotilla_resources::TerminalCrewContext {
                 namespace: NAMESPACE.to_string(),
                 convoy: "demo".to_string(),
-                vessel_ref: "demo-work".to_string(),
+                vessel_ref: vessel.clone(),
             }),
         },
         cwd: workspace.display().to_string(),
@@ -268,9 +257,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         ]),
         pool: "fake-terminals".to_string(),
     };
-    // Managed launch cards read durable context, just as the live command does.
     let backend = daemon.resource_backend();
-    freeze_crew(&backend, "demo", "demo-work", "coder", "claude-code", Vec::new()).await;
     let launch_name = match observation {
         LaunchObservationRecord::Present => request_session(&daemon, "terminal-demo-work-coder", &spec),
         _ => first_launch("terminal-demo-work-coder"),
@@ -351,7 +338,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
     for (name, expected) in [
         ("FLOTILLA_CREW_ID", launch_name.as_str()),
         ("FLOTILLA_CONVOY", "demo"),
-        ("FLOTILLA_VESSEL", "demo-work"),
+        ("FLOTILLA_VESSEL", vessel.as_str()),
         ("FLOTILLA_CREW_ROLE", "coder"),
         ("FLOTILLA_NAMESPACE", NAMESPACE),
         ("FLOTILLA_TERMINAL_SESSION", "terminal-demo-work-coder"),

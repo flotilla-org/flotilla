@@ -10,5 +10,5 @@ mod review_bundle;
 mod review_bundle_aggregator;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;
-mod vessel_finalization;
+// vessel_finalization deleted: a vessel is now a read view of its launch, with no finalizer to run (#3108).
 mod vessel_reconciler;

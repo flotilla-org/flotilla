@@ -246,122 +246,36 @@ fn a_session_reads_as_its_current_launch() {
     }
 }
 
-// Behaviour (#3629 layer 8, Vessel): a vessel's lease reads by its name, Ready once realised and
-// Lost once it vanished, and a convoy's vessels through the `vessel.by_convoy` index, live or ended.
+// Behaviour (#3629 layer 8, #3108): a vessel's launch reads by its launch name, never by its
+// work's bare name; Ready once realised and Lost once it vanished; and a work's launches through
+// the `vessel.by_launch` index, live or ended, oldest first. (Reading a vessel by its old record's
+// name went with the old Vessel's binding.)
 #[test]
 fn a_vessel_reads_as_its_lease() {
-    use std::collections::BTreeMap;
+    use flotilla_protocol::LifecycleReading;
+    use flotilla_provisioning_testkit::VesselsFixture;
+    use flotilla_resources::vessel_records::{VesselRecords, VesselStep};
 
-    use flotilla_provisioning::engine::vessel::{PlacementLifecycles, PINNED_CLASS};
-    use flotilla_state_machines::{
-        machines::{
-            convoy::{ConvoyId, Priority, VesselClass},
-            vessel::{VesselKind, VesselSpec},
-        },
-        placement::Host,
-    };
-    // The crew kinds' store, which holds the Vessel kind.
-    let registry = stored::crew_registry().expect("registry");
-    let store = Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")));
-    let vessels: Arc<dyn Lifecycles<VesselKind>> = Arc::new(
-        PlacementLifecycles::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("home")).expect("placements"),
+    let fixture = VesselsFixture::at(HOME);
+    let implement = fixture.request("convoy-a", "implement", "feta");
+    fixture.ready(&implement, "env-a");
+    let review = fixture.request("convoy-a", "review", "feta");
+    fixture.ready(&review, "env-b");
+    fixture.step(&review, VesselStep::Lost { reason: "container gone".into() });
+    let replacement = fixture.request("convoy-a", "review", "feta");
+
+    let read = fixture.vessels.get(&implement, None).expect("read").expect("held");
+    assert!(implement.starts_with("convoy-a-implement#"), "{implement} is a launch of its work");
+    assert_eq!(read.reading, LifecycleReading::Ready { identity: "env-a".into() });
+    assert_eq!(read.host, "feta");
+    assert_eq!(
+        fixture.vessels.get(&review, None).expect("read").expect("held").reading,
+        LifecycleReading::Lost { reason: Some("container gone".into()) }
     );
-    let lease = || VesselSpec {
-        convoy: ConvoyId::new("convoy-a", HOME),
-        class: VesselClass::new(PINNED_CLASS),
-        shape: BTreeMap::new(),
-        priority: Priority(0),
-        host: Host::new("feta"),
-    };
-    vessels.request("convoy-a-implement", lease(), Timestamp(1)).expect("granted");
-    vessels.step("convoy-a-implement", &Step::Realised { identity: "env-a".into() }, Timestamp(2)).expect("ready");
-    vessels.request("convoy-a-review", lease(), Timestamp(3)).expect("granted");
-    vessels.step("convoy-a-review", &Step::Realised { identity: "env-b".into() }, Timestamp(4)).expect("ready");
-    vessels
-        .step("convoy-a-review", &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }, Timestamp(5))
-        .expect("lost");
-
-    let reads = StoreReads::new(store);
-    let implement = reads.vessel("convoy-a-implement", HOME).expect("read").expect("held");
-    assert_eq!(implement.judgement, Judgement::Ready { identity: "env-a".into() });
-    assert_eq!(implement.request.host, Host::new("feta"));
-    assert_eq!(reads.vessel("convoy-a-review", HOME).expect("read").expect("held").judgement, Judgement::Lost { reason: None });
-    assert!(reads.vessel("convoy-b-implement", HOME).expect("read").is_none());
-    let mut convoy: Vec<String> =
-        reads.convoy_vessels(&ConvoyId::new("convoy-a", HOME)).expect("index").into_iter().map(|view| view.name).collect();
-    convoy.sort();
-    assert_eq!(convoy, ["convoy-a-implement", "convoy-a-review"]);
-}
-
-// Behaviour (#3771 review): the port reads a vessel by its old record's name, because the write
-// path names the engine's resource after it. Decided through the binding, read back by
-// `metadata.name`.
-#[test]
-fn a_vessel_written_through_the_binding_reads_by_its_old_name() {
-    use std::collections::BTreeMap;
-
-    use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
-    use flotilla_provisioning::engine::{
-        decide,
-        vessel::{PlacementLifecycles, VesselBinding},
-    };
-    use flotilla_resources::{ObjectMeta, ResourceObject, StatusPatch, VesselSpec as OldVesselSpec, VesselStatusPatch};
-    use flotilla_state_machines::machines::vessel::VesselKind;
-    let registry = stored::crew_registry().expect("registry");
-    let store = Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")));
-    let vessels: Arc<dyn Lifecycles<VesselKind>> = Arc::new(
-        PlacementLifecycles::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("home")).expect("placements"),
-    );
-    let mut obj = ResourceObject {
-        metadata: ObjectMeta {
-            name: "convoy-a-implement".into(),
-            namespace: "flotilla".into(),
-            resource_version: "1".into(),
-            labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
-            owner_references: vec![],
-            finalizers: vec![],
-            deletion_timestamp: None,
-            creation_timestamp: chrono::DateTime::UNIX_EPOCH,
-            merge: None,
-        },
-        spec: OldVesselSpec {
-            convoy_ref: "convoy-a".into(),
-            vessel_name: "implement".into(),
-            fulfilment_kind_ref: "docker".into(),
-            adopted_checkout_refs: BTreeMap::new(),
-        },
-        status: None,
-    };
-    let provisioning = VesselStatusPatch::MarkProvisioning {
-        observed_kind_ref: "docker".into(),
-        observed_kind_version: "1".into(),
-        placement_decision: Some(
-            PlacementDecision::builder()
-                .kind("docker".into())
-                .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("feta"), display_name: "feta".into() })
-                .build(),
-        ),
-        started_at: chrono::DateTime::UNIX_EPOCH,
-        message: None,
-        image: None,
-    };
-    let decided = decide::<VesselBinding>(vessels.as_ref(), &obj, Some(provisioning), chrono::Utc::now()).patch.expect("granted");
-    decided.apply(obj.status.get_or_insert_with(Default::default));
-
-    let reads = StoreReads::new(store);
-    let view = reads.vessel(&obj.metadata.name, HOME).expect("read").expect("read by the old record's name");
-    assert_eq!(view.name, obj.metadata.name);
-    assert_eq!(view.judgement, Judgement::InProgress);
-
-    // Failure is visible only through the engine: this snapshot deliberately receives no status patch.
-    let failure = VesselStatusPatch::MarkFailed { message: "provider refused provisioning".into() };
-    let decision = decide::<VesselBinding>(vessels.as_ref(), &obj, Some(failure), chrono::Utc::now());
-    assert!(decision.ended);
-    let view = reads.vessel(&obj.metadata.name, HOME).expect("read").expect("ended vessel");
-    assert!(matches!(view.judgement, Judgement::GaveUp { ref cause } if cause.detail == "provider refused provisioning"));
-    assert_eq!(obj.status.as_ref().expect("provisioning").phase, flotilla_resources::VesselPhase::Provisioning);
-    assert_eq!(obj.status.as_ref().expect("provisioning").message, None);
+    assert!(fixture.vessels.get("convoy-a-implement", None).expect("read").is_none(), "no read by the bare work name");
+    let launches: Vec<String> =
+        fixture.vessels.launches("convoy-a", HOME, "convoy-a-review", None).expect("index").into_iter().map(|launch| launch.name).collect();
+    assert_eq!(launches, [review, replacement]);
 }
 
 // Corrupt persisted retry times remain readable in debug and release builds; diagnostics preserve a usable fallback.

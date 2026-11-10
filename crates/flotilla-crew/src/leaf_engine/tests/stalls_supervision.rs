@@ -1946,16 +1946,19 @@ fn pending_launch_progress_is_bounded_and_recovers(tc: hegel::TestCase) {
     });
 }
 
-// A vessel the engine realises is launch progress even while its stored status still says Provisioning.
+// A vessel the engine realises is launch progress: its Ready restarts the launch bound.
 #[tokio::test]
 async fn engine_vessel_progress_resets_the_launch_bound() {
-    use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
-    use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
     let (backend, wake, _) = actor_nudge_scenario(&[]).await;
-    let fixture = VesselFixture::new(false);
-    let wake = ReconcilerWake::new(wake.subscriptions.with_lifecycle_reads(fixture.reads.clone()));
+    // The vessels' log is followed, as a daemon follows its store: the watch view learns of Ready.
+    let store = flotilla_provisioning_testkit::OtherHome::open("home");
+    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(store.service());
+    let _follower = engine.vessels.vessels.follow(Arc::clone(store.service())).expect("follow vessels");
+    backend.install_engine_records(Arc::new(flotilla_store::VesselViews::new(backend.clone(), "flotilla", engine.reads())));
+    let wake = ReconcilerWake::new(wake.subscriptions.with_lifecycle_reads(engine.reads()));
+    let fixture = &engine.vessels;
     backend.using::<TerminalSession>("flotilla").delete("resumed-coder").await.expect("no launch yet");
-    let start = Utc::now();
+    let start = Utc::now() - chrono::Duration::seconds(600);
     update_convoy(&backend, "stalled-work", |status| {
         status.started_at = Some(start);
         let work = status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew");
@@ -1963,57 +1966,40 @@ async fn engine_vessel_progress_resets_the_launch_bound() {
         work.task_assigned = true;
     })
     .await;
-    let vessel = object::<flotilla_resources::Vessel>(
-        "stalled-work-work",
-        flotilla_resources::VesselSpec {
-            convoy_ref: "stalled-work".into(),
-            vessel_name: "work".into(),
-            fulfilment_kind_ref: "local".into(),
-            adopted_checkout_refs: Default::default(),
-        },
-        flotilla_resources::VesselStatus {
-            phase: flotilla_resources::VesselPhase::Provisioning,
-            placement_decision: Some(
-                PlacementDecision::builder()
-                    .kind("local".into())
-                    .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host"), display_name: "host".into() })
-                    .build(),
-            ),
-            ..Default::default()
-        },
-    );
-    let vessels = backend.using::<flotilla_resources::Vessel>("flotilla");
-    let created = vessels
-        .create(
-            &InputMeta::builder()
-                .name(vessel.metadata.name.clone())
-                .labels(BTreeMap::from([(CONVOY_LABEL.into(), "stalled-work".into())]))
-                .build(),
-            &vessel.spec,
-        )
-        .await
-        .expect("vessel");
-    vessels
-        .update_status(&vessel.metadata.name, &created.metadata.resource_version, vessel.status.as_ref().expect("status"))
-        .await
-        .expect("stored");
-    fixture.request(&vessel);
-    let judge = |seconds| {
+    let launch = fixture.request("stalled-work", "work", "host");
+    let judge = |at: chrono::DateTime<Utc>| {
         let backend = backend.clone();
         let wake = &wake;
         async move {
             let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-            wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), start + chrono::Duration::seconds(seconds))
-                .await
-                .expect("judge");
+            wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), at).await.expect("judge");
             backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy").status.expect("status").attention
         }
     };
-    assert!(judge(0).await.is_none());
-    fixture.finish(&vessel, Ending::Ready("env"));
-    assert!(judge(600).await.is_none());
-    assert!(judge(1499).await.is_none(), "the engine's Ready restarted the bound");
-    assert_eq!(judge(1500).await.expect("bounded from the engine's progress").source, "launch-progress");
+    assert!(judge(start).await.is_none());
+    let mut watch = backend.using::<flotilla_resources::Vessel>("flotilla").watch(WatchStart::Now).await.expect("vessel watch");
+    fixture.ready(&launch, "env");
+    // The judge reads a watch view, so it judges once the watch has carried Ready.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(event) = watch.next().await {
+            if let WatchEvent::Added(vessel) | WatchEvent::Modified(vessel) = event.expect("vessel event") {
+                if vessel.status.is_some_and(|status| status.phase == flotilla_resources::VesselPhase::Ready) {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the watch carries Ready");
+    let vessel = backend.using::<flotilla_resources::Vessel>("flotilla").get(&launch).await.expect("vessel view");
+    let ready_at = vessel.status.and_then(|status| status.ready_at).expect("ready vessel");
+    assert!(judge(ready_at).await.is_none());
+    assert!(judge(start + chrono::Duration::seconds(900)).await.is_none(), "the engine's Ready restarted the bound");
+    assert!(judge(ready_at + chrono::Duration::seconds(899)).await.is_none());
+    assert_eq!(
+        judge(ready_at + chrono::Duration::seconds(900)).await.expect("bounded from the engine's progress").source,
+        "launch-progress"
+    );
 }
 
 // Supervision has a crew or convoy subject, and only a recipient with an inbox awaits a reply.

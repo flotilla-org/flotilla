@@ -10,10 +10,10 @@ use flotilla_resources::agent_activity::AgentActivityView;
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, record_name},
-    select_convoy_child_sources, select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewWorkPhase, LeafMaker,
-    NudgeObligation, ResourceObject, StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, SupervisionTarget,
-    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TurnDeliveryRule, WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewWorkPhase, LeafMaker, NudgeObligation, ResourceObject,
+    StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, SupervisionTarget, TerminalAttention,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule,
+    WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::off_frame;
 
@@ -735,15 +735,7 @@ impl ReconcilerWake {
         let messages = &tick.inputs.messages_list.items;
         let selected_sessions = select_convoy_children(convoy, sessions);
         self.observe_queued_turns_from_messages(namespace, convoy, &selected_sessions, messages, now).await?;
-        let selected_vessels = select_convoy_children(
-            convoy,
-            &flotilla_store::read_vessel_sources(
-                Arc::clone(&self.subscriptions.inner.lifecycle_reads),
-                select_convoy_child_sources(convoy, vessels).into_values().collect(),
-            )
-            .await
-            .map_err(|error| error.to_string())?,
-        );
+        let selected_vessels = select_convoy_children(convoy, vessels);
         self.observe_launch_progress(convoy, &selected_vessels, &selected_sessions, now).await?;
         Ok((selected_sessions, selected_vessels))
     }

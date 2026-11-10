@@ -97,6 +97,10 @@ pub(super) struct ControllerRuntimeState {
     /// again: the sender the probe uses, and the receiver its controller takes once.
     pub(super) checkout_rechecks: tokio::sync::mpsc::Sender<String>,
     pub(super) checkout_recheck_events: StdMutex<Option<tokio::sync::mpsc::Receiver<String>>>,
+    /// The vessel launches to plan again, as their convoys, crews' bindings or seats change: the
+    /// sender the wakes and seats use, and the receiver the Vessel controller takes once.
+    pub(super) vessel_rechecks: tokio::sync::mpsc::Sender<String>,
+    pub(super) vessel_recheck_events: StdMutex<Option<tokio::sync::mpsc::Receiver<String>>>,
     /// The remotes this host's clones could not reach, published on its heartbeat (#3108).
     pub(super) remote_reachability: Arc<RemoteProbe>,
     /// The credential delivery controller's inbox, for crew operations and people to reach it.
@@ -303,6 +307,7 @@ impl ControllerRuntimeState {
         ));
         let (environment_backings, environment_backing_events) = tokio::sync::mpsc::channel(64);
         let (checkout_rechecks, checkout_recheck_events) = tokio::sync::mpsc::channel(64);
+        let (vessel_rechecks, vessel_recheck_events) = tokio::sync::mpsc::channel(64);
         Self {
             environment_providers,
             skill_trees,
@@ -340,6 +345,8 @@ impl ControllerRuntimeState {
             environment_backing_events: StdMutex::new(Some(environment_backing_events)),
             checkout_rechecks,
             checkout_recheck_events: StdMutex::new(Some(checkout_recheck_events)),
+            vessel_rechecks,
+            vessel_recheck_events: StdMutex::new(Some(vessel_recheck_events)),
             remote_reachability: Arc::new(RemoteProbe::new(super::health::RuntimeHealth::default())),
             credential_events: Arc::default(),
         }
@@ -515,25 +522,21 @@ pub(super) async fn canonical_runtime_host_id(
 #[async_trait]
 impl StandingConvoyBackingInspector for ControllerRuntimeState {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
-        // The convoy's environments are those held for its vessels; an ended one's backing was
+        // The convoy's environments are those held for its works' launches; an ended one's backing was
         // torn down or observed gone.
-        let vessels = convoy
+        let works = convoy
             .status
             .as_ref()
             .and_then(|status| status.workflow_snapshot.as_ref())
-            .map(|snapshot| {
-                snapshot
-                    .vessels
-                    .iter()
-                    .map(|requirement| flotilla_resources::vessel_resource_name(&convoy.metadata.name, &requirement.name))
-                    .collect::<Vec<_>>()
-            })
+            .map(|snapshot| snapshot.vessels.iter().map(|requirement| requirement.name.clone()).collect::<std::collections::BTreeSet<_>>())
             .unwrap_or_default();
+        let convoy_name = convoy.metadata.name.clone();
         let reads = self.daemon.lifecycle_reads();
         let environments = tokio::task::spawn_blocking(move || {
             let environments = reads.environments()?;
+            let vessels = reads.vessels()?.of_convoy(&convoy_name)?;
             let mut held = Vec::new();
-            for vessel in &vessels {
+            for vessel in vessels.iter().filter(|vessel| works.contains(vessel.work())).map(|vessel| &vessel.name) {
                 held.extend(environments.held(vessel)?.into_iter().filter(|environment| !environment.ended()));
             }
             Ok::<_, String>(held)

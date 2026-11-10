@@ -94,6 +94,15 @@ pub const ENSURED_FROM_ANNOTATION: &str = "flotilla.work/ensured-from";
 /// When convoys leave the old store this becomes a field of the engine Convoy's request.
 pub const ADOPTED_CHECKOUT_ANNOTATION: &str = "flotilla.work/adopted-checkout";
 
+/// What convoy launch `name` (`<launch_of>#<n>`) is a launch of; a name with no launch number
+/// returns as is.
+pub fn launch_of(name: &str) -> &str {
+    match name.rsplit_once('#') {
+        Some((launch_of, n)) if !n.is_empty() && n.bytes().all(|byte| byte.is_ascii_digit()) => launch_of,
+        _ => name,
+    }
+}
+
 /// The checkout `convoy` adopts, if admission recorded one.
 pub fn adopted_checkout(convoy: &crate::ResourceObject<Convoy>) -> Result<Option<crate::CheckoutSpec>, String> {
     convoy
@@ -1049,10 +1058,8 @@ pub struct ConvoyStatus {
     pub landing_entry: Option<LandingEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing_settlement: Option<SettlementEvaluation>,
-    /// Per-vessel runtime evidence survives backing environment teardown.
-    /// ADR 0047: keep this decoder default for one roll.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub environment_observations: BTreeMap<String, flotilla_protocol::EnvironmentRuntimeObservation>,
+    // Retired with the vessel's move onto the engine (#3108): `environment_observations`, now its
+    // environments' home memory. Earlier records carrying it decode and drop it.
     /// Frozen ensure configuration that admitted this generation. Previous
     /// generations have no baseline; an explicit roll establishes one.
     /// Future ConvoyEnsureSpec changes must also decode this embedded stored
@@ -1644,10 +1651,6 @@ impl ConvoyPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct WorkState {
-    /// Provisioning retry budget survives vessel teardown and controller restart.
-    /// ADR 0047: remove this decoder default one fleet roll after #2875.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provisioning_retry: Option<crate::ControllerRetry>,
     pub phase: WorkPhase,
     /// Authority responsible for settling this work at the roll-up level.
     #[builder(default)]
@@ -1663,6 +1666,8 @@ pub struct WorkState {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<PlacementStatus>,
+    // Retired with the vessel's move onto the engine (#3108): `provisioning_retry`, now the
+    // vessel requester's replacement backoff. Earlier records carrying it decode and drop it.
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1861,10 +1866,6 @@ pub enum ConvoyStatusPatch {
         activated: Box<ConvoyStatus>,
         previous: Box<ConvoyStatus>,
     },
-    ObserveEnvironment {
-        vessel: String,
-        observation: flotilla_protocol::EnvironmentRuntimeObservation,
-    },
     RecordNaming {
         naming: flotilla_protocol::ConvoyNaming,
     },
@@ -1969,11 +1970,6 @@ pub enum ConvoyStatusPatch {
         /// Crew whose sessions the vessel actually launched. Latent agents are
         /// absent and stay `Pending` until a handoff starts them.
         launched_roles: BTreeSet<String>,
-    },
-    WorkProvisioningRetry {
-        work: String,
-        retry: crate::ControllerRetry,
-        message: String,
     },
     WorkInterrupted {
         work: String,
@@ -2121,7 +2117,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::HandPromisesToEngine { .. } => "HandPromisesToEngine",
             Self::HoldTurnDelivery { .. } => "HoldTurnDelivery",
             Self::RestoreTurnActivation { .. } => "RestoreTurnActivation",
-            Self::ObserveEnvironment { .. } => "ObserveEnvironment",
             Self::RecordNaming { .. } => "RecordNaming",
             Self::DiscoverSubjects { .. } => "DiscoverSubjects",
             Self::RecordBranchSubjectScan { .. } => "RecordBranchSubjectScan",
@@ -2146,7 +2141,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::AcknowledgeSupervisorTurn { .. } => "AcknowledgeSupervisorTurn",
             Self::WorkLaunching { .. } => "WorkLaunching",
             Self::WorkRunning { .. } => "WorkRunning",
-            Self::WorkProvisioningRetry { .. } => "WorkProvisioningRetry",
             Self::WorkInterrupted { .. } => "WorkInterrupted",
             Self::ForceWorkCompleted { .. } => "ForceWorkCompleted",
             Self::MarkWorkFailed { .. } => "MarkWorkFailed",
@@ -2177,8 +2171,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
         if status.phase.is_terminal()
             && !matches!(
                 self,
-                Self::ObserveEnvironment { .. }
-                    | Self::RecordLandingEvent { .. }
+                Self::RecordLandingEvent { .. }
                     | Self::RecordLifecycleMutation { .. }
                     | Self::SetStalled { .. }
                     | Self::SetTeardownWait { .. }
@@ -2221,9 +2214,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         status.stalled = previous.stalled.clone();
                     }
                 }
-            }
-            Self::ObserveEnvironment { vessel, observation } => {
-                status.environment_observations.entry(vessel.clone()).or_default().merge(observation)
             }
             Self::RecordNaming { naming } => {
                 status.naming = Some(naming.clone());
@@ -2447,8 +2437,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::WorkRunning { work, started_at, launched_roles } => {
                 if let Some(state) = status.work.get_mut(work) {
-                    // Running ends this provisioning episode; later runtime failures start a new episode.
-                    state.provisioning_retry = None;
                     state.phase = WorkPhase::Running;
                     state.completion_authority = WorkCompletionAuthority::CrewRollup;
                     state.message = None;
@@ -2467,20 +2455,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         state.phase = CrewWorkPhase::Working;
                         state.message = None;
                     }
-                }
-            }
-            Self::WorkProvisioningRetry { work, retry, message } => {
-                let roles = status
-                    .crew_work
-                    .get(work)
-                    .into_iter()
-                    .flat_map(|crew| crew.iter())
-                    .filter(|(_, state)| state.phase == CrewWorkPhase::Working)
-                    .map(|(role, _)| role.clone())
-                    .collect();
-                Self::WorkInterrupted { work: work.clone(), roles, message: message.clone() }.apply(status);
-                if let Some(state) = status.work.get_mut(work) {
-                    state.provisioning_retry = Some(retry.clone());
                 }
             }
             Self::WorkInterrupted { work, roles, message } => {
@@ -4552,5 +4526,25 @@ mod selected_child_provenance_tests {
         let mut unrelated = untrusted;
         unrelated.object.metadata.labels.insert(CONVOY_LABEL.into(), "other-crew".into());
         assert!(select_convoy_children(&convoy, &[unrelated]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod retired_field_tests {
+    use super::*;
+
+    // ADR 0047: a convoy status stored before the vessel's move onto the engine (#3108) still
+    // decodes; its copied environment observations and its works' provisioning retries are dropped.
+    #[test]
+    fn a_status_with_its_retired_vessel_fields_decodes() {
+        let stored = serde_json::json!({
+            "phase": "Active",
+            "work": { "work": { "phase": "Running", "provisioning_retry": { "attempts": 2, "next_attempt_at": "2026-10-05T10:13:00Z" } } },
+            "environment_observations": { "work": { "memory_usage_bytes": 123 } },
+        });
+        let status: ConvoyStatus = serde_json::from_value(stored).expect("old status decodes");
+        assert_eq!((status.phase, status.work["work"].phase), (ConvoyPhase::Active, WorkPhase::Running));
+        let encoded = serde_json::to_string(&status).expect("encode");
+        assert!(!encoded.contains("provisioning_retry") && !encoded.contains("environment_observations"), "{encoded}");
     }
 }

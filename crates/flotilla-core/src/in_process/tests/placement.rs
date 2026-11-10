@@ -511,9 +511,8 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
         let spec = HostSpec { display_name: "shared-host".to_string(), connection: Default::default(), ..HostSpec::default() };
         put_host(&daemon, host_id, &spec, &HostStatus::default()).await;
     }
-    let backend = daemon.resource_backend();
-    create_running_session(&engine, &backend, &ambiguous_env, "terminal-ambiguous", "convoy-ambiguous", "watcher").await;
-    create_running_session(&engine, &backend, &local_env, "terminal-local", "convoy-local", "watcher").await;
+    create_running_session(&engine, &ambiguous_env, "terminal-ambiguous", "convoy-ambiguous", "watcher").await;
+    create_running_session(&engine, &local_env, "terminal-local", "convoy-local", "watcher").await;
 
     let rows = daemon.fleet_list_internal().await.expect("fleet list").rows;
     let hosts_by_convoy = rows.into_iter().map(|row| (row.convoy, row.host)).collect::<BTreeMap<_, _>>();
@@ -543,11 +542,11 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
     for (convoy, project) in [("convoy-one", "island-one"), ("convoy-two", "island-two")] {
         create_identity_convoy(&backend, convoy, convoy, Some(project)).await;
         if convoy == "convoy-one" {
-            ensure_vessel(&backend, "vessel-one", convoy, "work").await;
+            let vessel = ensure_vessel(&engine, convoy, "work");
             let launch = engine.terminals.request(&TerminalLaunchRequest {
                 session: "terminal-convoy-one".to_string(),
                 environment: env.clone(),
-                vessel: Some("vessel-one".to_string()),
+                vessel: Some(vessel),
                 role: "coder".to_string(),
                 pool: "passthrough".to_string(),
                 cwd: "/repo".to_string(),
@@ -572,7 +571,7 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
             // Its crew id is its launch's name.
             crew_one = launch;
         } else {
-            create_running_session(&engine, &backend, &env, &format!("terminal-{convoy}"), convoy, "coder").await;
+            create_running_session(&engine, &env, &format!("terminal-{convoy}"), convoy, "coder").await;
         }
     }
 

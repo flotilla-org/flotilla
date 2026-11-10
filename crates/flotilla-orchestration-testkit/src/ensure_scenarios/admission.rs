@@ -9,8 +9,18 @@ pub async fn two_origins_admit_identical_placements_without_authorship_collision
 }
 
 pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_second_convoy(factory: &dyn EnsureScenarioController) {
-    use flotilla_resources::Actuation;
+    use flotilla_admission::reconcilers::vessel_requests::{VesselReleaseGate, VesselRequests};
+    use flotilla_resources::vessel_records::{VesselRecords, VesselStep};
     use flotilla_store::controller::Reconciler;
+
+    /// The governor's convoy never ends here: no release is asked of the gate.
+    struct NeverReleased;
+    #[async_trait::async_trait]
+    impl VesselReleaseGate for NeverReleased {
+        async fn may_release(&self, convoy: &str, _convoy_home: &str) -> Result<(), String> {
+            Err(format!("convoy {} is live", convoy))
+        }
+    }
 
     let (daemon, backend, clock, temp) = standing_ensure_fixture(factory).await;
     configure_standing_ensure_agent(&daemon, Vec::new()).await;
@@ -48,35 +58,23 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
     );
     convoys.update_status(&convoy_name, &admitted.metadata.resource_version, &status).await.expect("running governor");
-    let vessels = backend.clone().using::<Vessel>("flotilla");
-    let vessel_name = format!("{convoy_name}-work");
-    let vessel = vessels
-        .create(
-            &InputMeta::builder()
-                .name(vessel_name.clone())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.clone())]))
-                .build(),
-            &VesselSpec {
-                convoy_ref: convoy_name.clone(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "docker".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
+    // The governor's work runs in its first launch, which a host reboot loses with its container.
+    let requests = |daemon: &InProcessDaemon| {
+        VesselRequests::new(
+            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), "flotilla")),
+            daemon.lifecycle_reads(),
+            Arc::new(NeverReleased),
+            // The host the governor's work is placed on: the standing agent's.
+            flotilla_protocol::CanonicalHostId::resolved("standing-agent-host"),
+            [],
         )
-        .await
-        .expect("governor vessel");
-    vessels
-        .update_status(
-            &vessel_name,
-            &vessel.metadata.resource_version,
-            &flotilla_resources::VesselStatus {
-                phase: flotilla_resources::VesselPhase::Failed,
-                message: Some("Docker container stopped after host reboot".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("lost container");
+    };
+    let requested = requests(&daemon).sync_once(chrono::Utc::now()).await.expect("launch the governor").requested;
+    assert_eq!(requested.len(), 1, "one launch of the governor's work");
+    let first = requested[0].clone();
+    let vessels = &engine(&daemon).vessels;
+    vessels.ready(&first, "env-governor");
+    vessels.step(&first, VesselStep::Lost { reason: "Docker container stopped after host reboot".to_string() });
     assert!(daemon.lifecycle_reads().checkouts().and_then(|checkouts| checkouts.here()).expect("checkouts here").is_empty());
     drop(daemon);
     let restarted = InProcessDaemon::new_with_resource_backend_and_clock(
@@ -98,56 +96,27 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         ))
         .await;
 
+    // The lost launch interrupts the work, keeping the cause; the convoy does not fail.
     let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-        .with_vessels(vessels.clone())
+        .with_vessels(backend.clone().using::<Vessel>("flotilla"))
         .with_lifecycle_reads(restarted.lifecycle_reads());
     let convoy = convoys.get(&convoy_name).await.expect("governor after reboot");
     let outcome = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("reboot observations"), clock.now());
-    assert!(matches!(outcome.patch, Some(flotilla_resources::ConvoyStatusPatch::WorkProvisioningRetry { .. })));
-    // #2875: reboot recovery keeps the death cause and waits for a durable
-    // deadline, rather than replacing the governor at every watch tick.
-    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { .. })));
     flotilla_store::apply_status_patch(&convoys, &convoy_name, &outcome.patch.expect("interrupt work")).await.expect("interrupt work");
-    clock.advance(ChronoDuration::seconds(29));
-    let convoy = convoys.get(&convoy_name).await.expect("backing off governor");
-    assert_eq!(convoy.status.as_ref().expect("status").work["work"].message.as_deref(), Some("Docker container stopped after host reboot"));
-    let waiting = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("failed vessel still observed"), clock.now());
-    assert!(!waiting
-        .actuations
-        .iter()
-        .any(|actuation| matches!(actuation, Actuation::DeleteVessel { .. } | Actuation::CreateVessel { .. })));
-    clock.advance(ChronoDuration::seconds(1));
-    let retiring = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("failed vessel"), clock.now());
-    assert!(retiring.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == &vessel_name)));
-    vessels.delete(&vessel_name).await.expect("retire lost vessel");
-
     let convoy = convoys.get(&convoy_name).await.expect("interrupted governor");
-    let replacement = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("lost vessel absent"), clock.now());
-    assert_eq!(
-        replacement.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateVessel { .. })).count(),
-        1,
-        "convoy annotations: {:?}",
-        convoy.metadata.annotations
-    );
-    flotilla_store::apply_status_patch(&convoys, &convoy_name, &replacement.patch.expect("reserve next attempt"))
-        .await
-        .expect("retry reservation");
-    let convoy = convoys.get(&convoy_name).await.expect("reserved retry");
-    let stale_observation =
-        reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("replacement not yet observed"), clock.now());
-    assert!(!stale_observation.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
-    let (meta, spec) = replacement
-        .actuations
-        .into_iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateVessel { meta, spec } => Some((meta, spec)),
-            _ => None,
-        })
-        .expect("replacement vessel");
-    vessels.create(&meta, &spec).await.expect("admit replacement");
-    let convoy = convoys.get(&convoy_name).await.expect("standing convoy");
-    let repeated = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("replacement observed"), clock.now());
-    assert!(!repeated.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
+    assert_eq!(convoy.status.as_ref().expect("status").work["work"].phase, flotilla_resources::WorkPhase::Interrupted);
+
+    // #2875: the replacement waits out the backoff from the loss, rather than relaunching at
+    // every pass; then exactly one launch replaces it.
+    let lost_at = engine(&restarted).vessels.vessels.get(&first, None).expect("read").expect("lost launch").since;
+    let waiting = requests(&restarted).sync_once(lost_at + chrono::Duration::seconds(29)).await.expect("backing off");
+    assert!(waiting.requested.is_empty(), "no replacement inside the backoff");
+    let replaced = requests(&restarted).sync_once(lost_at + chrono::Duration::seconds(30)).await.expect("replace");
+    assert_eq!(replaced.requested.len(), 1, "one replacement launch");
+    assert_ne!(replaced.requested[0], first);
+    let repeated = requests(&restarted).sync_once(lost_at + chrono::Duration::seconds(31)).await.expect("replacement held");
+    assert!(repeated.requested.is_empty(), "the live replacement is kept");
+
     restarted.reconcile_convoy_ensures_once("flotilla").await.expect("ensure remains steady after restart");
     assert_eq!(convoys.list().await.expect("convoys").items.len(), 1);
     assert_ne!(convoys.get(&convoy_name).await.expect("convoy").status.expect("status").phase, ConvoyPhase::Failed);

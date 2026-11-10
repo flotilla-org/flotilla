@@ -15,9 +15,10 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 use futures::{FutureExt, StreamExt};
 
-use super::support::test_meta;
+use super::support::{test_engine, test_meta};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource};
 
 // #2559: an idle reconciliation pass must neither write resources nor emit
 // events, because its runtime caller is triggered by those same watches.
@@ -222,49 +223,31 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         )
         .await
         .expect("running governor");
-    let sessions = placement.clone().using::<ResourceTerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("governor-terminal".to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "governor-convoy".to_string()),
-                    (VESSEL_LABEL.to_string(), "govern".to_string()),
-                    (ROLE_LABEL.to_string(), "governor".to_string()),
-                ]))
-                .build(),
-            &ResourceTerminalSessionSpec {
-                env_ref: "remote-env".to_string(),
-                role: "governor".to_string(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("governor"),
-                    brief: flotilla_resources::TerminalBrief {
-                        path: "brief.md".to_string(),
-                        content: "standing brief".to_string(),
-                        artifact_digest: None,
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".to_string(),
-                        convoy: "governor-convoy".to_string(),
-                        vessel_ref: "governor-convoy-govern".to_string(),
-                    }),
-                },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
+    // The governor's session runs on the placement host, held for its work's launch there.
+    test_engine(&daemon);
+    let placement_engine = test_engine(&placement_daemon);
+    let vessel = placement_engine.vessels.request("governor-convoy", "govern", "placement");
+    let governor_session = placement_engine.terminals.request(&TerminalLaunchRequest {
+        session: "governor-terminal".to_string(),
+        environment: "remote-env".to_string(),
+        vessel: Some(vessel),
+        role: "governor".to_string(),
+        pool: "cleat".to_string(),
+        cwd: "/workspace".to_string(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Agent {
+            capability: "governor".to_string(),
+            adapter: None,
+            model: None,
+            brief: flotilla_resources::TerminalBrief {
+                path: "brief.md".to_string(),
+                content: "standing brief".to_string(),
+                artifact_digest: None,
+                copies: Vec::new(),
             },
-        )
-        .await
-        .expect("governor terminal on placement host");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() },
-        )
-        .await
-        .expect("running terminal");
+        },
+    });
+    placement_engine.terminals.ready(&governor_session, "governor-sid", &Default::default());
     let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
         .convoy("governor-convoy".to_string())

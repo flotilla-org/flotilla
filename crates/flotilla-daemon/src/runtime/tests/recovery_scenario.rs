@@ -117,6 +117,19 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     .await;
 
     let terminals = backend.clone().using::<TerminalSession>(NAMESPACE);
+    // The work runs once its vessel is ready; its crews are seated after, the coder first.
+    wait_until(|| {
+        let terminals = terminals.clone();
+        async move {
+            terminals.list().await.is_ok_and(|sessions| {
+                sessions
+                    .items
+                    .iter()
+                    .any(|session| session.spec.role == "coder" && session.status.as_ref().is_some_and(|status| status.crew.is_some()))
+            })
+        }
+    })
+    .await;
     let coder = terminals
         .list()
         .await

@@ -5,8 +5,11 @@ use tracing::Instrument;
 
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_resources::convoy_address::convoy_address;
-use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::ResumeIntent;
+use flotilla_resources::{
+    lifecycle_reads::{LifecycleReads, NoLifecycleReads},
+    vessel_records::engine_vessel,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -39,9 +42,7 @@ use flotilla_resources::{
 };
 #[cfg(test)]
 use flotilla_resources::{CrewMessageDelivery, TerminalCrewMessage};
-use flotilla_store::{
-    apply_status_patch as apply_resource_status_patch, controller::delete_lifecycle_owned_matching, off_frame, ResourceBackend, StoreQuery,
-};
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, off_frame, ResourceBackend, StoreQuery};
 use tokio::sync::{Mutex, RwLock};
 #[cfg(test)]
 use tracing::debug;
@@ -71,7 +72,7 @@ fn vessel_ending_reason(
         ResourceProvenance::Local => None,
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
     };
-    Ok(match reads.try_reading(ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref())? {
+    Ok(match engine_vessel(reads, &vessel.object, origin.as_deref())?.map(|record| record.reading) {
         Some(
             reading @ (LifecycleReading::Released
             | LifecycleReading::Lost { .. }
@@ -1616,12 +1617,9 @@ impl CrewService {
         // Every attention about the convoy and the records under it ends with them, acknowledged or
         // not; first, while the records still name what each is about.
         self.resource_backend.attentions().clear_within(namespace, &Subject::convoy(name)).await?;
-        let selector = BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]);
-        delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<Vessel>(namespace), &selector)
-            .await
-            .map_err(|error| error.to_string())?;
-        // The convoy's checkouts and terminal sessions are the engine's: their controllers release
-        // them once the engine Convoy, and the Vessels holding the sessions, have ended.
+        // The convoy's vessels, checkouts and terminal sessions are the engine's: the vessel
+        // requester releases each live launch once its convoy is gone, and their controllers release
+        // what was held for the engine Convoy and the launches once those have ended.
         Ok(())
     }
 
@@ -2902,8 +2900,19 @@ impl CrewService {
     }
 
     async fn ensure_vessel_backing_available(&self, namespace: &str, convoy: &str, vessel: &str) -> Result<(), String> {
-        let vessel_ref = flotilla_resources::vessel_resource_name(convoy, vessel);
-        match self.resource_backend.including_replicas::<flotilla_resources::Vessel>(namespace).get(&vessel_ref).await {
+        // The work's newest launch, at whichever home it runs: a work never launched has no
+        // backing to have lost.
+        let Some(launch) = self
+            .lifecycle_reads
+            .vessels()?
+            .of_convoy(convoy)?
+            .into_iter()
+            .filter(|launch| launch.work() == vessel)
+            .max_by_key(|launch| (launch.requested_at, launch.launch_number()))
+        else {
+            return Ok(());
+        };
+        match self.resource_backend.including_replicas::<flotilla_resources::Vessel>(namespace).get(&launch.name).await {
             Ok(resource) => {
                 if let Some((ending, reason)) = vessel_ending_reason(self.lifecycle_reads.as_ref(), &resource, "environment disappeared")? {
                     if !matches!(ending, flotilla_protocol::LifecycleReading::Lost { .. }) {
@@ -3828,17 +3837,16 @@ fn checkout_work_location(spec: &flotilla_resources::CheckoutSpec, path: &str) -
 mod vessel_ending_tests {
     use super::vessel_ending_reason;
     use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
-    use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
+    use flotilla_provisioning_testkit::{object, VesselsFixture};
     use flotilla_resources::{
-        lifecycle_reads::ProvisioningKind, ReadResourceObject, ResourceProvenance, Vessel, VesselPhase, VesselSpec, VesselStatus,
+        vessel_records::{engine_vessel, VesselStep},
+        ReadResourceObject, ResourceProvenance, Vessel, VesselPhase, VesselSpec, VesselStatus,
     };
 
-    // Crew listing and resume share one checked reading; stale Lost cannot hide a live lease.
-    #[test]
-    fn crew_services_read_the_lease_ending_without_a_copy() {
-        let fixture = VesselFixture::new(false);
-        let vessel = object::<Vessel>(
-            "vessel",
+    /// A stale Lost snapshot of launch `launch`.
+    fn stale(launch: &str) -> ReadResourceObject<Vessel> {
+        let object = object::<Vessel>(
+            launch,
             VesselSpec {
                 convoy_ref: "convoy".into(),
                 vessel_name: "work".into(),
@@ -3857,24 +3865,40 @@ mod vessel_ending_tests {
                 ..Default::default()
             },
         );
-        fixture.request(&vessel);
-        let vessel = ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local };
+        ReadResourceObject { object, provenance: ResourceProvenance::Local }
+    }
+
+    // Crew listing and resume share one checked reading; stale Lost cannot hide a live launch.
+    #[test]
+    fn crew_services_read_the_lease_ending_without_a_copy() {
+        let fixture = VesselsFixture::default();
+        let vessel = stale(&fixture.request("convoy", "work", "host"));
         assert!(vessel_ending_reason(fixture.reads.as_ref(), &vessel, "legacy").expect("live").is_none());
-        // Exhaustion is a failed judgement, not a committed ending: listing has no loss until GiveUp.
-        let pending = VesselFixture::new(false);
-        pending.request(&vessel.object);
-        pending.exhaust_before_give_up(&vessel.object, "provider refused");
+        // A failed try is not a committed ending: listing has no loss until GiveUp. The vessel port
+        // writes GiveUp as it exhausts a launch, so an Exhausted launch is no longer held to read (#3108).
+        let pending = VesselsFixture::default();
+        let retrying = stale(&pending.request("convoy", "work", "host"));
+        let fail =
+            || pending.step(&retrying.object.metadata.name, VesselStep::Failed { cause: "provider refused".into(), retryable: true });
+        fail();
+        assert!(vessel_ending_reason(pending.reads.as_ref(), &retrying, "legacy").expect("no ending yet").is_none());
+        let ended = || engine_vessel(pending.reads.as_ref(), &retrying.object, None).expect("read").expect("launch").ended();
+        for _ in 0..32 {
+            if ended() {
+                break;
+            }
+            fail();
+        }
         assert_eq!(
-            pending.reads.try_reading(ProvisioningKind::Vessel, "vessel", None).expect("exhausted"),
-            Some(LifecycleReading::Exhausted { cause: "provider refused".into() })
+            vessel_ending_reason(pending.reads.as_ref(), &retrying, "legacy").expect("gave up"),
+            Some((LifecycleReading::GaveUp { cause: "provider refused".into() }, "provider refused".into()))
         );
-        assert!(vessel_ending_reason(pending.reads.as_ref(), &vessel, "legacy").expect("no ending yet").is_none());
-        fixture.finish(&vessel.object, Ending::Released);
+        fixture.step(&vessel.object.metadata.name, VesselStep::Released);
         assert_eq!(
             vessel_ending_reason(fixture.reads.as_ref(), &vessel, "legacy").expect("ended"),
             Some((LifecycleReading::Released, "released".into()))
         );
-        fixture.poison();
+        flotilla_store_testkit::poison_mutex(std::sync::Arc::clone(&fixture.store));
         assert!(vessel_ending_reason(fixture.reads.as_ref(), &vessel, "legacy").unwrap_err().contains("poisoned"));
     }
 }

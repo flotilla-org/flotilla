@@ -530,6 +530,45 @@ impl EnvironmentProvider for TestInteriorEnvironmentProvider {
     }
 }
 
+/// Provisions one environment, made for the id it is requested under: an environment's name
+/// follows its vessel's launch, which a test cannot know beforehand (#3108).
+pub(super) struct RequestedInteriorEnvironmentProvider {
+    pub(super) make: Mutex<Option<MakeEnvironment>>,
+}
+
+/// Makes the environment provisioned under the id given.
+pub(super) type MakeEnvironment = Box<dyn FnOnce(EnvironmentId) -> EnvironmentHandle + Send>;
+
+#[async_trait]
+impl EnvironmentProvider for RequestedInteriorEnvironmentProvider {
+    flotilla_discovery_testkit::injected_environment_provider!();
+    async fn prepare(
+        &self,
+        _spec: &flotilla_resources::EnvironmentSpec,
+        _opts: &flotilla_environment::environment::PrepareOpts,
+    ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
+        Ok(flotilla_environment::environment::PreparedEnvironment::new(&Arc::new(()), ()))
+    }
+
+    async fn provision(
+        &self,
+        id: EnvironmentId,
+        _image: &flotilla_environment::environment::PreparedEnvironment,
+        _opts: flotilla_environment::environment::ProvisionOpts,
+    ) -> Result<EnvironmentHandle, EnvironmentProvisionError> {
+        let make = self.make.lock().await.take().ok_or_else(|| EnvironmentProvisionError::from("test environment already created"))?;
+        Ok(make(id))
+    }
+
+    async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn destroy(&self, _container_id: &str) -> Result<(), String> {
+        Err("not used".to_string())
+    }
+}
+
 pub(super) struct AdoptionEnvironmentProvider {
     pub(super) handles: Vec<EnvironmentHandle>,
 }
@@ -753,7 +792,9 @@ pub(super) fn passthrough_registry() -> Arc<ProviderRegistry> {
     Arc::new(registry)
 }
 
-pub(super) fn passthrough_registry_with_environment(handle: EnvironmentHandle) -> Arc<ProviderRegistry> {
+pub(super) fn passthrough_registry_with_environment(
+    make: impl FnOnce(EnvironmentId) -> EnvironmentHandle + Send + 'static,
+) -> Arc<ProviderRegistry> {
     use flotilla_discovery::registry::ProviderRegistry;
     use flotilla_terminal::passthrough::PassthroughTerminalPool;
 
@@ -767,7 +808,7 @@ pub(super) fn passthrough_registry_with_environment(handle: EnvironmentHandle) -
     registry.environment_providers.insert(
         "docker",
         ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
-        Arc::new(TestInteriorEnvironmentProvider { handle: Mutex::new(Some(handle)) }),
+        Arc::new(RequestedInteriorEnvironmentProvider { make: Mutex::new(Some(Box::new(make))) }),
     );
     Arc::new(registry)
 }

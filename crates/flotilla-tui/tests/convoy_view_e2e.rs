@@ -192,7 +192,6 @@ async fn generated_table_action_completes_work() {
     work.insert(
         "implement".to_string(),
         WorkState {
-            provisioning_retry: None,
             phase: WorkPhase::Pending,
             completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: None,

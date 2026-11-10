@@ -43,6 +43,7 @@ use crate::{
         environment::{EnvironmentKind, EnvironmentRequest},
         host::{HostObservation, Readiness},
         image_build::{Delivery, ImageBuildKind},
+        terminal_session::{TerminalSessionKind, TerminalSessionRequest},
         Holder,
     },
 };
@@ -90,6 +91,7 @@ const IMAGE_BUILD: KindCode = <Resource<Lifecycle<ImageBuildKind>> as Kind>::COD
 const CHECKOUT: KindCode = <Resource<Lifecycle<CheckoutKind>> as Kind>::CODE;
 const VESSEL: KindCode = <Resource<Lifecycle<VesselKind>> as Kind>::CODE;
 const OBSERVATION: KindCode = <HostObservation as Kind>::CODE;
+const TERMINAL_SESSION: KindCode = <Resource<Lifecycle<TerminalSessionKind>> as Kind>::CODE;
 
 fn failed(detail: impl Into<String>, retryable: bool) -> ProviderFailure {
     let category = if retryable { CauseCategory::Transient } else { CauseCategory::External };
@@ -260,7 +262,7 @@ where
     }
 
     fn followed(&self) -> Vec<KindCode> {
-        vec![IMAGE_BUILD, VESSEL, CHECKOUT, OBSERVATION]
+        vec![IMAGE_BUILD, VESSEL, CHECKOUT, TERMINAL_SESSION, OBSERVATION]
     }
 
     fn dependencies(&self, request: &EnvironmentRequest) -> Vec<Identity> {
@@ -308,22 +310,35 @@ where
         Ok(facts)
     }
 
+    /// The checkouts made in it and the terminal sessions running in it: each is released
+    /// before the environment it lives in.
     fn release_blockers(&self, read: &mut Read<'_>, name: &str, _: &EnvironmentRequest) -> Result<Vec<Identity>, StoreError> {
-        let query = CheckoutRequest::by_environment(&Ref::new(name.to_owned(), self.home.clone()));
-        let mut blockers = Vec::new();
-        let mut after = None;
-        loop {
-            let page = read.page(&query, after.as_ref(), 256)?;
-            for id in page.ids {
-                let Some(loaded) = read.load::<Resource<Lifecycle<CheckoutKind>>>(id)? else { continue };
-                if loaded.value.state().live() {
-                    blockers.push(Identity { kind: CHECKOUT, name: loaded.name, home: loaded.home });
-                }
+        let environment = Ref::new(name.to_owned(), self.home.clone());
+        let mut blockers = live::<CheckoutKind, _>(read, &CheckoutRequest::by_environment(&environment), CHECKOUT)?;
+        blockers.extend(live::<TerminalSessionKind, _>(read, &TerminalSessionRequest::by_environment(&environment), TERMINAL_SESSION)?);
+        Ok(blockers)
+    }
+}
+
+/// The live resources of kind `K` that `query` selects, as `code` identities.
+fn live<K, Q>(read: &mut Read<'_>, query: &flotilla_schema::IndexQuery<Q>, code: KindCode) -> Result<Vec<Identity>, StoreError>
+where
+    K: flotilla_state_machines::machines::lifecycle::LifecycleKind,
+    Resource<Lifecycle<K>>: Kind,
+{
+    let mut live = Vec::new();
+    let mut after = None;
+    loop {
+        let page = read.page(query, after.as_ref(), 256)?;
+        for id in page.ids {
+            let Some(loaded) = read.load::<Resource<Lifecycle<K>>>(id)? else { continue };
+            if loaded.value.state().live() {
+                live.push(Identity { kind: code, name: loaded.name, home: loaded.home });
             }
-            match page.next {
-                Some(next) => after = Some(next),
-                None => return Ok(blockers),
-            }
+        }
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return Ok(live),
         }
     }
 }

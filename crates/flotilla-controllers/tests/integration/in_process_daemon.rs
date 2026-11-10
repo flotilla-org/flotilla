@@ -1176,10 +1176,9 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let _engine = install_engine_reads(&daemon);
+    let engine = install_engine(&daemon);
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let vessels = backend.clone().using::<flotilla_resources::Vessel>("flotilla");
     let change_requests = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
     let repo_ref = flotilla_resources::RepositoryKey("repo-a".to_string());
     let workflow = implement_review_workflow_spec();
@@ -1234,21 +1233,8 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
         .await
         .expect("create convoy");
     convoys.update_status("terminal-checkout", &convoy.metadata.resource_version, &status).await.expect("publish landing status");
-    let vessel = vessels
-        .create(
-            &InputMeta::builder()
-                .name("terminal-checkout-work".to_string())
-                .labels(BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), "terminal-checkout".to_string())]))
-                .build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "terminal-checkout".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create live vessel");
+    // The work's live launch.
+    let vessel = engine.vessels.request("terminal-checkout", "work", "host");
     let observed_at = chrono::Utc::now();
     let record_name = cr_name("github.com", "owner/repo", 42);
     let record = change_requests
@@ -1305,7 +1291,8 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
     assert!(!explanation.settlement.satisfied, "a live vessel must retain its missing-checkout expectation");
     assert!(explanation.settlement.unmet.iter().any(|unmet| unmet.reason == "missing_record" && unmet.subject == "checkout/checkout-dead"));
 
-    vessels.delete(&vessel.metadata.name).await.expect("tear down vessel");
+    // Its home releases it: the launch is torn down.
+    engine.vessels.step(&vessel, flotilla_resources::vessel_records::VesselStep::Released);
     let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
     assert!(explanation.settlement.satisfied, "terminal world evidence should discharge the torn-down vessel's checkout");
     assert!(explanation.settlement.unmet.is_empty());
@@ -8864,7 +8851,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let _engine = install_decided_engine(&authority);
+    let authority_engine = install_decided_engine(&authority);
     let terminal_host = InProcessDaemon::new(
         vec![],
         test_config_store(terminal_temp.path().join("config")),
@@ -8930,23 +8917,11 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         .await
         .expect("create convoy");
     convoys.update_status("handoff-convoy", &created.metadata.resource_version, &initial_status).await.expect("set crew status");
-    authority
-        .resource_backend()
-        .using::<flotilla_resources::Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("work-vessel".to_string()).build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "handoff-convoy".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "host-direct".to_string(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("create vessel");
+    // The work's launch, homed at the authority.
+    let vessel_ref = authority_engine.vessels.request("handoff-convoy", "work", "feta");
     let session_name = |role: &str, index| {
         flotilla_resources::TerminalSessionIdentity::builder()
-            .vessel_ref("work-vessel".to_string())
+            .vessel_ref(vessel_ref.clone())
             .convoy("handoff-convoy".to_string())
             .vessel("work".to_string())
             .role(role.to_string())
@@ -8956,23 +8931,19 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
             .build()
             .name()
     };
-    // The vessel's convoy reaches the session's home as the authority's records replicate there.
-    let replicate_vessel = || async {
-        let vessels = authority.resource_backend().using::<flotilla_resources::Vessel>("flotilla").list().await.expect("vessels");
-        terminal_host
-            .resource_backend()
-            .replica_writer::<flotilla_resources::Vessel>(authority.node_id().clone(), "flotilla")
-            .replace(&vessels, chrono::Utc::now())
-            .await
-            .expect("replicate vessel");
-    };
-    replicate_vessel().await;
+    // The vessel's launch reaches the session's home as the authority's home replicates there.
+    let authority_store = authority.decided_store().expect("authority store");
+    flotilla_provisioning_testkit::replicate_home(
+        &authority_store,
+        authority_store.home(),
+        &terminal_host.decided_store().expect("terminal host store"),
+    );
     // Each crew session is launched at the terminal host, and its log reaches the authority.
     let start_session = |role: &str, index| {
         let launch = terminal_engine.terminals.request(&TerminalLaunchRequest {
             session: session_name(role, index),
             environment: "remote-environment".to_string(),
-            vessel: Some("work-vessel".to_string()),
+            vessel: Some(vessel_ref.clone()),
             role: role.to_string(),
             pool: "fake-terminals".to_string(),
             cwd: "/workspace".to_string(),
@@ -9000,7 +8971,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         crew_id: None,
         namespace: Some("flotilla".to_string()),
         convoy: Some("handoff-convoy".to_string()),
-        vessel_ref: Some("work-vessel".to_string()),
+        vessel_ref: Some(vessel_ref.clone()),
         role: Some("coder".to_string()),
     };
 
@@ -9057,7 +9028,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let _engine = install_decided_engine(&authority);
+    let authority_engine = install_decided_engine(&authority);
     let terminal_host = InProcessDaemon::new(
         vec![],
         test_config_store(terminal_temp.path().join("config")),
@@ -9097,27 +9068,14 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         )
         .await
         .expect("mark stalled crew work");
-    // The crew's vessel, held at the authority, reaches the terminal host as its records replicate.
-    let vessel_ref = flotilla_resources::vessel_resource_name("split-convoy", "work");
-    let vessels = authority.resource_backend().using::<flotilla_resources::Vessel>("flotilla");
-    vessels
-        .create(
-            &InputMeta::builder().name(vessel_ref.clone()).build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "split-convoy".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "host-direct".to_string(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("create vessel");
-    terminal_host
-        .resource_backend()
-        .replica_writer::<flotilla_resources::Vessel>(authority.node_id().clone(), "flotilla")
-        .replace(&vessels.list().await.expect("vessel snapshot"), chrono::Utc::now())
-        .await
-        .expect("replicate vessel");
+    // The crew's launch, homed at the authority, reaches the terminal host as its home replicates.
+    let vessel_ref = authority_engine.vessels.request("split-convoy", "work", "feta");
+    let authority_store = authority.decided_store().expect("authority store");
+    flotilla_provisioning_testkit::replicate_home(
+        &authority_store,
+        authority_store.home(),
+        &terminal_host.decided_store().expect("terminal host store"),
+    );
     // The crew's session is launched at the terminal host, and its log reaches the authority.
     let launch = terminal_engine.terminals.request(&TerminalLaunchRequest {
         session: "split-session".to_string(),
@@ -9301,23 +9259,10 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         )
         .await
         .expect("mark crew working");
-    // Each crew's vessel holds its session, launched and running.
-    let vessels = backend.clone().using::<flotilla_resources::Vessel>("flotilla");
+    // Each crew's vessel launch holds its session, launched and running.
     let mut launches = BTreeMap::new();
     for (vessel, role, capability, session_id) in [("work", "coder", "coding", "idle-coder"), ("review", "qa", "review", "idle-review")] {
-        let vessel_ref = flotilla_resources::vessel_resource_name("idle-convoy", vessel);
-        vessels
-            .create(
-                &InputMeta::builder().name(vessel_ref.clone()).build(),
-                &flotilla_resources::VesselSpec {
-                    convoy_ref: "idle-convoy".to_string(),
-                    vessel_name: vessel.to_string(),
-                    fulfilment_kind_ref: "host-direct".to_string(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                },
-            )
-            .await
-            .expect("create crew vessel");
+        let vessel_ref = engine.vessels.request("idle-convoy", vessel, daemon.host_name().as_str());
         let launch = engine.terminals.request(&crew_session_request(
             &format!("idle-{role}-session"),
             &vessel_ref,
@@ -9452,7 +9397,7 @@ async fn convoy_explain_reports_completed_work_without_a_crew_claim() {
 
 #[tokio::test]
 async fn operator_forced_completion_settles_a_ledger_less_crew() {
-    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let (_temp, _repo, daemon, engine) = daemon_for_cwd_with_engine().await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys
@@ -9489,20 +9434,8 @@ async fn operator_forced_completion_settles_a_ledger_less_crew() {
         )
         .await
         .expect("mark crew working");
-    backend
-        .clone()
-        .using::<flotilla_resources::Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("missing-ledger-vessel".to_string()).build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "missing-ledger".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create vessel");
+    // The work's launch.
+    let vessel_ref = engine.vessels.request("missing-ledger", "work", daemon.host_name().as_str());
 
     let admitted = convoys.get("missing-ledger").await.unwrap();
     for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], admitted.status.as_ref().unwrap(), false) {
@@ -9520,7 +9453,7 @@ async fn operator_forced_completion_settles_a_ledger_less_crew() {
                         crew_id: None,
                         namespace: Some("flotilla".to_string()),
                         convoy: Some("missing-ledger".to_string()),
-                        vessel_ref: Some("missing-ledger-vessel".to_string()),
+                        vessel_ref: Some(vessel_ref.clone()),
                         role: Some("coder".to_string()),
                     },
                     message: Some("operator accepted the ledger-less claim".to_string()),
@@ -10178,7 +10111,7 @@ async fn explicit_convoy_name_survives_failed_branch_generation() {
 async fn convoy_resume_milliseconds_after_complete_still_lands() {
     use flotilla_resources::StatusPatch;
     use flotilla_store::controller::Reconciler;
-    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let (_temp, _repo, daemon, engine) = daemon_for_cwd_with_engine().await;
     let backend = daemon.resource_backend();
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let created = convoys
@@ -10219,19 +10152,8 @@ async fn convoy_resume_milliseconds_after_complete_still_lands() {
         )
         .await
         .unwrap();
-    backend
-        .using::<flotilla_resources::Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("claimed-resume-vessel".into()).build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "claimed-resume".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .unwrap();
+    // The work's launch.
+    engine.vessels.request("claimed-resume", "work", daemon.host_name().as_str());
     let mut events = daemon.subscribe();
     let mut current = convoys.get("claimed-resume").await.unwrap();
     let status = current.status.as_mut().unwrap();

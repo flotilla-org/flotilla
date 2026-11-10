@@ -160,11 +160,11 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             .await
             .expect("admitted claim");
         let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-        ensure_vessel(&backend, "turn-credential-vessel", "turn-credential-work", "work").await;
+        let vessel = ensure_vessel(&engine, "turn-credential-work", "work");
         let launch = engine.terminals.request(&TerminalLaunchRequest {
             session: "turn-credential-session".to_string(),
             environment: "credential-env".to_string(),
-            vessel: Some("turn-credential-vessel".to_string()),
+            vessel: Some(vessel),
             role: "coder".to_string(),
             pool: "passthrough".to_string(),
             cwd: "/repo".to_string(),

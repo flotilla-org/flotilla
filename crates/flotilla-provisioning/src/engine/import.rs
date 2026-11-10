@@ -46,20 +46,25 @@ use flotilla_engine_store::{ImportTarget, Rehearsal, IMPORT_WRITER};
 use flotilla_resources::{
     Checkout as OldCheckout, CheckoutPhase, Clone as OldClone, ClonePhase, Environment as OldEnvironment, EnvironmentPhase,
     EnvironmentStatus, ImageBuild as OldImageBuild, ImageBuildFailureClass, ImageBuildPhase, ResourceObject,
-    TerminalSession as OldTerminalSession, TerminalSessionPhase, Vessel as OldVessel, VesselPhase,
+    TerminalSession as OldTerminalSession, TerminalSessionPhase, Vessel as OldVessel, VesselPhase, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 use flotilla_schema::{Kind, NewChange, State, Timestamp};
 use flotilla_state_machines::{
-    machines::lifecycle::{Ending, Lifecycle, LifecycleKind, LifecycleState},
+    machines::{
+        convoy::{ConvoyId, Priority, VesselClass},
+        lifecycle::{Ending, Lifecycle, LifecycleKind, LifecycleState},
+        vessel::{VesselKind, VesselSpec},
+    },
+    placement::Host,
     Cause, CauseCategory, Failure, Resource, Version,
 };
 
 use flotilla_resources::{
     checkout_records::{launched, CheckoutHolder, Inspection},
-    CONVOY_LABEL,
+    vessel_resource_name, CONVOY_LABEL,
 };
 
-use super::{checkouts, clones, environments, image_build::ImageBuildBinding, terminals, vessel::VesselBinding, Binding};
+use super::{checkouts, clones, environments, image_build::ImageBuildBinding, terminals, vessel::PINNED_CLASS, Binding};
 use crate::stored::{
     checkout::{CheckoutFacts, CheckoutKind},
     clone::{CloneFacts, CloneKind},
@@ -67,6 +72,7 @@ use crate::stored::{
     launch_facts::EnvironmentLaunchFacts,
     terminal_facts::{AgentLaunch, TerminalEndpoint, TerminalLaunchFacts},
     terminal_session::TerminalSessionKind,
+    Holder,
 };
 
 /// A kind whose old records the import maps.
@@ -240,42 +246,108 @@ where
     }
 }
 
-/// Imports old Vessel `records` into `target` (#3629 Q6). A vessel that was placed is a lease
-/// granted on its pinned host; one never placed held no lease and is not stored, so it is noted
-/// rather than refused: a waiting one is taken on by the write path once it is placed.
-pub fn import_vessels(records: &[(ResourceObject<OldVessel>, String)], target: &mut impl ImportTarget, report: &mut ImportReport) {
-    let mut placed = Vec::new();
-    for (vessel, home) in records.iter().filter(|(_, home)| target.imports(home)) {
-        let name = &vessel.metadata.name;
-        if VesselBinding::pinned_host(vessel).is_some() {
-            if vessel.status.as_ref().is_some_and(|status| status.phase == VesselPhase::Pending) {
-                // Not a state the old reconciler writes (see `imported_state`): imported, and named.
-                report.notes.push(format!("Vessel `{name}` is Pending with a recorded placement: imported as requested"));
-            }
-            placed.push((vessel.clone(), home.clone()));
+/// Each imported vessel's launch, by its home and old name: what was held for the old vessel (its
+/// environment, its crews' terminal sessions) is held for that launch.
+pub type VesselLaunches = BTreeMap<(String, String), String>;
+
+/// Imports old Vessel `records` into `target` (#3629 Q6), each as the first launch of its work
+/// (`<convoy>-<work>#<n>`, n the home sequence its create takes). A vessel that was placed is a
+/// lease granted on its pinned host; one never placed held no lease and is not stored, so it is
+/// noted rather than refused: its home's vessel requester requests its work's launch.
+pub fn import_vessels(
+    records: &[(ResourceObject<OldVessel>, String)],
+    target: &mut impl ImportTarget,
+    report: &mut ImportReport,
+) -> VesselLaunches {
+    let mut launches = VesselLaunches::new();
+    for (vessel, home) in records {
+        if !target.imports(home) {
             continue;
         }
-        match vessel.status.as_ref().map(|status| status.phase).unwrap_or_default() {
-            VesselPhase::Pending => {
-                report.notes.push(format!("Vessel `{name}` is not placed yet: waiting, not stored until the write path places it"))
+        let name = &vessel.metadata.name;
+        if pinned_host(vessel).is_none() {
+            match vessel.status.as_ref().map(|status| status.phase).unwrap_or_default() {
+                VesselPhase::Pending => {
+                    report.notes.push(format!("Vessel `{name}` is not placed yet: not stored; its home requests its work's launch"))
+                }
+                VesselPhase::Lost | VesselPhase::Failed => {
+                    report.notes.push(format!("Vessel `{name}` ended before it was placed: not stored"))
+                }
+                // Provisioning or later with no recorded placement has no lease to import: refused,
+                // so the roll lists it.
+                phase => report.refused.push(ImportRefusal {
+                    kind: "Vessel",
+                    record: name.clone(),
+                    reason: format!("{phase:?} with no recorded placement: no lease to import"),
+                }),
             }
-            VesselPhase::Lost | VesselPhase::Failed => report.notes.push(format!("Vessel `{name}` ended before it was placed: not stored")),
-            // Provisioning or later with no recorded placement has no lease to import: refused, so
-            // the roll lists it.
-            phase => report.refused.push(ImportRefusal {
-                kind: "Vessel",
-                record: name.clone(),
-                reason: format!("{phase:?} with no recorded placement: no lease to import; the old path keeps it"),
-            }),
+            continue;
         }
+        if vessel.status.as_ref().is_some_and(|status| status.phase == VesselPhase::Pending) {
+            // Not a state the old reconciler writes (see `vessel_state`): imported, and named.
+            report.notes.push(format!("Vessel `{name}` is Pending with a recorded placement: imported as requested"));
+        }
+        let result = import_vessel(vessel, home).and_then(|mut imported| {
+            let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+            write_imported(target, &mut imported, &change).map(|()| imported).map_err(|reason| ImportRefusal {
+                kind: VesselKind::NAME,
+                record: name.clone(),
+                reason,
+            })
+        });
+        if let Ok(imported) = &result {
+            launches.insert((home.clone(), name.clone()), imported.resource.name().to_owned());
+        }
+        report.record(&result);
     }
-    import_records::<VesselBinding>(&placed, target, report);
+    launches
+}
+
+/// Maps old Vessel `obj`, homed at `home`, onto its work's first launch: leased on the host its
+/// placement recorded, in the convoy homed where it was admitted.
+pub fn import_vessel(obj: &ResourceObject<OldVessel>, home: &str) -> Result<ImportedResource<VesselKind>, ImportRefusal> {
+    let refuse = |reason: String| ImportRefusal { kind: VesselKind::NAME, record: obj.metadata.name.clone(), reason };
+    let host = pinned_host(obj).ok_or_else(|| refuse("no recorded placement: no lease to import".to_owned()))?;
+    // The convoy is homed where it was admitted: the root a federated convoy's vessel records, or
+    // this home.
+    let convoy_home = obj.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map_or(home, String::as_str);
+    let launch_of = vessel_resource_name(flotilla_resources::convoy::launch_of(&obj.spec.convoy_ref), &obj.spec.vessel_name);
+    let request = VesselSpec {
+        launch_of: launch_of.clone(),
+        launch: 0,
+        convoy: ConvoyId::new(obj.spec.convoy_ref.clone(), convoy_home),
+        class: VesselClass::new(PINNED_CLASS),
+        shape: BTreeMap::new(),
+        priority: Priority(0),
+        host: Host::new(host),
+    };
+    let state = vessel_state(obj).map_err(refuse)?;
+    let since = Timestamp::from_datetime(&obj.metadata.creation_timestamp);
+    Ok(ImportedResource {
+        record: obj.metadata.name.clone(),
+        home: home.to_owned(),
+        resource: Resource::stored(launch_of, request, State::new(state, since), Version(1)),
+    })
+}
+
+/// The host old vessel `obj` was pinned to at admission, once its provisioning recorded the
+/// placement: its lease's host.
+fn pinned_host(obj: &ResourceObject<OldVessel>) -> Option<&str> {
+    obj.status.as_ref().and_then(|status| status.placement_decision.as_ref()).map(|decision| decision.target_host.reference.as_str())
+}
+
+/// `holder` as the launch its old vessel imported as, at `home`: unchanged when it names no
+/// imported vessel.
+fn held_for_launch(holder: &str, home: &str, vessels: &VesselLaunches) -> String {
+    vessels.get(&(home.to_owned(), holder.to_owned())).cloned().unwrap_or_else(|| holder.to_owned())
 }
 
 /// [`import_vessels`] into a [`rehearsal`] of its own.
 pub fn rehearse_vessels(records: &[(ResourceObject<OldVessel>, String)], report: &mut ImportReport) {
     match rehearsal() {
-        Ok(mut rehearsal) => import_vessels(records, &mut rehearsal, report),
+        Ok(mut rehearsal) => {
+            import_vessels(records, &mut rehearsal, report);
+        }
         Err(reason) => report.refused.push(ImportRefusal { kind: "Vessel", record: "<all>".to_owned(), reason }),
     }
 }
@@ -285,6 +357,7 @@ pub fn rehearse_vessels(records: &[(ResourceObject<OldVessel>, String)], report:
 /// may still run (a failed teardown or provision), so its teardown is still owed.
 pub fn import_environments(
     records: &[(ResourceObject<OldEnvironment>, String)],
+    vessels: &VesselLaunches,
     target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) {
@@ -299,7 +372,7 @@ pub fn import_environments(
     }
     for (environment, home) in &kept {
         let refuse = |reason: String| ImportRefusal { kind: EnvironmentKind::NAME, record: environment.metadata.name.clone(), reason };
-        let result = import_environment(environment, home).and_then(|imported| {
+        let result = import_environment(environment, home, vessels).and_then(|imported| {
             let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
             target.write(home, imported.resource.name(), &change, &imported.resource).map_err(refuse)?;
             // A realised launch keeps the facts its provider reported, written beside it.
@@ -314,12 +387,21 @@ pub fn import_environments(
 }
 
 /// Maps old Environment `obj`, homed at `home`, onto its engine resource: the request the
-/// environment port makes, held for the vessel its label names.
-pub fn import_environment(obj: &ResourceObject<OldEnvironment>, home: &str) -> Result<ImportedResource<EnvironmentKind>, ImportRefusal> {
+/// environment port makes, held for the launch the vessel its label names imported as.
+pub fn import_environment(
+    obj: &ResourceObject<OldEnvironment>,
+    home: &str,
+    vessels: &VesselLaunches,
+) -> Result<ImportedResource<EnvironmentKind>, ImportRefusal> {
     let refuse = |reason: String| ImportRefusal { kind: EnvironmentKind::NAME, record: obj.metadata.name.clone(), reason };
     // An empty label names no vessel.
-    let vessel = obj.metadata.labels.get(flotilla_resources::VESSEL_REF_LABEL).filter(|vessel| !vessel.is_empty());
-    let request = environments::request_of(&obj.spec, vessel.map(String::as_str), home).map_err(refuse)?;
+    let vessel = obj
+        .metadata
+        .labels
+        .get(flotilla_resources::VESSEL_REF_LABEL)
+        .filter(|vessel| !vessel.is_empty())
+        .map(|vessel| held_for_launch(vessel, home, vessels));
+    let request = environments::request_of(&obj.spec, vessel.as_deref(), home).map_err(refuse)?;
     let state = environment_state(obj).map_err(refuse)?;
     let since = Timestamp::from_datetime(&obj.metadata.creation_timestamp);
     Ok(ImportedResource {
@@ -561,6 +643,7 @@ pub fn import_checkout(
 /// launch each imported as, by home and old name, for the messages delivered to it.
 pub fn import_terminal_sessions(
     records: &[(ResourceObject<OldTerminalSession>, String)],
+    vessels: &VesselLaunches,
     target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) -> BTreeMap<(String, String), String> {
@@ -570,7 +653,7 @@ pub fn import_terminal_sessions(
             continue;
         }
         let refuse = |reason: String| ImportRefusal { kind: TerminalSessionKind::NAME, record: session.metadata.name.clone(), reason };
-        let result = import_terminal_session(session, home).and_then(|mut imported| {
+        let result = import_terminal_session(session, home, vessels).and_then(|mut imported| {
             let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
             write_imported(target, &mut imported, &change).map_err(refuse)?;
             if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
@@ -586,13 +669,18 @@ pub fn import_terminal_sessions(
     launches
 }
 
-/// Maps old TerminalSession `obj`, homed at `home`, onto its first launch.
+/// Maps old TerminalSession `obj`, homed at `home`, onto its first launch: a crew's session is held
+/// for the launch its vessel imported as.
 pub fn import_terminal_session(
     obj: &ResourceObject<OldTerminalSession>,
     home: &str,
+    vessels: &VesselLaunches,
 ) -> Result<ImportedResource<TerminalSessionKind>, ImportRefusal> {
     let refuse = |reason: String| ImportRefusal { kind: TerminalSessionKind::NAME, record: obj.metadata.name.clone(), reason };
-    let request = terminals::request_of_old(obj, home).map_err(refuse)?;
+    let mut request = terminals::request_of_old(obj, home).map_err(refuse)?;
+    if let Some(vessel) = request.holder.as_ref().and_then(|holder| holder.0.strip_prefix("vessel:")) {
+        request.holder = Some(Holder::vessel(&held_for_launch(vessel, home, vessels)));
+    }
     let status = obj.status.as_ref();
     let state = match status.map(|status| status.phase).unwrap_or_default() {
         TerminalSessionPhase::Starting => LifecycleState::requested(),
@@ -633,23 +721,20 @@ fn terminal_launch_facts(obj: &ResourceObject<OldTerminalSession>) -> TerminalLa
     }
 }
 
-impl Imported for VesselBinding {
-    fn imported_state(obj: &ResourceObject<OldVessel>) -> Result<LifecycleState, String> {
-        let status = obj.status.as_ref();
-        Ok(match status.map(|status| status.phase).unwrap_or_default() {
-            // Placed and not yet ready. The old reconciler records a placement and Provisioning in
-            // one patch, so a placed Pending vessel is not one it writes; it maps with Provisioning
-            // rather than being refused, since its lease is as granted.
-            VesselPhase::Pending | VesselPhase::Provisioning => LifecycleState::requested(),
-            // Interrupted is a judgement (its roles stopped); the lease is realised, under its
-            // environment.
-            VesselPhase::Ready | VesselPhase::Interrupted => {
-                realised(status.and_then(|status| status.environment_ref.clone()), "environment")?
-            }
-            VesselPhase::Lost => LifecycleState::Gone { ending: Ending::Lost },
-            VesselPhase::Failed => LifecycleState::Gone {
-                ending: Ending::Failed { reason: status.and_then(|status| status.message.clone()).unwrap_or_default() },
-            },
-        })
-    }
+/// The stored state old Vessel `obj`'s status maps to.
+fn vessel_state(obj: &ResourceObject<OldVessel>) -> Result<LifecycleState, String> {
+    let status = obj.status.as_ref();
+    Ok(match status.map(|status| status.phase).unwrap_or_default() {
+        // Placed and not yet ready. The old reconciler records a placement and Provisioning in
+        // one patch, so a placed Pending vessel is not one it writes; it maps with Provisioning
+        // rather than being refused, since its lease is as granted.
+        VesselPhase::Pending | VesselPhase::Provisioning => LifecycleState::requested(),
+        // Interrupted is a judgement (its roles stopped); the lease is realised, under its
+        // environment.
+        VesselPhase::Ready | VesselPhase::Interrupted => realised(status.and_then(|status| status.environment_ref.clone()), "environment")?,
+        VesselPhase::Lost => LifecycleState::Gone { ending: Ending::Lost },
+        VesselPhase::Failed => {
+            LifecycleState::Gone { ending: Ending::Failed { reason: status.and_then(|status| status.message.clone()).unwrap_or_default() } }
+        }
+    })
 }

@@ -106,8 +106,9 @@ impl Kind {
         match self {
             Kind::Fleet | Kind::Project | Kind::Forge | Kind::Usage | Kind::Host => parent.is_none(),
             // A convoy without a Project is valid today (`ConvoySpec.project_ref`
-            // is optional); a convoy with one sits under it.
-            Kind::Convoy => matches!(parent, None | Some(Kind::Project)),
+            // is optional); a convoy with one sits under it. Under a host it is the
+            // convoy homed there, as a checkout's holder names it (#3108).
+            Kind::Convoy => matches!(parent, None | Some(Kind::Project | Kind::Host)),
             Kind::Vessel => parent == Some(Kind::Convoy),
             Kind::Role => matches!(parent, Some(Kind::Fleet | Kind::Project | Kind::Convoy | Kind::Host)),
             Kind::Artifact => parent == Some(Kind::Role),

@@ -36,7 +36,7 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 | `terminal_session` | root | 23 | 6: `source` 4, `ending` 2 | `terminal_session_env` (child), `terminal_session_labels` (child) | `by_vessel` (vessel, ordinal), `live_by_pool` (pool) |
 | `terminal_session_env` | child | 3 | – | – | – |
 | `terminal_session_labels` | child | 2 | – | – | – |
-| `vessel` | root | 18 | 2: `ending` 2 | `vessel_shape` (child) | `live_by_host` (host), `by_convoy` (convoy) |
+| `vessel` | root | 20 | 2: `ending` 2 | `vessel_shape` (child) | `live_by_host` (host), `by_launch` (convoy, launch_of, launch) |
 | `vessel_shape` | child | 3 | – | – | – |
 
 Tables wider than 30 columns:
@@ -107,5 +107,6 @@ Interned column domains:
 | `terminal_session` | `role` | `rl` |
 | `terminal_session` | `pool` | `pl` |
 | `terminal_session` | `source_selector` | `sl` |
+| `vessel` | `launch_of` | `ln` |
 | `vessel` | `class` | `vc` |
 | `vessel` | `host` | `hs` |

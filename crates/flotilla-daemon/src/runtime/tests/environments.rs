@@ -1,7 +1,7 @@
 use super::*;
 use crate::environment_tools::EnvironmentToolProvisioner;
 use crate::runtime::environments::{mark_unavailable_environment, BackingDisposition};
-use crate::testkits::engine::runtime_checkouts;
+use crate::testkits::engine::{engine, runtime_checkouts};
 use flotilla_provisioning::engine::controller::{Backing, BackingEvent};
 
 #[tokio::test]
@@ -177,12 +177,15 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
     let [convoy, unrealised]: [_; 2] = standing.try_into().expect("two convoys");
     let environments = engine_environments(&daemon);
     let spec = docker_environment_spec("host-test", BTreeSet::new());
+    let vessels = &engine(&daemon).vessels;
     // A launch realised under its container, after a failed attempt on the daemon's side.
-    environments.request("quartermaster-work", &spec, Some(&flotilla_resources::vessel_resource_name("quartermaster", "work")));
+    let quartermaster = vessels.request("quartermaster", "work", "host-test");
+    environments.request("quartermaster-work", &spec, Some(&quartermaster));
     environments.retry("quartermaster-work", "provider registry unavailable");
     environments.ready("quartermaster-work", "test-interior", Default::default());
     // A launch whose only attempt failed before it was realised has no container identity.
-    environments.request("purser-work", &spec, Some(&flotilla_resources::vessel_resource_name("purser", "work")));
+    let purser = vessels.request("purser", "work", "host-test");
+    environments.request("purser-work", &spec, Some(&purser));
     environments.retry("purser-work", "provider registry unavailable");
     let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
         id: EnvironmentId::new("quartermaster-work"),

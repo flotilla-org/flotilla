@@ -279,6 +279,12 @@ impl Store {
         std::sync::Arc::clone(&self.runtime.commits)
     }
 
+    /// Calls `listener` after each commit to this store, while the caller keeps it alive, as
+    /// [`crate::stream::Service::on_commit`] does.
+    pub fn on_commit(&self, listener: std::sync::Weak<crate::stream::CommitListener>) {
+        self.runtime.commits.listen(listener);
+    }
+
     /// Committed local gate input, independent of the store transaction lock.
     pub fn applied_watermark(&self, home: &str) -> crate::stream::Watermark {
         crate::stream::watermark(&self.runtime.watermarks, home)

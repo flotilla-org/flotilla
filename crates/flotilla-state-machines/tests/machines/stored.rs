@@ -24,7 +24,7 @@ use flotilla_state_machines::{
             RequestBody,
         },
         person::Person,
-        vessel::{live_leases, Vessel},
+        vessel::{live_leases, Vessel, VesselSpec},
     },
     placement::{Dimension, Host, Lease, Ledger, LedgerError, Request, VesselId},
     EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
@@ -196,14 +196,16 @@ fn resources_survive_the_codec() {
     // A vessel's convoy is homed elsewhere: its reference keeps the convoy's home (#3392 G3).
     let mut vessels = Home::<Vessel>::new("capacity-host").expect("valid");
     let vessel = lease_of("c", 4);
-    vessels.create("v", vessel.clone().into(), &MemoryLifecycleWorld::default(), Timestamp(0)).expect("created");
+    let created = vessels.create("v", VesselSpec::of("c-w", vessel.clone()), &MemoryLifecycleWorld::default(), Timestamp(0));
+    let v = created.expect("created").resource.name().to_owned();
+    assert_eq!(v, "c-w#1", "a vessel is a numbered launch of its work");
     let attempted = lifecycle::Attempted { outcome: Outcome::Succeeded };
-    vessels.apply("v", attempted, &MemoryLifecycleWorld::default(), Timestamp(5)).expect("attempt while requested");
+    vessels.apply(&v, attempted, &MemoryLifecycleWorld::default(), Timestamp(5)).expect("attempt while requested");
     let mut world = MemoryLifecycleWorld::default();
     let observed = Ref::<Realisation>::new("probe");
     world.realisations.put(&observed, Observed { identity: "vm-1".into() });
-    vessels.apply("v", Realise { identity: "vm-1".into(), observed }, &world, Timestamp(6)).expect("realised");
-    let stored = round_trip(&vessels, "v");
+    vessels.apply(&v, Realise { identity: "vm-1".into(), observed }, &world, Timestamp(6)).expect("realised");
+    let stored = round_trip(&vessels, &v);
     let spec = stored.spec();
     assert_eq!((spec.lease(), spec.convoy.home.as_str()), (vessel, "admitting-host"));
     assert_eq!(stored.state(), &LifecycleState::Realised { identity: "vm-1".into() });
@@ -226,27 +228,32 @@ fn the_host_ledger_is_rebuilt_from_live_vessels() {
     let mut before = Ledger::new();
     before.add_host(Host::new("3"), [(Dimension(0), 10)].into()).expect("host");
     let mut vessels = Home::<Vessel>::new("capacity-host").expect("valid");
+    let mut launches = Vec::new();
     for (name, units) in [("a", 4), ("b", 3), ("gone", 2)] {
         let lease = lease_of("c", units);
         before.set_caps(lease.request.convoy.clone(), [(VesselClass::new("1"), 5)].into());
         before.request(VesselId::new(name), lease.request.clone()).expect("requested");
         let placed = before.place(&VesselId::new(name), Host::new("3")).expect("placed").clone();
-        vessels.create(name, placed.into(), &MemoryLifecycleWorld::default(), Timestamp(0)).expect("created");
+        let created = vessels.create(name, VesselSpec::of(name, placed), &MemoryLifecycleWorld::default(), Timestamp(0));
+        let launch = created.expect("created").resource.name().to_owned();
+        before.rename(&VesselId::new(name), VesselId::new(launch.as_str())).expect("renamed");
+        launches.push(launch);
     }
+    let gone = launches[2].clone();
     let mut world = MemoryLifecycleWorld::default();
     let (observed, absent) = (Ref::new("probe"), Ref::new("probe"));
     world.realisations.put(&observed, Observed { identity: "vm-1".into() });
     world.absences.put(&absent, true);
-    vessels.apply("gone", Realise { identity: "vm-1".into(), observed }, &world, Timestamp(1)).expect("realised");
+    vessels.apply(&gone, Realise { identity: "vm-1".into(), observed }, &world, Timestamp(1)).expect("realised");
     vessels
         .apply(
-            "gone",
+            &gone,
             Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost(), observed: absent },
             &world,
             Timestamp(2),
         )
         .expect("gone");
-    before.release(&VesselId::new("gone")).expect("released when Gone");
+    before.release(&VesselId::new(gone.as_str())).expect("released when Gone");
 
     let stored: Vec<Resource<Vessel>> = vessels
         .resources()
@@ -264,7 +271,10 @@ fn the_host_ledger_is_rebuilt_from_live_vessels() {
     assert_eq!(after.available(Host::new("3")), Ok([(Dimension(0), 3)].into()));
     let convoy = lease_of("c", 0).request.convoy;
     assert_eq!(after.live(&convoy, &VesselClass::new("1")), before.live(&convoy, &VesselClass::new("1")));
-    assert_eq!(after.restore(VesselId::new("a"), lease_of("c", 1)), Err(LedgerError::DuplicateRequest(VesselId::new("a"))));
+    assert_eq!(
+        after.restore(VesselId::new(launches[0].as_str()), lease_of("c", 1)),
+        Err(LedgerError::DuplicateRequest(VesselId::new(launches[0].as_str())))
+    );
     assert_eq!(
         after.restore(VesselId::new("big"), lease_of("c", 4)),
         Err(LedgerError::CapacityUnderflow { host: Host::new("3"), dimension: Dimension(0) })

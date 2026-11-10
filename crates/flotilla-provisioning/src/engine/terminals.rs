@@ -21,7 +21,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, Store};
 use flotilla_state_machines::Resource;
 
 use super::{
-    reads::{indexed, keyed, latest, view, ReadError, StoreReads, View},
+    reads::{indexed, keyed, latest, requested_at, view, ReadError, StoreReads, View},
     EngineError, Lifecycles,
 };
 use crate::stored::{
@@ -150,20 +150,13 @@ fn time(at: Timestamp) -> DateTime<Utc> {
     at.to_datetime().unwrap_or(DateTime::UNIX_EPOCH)
 }
 
-/// When launch `name` homed at `home` was requested: the time of the change that created it.
-fn requested_at(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<Timestamp>, ReadError> {
-    let Some(id) = read.resolve(<Resource<TerminalSession> as Kind>::CODE, name, home)? else { return Ok(None) };
-    let Some(created) = read.changes(id, 0, 1)?.into_iter().next() else { return Ok(None) };
-    Ok(read.change(home, created.change)?.map(|change| change.at))
-}
-
 /// `view` as a reader sees it, with the facts its launch was realised with.
 pub(crate) fn record(read: &mut Read<'_>, view: View<TerminalSessionKind>) -> Result<TerminalRecord, ReadError> {
     let facts = match read.resolve(TerminalLaunchFacts::CODE, &view.name, &view.home)? {
         Some(id) => read.load::<TerminalLaunchFacts>(id)?.map(|loaded| facts_view(&loaded.value)),
         None => None,
     };
-    let requested_at = requested_at(read, &view.name, &view.home)?.map(time).unwrap_or(DateTime::UNIX_EPOCH);
+    let requested_at = requested_at::<Resource<TerminalSession>>(read, &view.name, &view.home)?.map(time).unwrap_or(DateTime::UNIX_EPOCH);
     let request = &view.request;
     Ok(TerminalRecord {
         environment: request.environment.name.clone(),
@@ -188,7 +181,7 @@ pub(crate) fn record(read: &mut Read<'_>, view: View<TerminalSessionKind>) -> Re
 pub struct EngineTerminals {
     lifecycles: Arc<dyn Lifecycles<TerminalSessionKind>>,
     reads: StoreReads,
-    homes: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    homes: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     changes: tokio::sync::broadcast::Sender<TerminalChange>,
     observations: TerminalObservations,
 }
@@ -209,7 +202,7 @@ impl EngineTerminals {
         Self {
             lifecycles,
             reads: StoreReads::new(store),
-            homes: Box::new(homes),
+            homes: Arc::new(homes),
             changes: tokio::sync::broadcast::channel(CHANGES).0,
             observations: TerminalObservations::default(),
         }
@@ -229,19 +222,7 @@ impl EngineTerminals {
         let changes = self.changes.clone();
         Ok(tokio::spawn(async move {
             loop {
-                let followed = watch
-                    .next(|_, followed| {
-                        Ok(followed
-                            .into_iter()
-                            .map(|followed| match followed {
-                                flotilla_engine_store::follow::Followed::Changed(identity) => {
-                                    TerminalChange::Changed { name: identity.name, home: identity.home }
-                                }
-                                flotilla_engine_store::follow::Followed::Rescan(_) => TerminalChange::Rescanned,
-                            })
-                            .collect::<Vec<_>>())
-                    })
-                    .await;
+                let followed = watch.next(|_, followed| Ok(followed.into_iter().map(terminal_change).collect::<Vec<_>>())).await;
                 match followed {
                     // No follower is no reason to stop: one may subscribe later.
                     Ok(followed) => followed.into_iter().for_each(|change| drop(changes.send(change))),
@@ -299,6 +280,22 @@ impl EngineTerminals {
 }
 
 impl TerminalRecords for EngineTerminals {
+    fn cursor(&self) -> Option<Box<dyn flotilla_resources::lifecycle_reads::ChangeCursor<TerminalChange>>> {
+        let cursor = super::log_cursor::LogCursor::start(
+            self.reads.clone(),
+            Arc::clone(&self.homes),
+            [<Resource<TerminalSession> as Kind>::CODE, TerminalLaunchFacts::CODE],
+            terminal_change,
+        );
+        match cursor {
+            Ok(cursor) => Some(Box::new(cursor)),
+            Err(error) => {
+                tracing::warn!(%error, "the log could not be followed from here; readers read afresh");
+                None
+            }
+        }
+    }
+
     fn home(&self) -> &str {
         self.lifecycles.home()
     }
@@ -376,5 +373,13 @@ impl TerminalRecords for EngineTerminals {
             .replace_launch(session, &newest, held.spec().clone(), Self::now())
             .map(TerminalRenewal::Started)
             .map_err(|error| format!("renew terminal session {session}: {error}"))
+    }
+}
+
+/// What a followed write of the kinds tells readers.
+fn terminal_change(followed: flotilla_engine_store::follow::Followed) -> TerminalChange {
+    match followed {
+        flotilla_engine_store::follow::Followed::Changed(identity) => TerminalChange::Changed { name: identity.name, home: identity.home },
+        flotilla_engine_store::follow::Followed::Rescan(_) => TerminalChange::Rescanned,
     }
 }

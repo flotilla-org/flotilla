@@ -7,6 +7,7 @@ pub mod image_build;
 mod memory_store;
 pub mod other_home;
 pub mod terminals;
+pub mod vessels;
 pub use agent_sessions::AgentSessionsFixture;
 pub use checkouts::CheckoutFixture;
 pub use clones::CloneFixture;
@@ -15,6 +16,7 @@ pub use memory_store::memory_store;
 pub use other_home::{other_home_for, put_host_at_its_home, put_host_at_its_home_heard, replicate_home, replicate_home_at, OtherHome};
 use std::sync::{Arc, Mutex};
 pub use terminals::TerminalsFixture;
+pub use vessels::VesselsFixture;
 
 use flotilla_engine_store::StoreLog;
 use flotilla_provisioning::engine::{
@@ -29,13 +31,14 @@ use flotilla_state_machines::{
     Cause, CauseCategory, Home, Log, Outcome,
 };
 
-/// The engine's environments, clones, checkouts and terminal sessions homed at one home on one
-/// store, each fixture's `reads` serving all four, as a daemon's lifecycle reads do.
+/// The engine's environments, clones, checkouts, terminal sessions and vessels homed at one home
+/// on one store, each fixture's `reads` serving all five, as a daemon's lifecycle reads do.
 pub struct EngineFixture {
     pub environments: EnvironmentFixture,
     pub clones: CloneFixture,
     pub checkouts: CheckoutFixture,
     pub terminals: TerminalsFixture,
+    pub vessels: VesselsFixture,
 }
 
 impl Default for EngineFixture {
@@ -52,16 +55,21 @@ impl EngineFixture {
 
     /// An engine over `store`, whose home is `home`: a daemon's decided store, say.
     pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
-        Self::with_terminals(home, Arc::clone(&store), TerminalsFixture::over(home, store))
+        Self::with_terminals(home, Arc::clone(&store), TerminalsFixture::over(home, Arc::clone(&store)), VesselsFixture::over(home, store))
     }
 
     /// An engine over a daemon's decided store `service`, whose terminal sessions are read at every
     /// home it holds: another daemon's arrive as its log is replicated in.
     pub fn over_service(service: &Arc<flotilla_schema_sqlite::stream::Service>) -> Self {
-        Self::with_terminals(service.home(), service.store(), TerminalsFixture::over_service(service))
+        Self::with_terminals(
+            service.home(),
+            service.store(),
+            TerminalsFixture::over_service(service),
+            VesselsFixture::over_service(service),
+        )
     }
 
-    fn with_terminals(home: &str, store: Arc<Mutex<Store>>, mut terminals: TerminalsFixture) -> Self {
+    fn with_terminals(home: &str, store: Arc<Mutex<Store>>, mut terminals: TerminalsFixture, mut vessels: VesselsFixture) -> Self {
         let mut environments = EnvironmentFixture::over(home, Arc::clone(&store));
         let mut clones = CloneFixture::over(home, Arc::clone(&store));
         let mut checkouts = CheckoutFixture::over(home, Arc::clone(&store));
@@ -70,16 +78,18 @@ impl EngineFixture {
                 .with_environments(Arc::clone(&environments.environments) as Arc<dyn EnvironmentRecords>)
                 .with_clones(Arc::clone(&clones.clones) as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
                 .with_checkouts(Arc::clone(&checkouts.checkouts) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
-                .with_terminals(Arc::clone(&terminals.terminals) as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>),
+                .with_terminals(Arc::clone(&terminals.terminals) as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>)
+                .with_vessels(Arc::clone(&vessels.vessels) as Arc<dyn flotilla_resources::vessel_records::VesselRecords>),
         );
         environments.reads = reads.clone();
         clones.reads = reads.clone();
         checkouts.reads = reads.clone();
-        terminals.reads = reads;
-        Self { environments, clones, checkouts, terminals }
+        terminals.reads = reads.clone();
+        vessels.reads = reads;
+        Self { environments, clones, checkouts, terminals, vessels }
     }
 
-    /// The readings serving all four.
+    /// The readings serving all five.
     pub fn reads(&self) -> Arc<dyn LifecycleReads> {
         self.checkouts.reads.clone()
     }
@@ -247,38 +257,6 @@ pub async fn store_object<T: flotilla_resources::Resource>(
             records.update_status(&created.metadata.name, &created.metadata.resource_version, &status).await.expect("stale status")
         }
         None => created,
-    }
-}
-
-/// The Vessel lease using the same real store and reader contract.
-pub type VesselFixture = LifecycleFixture<flotilla_provisioning::engine::vessel::VesselBinding>;
-
-impl VesselFixture {
-    /// Holds the lease of `vessel`, of `convoy`, pinned to `host`, as its placement does: the
-    /// environment requested for it waits on this.
-    pub fn lease(&self, vessel: &str, convoy: &str, host: &str) -> ResourceObject<flotilla_resources::Vessel> {
-        use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
-        use flotilla_resources::{Vessel, VesselSpec, VesselStatus};
-        let placed = object::<Vessel>(
-            vessel,
-            VesselSpec {
-                convoy_ref: convoy.into(),
-                vessel_name: vessel.into(),
-                fulfilment_kind_ref: String::new(),
-                adopted_checkout_refs: Default::default(),
-            },
-            VesselStatus {
-                placement_decision: Some(
-                    PlacementDecision::builder()
-                        .kind("pinned".into())
-                        .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.into() })
-                        .build(),
-                ),
-                ..Default::default()
-            },
-        );
-        self.request(&placed);
-        placed
     }
 }
 

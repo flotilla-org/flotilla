@@ -29,11 +29,11 @@ use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::{codex_central_auth_path, AgentMaterialRegistry, CodexCentralRefresher, CredentialStore};
 use flotilla_crew::convoy::ConvoyReconciler;
-use flotilla_crew::reconcilers::vessel::VesselReconciler;
+use flotilla_crew::reconcilers::vessel::{ConvoyVesselWake, CrewSeats, VesselPlanning};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
-use flotilla_provisioning::engine::{image_build::ImageBuildBinding, vessel::VesselBinding, Engine};
+use flotilla_provisioning::engine::{image_build::ImageBuildBinding, Engine};
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
@@ -64,8 +64,8 @@ use self::tasks::{
     spawn_environment_orphan_sweep_task, spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task,
     spawn_local_fulfilment_probe_task, spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task,
     spawn_provisioned_environment_reconciliation_task, spawn_sleep_inhibitor_task, spawn_ssh_fulfilment_probe_task,
-    spawn_startup_restoration, spawn_vessel_placement_projector, supervise_controller, CheckoutArchiveRoot, CheckoutArchiveSweep,
-    PeriodicTaskStart, MANIFEST_RECONCILE_INTERVAL,
+    spawn_startup_restoration, spawn_vessel_requests, supervise_controller, CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart,
+    MANIFEST_RECONCILE_INTERVAL,
 };
 use self::terminal::TerminalControllerRuntime;
 use crate::server::environment_sockets::EnvironmentSocketService;
@@ -796,11 +796,17 @@ fn spawn_controller_loops(
 
     let mut controllers = vec![
         gc,
-        spawn_vessel_placement_projector(
-            backend.clone(),
-            namespace_string.clone(),
-            state.local_host_ref.clone(),
-            state.ssh_host_refs(),
+        spawn_vessel_requests(
+            flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
+                std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(
+                    backend.clone(),
+                    namespace_string.clone(),
+                )),
+                state.daemon.lifecycle_reads(),
+                Arc::new(ports::DaemonVesselReleaseGate { daemon: Arc::clone(&state.daemon), namespace: namespace_string.clone() }),
+                CanonicalHostId::resolved(state.local_host_ref.clone()),
+                state.ssh_host_refs(),
+            ),
             supervision.clone(),
             runtime_health.clone(),
         ),
@@ -823,34 +829,19 @@ fn spawn_controller_loops(
         }),
         controller!(Vessel, {
             let state = Arc::clone(&state);
-            let config_dir = state.config.base_path().as_path().to_path_buf();
-            let local_host_ref = state.local_host_ref.clone();
-            let additional_host_refs = state.ssh_host_refs();
             move |backend: ResourceBackend, namespace_string: String| {
-                let config_dir = config_dir.clone();
-                let local_host_ref = local_host_ref.clone();
-                let additional_host_refs = additional_host_refs.clone();
-                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.vessels));
-                let mut secondaries = VesselReconciler::secondary_watches();
-                // A vessel's environment and checkouts are the engine's: their changes wake the
-                // vessel holding them.
-                if let Ok(service) = state.daemon.decided_store() {
-                    secondaries
-                        .push(Box::new(flotilla_provisioning::engine::environments::EnvironmentHolderWake::new(Arc::clone(&service))));
-                    secondaries.push(Box::new(flotilla_provisioning::engine::checkouts::CheckoutVesselWake::new(service)));
-                }
-                (
-                    secondaries,
-                    Engine::<_, VesselBinding>::new(
-                        VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
-                            .with_lifecycle_reads(state.daemon.lifecycle_reads())
-                            .with_accounts(state.daemon.account_records())
-                            .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None }))
-                            .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref))
-                            .with_additional_host_refs(additional_host_refs),
-                        lifecycles,
-                    ),
-                )
+                // A ready vessel's crews are seated as it, its sessions, its convoy, its crews'
+                // bindings and their briefs change; the Vessel controller writes its edges.
+                let mut secondaries = CrewSeats::secondary_watches();
+                secondaries.push(Box::new(ConvoyVesselWake::new(
+                    &backend,
+                    &namespace_string,
+                    state.daemon.lifecycle_reads(),
+                    state.daemon.convoy_engine_path(),
+                    state.daemon.account_records(),
+                )));
+                let planning = Arc::new(vessel_planning(&state, &backend, &namespace_string));
+                (secondaries, CrewSeats::new(planning).with_rechecks(state.vessel_rechecks.clone()))
             }
         }),
         controller!(Convoy, {
@@ -897,6 +888,7 @@ fn spawn_controller_loops(
     controllers.extend(spawn_clone_controller(&state));
     controllers.extend(spawn_checkout_controller(&state));
     controllers.extend(spawn_terminal_controller(&state));
+    controllers.extend(spawn_vessel_controller(&state));
     if let Some(distributor) = &state.image_inventory {
         let distributor = Arc::clone(distributor);
         controllers.push(tokio::spawn(async move {
@@ -1248,6 +1240,56 @@ fn spawn_checkout_controller(state: &Arc<ControllerRuntimeState>) -> Option<Join
     }
 }
 
+/// This home's vessel planner over `backend` in `namespace`.
+fn vessel_planning(state: &Arc<ControllerRuntimeState>, backend: &ResourceBackend, namespace: &str) -> VesselPlanning {
+    VesselPlanning::new_with_config_dir(backend.clone(), namespace, state.config.base_path().as_path().to_path_buf())
+        .with_lifecycle_reads(state.daemon.lifecycle_reads())
+        .with_accounts(state.daemon.account_records())
+        .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(state), change_requests: None }))
+        .with_federated_dependencies(backend, CanonicalHostId::resolved(state.local_host_ref.clone()))
+        .with_additional_host_refs(state.ssh_host_refs())
+}
+
+/// The Vessel controller (#3108): the single writer of this home's vessel launches, realising each
+/// in its environment once what its planner requests for it is realised. Its holdings' commits
+/// wake it; its convoy's, its crews' bindings' and its seats' changes are told as rechecks.
+fn spawn_vessel_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHandle<()>> {
+    use flotilla_provisioning::engine::{controller::Controller, vessel_actuator::VesselActuator};
+    let engine = state.provisioning.as_ref()?;
+    let rechecks = state.vessel_recheck_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
+    let service = match state.daemon.decided_store() {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "the Vessel controller has no decided store; vessels will not launch");
+            return None;
+        }
+    };
+    let backend = state.daemon.resource_backend();
+    let planning = Arc::new(vessel_planning(state, &backend, &state.namespace));
+    tokio::spawn(
+        ConvoyVesselWake::new(
+            &backend,
+            &state.namespace,
+            state.daemon.lifecycle_reads(),
+            state.daemon.convoy_engine_path(),
+            state.daemon.account_records(),
+        )
+        .recheck(state.namespace.clone(), state.vessel_rechecks.clone()),
+    );
+    let actuator = Arc::new(VesselActuator::new(planning));
+    match Controller::start(Arc::clone(&engine.vessels), actuator, state.daemon.clock_for_scenarios(), service) {
+        Ok(controller) => Some(tokio::spawn(async move {
+            // No probe observes a vessel: its holdings' commits and its rechecks look at it.
+            let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
+            controller.run_with(backings, rechecks).await
+        })),
+        Err(error) => {
+            error!(%error, "the Vessel controller could not start; vessels will not launch");
+            None
+        }
+    }
+}
+
 /// The env each vessel's environment is launched with beyond its stored recipe: its crews' skills
 /// and credential grants, from its convoy's frozen requirement.
 struct VesselLaunchEnvironment {
@@ -1276,12 +1318,12 @@ async fn open_provisioning_lifecycles(
         launch_log::{LaunchLog, StagedFacts},
         reads::{LifecycleReadPort, StoreReads},
         terminals::EngineTerminals,
-        vessel::PlacementLifecycles,
+        vessel::{EngineVessels, PlacementLifecycles},
         LifecycleHome, ProvisioningLifecycles,
     };
     let store = daemon.decided_store()?.store();
     let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
-    daemon.install_vessel_seats(Arc::new(EngineVesselSeats { backend: daemon.resource_backend(), reads: daemon.lifecycle_reads() }))?;
+    daemon.install_vessel_seats(Arc::new(EngineVesselSeats { reads: daemon.lifecycle_reads() }))?;
     let opened = Arc::clone(&store);
     let service = daemon.decided_store()?;
     let lifecycles = tokio::task::spawn_blocking(move || {
@@ -1336,23 +1378,26 @@ async fn open_provisioning_lifecycles(
     // Every terminal-session reader and requester goes through the engine's launches.
     let terminals = Arc::clone(&lifecycles.terminal_records);
     let terminal_changes = terminals.follow(daemon.decided_store()?)?;
+    // Every vessel reader goes through the engine's launches; this home's are written only here.
+    let vessels = Arc::new(EngineVessels::over(Arc::clone(&lifecycles.vessels), daemon.decided_store()?));
+    let vessel_changes = vessels.follow(daemon.decided_store()?)?;
     daemon.install_lifecycle_reads(Arc::new(
         LifecycleReadPort::new(StoreReads::new(store), home)
             .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>)
             .with_clones(clones as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
             .with_checkouts(Arc::clone(&lifecycles.checkout_records) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
-            .with_terminals(terminals as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>),
+            .with_terminals(terminals as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>)
+            .with_vessels(vessels as Arc<dyn flotilla_resources::vessel_records::VesselRecords>),
     ))?;
     // Cached checkout providers end with the checkout launches they belong to.
     daemon.follow_checkout_provider_lifetimes()?;
-    Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes, terminal_changes]))
+    Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes, terminal_changes, vessel_changes]))
 }
 
 /// Which seats a vessel serves (#3629 layer 8): the newest launch of each session the engine holds
 /// for it, by role. A role launched at more than one home (a vessel placed anew) is served by its
 /// most recently requested launch.
 struct EngineVesselSeats {
-    backend: ResourceBackend,
     reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
 }
 
@@ -1364,7 +1409,7 @@ impl flotilla_resources::vessel_seats::VesselSeats for EngineVesselSeats {
         vessel_ref: &str,
     ) -> Result<std::collections::BTreeMap<String, flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>>, String>
     {
-        let views = flotilla_store::TerminalViews::new(self.backend.clone(), namespace, Arc::clone(&self.reads));
+        let views = flotilla_store::TerminalViews::new(namespace, Arc::clone(&self.reads));
         let mut seats = std::collections::BTreeMap::<String, flotilla_resources::ReadResourceObject<_>>::new();
         for view in views.of_vessel(vessel_ref).await.map_err(|error| error.to_string())? {
             let newer = seats

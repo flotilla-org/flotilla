@@ -39,6 +39,11 @@ pub trait EngineRecords: Send + Sync + std::fmt::Debug {
     async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String>;
     /// Every home's record of every name of `kind`.
     async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String>;
+    /// Every home's record `name` of `kind`: those [`EngineRecords::sources`] lists, unless the
+    /// port can read one name alone.
+    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        Ok(self.sources(kind).await?.into_iter().filter(|record| record.name == name).collect())
+    }
     /// Writes this home's record `name` of `kind` from an old object's metadata and spec: created,
     /// or replaced, keeping its status. Stamps the kind does not keep are not kept.
     async fn apply(

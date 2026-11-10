@@ -7,7 +7,6 @@ pub async fn refused_convoy_reclaim_leaves_runtime_children_untouched(factory: &
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     let repository = RepositoryKey("github.com-acme-standing".to_string());
     let convoy_name = "failed-before-checkout";
-    let vessel_name = "failed-before-checkout-work";
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys
         .create(
@@ -27,29 +26,17 @@ pub async fn refused_convoy_reclaim_leaves_runtime_children_untouched(factory: &
         )
         .await
         .expect("failed convoy");
-    backend
-        .clone()
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name(vessel_name.to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
-                .build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: convoy_name.to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "contained".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
+    let launch = engine(&daemon).vessels.request(convoy_name, "work", "local");
 
     let refusal = daemon.reap_convoy_internal("flotilla", convoy_name, false).await.expect_err("unsafe reclaim must be refused");
 
     assert!(refusal.contains("missing checkout integration evidence"));
     assert!(convoys.get(convoy_name).await.is_ok(), "refusal must retain the convoy");
-    assert!(backend.clone().using::<Vessel>("flotilla").get(vessel_name).await.is_ok(), "refusal must retain the vessel");
+    {
+        use flotilla_resources::vessel_records::VesselRecords;
+        let held = engine(&daemon).vessels.vessels.get(&launch, None).expect("read").expect("launch");
+        assert!(!held.ended(), "refusal must retain the vessel");
+    }
 
     let principal = PrincipalRef::implicit_for_namespace("flotilla");
     daemon
@@ -361,9 +348,9 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
         )
         .await
         .expect("fail convoy after resolution loss");
-    let vessel = flotilla_resources::vessel_resource_name(&first_ref, "work");
-    // Its live backing environment, held for that vessel on the engine.
+    // Its live backing environment, held on the engine for the work's launch.
     let environments = engine(&daemon);
+    let vessel = environments.vessels.request(&first_ref, "work", "local");
     environments.environments.put_ready(
         "quartermaster-work",
         &ResourceEnvironmentSpec {
@@ -430,28 +417,9 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
         .status
         .and_then(|status| status.convoy_ref)
         .expect("convoy ref");
-    // Step 3 removes only the retired Presentation cascade. Managed Vessel children must still be
-    // cascaded by convoy teardown; its sessions are the engine's, released once their vessel ends.
-    let meta = InputMeta::builder()
-        .name("quartermaster-work".to_string())
-        .labels(BTreeMap::from([
-            (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
-            (CONVOY_LABEL.to_string(), convoy_ref.clone()),
-        ]))
-        .build();
-    let vessels = backend.using::<flotilla_resources::Vessel>("flotilla");
-    vessels
-        .create(
-            &meta,
-            &flotilla_resources::VesselSpec {
-                convoy_ref: convoy_ref.clone(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "default".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("vessel");
+    // Convoy teardown ends its managed children: its vessel's launch is released by the vessel
+    // requester once the convoy is gone; its sessions are the engine's, released once it ends.
+    let launch = engine(&daemon).vessels.request(&convoy_ref, "work", "local");
     // Attentions about the convoy, its vessel and its role, every one acknowledged, end with them.
     let attentions = backend.attentions();
     let now = chrono::Utc::now();
@@ -478,8 +446,26 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
 
     assert!(demands.list().await.expect("demands").items.is_empty(), "no attention is left about the reaped convoy");
 
-    assert!(matches!(vessels.get("quartermaster-work").await, Err(ResourceError::NotFound { .. })));
     assert!(matches!(backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await, Err(ResourceError::NotFound { .. })));
+    let requests = flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), "flotilla")),
+        daemon.lifecycle_reads(),
+        std::sync::Arc::new(NoGate),
+        flotilla_protocol::CanonicalHostId::resolved("local"),
+        [],
+    );
+    let pass = requests.sync_once(chrono::Utc::now()).await.expect("vessel requests");
+    assert_eq!(pass.released, vec![launch], "a reaped convoy's vessel is released");
+}
+
+/// A gate never asked: a convoy that is gone sanctions its own reclaim.
+struct NoGate;
+
+#[async_trait::async_trait]
+impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for NoGate {
+    async fn may_release(&self, convoy: &str, _convoy_home: &str) -> Result<(), String> {
+        panic!("convoy {} is gone; its reclaim needs no gate", convoy)
+    }
 }
 
 pub async fn forced_convoy_delete_retains_force_intent_until_checkout_finalizes(factory: &dyn EnsureScenarioController) {

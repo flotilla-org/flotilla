@@ -18,7 +18,8 @@ use chrono::{DateTime, Utc};
 use flotilla_engine_store::plain::{PendingChange, PlainLog};
 use flotilla_resources::{
     checkout_records::{
-        launched, CheckoutChange, CheckoutHolder, CheckoutRecord, CheckoutRecords, Inspection, Integration, Landed, HOLDER_NOT_OPEN,
+        launched, CheckoutChange, CheckoutHolder, CheckoutRecord, CheckoutRecords, Inspection, Integration, Landed, HOLDER_ENDED,
+        HOLDER_NOT_OPEN,
     },
     host_direct_environment_name, CheckoutSpec, CheckoutWorktreeSpec, FreshCloneCheckoutSpec, ObservedCheckoutSpec, RepositoryKey,
     HOST_DIRECT_NAME_PREFIX,
@@ -32,7 +33,7 @@ use flotilla_state_machines::{
 
 use super::{
     launch_log::StagedFacts,
-    reads::{indexed, keyed, latest, view, ReadError, StoreReads, View},
+    reads::{indexed, keyed, latest, requested_at, view, ReadError, StoreReads, View},
     EngineError, Lifecycles,
 };
 use crate::stored::{
@@ -67,7 +68,7 @@ fn open_convoy(read: &mut Read<'_>, name: &str) -> Result<Result<(Identity, u64)
         }
         ended = true;
     }
-    Ok(Err(if ended { format!("convoy {name} has ended") } else { format!("convoy {name} {HOLDER_NOT_OPEN}") }))
+    Ok(Err(if ended { format!("convoy {name} {HOLDER_ENDED}") } else { format!("convoy {name} {HOLDER_NOT_OPEN}") }))
 }
 
 /// The holder a stored `holder` names, if it is a checkout's.
@@ -163,13 +164,6 @@ fn time(at: Timestamp) -> Option<DateTime<Utc>> {
     at.to_datetime()
 }
 
-/// When launch `name` homed at `home` was requested: the time of the change that created it.
-fn requested_at(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<Timestamp>, ReadError> {
-    let Some(id) = read.resolve(<Resource<Checkout> as Kind>::CODE, name, home)? else { return Ok(None) };
-    let Some(created) = read.changes(id, 0, 1)?.into_iter().next() else { return Ok(None) };
-    Ok(read.change(home, created.change)?.map(|change| change.at))
-}
-
 /// The stored inspection `inspection` makes, failing since `failing_since`.
 pub(crate) fn stored_integration(inspection: Inspection, failing_since: Option<Timestamp>) -> CheckoutIntegration {
     let details = |details: Vec<String>| (!details.is_empty()).then_some(details);
@@ -222,7 +216,7 @@ pub struct EngineCheckouts {
     log: PlainLog,
     /// What each launch is created under, staged here for the launch log that creates it.
     inputs: StagedFacts<Vec<ChangeItem>>,
-    homes: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    homes: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     changes: tokio::sync::broadcast::Sender<CheckoutChange>,
 }
 
@@ -246,7 +240,7 @@ impl EngineCheckouts {
             log: PlainLog::new(Arc::clone(&store)),
             reads: StoreReads::new(store),
             inputs,
-            homes: Box::new(homes),
+            homes: Arc::new(homes),
             changes: tokio::sync::broadcast::channel(CHANGES).0,
         }
     }
@@ -276,17 +270,7 @@ impl EngineCheckouts {
         let changes = self.changes.clone();
         Ok(tokio::spawn(async move {
             loop {
-                let followed = watch
-                    .next(|_, followed| {
-                        Ok(followed
-                            .into_iter()
-                            .map(|followed| match followed {
-                                flotilla_engine_store::follow::Followed::Changed(identity) => CheckoutChange::Changed(identity.name),
-                                flotilla_engine_store::follow::Followed::Rescan(_) => CheckoutChange::Rescanned,
-                            })
-                            .collect::<Vec<_>>())
-                    })
-                    .await;
+                let followed = watch.next(|_, followed| Ok(followed.into_iter().map(checkout_change).collect::<Vec<_>>())).await;
                 match followed {
                     // No follower is no reason to stop: one may subscribe later.
                     Ok(followed) => followed.into_iter().for_each(|change| drop(changes.send(change))),
@@ -317,7 +301,7 @@ impl EngineCheckouts {
             },
             None => None,
         };
-        let requested_at = requested_at(read, &view.name, &view.home)?.and_then(time).unwrap_or(DateTime::UNIX_EPOCH);
+        let requested_at = requested_at::<Resource<Checkout>>(read, &view.name, &view.home)?.and_then(time).unwrap_or(DateTime::UNIX_EPOCH);
         Ok(CheckoutRecord {
             requested_at,
             reading: view.judgement.reading(),
@@ -399,6 +383,22 @@ impl EngineCheckouts {
 }
 
 impl CheckoutRecords for EngineCheckouts {
+    fn cursor(&self) -> Option<Box<dyn flotilla_resources::lifecycle_reads::ChangeCursor<CheckoutChange>>> {
+        let cursor = super::log_cursor::LogCursor::start(
+            self.reads.clone(),
+            Arc::clone(&self.homes),
+            [<Resource<Checkout> as Kind>::CODE, CheckoutFacts::CODE, CheckoutIntegration::CODE],
+            checkout_change,
+        );
+        match cursor {
+            Ok(cursor) => Some(Box::new(cursor)),
+            Err(error) => {
+                tracing::warn!(%error, "the log could not be followed from here; readers read afresh");
+                None
+            }
+        }
+    }
+
     fn home(&self) -> &str {
         self.lifecycles.home()
     }
@@ -496,20 +496,32 @@ impl CheckoutRecords for EngineCheckouts {
     }
 }
 
-/// The requests of the checkouts the next batch of followed log entries changed, at any home. A
-/// rescan names no checkout: the primary's resync covers it.
-async fn changed_requests(watch: &mut super::watch::EngineWatch) -> Result<Vec<CheckoutRequest>, String> {
+/// The checkouts the next batch of followed log entries changed, at any home.
+struct Changed {
+    requests: Vec<CheckoutRequest>,
+    /// The follower fell behind and rescanned: which checkouts changed is unknown, so every
+    /// primary is woken.
+    rescanned: bool,
+}
+
+async fn changed_requests(watch: &mut super::watch::EngineWatch) -> Result<Changed, String> {
     watch
         .next(|read, followed| {
-            let mut requests = Vec::new();
+            let mut changed = Changed { requests: Vec::new(), rescanned: false };
             for followed in followed {
-                let flotilla_engine_store::follow::Followed::Changed(identity) = followed else { continue };
+                let identity = match followed {
+                    flotilla_engine_store::follow::Followed::Changed(identity) => identity,
+                    flotilla_engine_store::follow::Followed::Rescan(_) => {
+                        changed.rescanned = true;
+                        continue;
+                    }
+                };
                 let Some(id) = read.resolve(<Resource<Checkout> as Kind>::CODE, &identity.name, &identity.home)? else { continue };
                 if let Some(loaded) = read.load::<Resource<Checkout>>(id)? {
-                    requests.push(loaded.value.spec().clone());
+                    changed.requests.push(loaded.value.spec().clone());
                 }
             }
-            Ok(requests)
+            Ok(changed)
         })
         .await
         .map_err(|error| error.to_string())
@@ -552,8 +564,11 @@ impl flotilla_store::controller::SecondaryWatch for CheckoutRepositoryWake {
             let mut watch = start_watch(&self.service)?;
             loop {
                 match changed_requests(&mut watch).await {
-                    Ok(requests) => {
-                        for request in requests {
+                    Ok(changed) => {
+                        if changed.rescanned {
+                            sender.send_every();
+                        }
+                        for request in changed.requests {
                             if sender.send(request.repository).await.is_err() {
                                 return Ok(());
                             }
@@ -586,86 +601,17 @@ async fn holder_convoys(
         .collect())
 }
 
-/// The convoy holders of the checkouts the next batch of followed log entries changed.
-async fn changed_holders(watch: &mut super::watch::EngineWatch) -> Result<std::collections::BTreeSet<String>, String> {
-    Ok(changed_requests(watch)
-        .await?
+/// The convoy holders of the checkouts the next batch of followed log entries changed, and
+/// whether the follower rescanned.
+async fn changed_holders(watch: &mut super::watch::EngineWatch) -> Result<(std::collections::BTreeSet<String>, bool), String> {
+    let changed = changed_requests(watch).await?;
+    let holders = changed
+        .requests
         .iter()
         .filter_map(|request| request.holder.as_ref().and_then(checkout_holder))
         .map(|CheckoutHolder::Convoy(convoy)| convoy)
-        .collect())
-}
-
-/// Wakes the vessels of the convoy a checkout is held for when it changes: a vessel waits for its
-/// convoy's checkouts to be ready, and reads their paths (#3108). The holder is the engine launch,
-/// one per generation; that generation's vessels are woken.
-#[derive(Clone)]
-pub struct CheckoutVesselWake {
-    service: Arc<flotilla_schema_sqlite::stream::Service>,
-}
-
-impl CheckoutVesselWake {
-    pub fn new(service: Arc<flotilla_schema_sqlite::stream::Service>) -> Self {
-        Self { service }
-    }
-
-    /// The vessels of the old convoys whose engine Convoy is among `holders`.
-    async fn vessels(
-        backend: &flotilla_store::ResourceBackend,
-        namespace: &str,
-        holders: &std::collections::BTreeSet<String>,
-    ) -> Result<Vec<String>, flotilla_resources::ResourceError> {
-        let convoys = holder_convoys(backend, namespace, holders).await?;
-        Ok(backend
-            .clone()
-            .using::<flotilla_resources::Vessel>(namespace)
-            .list()
-            .await?
-            .items
-            .into_iter()
-            .filter(|vessel| convoys.contains(&vessel.spec.convoy_ref))
-            .map(|vessel| vessel.metadata.name)
-            .collect())
-    }
-}
-
-impl flotilla_store::controller::SecondaryWatch for CheckoutVesselWake {
-    type Primary = flotilla_resources::Vessel;
-
-    fn clone_box(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = Self::Primary>> {
-        Box::new(self.clone())
-    }
-
-    fn spawn(
-        self: Box<Self>,
-        backend: flotilla_store::ResourceBackend,
-        namespace: String,
-        sender: flotilla_store::controller::WorkQueueSender,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), flotilla_resources::ResourceError>> + Send>> {
-        Box::pin(async move {
-            let mut watch = start_watch(&self.service)?;
-            loop {
-                let holders = match changed_holders(&mut watch).await {
-                    Ok(holders) if holders.is_empty() => continue,
-                    Ok(holders) => holders,
-                    Err(error) => {
-                        tracing::warn!(%error, "the checkout vessel wake could not read the log; retrying");
-                        continue;
-                    }
-                };
-                match Self::vessels(&backend, &namespace, &holders).await {
-                    Ok(vessels) => {
-                        for vessel in vessels {
-                            if sender.send(vessel).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    Err(error) => tracing::warn!(%error, "the checkout vessel wake could not read the vessels"),
-                }
-            }
-        })
-    }
+        .collect();
+    Ok((holders, changed.rescanned))
 }
 
 /// Wakes the convoy a checkout is held for when it changes: a convoy reads its checkouts'
@@ -698,8 +644,15 @@ impl flotilla_store::controller::SecondaryWatch for CheckoutConvoyWake {
             let mut watch = start_watch(&self.service)?;
             loop {
                 let holders = match changed_holders(&mut watch).await {
-                    Ok(holders) if holders.is_empty() => continue,
-                    Ok(holders) => holders,
+                    Ok((holders, rescanned)) => {
+                        if rescanned {
+                            sender.send_every();
+                        }
+                        if holders.is_empty() {
+                            continue;
+                        }
+                        holders
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "the checkout convoy wake could not read the log; retrying");
                         continue;
@@ -717,6 +670,14 @@ impl flotilla_store::controller::SecondaryWatch for CheckoutConvoyWake {
                 }
             }
         })
+    }
+}
+
+/// What a followed write of the kinds tells readers.
+fn checkout_change(followed: flotilla_engine_store::follow::Followed) -> CheckoutChange {
+    match followed {
+        flotilla_engine_store::follow::Followed::Changed(identity) => CheckoutChange::Changed(identity.name),
+        flotilla_engine_store::follow::Followed::Rescan(_) => CheckoutChange::Rescanned,
     }
 }
 

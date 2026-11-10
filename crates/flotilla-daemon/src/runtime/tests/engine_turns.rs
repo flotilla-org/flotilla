@@ -47,25 +47,12 @@ async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
         .await
         .expect("convoy");
     // The crew's vessel holds its session, which runs its agent under pool session `agent`.
-    backend
-        .clone()
-        .using::<Vessel>(NAMESPACE)
-        .create(
-            &empty_meta("turns-work"),
-            &VesselSpec {
-                convoy_ref: "turns".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "host-direct".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("crew vessel");
+    let vessel = engine(&daemon).vessels.request("turns", "work", &profile.host_id);
     let terminals = &engine(&daemon).terminals;
     let launch = terminals.request(&flotilla_resources::terminal_records::TerminalLaunchRequest {
         session: "agent".into(),
         environment: profile.host_direct_environment_name(),
-        vessel: Some("turns-work".into()),
+        vessel: Some(vessel),
         role: "coder".into(),
         pool: "turn-probe".into(),
         cwd: "/workspace".into(),

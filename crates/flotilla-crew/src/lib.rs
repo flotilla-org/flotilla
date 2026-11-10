@@ -14,17 +14,32 @@ pub mod ports;
 pub mod reconcilers;
 pub mod review_bundle;
 
-/// Readings that serve the engine's checkouts with none held, as a daemon's readings always serve
-/// them (#3108). One store serves every unit test: it is only read.
+/// Readings that serve the engine's checkouts and vessels with none held, as a daemon's readings
+/// always serve them (#3108). One store serves every unit test: it is only read.
 #[cfg(test)]
 pub(crate) fn no_held_checkouts() -> std::sync::Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads> {
-    std::sync::Arc::clone(&checkout_fixture().reads)
+    engine_fixture().reads()
 }
 
 #[cfg(test)]
-fn checkout_fixture() -> &'static flotilla_provisioning_testkit::CheckoutFixture {
-    static FIXTURE: std::sync::OnceLock<flotilla_provisioning_testkit::CheckoutFixture> = std::sync::OnceLock::new();
-    FIXTURE.get_or_init(flotilla_provisioning_testkit::CheckoutFixture::default)
+fn engine_fixture() -> &'static flotilla_provisioning_testkit::EngineFixture {
+    static FIXTURE: std::sync::OnceLock<flotilla_provisioning_testkit::EngineFixture> = std::sync::OnceLock::new();
+    FIXTURE.get_or_init(flotilla_provisioning_testkit::EngineFixture::default)
+}
+
+/// Readings as [`no_held_checkouts`] serves them, also serving `agent_sessions`.
+#[cfg(test)]
+fn reads_with_agent_sessions(
+    agent_sessions: std::sync::Arc<dyn flotilla_resources::agent_activity::AgentSessionReads>,
+) -> std::sync::Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads> {
+    use flotilla_provisioning::engine::reads::{LifecycleReadPort, StoreReads};
+    let engine = engine_fixture();
+    std::sync::Arc::new(
+        LifecycleReadPort::new(StoreReads::new(std::sync::Arc::clone(&engine.checkouts.store)), engine.checkouts.home.clone())
+            .with_checkouts(std::sync::Arc::clone(&engine.checkouts.checkouts) as _)
+            .with_vessels(std::sync::Arc::clone(&engine.vessels.vessels) as _)
+            .with_agent_sessions(agent_sessions),
+    )
 }
 
 #[cfg(test)]
@@ -41,7 +56,7 @@ pub(crate) fn agent_reads() -> std::sync::Arc<dyn flotilla_resources::lifecycle_
     let fixture =
         std::sync::Arc::new(flotilla_provisioning_testkit::AgentSessionsFixture::new(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH));
     AGENTS.with(|agents| *agents.borrow_mut() = Some(std::sync::Arc::clone(&fixture)));
-    checkout_fixture().reads_with_agent_sessions(fixture)
+    reads_with_agent_sessions(fixture)
 }
 
 /// Readings as a daemon restarted at `watched_from` serves them: this test's AgentSessions, with
@@ -52,7 +67,7 @@ pub(crate) fn restarted_agent_reads(
 ) -> std::sync::Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads> {
     let fixture = std::sync::Arc::new(agents().restarted(watched_from));
     AGENTS.with(|agents| *agents.borrow_mut() = Some(std::sync::Arc::clone(&fixture)));
-    checkout_fixture().reads_with_agent_sessions(fixture)
+    reads_with_agent_sessions(fixture)
 }
 
 /// The AgentSessions the readings this test thread last built serve.

@@ -37,9 +37,8 @@ use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
     FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError,
-    ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase,
-    VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement,
+    WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
@@ -572,6 +571,9 @@ impl Aggregator {
         let mut durable_repository_stream = self.recover_repository_watch(durable_repositories).await?;
         let mut observed_convoy_stream = self.recover_convoy_watch(LocalSource::Observed, observed_convoys).await?;
         let mut observed_session_stream = self.recover_observed_session_watch(observed_sessions).await?;
+        // The engine's checkout commits, at every home, wake the checkout rows and readiness
+        // (#3108); subscribed before the first read, so a commit between the two is not missed.
+        let mut checkout_changes = self.lifecycle_reads.checkouts().ok().map(|checkouts| checkouts.changes());
         self.read_engine_checkouts();
         self.refresh_origin_hosts().await;
         let mut observed_checkout_stream = self.recover_checkout_watch(observed_checkouts).await?;
@@ -579,8 +581,6 @@ impl Aggregator {
         self.readiness_vessels = readiness_resources(items);
         let (items, mut host_stream) = Self::recover_replica_watch(durable_hosts).await?;
         self.replace_hosts(items);
-        // The engine's checkout commits, at every home, wake readiness (#3108).
-        let mut checkout_changes = self.lifecycle_reads.checkouts().ok().map(|checkouts| checkouts.changes());
         // AgentSessions are the engine's, at every home: followed from the decided store (#3108).
         let mut agent_session_updates = match self.agent_session_port.follow().await {
             Ok(follow) => {
@@ -2642,29 +2642,6 @@ impl Aggregator {
         session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running)
     }
 
-    pub(super) fn vessel_phase_from_reading(
-        vessel: &ReadResourceObject<Vessel>,
-        reading: Option<&flotilla_protocol::LifecycleReading>,
-    ) -> VesselPhase {
-        use flotilla_protocol::LifecycleReading;
-        match reading {
-            Some(LifecycleReading::Ready { .. }) => {
-                if vessel.object.status.as_ref().is_some_and(|status| !status.interrupted_roles.is_empty()) {
-                    VesselPhase::Interrupted
-                } else {
-                    VesselPhase::Ready
-                }
-            }
-            Some(LifecycleReading::InProgress | LifecycleReading::Retrying { .. }) => VesselPhase::Provisioning,
-            // Exhaustion is a failed judgement while the engine finishes the terminal GiveUp write.
-            Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. } | LifecycleReading::Exhausted { .. }) => {
-                VesselPhase::Failed
-            }
-            Some(LifecycleReading::Lost { .. } | LifecycleReading::Released) => VesselPhase::Lost,
-            None => vessel.object.status.as_ref().map(|status| status.phase).unwrap_or_default(),
-        }
-    }
-
     fn vessel_materialize(&self, namespace: &str, convoy: &str, vessel: &str, vessel_host: &HostName) -> Option<String> {
         self.convoy_sessions(namespace, convoy)
             .filter(|session| {
@@ -3327,6 +3304,7 @@ fn work_phase(phase: ResourceWorkPhase) -> WorkPhase {
 
 #[cfg(test)]
 mod tests {
+    use flotilla_resources::VesselPhase;
     use std::{
         collections::{BTreeMap, VecDeque},
         sync::{
@@ -6915,7 +6893,6 @@ mod tests {
             .map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(6)))
             .collect::<Vec<_>>();
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-            let backend = ResourceBackend::new(InMemoryBackend::default());
             let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Ready).call();
             if governor {
                 convoy.spec.role = "governor".into();
@@ -6934,20 +6911,18 @@ mod tests {
             };
             convoy.status.as_mut().expect("status").work.get_mut("implement").expect("work").placement =
                 Some(PlacementStatus { fields: BTreeMap::from([("host".into(), serde_json::json!(host.as_str()))]) });
-            let mut vessel = backend
-                .using::<Vessel>("flotilla")
-                .create(
-                    &InputMeta::builder().name("vessel-a".into()).build(),
-                    &VesselSpec {
-                        convoy_ref: convoy.metadata.name.clone(),
-                        vessel_name: "implement".into(),
-                        fulfilment_kind_ref: "local".into(),
-                        adopted_checkout_refs: BTreeMap::new(),
-                    },
-                )
-                .await
-                .expect("vessel");
-            vessel.status = Some(VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() });
+            // The work's launch at the vessel's home, read as the old Vessel view.
+            let launch = reads.launch(if remote { "remote-origin" } else { "kiwi" }, &convoy.metadata.name, "implement", host.as_str());
+            let mut vessel = flotilla_provisioning_testkit::object::<Vessel>(
+                &launch,
+                VesselSpec {
+                    convoy_ref: convoy.metadata.name.clone(),
+                    vessel_name: "implement".into(),
+                    fulfilment_kind_ref: "local".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+                VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() },
+            );
             apply_readiness_event(
                 &mut aggregator.readiness_vessels,
                 ReadWatchEvent::Added(ReadResourceObject { object: vessel.clone(), provenance: provenance.clone() }),
@@ -6999,6 +6974,7 @@ mod tests {
                 reads.set(crate::ports::ProvisioningKind::Clone, "ops-clone", reading);
                 vessel.status.as_mut().expect("status").phase =
                     if op == 3 || op == 6 { VesselPhase::Ready } else { VesselPhase::Provisioning };
+                reads.realise(op == 3 || op == 6);
                 apply_readiness_event(
                     &mut aggregator.readiness_vessels,
                     ReadWatchEvent::Modified(ReadResourceObject { object: vessel.clone(), provenance: provenance.clone() }),
@@ -7034,9 +7010,30 @@ mod tests {
         /// The home and spec of each checkout the engine holds: its reading is scripted as a
         /// [`crate::ports::ProvisioningKind::Checkout`] reading.
         checkouts: std::sync::Mutex<BTreeMap<String, (String, CheckoutSpec)>>,
+        /// The vessel's launch at its home, once requested: still being realised, and realised.
+        launches: std::sync::OnceLock<(flotilla_provisioning_testkit::VesselsFixture, flotilla_provisioning_testkit::VesselsFixture)>,
+        /// Whether the vessel reads as its realised launch.
+        realised: std::sync::atomic::AtomicBool,
     }
 
     impl ScriptedReadings {
+        /// Requests the launch serving `work` of `convoy` on `host` at `home`, and returns its
+        /// name; it reads as being realised until [`Self::realise`].
+        fn launch(&self, home: &str, convoy: &str, work: &str, host: &str) -> String {
+            let (pending, realised) = self.launches.get_or_init(|| {
+                (flotilla_provisioning_testkit::VesselsFixture::at(home), flotilla_provisioning_testkit::VesselsFixture::at(home))
+            });
+            let launch = pending.request(convoy, work, host);
+            assert_eq!(realised.request(convoy, work, host), launch, "both launches share one name");
+            realised.ready(&launch, "env");
+            launch
+        }
+
+        /// Whether the vessel reads as realised or still being realised.
+        fn realise(&self, realised: bool) {
+            self.realised.store(realised, std::sync::atomic::Ordering::SeqCst);
+        }
+
         fn set(&self, kind: crate::ports::ProvisioningKind, name: &str, reading: Option<flotilla_protocol::LifecycleReading>) {
             let mut readings = self.readings.lock().expect("script");
             match reading {
@@ -7073,6 +7070,11 @@ mod tests {
         }
         fn checkouts(&self) -> Result<&dyn flotilla_resources::checkout_records::CheckoutRecords, String> {
             Ok(self)
+        }
+        fn vessels(&self) -> Result<&dyn flotilla_resources::vessel_records::VesselRecords, String> {
+            let (pending, realised) = self.launches.get().ok_or("no vessel launched")?;
+            let fixture = if self.realised.load(std::sync::atomic::Ordering::SeqCst) { realised } else { pending };
+            Ok(fixture.vessels.as_ref())
         }
     }
 
@@ -7181,7 +7183,6 @@ mod tests {
         reads: Arc<ScriptedReadings>,
     ) -> (Aggregator, ResourceRef, ResourceObject<Convoy>) {
         use flotilla_resources::{VesselPhase, VesselSpec, VesselStatus};
-        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Ready).call();
         let (events, _) = broadcast::channel(128);
         let mut aggregator =
@@ -7196,20 +7197,18 @@ mod tests {
         };
         convoy.status.as_mut().expect("status").work.get_mut("implement").expect("work").placement =
             Some(PlacementStatus { fields: BTreeMap::from([("host".into(), serde_json::json!(host.as_str()))]) });
-        let mut vessel = backend
-            .using::<Vessel>("flotilla")
-            .create(
-                &InputMeta::builder().name("vessel-a".into()).build(),
-                &VesselSpec {
-                    convoy_ref: convoy.metadata.name.clone(),
-                    vessel_name: "implement".into(),
-                    fulfilment_kind_ref: "local".into(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                },
-            )
-            .await
-            .expect("vessel");
-        vessel.status = Some(VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() });
+        // The work's launch at the vessel's home, read as the old Vessel view.
+        let launch = reads.launch(if remote { "remote-origin" } else { "kiwi" }, &convoy.metadata.name, "implement", host.as_str());
+        let vessel = flotilla_provisioning_testkit::object::<Vessel>(
+            &launch,
+            VesselSpec {
+                convoy_ref: convoy.metadata.name.clone(),
+                vessel_name: "implement".into(),
+                fulfilment_kind_ref: "local".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+            VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() },
+        );
         apply_readiness_event(
             &mut aggregator.readiness_vessels,
             ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance: provenance.clone() }),
@@ -7346,29 +7345,39 @@ mod tests {
     }
 
     fn assert_vessel_readiness_contract(old: VesselPhase, reason: &str, mode: usize) {
-        use crate::ports::ProvisioningKind;
         use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
-        use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
-        use flotilla_resources::{VesselSpec, VesselStatus};
+        use flotilla_provisioning_testkit::{object, VesselsFixture};
+        use flotilla_resources::{vessel_records::VesselStep, VesselSpec, VesselStatus};
         let recorded_reason = reason;
-        let (ending, expected, reason) = match mode {
-            0 => (Some(Ending::Released), VesselPhase::Lost, "released"),
-            1 => (Some(Ending::Lost("env")), VesselPhase::Lost, "observed absent"),
-            2 => {
-                (Some(Ending::Failed(reason)), VesselPhase::Failed, if reason.is_empty() { "failed (no reason recorded)" } else { reason })
+        let ready = |environment: &str| VesselStep::Realised { environment: environment.into() };
+        let (steps, expected, reason) = match mode {
+            0 => (vec![VesselStep::Released], VesselPhase::Lost, "released".to_owned()),
+            1 => {
+                (vec![ready("env"), VesselStep::Lost { reason: "observed absent".into() }], VesselPhase::Lost, "observed absent".to_owned())
             }
-            3 => (Some(Ending::GaveUp(reason)), VesselPhase::Failed, reason),
-            4 => (None, VesselPhase::Provisioning, "being realised"),
-            5 => (Some(Ending::Ready("env")), VesselPhase::Interrupted, "crew roles are interrupted: coder"),
-            6 => (None, VesselPhase::Provisioning, "provider is busy (1 failed; next try at 1970-01-01T00:00:03+00:00)"),
-            _ => (None, VesselPhase::Failed, "provider refused (attempts spent)"),
+            2 => (
+                vec![ready("env"), VesselStep::Broke { reason: reason.into() }],
+                VesselPhase::Failed,
+                if reason.is_empty() { "failed (no reason recorded)".to_owned() } else { reason.to_owned() },
+            ),
+            3 => (vec![VesselStep::Failed { cause: reason.into(), retryable: false }], VesselPhase::Failed, reason.to_owned()),
+            4 => (Vec::new(), VesselPhase::Provisioning, "being realised".to_owned()),
+            5 => (vec![ready("env")], VesselPhase::Interrupted, "crew roles are interrupted: coder".to_owned()),
+            6 => (
+                vec![VesselStep::Failed { cause: "provider is busy".into(), retryable: true }],
+                VesselPhase::Provisioning,
+                "provider is busy (1 failed; next try at".to_owned(),
+            ),
+            // Its tries spent and no give-up written yet: a restart between the two leaves it so.
+            _ => (Vec::new(), VesselPhase::Failed, "provider refused (attempts spent)".to_owned()),
         };
         let convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
         let status = convoy.status.as_ref().expect("status");
         let definition = &status.workflow_snapshot.as_ref().expect("snapshot").vessels[0];
-        let fixture = VesselFixture::new(false);
+        let fixture = VesselsFixture::default();
+        let launch = fixture.request(&convoy.metadata.name, &definition.name, "host");
         let vessel = object::<Vessel>(
-            "vessel",
+            &launch,
             VesselSpec {
                 convoy_ref: convoy.metadata.name.clone(),
                 vessel_name: definition.name.clone(),
@@ -7389,14 +7398,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        fixture.request(&vessel);
-        if mode == 6 {
-            fixture.retry(&vessel, "provider is busy");
-        } else if mode == 7 {
-            fixture.exhaust_before_give_up(&vessel, "provider refused");
+        for step in steps {
+            fixture.step(&launch, step);
         }
-        if let Some(ending) = ending {
-            fixture.finish(&vessel, ending);
+        if mode == 7 {
+            fixture.exhaust_before_give_up(&launch, "provider refused");
         }
         let (events, _) = broadcast::channel(8);
         let mut aggregator =
@@ -7427,11 +7433,17 @@ mod tests {
             &Ok(BTreeMap::new()),
         );
         assert_eq!(readiness.blockers.len(), 1, "stale checkout refs are not combined with engine evidence");
-        assert_eq!(readiness.blockers[0].reason, reason);
+        // A retrying launch's next try is at the engine's clock; the rest of its reason is fixed.
+        if mode == 6 {
+            assert!(readiness.blockers[0].reason.starts_with(&reason), "{}", readiness.blockers[0].reason);
+        } else {
+            assert_eq!(readiness.blockers[0].reason, reason);
+        }
         assert_eq!(readiness.blockers[0].phase, format!("{expected:?}"));
         if mode == 2 {
             assert_eq!(
-                fixture.reads.try_reading(ProvisioningKind::Vessel, "vessel", None),
+                flotilla_resources::vessel_records::engine_vessel(fixture.reads.as_ref(), &read.object, None)
+                    .map(|record| record.map(|record| record.reading)),
                 Ok(Some(LifecycleReading::Failed { reason: recorded_reason.into() }))
             );
         }

@@ -1192,9 +1192,17 @@ async fn get_all_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, 
 
 async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceDelete, ResourceError> {
     let resolver = backend.using::<T>(namespace);
-    if backend.engine_records(T::API_PATHS.kind).is_some() {
-        // The engine keeps its own deletions: no old-store tombstone or decode quarantine.
-        let object = resolver.get(name).await?;
+    if let Some(records) = backend.engine_records(T::API_PATHS.kind) {
+        // The engine keeps its own deletions: no old-store tombstone or decode quarantine. Its port
+        // answers a delete of a name it does not list too, refusing it when the kind takes no writes.
+        let object = match resolver.get(name).await {
+            Ok(object) => object,
+            Err(not_found @ ResourceError::NotFound { .. }) => {
+                records.delete(T::API_PATHS.kind, name).await.map_err(ResourceError::invalid)?;
+                return Err(not_found);
+            }
+            Err(error) => return Err(error),
+        };
         resolver.delete(name).await?;
         return Ok(DynamicResourceDelete {
             object: DynamicResourceObject {

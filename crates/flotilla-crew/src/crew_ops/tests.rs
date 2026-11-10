@@ -94,6 +94,21 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
     fixture_with_message_path(phase, Default::default()).await
 }
 
+/// The engine's launch of `work` in convoy `crew`, realised in `environment`, read as a vessel
+/// through `backend`; `crew` reads the engine, as a daemon's readings serve it.
+fn launch_vessel(
+    crew: &mut Arc<CrewService>,
+    backend: &ResourceBackend,
+    environment: &str,
+) -> (flotilla_provisioning_testkit::EngineFixture, String) {
+    let engine = flotilla_provisioning_testkit::EngineFixture::default();
+    let launch = engine.vessels.request("crew", "work", "host");
+    engine.vessels.ready(&launch, environment);
+    backend.install_engine_records(Arc::new(flotilla_store::VesselViews::new(backend.clone(), "flotilla", engine.reads())));
+    Arc::get_mut(crew).expect("unique service").lifecycle_reads = engine.reads();
+    (engine, launch)
+}
+
 /// [`fixture`], with the `[primitives]` Message path the crew service and its
 /// leaf subscriptions share, as the composition root wires them; the engine's
 /// path at this home unless `message_path` is already set.
@@ -290,33 +305,19 @@ async fn legacy_adoption_reads_only_live_convoys() {
     assert_eq!(reads.of(&backend).objects("Convoy", ReadOperation::Query), 22);
 }
 
-// Resume uses the held Environment's ending and cause even when every old phase disagrees.
-// Unheld resources preserve the legacy refusal; requested, retrying and realised resources may resume.
+// Resume uses the Environment its vessel's launch realised in, by its ending and cause: requested
+// and realised environments may resume.
 #[tokio::test]
 async fn resume_reads_environment_lifecycle_without_a_copy() {
-    use flotilla_provisioning_testkit::{object, store_object, Ending, EnvironmentFixture};
-    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Vessel, VesselSpec, VesselStatus};
+    use flotilla_provisioning_testkit::Ending;
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec};
     let (mut crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
     let env = EnvironmentSpec {
         host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
         ..Default::default()
     };
-    store_object(
-        &backend,
-        object::<Vessel>(
-            &flotilla_resources::vessel_resource_name("crew", "work"),
-            VesselSpec {
-                convoy_ref: "crew".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-            VesselStatus { environment_ref: Some("env".into()), ..Default::default() },
-        ),
-    )
-    .await;
-    let lifecycle = EnvironmentFixture::default();
-    Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = lifecycle.reads.clone();
+    let (engine, _) = launch_vessel(&mut crew, &backend, "env");
+    let lifecycle = &engine.environments;
     lifecycle.request("env", &env, None);
     crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect("requested may resume");
     lifecycle.finish("env", Ending::Ready("/work"));

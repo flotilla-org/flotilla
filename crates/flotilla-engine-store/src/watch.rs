@@ -2,7 +2,13 @@
 //! followed kind, never on a timer, and reads the log on a blocking thread, so the store's lock
 //! is never taken on an async worker. A commit of other kinds, or a keepalive, wakes nothing.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use crate::follow::{Followed, Follower};
 use flotilla_schema::KindCode;
@@ -17,6 +23,7 @@ pub struct EngineWatch {
     service: Arc<Service>,
     follower: Follower,
     wake: Arc<Notify>,
+    resets: Arc<AtomicBool>,
     // The store holds the listener weakly: it lapses with this watch.
     _listener: Arc<CommitListener>,
 }
@@ -38,9 +45,13 @@ impl EngineWatch {
     fn start_waking(service: Arc<Service>, kinds: impl IntoIterator<Item = KindCode>, hearing: bool) -> Result<Self, StoreError> {
         let kinds: BTreeSet<KindCode> = kinds.into_iter().collect();
         let wake = Arc::new(Notify::new());
+        let resets = Arc::new(AtomicBool::new(false));
         let listener: Arc<CommitListener> = {
-            let (wake, kinds) = (Arc::clone(&wake), kinds.clone());
+            let (wake, kinds, resets) = (Arc::clone(&wake), kinds.clone(), Arc::clone(&resets));
             Arc::new(move |committed: &Committed<'_>| {
+                if committed.rescan {
+                    resets.store(true, Ordering::SeqCst);
+                }
                 if committed.touches(&kinds) || (hearing && !committed.heard.is_empty()) {
                     wake.notify_one()
                 }
@@ -50,7 +61,7 @@ impl EngineWatch {
         let mut follower = Follower::new(kinds);
         let homes = service.homes();
         service.with_store(|store| follower.start(&mut store.read()?, &homes))?;
-        Ok(Self { service, follower, wake, _listener: listener })
+        Ok(Self { service, follower, wake, resets, _listener: listener })
     }
 
     /// Waits for the next commit, then passes over the log and hands what it found to `read`,
@@ -76,11 +87,12 @@ impl EngineWatch {
     ) -> Result<T, StoreError> {
         let service = Arc::clone(&self.service);
         let mut follower = self.follower.clone();
+        let reset = self.resets.swap(false, Ordering::SeqCst);
         let (follower, result) = tokio::task::spawn_blocking(move || {
             let homes = service.homes();
             let result = service.with_store(|store| {
                 let mut store_read = store.read()?;
-                let followed = follower.pass(&mut store_read, &homes)?;
+                let followed = reset_or_pass(&mut follower, &mut store_read, &homes, reset)?;
                 read(&mut store_read, followed)
             });
             (follower, result)
@@ -89,6 +101,8 @@ impl EngineWatch {
         .map_err(|error| StoreError::Stream(format!("log pass did not finish: {error}")))?;
         if result.is_ok() {
             self.follower = follower;
+        } else if reset {
+            self.resets.store(true, Ordering::SeqCst);
         }
         result
     }
@@ -209,4 +223,15 @@ async fn follow(mut watch: EngineWatch, sender: tokio::sync::watch::Sender<u64>,
             },
         }
     }
+}
+
+/// The pass of `follower` over `homes`, or, where a home was `reset` since it last passed (a
+/// snapshot cut or a replica reset, which can leave the home's sequence where it was), a rescan of
+/// every home, followed from now.
+pub fn reset_or_pass(follower: &mut Follower, read: &mut Read<'_>, homes: &[String], reset: bool) -> Result<Vec<Followed>, StoreError> {
+    if !reset {
+        return follower.pass(read, homes);
+    }
+    follower.start(read, homes)?;
+    Ok(homes.iter().cloned().map(Followed::Rescan).collect())
 }

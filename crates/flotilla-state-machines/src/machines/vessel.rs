@@ -30,7 +30,7 @@ use super::{
 };
 use crate::{
     placement::{Dimension, Host, Lease, Request, VesselId},
-    Resource,
+    AttemptPolicy, Resource,
 };
 
 /// Vessels as a lifecycle kind: the spec is the granted lease.
@@ -39,24 +39,53 @@ pub struct VesselKind;
 impl LifecycleKind for VesselKind {
     const NAME: &'static str = "Vessel";
     type Request = VesselSpec;
+    fn launch(request: &VesselSpec) -> Option<(&str, u64)> {
+        Some((&request.launch_of, request.launch))
+    }
+    fn numbered(request: VesselSpec, launch: u64) -> VesselSpec {
+        VesselSpec { launch, ..request }
+    }
+    /// A vessel's home tries to make it ready under the local controllers' retry limit and
+    /// backoff (`flotilla_resources::controller_retry::LOCAL_RETRY_*`), not unbounded.
+    fn policy() -> AttemptPolicy {
+        VESSEL_POLICY
+    }
 }
+
+/// [`VesselKind::policy`]: 10 failed tries, 2 s after the first, doubling to 5 min.
+pub const VESSEL_POLICY: AttemptPolicy = AttemptPolicy { max_failures: 10, base: 2 * SECOND, factor: 2, cap: 300 * SECOND };
+
+const SECOND: i64 = 1_000_000;
 
 /// The Vessel machine: the shared lifecycle over a lease.
 pub type Vessel = Lifecycle<VesselKind>;
 
 /// A granted lease as the vessel's spec, which declares the stored Vessel
-/// (kind code `ve`): the request's convoy, class and priority and the host as
-/// columns, and its shape as a child table. Indexed for a host's live vessels
-/// (the ledger's view) and for a convoy's vessels.
+/// (kind code `ve`): the launch it is, the request's convoy, class and
+/// priority and the host as columns, and its shape as a child table. Indexed
+/// for a host's live vessels (the ledger's view) and for a convoy's vessels by
+/// work, in launch order.
+///
+/// Each vessel is a launch named `<convoy>-<work>#<n>` (owner's ruling, #3108):
+/// a vessel lost to its backing is replaced by the next launch of its work in
+/// the same convoy, and an ended launch is never revived. A convoy's name is
+/// unique only at its own home, so its vessels are found by the convoy's
+/// identity and the launch name together (`by_launch`).
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(
     kind = "Vessel",
     code = "ve",
     state = LifecycleState,
     index(name = "live_by_host", eq(host), when(state in [Requested, Realised])),
-    index(name = "by_convoy", eq(convoy))
+    // A convoy's vessels, a work's launches together in launch order: the newest is the last.
+    index(name = "by_launch", eq(convoy, launch_of), order(launch))
 )]
 pub struct VesselSpec {
+    /// The name this is a launch of, `<convoy>-<work>`, interned (domain `ln`).
+    #[store(intern = "ln")]
+    pub launch_of: String,
+    /// The home sequence the launch's create took; 0 until its log numbers it.
+    pub launch: u64,
     /// The convoy whose quota the lease counts against, at its own home.
     pub convoy: ConvoyId,
     pub class: VesselClass,
@@ -78,10 +107,11 @@ impl VesselSpec {
     }
 }
 
-impl From<Lease> for VesselSpec {
-    fn from(lease: Lease) -> VesselSpec {
+impl VesselSpec {
+    /// The spec of a launch of `launch_of` granted `lease`, numbered when its create is logged.
+    pub fn of(launch_of: impl Into<String>, lease: Lease) -> VesselSpec {
         let Lease { request: Request { convoy, class, shape, priority }, host } = lease;
-        VesselSpec { convoy, class, shape, priority, host }
+        VesselSpec { launch_of: launch_of.into(), launch: 0, convoy, class, shape, priority, host }
     }
 }
 

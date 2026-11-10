@@ -18,6 +18,10 @@ use crate::{CheckoutSpec, RepositoryKey};
 /// waits for the convoy rather than failing.
 pub const HOLDER_NOT_OPEN: &str = "is not admitted on the engine yet";
 
+/// What a refused request says when its holder's engine Convoy has ended: nothing new is held for
+/// it, and what asked is released with it rather than failed.
+pub const HOLDER_ENDED: &str = "has ended";
+
 /// Who a checkout is held for. The holder carries no ownership: a finishing holder finds its
 /// checkouts by it and releases them.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -312,6 +316,11 @@ pub trait CheckoutRecords: Send + Sync {
     /// Where none are followed, the channel is closed.
     fn changes(&self) -> tokio::sync::broadcast::Receiver<CheckoutChange> {
         tokio::sync::broadcast::channel(1).1
+    }
+    /// A cursor over the checkouts' changes from now on, read from the log; none where no log is
+    /// held, and a reader then reads everything afresh.
+    fn cursor(&self) -> Option<Box<dyn crate::lifecycle_reads::ChangeCursor<CheckoutChange>>> {
+        None
     }
 }
 

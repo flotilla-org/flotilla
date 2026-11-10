@@ -13,7 +13,7 @@ use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_crew::leaf_engine::CrewTurnIntent;
-use flotilla_crew::reconcilers::vessel::VesselReconciler;
+use flotilla_crew::reconcilers::vessel::VesselPlanning;
 use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task;
 use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task_with_watches;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
@@ -22,10 +22,9 @@ use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, EnvironmentSpec,
     ExitDeclaration, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Message,
-    MessageExpectation, Resource, Selector, TerminalSession, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    MessageExpectation, Resource, Selector, TerminalSession, Vessel, VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
 };
-use flotilla_store::{controller::Reconciler, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use futures::StreamExt;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -99,8 +98,13 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .expect("cross-host Message mutation router");
 
     let convoys = home.clone().using::<Convoy>("flotilla");
-    let created =
-        convoys.create(&meta("nudge-convoy"), &ConvoySpec::builder().workflow_ref("wf".to_string()).build()).await.expect("convoy");
+    let created = convoys
+        .create(
+            &meta("nudge-convoy"),
+            &ConvoySpec::builder().workflow_ref("wf".to_string()).placement_policy("placement-policy".to_string()).build(),
+        )
+        .await
+        .expect("convoy");
     convoys
         .update_status(
             &created.metadata.name,
@@ -166,44 +170,49 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         "/workspace",
         Default::default(),
     );
-    let vessel = placement
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("nudge-convoy-work".to_string())
-                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), home_daemon.node_id().to_string())]))
-                .build(),
-            &VesselSpec {
-                convoy_ref: "nudge-convoy".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "placement-policy".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("placement vessel");
-    let reconciler = VesselReconciler::new(placement.clone(), "flotilla")
-        .with_lifecycle_reads(placement_daemon.lifecycle_reads())
-        .with_federated_dependencies(&placement, flotilla_protocol::CanonicalHostId::resolved("placement-host"));
-    // The vessel requests its crew's session; its launch runs the crew's agent at the placement.
-    reconciler.prepare(&vessel).await.expect("vessel dependencies");
+    // The placement launches the work of the convoy homed at home; its vessel reads as the launch.
+    let held = crate::engine(&placement_daemon).vessels.request_for(&flotilla_resources::vessel_records::VesselLaunchRequest {
+        convoy: "nudge-convoy".to_string(),
+        convoy_home: home_daemon.node_id().as_str().to_string(),
+        work: "work".to_string(),
+        host: "placement-host".to_string(),
+    });
+    placement.using::<Vessel>("flotilla").get(&held).await.expect("placement vessel");
+    // The vessel is realised and its crew seated; its session's launch runs the crew's agent at
+    // the placement.
+    let _vessels = flotilla_orchestration_testkit::run_vessels(
+        &placement,
+        "flotilla",
+        VesselPlanning::new(placement.clone(), "flotilla")
+            .with_lifecycle_reads(placement_daemon.lifecycle_reads())
+            .with_federated_dependencies(&placement, flotilla_protocol::CanonicalHostId::resolved("placement-host")),
+        Arc::clone(&crate::engine(&placement_daemon).vessels.lifecycles),
+        placement_daemon.lifecycle_reads(),
+        placement_daemon.decided_store().expect("placement decided store"),
+    );
     let terminals = &crate::engine(&placement_daemon).terminals;
-    let launch = terminals.terminals.of_vessel("nudge-convoy-work").expect("vessel sessions").pop().expect("crew terminal requested").name;
+    let requested = || terminals.terminals.of_vessel(&held).expect("vessel sessions").pop();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while requested().is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("crew terminal requested");
+    let launch = requested().expect("crew terminal requested").name;
     let agent = AgentLaunch { adapter: "codex".into(), model: None, stance: "work".into() };
     terminals.ready(&launch, "receiver-session", &TerminalLaunchFacts { agent: Some(agent), ..Default::default() });
     let convoy = convoys.get("nudge-convoy").await.expect("working convoy");
     let mut status = convoy.status.expect("working status");
     status.crew_work.get_mut("work").expect("work crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Stalled;
     convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("stall crew");
-    // The session's launch reaches the convoy's home as the placement's log does, and its
-    // holder vessel as the placement's records replicate.
+    // The session's launch and its holder vessel reach the convoy's home as the placement's log does.
     crate::engine(&home_daemon);
     flotilla_provisioning_testkit::other_home::replicate_home(
         &placement_daemon.decided_store().expect("placement decided store"),
         placement_daemon.node_id().as_str(),
         &home_daemon.decided_store().expect("home decided store"),
     );
-    replicate::<Vessel>(&placement, &home, placement_daemon.node_id()).await;
 
     // #2287: replication wakes delivery and acknowledgment; no timer does.
     // Await the subscribed startup scan so delivery cannot accidentally come from startup.

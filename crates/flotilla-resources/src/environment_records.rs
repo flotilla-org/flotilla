@@ -5,7 +5,12 @@
 //! [`EnvironmentSpec`] vocabulary its providers take), who holds it, its lifecycle reading, and
 //! the facts fixed when its current launch was realised. Nothing here is stored in this shape.
 
-use flotilla_protocol::{ConfiguredResourceLimits, LifecycleReading};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, PoisonError},
+};
+
+use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentRuntimeObservation, LifecycleReading};
 
 use crate::{EnvironmentProviderDescriptor, EnvironmentSpec};
 
@@ -88,5 +93,51 @@ pub trait EnvironmentRecords: Send + Sync {
     /// Where none are followed, the channel is closed.
     fn changes(&self) -> tokio::sync::broadcast::Receiver<EnvironmentChange> {
         tokio::sync::broadcast::channel(1).1
+    }
+    /// A cursor over the environments' changes from now on, read from the log; none where no log is
+    /// held, and a reader then reads everything afresh.
+    fn cursor(&self) -> Option<Box<dyn crate::lifecycle_reads::ChangeCursor<EnvironmentChange>>> {
+        None
+    }
+    /// What this home observes of its environments' runtimes, in memory.
+    fn observations(&self) -> &EnvironmentObservations;
+}
+
+/// What this home observes of its environments' runtimes (their containers, memory use and
+/// termination), by environment name, held in memory: local observations, never replicated
+/// (owner's ruling, #3108). An environment's last observation outlives its teardown until the
+/// daemon restarts, so an explanation can show what it last used.
+#[derive(Debug, Default)]
+pub struct EnvironmentObservations {
+    held: Mutex<HashMap<String, EnvironmentRuntimeObservation>>,
+}
+
+impl EnvironmentObservations {
+    /// What is observed of environment `name`, if anything.
+    pub fn get(&self, name: &str) -> Option<EnvironmentRuntimeObservation> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner).get(name).cloned()
+    }
+
+    /// Merges `incoming` into what is held for environment `name`; the merged observation when it
+    /// changed. A sample whose container, start and memory use are unchanged keeps the time the
+    /// memory use was first observed, so its age shows how long it has held.
+    pub fn observe(&self, name: &str, incoming: &EnvironmentRuntimeObservation) -> Option<EnvironmentRuntimeObservation> {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let current = held.get(name);
+        let mut merged = current.cloned().unwrap_or_default();
+        merged.merge(incoming);
+        if let Some(current) = current {
+            if merged.container_id == current.container_id
+                && merged.started_at == current.started_at
+                && merged.memory_usage_bytes == current.memory_usage_bytes
+            {
+                merged.memory_observed_at.clone_from(&current.memory_observed_at);
+            }
+            if &merged == current {
+                return None;
+            }
+        }
+        held.insert(name.to_owned(), merged.clone());
+        Some(merged)
     }
 }

@@ -9,7 +9,7 @@ use flotilla_protocol::{CrewCommandContext, DaemonEvent, HostName, NodeId};
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, Vessel, VesselSpec,
+    TerminalSessionPhase as ResourceTerminalSessionPhase,
 };
 use flotilla_store::ResourceBackend;
 
@@ -26,7 +26,7 @@ use flotilla_store_testkit::cr_name;
 
 #[tokio::test]
 async fn crew_fail_requires_operator_force() {
-    let (daemon, backend, _temp, watch, _engine) = stall_test_daemon().await;
+    let (daemon, backend, _temp, watch, engine) = stall_test_daemon().await;
     let error = daemon
         .crew_fail_internal(&CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() }, "blocked".into(), false, None)
         .await
@@ -61,26 +61,13 @@ async fn crew_fail_requires_operator_force() {
         )
         .await
         .expect("crew status");
-    backend
-        .clone()
-        .using::<Vessel>("flotilla")
-        .create(
-            &test_meta("operator-failure-vessel"),
-            &VesselSpec {
-                convoy_ref: "operator-failure".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
+    let vessel = super::support::ensure_vessel(&engine, "operator-failure", "work");
     daemon
         .crew_fail_internal(
             &CrewCommandContext {
                 namespace: Some("flotilla".into()),
                 convoy: Some("operator-failure".into()),
-                vessel_ref: Some("operator-failure-vessel".into()),
+                vessel_ref: Some(vessel),
                 role: Some("coder".into()),
                 ..Default::default()
             },
@@ -134,7 +121,6 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     let idle_at = Utc::now() - chrono::Duration::seconds(6);
     let launch = stall_test_session(
         &engine,
-        &backend,
         "idle-crew",
         "idle-session",
         "coder",
@@ -214,7 +200,6 @@ async fn stale_working_attention_does_not_stall_crew() {
         .expect("active status");
     stall_test_session(
         &engine,
-        &backend,
         "stale-crew",
         "stale-session",
         "coder",
@@ -318,7 +303,6 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
         .expect("fresh observation");
     stall_test_session(
         &engine,
-        &backend,
         "landed-claim",
         "idle-landing-session",
         "coder",
@@ -494,7 +478,6 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
         .expect("active status");
     stall_test_session(
         &engine,
-        &backend,
         "standing",
         "governor-session",
         "governor",
@@ -621,7 +604,7 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
 async fn promise_retractions_stall_unless_crew_sourced() {
     use flotilla_protocol::commands::CrewPromiseOperation;
     use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState};
-    let (daemon, backend, _temp, watch, _engine) = stall_test_daemon().await;
+    let (daemon, backend, _temp, watch, engine) = stall_test_daemon().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let created = convoys.create(&test_meta("promise-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.unwrap();
     let mut status = ConvoyStatus {
@@ -645,23 +628,11 @@ async fn promise_retractions_stall_unless_crew_sourced() {
         );
     }
     convoys.update_status("promise-crew", &created.metadata.resource_version, &status).await.unwrap();
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &test_meta("promise-vessel"),
-            &VesselSpec {
-                convoy_ref: "promise-crew".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .unwrap();
+    let vessel = super::support::ensure_vessel(&engine, "promise-crew", "work");
     let context = CrewCommandContext {
         namespace: Some("flotilla".into()),
         convoy: Some("promise-crew".into()),
-        vessel_ref: Some("promise-vessel".into()),
+        vessel_ref: Some(vessel),
         role: Some("coder".into()),
         ..Default::default()
     };

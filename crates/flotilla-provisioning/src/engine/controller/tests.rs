@@ -5,7 +5,9 @@
 //! ImageBuild lifecycles at the same home (a kind whose resources are not launches, so each is
 //! named as written): `input-<key>` is an input, `holder-<key>` ends the holder
 //! once Gone, `fact-<key>` reports the provider usable while Realised, and a live `served-<key>`
-//! holds its release back.
+//! holds its release back. An environment given holdings holds `hold-<key>-<i>` records, each
+//! requested only once the one before it is realised, as a vessel's later holdings need its
+//! earlier ones' facts.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -27,7 +29,7 @@ use flotilla_state_machines::{
 };
 use tokio::sync::{mpsc, Notify};
 
-use super::{Actuator, Backing, BackingEvent, Controller, Holding, ProviderFailure, Usability};
+use super::{Actuator, Backing, BackingEvent, Controller, Holding, Holdings, ProviderFailure, Usability};
 use crate::{
     engine::{LifecycleHome, Lifecycles, Step},
     stored::{
@@ -93,6 +95,12 @@ struct Script {
     with_fact: BTreeSet<String>,
     realised: Vec<String>,
     released: Vec<(String, Option<String>)>,
+    /// How many holdings each key holds, staged one after another; none holds nothing.
+    holdings: BTreeMap<String, usize>,
+    /// Each key's planning failure: its holdings cannot be planned.
+    unplannable: BTreeMap<String, ProviderFailure>,
+    /// Where holdings are requested and read.
+    records: Option<Arc<LifecycleHome<ImageBuildKind, StoreLog>>>,
 }
 
 #[derive(Default)]
@@ -153,6 +161,37 @@ impl Actuator<EnvironmentKind> for Scripted {
         let live = state_of(read, &name)?.is_some_and(|state| state.live());
         Ok(if live { vec![record(&name)] } else { Vec::new() })
     }
+
+    fn holds(&self) -> bool {
+        !self.script().holdings.is_empty() || !self.script().unplannable.is_empty()
+    }
+
+    async fn holdings(&self, _: &str, request: &EnvironmentRequest) -> Result<Holdings, ProviderFailure> {
+        let key = key(request);
+        // The script is not held across the store's writes: the controller's reads ask it for
+        // usability while they hold the store.
+        let (count, records) = {
+            let script = self.script();
+            if let Some(failure) = script.unplannable.get(&key) {
+                return Err(failure.clone());
+            }
+            (script.holdings.get(&key).copied().unwrap_or_default(), Arc::clone(script.records.as_ref().expect("records")))
+        };
+        let mut held = Vec::new();
+        for index in 0..count {
+            let name = format!("hold-{key}-{index}");
+            if records.get(&name).is_none() {
+                records.request(&name, record_request(), World::now()).expect("request holding");
+            }
+            let usable = records.get(&name).is_some_and(|holding| holding.state().realised());
+            held.push(Usability { fact: record(&name), usable });
+            // The next holding is planned from this one's facts.
+            if !usable {
+                return Ok(Holdings { held, complete: index + 1 == count });
+            }
+        }
+        Ok(Holdings { held, complete: true })
+    }
 }
 
 /// A retryable or final failure.
@@ -185,16 +224,9 @@ impl World {
             Arc::new(move |_: &flotilla_schema_sqlite::stream::Committed<'_>| commits.notify_waiters())
         };
         service.on_commit(Arc::downgrade(&listener));
-        Self {
-            _directory: directory,
-            service,
-            environments,
-            records,
-            actuator: Arc::default(),
-            commits,
-            _listener: listener,
-            backing: None,
-        }
+        let actuator = Arc::new(Scripted::default());
+        actuator.script().records = Some(Arc::clone(&records));
+        Self { _directory: directory, service, environments, records, actuator, commits, _listener: listener, backing: None }
     }
 
     /// Starts the controller over the records as they are now.
@@ -262,6 +294,38 @@ async fn a_request_is_realised() {
     world.start();
     world.request("a");
     world.until("a realised", |world| world.state("a") == LifecycleState::Realised { identity: "id-a".into() }).await;
+}
+
+// A resource that holds others requests them one by one, each once the one before it is
+// realised, and is realised itself once all are. Waiting on them spends none of its tries, and
+// it is tried once.
+#[tokio::test]
+async fn waiting_for_holdings_spends_no_tries() {
+    let mut world = World::open();
+    world.actuator.script().holdings.insert("a".into(), 3);
+    world.start();
+    world.request("a");
+    for index in 0..3 {
+        let holding = format!("hold-a-{index}");
+        world.until("the next holding requested", |world| world.records.get(&holding).is_some()).await;
+        assert_eq!(failures(&world.state("a")), Some(0), "waiting is not a try");
+        assert!(world.actuator.script().realised.is_empty(), "not tried before its holdings are realised");
+        world.record_step(&holding, Step::Realised { identity: holding.clone() });
+    }
+    world.until("a realised", |world| world.state("a").realised()).await;
+    assert_eq!(world.actuator.script().realised, ["a"], "tried once, when everything it holds is realised");
+}
+
+// A holding kind whose holdings cannot be planned fails as its planning says: a planning error
+// gives up at once, without a try at realising it.
+#[tokio::test]
+async fn a_planning_error_gives_up_without_a_try() {
+    let mut world = World::open();
+    world.actuator.script().unplannable.insert("a".into(), failure("work missing from its convoy", false));
+    world.start();
+    world.request("a");
+    world.until("a gave up", |world| matches!(world.state("a"), LifecycleState::GaveUp { .. })).await;
+    assert!(world.actuator.script().realised.is_empty());
 }
 
 // A retryable failure is recorded and nothing more: the controller does not try again on its

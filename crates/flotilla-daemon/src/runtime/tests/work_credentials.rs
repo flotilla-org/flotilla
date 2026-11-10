@@ -1,5 +1,6 @@
 use super::*;
 use crate::testkits::engine::engine;
+use flotilla_resources::vessel_records::VesselStep;
 use flotilla_resources::ResumeIntent;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -87,33 +88,12 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         )
         .await
         .expect("mark work running");
-    let vessels = backend.using::<Vessel>(NAMESPACE);
-    let vessel = vessels
-        .create(
-            &empty_meta("credential-work-vessel"),
-            &VesselSpec {
-                convoy_ref: "credential-work".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create vessel");
-    vessels
-        .update_status(
-            &vessel.metadata.name,
-            &vessel.metadata.resource_version,
-            &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some(env_id.as_str().to_string()),
-                ..VesselStatus::default()
-            },
-        )
-        .await
-        .expect("place vessel");
-    let live =
-        create_credential_test_session(&engine(&daemon).terminals, "credential-work-session", "credential-work-vessel", env_id.as_str());
+    let fixture = engine(&daemon);
+    let vessels = &fixture.vessels;
+    let host = daemon.local_host_id().expect("local host").to_string();
+    let vessel = vessels.request("credential-work", "work", &host);
+    vessels.ready(&vessel, env_id.as_str());
+    let live = create_credential_test_session(&engine(&daemon).terminals, "credential-work-session", &vessel, env_id.as_str());
     engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
@@ -193,36 +173,10 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         )
         .await
         .expect("mark unavailable work running");
-    let unavailable_vessel = vessels
-        .create(
-            &empty_meta("unavailable-work-vessel"),
-            &VesselSpec {
-                convoy_ref: "unavailable-credential-work".to_string(),
-                vessel_name: "unavailable".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create unavailable vessel");
-    vessels
-        .update_status(
-            &unavailable_vessel.metadata.name,
-            &unavailable_vessel.metadata.resource_version,
-            &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some("aaa-unavailable".to_string()),
-                ..VesselStatus::default()
-            },
-        )
-        .await
-        .expect("place unavailable vessel");
-    let unavailable = create_credential_test_session(
-        &engine(&daemon).terminals,
-        "unavailable-work-session",
-        "unavailable-work-vessel",
-        "aaa-unavailable",
-    );
+    let unavailable_vessel = vessels.request("unavailable-credential-work", "unavailable", &host);
+    vessels.ready(&unavailable_vessel, "aaa-unavailable");
+    let unavailable =
+        create_credential_test_session(&engine(&daemon).terminals, "unavailable-work-session", &unavailable_vessel, "aaa-unavailable");
     // The start pass stages the target environment despite the unrelated environment's failure.
     let mut delivery = CredentialDelivery::new(Arc::clone(&state)).expect("a credential store");
     let error = delivery.start().await.expect_err("the unavailable environment fails");
@@ -237,7 +191,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
     let scoped_error = deliver("aaa-unavailable").await.expect_err("unavailable target still fails");
     assert!(scoped_error.contains("aaa-unavailable"), "{scoped_error}");
     deliver(env).await.expect("target environment stages despite unrelated failure");
-    vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");
+    vessels.step(&unavailable_vessel, VesselStep::Released);
     engine(&daemon).terminals.release(&unavailable);
 
     engine_environments(&daemon).request(
@@ -284,37 +238,15 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         )
         .await
         .expect("mark second crew running");
-    let conflicting_vessel = vessels
-        .create(
-            &empty_meta("conflicting-work-vessel"),
-            &VesselSpec {
-                convoy_ref: "conflicting-credential-work".to_string(),
-                vessel_name: "other-work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create second vessel");
-    vessels
-        .update_status(
-            &conflicting_vessel.metadata.name,
-            &conflicting_vessel.metadata.resource_version,
-            &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some(env_id.as_str().to_string()),
-                ..VesselStatus::default()
-            },
-        )
-        .await
-        .expect("place second vessel in shared environment");
+    let conflicting_vessel = vessels.request("conflicting-credential-work", "other-work", &host);
+    vessels.ready(&conflicting_vessel, env_id.as_str());
     let conflicting =
-        create_credential_test_session(&engine(&daemon).terminals, "conflicting-work-session", "conflicting-work-vessel", env_id.as_str());
+        create_credential_test_session(&engine(&daemon).terminals, "conflicting-work-session", &conflicting_vessel, env_id.as_str());
     let error = deliver(env).await.expect_err("shared environment must reject differing permissions");
     assert!(error.contains("different minted permissions for `work-token`"), "{error}");
     let repeated_error = deliver(env).await.expect_err("a persistent conflict keeps failing");
     assert!(repeated_error.contains("different minted permissions for `work-token`"), "{repeated_error}");
-    vessels.delete("conflicting-work-vessel").await.expect("remove second vessel");
+    vessels.step(&conflicting_vessel, VesselStep::Released);
     engine(&daemon).terminals.release(&conflicting);
 
     deliver(env).await.expect("the resolved conflict stages the running crew's credentials");
@@ -382,7 +314,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
     .await
     .expect("the session's stop withdraws its credentials");
 
-    vessels.delete("credential-work-vessel").await.expect("tear down vessel");
+    vessels.step(&vessel, VesselStep::Released);
     deliver(env).await.expect("nothing to deliver after vessel teardown");
     assert!(!can_fill_git_credential().await);
 }
@@ -457,32 +389,12 @@ async fn a_missing_credential_declaration_is_delivered_once_it_arrives() {
         )
         .await
         .expect("mark work running");
-    let vessels = backend.using::<Vessel>(NAMESPACE);
-    let vessel = vessels
-        .create(
-            &empty_meta("late-vessel"),
-            &VesselSpec {
-                convoy_ref: "late-work".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create vessel");
-    vessels
-        .update_status(
-            &vessel.metadata.name,
-            &vessel.metadata.resource_version,
-            &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some(env_id.as_str().to_string()),
-                ..VesselStatus::default()
-            },
-        )
-        .await
-        .expect("place vessel");
-    create_credential_test_session(&engine(&daemon).terminals, "late-session", "late-vessel", env_id.as_str());
+    let fixture = engine(&daemon);
+    let vessels = &fixture.vessels;
+    let host = daemon.local_host_id().expect("local host").to_string();
+    let vessel = vessels.request("late-work", "work", &host);
+    vessels.ready(&vessel, env_id.as_str());
+    create_credential_test_session(&engine(&daemon).terminals, "late-session", &vessel, env_id.as_str());
     engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(

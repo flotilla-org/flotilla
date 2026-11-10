@@ -58,7 +58,8 @@ fn crew_statements_and_identity_removal_search_by_key() {
     assert!(failures.is_empty(), "{failures:#?}");
     let sql = &statements.iter().find(|(label, _)| label == "identity_delete").expect("shared statement").1;
     let rows = plan(&conn, sql);
-    for index in ["vessel_by_convoy", "terminal_session_by_environment"] {
+    // A vessel's convoy leads its `by_launch` index.
+    for index in ["vessel_by_launch", "terminal_session_by_environment"] {
         assert!(rows.iter().any(|row| row.contains(index)), "{index}: {rows:?}");
     }
 }

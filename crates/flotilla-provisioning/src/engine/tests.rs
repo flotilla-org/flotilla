@@ -232,7 +232,7 @@ fn an_empty_label_holds_nothing_and_a_rootless_host_direct_environment_is_refuse
     use super::{environments::request_of, import::import_environment};
     let mut environment = environment_object(false);
     environment.metadata.labels.insert(VESSEL_REF_LABEL.into(), String::new());
-    assert_eq!(import_environment(&environment, HOME).expect("request").resource.spec().holder, None);
+    assert_eq!(import_environment(&environment, HOME, &Default::default()).expect("request").resource.spec().holder, None);
     environment.spec.host_direct.as_mut().expect("host direct").repo_default_dir = String::new();
     assert!(request_of(&environment.spec, None, HOME).expect_err("refused").contains("checkout root"));
 }
@@ -532,7 +532,7 @@ fn every_old_phase_imports_and_rehearses() {
     ] {
         let mut obj = session_object(phase);
         obj.status = Some(TerminalSessionStatus { phase, session_id: Some("s1".into()), ..Default::default() });
-        let result = import_terminal_session(&obj, HOME);
+        let result = import_terminal_session(&obj, HOME, &Default::default());
         report.record(&result);
         let imported = result.expect("imports");
         assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
@@ -545,12 +545,13 @@ fn every_old_phase_imports_and_rehearses() {
     }
     // Two records importing under one name: the rehearsal refuses the second, named.
     let twice = [session_object(TerminalSessionPhase::Starting), session_object(TerminalSessionPhase::Starting)]
-        .map(|obj| import_terminal_session(&obj, HOME).expect("imports"));
+        .map(|obj| import_terminal_session(&obj, HOME, &Default::default()).expect("imports"));
     let refused = rehearse(&twice);
     assert_eq!(refused.keys().collect::<Vec<_>>(), [&1], "the second, by its index");
     assert!(refused[&1].reason.contains("already exists"), "{refused:?}");
     // One name at two homes is two resources; the rehearsal's own home is no record's.
-    let homed = |home: &str| import_terminal_session(&session_object(TerminalSessionPhase::Starting), home).expect("imports");
+    let homed =
+        |home: &str| import_terminal_session(&session_object(TerminalSessionPhase::Starting), home, &Default::default()).expect("imports");
     assert_eq!(rehearse(&[homed("feta"), homed("kiwi")]), BTreeMap::new(), "told apart by home");
     let refused = rehearse(&[homed(flotilla_engine_store::REHEARSAL_HOME)]);
     assert!(refused[&0].reason.contains("rehearsal's own home"), "{refused:?}");
@@ -565,7 +566,7 @@ fn every_old_phase_imports_and_rehearses() {
     ] {
         let mut obj = environment_object(true);
         obj.status = Some(EnvironmentStatus { phase, docker_container_id: Some("c0ffee".into()), ..Default::default() });
-        let imported = import_environment(&obj, HOME).expect("imports");
+        let imported = import_environment(&obj, HOME, &Default::default()).expect("imports");
         if phase == EnvironmentPhase::Lost {
             assert_eq!(
                 imported.resource.state(),
@@ -662,7 +663,7 @@ fn the_rehearsal_lists_records_with_no_mapping() {
     report.record(&import_checkout(&orphan, HOME, &imported_convoy, &BTreeMap::new()).map(|(imported, _)| imported));
     let mut nameless = environment_object(true);
     nameless.status = Some(EnvironmentStatus { phase: EnvironmentPhase::Ready, ..Default::default() });
-    report.record(&import_environment(&nameless, HOME));
+    report.record(&import_environment(&nameless, HOME, &Default::default()));
     let listed: Vec<(&str, &str)> = report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect();
     assert_eq!(listed, [("Checkout", "orphan-a"), ("Environment", "env-a")]);
     assert!(report.refused[0].reason.contains("was not imported"));
@@ -706,7 +707,7 @@ fn the_import_maps_live_cloud_sandboxes_and_drops_deleted_gone_ones() {
             obj.metadata.deletion_timestamp = deleted.then(Utc::now);
             let mut target = rehearsal().expect("rehearsal");
             let mut report = ImportReport::default();
-            import_environments(&[(obj.clone(), HOME.to_owned())], &mut target, &mut report);
+            import_environments(&[(obj.clone(), HOME.to_owned())], &Default::default(), &mut target, &mut report);
             assert_eq!(report.refused, vec![], "{phase:?}");
             let gone = deleted && phase == EnvironmentPhase::Lost;
             let counted = |counts: &BTreeMap<(&'static str, &'static str), usize>| counts.values().sum::<usize>();
@@ -719,7 +720,7 @@ fn the_import_maps_live_cloud_sandboxes_and_drops_deleted_gone_ones() {
                 assert_eq!(report.imported.get(&("Environment", label)), Some(&1), "{phase:?}");
             }
             if phase == EnvironmentPhase::Ready {
-                let imported = super::import::import_environment(&obj, HOME).expect("imports");
+                let imported = super::import::import_environment(&obj, HOME, &Default::default()).expect("imports");
                 assert_eq!(imported.resource.state(), &LifecycleState::Realised { identity: "sandbox-1".into() });
             }
         }
@@ -740,37 +741,31 @@ fn vessel_object() -> ResourceObject<flotilla_resources::Vessel> {
     }
 }
 
-fn provisioning(host: Option<&str>) -> flotilla_resources::VesselStatusPatch {
+/// The placement `obj` recorded at admission: pinned on `host`.
+fn placed_on(obj: &mut ResourceObject<flotilla_resources::Vessel>, host: &str) {
     use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
-    flotilla_resources::VesselStatusPatch::MarkProvisioning {
-        observed_kind_ref: "docker".into(),
-        observed_kind_version: "1".into(),
-        placement_decision: host.map(|host| {
-            PlacementDecision::builder()
-                .kind("docker".into())
-                .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.into() })
-                .build()
-        }),
-        started_at: DateTime::UNIX_EPOCH,
-        message: None,
-        image: None,
-    }
+    obj.status.get_or_insert_with(Default::default).placement_decision = Some(
+        PlacementDecision::builder()
+            .kind("docker".into())
+            .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.into() })
+            .build(),
+    );
 }
 
-fn vessel_ready(environment: &str) -> flotilla_resources::VesselStatusPatch {
-    flotilla_resources::VesselStatusPatch::MarkReady {
-        configured_limits: None,
-        placement_decision: None,
-        environment_ref: Some(environment.into()),
-        image_ref: None,
-        local_image_id: None,
-        registry_digest: None,
-        checkout_refs: BTreeMap::new(),
-        terminal_session_refs: vec![],
-        requested_stance: Default::default(),
-        effective_stance: Default::default(),
-        ready_at: DateTime::UNIX_EPOCH,
-        image: None,
+/// A launch of `launch_of` in convoy-a, leased on `host`.
+fn lease(launch_of: &str, host: &str) -> flotilla_state_machines::machines::vessel::VesselSpec {
+    use flotilla_state_machines::{
+        machines::convoy::{ConvoyId, Priority, VesselClass},
+        placement::Host,
+    };
+    flotilla_state_machines::machines::vessel::VesselSpec {
+        launch_of: launch_of.into(),
+        launch: 0,
+        convoy: ConvoyId::new("convoy-a", HOME),
+        class: VesselClass::new(super::vessel::PINNED_CLASS),
+        shape: BTreeMap::new(),
+        priority: Priority(0),
+        host: Host::new(host),
     }
 }
 
@@ -779,101 +774,52 @@ fn placements(
     Arc::new(super::vessel::PlacementLifecycles::new(HOME, Home::new(HOME).expect("declaration")).expect("placements"))
 }
 
-// Behaviour (#3629 Q6, layer 7): a vessel's lease is the host pinned at admission, granted as its
-// provisioning starts with no capacity, class or priority judged. Its first readiness realises it
-// under its environment; interrupted and ready again, the lease holds; lost, it ends Gone and the
-// ledger frees the lease.
+// Behaviour (#3629 Q6, layer 7, #3108): a vessel's launch is leased on the host its work was placed
+// on, granted as it is requested with no capacity, class or priority judged, and named as a launch
+// of its work. Its readiness realises it under its environment; lost, it ends Gone and the ledger
+// frees the lease.
 #[tokio::test]
 async fn a_vessel_lease_is_granted_on_its_pinned_host_and_ends_gone() {
-    use flotilla_resources::VesselStatusPatch;
     use flotilla_state_machines::placement::{Host, VesselId};
 
-    use super::vessel::{VesselBinding, PINNED_CLASS};
+    use super::vessel::PINNED_CLASS;
     let home = placements();
-    let interrupted = VesselStatusPatch::MarkInterrupted { roles: ["coder".to_owned()].into(), message: "coder lost".into() };
-    let lost = VesselStatusPatch::MarkLost { message: "environment disappeared".into() };
-    let engine = Engine::<_, VesselBinding>::new(
-        Scripted::<flotilla_resources::Vessel>::new([
-            Some(provisioning(Some("feta"))),
-            Some(vessel_ready("env-a")),
-            Some(interrupted.clone()),
-            Some(vessel_ready("env-a")),
-            Some(lost.clone()),
-        ]),
-        Some(home.clone()),
-    );
-    let name = "convoy-a-implement";
-    let state = || home.get(name).map(|vessel| vessel.state().clone());
-    let mut obj = vessel_object();
+    let name =
+        home.request("convoy-a-implement", lease("convoy-a-implement", "feta"), super::at(Utc::now())).expect("granted").name().to_owned();
+    assert!(name.starts_with("convoy-a-implement#"), "{name} is a launch of its work");
+    let state = || home.get(&name).map(|vessel| vessel.state().clone());
 
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(provisioning(Some("feta"))));
-    let lease = home.get(name).expect("granted").spec().lease();
+    let lease = home.get(&name).expect("granted").spec().lease();
     assert_eq!(lease.host, Host::new("feta"));
     assert_eq!(lease.request.class.0, PINNED_CLASS);
     assert!(lease.request.shape.is_empty(), "no capacity judged");
     assert_eq!(lease.request.convoy, flotilla_schema::Ref::new("convoy-a", HOME));
     assert_eq!(state(), Some(LifecycleState::requested()));
 
-    reconcile(&engine, &mut obj).await;
-    assert_eq!(state(), Some(LifecycleState::Realised { identity: "env-a".into() }));
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(interrupted), "interrupted: the lease holds");
-    assert!(reconcile(&engine, &mut obj).await.patch.is_some(), "ready again: written, no edge");
+    home.step(&name, &Step::Realised { identity: "env-a".into() }, super::at(Utc::now())).expect("ready");
     assert_eq!(state(), Some(LifecycleState::Realised { identity: "env-a".into() }));
 
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(lost));
+    home.step(&name, &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }, super::at(Utc::now()))
+        .expect("lost");
     assert_eq!(state(), Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost }));
-    home.with_placements(|placements| assert!(placements.ledger().vessel(&VesselId::new(name)).is_none(), "the lease is freed"));
+    home.with_placements(|placements| assert!(placements.ledger().vessel(&VesselId::new(&name)).is_none(), "the lease is freed"));
 }
 
-// A vessel that fails before readiness returns its lease and gives up with the cause; one
-// admitted with no placement is leased at this home, the host whose reconciler provisions it, so
-// its teardown releases what is held for it.
+// A launch that fails before readiness, with no retry left, returns its lease and gives up with
+// the cause.
 #[tokio::test]
-async fn a_vessel_failing_before_ready_returns_its_lease_and_an_unplaced_one_is_leased_here() {
-    use flotilla_resources::VesselStatusPatch;
+async fn a_vessel_failing_before_ready_returns_its_lease() {
+    use flotilla_state_machines::{placement::VesselId, Cause, CauseCategory, Outcome};
 
-    use super::vessel::VesselBinding;
-    use flotilla_state_machines::placement::VesselId;
-    for failed in [
-        VesselStatusPatch::MarkFailed { message: "placement policy docker not found".into() },
-        VesselStatusPatch::MarkLost { message: "placement policy docker not found".into() },
-    ] {
-        let home = placements();
-        let engine = Engine::<_, VesselBinding>::new(
-            Scripted::<flotilla_resources::Vessel>::new([Some(provisioning(Some("feta"))), Some(failed.clone())]),
-            Some(home.clone()),
-        );
-        let mut obj = vessel_object();
-        reconcile(&engine, &mut obj).await;
-        assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(failed.clone()));
-        let state = home.get("convoy-a-implement").expect("failed vessel");
-        assert_eq!(state.state().cause().map(|cause| cause.detail.as_str()), Some("placement policy docker not found"));
-        assert!(matches!(state.state(), LifecycleState::GaveUp { .. }));
-        home.with_placements(|placements| {
-            assert!(placements.ledger().vessel(&VesselId::new("convoy-a-implement")).is_none());
-        });
-
-        // Matching terminal status produces no copy, and repeated reconciles do not act or write again.
-        let version = state.version();
-        let decision = super::decide::<VesselBinding>(home.as_ref(), &obj, None, Utc::now());
-        assert!(decision.ended);
-        assert!(decision.patch.is_none());
-        for _ in 0..3 {
-            assert!(reconcile(&engine, &mut obj).await.patch.is_none());
-            assert_eq!(home.get("convoy-a-implement").expect("ended vessel").version(), version);
-            assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), 2);
-        }
-
-        let unpinned =
-            Engine::<_, VesselBinding>::new(Scripted::<flotilla_resources::Vessel>::new([Some(provisioning(None))]), Some(home.clone()));
-        let mut obj = vessel_object();
-        obj.metadata.name = "convoy-b-implement".into();
-        assert_eq!(reconcile(&unpinned, &mut obj).await.patch, Some(provisioning(None)));
-        let lease = home.get("convoy-b-implement").expect("leased").spec().lease();
-        assert_eq!(lease.host, flotilla_state_machines::placement::Host::new(HOME));
-        assert!(lease.request.shape.is_empty(), "no capacity judged");
-        assert_eq!(home.get("convoy-b-implement").map(|vessel| vessel.state().clone()), Some(LifecycleState::requested()));
-    }
+    let home = placements();
+    let name =
+        home.request("convoy-a-implement", lease("convoy-a-implement", "feta"), super::at(Utc::now())).expect("granted").name().to_owned();
+    let failed = Outcome::Failed { cause: Cause::new(CauseCategory::External, "placement policy docker not found"), retryable: false };
+    home.step(&name, &Step::Attempted(failed), super::at(Utc::now())).expect("failed");
+    let state = home.get(&name).expect("failed vessel");
+    assert_eq!(state.state().cause().map(|cause| cause.detail.as_str()), Some("placement policy docker not found"));
+    assert!(matches!(state.state(), LifecycleState::GaveUp { .. }));
+    home.with_placements(|placements| assert!(placements.ledger().vessel(&VesselId::new(&name)).is_none()));
 }
 
 // Behaviour (#3629 Q6): a restart rebuilds the ledger's leases from the live vessels, each on its
@@ -885,24 +831,20 @@ fn a_restart_puts_each_live_lease_back_on_its_pinned_host() {
         Cause, CauseCategory, Outcome,
     };
 
-    use super::{
-        at,
-        vessel::{PlacementLifecycles, VesselBinding},
-    };
+    use super::{at, vessel::PlacementLifecycles};
     let home = placements();
-    let mut pinned = vessel_object();
-    provisioning(Some("feta")).apply(pinned.status.get_or_insert_with(Default::default));
-    home.request("live", VesselBinding::request(&pinned, HOME).expect("request"), at(DateTime::UNIX_EPOCH)).expect("granted");
-    home.request("ended", VesselBinding::request(&pinned, HOME).expect("request"), at(DateTime::UNIX_EPOCH)).expect("granted");
-    home.step("ended", &Step::Released, at(DateTime::UNIX_EPOCH)).expect("released");
-    home.request("gave-up", VesselBinding::request(&pinned, HOME).expect("request"), at(DateTime::UNIX_EPOCH)).expect("granted");
+    let request = |of: &str| home.request(of, lease(of, "feta"), at(DateTime::UNIX_EPOCH)).expect("granted").name().to_owned();
+    let live = request("live");
+    let ended = request("ended");
+    home.step(&ended, &Step::Released, at(DateTime::UNIX_EPOCH)).expect("released");
+    let gave_up = request("gave-up");
     home.step(
-        "gave-up",
+        &gave_up,
         &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, "provider refused"), retryable: false }),
         at(DateTime::UNIX_EPOCH),
     )
     .expect("gave up");
-    assert!(matches!(home.get("gave-up").expect("held").state(), LifecycleState::GaveUp { .. }));
+    assert!(matches!(home.get(&gave_up).expect("held").state(), LifecycleState::GaveUp { .. }));
     let mut restarted = Home::new(HOME).expect("declaration");
     home.with_placements(|placements| {
         for vessel in placements.home().resources() {
@@ -912,26 +854,23 @@ fn a_restart_puts_each_live_lease_back_on_its_pinned_host() {
     let restored = PlacementLifecycles::new(HOME, restarted).expect("placements");
     restored.with_placements(|placements| {
         let leased: Vec<_> = placements.ledger().leases().map(|(id, lease)| (id.clone(), lease.host.clone())).collect();
-        assert_eq!(leased, [(VesselId::new("live"), Host::new("feta"))]);
+        assert_eq!(leased, [(VesselId::new(&live), Host::new("feta"))]);
     });
 }
 
-// Behaviour (#3629 layer 9, Q6): each old vessel phase imports as its lease on its pinned host, and
-// the rehearsal restores each: provisioning is Requested, ready and interrupted are Realised under
-// the environment, and lost and failed retain distinct Gone endings. A vessel never placed
-// is noted, not stored and not refused.
+// Behaviour (#3629 layer 9, Q6, #3108): each old vessel phase imports as its work's first launch,
+// leased on its pinned host, and the rehearsal restores each: provisioning is Requested, ready and
+// interrupted are Realised under the environment, and lost and failed retain distinct Gone
+// endings. A vessel never placed is noted, not stored and not refused.
 #[test]
 fn every_vessel_phase_imports_as_its_lease() {
     use flotilla_resources::{VesselPhase, VesselStatus};
     use flotilla_state_machines::placement::Host;
 
-    use super::{
-        import::{import, label, rehearse_vessels, ImportReport},
-        vessel::VesselBinding,
-    };
+    use super::import::{import_vessel, label, rehearse_vessels, ImportReport};
     let placed = |phase| {
         let mut vessel = vessel_object();
-        provisioning(Some("feta")).apply(vessel.status.get_or_insert_with(Default::default));
+        placed_on(&mut vessel, "feta");
         let status = vessel.status.as_mut().expect("status");
         status.phase = phase;
         status.environment_ref = Some("env-a".into());
@@ -946,7 +885,7 @@ fn every_vessel_phase_imports_as_its_lease() {
         (VesselPhase::Lost, "gone"),
         (VesselPhase::Failed, "gone"),
     ] {
-        let imported = import::<VesselBinding>(&placed(phase), HOME).expect("imported");
+        let imported = import_vessel(&placed(phase), HOME).expect("imported");
         match phase {
             VesselPhase::Lost => assert_eq!(
                 imported.resource.state(),
@@ -962,16 +901,19 @@ fn every_vessel_phase_imports_as_its_lease() {
         }
         assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
         assert_eq!(imported.resource.spec().host, Host::new("feta"));
+        assert_eq!(imported.resource.spec().launch_of, "convoy-a-implement", "a launch of its work");
     }
     let mut nameless = placed(VesselPhase::Ready);
     nameless.status.as_mut().expect("status").environment_ref = None;
-    let refused = import::<VesselBinding>(&nameless, HOME).err().expect("a ready vessel runs in an environment");
+    let refused = import_vessel(&nameless, HOME).err().expect("a ready vessel runs in an environment");
     assert!(refused.reason.contains("no environment"), "{refused}");
     let mut unplaced = vessel_object();
     unplaced.metadata.name = "convoy-b-implement".into();
+    unplaced.spec.convoy_ref = "convoy-b".into();
     unplaced.status = Some(VesselStatus { phase: VesselPhase::Pending, ..Default::default() });
     let mut odd = vessel_object();
     odd.metadata.name = "convoy-c-implement".into();
+    odd.spec.convoy_ref = "convoy-c".into();
     odd.status = Some(VesselStatus { phase: VesselPhase::Ready, ..Default::default() });
     // Each stored state round-trips through the rehearsal's store (#3772 review).
     let mut records: Vec<_> = [
@@ -984,6 +926,7 @@ fn every_vessel_phase_imports_as_its_lease() {
     .map(|(phase, name)| {
         let mut vessel = placed(phase);
         vessel.metadata.name = format!("{name}-implement");
+        vessel.spec.convoy_ref = name.into();
         (vessel, HOME.to_owned())
     })
     .collect();
@@ -1006,34 +949,8 @@ fn every_vessel_phase_imports_as_its_lease() {
     assert!(refused[0].1.starts_with("Ready with no recorded placement"), "{refused:?}");
 }
 
-// Behaviour (#3770 review): an old patch the engine does not take is not written, so the old
-// vessel's `ready_at`, which the binding's steps read, follows the engine. A readiness refused
-// against an ended lease leaves `ready_at` unset and copies Lost; the vessel's next Lost or Failed
-// is then a Release, which an ended lease refuses too, and nothing more is written.
-#[tokio::test]
-async fn a_readiness_the_engine_does_not_take_is_not_written() {
-    use flotilla_resources::{VesselPhase, VesselStatusPatch};
-
-    use super::{decide, vessel::VesselBinding};
-    let home = placements();
-    let mut obj = vessel_object();
-    let decided = decide::<VesselBinding>(home.as_ref(), &obj, Some(provisioning(Some("feta"))), Utc::now()).patch.expect("granted");
-    decided.apply(obj.status.get_or_insert_with(Default::default));
-    // The lease ends behind the old status's back (its teardown, say).
-    home.step("convoy-a-implement", &Step::Released, super::at(Utc::now())).expect("released");
-
-    let decided = decide::<VesselBinding>(home.as_ref(), &obj, Some(vessel_ready("env-a")), Utc::now());
-    assert!(decided.patch.is_none(), "refused readiness emits no status copy");
-    let status = obj.status.as_ref().expect("status");
-    assert!(status.ready_at.is_none(), "never written ready");
-    assert_eq!(status.phase, VesselPhase::Provisioning, "old status is not a lifecycle source");
-    assert!(matches!(
-        super::reads::judge::<flotilla_state_machines::machines::vessel::VesselKind>(home.get("convoy-a-implement").expect("held").state()),
-        super::reads::Judgement::Released
-    ));
-    let lost = VesselStatusPatch::MarkLost { message: "gone".into() };
-    assert_eq!(decide::<VesselBinding>(home.as_ref(), &obj, Some(lost), Utc::now()).patch, None, "ended: nothing to write");
-}
+// The old Vessel's binding went with its writer (#3108): a readiness the engine refuses, once
+// written through the binding as a status copy, has no copy to withhold; a launch's home steps it.
 
 // Storage errors between Attempted and GiveUp cannot retally one failure, including after restart.
 // Generate repeated failures, restarts and empty/ASCII/Unicode causes at the storage boundary.

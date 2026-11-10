@@ -2,7 +2,8 @@ use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
-use flotilla_resources::Actuation;
+use flotilla_protocol::LifecycleReading;
+use flotilla_resources::vessel_records::VesselRecords;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -31,7 +32,7 @@ use flotilla_credentials::CredentialStore;
 use flotilla_credentials::CONTAINER_CODEX_HOME;
 use flotilla_credentials::FLOTILLA_SKILLS_DIR_ENV;
 use flotilla_crew::convoy::ConvoyReconciler;
-use flotilla_crew::reconcilers::vessel::VesselReconciler;
+use flotilla_crew::reconcilers::vessel::VesselPlanning;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery_testkit::fake_discovery_with_provider_set;
@@ -79,8 +80,8 @@ use flotilla_resources::{
     HostSpec, HostStatus, HostStatusPatch, InputMeta, ModelProbeState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
     PlacementStatus, Project, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceError, Selector,
     TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement,
-    VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
-    CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
+    VesselSpec, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
 };
 use flotilla_store::{controller::Reconciler, watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_terminal::{

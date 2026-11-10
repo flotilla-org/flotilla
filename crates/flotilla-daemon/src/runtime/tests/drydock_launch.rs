@@ -115,7 +115,7 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
             context: Box::new(flotilla_resources::TerminalCrewContext {
                 namespace: NAMESPACE.to_string(),
                 convoy: stand_in.convoy.clone(),
-                vessel_ref: "demo-work".to_string(),
+                vessel_ref: stand_in.vessel.clone(),
             }),
         },
         cwd: root.join("skill-source").display().to_string(),
@@ -252,6 +252,8 @@ async fn a_failed_vessel_layer_discards_only_a_vessel_it_created() {
 struct StandIn {
     temp: tempfile::TempDir,
     convoy: String,
+    /// The launch that serves the convoy's work.
+    vessel: String,
     env_id: EnvironmentId,
     spec: EnvironmentSpec,
     state: Arc<ControllerRuntimeState>,
@@ -427,7 +429,7 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
     };
     engine_environments(&daemon).request(env_id.as_str(), &spec, None);
     let source = LocalSkillSource::new(root, "research");
-    freeze_crew(&backend, &convoy, "demo-work", "coder", "claude-code", vec![source.selected.clone()]).await;
+    let vessel = freeze_crew(&daemon, &convoy, "coder", "claude-code", vec![source.selected.clone()]).await;
     bind_account(&daemon, &convoy, "coder", "claude-max", "test@example.com").await;
 
     let adapters: Arc<dyn CommandRunner> =
@@ -475,7 +477,7 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
     let tools = GenerationCli { root: root.to_path_buf(), refused: Arc::clone(&refuse_tools) };
     state.environment_tools = EnvironmentToolProvisioner::new(vec![Arc::new(tools)]);
     let state = Arc::new(state);
-    StandIn { temp, convoy, env_id, spec, state, backend, pool, _gateway: gateway, host, crew_connections, refuse_tools }
+    StandIn { temp, convoy, vessel, env_id, spec, state, backend, pool, _gateway: gateway, host, crew_connections, refuse_tools }
 }
 
 /// The vessel's image, as interior discovery finds it: with its harness, or without one.

@@ -6,8 +6,8 @@ use chrono::{DateTime, Utc};
 use flotilla_resources::{
     canonicalize_repo_url, repo_key, CheckoutSpec, CloneSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
     DockerEnvironmentSpec, EnvironmentSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec,
-    InputMeta, Repository, RepositorySpec, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel,
-    VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    InputMeta, Repository, RepositorySpec, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus,
+    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use flotilla_store::{ensure_repository, ResourceBackend};
 use tokio::{
@@ -42,11 +42,6 @@ pub fn labeled_meta(name: &str, labels: impl IntoIterator<Item = (String, String
     controller_meta().name(name).labels(labels.into_iter().collect()).call()
 }
 
-pub fn vessel_meta(name: &str, repo_url: &str) -> InputMeta {
-    let canonical_repo = canonicalize_repo_url(repo_url).expect("repo URL should canonicalize");
-    controller_meta().name(name).labels([("flotilla.work/repo-key".to_string(), repo_key(&canonical_repo))].into_iter().collect()).call()
-}
-
 #[bon::builder]
 pub fn work_state(
     phase: WorkPhase,
@@ -56,16 +51,7 @@ pub fn work_state(
     message: Option<String>,
     placement: Option<flotilla_resources::PlacementStatus>,
 ) -> WorkState {
-    WorkState {
-        provisioning_retry: None,
-        phase,
-        completion_authority: WorkCompletionAuthority::CrewRollup,
-        ready_at,
-        started_at,
-        finished_at,
-        message,
-        placement,
-    }
+    WorkState { phase, completion_authority: WorkCompletionAuthority::CrewRollup, ready_at, started_at, finished_at, message, placement }
 }
 
 pub async fn create_convoy_with_single_task(
@@ -147,32 +133,6 @@ pub async fn create_convoy_with_single_task(
         .await
         .expect("convoy status update should succeed");
     convoys.get(name).await.expect("convoy get should succeed")
-}
-
-pub async fn create_workspace(
-    backend: &ResourceBackend,
-    namespace: &str,
-    name: &str,
-    convoy_ref: &str,
-    task: &str,
-    fulfilment_kind_ref: &str,
-    repo_url: &str,
-) -> flotilla_resources::ResourceObject<Vessel> {
-    let workspaces = backend.clone().using::<Vessel>(namespace);
-    let mut meta = vessel_meta(name, repo_url);
-    meta.labels.insert(flotilla_resources::CONVOY_LABEL.to_string(), convoy_ref.to_string());
-    workspaces
-        .create(
-            &meta,
-            &VesselSpec {
-                convoy_ref: convoy_ref.to_string(),
-                vessel_name: task.to_string(),
-                fulfilment_kind_ref: fulfilment_kind_ref.to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("workspace create should succeed")
 }
 
 pub async fn create_kind(backend: &ResourceBackend, namespace: &str, name: &str, spec: FulfilmentKindSpec) {
@@ -392,6 +352,12 @@ impl ControllerLoopHarness {
         self.handles.push(tokio::spawn(async move {
             let _ = future.await;
         }));
+    }
+
+    /// Aborts `handle` with the harness's loops.
+    #[allow(dead_code)]
+    pub fn hold(&mut self, handle: JoinHandle<()>) {
+        self.handles.push(handle);
     }
 
     pub async fn wait_until<F, Fut>(&self, timeout: Duration, condition: F)

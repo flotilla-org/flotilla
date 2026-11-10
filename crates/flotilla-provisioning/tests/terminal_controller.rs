@@ -18,11 +18,12 @@ use flotilla_provisioning::{
     },
     stored::decided_registry,
 };
-use flotilla_provisioning_testkit::{Ending, TerminalsFixture, VesselFixture};
+use flotilla_provisioning_testkit::{EngineFixture, TerminalsFixture};
 use flotilla_resources::{
     environment_records::LaunchFacts,
     terminal_records::{TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecord, TerminalRecords},
-    EnvironmentSpec, HostDirectEnvironmentSpec, ResourceObject, SystemClock, TerminalOccupancy, Vessel,
+    vessel_records::VesselStep,
+    EnvironmentSpec, HostDirectEnvironmentSpec, SystemClock, TerminalOccupancy,
 };
 use flotilla_schema_sqlite::stream::{CommitListener, Service};
 use tokio::sync::Notify;
@@ -53,6 +54,8 @@ struct Asked {
     unreachable: Option<String>,
     /// Why the agent's settled screen says it cannot work.
     screen_failure: Option<String>,
+    /// Why the session cannot be reached to kill it, as when its environment was not adopted.
+    unreachable_pool: Option<String>,
 }
 
 #[derive(Default)]
@@ -114,8 +117,9 @@ impl TerminalProvider for RecordingProvider {
     }
 
     async fn kill(&self, _: &TerminalRecord, session_id: &str) -> Result<(), String> {
-        self.asked().killed.push(session_id.into());
-        Ok(())
+        let mut asked = self.asked();
+        asked.killed.push(session_id.into());
+        asked.unreachable_pool.clone().map_or(Ok(()), Err)
     }
 
     async fn remove_exit_receipt(&self, launch: &TerminalRecord) -> Result<(), String> {
@@ -133,7 +137,7 @@ struct World {
     _directory: tempfile::TempDir,
     provider: Arc<RecordingProvider>,
     /// The vessel leases sessions are held for, and the environments they run in.
-    vessels: VesselFixture,
+    vessels: EngineFixture,
     terminals: TerminalsFixture,
     /// This home's probe, passed by hand.
     probe: TerminalProbe<RecordingProvider>,
@@ -174,7 +178,7 @@ impl World {
             Arc::new(move |_: &flotilla_schema_sqlite::stream::Committed<'_>| commits.notify_waiters())
         };
         service.on_commit(Arc::downgrade(&listener));
-        let vessels = VesselFixture::over(service.store(), false);
+        let vessels = EngineFixture::over(HOME, service.store());
         vessels.environments.request(ENVIRONMENT, &host_direct(), None);
         if ready {
             vessels.environments.ready(ENVIRONMENT, "/work", LaunchFacts::default());
@@ -199,10 +203,11 @@ impl World {
         Self { _directory: directory, provider, vessels, terminals, probe, commits, _listener: listener }
     }
 
-    /// A crew's agent session for `vessel`, its lease held here.
-    fn agent(&self, vessel: &str) -> (String, ResourceObject<Vessel>) {
-        let lease = self.vessels.lease(vessel, "c1", HOME);
-        (self.terminals.request(&TerminalsFixture::agent(vessel, "lead", ENVIRONMENT)), lease)
+    /// A crew's agent session for a launch of work `work`, its lease held here; the session and
+    /// the launch.
+    fn agent(&self, work: &str) -> (String, String) {
+        let lease = self.vessels.vessels.request("c1", work, HOME);
+        (self.terminals.request(&TerminalsFixture::agent(&lease, "lead", ENVIRONMENT)), lease)
     }
 
     fn reading(&self, launch: &str) -> LifecycleReading {
@@ -230,7 +235,7 @@ impl World {
     }
 
     /// An agent session for `vessel`, launched and realised, and its lease.
-    async fn running_agent(&self, vessel: &str) -> (String, ResourceObject<Vessel>) {
+    async fn running_agent(&self, vessel: &str) -> (String, String) {
         let (launch, lease) = self.agent(vessel);
         self.until("ready", |world| world.ready(&launch)).await;
         (launch, lease)
@@ -356,7 +361,8 @@ async fn the_probe_records_what_it_observes_of_a_running_launch() {
 async fn an_ended_lease_releases_its_session() {
     let world = World::start(RecordingProvider::default(), true);
     let (launch, lease) = world.running_agent("v1").await;
-    world.vessels.finish(&lease, Ending::Lost("vessel-v1"));
+    world.vessels.vessels.ready(&lease, "vessel-v1");
+    world.vessels.vessels.step(&lease, VesselStep::Lost { reason: "its environment disappeared".into() });
     world.until("released", |world| world.reading(&launch) == LifecycleReading::Released).await;
     let asked = world.provider.asked();
     let session = format!("pool-{launch}");
@@ -364,6 +370,20 @@ async fn an_ended_lease_releases_its_session() {
     assert_eq!(asked.killed, vec![session]);
     assert_eq!(asked.receipts_removed, vec![launch.clone()]);
     assert_eq!(asked.cleaned, vec![launch]);
+}
+
+// Behaviour: an ended vessel's session that cannot be reached, as when a restart did not adopt
+// its environment, is released all the same: its environment's release waits for it, and that
+// teardown removes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ended_vessels_unreachable_session_is_left_to_its_environment() {
+    let world = World::start(RecordingProvider::default(), true);
+    let (launch, lease) = world.running_agent("v1").await;
+    world.provider.asked().unreachable_pool = Some("provider registry unavailable".into());
+    world.vessels.vessels.ready(&lease, "vessel-v1");
+    world.vessels.vessels.step(&lease, VesselStep::Released);
+    world.until("released", |world| world.reading(&launch) == LifecycleReading::Released).await;
+    assert_eq!(world.provider.asked().killed, vec![format!("pool-{launch}")], "it was asked once");
 }
 
 // Behaviour: an ended environment took its sessions with it: they are released without asking

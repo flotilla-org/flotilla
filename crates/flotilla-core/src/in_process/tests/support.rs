@@ -22,8 +22,8 @@ use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, CrewWorkPhase, CrewWorkState,
     EnvironmentSpec as ResourceEnvironmentSpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec,
     FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostDirectEnvironmentSpec, HostSpec, HostStatus, InputMeta, ResourceObject,
-    TerminalAttention, TerminalSession as ResourceTerminalSession, Vessel, VesselRequirement, VesselSpec, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    TerminalAttention, TerminalSession as ResourceTerminalSession, VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
@@ -157,11 +157,11 @@ pub(super) async fn resume_staging_fixture_with_clock(
         )
         .await
         .expect("convoy status");
-    ensure_vessel(&backend, "resume-vessel", "resume-staging", "work").await;
+    let vessel = ensure_vessel(&engine, "resume-staging", "work");
     engine.terminals.request(&TerminalLaunchRequest {
         session: "resume-staging-session".to_string(),
         environment: "resume-env".to_string(),
-        vessel: Some("resume-vessel".to_string()),
+        vessel: Some(vessel),
         role: "coder".to_string(),
         pool: "passthrough".to_string(),
         cwd: "/repo".to_string(),
@@ -190,25 +190,10 @@ pub(super) async fn resume_staging_fixture_with_clock(
     (daemon, backend, probe)
 }
 
-/// Vessel `vessel_ref`, named `vessel` in convoy `convoy`: what a crew's sessions are held for,
-/// whose convoy and name their readers see.
-pub(in crate::in_process) async fn ensure_vessel(backend: &ResourceBackend, vessel_ref: &str, convoy: &str, vessel: &str) {
-    let vessels = backend.clone().using::<Vessel>("flotilla");
-    if vessels.get(vessel_ref).await.is_ok() {
-        return;
-    }
-    vessels
-        .create(
-            &test_meta(vessel_ref),
-            &VesselSpec {
-                convoy_ref: convoy.to_string(),
-                vessel_name: vessel.to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
+/// The launch serving `work` of convoy `convoy`: what a crew's sessions are held for, whose
+/// convoy and work their readers see. A live launch is reused.
+pub(in crate::in_process) fn ensure_vessel(engine: &TestEngine, convoy: &str, work: &str) -> String {
+    engine.vessels.request(convoy, work, "local")
 }
 
 /// Records `attention` as what this home observes of launch `launch`, as its hooks or screen reads do.
@@ -563,14 +548,12 @@ pub(in crate::in_process) fn create_test_environment(
 /// as `role`, under pool session `session-<name>`. Its launch.
 pub(in crate::in_process) async fn create_running_session(
     engine: &TestEngine,
-    backend: &ResourceBackend,
     env_ref: &str,
     name: &str,
     convoy: &str,
     role: &str,
 ) -> String {
-    let vessel_ref = format!("{convoy}-work");
-    ensure_vessel(backend, &vessel_ref, convoy, "work").await;
+    let vessel_ref = ensure_vessel(engine, convoy, "work");
     let launch = engine.terminals.request(&TerminalLaunchRequest {
         session: name.to_string(),
         environment: env_ref.to_string(),
@@ -744,16 +727,8 @@ pub(super) fn claim_crew(role: &str) -> flotilla_resources::CrewSpec {
 
 /// Session `name`, a tool running for convoy `convoy`'s `work` vessel as `role`, whose home
 /// observes `attention`. Its launch.
-pub(super) async fn stall_test_session(
-    engine: &TestEngine,
-    backend: &ResourceBackend,
-    convoy: &str,
-    name: &str,
-    role: &str,
-    attention: TerminalAttention,
-) -> String {
-    let vessel_ref = format!("{convoy}-work");
-    ensure_vessel(backend, &vessel_ref, convoy, "work").await;
+pub(super) async fn stall_test_session(engine: &TestEngine, convoy: &str, name: &str, role: &str, attention: TerminalAttention) -> String {
+    let vessel_ref = ensure_vessel(engine, convoy, "work");
     let launch = engine.terminals.request(&TerminalLaunchRequest {
         session: name.into(),
         environment: "env".into(),

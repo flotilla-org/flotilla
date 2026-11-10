@@ -378,6 +378,11 @@ pub trait TerminalRecords: Send + Sync {
     fn changes(&self) -> tokio::sync::broadcast::Receiver<TerminalChange> {
         tokio::sync::broadcast::channel(1).1
     }
+    /// A cursor over the sessions' changes from now on, read from the log; none where no log is
+    /// held, and a reader then reads everything afresh.
+    fn cursor(&self) -> Option<Box<dyn crate::lifecycle_reads::ChangeCursor<TerminalChange>>> {
+        None
+    }
     /// What this home observes of its own running launches, in memory.
     fn observations(&self) -> &TerminalObservations;
 }

@@ -219,6 +219,8 @@ impl Crew {
         let identity = &self.identity;
         let role = self.convoy_role().await.unwrap_or_else(|| identity.convoy.clone());
         let vessel = identity.vessel.strip_prefix(&format!("{}-", identity.convoy)).unwrap_or(&identity.vessel);
+        // The vessel is a launch, `<work>#<n>`; every launch of a work draws as the work.
+        let vessel = vessel.rsplit_once('#').map_or(vessel, |(work, _)| work);
         format!("{role}/{vessel}/{}", identity.role)
     }
 

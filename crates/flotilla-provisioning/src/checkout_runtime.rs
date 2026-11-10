@@ -338,7 +338,7 @@ pub async fn sweep_host_empty_convoy_directories(
 ) -> Result<(), String> {
     // Repository roots are shared across namespaces. Include replicated convoys,
     // and fail closed on any listing error before touching the filesystem.
-    // VesselReconciler reads its existing Convoy before creating Checkouts;
+    // VesselPlanning reads its existing Convoy before creating Checkouts;
     // checkout provisioning therefore starts after the owner is in this store.
     // A late Git materialisation after owner deletion recreates missing parents;
     // rmdir can race only while empty and cannot remove materialised files.

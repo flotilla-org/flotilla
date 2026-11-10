@@ -40,6 +40,8 @@ struct EngineSlots {
     /// Kinds the engine serves through ports of their own, which the generic resource verbs
     /// refuse: what to use instead.
     refused: std::collections::BTreeMap<&'static str, String>,
+    /// Each kind's shared listing while any watcher holds it.
+    feeds: std::collections::BTreeMap<&'static str, std::sync::Weak<crate::engine_feed::EngineFeed>>,
 }
 
 #[derive(Default)]
@@ -71,6 +73,8 @@ impl ResourceBackend {
         let mut engines = self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         for kind in records.kinds() {
             engines.ports.insert(kind, std::sync::Arc::clone(&records));
+            // Watchers of the port replaced keep its feed; new ones list the new port.
+            engines.feeds.remove(kind);
         }
     }
     /// The namespace the engine's records are served in, the daemon's provisioning namespace: a
@@ -103,6 +107,34 @@ impl ResourceBackend {
     /// The engine port serving `kind`, when one is installed.
     pub(crate) fn engine_records(&self, kind: &str) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>> {
         self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).ports.get(kind).cloned()
+    }
+
+    /// The shared listing of `kind`'s engine records, started for the first watcher; `None` unless
+    /// the engine serves `kind`.
+    pub(crate) async fn engine_feed(
+        &self,
+        kind: &'static str,
+    ) -> Option<Result<std::sync::Arc<crate::engine_feed::EngineFeed>, ResourceError>> {
+        let records = self.engine_records(kind)?;
+        if let Some(feed) =
+            self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).feeds.get(kind).and_then(std::sync::Weak::upgrade)
+        {
+            return Some(Ok(feed));
+        }
+        let started = match crate::engine_feed::EngineFeed::start(std::sync::Arc::clone(&records), kind).await {
+            Ok(started) => std::sync::Arc::new(started),
+            Err(error) => return Some(Err(ResourceError::other(error))),
+        };
+        let mut engines = self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Another watcher may have started one meanwhile: the first kept wins, for its port.
+        if !engines.ports.get(kind).is_some_and(|installed| std::sync::Arc::ptr_eq(installed, &records)) {
+            return Some(Ok(started));
+        }
+        if let Some(feed) = engines.feeds.get(kind).and_then(std::sync::Weak::upgrade) {
+            return Some(Ok(feed));
+        }
+        engines.feeds.insert(kind, std::sync::Arc::downgrade(&started));
+        Some(Ok(started))
     }
 
     /// Installs the engine's attentions behind `[primitives]`. A daemon runtime restarted over the
@@ -413,8 +445,7 @@ impl<T: Resource> ReplicaReadResolver<T> {
         if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
             return None;
         }
-        let reads = self.backend.definitions::<T>(&self.namespace).engine_reads().await?;
-        Some(reads.map(|reads| reads.into_iter().filter(|read| read.object.metadata.name == name).collect()))
+        self.backend.definitions::<T>(&self.namespace).engine_copies(name).await
     }
 
     pub(crate) async fn list_sources(&self) -> Result<ReadResourceList<T>, ResourceError> {
@@ -736,8 +767,16 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError> {
-        if let Some(local) = self.engine_local().await {
-            return local?.into_iter().find(|object| object.metadata.name == name).ok_or_else(|| ResourceError::not_found(name));
+        if let Some(copies) = self.backend.definitions::<T>(&self.namespace).engine_copies(name).await {
+            // This home's own record: no built-in and no other home's.
+            return copies?
+                .into_iter()
+                .find(|read| {
+                    matches!(read.provenance, ResourceProvenance::Local)
+                        && !flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, name)
+                })
+                .map(|read| read.object)
+                .ok_or_else(|| ResourceError::not_found(name));
         }
         dispatch_backend!(self, get_typed, name)
     }

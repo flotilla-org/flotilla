@@ -4,19 +4,15 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{ConfiguredResourceLimits, LifecycleReading, PlacementDecision};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    lifecycle_reads::{LifecycleReads, ProvisioningKind},
-    resource::define_resource,
-    status_patch::StatusPatch,
-    ReplicationClass, RepositoryKey, ResourceObject, Stance,
-};
+use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass, RepositoryKey, Stance};
 
+// A vessel is read from its launch on the engine (#3108): nothing patches its status.
 define_resource!(
     Vessel,
     "vessels",
     VesselSpec,
     VesselStatus,
-    VesselStatusPatch,
+    NoStatusPatch,
     replication = ReplicationClass::HomeBoundRuntime,
     queryable = &["metadata.name", "status.phase"]
 );
@@ -59,9 +55,6 @@ pub struct VesselStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configured_limits: Option<ConfiguredResourceLimits>,
     pub phase: VesselPhase,
-    /// ADR 0047: previous-generation records omit this; retain default for one roll.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_observation: Option<flotilla_protocol::EnvironmentRuntimeObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_decision: Option<PlacementDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,8 +93,9 @@ pub struct VesselStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_stance: Option<Stance>,
     // Retired with credential delivery's controller (#3108): `held_credentials`,
-    // `credential_delivery_retry` and `credential_refresh_retry`. Earlier records
-    // carrying them still decode, as the struct accepts and drops unknown fields.
+    // `credential_delivery_retry` and `credential_refresh_retry`. Retired with the vessel's
+    // move onto the engine (#3108): `runtime_observation`, now its environment's home memory.
+    // Earlier records carrying them still decode, as the struct accepts and drops unknown fields.
 }
 
 /// A vessel's frozen image: the composed identity, then the built digest once
@@ -114,321 +108,41 @@ pub struct VesselImage {
     pub digest: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VesselStatusPatch {
-    /// Record the composed image when provisioning starts or completes. A
-    /// recorded identity is kept: a different identity needs a relaunch.
-    RecordImage {
-        image: VesselImage,
-    },
-    /// Relaunch: replace the recorded image unconditionally.
-    ReplaceImage {
-        image: VesselImage,
-    },
-    ObserveDegradation {
-        conditions: BTreeMap<String, String>,
-    },
-    ObserveRuntime {
-        observation: flotilla_protocol::EnvironmentRuntimeObservation,
-    },
-    /// Report immutable mount drift without changing the phase of running crews.
-    RequireEnvironmentRecreation {
-        message: String,
-    },
-    MarkProvisioning {
-        observed_kind_ref: String,
-        observed_kind_version: String,
-        placement_decision: Option<PlacementDecision>,
-        started_at: DateTime<Utc>,
-        message: Option<String>,
-        /// The composed image provisioning started from, recorded as [`Self::RecordImage`].
-        image: Option<VesselImage>,
-    },
-    MarkReady {
-        configured_limits: Option<ConfiguredResourceLimits>,
-        placement_decision: Option<PlacementDecision>,
-        environment_ref: Option<String>,
-        image_ref: Option<String>,
-        local_image_id: Option<String>,
-        registry_digest: Option<String>,
-        checkout_refs: BTreeMap<RepositoryKey, String>,
-        terminal_session_refs: Vec<String>,
-        requested_stance: Stance,
-        effective_stance: Stance,
-        ready_at: DateTime<Utc>,
-        /// The composed image and digest the Ready Environment runs; replaces
-        /// any earlier record.
-        image: Option<VesselImage>,
-    },
-    MarkInterrupted {
-        roles: BTreeSet<String>,
-        message: String,
-    },
-    MarkLost {
-        message: String,
-    },
-    MarkFailed {
-        message: String,
-    },
-}
-
 impl VesselPhase {
     /// The phase the engine's reading decides; without a reading, the stored phase.
     pub fn from_reading(reading: Option<&LifecycleReading>, status: Option<&VesselStatus>) -> Self {
         match reading {
             Some(LifecycleReading::Lost { .. } | LifecycleReading::Released) => Self::Lost,
-            Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. }) => Self::Failed,
+            // Exhaustion is the failed judgement; the engine's GiveUp write follows it.
+            Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. } | LifecycleReading::Exhausted { .. }) => Self::Failed,
             Some(LifecycleReading::Ready { .. }) if status.is_some_and(|status| !status.interrupted_roles.is_empty()) => Self::Interrupted,
             Some(LifecycleReading::Ready { .. }) => Self::Ready,
-            // Exhausted still holds a Requested lease until GiveUp commits.
-            Some(LifecycleReading::InProgress | LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. }) => {
-                Self::Provisioning
-            }
+            Some(LifecycleReading::InProgress | LifecycleReading::Retrying { .. }) => Self::Provisioning,
             None => status.map(|status| status.phase).unwrap_or_default(),
         }
     }
 }
 
-/// A read view whose phase the engine decides. Never publish it back as stored status.
-/// An ending or readiness replaces the stored message; a live phase keeps the reconciler's own.
-pub fn project_reading(obj: &ResourceObject<Vessel>, reading: Option<&LifecycleReading>) -> ResourceObject<Vessel> {
-    let mut obj = obj.clone();
-    let Some(reading) = reading else { return obj };
-    let phase = VesselPhase::from_reading(Some(reading), obj.status.as_ref());
-    let status = obj.status.get_or_insert_with(Default::default);
-    if status.phase != phase {
-        status.phase = phase;
-        if matches!(phase, VesselPhase::Ready | VesselPhase::Lost | VesselPhase::Failed) {
-            status.message = reading.reason();
-        }
-    }
-    obj
-}
-
-/// The engine's view of `obj` homed at `origin`, or `obj` itself when the engine holds no record.
-pub fn read(reads: &dyn LifecycleReads, obj: &ResourceObject<Vessel>, origin: Option<&str>) -> Result<ResourceObject<Vessel>, String> {
-    Ok(project_reading(obj, reads.try_reading(ProvisioningKind::Vessel, &obj.metadata.name, origin)?.as_ref()))
-}
-
-impl StatusPatch<VesselStatus> for VesselStatusPatch {
-    fn apply(&self, status: &mut VesselStatus) {
-        match self {
-            Self::ObserveDegradation { conditions } => status.degraded = conditions.clone(),
-            Self::RecordImage { image } => record_image(status, image),
-            Self::ReplaceImage { image } => status.image = Some(image.clone()),
-            Self::ObserveRuntime { observation } => status.runtime_observation.get_or_insert_with(Default::default).merge(observation),
-            Self::RequireEnvironmentRecreation { message } => status.message = Some(message.clone()),
-            Self::MarkProvisioning { observed_kind_ref, observed_kind_version, placement_decision, started_at, message, image } => {
-                if let Some(image) = image {
-                    record_image(status, image);
-                }
-                status.phase = VesselPhase::Provisioning;
-                status.observed_kind_ref = Some(observed_kind_ref.clone());
-                status.observed_kind_version = Some(observed_kind_version.clone());
-                if let Some(placement_decision) = placement_decision {
-                    status.placement_decision.get_or_insert_with(|| placement_decision.clone());
-                }
-                status.started_at.get_or_insert(*started_at);
-                status.message = message.clone();
-            }
-            Self::MarkReady {
-                configured_limits,
-                placement_decision,
-                environment_ref,
-                image_ref,
-                local_image_id,
-                registry_digest,
-                checkout_refs,
-                terminal_session_refs,
-                requested_stance,
-                effective_stance,
-                ready_at,
-                image,
-            } => {
-                // Ready records the image the Environment actually runs.
-                if let Some(image) = image {
-                    status.image = Some(image.clone());
-                }
-                status.configured_limits = configured_limits.clone();
-                status.phase = VesselPhase::Ready;
-                if let Some(placement_decision) = placement_decision {
-                    status.placement_decision.get_or_insert_with(|| placement_decision.clone());
-                }
-                status.environment_ref = environment_ref.clone();
-                status.image_ref = image_ref.clone();
-                status.local_image_id = local_image_id.clone();
-                status.registry_digest = registry_digest.clone();
-                status.checkout_refs = checkout_refs.clone();
-                status.terminal_session_refs = terminal_session_refs.clone();
-                status.interrupted_roles.clear();
-                status.requested_stance = Some(*requested_stance);
-                status.effective_stance = Some(*effective_stance);
-                status.ready_at.get_or_insert(*ready_at);
-                status.message = None;
-            }
-            Self::MarkInterrupted { roles, message } => {
-                status.phase = VesselPhase::Interrupted;
-                status.interrupted_roles = roles.clone();
-                status.message = Some(message.clone());
-            }
-            Self::MarkLost { message } => {
-                status.phase = VesselPhase::Lost;
-                status.message = Some(message.clone());
-            }
-            Self::MarkFailed { message } => {
-                status.phase = VesselPhase::Failed;
-                status.message = Some(message.clone());
-            }
-        }
-    }
-}
-
-/// Name a convoy Vessel `<convoy>-<vessel>`.
-/// A recorded identity is kept until relaunch; recording the same identity
-/// fills a missing digest and never replaces a recorded one.
-fn record_image(status: &mut VesselStatus, image: &VesselImage) {
-    match &mut status.image {
-        Some(recorded) if recorded.identity == image.identity => {
-            if recorded.digest.is_none() {
-                recorded.digest.clone_from(&image.digest);
-            }
-        }
-        Some(_) => {}
-        None => status.image = Some(image.clone()),
-    }
-}
-
+/// Name a convoy Vessel `<convoy>-<vessel>`: the name its work's launches are of.
 pub fn vessel_resource_name(convoy_name: &str, vessel: &str) -> String {
     format!("{convoy_name}-{vessel}")
 }
 
 #[cfg(test)]
-mod image_tests {
-    use hegel::generators as gs;
-
+mod retired_field_tests {
     use super::*;
 
-    // ADR 0062: when its Environment becomes Ready the vessel records the
-    // image it actually runs, replacing an earlier record (a recreated
-    // Environment may run a newer digest or a relaunched identity).
+    // ADR 0047: a status stored before the move onto the engine (#3108) still decodes; its
+    // runtime observation, now home memory, is dropped.
     #[test]
-    fn ready_records_the_latest_image() {
-        let ready = |identity: &str, digest: &str| VesselStatusPatch::MarkReady {
-            configured_limits: None,
-            placement_decision: None,
-            environment_ref: Some("env".into()),
-            image_ref: None,
-            local_image_id: None,
-            registry_digest: None,
-            checkout_refs: BTreeMap::new(),
-            terminal_session_refs: Vec::new(),
-            requested_stance: Default::default(),
-            effective_stance: Default::default(),
-            ready_at: chrono::Utc::now(),
-            image: Some(VesselImage { identity: identity.into(), digest: Some(digest.into()) }),
-        };
-        let mut status = VesselStatus::default();
-        ready("sha256:a", "repo@sha256:1").apply(&mut status);
-        ready("sha256:a", "repo@sha256:2").apply(&mut status);
-        assert_eq!(status.image, Some(VesselImage { identity: "sha256:a".into(), digest: Some("repo@sha256:2".into()) }));
-        ready("sha256:b", "repo@sha256:3").apply(&mut status);
-        assert_eq!(status.image, Some(VesselImage { identity: "sha256:b".into(), digest: Some("repo@sha256:3".into()) }));
-    }
-
-    // ADR 0062: a running vessel keeps its image until relaunch. Recording is
-    // idempotent, fills a missing digest, never changes a recorded identity or
-    // digest, and only ReplaceImage switches identity. Generate interleavings
-    // of two identities with and without digests.
-    #[hegel::test]
-    fn recorded_image_is_kept_until_relaunch(tc: hegel::TestCase) {
-        let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
-        let mut status = VesselStatus::default();
-        let mut expected: Option<VesselImage> = None;
-        for _ in 0..steps {
-            let identity = format!("sha256:{}", tc.draw(gs::integers::<u8>().min_value(0).max_value(1)));
-            let digest = tc.draw(gs::booleans()).then(|| format!("{identity}-digest"));
-            let image = VesselImage { identity, digest };
-            let replace = tc.draw(gs::booleans());
-            let patch = if replace {
-                VesselStatusPatch::ReplaceImage { image: image.clone() }
-            } else {
-                VesselStatusPatch::RecordImage { image: image.clone() }
-            };
-            patch.apply(&mut status);
-            expected = match expected {
-                _ if replace => Some(image),
-                None => Some(image),
-                Some(mut recorded) if recorded.identity == image.identity => {
-                    recorded.digest = recorded.digest.or(image.digest);
-                    Some(recorded)
-                }
-                kept => kept,
-            };
-            assert_eq!(status.image, expected);
-            let after = status.clone();
-            patch.apply(&mut status);
-            assert_eq!(status, after, "recording the same image twice is idempotent");
-        }
-    }
-}
-
-#[cfg(test)]
-mod reading_tests {
-    use super::*;
-
-    fn vessel(phase: VesselPhase, interrupted_roles: BTreeSet<String>) -> ResourceObject<Vessel> {
-        ResourceObject {
-            metadata: crate::ObjectMeta {
-                name: "vessel".into(),
-                namespace: "flotilla".into(),
-                resource_version: "1".into(),
-                labels: Default::default(),
-                annotations: Default::default(),
-                owner_references: Vec::new(),
-                finalizers: Vec::new(),
-                deletion_timestamp: None,
-                creation_timestamp: chrono::DateTime::UNIX_EPOCH,
-                merge: None,
-            },
-            spec: VesselSpec {
-                convoy_ref: "convoy".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "local".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-            status: Some(VesselStatus { phase, message: Some("stored".into()), interrupted_roles, ..Default::default() }),
-        }
-    }
-
-    #[test]
-    fn the_engine_reading_decides_phase_and_ending_message() {
-        let at = chrono::DateTime::UNIX_EPOCH;
-        let roles = BTreeSet::from(["coder".to_string()]);
-        let cases = [
-            (LifecycleReading::InProgress, BTreeSet::new(), VesselPhase::Provisioning, Some("stored")),
-            (
-                LifecycleReading::Retrying { failures: 1, next: at, cause: "c".into() },
-                BTreeSet::new(),
-                VesselPhase::Provisioning,
-                Some("stored"),
-            ),
-            (LifecycleReading::Exhausted { cause: "c".into() }, BTreeSet::new(), VesselPhase::Provisioning, Some("stored")),
-            (LifecycleReading::Ready { identity: "env".into() }, BTreeSet::new(), VesselPhase::Ready, None),
-            (LifecycleReading::Ready { identity: "env".into() }, roles, VesselPhase::Interrupted, Some("stored")),
-            (LifecycleReading::Lost { reason: None }, BTreeSet::new(), VesselPhase::Lost, Some("observed absent")),
-            (LifecycleReading::Released, BTreeSet::new(), VesselPhase::Lost, Some("released")),
-            (LifecycleReading::Failed { reason: "boom".into() }, BTreeSet::new(), VesselPhase::Failed, Some("boom")),
-            (LifecycleReading::GaveUp { cause: "host gone".into() }, BTreeSet::new(), VesselPhase::Failed, Some("host gone")),
-        ];
-        for stored in [VesselPhase::Pending, VesselPhase::Provisioning, VesselPhase::Ready] {
-            for (reading, interrupted_roles, phase, message) in &cases {
-                let status = project_reading(&vessel(stored, interrupted_roles.clone()), Some(reading)).status.expect("status");
-                assert_eq!(status.phase, *phase, "{stored:?} {reading:?}");
-                let message = if stored == *phase { Some("stored") } else { *message };
-                assert_eq!(status.message.as_deref(), message, "{stored:?} {reading:?}");
-            }
-            let unread = vessel(stored, BTreeSet::new());
-            assert_eq!(project_reading(&unread, None).status, unread.status);
-        }
+    fn a_status_with_its_retired_runtime_observation_decodes() {
+        let stored = serde_json::json!({
+            "phase": "Ready",
+            "environment_ref": "env-a",
+            "runtime_observation": { "memory_usage_bytes": 123, "memory_observed_at": "2026-10-05T10:13:00Z" },
+        });
+        let status: VesselStatus = serde_json::from_value(stored).expect("old status decodes");
+        assert_eq!((status.phase, status.environment_ref.as_deref()), (VesselPhase::Ready, Some("env-a")));
+        assert!(!serde_json::to_value(&status).expect("encode").as_object().expect("object").contains_key("runtime_observation"));
     }
 }

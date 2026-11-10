@@ -47,6 +47,7 @@ pub mod image_build;
 pub mod import;
 pub mod kinds;
 pub mod launch_log;
+pub(crate) mod log_cursor;
 pub mod manifest_root;
 pub mod manifest_root_import;
 pub mod observations;
@@ -63,6 +64,7 @@ pub mod terminals;
 #[cfg(test)]
 mod tests;
 pub mod vessel;
+pub mod vessel_actuator;
 pub use flotilla_engine_store::watch;
 
 use std::sync::{Arc, Mutex};

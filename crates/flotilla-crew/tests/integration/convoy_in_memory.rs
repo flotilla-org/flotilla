@@ -3,8 +3,8 @@ use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
     external_patches, reconcile, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase, FreshCloneCheckoutSpec, FulfilmentKind,
     FulfilmentKindSpec, FulfilmentRealisation, InputMeta, IssueSnapshot, LifecycleAuthority, RepositoryKey, RepositorySpec, ResourceError,
-    Vessel, VesselPhase, VesselStatus, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION,
-    PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
+    Vessel, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND,
+    PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
 };
 use flotilla_store::{apply_status_patch, controller::ControllerLoop, PreparedSnapshotGarbageCollector, ResourceBackend};
 use flotilla_store_memory::InMemoryBackend;
@@ -241,6 +241,12 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let workspaces = backend.clone().using::<Vessel>("flotilla");
+    // A decided store whose vessel commits are followed, as the runtime's are: a launch's change
+    // reaches the convoy's watch only through its follower.
+    let store = flotilla_provisioning_testkit::OtherHome::open("home");
+    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(store.service());
+    let _follower = engine.vessels.vessels.follow(std::sync::Arc::clone(store.service())).expect("follow vessels");
+    backend.install_engine_records(std::sync::Arc::new(flotilla_store::VesselViews::new(backend.clone(), "flotilla", engine.reads())));
 
     let template = tool_only_workflow_template_object("review-and-fix");
     templates.create(&workflow_template_meta(&template.metadata.name), &template.spec).await.expect("template create should succeed");
@@ -250,66 +256,34 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: ConvoyReconciler::secondary_watches(),
-            reconciler: ConvoyReconciler::new(templates.clone())
-                .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
-                .with_vessels(workspaces.clone()),
+            reconciler: ConvoyReconciler::new(templates.clone()).with_lifecycle_reads(engine.reads()).with_vessels(workspaces.clone()),
             backend: backend.clone(),
         }
         .run(),
     );
 
+    let work_phase = || async {
+        convoys
+            .get("convoy-stage4a")
+            .await
+            .expect("convoy get should succeed")
+            .status
+            .and_then(|status| status.work.get("implement").map(|work| work.phase))
+    };
     timeout(Duration::from_secs(1), async {
-        loop {
-            if workspaces.get("convoy-stage4a-implement").await.is_ok() {
-                break;
-            }
+        while work_phase().await != Some(flotilla_resources::WorkPhase::Ready) {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("controller loop should create a task workspace for the ready task");
+    .expect("controller loop should make the task ready");
 
-    let workspace = workspaces.get("convoy-stage4a-implement").await.expect("workspace get should succeed");
-    workspaces
-        .update_status(
-            "convoy-stage4a-implement",
-            &workspace.metadata.resource_version,
-            &VesselStatus {
-                image: None,
-                degraded: Default::default(),
-                configured_limits: None,
-                runtime_observation: None,
-                placement_decision: None,
-                phase: VesselPhase::Ready,
-                message: None,
-                observed_kind_ref: Some("laptop-docker".to_string()),
-                observed_kind_version: Some("17".to_string()),
-                environment_ref: Some("env-implement".to_string()),
-                image_ref: Some("registry.example/crew:latest".to_string()),
-                local_image_id: Some("sha256:test-image".to_string()),
-                registry_digest: None,
-                checkout_refs: Default::default(),
-                terminal_session_refs: vec!["terminal-implement-coder".to_string()],
-                interrupted_roles: Default::default(),
-                started_at: Some(timestamp(18)),
-                ready_at: Some(timestamp(19)),
-                requested_stance: None,
-                effective_stance: None,
-            },
-        )
-        .await
-        .expect("workspace status update should succeed");
+    // Its home launches the ready work, and realises the launch.
+    let launch = engine.vessels.request("convoy-stage4a", "implement", "host");
+    engine.vessels.ready(&launch, "env-implement");
 
     timeout(Duration::from_secs(1), async {
-        loop {
-            let convoy = convoys.get("convoy-stage4a").await.expect("convoy get should succeed");
-            let Some(status) = convoy.status else {
-                tokio::task::yield_now().await;
-                continue;
-            };
-            if status.work.get("implement").is_some_and(|task| task.phase == flotilla_resources::WorkPhase::Running) {
-                break;
-            }
+        while work_phase().await != Some(flotilla_resources::WorkPhase::Running) {
             tokio::task::yield_now().await;
         }
     })
@@ -524,4 +498,72 @@ async fn controller_loop_finalizer_deletes_vessels_and_waits_for_its_checkouts()
     );
 
     loop_task.abort();
+}
+
+/// The next change a vessel watch shows: what happened, to which launch, and its phase.
+async fn next(
+    watch: &mut futures::stream::BoxStream<'static, Result<flotilla_resources::ReadWatchEvent<Vessel>, ResourceError>>,
+) -> (&'static str, String, Option<flotilla_resources::VesselPhase>) {
+    use flotilla_resources::ReadWatchEvent;
+    use futures::StreamExt;
+    match timeout(Duration::from_secs(5), watch.next()).await.expect("a change").expect("watching").expect("read") {
+        ReadWatchEvent::Added(read) => ("added", read.object.metadata.name, read.object.status.map(|status| status.phase)),
+        ReadWatchEvent::Modified(read) => ("modified", read.object.metadata.name, read.object.status.map(|status| status.phase)),
+        ReadWatchEvent::Deleted(read) => ("deleted", read.object.metadata.name, None),
+        ReadWatchEvent::DeletedByName { tombstone, .. } => ("deleted", tombstone.name, None),
+    }
+}
+
+// The vessel listing a watcher reads keeps up with each change its passes compose: a launch's
+// edge, its work's next launch replacing it, and a launch that ended leaving once its convoy has.
+#[tokio::test]
+async fn the_vessel_listing_follows_each_launch_and_its_convoy() {
+    use flotilla_resources::{vessel_records::VesselStep, VesselPhase};
+
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let store = flotilla_provisioning_testkit::OtherHome::open("home");
+    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(store.service());
+    let _follower = engine.vessels.vessels.follow(std::sync::Arc::clone(store.service())).expect("follow vessels");
+    backend.install_engine_records(std::sync::Arc::new(flotilla_store::VesselViews::new(backend.clone(), "flotilla", engine.reads())));
+    let created = convoys.create(&convoy_meta("convoy-listed"), &task_provisioning_convoy_spec()).await.expect("convoy create");
+    convoys
+        .update_status("convoy-listed", &created.metadata.resource_version, &bootstrapped_tool_only_convoy_status())
+        .await
+        .expect("convoy status");
+
+    let vessels = backend.including_replicas::<Vessel>("flotilla");
+    let mut watch = vessels.watch().await.expect("watch vessels");
+    let listed = || async {
+        let mut names: Vec<_> = vessels.list().await.expect("list").items.into_iter().map(|read| read.object.metadata.name).collect();
+        names.sort();
+        names
+    };
+
+    let implement = engine.vessels.request("convoy-listed", "implement", "host");
+    let review = engine.vessels.request("convoy-listed", "review", "host");
+    let mut seen = vec![next(&mut watch).await.1, next(&mut watch).await.1];
+    seen.sort();
+    assert_eq!(seen, listed().await);
+
+    engine.vessels.ready(&review, "env-review");
+    assert_eq!(next(&mut watch).await, ("modified", review.clone(), Some(VesselPhase::Ready)));
+
+    // The work's next launch replaces the one that gave up.
+    engine.vessels.step(&implement, VesselStep::Failed { cause: "refused".into(), retryable: false });
+    assert_eq!(next(&mut watch).await.0, "modified");
+    let again = engine.vessels.request("convoy-listed", "implement", "host");
+    let mut replaced = [next(&mut watch).await, next(&mut watch).await].map(|(event, name, _)| (event, name));
+    replaced.sort();
+    assert_eq!(replaced, [("added", again.clone()), ("deleted", implement.clone())]);
+
+    // A launch that ended is listed while its convoy is live, and leaves when the convoy ends.
+    engine.vessels.step(&review, VesselStep::Broke { reason: "gone".into() });
+    assert_eq!(next(&mut watch).await.0, "modified");
+    let current = convoys.get("convoy-listed").await.expect("convoy");
+    let mut status = current.status.expect("status");
+    status.phase = ConvoyPhase::Failed;
+    convoys.update_status("convoy-listed", &current.metadata.resource_version, &status).await.expect("convoy ends");
+    assert_eq!(next(&mut watch).await, ("deleted", review.clone(), None));
+    assert_eq!(listed().await, vec![again]);
 }

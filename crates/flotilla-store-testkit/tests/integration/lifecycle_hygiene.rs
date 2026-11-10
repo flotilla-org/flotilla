@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 use chrono::Utc;
 use flotilla_resources::{
     CheckoutPhase, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, EnvironmentPhase, EnvironmentStatus,
-    EnvironmentStatusPatch, StatusPatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, VesselPhase, VesselStatus,
-    VesselStatusPatch, WorkPhase, WorkState,
+    EnvironmentStatusPatch, StatusPatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, VesselPhase, WorkPhase, WorkState,
 };
 use hegel::generators as gs;
 
@@ -27,7 +26,8 @@ fn retired_phases_decode_but_are_never_written() {
 }
 
 // A lost environment retains its identity and evidence, becomes unavailable,
-// and is distinct from a failed provisioning attempt. Duplicate loss is harmless.
+// and is distinct from a failed provisioning attempt. Duplicate loss is harmless. (A vessel's
+// loss is its launch's Vanish on the engine since #3108; nothing patches its status.)
 #[hegel::test]
 fn loss_preserves_recorded_identity(tc: hegel::TestCase) {
     let reason = if tc.draw(gs::booleans()) { "host reboot" } else { "container gone" };
@@ -37,17 +37,12 @@ fn loss_preserves_recorded_identity(tc: hegel::TestCase) {
         docker_container_id: Some("retained-container".into()),
         ..Default::default()
     };
-    let mut vessel = VesselStatus { phase: VesselPhase::Ready, environment_ref: Some("retained-environment".into()), ..Default::default() };
     for _ in 0..2 {
         EnvironmentStatusPatch::MarkLost { message: reason.into() }.apply(&mut environment);
-        VesselStatusPatch::MarkLost { message: reason.into() }.apply(&mut vessel);
         assert_eq!(environment.phase, EnvironmentPhase::Lost);
         assert!(!environment.ready);
         assert_eq!(environment.docker_container_id.as_deref(), Some("retained-container"));
-        assert_eq!(vessel.phase, VesselPhase::Lost);
-        assert_eq!(vessel.environment_ref.as_deref(), Some("retained-environment"));
         assert_eq!(environment.message.as_deref(), Some(reason));
-        assert_eq!(vessel.message.as_deref(), Some(reason));
     }
 }
 

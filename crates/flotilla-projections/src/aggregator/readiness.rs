@@ -8,7 +8,7 @@ use flotilla_resources::checkout_records::{CheckoutChange, CheckoutRecord};
 use flotilla_resources::{CrewWorkPhase, CrewWorkState, VesselPhase};
 
 use super::*;
-use crate::ports::ProvisioningKind;
+use flotilla_resources::vessel_records::engine_vessel;
 
 impl Aggregator {
     pub(super) fn vessel_readiness(
@@ -46,8 +46,8 @@ impl Aggregator {
         });
         if let Some(vessel) = vessel {
             let origin = engine_origin(&vessel.provenance);
-            let engine = match self.lifecycle_reads.try_reading(ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref()) {
-                Ok(reading) => reading,
+            let engine = match engine_vessel(self.lifecycle_reads.as_ref(), &vessel.object, origin.as_deref()) {
+                Ok(record) => record.map(|record| record.reading),
                 Err(error) => {
                     return (
                         Readiness {
@@ -69,7 +69,7 @@ impl Aggregator {
                 }
             };
             let status = engine.is_none().then_some(vessel.object.status.as_ref()).flatten();
-            let vessel_phase = Self::vessel_phase_from_reading(vessel, engine.as_ref());
+            let vessel_phase = VesselPhase::from_reading(engine.as_ref(), vessel.object.status.as_ref());
             if vessel_phase == VesselPhase::Ready {
                 result.state = ReadinessState::Ready;
             } else {

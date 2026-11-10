@@ -16,38 +16,243 @@ use std::{
 
 use futures::{stream::BoxStream, StreamExt};
 
-use flotilla_protocol::NodeId;
+use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     engine_records::{EngineObject, EngineRecords},
-    environment_records::EnvironmentRecord,
-    lifecycle_reads::LifecycleReads,
-    terminal_records::{newest_launches, TerminalHolderView, TerminalRecord, TerminalRecords},
-    ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    environment_records::{EnvironmentChange, EnvironmentRecord},
+    lifecycle_reads::{ChangeCursor, LifecycleReads},
+    terminal_records::{newest_launches, TerminalChange, TerminalHolderView, TerminalRecord, TerminalRecords},
+    vessel_records::VesselChange,
+    ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance, TerminalSession,
 };
 
-use crate::ResourceBackend;
+use crate::held_listing::{drained, ticks};
 
 const KIND: &str = "TerminalSession";
 
 /// Read views of the terminal sessions in one namespace.
+///
+/// Its listing is kept from pass to pass: each pass reads from the log what changed since the
+/// last, before it reads anything else, and composes again only the sessions that touched. A
+/// read port that holds no log reads every launch afresh.
 #[derive(Clone)]
 pub struct TerminalViews {
-    backend: ResourceBackend,
     namespace: String,
     reads: Arc<dyn LifecycleReads>,
+    listing: Arc<tokio::sync::Mutex<Listing>>,
+}
+
+/// A session at a home, as [`newest_launches`] keys it: its home and its session name.
+type Session = (String, String);
+
+/// Each session's newest launch at every home, as the last pass composed it.
+#[derive(Default)]
+struct Listing {
+    /// Where the next pass reads the changes since this one; none before the first.
+    cursors: Option<Cursors>,
+    sessions: BTreeMap<Session, Entry>,
+}
+
+/// A session's newest launch.
+struct Entry {
+    record: TerminalRecord,
+    /// Its view, while it is listed: a released launch is not.
+    view: Option<EngineObject>,
+    /// Whether its holder vessel could not be read when it was composed: its holder is unknown,
+    /// not absent, so each pass composes it again until it is read.
+    unresolved: bool,
+}
+
+/// What changed since the last pass.
+#[derive(Default)]
+struct Dirt {
+    /// Anything may have changed: a home's log was read afresh, or changes could not be read.
+    all: bool,
+    /// Launches that changed, by name and home.
+    terminals: BTreeSet<(String, String)>,
+    /// Launches whose observation at this home changed.
+    observed: BTreeSet<String>,
+    environments: BTreeSet<String>,
+    vessels: BTreeSet<String>,
+}
+
+/// Cursors over the changes of the records a session's view is composed from. A read port that
+/// serves no environments or vessels joins none, so follows none.
+struct Cursors {
+    terminals: Box<dyn ChangeCursor<TerminalChange>>,
+    environments: Option<Box<dyn ChangeCursor<EnvironmentChange>>>,
+    vessels: Option<Box<dyn ChangeCursor<VesselChange>>>,
+    /// What this home observes is in memory, told as it changes.
+    observed: tokio::sync::broadcast::Receiver<String>,
+}
+
+impl Cursors {
+    /// Cursors from now on, where `reads` holds a log of its sessions.
+    fn start(reads: &dyn LifecycleReads) -> Result<Option<Self>, String> {
+        let terminals = reads.terminals()?;
+        let Some(cursor) = terminals.cursor() else { return Ok(None) };
+        Ok(Some(Self {
+            terminals: cursor,
+            environments: reads.environments().ok().and_then(|environments| environments.cursor()),
+            vessels: reads.vessels().ok().and_then(|vessels| vessels.cursor()),
+            observed: terminals.observations().subscribe(),
+        }))
+    }
+
+    /// What changed since the last pass; a change that could not be read marks everything.
+    fn pass(&mut self) -> Dirt {
+        let mut dirt = Dirt::default();
+        match self.terminals.pass() {
+            Ok(changes) => changes.into_iter().for_each(|change| match change {
+                TerminalChange::Changed { name, home } => {
+                    dirt.terminals.insert((name, home));
+                }
+                TerminalChange::Rescanned => dirt.all = true,
+            }),
+            Err(_) => dirt.all = true,
+        }
+        if let Some(environments) = self.environments.as_mut() {
+            match environments.pass() {
+                Ok(changes) => changes.into_iter().for_each(|change| match change {
+                    EnvironmentChange::Changed(name) => {
+                        dirt.environments.insert(name);
+                    }
+                    EnvironmentChange::Rescanned => dirt.all = true,
+                }),
+                Err(_) => dirt.all = true,
+            }
+        }
+        if let Some(vessels) = self.vessels.as_mut() {
+            match vessels.pass() {
+                Ok(changes) => changes.into_iter().for_each(|change| match change {
+                    VesselChange::Changed { name, .. } => {
+                        dirt.vessels.insert(name);
+                    }
+                    VesselChange::Rescanned => dirt.all = true,
+                }),
+                Err(_) => dirt.all = true,
+            }
+        }
+        dirt.all |= drained(&mut self.observed, |name| {
+            dirt.observed.insert(name);
+            false
+        });
+        dirt
+    }
+}
+
+impl Dirt {
+    fn is_clean(&self) -> bool {
+        !self.all && self.terminals.is_empty() && self.observed.is_empty() && self.environments.is_empty() && self.vessels.is_empty()
+    }
 }
 
 impl TerminalViews {
-    pub fn new(backend: ResourceBackend, namespace: &str, reads: Arc<dyn LifecycleReads>) -> Self {
-        Self { backend, namespace: namespace.to_owned(), reads }
+    pub fn new(namespace: &str, reads: Arc<dyn LifecycleReads>) -> Self {
+        Self { namespace: namespace.to_owned(), reads, listing: Arc::default() }
     }
 
-    /// Each session's newest launch at every home, as read sources: this home's are local, other
-    /// homes' replicas of their home.
-    pub async fn sources(&self) -> Result<Vec<ReadResourceObject<TerminalSession>>, ResourceError> {
-        let records = self.blocking(|reads| reads.terminals()?.every()).await?;
-        self.compose(newest_launches(records).into_values().collect()).await
+    /// Each session's newest launch at every home, as the engine port lists it: this home's
+    /// local, other homes' replicas of their home. A released launch is listed no more.
+    async fn listed(&self) -> Result<Vec<EngineObject>, ResourceError> {
+        let mut listing = self.listing.lock().await;
+        let held = listing.cursors.take();
+        let (cursors, dirt) = self
+            .blocking(move |reads| match held {
+                Some(mut cursors) => {
+                    let dirt = cursors.pass();
+                    Ok((Some(cursors), dirt))
+                }
+                // Started before the full read: a change after it is read again at the next pass.
+                None => Ok((Cursors::start(reads)?, Dirt { all: true, ..Dirt::default() })),
+            })
+            .await?;
+        let follows = cursors.is_some();
+        listing.cursors = cursors;
+        if dirt.all || !follows {
+            let records = self.blocking(|reads| reads.terminals()?.every()).await;
+            let sessions = match records {
+                Ok(records) => self.entries(newest_launches(records).into_values().collect()).await,
+                Err(error) => Err(error),
+            };
+            match sessions {
+                Ok(sessions) => listing.sessions = sessions.into_iter().collect(),
+                Err(error) => {
+                    // What it holds is not known to be current: the next pass reads afresh.
+                    listing.cursors = None;
+                    return Err(error);
+                }
+            }
+        } else if !dirt.is_clean() || listing.sessions.values().any(|entry| entry.unresolved) {
+            if let Err(error) = self.pass(&mut listing, dirt).await {
+                listing.cursors = None;
+                return Err(error);
+            }
+        }
+        Ok(listing.sessions.values().filter_map(|entry| entry.view.clone()).collect())
+    }
+
+    /// Composes again the sessions `dirt` touched in `listing`, and takes in their new launches.
+    async fn pass(&self, listing: &mut Listing, dirt: Dirt) -> Result<(), ResourceError> {
+        let Dirt { terminals, observed, environments, vessels, .. } = dirt;
+        let changed = self
+            .blocking(move |reads| {
+                let records = reads.terminals()?;
+                let mut changed = Vec::new();
+                for (name, home) in &terminals {
+                    changed.extend(records.get(name, Some(home))?);
+                }
+                Ok(changed)
+            })
+            .await?;
+        let here = self.terminals().map_err(ResourceError::other)?.home().to_owned();
+        let mut again: BTreeSet<Session> = listing
+            .sessions
+            .iter()
+            .filter(|(_, entry)| {
+                let record = &entry.record;
+                entry.unresolved
+                    || environments.contains(&record.environment)
+                    || record.vessel.as_ref().is_some_and(|vessel| vessels.contains(vessel))
+                    || (record.home == here && observed.contains(&record.name))
+            })
+            .map(|(session, _)| session.clone())
+            .collect();
+        let mut records = BTreeMap::new();
+        for record in changed {
+            let session = (record.home.clone(), record.session_name().to_owned());
+            if listing.sessions.get(&session).is_some_and(|held| held.record.launch_number() > record.launch_number()) {
+                continue;
+            }
+            again.remove(&session);
+            records.insert(session, record);
+        }
+        records.extend(again.into_iter().filter_map(|session| listing.sessions.get(&session).map(|entry| (session, entry.record.clone()))));
+        listing.sessions.extend(self.entries(records.into_values().collect()).await?);
+        Ok(())
+    }
+
+    /// `records` as entries of the listing: only those listed are composed.
+    async fn entries(&self, records: Vec<TerminalRecord>) -> Result<Vec<(Session, Entry)>, ResourceError> {
+        let (released, shown): (Vec<_>, Vec<_>) = records.into_iter().partition(|record| record.reading == LifecycleReading::Released);
+        let here = self.terminals().map_err(ResourceError::other)?.home().to_owned();
+        let views = self.compose(shown.clone()).await?;
+        let mut entries = Vec::with_capacity(shown.len() + released.len());
+        for (record, view) in shown.into_iter().zip(views) {
+            let home = match &view.provenance {
+                ResourceProvenance::Local => here.clone(),
+                ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
+            };
+            let view = engine_object(view, home).map_err(ResourceError::other)?;
+            let unresolved = record.vessel.is_some() && !view.labels.contains_key(flotilla_resources::VESSEL_LABEL);
+            entries.push(((record.home.clone(), record.session_name().to_owned()), Entry { record, view: Some(view), unresolved }));
+        }
+        entries.extend(
+            released
+                .into_iter()
+                .map(|record| ((record.home.clone(), record.session_name().to_owned()), Entry { record, view: None, unresolved: false })),
+        );
+        Ok(entries)
     }
 
     /// This home's sessions' newest launches.
@@ -85,7 +290,7 @@ impl TerminalViews {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        let holders = self.holders(&records).await?;
+        let holders = self.holders(&records).await;
         let environments = self.environments(&records).await;
         let terminals = self.reads.terminals().map_err(ResourceError::other)?;
         let here = terminals.home().to_owned();
@@ -134,32 +339,41 @@ impl TerminalViews {
         })
     }
 
-    /// The holder Vessels `records` name, local or replicated.
-    async fn holders(&self, records: &[TerminalRecord]) -> Result<BTreeMap<String, TerminalHolderView>, ResourceError> {
-        let vessels = self.backend.including_replicas::<Vessel>(&self.namespace);
-        let mut holders = BTreeMap::new();
-        for vessel in records.iter().filter_map(|record| record.vessel.as_deref()) {
-            if holders.contains_key(vessel) {
-                continue;
-            }
-            match vessels.get(vessel).await {
-                Ok(source) => {
-                    let object = source.object;
-                    let annotations = [ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION]
-                        .into_iter()
-                        .filter_map(|key| object.metadata.annotations.get(key).map(|value| (key.to_owned(), value.clone())))
-                        .collect();
-                    holders.insert(
-                        vessel.to_owned(),
-                        TerminalHolderView { convoy: object.spec.convoy_ref, vessel_name: object.spec.vessel_name, annotations },
-                    );
-                }
-                // A launch outliving its vessel reads without its convoy.
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error),
-            }
+    /// The holder Vessel launches `records` name: read at the session's home, where a vessel
+    /// usually runs, then at this one, then wherever this store holds it. A launch outliving its
+    /// vessel, or whose vessel cannot be read, reads without its convoy.
+    async fn holders(&self, records: &[TerminalRecord]) -> BTreeMap<String, TerminalHolderView> {
+        let wanted: BTreeSet<(String, String)> =
+            records.iter().filter_map(|record| Some((record.vessel.clone()?, record.home.clone()))).collect();
+        if wanted.is_empty() {
+            return BTreeMap::new();
         }
-        Ok(holders)
+        let read = self
+            .blocking(move |reads| {
+                let vessels = reads.vessels()?;
+                let mut holders = BTreeMap::new();
+                for (vessel, home) in wanted {
+                    if holders.contains_key(&vessel) {
+                        continue;
+                    }
+                    let record = match vessels.get(&vessel, Some(&home))? {
+                        Some(record) => Some(record),
+                        None => match vessels.get(&vessel, None)? {
+                            Some(record) => Some(record),
+                            None => vessels.every()?.into_iter().find(|record| record.name == vessel),
+                        },
+                    };
+                    if let Some(record) = record {
+                        holders.insert(vessel, record.terminal_holder());
+                    }
+                }
+                Ok(holders)
+            })
+            .await;
+        read.unwrap_or_else(|error| {
+            tracing::debug!(%error, "terminals' vessels could not be read");
+            BTreeMap::new()
+        })
     }
 
     async fn blocking<T: Send + 'static>(
@@ -206,17 +420,7 @@ impl TerminalViews {
     }
 
     async fn engine_sources(&self) -> Result<Vec<EngineObject>, String> {
-        let sources = self.sources().await.map_err(|error| error.to_string())?;
-        sources
-            .into_iter()
-            .map(|source| {
-                let home = match &source.provenance {
-                    ResourceProvenance::Local => self.terminals()?.home().to_owned(),
-                    ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
-                };
-                engine_object(source, home)
-            })
-            .collect()
+        self.listed().await.map_err(|error| error.to_string())
     }
 }
 
@@ -230,8 +434,20 @@ impl EngineRecords for TerminalViews {
         self.terminals().map(|terminals| terminals.home().to_owned()).unwrap_or_default()
     }
 
+    /// This home's newest launch of `name`, read afresh so a home reads its own writes, else
+    /// another home's as listed. A released launch reads as absent, as from a listing.
     async fn get(&self, _kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        Ok(self.list(KIND).await?.into_iter().find(|object| object.name == name))
+        let here = self.home();
+        let owned = name.to_owned();
+        let record = self.blocking(move |reads| reads.terminals()?.get(&owned, None)).await.map_err(|error| error.to_string())?;
+        if let Some(record) = record.filter(|record| record.home == here) {
+            if record.reading == LifecycleReading::Released {
+                return Ok(None);
+            }
+            let view = self.compose(vec![record]).await.map_err(|error| error.to_string())?.pop();
+            return view.map(|view| engine_object(view, here)).transpose();
+        }
+        Ok(self.list(KIND).await?.into_iter().find(|object| object.name == name && object.home != here))
     }
 
     /// Each session's newest launch, this home's where it holds one, else the lexically first
@@ -250,6 +466,18 @@ impl EngineRecords for TerminalViews {
 
     async fn sources(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
         self.engine_sources().await
+    }
+
+    /// Every home's listed copy of `name`, and this home's newest launch of it however it ended.
+    async fn copies(&self, _kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        let here = self.home();
+        let mut copies = self.engine_sources().await?.into_iter().filter(|object| object.name == name).collect::<Vec<_>>();
+        if !copies.iter().any(|object| object.home == here) {
+            if let Some(found) = self.find(name, None).await.map_err(|error| error.to_string())? {
+                copies.push(engine_object(found, here)?);
+            }
+        }
+        Ok(copies)
     }
 
     async fn apply(
@@ -271,20 +499,14 @@ impl EngineRecords for TerminalViews {
         Err(format!("terminal session {name} ends when its holder does; it is not deleted"))
     }
 
-    /// A tick at each launch change at any home, and at each change of what this home observes.
+    /// A tick at each launch change at any home, at each change of what this home observes, and at
+    /// each change of the environments and vessels a view is joined with: the next listing reads
+    /// what changed from the log.
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
         let terminals = self.terminals()?;
-        Ok(futures::stream::select(ticks(terminals.changes()), ticks(terminals.observations().subscribe())).boxed())
+        let mut streams = vec![ticks(terminals.changes()), ticks(terminals.observations().subscribe())];
+        streams.extend(self.reads.environments().ok().map(|environments| ticks(environments.changes())));
+        streams.extend(self.reads.vessels().ok().map(|vessels| ticks(vessels.changes())));
+        Ok(futures::stream::select_all(streams).boxed())
     }
-}
-
-/// A tick per message on `changes`, and one when it lagged: a reader reads everything again.
-pub(crate) fn ticks<T: Clone + Send + 'static>(changes: tokio::sync::broadcast::Receiver<T>) -> BoxStream<'static, ()> {
-    futures::stream::unfold(changes, |mut changes| async move {
-        match changes.recv().await {
-            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some(((), changes)),
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-        }
-    })
-    .boxed()
 }

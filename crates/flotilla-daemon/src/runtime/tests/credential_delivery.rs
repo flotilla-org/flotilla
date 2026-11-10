@@ -1,5 +1,5 @@
 use super::*;
-use crate::testkits::engine::runtime_terminals;
+use crate::testkits::engine::{engine, runtime_terminals};
 use flotilla_engine_messages::view::record_name;
 use flotilla_resources::attentions::Subject;
 use flotilla_state_machines::machines::message::MessageState;
@@ -41,39 +41,17 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         )
         .await
         .expect("set convoy status");
+    let engine = engine(&daemon);
+    let launch = engine.vessels.request("credential-convoy", "work", daemon.local_host_id().expect("local host").as_str());
     engine_environments(&daemon).request(
         "standing-vessel",
         &EnvironmentSpec {
             host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
             ..Default::default()
         },
-        None,
+        Some(&launch),
     );
-    let vessels = backend.using::<Vessel>(NAMESPACE);
-    let vessel = vessels
-        .create(
-            &empty_meta("credential-vessel"),
-            &VesselSpec {
-                convoy_ref: "credential-convoy".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create vessel");
-    vessels
-        .update_status(
-            &vessel.metadata.name,
-            &vessel.metadata.resource_version,
-            &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some("standing-vessel".to_string()),
-                ..VesselStatus::default()
-            },
-        )
-        .await
-        .expect("place vessel");
+    engine.vessels.ready(&launch, "standing-vessel");
     let transient = CredentialRefreshError {
         environment_ref: "standing-vessel".to_string(),
         credential_name: Some("github-app".to_string()),
@@ -441,7 +419,7 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
     spec.docker.as_mut().expect("docker").required_agent_adapters = BTreeSet::from(["claude-code".into()]);
     engine_environments(&daemon).request(env_id.as_str(), &spec, None);
     let source = LocalSkillSource::new(temp.path(), "research");
-    freeze_crew(&backend, "demo", "demo-work", "coder", "claude-code", vec![source.selected.clone()]).await;
+    let vessel = freeze_crew(&daemon, "demo", "coder", "claude-code", vec![source.selected.clone()]).await;
     bind_account(&daemon, "demo", "coder", "claude-max", "test@example.com").await;
 
     let home = PathBuf::from("/home/crew/flotilla/agent-homes/requesters/demo/coder/claude");
@@ -519,7 +497,7 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
             context: Box::new(flotilla_resources::TerminalCrewContext {
                 namespace: NAMESPACE.to_string(),
                 convoy: "demo".to_string(),
-                vessel_ref: "demo-work".to_string(),
+                vessel_ref: vessel.clone(),
             }),
         },
         cwd: temp.path().display().to_string(),
@@ -897,8 +875,12 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let daemon = in_memory_daemon(Vec::new(), config.clone()).await;
     let env_id = EnvironmentId::new("env-work");
-    // The live crew's launch, running before this start as the last run's controller left it.
-    create_credential_test_session(&runtime_terminals(&daemon), "live-crew", "credential-work-vessel", env_id.as_str());
+    // The work's launch and its live crew, running before this start as the last run's controller left them.
+    // Written on its decided store before the runtime starts, as the runtime's engine finds them.
+    let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store().expect("decided store"));
+    let vessel = vessels.request("credential-work", "work", daemon.local_host_id().expect("local host").as_str());
+    vessels.ready(&vessel, env_id.as_str());
+    create_credential_test_session(&runtime_terminals(&daemon), "live-crew", &vessel, env_id.as_str());
     let runtime = DaemonRuntime::start_with_options(
         daemon.clone(),
         config.clone(),
@@ -976,31 +958,6 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
         )
         .await
         .expect("live convoy");
-    let vessels = backend.using::<Vessel>(NAMESPACE);
-    let vessel = vessels
-        .create(
-            &empty_meta("credential-work-vessel"),
-            &VesselSpec {
-                convoy_ref: "credential-work".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
-    vessels
-        .update_status(
-            &vessel.metadata.name,
-            &vessel.metadata.resource_version,
-            &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some(env_id.to_string()),
-                ..VesselStatus::default()
-            },
-        )
-        .await
-        .expect("placed vessel");
     let state = Arc::new(
         ControllerRuntimeState::new(daemon.clone(), config, passthrough_registry(), None, "test-host".into(), "host-direct-test".into())
             .with_credential_store(store.clone()),

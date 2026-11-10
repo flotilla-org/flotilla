@@ -18,7 +18,13 @@
 //! - one of its own flights (realise, release, observe) finishing;
 //! - a [`BackingEvent`] its provider pushes, such as a container's death;
 //! - the earliest time a provider said a failed try could succeed ([`ProviderFailure::retry_at`]):
-//!   one deadline for the kind, never an interval.
+//!   one deadline for the kind, never an interval;
+//! - a commit of a record it holds ([`Actuator::holdings`]): a kind that holds others, such as a
+//!   vessel its environment and checkouts, requests them and waits for each to be realised; once
+//!   it is realised, such a commit observes it again.
+//!
+//! Waiting is not a try: a request waits on its usability facts and its holdings without
+//! spending any of its attempts.
 //!
 //! A retryable failure is recorded and nothing else: the resource is tried again on an event
 //! that could change the outcome, or at the time its provider named, no sooner than the kind's
@@ -120,7 +126,25 @@ impl Holding {
     }
 }
 
-/// One lifecycle kind's provider work. Nothing here writes the engine.
+/// What a resource holds now, as one call of [`Actuator::holdings`] found it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Holdings {
+    /// Each holding's record, usable once it is realised.
+    pub held: Vec<Usability>,
+    /// Whether every holding is requested. A plan whose later holdings need an earlier one's
+    /// facts is incomplete until those are realised, and its resource is not usable meanwhile.
+    pub complete: bool,
+}
+
+impl Holdings {
+    /// Nothing held, and nothing more to hold.
+    pub fn none() -> Holdings {
+        Holdings { held: Vec::new(), complete: true }
+    }
+}
+
+/// One lifecycle kind's provider work. Nothing here writes the engine, except that a kind which
+/// holds others requests them in [`Actuator::holdings`], at this home.
 #[async_trait]
 pub trait Actuator<K: LifecycleKind>: Send + Sync + 'static {
     /// Looks at `name`'s backing, changing nothing.
@@ -153,11 +177,24 @@ pub trait Actuator<K: LifecycleKind>: Send + Sync + 'static {
     fn release_waits(&self, _read: &mut Read<'_>, _name: &str, _request: &K::Request) -> Result<Vec<Identity>, StoreError> {
         Ok(Vec::new())
     }
+    /// Whether this kind holds others: if so, [`Actuator::holdings`] runs before each try.
+    fn holds(&self) -> bool {
+        false
+    }
+    /// Requests, idempotently at this home, what `name` holds now, and reports each holding's
+    /// realisation. It runs before each try and again at each commit of a holding; the try runs
+    /// only once every holding is requested and realised. A failure is one try: a planning error
+    /// is not retryable, a missing input that may yet arrive is.
+    async fn holdings(&self, _name: &str, _request: &K::Request) -> Result<Holdings, ProviderFailure> {
+        Ok(Holdings::none())
+    }
 }
 
 /// Why a resource is looked at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Trigger {
+    /// Its holdings were just requested and read: it is judged on them.
+    Held,
     /// The resource itself changed, or a flight of it finished.
     Own,
     /// A record it depends on changed: a failed attempt may run again.
@@ -175,6 +212,8 @@ enum Trigger {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Action {
     Nothing,
+    /// Request and read what it holds.
+    Hold,
     Observe,
     Realise,
     Release {
@@ -188,16 +227,21 @@ enum Action {
 }
 
 enum Done {
-    Observed(Result<Backing, Cause>),
+    Held(Result<Holdings, ProviderFailure>),
+    /// What an observation found, and for a holding kind what it holds, when that could be read.
+    Observed(Result<Backing, Cause>, Option<Holdings>),
     Realised(Result<String, ProviderFailure>),
     Released(Result<(), ProviderFailure>),
 }
 
 /// What a read found for one resource.
+#[derive(Clone)]
 struct Found {
     holder_ended: bool,
     holder: Option<Identity>,
     usability: Vec<Usability>,
+    /// Whether everything it holds is requested; always for a kind that holds nothing.
+    holdings_complete: bool,
     /// The records its release waits on, read only once its holder has ended.
     blockers: Vec<Identity>,
     /// The facts a failed release waits on, read only once its holder has ended.
@@ -206,7 +250,7 @@ struct Found {
 
 impl Found {
     fn usable(&self) -> bool {
-        self.usability.iter().all(|usability| usability.usable)
+        self.holdings_complete && self.usability.iter().all(|usability| usability.usable)
     }
 
     /// Its holder ended and nothing holds its release back.
@@ -270,6 +314,12 @@ pub struct Controller<K: LifecycleKind, A: Actuator<K>> {
     release_failed: BTreeSet<String>,
     /// When each failed resource is tried again, as its provider named and the backoff allows.
     retries: BTreeMap<String, Timestamp>,
+    /// What each resource of a holding kind held at its last [`Actuator::holdings`].
+    holdings: BTreeMap<String, Holdings>,
+    /// The resources whose holdings are being read, and those of them a record changed for
+    /// meanwhile: what that read finds may be stale, so it is read again.
+    holding: BTreeSet<String>,
+    stale_holdings: BTreeSet<String>,
 }
 
 impl<K, A> Controller<K, A>
@@ -302,6 +352,9 @@ where
             in_flight: BTreeSet::new(),
             release_failed: BTreeSet::new(),
             retries: BTreeMap::new(),
+            holdings: BTreeMap::new(),
+            holding: BTreeSet::new(),
+            stale_holdings: BTreeSet::new(),
         })
     }
 
@@ -344,14 +397,30 @@ where
                 Some(joined) = self.flights.join_next(), if !self.flights.is_empty() => match joined {
                     Ok((name, done)) => {
                         self.in_flight.remove(&name);
+                        let trigger = if matches!(done, Done::Held(Ok(_))) { Trigger::Held } else { Trigger::Own };
+                        // A holding this call named first was not followed while it ran, and one
+                        // that was may have changed meanwhile: either way its holdings are read
+                        // once more.
+                        self.holding.remove(&name);
+                        let stale = self.stale_holdings.remove(&name);
+                        let unseen = match &done {
+                            Done::Held(Ok(holdings)) | Done::Observed(_, Some(holdings)) => {
+                                let before = self.holdings.get(&name);
+                                stale || holdings.held.iter().any(|held| before.is_none_or(|before| !before.held.iter().any(|seen| seen.fact == held.fact)))
+                            }
+                            _ => false,
+                        };
                         self.finish(&name, done).await;
-                        self.evaluate(BTreeMap::from([(name, Trigger::Own)])).await;
+                        self.evaluate(BTreeMap::from([(name.clone(), trigger)])).await;
+                        if unseen {
+                            self.evaluate(BTreeMap::from([(name, Trigger::Dependency)])).await;
+                        }
                     }
                     Err(error) => warn!(kind = K::NAME, %error, "controller flight did not finish"),
                 },
                 event = backing.recv() => match event {
                     Some(event) => {
-                        self.finish(&event.name, Done::Observed(Ok(event.observed))).await;
+                        self.finish(&event.name, Done::Observed(Ok(event.observed), None)).await;
                         self.evaluate(BTreeMap::from([(event.name, Trigger::Own)])).await;
                     }
                     None => return,
@@ -423,7 +492,14 @@ where
                         } else {
                             (Vec::new(), Vec::new())
                         };
-                        Ok(Found { holder_ended, holder, usability: actuator.usability(read, request)?, blockers, release_waits })
+                        Ok(Found {
+                            holder_ended,
+                            holder,
+                            usability: actuator.usability(read, request)?,
+                            holdings_complete: true,
+                            blockers,
+                            release_waits,
+                        })
                     })
                     .collect::<Result<Vec<_>, StoreError>>()
             })
@@ -436,18 +512,43 @@ where
                 return;
             }
         };
-        for ((name, trigger, resource), found) in held.into_iter().zip(found) {
+        for ((name, trigger, resource), mut found) in held.into_iter().zip(found) {
+            if let Some(holdings) = self.holdings.get(&name) {
+                found.usability.extend(holdings.held.iter().cloned());
+                found.holdings_complete = holdings.complete;
+            }
             self.remember(&name, resource.spec(), &found);
             let usable_now = found.usable();
             let usable_again = self.usable.insert(name.clone(), usable_now) == Some(false) && usable_now;
             if self.in_flight.contains(&name) {
+                if self.holding.contains(&name) && trigger == Trigger::Dependency {
+                    self.stale_holdings.insert(name);
+                }
                 continue;
             }
             let state = resource.state();
+            // A holding of a realised resource changed: it is observed again, as a lost
+            // environment ends the vessel running in it.
+            let trigger = if self.actuator.holds() && trigger == Trigger::Dependency && matches!(state, LifecycleState::Realised { .. }) {
+                Trigger::Recheck
+            } else {
+                trigger
+            };
             if matches!(state, LifecycleState::Requested { .. }) && K::launch(resource.spec()).is_some() {
                 self.end_predecessor(&name).await;
             }
-            let action = act(state, &judge::<K>(state), &found, trigger, usable_again, self.release_failed.contains(&name));
+            let judgement = judge::<K>(state);
+            let release_failed = self.release_failed.contains(&name);
+            // A holding kind requests and reads its holdings before any try it would make were
+            // it usable, then is judged on them.
+            if self.actuator.holds() && trigger != Trigger::Held {
+                let unwaited = Found { usability: Vec::new(), holdings_complete: true, ..found.clone() };
+                if act(state, &judgement, &unwaited, trigger, usable_again, release_failed) == Action::Realise {
+                    self.perform(&name, resource.spec().clone(), Action::Hold).await;
+                    continue;
+                }
+            }
+            let action = act(state, &judgement, &found, trigger, usable_again, release_failed);
             self.perform(&name, resource.spec().clone(), action).await;
         }
     }
@@ -475,9 +576,23 @@ where
                 self.write(name, Step::Attempted(Outcome::Failed { cause, retryable })).await;
                 return;
             }
-            Action::Observe => {
+            Action::Hold => {
+                self.holding.insert(owned.clone());
                 self.flights.spawn(async move {
-                    let done = Done::Observed(actuator.observe(&owned, &request).await);
+                    let done = Done::Held(actuator.holdings(&owned, &request).await);
+                    (owned, done)
+                });
+            }
+            Action::Observe => {
+                // A holding kind's observation reads what it holds too, so that one adopted at
+                // start, or observed again, follows its holdings as they are now.
+                let holds = actuator.holds();
+                if holds {
+                    self.holding.insert(owned.clone());
+                }
+                self.flights.spawn(async move {
+                    let holdings = if holds { actuator.holdings(&owned, &request).await.ok() } else { None };
+                    let done = Done::Observed(actuator.observe(&owned, &request).await, holdings);
                     (owned, done)
                 });
             }
@@ -502,10 +617,23 @@ where
         let Some(resource) = self.lifecycles.get(name) else { return };
         let state = resource.state().clone();
         // A new try ran: what it found decides any later one.
-        if !matches!(done, Done::Observed(_)) {
+        if !matches!(done, Done::Observed(..) | Done::Held(Ok(_))) {
             self.retries.remove(name);
         }
+        if let Done::Observed(_, Some(holdings)) = &done {
+            self.holdings.insert(name.to_owned(), holdings.clone());
+        }
         match (done, &state) {
+            (Done::Held(Ok(holdings)), _) => {
+                self.holdings.insert(name.to_owned(), holdings);
+            }
+            (Done::Held(Err(failure)), LifecycleState::Requested { .. }) => {
+                let retry_at = failure.retry_at.filter(|_| failure.retryable);
+                self.write(name, Step::Attempted(Outcome::Failed { cause: failure.cause, retryable: failure.retryable })).await;
+                self.schedule(name, retry_at);
+            }
+            // A realised resource's holdings read again: its observation, not this read, ends it.
+            (Done::Held(Err(failure)), _) => warn!(kind = K::NAME, name, cause = ?failure.cause, "holdings could not be read"),
             (Done::Realised(Ok(identity)), _) => {
                 if let Some(EngineError::Refused(_)) = self.write(name, Step::Realised { identity: identity.clone() }).await {
                     // It ended while the work ran: what the work made is torn down.
@@ -543,16 +671,16 @@ where
                 self.release_failed.insert(name.to_owned());
                 warn!(kind = K::NAME, name, cause = ?failure.cause, "release failed");
             }
-            (Done::Observed(Ok(Backing::Present { identity })), LifecycleState::Requested { .. }) => {
+            (Done::Observed(Ok(Backing::Present { identity }), _), LifecycleState::Requested { .. }) => {
                 self.write(name, Step::Realised { identity }).await;
             }
-            (Done::Observed(Ok(Backing::Absent { reason })), LifecycleState::Realised { .. }) => {
+            (Done::Observed(Ok(Backing::Absent { reason }), _), LifecycleState::Realised { .. }) => {
                 self.write(name, Step::Vanished { cause: VanishCause::Lost { reason } }).await;
             }
-            (Done::Observed(Ok(Backing::Failed { reason })), LifecycleState::Realised { .. }) => {
+            (Done::Observed(Ok(Backing::Failed { reason }), _), LifecycleState::Realised { .. }) => {
                 self.write(name, Step::Vanished { cause: VanishCause::Failed { reason } }).await;
             }
-            (Done::Observed(Err(cause)), _) => warn!(kind = K::NAME, name, ?cause, "observation failed"),
+            (Done::Observed(Err(cause), _), _) => warn!(kind = K::NAME, name, ?cause, "observation failed"),
             _ => {}
         }
     }
@@ -599,6 +727,8 @@ where
 
     fn forget(&mut self, name: &str) {
         self.usable.remove(name);
+        self.holdings.remove(name);
+        self.stale_holdings.remove(name);
         self.release_failed.remove(name);
         self.retries.remove(name);
         self.unlink(name);

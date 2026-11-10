@@ -924,7 +924,7 @@ impl TerminalControllerRuntime {
     /// Launch `launch` in the old session shape the runtime reads: named as its session, with its
     /// holder's convoy.
     async fn session_view(&self, launch: &TerminalRecord) -> Result<ResourceObject<TerminalSession>, String> {
-        let views = TerminalViews::new(self.state.daemon.resource_backend(), &self.state.namespace, self.state.daemon.lifecycle_reads());
+        let views = TerminalViews::new(&self.state.namespace, self.state.daemon.lifecycle_reads());
         views
             .compose(vec![launch.clone()])
             .await

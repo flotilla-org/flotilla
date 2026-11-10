@@ -209,11 +209,21 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     assert!(host.status.is_some(), "startup heartbeat should publish host status");
 
     let workspaces = backend.clone().using::<Vessel>(NAMESPACE);
+    // The work's vessel is its launch, named for it.
+    let launch = daemon
+        .lifecycle_reads()
+        .vessels()
+        .and_then(|vessels| vessels.of_convoy("convoy-a"))
+        .expect("convoy launches")
+        .into_iter()
+        .find(|launch| launch.launch_of == "convoy-a-implement" && !launch.ended())
+        .expect("the work's launch")
+        .name;
     let sqlite_path = config.state_dir().as_path().join("resources.sqlite");
     let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut previous_idle_sample = None;
     loop {
-        let workspace = workspaces.get("convoy-a-implement").await.expect("steady workspace should remain");
+        let workspace = workspaces.get(&launch).await.expect("steady workspace should remain");
         let sample = (
             workspace.metadata.resource_version,
             workspace.status.expect("steady workspace status").ready_at,
@@ -286,10 +296,15 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     .await;
 
     if let Some(checkout_path) = teardown_checkout_path {
+        // A released launch stays as history (#3108): the vessel is gone once its launch ends.
+        let reads = daemon.lifecycle_reads();
         wait_until(|| {
             let convoys = convoys.clone();
-            let workspaces = workspaces.clone();
             let checkout_path = checkout_path.clone();
+            let released = reads
+                .vessels()
+                .and_then(|vessels| vessels.get(&launch, None))
+                .is_ok_and(|record| record.is_some_and(|record| record.ended()));
             async move {
                 convoys
                     .get("convoy-a")
@@ -297,7 +312,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
                     .ok()
                     .and_then(|convoy| convoy.status)
                     .is_some_and(|status| status.phase == ConvoyPhase::Landed)
-                    && workspaces.list().await.is_ok_and(|list| list.items.is_empty())
+                    && released
                     && !Path::new(&checkout_path).exists()
             }
         })

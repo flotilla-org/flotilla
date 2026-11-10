@@ -177,13 +177,13 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     terminals.ready(&source_launch, "resume-staging-pool-session", &Default::default());
     let working = |as_of| TerminalAttention { state: TerminalAttentionState::Working, as_of, source: TerminalAttentionSource::Hook };
     observe_attention(&probe.engine, &source_launch, working(chrono::Utc::now()));
-    ensure_vessel(&backend, "governor-watch", "governor", "watch").await;
+    let governor_vessel = ensure_vessel(&probe.engine, "governor", "watch");
     let mut governor_request = terminals.record(&source_launch);
     governor_request.role = "governor".to_string();
     let governor_launch = terminals.request(&TerminalLaunchRequest {
         session: "governor-session".to_string(),
         environment: governor_request.environment,
-        vessel: Some("governor-watch".to_string()),
+        vessel: Some(governor_vessel),
         role: governor_request.role,
         pool: governor_request.pool,
         cwd: governor_request.cwd,

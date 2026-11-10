@@ -36,6 +36,7 @@ use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_provider_runtime::host_environment::HostEnvironment;
 use flotilla_resources::convoy_address::{convoy_address, RoleAddress};
 use flotilla_resources::environment_records::EnvironmentRecord;
+use flotilla_resources::terminal_records::TerminalRecord;
 use flotilla_terminal::TerminalSessionLiveness;
 
 // A held environment can only attach to its realised backing; unheld environments use the legacy handle.
@@ -437,18 +438,33 @@ impl<'a> AttachResolver<'a> {
         }
         match index.resolve(self, reference, host, transient, mode).await {
             Err(AttachIndexError::NoMatch(_)) if reference.starts_with("terminal-") => {
+                // A session released with its environment is listed no more but reads by name:
+                // its environment's end says why it went.
+                let namespace = self.provisioning_namespace().await;
+                if let Ok(session) = self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).get(reference).await {
+                    let environments = self.lifecycle_reads.environments();
+                    if let Some(environment) = environments.and_then(|environments| environments.find(&session.spec.env_ref)).ok().flatten()
+                    {
+                        live_for_attach(&environment)?;
+                    }
+                }
                 Err(format!("session {reference} no longer exists on {}", host.unwrap_or(self.host_name)))
             }
             Err(AttachIndexError::NoMatch(error)) => {
                 let convoys = &index.convoys;
                 let requested_role = reference.contains('@').then(|| RoleAddress::from_str(reference)).transpose()?;
-                if convoys.iter().any(|source| {
+                let named = convoys.iter().find(|source| {
                     source.object.metadata.name == reference
                         || (source.object.spec.role == reference)
                         || requested_role.as_ref().is_some_and(|address| {
                             source.object.spec.role == address.role && source.object.spec.project_ref.as_deref() == Some(&address.project)
                         })
-                }) {
+                });
+                if let Some(source) = named {
+                    // A released session is listed no more, but its launch still names it.
+                    if let Some(session) = self.ended_session(&source.object.metadata.name, &source.object.spec.role) {
+                        return Err(format!("session {session} no longer exists on {}", host.unwrap_or(self.host_name)));
+                    }
                     Err(format!(
                         "no session available for {reference} on {}; the crew has not started yet or its session has ended",
                         host.unwrap_or(self.host_name)
@@ -460,6 +476,19 @@ impl<'a> AttachResolver<'a> {
             Err(error) => Err(error.into_message()),
             Ok(resolved) => Ok(resolved),
         }
+    }
+
+    /// The session of `role` in `convoy` whose newest launch here has ended.
+    fn ended_session(&self, convoy: &str, role: &str) -> Option<String> {
+        let vessels = self.lifecycle_reads.vessels().ok()?.of_convoy(convoy).ok()?;
+        let terminals = self.lifecycle_reads.terminals().ok()?;
+        vessels
+            .iter()
+            .flat_map(|vessel| terminals.of_vessel(&vessel.name).unwrap_or_default())
+            .filter(|terminal| terminal.role == role)
+            .max_by_key(|terminal| terminal.requested_at)
+            .filter(TerminalRecord::ended)
+            .map(|terminal| terminal.session_name().to_owned())
     }
 
     async fn attach_candidate_index(&self, references: &[String]) -> Result<AttachCandidateIndex, String> {
@@ -1816,11 +1845,11 @@ mod tests {
             daemon: "crew@7".into(),
             session: "session-crew".into(),
         });
-        ensure_vessel(&backend, "convoy-work", "convoy", "work").await;
+        let vessel = ensure_vessel(&engine, "convoy", "work");
         let request = flotilla_resources::terminal_records::TerminalLaunchRequest {
             session: "crew".into(),
             environment: "pre-agent".into(),
-            vessel: Some("convoy-work".into()),
+            vessel: Some(vessel),
             role: "coder".into(),
             pool: "passthrough".into(),
             cwd: "/repo".into(),
@@ -2169,8 +2198,8 @@ mod tests {
             .expect("local host resource");
         let engine = test_engine(&daemon);
         let environment = create_test_environment(&engine.environments, "governor-env", &local_host);
-        create_running_session(&engine, &backend, &environment, "governor-session", "convoy-andamento", "governor").await;
-        create_running_session(&engine, &backend, &environment, "flotilla-governor-session", "convoy-flotilla", "governor").await;
+        create_running_session(&engine, &environment, "governor-session", "convoy-andamento", "governor").await;
+        create_running_session(&engine, &environment, "flotilla-governor-session", "convoy-flotilla", "governor").await;
 
         let resolver = daemon.attach_resolver();
 
@@ -2236,7 +2265,7 @@ mod tests {
         let _messages = install_engine_messages(&daemon);
         let engine = test_engine(&daemon);
         let environment = create_test_environment(&engine.environments, "coder-env", &host);
-        create_running_session(&engine, &backend, &environment, "coder-session", "convoy-failed", "coder").await;
+        create_running_session(&engine, &environment, "coder-session", "convoy-failed", "coder").await;
         let convoys = backend.using::<ResourceConvoy>("flotilla");
         let convoy = convoys.get("convoy-failed").await.expect("convoy");
         convoys
@@ -2284,8 +2313,8 @@ mod tests {
             .expect("local host resource");
         let engine = test_engine(&daemon);
         let environment = create_test_environment(&engine.environments, "coder-env", &host);
-        create_running_session(&engine, &backend, &environment, "terminal-old", "convoy-old", "coder").await;
-        let newer = create_running_session(&engine, &backend, &environment, "terminal-new", "convoy-new", "coder").await;
+        create_running_session(&engine, &environment, "terminal-old", "convoy-old", "coder").await;
+        let newer = create_running_session(&engine, &environment, "terminal-new", "convoy-new", "coder").await;
 
         let resolver = daemon.attach_resolver();
         let resolved = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect("newest generation");
@@ -2294,7 +2323,7 @@ mod tests {
         assert_eq!(old.binding.and_then(|binding| binding.session), Some("terminal-old".to_string()));
 
         backend.using::<ResourceConvoy>("flotilla").create(&test_meta("convoy-peer"), &successor).await.expect("peer generation");
-        let peer = create_running_session(&engine, &backend, &environment, "terminal-peer", "convoy-peer", "coder").await;
+        let peer = create_running_session(&engine, &environment, "terminal-peer", "convoy-peer", "coder").await;
         let error =
             resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect_err("same generation is ambiguous");
         assert!(error.contains("ambiguous"), "{error}");
@@ -2345,7 +2374,7 @@ mod tests {
                 .expect("host");
             let engine = test_engine(&daemon);
             let environment = create_test_environment(&engine.environments, "env-main", &host);
-            create_running_session(&engine, &backend, &environment, "terminal-main", "convoy-main", "coder").await;
+            create_running_session(&engine, &environment, "terminal-main", "convoy-main", "coder").await;
             for n in 0..unrelated {
                 create_identity_convoy(&backend, &format!("unrelated-{n}"), "other", Some("other")).await;
                 backend
@@ -2435,7 +2464,7 @@ mod tests {
             .expect("local host resource");
         let engine = test_engine(&daemon);
         let environment = create_test_environment(&engine.environments, "coder-env", &host);
-        let gone = create_running_session(&engine, &backend, &environment, "terminal-gone", "convoy-gone", "coder").await;
+        let gone = create_running_session(&engine, &environment, "terminal-gone", "convoy-gone", "coder").await;
         // Its launch ended and was released.
         engine.terminals.release(&gone);
 

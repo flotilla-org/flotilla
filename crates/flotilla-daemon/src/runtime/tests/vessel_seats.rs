@@ -1,7 +1,6 @@
 use super::*;
 use flotilla_provisioning_testkit::TerminalsFixture;
 use flotilla_resources::vessel_seats::VesselSeats;
-use flotilla_store_memory::InMemoryBackend;
 
 // Behaviour (#3629 layer 8, #3108): a vessel's seats are the newest launch of each session the
 // engine holds for it, by role: a relaunch serves its role in place of the launch it follows, and
@@ -17,7 +16,7 @@ async fn a_vessels_seats_are_the_newest_launches_it_holds() {
     let reviewer = terminals.request(&TerminalsFixture::agent("vessel-a", "reviewer", "env-a"));
     terminals.request(&TerminalsFixture::agent("vessel-b", "coder", "env-a"));
 
-    let seats = EngineVesselSeats { backend: ResourceBackend::new(InMemoryBackend::default()), reads: terminals.reads.clone() };
+    let seats = EngineVesselSeats { reads: terminals.reads.clone() };
     let served: BTreeMap<String, Option<String>> = seats
         .seats(NAMESPACE, "vessel-a")
         .await

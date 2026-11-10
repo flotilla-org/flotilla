@@ -123,6 +123,39 @@ pub struct ReadProjections<'a> {
 }
 
 impl ReadProjections<'_> {
+    /// What this home last observed of the runtime of each of `convoy`'s works, by work: of its
+    /// newest launch whose environment this home observed. A home holds what it observed in
+    /// memory, so another home's works show nothing here, and a lost launch's last observation
+    /// shows until its replacement is observed.
+    fn environment_observations(
+        &self,
+        convoy: &ResourceObject<ResourceConvoy>,
+    ) -> BTreeMap<String, flotilla_protocol::EnvironmentRuntimeObservation> {
+        let observed = || -> Result<_, String> {
+            let environments = self.lifecycles.environments()?;
+            let mut launches = self.lifecycles.vessels()?.of_convoy(&convoy.metadata.name)?;
+            launches.sort_by_key(|launch| std::cmp::Reverse((launch.requested_at, launch.launch_number())));
+            let mut observed = BTreeMap::new();
+            for launch in launches {
+                if observed.contains_key(launch.work()) {
+                    continue;
+                }
+                let held = match launch.environment() {
+                    Some(environment) => vec![environment.to_owned()],
+                    None => environments.held(&launch.name)?.into_iter().map(|environment| environment.name).collect(),
+                };
+                if let Some(observation) = held.iter().find_map(|environment| environments.observations().get(environment)) {
+                    observed.insert(launch.work().to_owned(), observation);
+                }
+            }
+            Ok(observed)
+        };
+        observed().unwrap_or_else(|error| {
+            tracing::debug!(convoy = %convoy.metadata.name, %error, "the convoy's environment observations could not be read");
+            BTreeMap::new()
+        })
+    }
+
     /// Read local and replicated convoy conditions across every stored namespace.
     pub async fn crew_stalls(
         backend: &ResourceBackend,
@@ -1737,7 +1770,7 @@ impl ReadProjections<'_> {
                 .map(|cascade| serde_json::to_value(cascade).expect("serialize cascade")),
 
             messages,
-            environment_observations: convoy.status.as_ref().map(|status| status.environment_observations.clone()).unwrap_or_default(),
+            environment_observations: self.environment_observations(&convoy),
             skills: convoy
                 .status
                 .as_ref()

@@ -9,7 +9,7 @@ use std::{
 
 use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_resources::{
-    environment_records::{EnvironmentChange, EnvironmentRecord, EnvironmentRecords, LaunchFacts},
+    environment_records::{EnvironmentChange, EnvironmentObservations, EnvironmentRecord, EnvironmentRecords, LaunchFacts},
     CloudSandboxEnvironmentSpec, DockerEnvironmentSpec, EnvironmentSpec, HostDirectEnvironmentSpec,
 };
 use flotilla_schema::{Frozen, Kind, Ref, Timestamp};
@@ -204,8 +204,9 @@ fn record(read: &mut Read<'_>, view: View<EnvironmentKind>) -> Result<Environmen
 pub struct EngineEnvironments {
     lifecycles: Arc<dyn Lifecycles<EnvironmentKind>>,
     reads: StoreReads,
-    homes: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    homes: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     changes: tokio::sync::broadcast::Sender<EnvironmentChange>,
+    observations: EnvironmentObservations,
 }
 
 /// How many changes a slow follower may fall behind by; one that lags rereads everything.
@@ -218,7 +219,13 @@ impl EngineEnvironments {
         store: Arc<Mutex<Store>>,
         homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
-        Self { lifecycles, reads: StoreReads::new(store), homes: Box::new(homes), changes: tokio::sync::broadcast::channel(CHANGES).0 }
+        Self {
+            lifecycles,
+            reads: StoreReads::new(store),
+            homes: Arc::new(homes),
+            changes: tokio::sync::broadcast::channel(CHANGES).0,
+            observations: EnvironmentObservations::default(),
+        }
     }
 
     /// The port over `service`'s store and homes.
@@ -235,17 +242,7 @@ impl EngineEnvironments {
         let changes = self.changes.clone();
         Ok(tokio::spawn(async move {
             loop {
-                let followed = watch
-                    .next(|_, followed| {
-                        Ok(followed
-                            .into_iter()
-                            .map(|followed| match followed {
-                                flotilla_engine_store::follow::Followed::Changed(identity) => EnvironmentChange::Changed(identity.name),
-                                flotilla_engine_store::follow::Followed::Rescan(_) => EnvironmentChange::Rescanned,
-                            })
-                            .collect::<Vec<_>>())
-                    })
-                    .await;
+                let followed = watch.next(|_, followed| Ok(followed.into_iter().map(environment_change).collect::<Vec<_>>())).await;
                 match followed {
                     // No follower is no reason to stop: one may subscribe later.
                     Ok(followed) => followed.into_iter().for_each(|change| drop(changes.send(change))),
@@ -261,6 +258,26 @@ impl EngineEnvironments {
 }
 
 impl EnvironmentRecords for EngineEnvironments {
+    fn cursor(&self) -> Option<Box<dyn flotilla_resources::lifecycle_reads::ChangeCursor<EnvironmentChange>>> {
+        let cursor = super::log_cursor::LogCursor::start(
+            self.reads.clone(),
+            Arc::clone(&self.homes),
+            [<Resource<Environment> as Kind>::CODE],
+            environment_change,
+        );
+        match cursor {
+            Ok(cursor) => Some(Box::new(cursor)),
+            Err(error) => {
+                tracing::warn!(%error, "the log could not be followed from here; readers read afresh");
+                None
+            }
+        }
+    }
+
+    fn observations(&self) -> &EnvironmentObservations {
+        &self.observations
+    }
+
     fn changes(&self) -> tokio::sync::broadcast::Receiver<EnvironmentChange> {
         self.changes.subscribe()
     }
@@ -353,73 +370,10 @@ impl EnvironmentRecords for EngineEnvironments {
     }
 }
 
-/// Wakes a vessel's reconciler when the environment held for it changes: its readiness, facts
-/// and ending live in the engine, with no old record to watch (#3108).
-///
-/// A host's own environment (host-direct) is held for no vessel, yet a vessel placed on that host
-/// waits for it to be ready before it plans its clone and checkouts. Its change wakes every
-/// vessel: it is realised once per host start and ends with the host, so this is rare.
-#[derive(Clone)]
-pub struct EnvironmentHolderWake {
-    service: Arc<flotilla_schema_sqlite::stream::Service>,
-}
-
-impl EnvironmentHolderWake {
-    pub fn new(service: Arc<flotilla_schema_sqlite::stream::Service>) -> Self {
-        Self { service }
-    }
-}
-
-impl flotilla_store::controller::SecondaryWatch for EnvironmentHolderWake {
-    type Primary = flotilla_resources::Vessel;
-
-    fn clone_box(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = Self::Primary>> {
-        Box::new(self.clone())
-    }
-
-    fn spawn(
-        self: Box<Self>,
-        _backend: flotilla_store::ResourceBackend,
-        _namespace: String,
-        sender: flotilla_store::controller::WorkQueueSender,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), flotilla_resources::ResourceError>> + Send>> {
-        Box::pin(async move {
-            let mut watch = super::watch::EngineWatch::start(Arc::clone(&self.service), [<Resource<Environment> as Kind>::CODE])
-                .map_err(|error| flotilla_resources::ResourceError::other(error.to_string()))?;
-            loop {
-                let woken = watch
-                    .next(|read, followed| {
-                        let mut vessels = Vec::new();
-                        let mut every_vessel = false;
-                        for followed in followed {
-                            // A rescan names no resource: the vessels' resync covers it.
-                            let flotilla_engine_store::follow::Followed::Changed(identity) = followed else { continue };
-                            let Some(id) = read.resolve(<Resource<Environment> as Kind>::CODE, &identity.name, &identity.home)? else {
-                                continue;
-                            };
-                            let Some(loaded) = read.load::<Resource<Environment>>(id)? else { continue };
-                            match loaded.value.spec().holder.as_ref() {
-                                Some(holder) => vessels.extend(holder.0.strip_prefix("vessel:").map(str::to_owned)),
-                                None => every_vessel = true,
-                            }
-                        }
-                        Ok((vessels, every_vessel))
-                    })
-                    .await;
-                match woken {
-                    Ok((vessels, every_vessel)) => {
-                        if every_vessel {
-                            sender.send_every();
-                        }
-                        for vessel in vessels {
-                            if sender.send(vessel).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    Err(error) => tracing::warn!(%error, "the environment holder wake could not read the log; retrying"),
-                }
-            }
-        })
+/// What a followed write of the kinds tells readers.
+fn environment_change(followed: flotilla_engine_store::follow::Followed) -> EnvironmentChange {
+    match followed {
+        flotilla_engine_store::follow::Followed::Changed(identity) => EnvironmentChange::Changed(identity.name),
+        flotilla_engine_store::follow::Followed::Rescan(_) => EnvironmentChange::Rescanned,
     }
 }

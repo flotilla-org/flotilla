@@ -1,6 +1,6 @@
-//! The lifecycle importer: Environment, ImageBuild, Clone, Checkout, TerminalSession, Vessel and
-//! ConvoyEnsure. A placed Vessel is a lease granted on its pinned host; one never placed is noted,
-//! not stored. An Ensure is bound while the convoy it records is live.
+//! The lifecycle importer: Vessel, TerminalSession, Environment, ImageBuild, Clone, Checkout and
+//! ConvoyEnsure. A placed Vessel is its work's first launch, a lease granted on its pinned host;
+//! one never placed is noted, not stored. An Ensure is bound while the convoy it records is live.
 
 use std::collections::BTreeMap;
 
@@ -22,7 +22,22 @@ use flotilla_state_machines::{machines::convoy::Convoy as EngineConvoy, Resource
 
 use super::{Carried, Source};
 
-pub(super) const KINDS: [&str; 6] = ["environments", "imagebuilds", "clones", "checkouts", "vessels", "convoyensures"];
+pub(super) const KINDS: [&str; 5] = ["environments", "imagebuilds", "clones", "checkouts", "convoyensures"];
+
+/// Vessels import first, each as its work's first launch, so the environments and terminal
+/// sessions held for an old vessel are held for the launch it became: a launch's number is its
+/// home's sequence when it is written. A vessel keeps the old convoy it serves, which its home's
+/// vessel requester reads.
+pub(super) fn vessels(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
+    for namespace in source.namespaces(&["vessels"]) {
+        let vessels: Vec<_> = source
+            .owned::<Vessel>("vessels", Some(namespace), "Vessel", target, report)
+            .into_iter()
+            .map(|record| (record.object, record.home))
+            .collect();
+        carried.vessels.extend(import_vessels(&vessels, target, report));
+    }
+}
 
 /// TerminalSessions import before the messages delivered to them, so each delivery names the
 /// launch its session became: a launch's number is its home's sequence when it is written.
@@ -33,7 +48,7 @@ pub(super) fn terminal_sessions(source: &Source, target: &mut Import, carried: &
             .into_iter()
             .map(|record| (record.object, record.home))
             .collect();
-        carried.launches.extend(import_terminal_sessions(&sessions, target, report));
+        carried.launches.extend(import_terminal_sessions(&sessions, &carried.vessels, target, report));
     }
 }
 
@@ -60,7 +75,7 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
         .into_iter()
         .map(|record| (record.object, record.home))
         .collect();
-    import_environments(&environments, target, report);
+    import_environments(&environments, &carried.vessels, target, report);
     records!(ImageBuild, "imagebuilds", "ImageBuild", ImageBuildBinding);
     let clones: Vec<_> = source
         .owned::<CloneResource>("clones", namespace, "Clone", target, report)
@@ -94,23 +109,6 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
         }
         import_checkouts(std::slice::from_ref(&record), &holder, &clone_launches, target, report);
     }
-    let mut vessels: Vec<_> = source
-        .owned::<Vessel>("vessels", namespace, "Vessel", target, report)
-        .into_iter()
-        .map(|vessel| (vessel.object, vessel.home))
-        .collect();
-    for (vessel, home) in &mut vessels {
-        let convoy_home = vessel.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).unwrap_or(home);
-        if let Some(stable) = aliases.get(&(convoy_home.clone(), vessel.spec.convoy_ref.clone())) {
-            vessel.spec.convoy_ref.clone_from(stable);
-        } else {
-            report.notes.push(format!(
-                "Vessel `{}` records convoy `{}` from home `{convoy_home}`, which is not held or has no mappable identity: left unchanged",
-                vessel.metadata.name, vessel.spec.convoy_ref
-            ));
-        }
-    }
-    import_vessels(&vessels, target, report);
     let standing: Vec<_> = aliases.iter().filter(|((home, old), stable)| target.imports(home) && old != *stable).collect();
     if !standing.is_empty() {
         let identities: std::collections::BTreeSet<_> = standing.iter().map(|((home, _), stable)| (home, stable)).collect();

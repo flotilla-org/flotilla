@@ -197,6 +197,10 @@ mod tests {
             self.live()
         }
 
+        fn observations(&self) -> &flotilla_resources::environment_records::EnvironmentObservations {
+            unreachable!("the sweep reads live environments only")
+        }
+
         fn live(&self) -> Result<Vec<EnvironmentRecord>, String> {
             let record = |name: &String| EnvironmentRecord {
                 name: name.clone(),

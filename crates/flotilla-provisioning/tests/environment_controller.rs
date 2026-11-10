@@ -27,6 +27,7 @@ use flotilla_provisioning::{
         environment::EnvironmentKind,
         host::{HostObservation, Provider, Readiness},
         image_build::{Architecture, Delivery, ImageBuildKind, ImageBuildRequest, Reservation},
+        terminal_session::{Launch, TerminalSessionKind, TerminalSessionRequest},
         Holder,
     },
 };
@@ -169,6 +170,7 @@ struct World {
     vessels: Arc<dyn Lifecycles<VesselKind>>,
     builds: Arc<dyn Lifecycles<ImageBuildKind>>,
     checkouts: Arc<dyn Lifecycles<CheckoutKind>>,
+    terminals: Arc<dyn Lifecycles<TerminalSessionKind>>,
     commits: Arc<Notify>,
     _listener: Arc<CommitListener>,
     backing: tokio::sync::mpsc::Sender<BackingEvent>,
@@ -219,6 +221,7 @@ impl World {
             vessels: Arc::new(LifecycleHome::new(HOME, open_home(log()).expect("vessels"))),
             builds: Arc::new(LifecycleHome::new(HOME, open_home(log()).expect("builds"))),
             checkouts: Arc::new(LifecycleHome::new(HOME, open_home(log()).expect("checkouts"))),
+            terminals: Arc::new(LifecycleHome::new(HOME, open_home(log()).expect("terminals"))),
             _directory: directory,
             service,
             provider,
@@ -251,9 +254,9 @@ impl World {
     /// Requests an environment held for another vessel, and waits for it: the controller has
     /// passed every change made before.
     async fn passed(&self, marker: &str) {
-        self.vessel(marker);
+        let vessel = self.vessel(marker);
         let name = format!("env-{marker}");
-        self.environments.request(&name, &docker("crew@sha256:pinned", None), Some(marker)).expect("request");
+        self.environments.request(&name, &docker("crew@sha256:pinned", None), Some(&vessel)).expect("request");
         self.until(&name, |world| world.ready(&name)).await;
     }
 
@@ -273,15 +276,18 @@ impl World {
         tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap_or_else(|_| panic!("timed out waiting for {what}"));
     }
 
-    fn vessel(&self, name: &str) {
+    /// Leases a launch of work `name` here; its launch name, which the environment is held for.
+    fn vessel(&self, name: &str) -> String {
         let lease = VesselSpec {
+            launch_of: name.to_owned(),
+            launch: 0,
             convoy: ConvoyId::new("convoy", HOME),
             class: VesselClass::new("pinned"),
             shape: BTreeMap::new(),
             priority: Priority(0),
             host: Host::new(HOME),
         };
-        self.vessels.request(name, lease, now()).expect("lease");
+        self.vessels.request(name, lease, now()).expect("lease").name().to_owned()
     }
 
     fn build(&self, name: &str) {
@@ -322,6 +328,22 @@ impl World {
             holder: Some(Holder::convoy("convoy")),
         };
         self.checkouts.request(name, request, now()).expect("checkout");
+    }
+
+    /// A terminal session launched in `environment` for vessel `vessel`.
+    fn terminal(&self, name: &str, environment: &str, vessel: &str) {
+        let request = TerminalSessionRequest {
+            launch_of: name.into(),
+            launch: 0,
+            environment: Ref::new(environment, HOME),
+            holder: Some(Holder::vessel(vessel)),
+            role: "coder".into(),
+            pool: "cleat".into(),
+            cwd: "/w".into(),
+            env: BTreeMap::new(),
+            source: Launch::Tool { command: "sh".into() },
+        };
+        self.terminals.request(name, request, now()).expect("terminal");
     }
 }
 
@@ -393,18 +415,22 @@ fn provider_readiness(readiness: Readiness) -> HostObservation {
 #[tokio::test]
 async fn a_vessel_s_environment_launches_with_its_derived_env_and_its_facts() {
     let world = World::start(None);
-    world.vessel("v1");
-    assert!(world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some("v1")).expect("request"));
+    let v1 = world.vessel("v1");
+    assert!(world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some(&v1)).expect("request"));
     world.until("env-v1 ready", |world| world.ready("env-v1")).await;
 
     let launched = world.provider.provisioned("env-v1");
     let env = &launched[0].docker.as_ref().expect("docker").env;
     assert_eq!(env.get("DECLARED").map(String::as_str), Some("1"));
-    assert_eq!(env.get(CREDENTIAL_REFS_ENV).map(String::as_str), Some("[\"v1-token\"]"), "composed at launch from the vessel");
+    assert_eq!(
+        env.get(CREDENTIAL_REFS_ENV).map(String::as_str),
+        Some(format!("[\"{v1}-token\"]").as_str()),
+        "composed at launch from the vessel"
+    );
 
     let record = world.environments.get("env-v1", None).expect("read").expect("held");
     assert_eq!(record.identity(), Some("ctr-env-v1"));
-    assert_eq!(record.vessel.as_deref(), Some("v1"));
+    assert_eq!(record.vessel.as_deref(), Some(v1.as_str()));
     let stored = &record.spec.docker.as_ref().expect("docker").env;
     assert_eq!(stored.get("DECLARED").map(String::as_str), Some("1"));
     assert!(!stored.contains_key(CREDENTIAL_REFS_ENV), "a launch-derived entry is not stored");
@@ -413,9 +439,9 @@ async fn a_vessel_s_environment_launches_with_its_derived_env_and_its_facts() {
     assert_eq!(facts.local_image_id.as_deref(), Some("sha256:local"));
     // #2650: the limits the provider applied are recorded, not recomputed from host configuration.
     assert_eq!(facts.configured_limits, Some(ConfiguredResourceLimits { cpus: Some(4), ..ConfiguredResourceLimits::default() }));
-    assert_eq!(world.environments.held("v1").expect("held").len(), 1);
+    assert_eq!(world.environments.held(&v1).expect("held").len(), 1);
     // Requested again under its name, it is left as it is.
-    assert!(!world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some("v1")).expect("request"));
+    assert!(!world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some(&v1)).expect("request"));
 }
 
 // Behaviour: an environment whose image is built waits while its build runs, and is launched on
@@ -427,12 +453,12 @@ async fn a_vessel_s_environment_launches_with_its_derived_env_and_its_facts() {
 #[tokio::test]
 async fn a_built_environment_waits_for_its_build(#[case] delivery: Delivery, #[case] pull: DockerImagePullPolicy) {
     let world = World::start(None);
-    world.vessel("v1");
+    let v1 = world.vessel("v1");
     world.build_to("b1", delivery);
-    world.environments.request("env-v1", &docker("", Some("b1")), Some("v1")).expect("request");
+    world.environments.request("env-v1", &docker("", Some("b1")), Some(&v1)).expect("request");
     // Another environment realised after it: the controller has passed it.
-    world.vessel("v2");
-    world.environments.request("env-v2", &docker("crew@sha256:pinned", None), Some("v2")).expect("request");
+    let v2 = world.vessel("v2");
+    world.environments.request("env-v2", &docker("crew@sha256:pinned", None), Some(&v2)).expect("request");
     world.until("env-v2 ready", |world| world.ready("env-v2")).await;
     assert!(world.provider.provisioned("env-v1").is_empty(), "nothing is launched while the build runs");
     assert_eq!(world.reading("env-v1"), Some(LifecycleReading::InProgress), "no attempt is spent waiting");
@@ -451,8 +477,8 @@ async fn a_built_environment_waits_for_its_build(#[case] delivery: Delivery, #[c
 #[tokio::test]
 async fn an_unready_provider_holds_the_launch_until_it_is_ready() {
     let world = World::start(Some(provider_readiness(Readiness::MissingTool { reason: "docker missing".into() })));
-    world.vessel("v1");
-    world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some("v1")).expect("request");
+    let v1 = world.vessel("v1");
+    world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some(&v1)).expect("request");
     // A host-direct environment uses another provider, which the host does not report: it runs.
     let host = EnvironmentSpec {
         host_direct: Some(HostDirectEnvironmentSpec { host_ref: HOME.into(), repo_default_dir: "/repos".into() }),
@@ -488,14 +514,14 @@ async fn a_host_direct_environment_is_realised_under_its_root() {
 #[tokio::test]
 async fn a_vessel_s_end_releases_its_environment_after_its_checkouts() {
     let world = World::start(None);
-    world.vessel("v1");
-    world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some("v1")).expect("request");
+    let v1 = world.vessel("v1");
+    world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some(&v1)).expect("request");
     world.until("env-v1 ready", |world| world.ready("env-v1")).await;
     world.checkout("c1", "env-v1");
-    world.vessels.step("v1", &Step::Released, now()).expect("vessel ended");
+    world.vessels.step(&v1, &Step::Released, now()).expect("vessel ended");
     // Another environment realised after the vessel ended: the controller has passed env-v1.
-    world.vessel("v2");
-    world.environments.request("env-v2", &docker("crew@sha256:pinned", None), Some("v2")).expect("request");
+    let v2 = world.vessel("v2");
+    world.environments.request("env-v2", &docker("crew@sha256:pinned", None), Some(&v2)).expect("request");
     world.until("env-v2 ready", |world| world.ready("env-v2")).await;
     assert!(world.ready("env-v1"), "held while a checkout is made in it");
     assert!(world.provider.asked().destroyed.is_empty());
@@ -507,6 +533,29 @@ async fn a_vessel_s_end_releases_its_environment_after_its_checkouts() {
     assert!(world.environments.live().expect("live").iter().all(|record| record.name != "env-v1"));
 }
 
+// Behaviour: a vessel's end releases its environment only once no live terminal session runs in it:
+// the session's teardown needs the environment's provider.
+#[tokio::test]
+async fn a_vessel_s_end_releases_its_environment_after_its_terminal_sessions() {
+    let world = World::start(None);
+    let v1 = world.vessel("v1");
+    world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some(&v1)).expect("request");
+    world.until("env-v1 ready", |world| world.ready("env-v1")).await;
+    world.terminal("t1", "env-v1", &v1);
+    world.vessels.step(&v1, &Step::Released, now()).expect("vessel ended");
+    // Another environment realised after the vessel ended: the controller has passed env-v1.
+    let v2 = world.vessel("v2");
+    world.environments.request("env-v2", &docker("crew@sha256:pinned", None), Some(&v2)).expect("request");
+    world.until("env-v2 ready", |world| world.ready("env-v2")).await;
+    assert!(world.ready("env-v1"), "held while a terminal session runs in it");
+    assert!(world.provider.asked().destroyed.is_empty());
+
+    let t1 = world.terminals.newest_launch("t1").expect("a launch");
+    world.terminals.step(t1.name(), &Step::Released, now()).expect("terminal ended");
+    world.until("env-v1 released", |world| world.released("env-v1")).await;
+    assert_eq!(world.provider.asked().destroyed, [("env-v1".to_owned(), "ctr-env-v1".to_owned())]);
+}
+
 // Behaviour: a provider's refusal gives the environment up with the provider's reason, for a
 // container and for the host's own root alike; it is not tried again.
 #[rstest::rstest]
@@ -516,8 +565,8 @@ async fn a_vessel_s_end_releases_its_environment_after_its_checkouts() {
 async fn a_provider_refusal_gives_the_environment_up(#[case] spec: EnvironmentSpec) {
     let refusal = "central Codex credential is not provisioned on this host";
     let world = World::with(RecordingProvider::failing(EnvironmentProvisionError::Failed(refusal.into())), None);
-    world.vessel("v1");
-    world.environments.request("env-v1", &spec, Some("v1")).expect("request");
+    let v1 = world.vessel("v1");
+    world.environments.request("env-v1", &spec, Some(&v1)).expect("request");
     world.until("env-v1 given up", |world| world.gave_up("env-v1").is_some()).await;
     assert!(world.gave_up("env-v1").expect("cause").contains(refusal));
     world.passed("v2").await;
@@ -529,11 +578,11 @@ async fn a_provider_refusal_gives_the_environment_up(#[case] spec: EnvironmentSp
 #[tokio::test]
 async fn a_failed_teardown_keeps_the_environment_realised() {
     let world = World::start(None);
-    world.vessel("v1");
-    world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some("v1")).expect("request");
+    let v1 = world.vessel("v1");
+    world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some(&v1)).expect("request");
     world.until("env-v1 ready", |world| world.ready("env-v1")).await;
     world.provider.asked().teardown_failure = Some("failed to parse provisioned mount metadata: corrupt label".into());
-    world.vessels.step("v1", &Step::Released, now()).expect("vessel ended");
+    world.vessels.step(&v1, &Step::Released, now()).expect("vessel ended");
     tokio::time::timeout(Duration::from_secs(10), world.provider.torn_down.notified()).await.expect("teardown asked");
     world.passed("v2").await;
     // A later change may try the release again; each try destroys the same backing.
@@ -551,10 +600,10 @@ async fn a_failed_teardown_keeps_the_environment_realised() {
 #[tokio::test]
 async fn an_unrealised_environment_s_end_tears_down_an_unrecorded_backing() {
     let world = World::start(None);
-    world.vessel("v1");
+    let v1 = world.vessel("v1");
     world.build("b1");
-    world.environments.request("env-v1", &docker("", Some("b1")), Some("v1")).expect("request");
-    world.vessels.step("v1", &Step::Released, now()).expect("vessel ended");
+    world.environments.request("env-v1", &docker("", Some("b1")), Some(&v1)).expect("request");
+    world.vessels.step(&v1, &Step::Released, now()).expect("vessel ended");
     world.until("env-v1 released", |world| world.released("env-v1")).await;
     assert_eq!(world.provider.asked().unrecorded, ["env-v1"]);
     assert!(world.provider.provisioned("env-v1").is_empty());
@@ -565,8 +614,8 @@ async fn an_unrealised_environment_s_end_tears_down_an_unrecorded_backing() {
 #[tokio::test]
 async fn a_lost_environment_is_not_launched_again() {
     let world = World::start(None);
-    world.vessel("v1");
-    world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some("v1")).expect("request");
+    let v1 = world.vessel("v1");
+    world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some(&v1)).expect("request");
     world.until("env-v1 ready", |world| world.ready("env-v1")).await;
     let observed = Backing::Absent { reason: Some("cgroup_oom".into()) };
     world.backing.send(BackingEvent { name: "env-v1".into(), observed }).await.expect("observed");
@@ -582,9 +631,9 @@ async fn a_lost_environment_is_not_launched_again() {
 #[tokio::test]
 async fn a_build_that_gave_up_gives_its_environment_up() {
     let world = World::start(None);
-    world.vessel("v1");
+    let v1 = world.vessel("v1");
     world.build("b1");
-    world.environments.request("env-v1", &docker("", Some("b1")), Some("v1")).expect("request");
+    world.environments.request("env-v1", &docker("", Some("b1")), Some(&v1)).expect("request");
     world
         .builds
         .step(
@@ -618,8 +667,8 @@ async fn a_request_with_no_recipe_is_refused() {
 #[tokio::test]
 async fn a_cloud_sandbox_is_realised_and_destroyed_under_its_backing() {
     let world = World::start(None);
-    world.vessel("v1");
-    world.environments.request("cloud", &cloud("image@sha256:digest", None), Some("v1")).expect("request");
+    let v1 = world.vessel("v1");
+    world.environments.request("cloud", &cloud("image@sha256:digest", None), Some(&v1)).expect("request");
     world.until("cloud ready", |world| world.ready("cloud")).await;
     let record = world.environments.get("cloud", None).expect("read").expect("held");
     assert_eq!(record.identity(), Some("sandbox-cloud"));
@@ -629,7 +678,7 @@ async fn a_cloud_sandbox_is_realised_and_destroyed_under_its_backing() {
     assert_eq!(facts.local_image_id.as_deref(), Some("sha256:digest"));
     assert_eq!(facts.registry_digest.as_deref(), Some("image@sha256:digest"));
     assert_eq!(facts.provider_descriptor.expect("descriptor").instance, "daytona");
-    world.vessels.step("v1", &Step::Released, now()).expect("vessel ended");
+    world.vessels.step(&v1, &Step::Released, now()).expect("vessel ended");
     world.until("cloud released", |world| world.released("cloud")).await;
     assert_eq!(world.provider.asked().destroyed, [("cloud".to_owned(), "sandbox-cloud".to_owned())]);
 }
@@ -643,9 +692,9 @@ async fn a_cloud_sandbox_is_realised_and_destroyed_under_its_backing() {
 #[tokio::test]
 async fn a_built_cloud_sandbox_launches_on_the_registry_digest(#[case] delivery: Delivery) {
     let world = World::start(None);
-    world.vessel("v1");
+    let v1 = world.vessel("v1");
     world.build_to("b1", delivery.clone());
-    world.environments.request("cloud", &cloud("", Some("b1")), Some("v1")).expect("request");
+    world.environments.request("cloud", &cloud("", Some("b1")), Some(&v1)).expect("request");
     let digest = "registry.test/crew@sha256:built";
     world.builds.step("b1", &Step::Realised { identity: digest.into() }, now()).expect("built");
     match delivery {
@@ -680,8 +729,8 @@ fn an_unadopted_backing_is_retried_and_other_failures_are_not(tc: hegel::TestCas
             EnvironmentProvisionError::Failed(diagnostic.clone())
         };
         let world = World::with(RecordingProvider::failing(failure), None);
-        world.vessel("v1");
-        world.environments.request("cloud", &cloud("image@sha256:digest", None), Some("v1")).expect("request");
+        let v1 = world.vessel("v1");
+        world.environments.request("cloud", &cloud("image@sha256:digest", None), Some(&v1)).expect("request");
         world
             .until("a settled attempt", |world| {
                 matches!(world.reading("cloud"), Some(LifecycleReading::Retrying { .. } | LifecycleReading::GaveUp { .. }))

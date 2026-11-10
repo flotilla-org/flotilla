@@ -42,7 +42,20 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     let config = Arc::new(ConfigStore::with_base(config_base));
     let daemon = in_memory_daemon(Vec::new(), config).await;
     let engine = flotilla_provisioning_testkit::clones::RunningClones::start("local", Arc::new(MissingRepositoryCloneRuntime));
-    daemon.install_lifecycle_reads(engine.reads.clone()).expect("engine reads");
+    // The clones' readings, with the vessels explain reads beside them, on the same store.
+    let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&engine.service);
+    let reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads> = Arc::new(
+        flotilla_provisioning::engine::reads::LifecycleReadPort::new(
+            flotilla_provisioning::engine::reads::StoreReads::new(engine.service.store()),
+            "local".to_owned(),
+        )
+        .with_environments(Arc::clone(&engine.environments.environments) as _)
+        .with_clones(Arc::clone(&engine.clones) as _)
+        .with_checkouts(Arc::clone(&engine.checkouts.checkouts) as _)
+        .with_terminals(Arc::clone(&engine.terminals.terminals) as _)
+        .with_vessels(Arc::clone(&vessels.vessels) as _),
+    );
+    daemon.install_lifecycle_reads(reads).expect("engine reads");
     let clone_path = temp.path().join("clone").display().to_string();
     engine.environments.put_ready(
         "host-direct-test",

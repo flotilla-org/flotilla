@@ -16,7 +16,7 @@ use std::{
 
 use futures::{stream::BoxStream, StreamExt};
 
-use crate::terminal_views::ticks;
+use crate::held_listing::ticks;
 
 use flotilla_protocol::LifecycleReading;
 use flotilla_resources::{

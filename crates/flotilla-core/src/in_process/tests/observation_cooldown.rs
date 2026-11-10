@@ -2,12 +2,10 @@ use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
 use chrono::Utc;
-use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, Vessel, VesselSpec,
-};
+use flotilla_resources::{Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState};
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
-use super::support::{claim_crew, stall_test_daemon, stall_workflow_snapshot, test_meta};
+use super::support::{claim_crew, ensure_vessel, stall_test_daemon, stall_workflow_snapshot, test_meta};
 
 // #2202, #3108: the forge observer's branch probe is the only forge read. Each
 // repository's probe records what it finds; a failed probe records nothing.
@@ -94,7 +92,7 @@ fn convoy_branch_refresh_reuses_repository_results(tc: hegel::TestCase) {
 // a completion claim. Another crew's artifact never keeps that promise.
 #[tokio::test]
 async fn prless_decision_ledger_promise_settles_without_a_claim() {
-    let (_daemon, backend, _temp, watch, _engine) = stall_test_daemon().await;
+    let (_daemon, backend, _temp, watch, engine) = stall_test_daemon().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let created = convoys
         .create(
@@ -135,19 +133,7 @@ async fn prless_decision_ledger_promise_settles_without_a_claim() {
         )
         .await
         .expect("working crew");
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &test_meta("ledger-claim-vessel"),
-            &VesselSpec {
-                convoy_ref: "ledger-claim".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
+    ensure_vessel(&engine, "ledger-claim", "work");
     // #3586: the ledger promise is observed and kept by reconciliation, with no completion claim.
     let current = convoys.get("ledger-claim").await.unwrap();
     for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], current.status.as_ref().unwrap(), false) {

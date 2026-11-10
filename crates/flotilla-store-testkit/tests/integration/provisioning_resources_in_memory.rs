@@ -52,7 +52,6 @@ async fn vessel_metadata_and_status_roundtrip() {
                 image: None,
                 degraded: Default::default(),
                 configured_limits: None,
-                runtime_observation: None,
                 placement_decision: None,
                 phase: VesselPhase::Ready,
                 message: None,

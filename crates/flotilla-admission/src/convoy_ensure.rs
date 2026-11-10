@@ -115,24 +115,20 @@ impl ResourceStandingConvoyBackingInspector {
 #[async_trait]
 impl StandingConvoyBackingInspector for ResourceStandingConvoyBackingInspector {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
-        // The convoy's environments are those held for its vessels.
-        let vessels = convoy
+        // The convoy's environments are those held for its works' launches.
+        let works = convoy
             .status
             .as_ref()
             .and_then(|status| status.workflow_snapshot.as_ref())
-            .map(|snapshot| {
-                snapshot
-                    .vessels
-                    .iter()
-                    .map(|requirement| flotilla_resources::vessel_resource_name(&convoy.metadata.name, &requirement.name))
-                    .collect::<Vec<_>>()
-            })
+            .map(|snapshot| snapshot.vessels.iter().map(|requirement| requirement.name.clone()).collect::<std::collections::BTreeSet<_>>())
             .unwrap_or_default();
+        let convoy_name = convoy.metadata.name.clone();
         let reads = Arc::clone(&self.lifecycle_reads);
         let environments = tokio::task::spawn_blocking(move || {
             let environments = reads.environments()?;
+            let vessels = reads.vessels()?.of_convoy(&convoy_name)?;
             let mut held = Vec::new();
-            for vessel in &vessels {
+            for vessel in vessels.iter().filter(|vessel| works.contains(vessel.work())).map(|vessel| &vessel.name) {
                 held.extend(environments.held(vessel)?);
             }
             Ok::<_, String>(held)
@@ -164,7 +160,7 @@ impl StandingConvoyBackingInspector for ResourceStandingConvoyBackingInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotilla_provisioning_testkit::{Ending, EnvironmentFixture};
+    use flotilla_provisioning_testkit::{Ending, EngineFixture};
     use flotilla_resources::{
         ConvoySpec, ConvoyStatus, EnvironmentSpec, HostDirectEnvironmentSpec, InputMeta, VesselRequirement, WorkflowSnapshot,
     };
@@ -190,14 +186,17 @@ mod tests {
             };
             let status = ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() };
             let convoy = convoys.update_status("convoy", &created.metadata.resource_version, &status).await.expect("snapshot");
-            let fixture = EnvironmentFixture::default();
-            let inspector = ResourceStandingConvoyBackingInspector::new(backend).with_lifecycle_reads(fixture.reads.clone());
+            let engine = EngineFixture::default();
+            let fixture = &engine.environments;
+            let inspector = ResourceStandingConvoyBackingInspector::new(backend).with_lifecycle_reads(engine.reads());
             assert!(inspector.verify_backing_dead(&convoy).await.is_err(), "a provisioning convoy with no environment has no evidence");
             let spec = EnvironmentSpec {
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
                 ..Default::default()
             };
-            fixture.request("env", &spec, Some(&flotilla_resources::vessel_resource_name("convoy", "work")));
+            // The work's launch holds its environment.
+            let launch = engine.vessels.request("convoy", "work", "host");
+            fixture.request("env", &spec, Some(&launch));
             assert!(inspector.verify_backing_dead(&convoy).await.is_err());
             fixture.finish("env", ending);
             assert!(inspector.verify_backing_dead(&convoy).await.is_ok(), "an ended environment is verified dead");

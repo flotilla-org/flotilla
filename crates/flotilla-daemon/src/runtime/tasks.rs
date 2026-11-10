@@ -13,7 +13,7 @@ use std::{
 };
 
 use chrono::Utc;
-use flotilla_admission::reconcilers::vessel_placement::VesselPlacementProjector;
+use flotilla_admission::reconcilers::vessel_requests::VesselRequests;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_provisioning::checkout_runtime::sweep_host_empty_convoy_directories;
@@ -21,7 +21,6 @@ use flotilla_provisioning::checkout_runtime::sweep_host_empty_convoy_directories
 use flotilla_credentials::CredentialStore;
 use flotilla_discovery::registry::{command_provider_registry, ProviderRegistry};
 use flotilla_environment::environment::EnvironmentInput;
-use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{Convoy, FulfilmentFacts, Host, HostStatusPatch, Resource, ResourceError, RetryBackoff, TerminalSession, Vessel};
 use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_vcs::vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT;
@@ -314,21 +313,16 @@ where
     })
 }
 
-pub(super) fn spawn_vessel_placement_projector(
-    backend: ResourceBackend,
-    namespace: String,
-    local_host_ref: String,
-    additional_host_refs: Vec<CanonicalHostId>,
+pub(super) fn spawn_vessel_requests(
+    requests: VesselRequests,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // The projector and the Vessel reconciler need distinct health keys, while both remain tied to the resource they manage.
+        // The requester and the Vessel reconciler need distinct health keys, while both remain tied to the resource they manage.
         supervise_controller(Vessel::API_PATHS.plural, supervision, runtime_health, move || {
-            let projector =
-                VesselPlacementProjector::new(backend.clone(), namespace.clone(), CanonicalHostId::resolved(local_host_ref.clone()))
-                    .with_additional_host_refs(additional_host_refs.clone());
-            async move { projector.run().await }
+            let requests = requests.clone();
+            async move { requests.run().await }
         })
         .await;
     })

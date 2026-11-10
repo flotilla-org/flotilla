@@ -136,7 +136,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 promises: Default::default(),
                 landing_entry: None,
                 landing_settlement: None,
-                environment_observations: Default::default(),
                 nudge_obligations: Vec::new(),
                 ensure_admission: None,
                 subjects: Vec::new(),

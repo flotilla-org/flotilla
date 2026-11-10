@@ -497,39 +497,16 @@ async fn terminal_convoys_refuse_resume_and_turn_delivery() {
 // the unavailable rehydration path and never queues input or stages credentials.
 #[tokio::test]
 async fn lost_vessel_resume_explains_rehydration() {
-    let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
-    let vessels = backend.using::<flotilla_resources::Vessel>("flotilla");
-    let vessel = vessels
-        .create(
-            &InputMeta::builder().name("crew-work".into()).build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "crew".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("vessel");
-    vessels
-        .update_status(
-            "crew-work",
-            &vessel.metadata.resource_version,
-            &flotilla_resources::VesselStatus {
-                phase: flotilla_resources::VesselPhase::Lost,
-                message: Some("host reboot".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("loss");
+    let (mut crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
+    let (engine, launch) = super::launch_vessel(&mut crew, &backend, "env");
+    engine.vessels.step(&launch, flotilla_resources::vessel_records::VesselStep::Lost { reason: "host reboot".into() });
     let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
     let view = crew
         .crew_state(
             &ResolvedCrewContext {
                 namespace: "flotilla".into(),
                 convoy: "crew".into(),
-                vessel_ref: "crew-work".into(),
+                vessel_ref: launch.clone(),
                 vessel: "work".into(),
                 caller_role: "coder".into(),
                 caller_session: None,
@@ -553,6 +530,7 @@ async fn lost_vessel_resume_explains_rehydration() {
         .resource_backend(backend.clone())
         .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())))
         .leaf_subscriptions(crew.leaf_subscriptions.clone())
+        .lifecycle_reads(engine.reads())
         .work_credential_reconciler(RwLock::new(Some(probe.clone() as Arc<dyn WorkCredentialReconciler>)))
         .clock(crew.clock.clone())
         .provisioning_namespace(crew.provisioning_namespace.clone())
@@ -577,10 +555,7 @@ async fn lost_vessel_resume_explains_rehydration() {
     let original = sessions.get("session").await.expect("session");
     let mut session = sessions
         .create(
-            &InputMeta::builder()
-                .name("mapped-session".into())
-                .labels(BTreeMap::from([(VESSEL_REF_LABEL.into(), "crew-work".into())]))
-                .build(),
+            &InputMeta::builder().name("mapped-session".into()).labels(BTreeMap::from([(VESSEL_REF_LABEL.into(), launch.clone())])).build(),
             &original.spec,
         )
         .await
@@ -588,7 +563,7 @@ async fn lost_vessel_resume_explains_rehydration() {
     let context = ResolvedCrewContext {
         namespace: "flotilla".into(),
         convoy: "crew".into(),
-        vessel_ref: "crew-work".into(),
+        vessel_ref: launch.clone(),
         vessel: "work".into(),
         caller_role: "coder".into(),
         caller_session: None,
@@ -1235,14 +1210,14 @@ fn awaiting_records_take_the_stall_or_the_expectations_kind() {
 // catches up, including a session previously misclassified as failed.
 #[hegel::test]
 fn lost_environment_resume_reports_cause(tc: hegel::TestCase) {
-    use flotilla_provisioning_testkit::{Ending, EnvironmentFixture};
-    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, VesselPhase, VesselSpec, VesselStatus};
+    use flotilla_provisioning_testkit::Ending;
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec};
     let failed_session = tc.draw(hegel::generators::booleans());
     let provisioning_failed = tc.draw(hegel::generators::booleans());
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
         let (mut crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
-        let environments = EnvironmentFixture::default();
-        Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = environments.reads.clone();
+        let (engine, _) = super::launch_vessel(&mut crew, &backend, "resume-env");
+        let environments = &engine.environments;
         let spec = EnvironmentSpec {
             host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
             ..Default::default()
@@ -1254,27 +1229,6 @@ fn lost_environment_resume_reports_cause(tc: hegel::TestCase) {
         } else {
             environments.lose("resume-env", "cgroup_oom");
         }
-        let vessels = backend.using::<Vessel>("flotilla");
-        let vessel = vessels
-            .create(
-                &InputMeta::builder().name("crew-work".into()).build(),
-                &VesselSpec {
-                    convoy_ref: "crew".into(),
-                    vessel_name: "work".into(),
-                    fulfilment_kind_ref: "policy".into(),
-                    adopted_checkout_refs: Default::default(),
-                },
-            )
-            .await
-            .expect("vessel");
-        vessels
-            .update_status(
-                "crew-work",
-                &vessel.metadata.resource_version,
-                &VesselStatus { phase: VesselPhase::Ready, environment_ref: Some("resume-env".into()), ..Default::default() },
-            )
-            .await
-            .expect("stale vessel");
         let sessions = backend.using::<ResourceTerminalSession>("flotilla");
         let session = sessions.get("session").await.expect("session");
         sessions

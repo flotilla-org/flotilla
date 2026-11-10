@@ -77,9 +77,9 @@ use flotilla_resources::{
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSource, CrewSpec,
     CrewWorkPhase, CrewWorkState, FulfilmentKind, FulfilmentKindSpec, Host, HostSpec, HostStatus, InputMeta, Message, RepositoryKey,
     Resource, ResourceError, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
-    GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
+    WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL,
+    HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
 };
 use flotilla_store::off_frame;
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, old_store_resource_kinds, ResourceBackend};
@@ -1780,6 +1780,21 @@ async fn in_memory_mutation_preserves_socket_caller_in_status_and_explain() {
     assert_eq!(explanation.lifecycle_mutations[0].caller.crew.as_ref().expect("crew caller").crew_id, "crew-123");
 }
 
+/// The launch through `vessels` at `crew_host` of `convoy`'s work, the convoy homed at `home`.
+fn crew_vessel(
+    vessels: &flotilla_provisioning_testkit::VesselsFixture,
+    crew_host: &Arc<InProcessDaemon>,
+    convoy: &str,
+    home: &Arc<InProcessDaemon>,
+) -> String {
+    vessels.request_for(&flotilla_resources::vessel_records::VesselLaunchRequest {
+        convoy: convoy.into(),
+        convoy_home: home.node_id().as_str().into(),
+        work: "work".into(),
+        host: crew_host.node_id().as_str().into(),
+    })
+}
+
 #[tokio::test]
 async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home() {
     let leader = empty_daemon_named("artifact-crew-host").await;
@@ -1793,21 +1808,8 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
         .create(&InputMeta::builder().name(convoy.to_string()).build(), &ConvoySpec::builder().workflow_ref("scratch".to_string()).build())
         .await
         .expect("create home convoy");
-    // The crew's vessel, holding its session, is the crew host's.
-    leader
-        .resource_backend()
-        .using::<Vessel>(namespace)
-        .create(
-            &InputMeta::builder().name("artifact-demo-work".into()).build(),
-            &VesselSpec {
-                convoy_ref: convoy.into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("crew vessel");
+    // The crew's vessel, holding its session, is a launch at the crew host of work in the home's convoy.
+    let vessel = crew_vessel(&engine(&leader).vessels, &leader, convoy, &follower);
     let launch = run_session(
         &leader,
         "terminal-artifact-coder",
@@ -1817,11 +1819,7 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
             .source(TerminalSessionSource::Agent {
                 selector: Selector::for_capability("coding"),
                 brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: String::new(), copies: vec![] },
-                context: Box::new(TerminalCrewContext {
-                    namespace: namespace.into(),
-                    convoy: convoy.into(),
-                    vessel_ref: "artifact-demo-work".into(),
-                }),
+                context: Box::new(TerminalCrewContext { namespace: namespace.into(), convoy: convoy.into(), vessel_ref: vessel.clone() }),
             })
             .cwd(workspace.path().to_string_lossy().into_owned())
             .pool("cleat".to_string())
@@ -1835,7 +1833,7 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
             CallerCrew::builder()
                 .namespace(namespace.to_string())
                 .convoy(convoy.to_string())
-                .vessel("artifact-demo-work".to_string())
+                .vessel(vessel.clone())
                 .role("coder".to_string())
                 .crew_id(launch.clone())
                 .build(),
@@ -2065,20 +2063,9 @@ async fn artifact_environment_reference_contract() {
             .await
             .unwrap();
         }
-        leader
-            .resource_backend()
-            .using::<Vessel>(namespace)
-            .create(
-                &InputMeta::builder().name("artifact-demo-work".into()).build(),
-                &VesselSpec {
-                    convoy_ref: convoy.into(),
-                    vessel_name: "work".into(),
-                    fulfilment_kind_ref: "test".into(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                },
-            )
-            .await
-            .expect("crew vessel");
+        // A runtime composed this daemon: the launch is written at its home on its decided store.
+        let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&leader.decided_store().expect("decided store"));
+        let vessel = crew_vessel(&vessels, &leader, convoy, &follower);
         // A runtime composed this daemon: the launch is written at its home as its controller writes it.
         let terminals = runtime_terminals(&leader);
         let launch = terminals.request(&session_request(
@@ -2092,7 +2079,7 @@ async fn artifact_environment_reference_contract() {
                     context: Box::new(TerminalCrewContext {
                         namespace: namespace.into(),
                         convoy: convoy.into(),
-                        vessel_ref: "artifact-demo-work".into(),
+                        vessel_ref: vessel.clone(),
                     }),
                 })
                 .cwd(if environment_kind == ArtifactEnvironment::LocalHostDirect {
@@ -2111,7 +2098,7 @@ async fn artifact_environment_reference_contract() {
                 CallerCrew::builder()
                     .namespace(namespace.to_string())
                     .convoy(convoy.to_string())
-                    .vessel("artifact-demo-work".to_string())
+                    .vessel(vessel.clone())
                     .role("coder".to_string())
                     .crew_id(launch.clone())
                     .build(),
@@ -2966,6 +2953,7 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
     let convoy = &convoys.items[0];
     assert_eq!(convoy.spec.dispatching_principal_ref, expected_principal, "crew caller reaches admission across the peer session");
 
+    let reads = engine(&topology.follower).reads();
     let controller = ControllerLoop {
         primary: placement.using::<Convoy>(namespace),
         secondaries: Vec::new(),
@@ -2976,19 +2964,42 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
         backend: placement.clone(),
     };
     let controller_task = tokio::spawn(controller.run());
-    eventually(Duration::from_secs(5), Duration::from_millis(10), "feta authors its Vessel", || async {
-        let vessels = placement.using::<Vessel>(namespace).list().await.expect("feta Vessels");
-        if !vessels.items.is_empty() {
-            assert_eq!(vessels.items.len(), 1, "one Vessel is authored at its actuation host");
-            assert_eq!(vessels.items[0].spec.convoy_ref, convoy.metadata.name);
+    // Feta serves the placed host, so its vessel requests launch the work there.
+    use flotilla_resources::vessel_records::VesselRecords;
+    struct Kept;
+    #[async_trait]
+    impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for Kept {
+        async fn may_release(&self, convoy: &str, _convoy_home: &str) -> Result<(), String> {
+            Err(format!("convoy {} is kept for the test", convoy))
+        }
+    }
+    let requests = |backend: &ResourceBackend, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>, host: &str| {
+        flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
+            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), namespace)),
+            reads,
+            Arc::new(Kept),
+            flotilla_protocol::CanonicalHostId::resolved(host),
+            [],
+        )
+    };
+    let feta_requests = requests(&placement, Arc::clone(&reads), &remote_host_id);
+    let kiwi_requests =
+        requests(&dispatcher, engine(&topology.leader).reads(), &topology.leader.local_host_id().expect("kiwi host identity").to_string());
+    let feta_vessels = &engine(&topology.follower).vessels;
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "feta launches its vessel", || async {
+        feta_requests.sync_once(Utc::now()).await.expect("feta vessel requests");
+        let launches = VesselRecords::every(feta_vessels.vessels.as_ref()).expect("feta launches");
+        if !launches.is_empty() {
+            assert_eq!(launches.len(), 1, "one vessel is launched at its actuation host");
+            assert_eq!(launches[0].convoy, convoy.metadata.name);
             return true;
         }
         false
     })
     .await;
     controller_task.abort();
-    assert_eq!(placement.using::<Vessel>(namespace).list().await.expect("feta Vessels").items.len(), 1);
-    assert!(dispatcher.using::<Vessel>(namespace).list().await.expect("kiwi Vessels").items.is_empty());
+    assert!(kiwi_requests.sync_once(Utc::now()).await.expect("kiwi vessel requests").requested.is_empty());
+    assert!(VesselRecords::every(engine(&topology.leader).vessels.vessels.as_ref()).expect("kiwi launches").is_empty());
 }
 
 #[tokio::test]
@@ -3397,17 +3408,8 @@ async fn placement_host_capacity_scenario(hold_definitions: bool) {
     assert!(message.contains("reap settled convoys"), "{message}");
     assert!(message.contains("scripts/prune-target.sh"), "{message}");
     assert!(message.contains("pick another host"), "{message}");
-    if hold_definitions {
-        // The refusal must not depend on either declaration reaching the origin.
-        assert!(matches!(
-            topology.leader.resource_backend().definitions::<flotilla_resources::Project>(namespace).get("flotilla").await,
-            Err(ResourceError::NotFound { .. })
-        ));
-        assert!(matches!(
-            topology.leader.resource_backend().definitions::<WorkflowTemplate>(namespace).get("remote-workflow").await,
-            Err(ResourceError::NotFound { .. })
-        ));
-    }
+    // No absence check at the origin: Project and WorkflowTemplate are engine definitions now and
+    // reach it with the follower's log, which the old-store kind filter cannot hold back.
 
     assert!(
         matches!(
@@ -3710,6 +3712,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     }
     off_frame(|| stall_source_crew(a, legacy_cursor, unavailable)).await;
     off_frame(|| replicate_governor_to_source(a, b, stale_home)).await;
+    off_frame(|| await_replicated_session(a, &governor)).await;
 
     for _ in 0..passes {
         off_frame(|| check_supervision_escalation_pass(a, b)).await;
@@ -3767,23 +3770,31 @@ async fn replicate_governor_to_source(a: &InProcessDaemon, b: &InProcessDaemon, 
         .replace(&b_backend.using::<Convoy>("flotilla").list().await.expect("governor"), Utc::now())
         .await
         .expect("replicate governor");
-    // The governor's launch travels B's engine log; its holder Vessel replicates beside the convoy.
+    // The governor's launch and its holder vessel travel B's engine log.
     flotilla_provisioning_testkit::replicate_home(
         &b.decided_store().expect("governor home"),
         b.node_id().as_str(),
         &a.decided_store().expect("source home"),
     );
-    a_backend
-        .replica_writer::<Vessel>(b.node_id().clone(), "flotilla")
-        .replace(&b_backend.using::<Vessel>("flotilla").list().await.expect("governor vessel"), Utc::now())
-        .await
-        .expect("replicate governor vessel");
     apply_convoy_replica_feed(a, "flotilla", "governor", b.host_name().clone()).await;
     if stale_home {
         // Ordinary Message homing follows resource provenance even when the
         // older presentation feed incorrectly projects the convoy as local.
         apply_convoy_replica_feed(a, "flotilla", "governor", a.host_name().clone()).await;
     }
+}
+
+/// `a` reads the session of crew `crew_id`, held for its vessel: a's engine follows the log
+/// replicated in, and its session listing catches up with it.
+async fn await_replicated_session(a: &InProcessDaemon, crew_id: &str) {
+    let sessions = a.resource_backend().including_replicas::<TerminalSession>("flotilla");
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "the source reads the replicated session", || async {
+        sessions.list().await.expect("sessions").items.iter().map(|source| &source.object).any(|session| {
+            session.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| crew.id == crew_id)
+                && session.metadata.labels.contains_key(flotilla_resources::VESSEL_LABEL)
+        })
+    })
+    .await;
 }
 
 /// The stalled convoy replicates to the governor's host `b`, with its presentation feed: the
@@ -3854,25 +3865,13 @@ async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &st
         )
         .await
         .expect("active crew");
-    // The crew's session is the daemon's engine launch, held for its vessel.
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name(vessel.into()).build(),
-            &VesselSpec {
-                convoy_ref: name.into(),
-                vessel_name: vessel.into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("crew vessel");
+    // The crew's session is the daemon's engine launch, held for its vessel's launch.
+    let held = engine(daemon).vessels.request(name, vessel, daemon.node_id().as_str());
     let terminals = &engine(daemon).terminals;
     let launch = terminals.request(&TerminalLaunchRequest {
         session: format!("{name}-session"),
         environment: "test-env".into(),
-        vessel: Some(vessel.into()),
+        vessel: Some(held),
         role: role.into(),
         pool: "cleat".into(),
         cwd: "/workspace".into(),
@@ -4124,25 +4123,13 @@ async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {
         )
         .await
         .expect("unfinished exited work");
-    // The crew's session is the home's engine launch, held for its vessel; its agent exited.
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("exited-work-work".into()).build(),
-            &VesselSpec {
-                convoy_ref: "exited-work".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("crew vessel");
+    // The crew's session is the home's engine launch, held for its vessel's launch; its agent exited.
+    let vessel = engine(home).vessels.request("exited-work", "work", home.node_id().as_str());
     let terminals = &engine(home).terminals;
     let launch = terminals.request(&TerminalLaunchRequest {
         session: "exited-session".into(),
         environment: "warm-env".into(),
-        vessel: Some("exited-work-work".into()),
+        vessel: Some(vessel),
         role: "coder".into(),
         pool: "cleat".into(),
         cwd: "/warm/checkout".into(),
@@ -4628,20 +4615,13 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
         )
         .await
         .expect("workflow");
-    let backend = owner.resource_backend();
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("capabilities-work".into()).build(),
-            &VesselSpec {
-                convoy_ref: "capabilities".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("vessel");
+    // The vessel is a launch at the owner of the convoy's work; the convoy is homed at the leader.
+    let vessel = engine(owner).vessels.request_for(&flotilla_resources::vessel_records::VesselLaunchRequest {
+        convoy: "capabilities".into(),
+        convoy_home: topology.leader.node_id().as_str().into(),
+        work: "work".into(),
+        host: "session-host".into(),
+    });
     owner_environments.request(
         "capabilities-env",
         &EnvironmentSpec {
@@ -4656,7 +4636,7 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
     let launch = terminals.request(&TerminalLaunchRequest {
         session: "capabilities-terminal".into(),
         environment: "capabilities-env".into(),
-        vessel: Some("capabilities-work".into()),
+        vessel: Some(vessel.clone()),
         role: role.into(),
         pool: "cleat".into(),
         cwd: "/repo".into(),
@@ -4670,7 +4650,7 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
     });
     terminals.ready(&launch, "capabilities-terminal", &Default::default());
     if remote {
-        // The leader routes by the owner's launch, which reaches it with the owner's log.
+        // The leader routes by the owner's launches, which reach it with the owner's log.
         flotilla_provisioning_testkit::replicate_home(
             &topology.follower.decided_store().expect("owner decided store"),
             topology.follower.node_id().as_str(),
@@ -4684,18 +4664,11 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
             .replace(&convoys.list().await.expect("convoys"), Utc::now())
             .await
             .expect("convoy replica");
-        topology
-            .leader
-            .resource_backend()
-            .replica_writer::<Vessel>(owner.node_id().clone(), "flotilla")
-            .replace(&backend.using::<Vessel>("flotilla").list().await.expect("vessels"), Utc::now())
-            .await
-            .expect("vessel replica");
     }
     let context = CrewCommandContext::builder()
         .namespace("flotilla".into())
         .convoy("capabilities".into())
-        .vessel_ref("capabilities-work".into())
+        .vessel_ref(vessel.clone())
         .role(role.into())
         .build();
     let target = topology
