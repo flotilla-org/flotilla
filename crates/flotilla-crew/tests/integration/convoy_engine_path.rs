@@ -33,6 +33,8 @@ struct Recording {
     changes: Mutex<Option<tokio::sync::broadcast::Sender<String>>>,
     /// The promises the engine holds, once handed over from the stored status.
     held: Option<OldPromises>,
+    /// The disposition the engine delivered the convoy with, once it has.
+    delivered: Option<String>,
 }
 
 #[async_trait]
@@ -65,6 +67,9 @@ impl EngineConvoys for Recording {
     }
     async fn deliver(&self, _: &ResourceObject<Convoy>) -> Result<(), String> {
         Ok(())
+    }
+    fn delivered(&self, _: &ResourceObject<Convoy>) -> Option<String> {
+        self.delivered.clone()
     }
     async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
         Ok(())
@@ -200,6 +205,40 @@ async fn an_engine_refusal_fails_the_convoy() {
     let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
     let Some(ConvoyStatusPatch::FailConvoy { message, .. }) = outcome.patch else { panic!("fail: {:?}", outcome.patch) };
     assert_eq!(message.as_deref(), Some("the engine refused this convoy's admission: NoObligations"));
+}
+
+// Behaviour (the load_driver_smoke landing race): once the engine has delivered a landing convoy,
+// a work that fails afterwards (its vessel's checkout refused because the convoy has ended) does
+// not fail the convoy: it settles Landed. Before the engine delivers, the failure still fails it.
+#[tokio::test]
+async fn a_work_failing_after_the_engine_delivered_does_not_fail_the_convoy() {
+    use flotilla_resources::{WorkPhase, WorkState};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoy = ledger_convoy(&backend).await;
+    let mut landing = convoy.clone();
+    let status = landing.status.as_mut().expect("status");
+    status.phase = ConvoyPhase::Landing;
+    status.observed_workflow_ref = Some("w".into());
+    status.promises.clear();
+    status.work.insert(
+        "work".into(),
+        WorkState::builder().phase(WorkPhase::Failed).message("request checkout: convoy c has ended".into()).build(),
+    );
+    let pass = |delivered: Option<&str>| {
+        let engine =
+            Arc::new(Recording { holds: true, held: Some(BTreeMap::new()), delivered: delivered.map(str::to_owned), ..Default::default() });
+        let reconciler = reconciler(&backend, engine);
+        let landing = landing.clone();
+        async move {
+            let prepared = reconciler.prepare(&landing).await.expect("prepare");
+            reconciler.reconcile(&landing, &prepared, chrono::Utc::now()).patch.expect("a transition")
+        }
+    };
+    let mut settled = landing.status.clone().expect("status");
+    pass(Some("landed")).await.apply(&mut settled);
+    assert_eq!(settled.phase, ConvoyPhase::Landed);
+    assert_eq!(settled.disposition.as_deref(), Some("landed"));
+    assert!(matches!(pass(None).await, ConvoyStatusPatch::FailConvoy { .. }), "before delivery the failure fails the convoy");
 }
 
 // Behaviour (#3732 review): each engine edit's convoy name wakes the convoy reconciler through

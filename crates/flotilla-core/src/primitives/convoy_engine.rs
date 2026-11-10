@@ -24,8 +24,8 @@ use flotilla_resources::{
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::convoy::{
-        AbandonCause, AddSeat, Authority, Convoy, ConvoyEdge, ConvoyLabel, Declare, Deliver, Keep, Progress, Promise, PromiseId, Reassign,
-        Reject, Retract, SeatName, Submit,
+        AbandonCause, AddSeat, Authority, Convoy, ConvoyEdge, ConvoyLabel, ConvoyState, Declare, Deliver, Keep, Progress, Promise,
+        PromiseId, Reassign, Reject, Retract, SeatName, Submit,
     },
     Ref, Resource,
 };
@@ -427,6 +427,14 @@ impl EngineConvoys for ConvoyEngine {
             ))
         })
         .await
+    }
+
+    fn delivered(&self, convoy: &ResourceObject<OldConvoy>) -> Option<String> {
+        let current = self.convoys.get(&map::engine_name(convoy).ok()?)?;
+        match current.state() {
+            ConvoyState::Delivered { disposition, .. } if holds_generation(convoy, &current) => Some(disposition.clone()),
+            _ => None,
+        }
     }
 
     async fn abandon(&self, convoy: &ResourceObject<OldConvoy>, principal: &str, reason: &str) -> Result<(), String> {

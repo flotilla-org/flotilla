@@ -1478,6 +1478,7 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
         &BTreeMap::new(),
         LifecycleConditions {
             exit_disposition: settlement.disposition,
+            engine_delivered: None,
             reclaim_eligible: false,
             settlement_evidence: Some(settlement.evaluation),
         },

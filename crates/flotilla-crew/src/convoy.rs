@@ -65,6 +65,8 @@ pub struct ConvoyPrepared {
     observed_subjects: Vec<Subject>,
     promise_patch: Option<ConvoyStatusPatch>,
     exit_disposition: Option<String>,
+    /// The disposition the engine delivered the convoy with, once it has.
+    engine_delivered: Option<String>,
     settlement_evidence: Option<SettlementEvaluation>,
     settlement_attention: Option<ConvoyAttention>,
     reclaim_eligible: bool,
@@ -743,6 +745,7 @@ impl Reconciler for ConvoyReconciler {
                 exit_disposition = None;
             }
         }
+        let engine_delivered = engine.and_then(|engine| engine.delivered(obj));
         let settlement_attention = settlement.as_ref().and_then(|settlement| {
             settlement.evaluation.unmet.iter().find_map(|unmet| match unmet {
                 UnmetSettlementExpectation::ObservedDigestMismatch { reference, claimed, observed } => Some(
@@ -774,6 +777,7 @@ impl Reconciler for ConvoyReconciler {
             observed_subjects,
             promise_patch,
             exit_disposition,
+            engine_delivered,
             settlement_evidence: settlement.map(|settlement| settlement.evaluation),
             settlement_attention,
             reclaim_eligible,
@@ -891,6 +895,7 @@ impl Reconciler for ConvoyReconciler {
             &prepared.checkouts,
             LifecycleConditions {
                 exit_disposition: prepared.exit_disposition.clone(),
+                engine_delivered: prepared.engine_delivered.clone(),
                 reclaim_eligible: prepared.reclaim_eligible,
                 settlement_evidence: prepared.settlement_evidence.clone(),
             },

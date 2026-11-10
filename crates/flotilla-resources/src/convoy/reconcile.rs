@@ -53,6 +53,9 @@ pub struct InternalReconcileOutcome {
 #[derive(Debug, Clone)]
 pub struct LifecycleConditions {
     pub exit_disposition: Option<String>,
+    /// The engine has delivered the convoy, with this disposition: Landing settles at once,
+    /// whatever its works read now. `None` off the engine, or while it holds the convoy open.
+    pub engine_delivered: Option<String>,
     pub reclaim_eligible: bool,
     pub settlement_evidence: Option<SettlementEvaluation>,
 }
@@ -787,7 +790,7 @@ pub fn reconcile(
         template,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        LifecycleConditions { exit_disposition, reclaim_eligible: false, settlement_evidence: None },
+        LifecycleConditions { exit_disposition, engine_delivered: None, reclaim_eligible: false, settlement_evidence: None },
         now,
     );
     ReconcileOutcome { patch: outcome.patch, events: outcome.events }
@@ -873,6 +876,20 @@ fn reconcile_internal_without_landing_event(
 
     if let Some(outcome) = backfill_crew_work_outcome(&status) {
         return with_cleanup(convoy, &status, vessels, conditions.reclaim_eligible, outcome);
+    }
+
+    // The engine decided the convoy when it delivered it. A work that fails afterwards (its
+    // vessel refused a checkout because the convoy has ended) does not undo that.
+    if let (ConvoyPhase::Landing, Some(delivered)) = (status.phase, conditions.engine_delivered.as_deref()) {
+        let disposition = conditions.exit_disposition.as_deref().unwrap_or(delivered);
+        let outcome = settle_landing(convoy, checkouts, &conditions, disposition, now);
+        return with_cleanup(
+            convoy,
+            &status,
+            vessels,
+            conditions.reclaim_eligible,
+            InternalReconcileOutcome { patch: outcome.patch, actuations: Vec::new(), events: outcome.events },
+        );
     }
 
     if let Some(outcome) = fail_fast_outcome(&status, now) {
@@ -1235,6 +1252,47 @@ fn roll_up_crew_work_outcome(
     None
 }
 
+/// Landing settles as Landed with `exit_disposition`, recording any landed target that differs
+/// from the one a repository declared.
+fn settle_landing(
+    convoy: &ResourceObject<Convoy>,
+    checkouts: &BTreeMap<String, CheckoutRecord>,
+    conditions: &LifecycleConditions,
+    exit_disposition: &str,
+    now: DateTime<Utc>,
+) -> ReconcileOutcome {
+    let target_mismatches = convoy
+        .spec
+        .repositories
+        .iter()
+        .filter_map(|repository| {
+            checkouts
+                .values()
+                .find(|checkout| checkout.spec.repo_ref() == &repository.repo_ref)
+                .and_then(CheckoutRecord::inspection)
+                .and_then(|inspection| inspection.landed_evidence.as_ref())
+                .and_then(|evidence| {
+                    let observed_target_ref = evidence.target_ref.as_ref()?;
+                    (observed_target_ref != &repository.target_ref).then(|| super::TargetMismatch {
+                        repo_ref: repository.repo_ref.clone(),
+                        change_request_id: evidence.change_request.to_string(),
+                        declared_target_ref: repository.target_ref.clone(),
+                        observed_target_ref: observed_target_ref.clone(),
+                    })
+                })
+        })
+        .collect();
+    ReconcileOutcome {
+        patch: Some(controller_patches::settle_with_evidence(
+            exit_disposition.to_string(),
+            target_mismatches,
+            now,
+            conditions.settlement_evidence.clone(),
+        )),
+        events: vec![ConvoyEvent::PhaseChanged { from: ConvoyPhase::Landing, to: ConvoyPhase::Landed }],
+    }
+}
+
 fn roll_up_phase_outcome(
     convoy: &ResourceObject<Convoy>,
     status: &super::ConvoyStatus,
@@ -1246,36 +1304,7 @@ fn roll_up_phase_outcome(
         && status.work.values().all(|state| state.phase == WorkPhase::Complete)
         && status.promises.values().flat_map(BTreeMap::values).flatten().all(|p| p.state.terminal());
     if let (ConvoyPhase::Landing, true, Some(exit_disposition)) = (status.phase, all_complete, conditions.exit_disposition.as_deref()) {
-        let target_mismatches = convoy
-            .spec
-            .repositories
-            .iter()
-            .filter_map(|repository| {
-                checkouts
-                    .values()
-                    .find(|checkout| checkout.spec.repo_ref() == &repository.repo_ref)
-                    .and_then(CheckoutRecord::inspection)
-                    .and_then(|inspection| inspection.landed_evidence.as_ref())
-                    .and_then(|evidence| {
-                        let observed_target_ref = evidence.target_ref.as_ref()?;
-                        (observed_target_ref != &repository.target_ref).then(|| super::TargetMismatch {
-                            repo_ref: repository.repo_ref.clone(),
-                            change_request_id: evidence.change_request.to_string(),
-                            declared_target_ref: repository.target_ref.clone(),
-                            observed_target_ref: observed_target_ref.clone(),
-                        })
-                    })
-            })
-            .collect();
-        return Some(ReconcileOutcome {
-            patch: Some(controller_patches::settle_with_evidence(
-                exit_disposition.to_string(),
-                target_mismatches,
-                now,
-                conditions.settlement_evidence.clone(),
-            )),
-            events: vec![ConvoyEvent::PhaseChanged { from: ConvoyPhase::Landing, to: ConvoyPhase::Landed }],
-        });
+        return Some(settle_landing(convoy, checkouts, conditions, exit_disposition, now));
     }
 
     let any_interrupted = status.work.values().any(|state| state.phase == WorkPhase::Interrupted);

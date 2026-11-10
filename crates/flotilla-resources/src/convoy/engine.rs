@@ -110,6 +110,11 @@ pub trait EngineConvoys: Send + Sync {
     /// Landing's delivery: refused while anything is open.
     async fn deliver(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String>;
 
+    /// The disposition the engine delivered `convoy` with, once it has: the convoy's outcome is
+    /// decided, and nothing the old path observes afterwards (a work failing as its vessels find
+    /// the convoy ended) changes it. `None` while it is open, or not held here.
+    fn delivered(&self, convoy: &ResourceObject<Convoy>) -> Option<String>;
+
     /// An operator's abandonment, with a reason.
     async fn abandon(&self, convoy: &ResourceObject<Convoy>, principal: &str, reason: &str) -> Result<(), String>;
 
@@ -258,6 +263,9 @@ mod tests {
         }
         async fn deliver(&self, _: &ResourceObject<Convoy>) -> Result<(), String> {
             Ok(())
+        }
+        fn delivered(&self, _: &ResourceObject<Convoy>) -> Option<String> {
+            None
         }
         async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
             Ok(())
