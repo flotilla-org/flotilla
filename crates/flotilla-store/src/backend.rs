@@ -37,6 +37,17 @@ struct EngineSlots {
     /// The engine keeps no namespaces: its records read in whichever namespace is asked, and carry
     /// this daemon's one, as a scan for the namespaces holding a kind it serves answers.
     namespace: Option<String>,
+    /// Kinds the engine serves through ports of their own, which the generic resource verbs
+    /// refuse: what to use instead.
+    refused: std::collections::BTreeMap<&'static str, GenericVerbRefusal>,
+}
+
+/// A kind the generic resource verbs refuse, because the engine serves it through a port of its
+/// own: what to use instead, and whether apply is still served (Message admission).
+#[derive(Debug, Clone)]
+pub struct GenericVerbRefusal {
+    pub instead: String,
+    pub applies: bool,
 }
 
 #[derive(Default)]
@@ -81,6 +92,20 @@ impl ResourceBackend {
         let engines = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         engines.ports.contains_key(kind).then(|| engines.namespace.clone()).flatten()
     }
+    /// Refuses the generic resource verbs (get, list, watch, digest, apply, status patch, delete)
+    /// for `kind`, which the engine serves through a port of its own; `instead` names the commands
+    /// that read or change it. With `applies`, apply is still served.
+    pub fn refuse_generic_verbs(&self, kind: &'static str, instead: impl Into<String>, applies: bool) {
+        self.engines
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .refused
+            .insert(kind, GenericVerbRefusal { instead: instead.into(), applies });
+    }
+    /// Why the generic resource verbs refuse `kind`, by its kind name, when they do.
+    pub fn generic_verb_refusal(&self, kind: &str) -> Option<GenericVerbRefusal> {
+        self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).refused.get(kind).cloned()
+    }
     /// The engine port serving `kind`, when one is installed.
     pub(crate) fn engine_records(&self, kind: &str) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>> {
         self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).ports.get(kind).cloned()
@@ -90,6 +115,8 @@ impl ResourceBackend {
     /// same backend installs its reopened engine in place of the last.
     pub fn install_attentions(&self, attentions: std::sync::Arc<dyn flotilla_resources::attentions::Attentions>) {
         *self.attentions.0.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attentions);
+        // A Demand is an attention Message on the engine.
+        self.refuse_generic_verbs("Demand", "use `flotilla message inbox` and `flotilla message acknowledge`", false);
     }
 
     /// Whether the engine's attentions are installed, so Demand is written by no one.
@@ -736,6 +763,10 @@ impl<T: Resource> TypedResolver<T> {
     /// Read the local collection's list/watch position without decoding objects.
     /// HTTP uses collection metadata from the standard list endpoint.
     pub async fn current_position(&self) -> Result<crate::ResourcePosition, ResourceError> {
+        // An engine-served kind has no position to resume from, as its lists carry none.
+        if self.backend.engine_records(T::API_PATHS.kind).is_some() {
+            return Ok(crate::ResourcePosition { resource_version: String::new(), generation: None });
+        }
         dispatch_backend!(self, current_position_typed)
     }
 

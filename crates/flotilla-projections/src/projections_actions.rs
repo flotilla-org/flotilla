@@ -299,6 +299,9 @@ impl ProjectionsActions<'_> {
                 }
             }
             CommandAction::QueryResourceList { namespace, kind, include_replicas } => {
+                if let Some(refused) = flotilla_store::generic_verb_refusal(self.resource_backend, kind, false) {
+                    return Ok(CommandValue::Error { message: refused.to_string() });
+                }
                 let listed = if *include_replicas {
                     list_resource_kind_including_replicas(self.resource_backend, namespace, kind).await
                 } else {
@@ -352,6 +355,9 @@ impl ProjectionsActions<'_> {
                 Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryResourceGet { namespace, kind, name } => {
+                if let Some(refused) = flotilla_store::generic_verb_refusal(self.resource_backend, kind, false) {
+                    return Ok(CommandValue::Error { message: refused.to_string() });
+                }
                 // Take the collection cursor before reading the object. A
                 // concurrent mutation can then be replayed (at worst as a
                 // duplicate) instead of being hidden behind a newer cursor.

@@ -2331,6 +2331,13 @@ impl InProcessDaemon {
             Err(_) => reads,
         };
         self.lifecycle_reads.install(Arc::clone(&reads))?;
+        for kind in ["Clone", "Environment"] {
+            self.resource_backend.refuse_generic_verbs(
+                kind,
+                "the provisioning reconcilers write it for a convoy's vessels; see them with `flotilla convoy explain`",
+                false,
+            );
+        }
         // The old store's TerminalSession reads are served from the engine's launches.
         self.resource_backend.install_engine_records(Arc::new(flotilla_store::TerminalViews::new(
             self.resource_backend.clone(),
@@ -2407,6 +2414,11 @@ impl InProcessDaemon {
         let convoys: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> = primitives.convoy_engine().clone();
         self.convoy_engine_path.set(convoys).map_err(|_| "the Convoy path is already installed".to_owned())?;
         self.resource_backend.install_attentions(Arc::clone(&primitives) as Arc<dyn flotilla_resources::attentions::Attentions>);
+        self.resource_backend.refuse_generic_verbs(
+            "Message",
+            "apply admits one through the engine; read messages with `flotilla message inbox`",
+            true,
+        );
         let engine: Arc<dyn flotilla_crew::ports::EngineMessages> = primitives;
         self.crew_message_path.set(engine).map_err(|_| "the crew's Message path is already installed".to_owned())
     }
@@ -5086,6 +5098,16 @@ impl InProcessDaemon {
             _ => None,
         };
         let Some((namespace, kind, name)) = target else { return Ok(None) };
+        // A kind the engine serves through a port of its own has no old object to read: a
+        // Message is admitted at its creation origin, and every other verb is refused locally.
+        if flotilla_store::generic_verb_refusal(&self.resource_backend, kind, false).is_some() {
+            return match action {
+                CommandAction::ResourceApply { document, .. } if kind == "Message" => {
+                    off_frame(|| self.message_creation_origin(namespace, document)).await
+                }
+                _ => Ok(None),
+            };
+        }
         let object = match get_resource_kind_including_replicas(&self.resource_backend, namespace, kind, name).await {
             Ok(object) => object,
             Err(ResourceError::NotFound { .. }) => {

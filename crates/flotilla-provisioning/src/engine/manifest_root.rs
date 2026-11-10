@@ -164,18 +164,23 @@ impl EngineManifestRoots {
     /// Root `name`'s live generation at each home. A retired generation keeps its records for
     /// attribution but is no longer declared, so no view shows it, as the old store's deleted root.
     fn views(&self, resident: &Resident, name: Option<&str>) -> Vec<RootView> {
-        let mut chosen = BTreeMap::<(String, String), &Resource<ManifestRoot>>::new();
-        for ((home, engine), root) in &resident.roots {
-            if name.is_some_and(|name| base(engine) != name) || !matches!(root.state(), RootState::Bound { .. }) {
-                continue;
-            }
-            let slot = chosen.entry((home.clone(), base(engine).to_owned())).or_insert(root);
-            if generation(root.name()) > generation(slot.name()) {
-                *slot = root;
-            }
-        }
-        chosen.into_iter().map(|((home, _), root)| self.view(&home, root)).collect()
+        live_roots(resident, name).into_iter().map(|(home, root)| self.view(&home, root)).collect()
     }
+}
+
+/// Root `name`'s (or every root's) live generation at each home, with its home.
+fn live_roots<'a>(resident: &'a Resident, name: Option<&str>) -> Vec<(String, &'a Resource<ManifestRoot>)> {
+    let mut chosen = BTreeMap::<(String, String), &Resource<ManifestRoot>>::new();
+    for ((home, engine), root) in &resident.roots {
+        if name.is_some_and(|name| base(engine) != name) || !matches!(root.state(), RootState::Bound { .. }) {
+            continue;
+        }
+        let slot = chosen.entry((home.clone(), base(engine).to_owned())).or_insert(root);
+        if generation(root.name()) > generation(slot.name()) {
+            *slot = root;
+        }
+    }
+    chosen.into_iter().map(|((home, _), root)| (home, root)).collect()
 }
 
 /// Applies `edge` to root `engine` of `roots`; a write that changes nothing is done.
@@ -534,4 +539,114 @@ impl ManifestRoots for EngineManifestRoots {
             self.apply(&engine, Unsuspend { document }).map(drop)
         }
     }
+}
+
+impl std::fmt::Debug for EngineManifestRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineManifestRoots").field("home", &self.home).finish_non_exhaustive()
+    }
+}
+
+const ROOT_KIND: &str = "ManifestRoot";
+
+impl EngineManifestRoots {
+    /// Every home's live root as the old store's object.
+    fn objects(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+        if kind != ROOT_KIND {
+            return Err(format!("{kind} is not served by the ManifestRoot records"));
+        }
+        let resident = self.refresh()?;
+        live_roots(&resident, None)
+            .into_iter()
+            .map(|(home, root)| {
+                let view = self.view(&home, root);
+                Ok(flotilla_resources::engine_records::EngineObject {
+                    name: view.name,
+                    home,
+                    version: root.version().0,
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    spec: serde_json::to_value(&view.spec).map_err(|error| error.to_string())?,
+                    status: Some(serde_json::to_value(&view.status).map_err(|error| error.to_string())?),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The generic resource verbs read roots; a root is written only by its home's manifest
+/// reconciler and the `flotilla manifest` commands.
+#[async_trait::async_trait]
+impl flotilla_resources::engine_records::EngineRecords for EngineManifestRoots {
+    fn kinds(&self) -> &'static [&'static str] {
+        &[ROOT_KIND]
+    }
+
+    fn home(&self) -> String {
+        self.home.clone()
+    }
+
+    async fn get(&self, kind: &str, name: &str) -> Result<Option<flotilla_resources::engine_records::EngineObject>, String> {
+        let mut held: Vec<_> = self.objects(kind)?.into_iter().filter(|object| object.name == name).collect();
+        held.sort_by_key(|object| (object.home != self.home, object.home.clone()));
+        Ok(held.into_iter().next())
+    }
+
+    async fn list(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+        let mut by_name = BTreeMap::new();
+        let mut objects = self.objects(kind)?;
+        objects.sort_by_key(|object| (object.home != self.home, object.home.clone()));
+        for object in objects {
+            by_name.entry(object.name.clone()).or_insert(object);
+        }
+        Ok(by_name.into_values().collect())
+    }
+
+    async fn sources(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+        self.objects(kind)
+    }
+
+    async fn apply(
+        &self,
+        kind: &str,
+        name: &str,
+        _labels: &BTreeMap<String, String>,
+        _annotations: &BTreeMap<String, String>,
+        _spec: serde_json::Value,
+    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+        Err(root_refusal(kind, name))
+    }
+
+    async fn set_status(
+        &self,
+        kind: &str,
+        name: &str,
+        _status: serde_json::Value,
+    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+        Err(root_refusal(kind, name))
+    }
+
+    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
+        Err(root_refusal(kind, name))
+    }
+
+    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
+        let watch = super::watch::EngineWatch::start(Arc::clone(&self.service), [ROOT]).map_err(|error| error.to_string())?;
+        let stream = futures::stream::unfold(watch, |mut watch| async move {
+            match watch.next(|_, _| Ok(())).await {
+                Ok(()) => Some(((), watch)),
+                Err(error) => {
+                    tracing::warn!(%error, "ManifestRoot records watch ended");
+                    None
+                }
+            }
+        });
+        Ok(Box::pin(stream))
+    }
+}
+
+fn root_refusal(kind: &str, name: &str) -> String {
+    format!(
+        "{kind} {name} is written only by its home's manifest reconciler, from its declared source; resolve its documents with `flotilla manifest`"
+    )
 }

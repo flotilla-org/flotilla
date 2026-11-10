@@ -229,7 +229,7 @@ async fn an_eager_supervisor_waits_for_work_and_lands_after_answering() {
 
 /// On the engine path every Message is the engine's; the old store holds none.
 async fn assert_no_old_messages(fleet: &TestDaemon) {
-    let old = fleet.list::<flotilla_resources::Message>().await;
+    let old = fleet.old_store_list::<flotilla_resources::Message>().await;
     assert!(old.is_empty(), "the old store holds Messages: {old:?}");
 }
 
@@ -940,6 +940,8 @@ macro_rules! replication_kinds {
     };
 }
 
+// Clone, Environment and Message live only on the engine, behind ports the resource commands
+// refuse, so `flotilla get` lists none of them here.
 replication_kinds!(
     AccessDelivery,
     AccountBinding,
@@ -947,13 +949,11 @@ replication_kinds!(
     Artifact,
     ChangeRequest,
     Checkout,
-    Clone,
     Convoy,
     ConvoyEnsure,
     CredentialGrant,
     CredentialSpec,
     CrewDefaults,
-    Environment,
     FleetDesignation,
     Forge,
     FulfilmentKind,
@@ -962,7 +962,6 @@ replication_kinds!(
     ImageLayer,
     Issue,
     ManifestRoot,
-    Message,
     Project,
     Repository,
     TerminalSession,
@@ -970,17 +969,17 @@ replication_kinds!(
     WorkflowTemplate,
 );
 
-/// One record of each kind the stalled convoy does not make, applied as an
-/// operator applies them; the controllers then keep them as they keep any.
+/// One record of each kind the stalled convoy does not make that an operator
+/// can apply; the controllers then keep them as they keep any. The account
+/// controllers and a home's manifest reconciler alone write AccountBinding,
+/// AccountProvision's binding and ManifestRoot, so none is applied here.
 async fn apply_transport_fixtures(fleet: &TestDaemon, host: &str) {
     use flotilla_resources::{
-        account_access::{requester_address, AccessName, BindingState, CredentialName, ProvisionPlan, Selection, UpdateMode},
-        AccessDelivery, AccessDeliverySpec, AccountBinding, AccountBindingSpec, AccountProvision, AccountProvisionSpec, ChangeRequest,
-        ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, ImageBuild, ImageLayer, Issue, ManifestRoot,
+        AccessDelivery, AccessDeliverySpec, ChangeRequest, ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, ImageBuild,
+        ImageLayer, Issue,
     };
     let local = fleet.list::<Host>().await.into_iter().next().expect("local host").metadata.name;
     let place = flotilla_resources::host_direct_environment_name(&local);
-    let at = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
     let credential = format!("{host}-credential");
     let spec = serde_json::json!({
         "consumer": {"adapter": "claude-oauth", "account_email": format!("{host}@example.invalid")},
@@ -993,36 +992,6 @@ async fn apply_transport_fixtures(fleet: &TestDaemon, host: &str) {
     let layer = builtin::<ImageLayer>();
     apply_json::<ImageLayer>(fleet, &format!("{host}-layer"), layer.clone()).await;
     apply_json::<WorkflowTemplate>(fleet, &format!("{host}-template"), builtin::<WorkflowTemplate>()).await;
-    let binding = format!("{host}-binding");
-    let spec = AccountBindingSpec {
-        requester: requester_address(Some("fleet"), &format!("{host}-convoy"), "coder").expect("requester"),
-        item: "claude-code".into(),
-        requirement: AccessName("claude-code:account".into()),
-        credential: CredentialName(credential.clone()),
-        account: None,
-        grants: Default::default(),
-        candidates: Default::default(),
-        exclusions: Default::default(),
-        selection: Selection::Draw { index: 0 },
-        epochs: flotilla_schema::Records::new(),
-        opened_at: at,
-        state: flotilla_schema::State::new(BindingState::Open, at),
-    };
-    fleet.apply::<AccountBinding>(&binding, spec).await;
-    let provision = AccountProvisionSpec {
-        binding: flotilla_schema::Ref::new(&binding, &local),
-        place: place.clone(),
-        environment_kind: "host-direct".into(),
-        plan: ProvisionPlan {
-            implementation: "claude-direct".into(),
-            effective_access: "account".into(),
-            mechanism: "oauth token".into(),
-            update_mode: UpdateMode::Push,
-        },
-        home: "/transport".into(),
-        delivered: None,
-    };
-    fleet.apply::<AccountProvision>(&format!("{host}-provision"), provision).await;
     let access = format!("{host}-access");
     let delivery = AccessDeliverySpec {
         access: access.clone(),
@@ -1036,8 +1005,6 @@ async fn apply_transport_fixtures(fleet: &TestDaemon, host: &str) {
     let observed = |number: u64| serde_json::json!({"service": "https://github.com", "scope": format!("{host}/app"), "number": number, "observing_authority": local});
     apply_json::<ChangeRequest>(fleet, &format!("{host}-change-request"), observed(1)).await;
     apply_json::<Issue>(fleet, &format!("{host}-issue"), observed(2)).await;
-    let root = serde_json::json!({"host": local, "path": "/transport/manifests", "source": "transport"});
-    apply_json::<ManifestRoot>(fleet, &format!("manifest-{host}"), root).await;
     let ensure = serde_json::json!({"project_ref": "fleet", "role": format!("{host}-standing"), "workflow_ref": CrewMix::Coder.workflow_name(), "repositories": []});
     apply_json::<ConvoyEnsure>(fleet, &format!("{host}-ensure"), ensure).await;
     let layers: Vec<flotilla_resources::ImageLayerSpec> = vec![serde_json::from_value(layer).expect("a current layer")];
@@ -1073,10 +1040,10 @@ async fn two_daemons_replicate_every_kind() {
     apply_transport_fixtures(&a, "engine-a").await;
     apply_transport_fixtures(&b, "engine-b").await;
     let (before_a, before_b) = tokio::join!(inventories(&a), inventories(&b));
-    // A Checkout, a Clone, a Message and an Environment live only on the engine, which
-    // `get` does not read (see `assert_no_old_messages`), so there is none to compare.
+    // `get` lists no Checkout here, and only their controllers write AccountBinding,
+    // AccountProvision and ManifestRoot, which make none for a stalled dummy crew.
     let unmade: Vec<_> = before_a.iter().filter(|(_, records)| records.is_empty()).map(|(kind, _)| *kind).collect();
-    assert_eq!(unmade, ["Checkout", "Clone", "Environment", "Message"], "every other kind has a record to replicate");
+    assert_eq!(unmade, ["AccountBinding", "AccountProvision", "Checkout", "ManifestRoot"], "every other kind has a record to replicate");
     let _peering = TestDaemon::peer(&a, &b).await;
     assert_every_kind_replicated(&before_a, &before_b, &b).await;
     assert_every_kind_replicated(&before_b, &before_a, &a).await;

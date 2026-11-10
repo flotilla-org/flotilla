@@ -1791,7 +1791,7 @@ mod tests {
             .create(&InputMeta::builder().name("colliding".to_string()).build(), &kind_spec("live"))
             .await
             .expect("create unmanaged object");
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path()).with_roots(daemon.manifest_roots());
         reconciler.reconcile_once_for_test().await.expect("reconcile");
         let root = test_root(&backend).await;
         let status = root.status.expect("status");
@@ -2723,7 +2723,8 @@ mod registered_charter_tests {
         let mut document = serde_json::json!({"apiVersion": "flotilla.work/v1", "kind": "FulfilmentKind", "metadata": {"name": "fleet-target-host"}, "spec": spec});
         std::fs::write(&path, serde_json::to_string(&document).expect("encode")).expect("fleet policy");
         let mut reconciler = ResourceManifestReconciler::new(fleet_backend.clone(), "flotilla", &input)
-            .with_binding(Some(CharterSource::LocalDirectory { directory: input.to_string_lossy().into_owned() }));
+            .with_binding(Some(CharterSource::LocalDirectory { directory: input.to_string_lossy().into_owned() }))
+            .with_roots(fleet.manifest_roots());
         reconciler.reconcile_once_for_test().await.expect("apply fleet policy");
         let topology = spawn_in_memory_request_topology(fleet, host).await.expect("connect daemon stores");
         for cost_class in [flotilla_resources::FulfilmentCostClass::OwnedIdle, flotilla_resources::FulfilmentCostClass::Metered] {

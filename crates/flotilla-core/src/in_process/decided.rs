@@ -82,7 +82,13 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
             .map_err(|error| format!("open decided store {}: {error}{}", path.display(), remedy(&error)))?,
     );
     let clock = || Arc::clone(&identity.clock);
+    // #3824 layers 1 and 2c: the account kinds and ManifestRoot, which the generic resource verbs
+    // reach through their records as well.
+    let accounts = Arc::new(EngineAccounts::open(Arc::clone(&service), clock())?);
+    let manifest_roots = Arc::new(EngineManifestRoots::open(Arc::clone(&service), clock())?);
     let records: Vec<Arc<dyn EngineRecords>> = vec![
+        Arc::clone(&accounts) as Arc<dyn EngineRecords>,
+        Arc::clone(&manifest_roots) as Arc<dyn EngineRecords>,
         // #3824 layer 2b-ii: the definition kinds.
         Arc::new(EngineDefinitions::open(Arc::clone(&service), clock())?),
         // #3824 layer 3a and 3b: Repository, and Project with its operations' record.
@@ -98,9 +104,6 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
     // ChangeRequest and Issue: written by their source's observer, read at every home.
     let source_observers = Arc::new(flotilla_resources::engine_records::LateSourceObservers::default());
     let observations = Arc::new(EngineObservations::open(Arc::clone(&service), clock())?.observed_by(source_observers.clone()));
-    // #3824 layers 1 and 2c: the account kinds and ManifestRoot.
-    let accounts = Arc::new(EngineAccounts::open(Arc::clone(&service), clock())?);
-    let manifest_roots = Arc::new(EngineManifestRoots::open(Arc::clone(&service), clock())?);
     Ok(ComposedEngine {
         service,
         records,

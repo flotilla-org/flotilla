@@ -48,6 +48,73 @@ async fn census_of_old_store_accesses_on_the_way_to_delivery() {
     }
 }
 
+// `flotilla apply` of an AccountProvision writes the engine's record, and the provision
+// controller wakes on that change alone: its place is no environment, so it removes it. The old
+// store is recorded rather than refused, because other controllers still reach it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_account_provision_wakes_its_controller_on_the_engine() {
+    use flotilla_resources::account_access::{ProvisionPlan, UpdateMode};
+    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
+    daemon.stage("provision");
+    let spec = flotilla_resources::AccountProvisionSpec {
+        binding: flotilla_schema::Ref::new("absent-binding".to_owned(), "elsewhere".to_owned()),
+        place: "no-such-environment".into(),
+        environment_kind: "docker".into(),
+        plan: ProvisionPlan {
+            implementation: "claude-direct".into(),
+            effective_access: "account".into(),
+            mechanism: "oauth-token".into(),
+            update_mode: UpdateMode::Push,
+        },
+        home: "/home/agent/.claude".into(),
+        delivered: None,
+    };
+    daemon.apply::<flotilla_resources::AccountProvision>("applied", spec).await;
+    daemon.wait_gone::<flotilla_resources::AccountProvision>("applied").await;
+    // Other controllers still reach the old store meanwhile; no access is of an account kind.
+    let report = daemon.old_store_report().expect("recorded");
+    assert!(!report.contains("Account"), "the provision reached the old store:\n{report}");
+}
+
+// The resource commands refuse a kind the engine serves through a port of its own, naming the
+// commands that read or change it, rather than reading or writing the old store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_resource_commands_refuse_kinds_served_through_their_own_ports() {
+    use flotilla_protocol::{CommandAction, CommandValue};
+    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
+    daemon.stage("refusals");
+    let refusal = |value: CommandValue| match value {
+        CommandValue::Error { message } => message,
+        other => panic!("not refused: {other:?}"),
+    };
+    let clone = refusal(
+        daemon.execute(CommandAction::QueryResourceGet { namespace: "flotilla".into(), kind: "clones".into(), name: "any".into() }).await,
+    );
+    assert!(clone.contains("Clone is served by the engine") && clone.contains("flotilla convoy explain"), "{clone}");
+    let messages = refusal(
+        daemon
+            .execute(CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: "Message".into(), include_replicas: true })
+            .await,
+    );
+    assert!(messages.contains("flotilla message inbox"), "{messages}");
+    let environment = refusal(
+        daemon
+            .execute(CommandAction::ResourceDelete {
+                namespace: "flotilla".into(),
+                kind: "Environment".into(),
+                name: "any".into(),
+                replica_origin: None,
+            })
+            .await,
+    );
+    assert!(environment.contains("Environment is served by the engine"), "{environment}");
+    let report = daemon.old_store_report().expect("recorded");
+    let refusals = report.split("stage refusals:").nth(1).unwrap_or_default();
+    for kind in ["Clone", "Message", "Environment"] {
+        assert!(!refusals.contains(&format!("  {kind} ")), "{kind} reached the old store:\n{report}");
+    }
+}
+
 async fn delivered_convoy(daemon: &TestDaemon) {
     daemon.stage("admission");
     daemon.request_convoy(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;

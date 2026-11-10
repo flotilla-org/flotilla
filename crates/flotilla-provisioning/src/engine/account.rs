@@ -23,8 +23,11 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::account_access::{
     binding_name, requester_parts, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords, BindingRecord,
-    BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite,
+    BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite, ACCOUNT_BINDING_LABEL,
+    ACCOUNT_CREDENTIAL_LABEL,
 };
+use flotilla_resources::engine_records::{EngineObject, EngineRecords};
+use flotilla_resources::CONVOY_LABEL;
 use flotilla_schema::{Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
@@ -716,5 +719,154 @@ pub fn import_accounts(
             Ok(()) => *report.imported.entry(("AccountProvision", label)).or_default() += 1,
             Err(reason) => report.refused.push(refuse(reason)),
         }
+    }
+}
+
+impl std::fmt::Debug for EngineAccounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineAccounts").field("home", &self.home).finish_non_exhaustive()
+    }
+}
+
+const BINDING_KIND: &str = "AccountBinding";
+const PROVISION_KIND: &str = "AccountProvision";
+
+/// A binding as the old store's object: labelled by its own name, its credential and its
+/// requester's convoy, as its readers find it.
+fn binding_object(binding: &Resource<AccountBinding>, home: &str) -> Result<EngineObject, String> {
+    let record = record(binding, home);
+    let mut labels = BTreeMap::from([
+        (ACCOUNT_BINDING_LABEL.to_owned(), record.name.clone()),
+        (ACCOUNT_CREDENTIAL_LABEL.to_owned(), record.spec.credential.0.clone()),
+    ]);
+    labels.extend(convoy_of(binding).map(|convoy| (CONVOY_LABEL.to_owned(), convoy)));
+    Ok(EngineObject {
+        name: record.name,
+        home: record.home,
+        version: binding.version().0,
+        labels,
+        annotations: BTreeMap::new(),
+        spec: serde_json::to_value(&record.spec).map_err(|error| error.to_string())?,
+        status: None,
+    })
+}
+
+/// A provision as the old store's object: labelled by its binding, and its convoy while this
+/// store holds the binding.
+fn provision_object(provision: &Plain<ProvisionSpec>, bindings: &Bindings) -> Result<EngineObject, String> {
+    let record = provision_record(provision);
+    let mut labels = BTreeMap::from([(ACCOUNT_BINDING_LABEL.to_owned(), record.spec.binding.name.clone())]);
+    let binding = bindings.get(&(record.spec.binding.home.clone(), record.spec.binding.name.clone()));
+    labels.extend(binding.and_then(convoy_of).map(|convoy| (CONVOY_LABEL.to_owned(), convoy)));
+    Ok(EngineObject {
+        name: record.name,
+        home: record.home,
+        version: provision.version,
+        labels,
+        annotations: BTreeMap::new(),
+        spec: serde_json::to_value(&record.spec).map_err(|error| error.to_string())?,
+        status: None,
+    })
+}
+
+impl EngineAccounts {
+    /// Every home's record of `kind`, as the old store's objects.
+    fn objects(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
+        let resident = self.refresh()?;
+        match kind {
+            BINDING_KIND => resident.bindings.iter().map(|((home, _), binding)| binding_object(binding, home)).collect(),
+            PROVISION_KIND => resident.provisions.values().map(|provision| provision_object(provision, &resident.bindings)).collect(),
+            other => Err(format!("{other} is not served by the account records")),
+        }
+    }
+}
+
+/// Resolves each name to this home's record, else the lexically first home's.
+fn resolved(objects: Vec<EngineObject>, home: &str) -> Vec<EngineObject> {
+    let mut by_name: BTreeMap<String, EngineObject> = BTreeMap::new();
+    for object in objects {
+        let keep = by_name.get(&object.name).is_some_and(|held| held.home == home || (object.home != home && held.home < object.home));
+        if !keep {
+            by_name.insert(object.name.clone(), object);
+        }
+    }
+    by_name.into_values().collect()
+}
+
+/// The generic resource verbs read both account kinds, and write a provision at this place. A
+/// binding is written only by the account controllers, and changed by `flotilla convoy rebind`.
+#[async_trait::async_trait]
+impl EngineRecords for EngineAccounts {
+    fn kinds(&self) -> &'static [&'static str] {
+        &[BINDING_KIND, PROVISION_KIND]
+    }
+
+    fn home(&self) -> String {
+        self.home.clone()
+    }
+
+    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
+        Ok(resolved(self.objects(kind)?, &self.home).into_iter().find(|object| object.name == name))
+    }
+
+    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
+        Ok(resolved(self.objects(kind)?, &self.home))
+    }
+
+    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
+        self.objects(kind)
+    }
+
+    async fn apply(
+        &self,
+        kind: &str,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+        _annotations: &BTreeMap<String, String>,
+        spec: serde_json::Value,
+    ) -> Result<EngineObject, String> {
+        if kind != PROVISION_KIND {
+            return Err(binding_refusal(kind, name));
+        }
+        let spec: AccountProvisionSpec = serde_json::from_value(spec).map_err(|error| format!("decode {kind} spec: {error}"))?;
+        let convoy = labels.get(CONVOY_LABEL).map(String::as_str).unwrap_or_default();
+        self.record_provision("", name, convoy, &spec, true).await?;
+        let written = self.objects(kind)?.into_iter().find(|object| object.name == name && object.home == self.home);
+        written.ok_or_else(|| format!("{kind} {name} was written but does not read back"))
+    }
+
+    async fn set_status(&self, kind: &str, name: &str, _status: serde_json::Value) -> Result<EngineObject, String> {
+        Err(format!("{kind} {name} keeps no status"))
+    }
+
+    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
+        if kind != PROVISION_KIND {
+            return Err(binding_refusal(kind, name));
+        }
+        self.delete_provision("", name).await
+    }
+
+    async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
+        let watch = EngineWatch::start(Arc::clone(&self.service), [BINDING, PROVISION]).map_err(store_error)?;
+        let stream = futures::stream::unfold(watch, |mut watch| async move {
+            match watch.next(|_, _| Ok(())).await {
+                Ok(()) => Some(((), watch)),
+                Err(error) => {
+                    tracing::warn!(%error, "account records watch ended");
+                    None
+                }
+            }
+        });
+        Ok(Box::pin(stream))
+    }
+}
+
+fn binding_refusal(kind: &str, name: &str) -> String {
+    if kind == BINDING_KIND {
+        format!(
+            "AccountBinding {name} is written only by the account controllers; change a requester's binding with `flotilla convoy rebind`"
+        )
+    } else {
+        format!("{kind} is not served by the account records")
     }
 }

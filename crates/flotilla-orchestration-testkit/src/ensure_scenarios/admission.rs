@@ -987,7 +987,7 @@ pub async fn driverless_ensure_home_case(
     refused: bool,
     passes: &[usize],
 ) {
-    use flotilla_resources::{ManifestRoot, ManifestRootSpec};
+    use flotilla_resources::manifest_roots::RootDeclaration;
 
     let home = standing_ensure_fixture_for(factory, "kiwi", true).await;
     let peer_a = standing_ensure_fixture_for(factory, "feta", false).await;
@@ -1000,14 +1000,9 @@ pub async fn driverless_ensure_home_case(
     let ensures = home_backend.definitions::<ConvoyEnsure>("flotilla");
     let mut ensure = ensures.get("quartermaster").await.expect("home ensure");
     if declared {
-        acting_backend
-            .using::<ManifestRoot>("flotilla")
-            .create(
-                &test_meta("declaring-root"),
-                &ManifestRootSpec::builder().host("feta".into()).path("/ops".into()).source("project-map".into()).build(),
-            )
-            .await
-            .expect("declaring root");
+        let declaration =
+            RootDeclaration { host: "feta".into(), path: "/ops".into(), source: "project-map".into(), binding: None, ops: false };
+        hosts[acting_home].0.manifest_roots().declare("flotilla", "declaring-root", declaration).await.expect("declaring root");
         let mut meta = InputMeta::from(&ensure.metadata);
         meta.annotations.insert("flotilla.work/manifest-reconciler-root".into(), if legacy { "feta" } else { "declaring-root" }.into());
         meta.annotations.insert("flotilla.work/manifest-source".into(), "project-map".into());
@@ -1035,18 +1030,6 @@ pub async fn driverless_ensure_home_case(
         let mut meta = InputMeta::from(&copy.metadata);
         meta.labels.insert("local-copy".into(), peer.0.node_id().to_string());
         backend.definitions::<ConvoyEnsure>("flotilla").apply(&meta, &copy.spec).await.expect("local definition copy does not confer home");
-    }
-    if declared {
-        let roots = acting_backend.using::<ManifestRoot>("flotilla").list().await.expect("root snapshot");
-        for (index, host) in hosts.iter().enumerate() {
-            if index != acting_home {
-                host.1
-                    .replica_writer::<ManifestRoot>(hosts[acting_home].0.node_id().clone(), "flotilla")
-                    .replace(&roots, Utc::now())
-                    .await
-                    .expect("replicate declaring root");
-            }
-        }
     }
     let mut before = Vec::new();
     for host in hosts {

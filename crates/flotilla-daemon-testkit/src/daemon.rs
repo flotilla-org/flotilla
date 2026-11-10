@@ -354,6 +354,14 @@ impl TestDaemon {
         read.records.into_iter().filter_map(|record| record.object).map(decode).collect()
     }
 
+    /// Every `T` the old store itself holds. The resource commands refuse a
+    /// kind the engine serves through a port of its own, so a scenario that
+    /// checks nothing reached the old store reads it here.
+    pub async fn old_store_list<T: Resource>(&self) -> Vec<ResourceObject<T>> {
+        let listed = self.composition.backend.using::<T>(NAMESPACE).list().await;
+        listed.unwrap_or_else(|error| panic!("old store list {}: {error}", T::API_PATHS.kind)).items
+    }
+
     /// Create or update the `T` named `name`, as `flotilla apply` does.
     pub async fn apply<T: Resource>(&self, name: &str, spec: T::Spec) {
         let document = serde_json::json!({
