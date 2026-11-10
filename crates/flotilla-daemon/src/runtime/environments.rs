@@ -13,7 +13,7 @@ use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provisioning::engine::controller::Backing;
 use flotilla_resources::environment_records::EnvironmentRecord;
-use flotilla_resources::{Checkout, ResourceError, Vessel, VesselStatusPatch};
+use flotilla_resources::{Vessel, VesselStatusPatch};
 use tracing::{info, warn};
 
 use super::docker::{probe_provisioned_environment, verify_declared_agent_adapters};
@@ -84,8 +84,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
             continue;
         }
         let state = Arc::clone(state);
-        let namespace = namespace.to_owned();
-        cloud_jobs.push((environment.name.clone(), async move { reconcile_cloud_environment(&state, &namespace, &environment).await }));
+        cloud_jobs.push((environment.name.clone(), async move { reconcile_cloud_environment(&state, &environment).await }));
     }
     // Start cloud work before any Docker inventory/SSH awaits. Dropping this
     // JoinSet aborts its coordinator, which in turn aborts its active jobs.
@@ -262,7 +261,6 @@ pub(super) async fn reconcile_provisioned_environment(
     let Some(container_id) = container_id else {
         return mark_unavailable_environment(
             state,
-            namespace,
             &env_id,
             BackingDisposition::Failed,
             "ready Docker environment has no container identity",
@@ -272,7 +270,6 @@ pub(super) async fn reconcile_provisioned_environment(
     let Some(handle) = handle else {
         return mark_unavailable_environment(
             state,
-            namespace,
             &env_id,
             BackingDisposition::Lost,
             &format!("Docker container {container_id} is not running"),
@@ -287,7 +284,6 @@ pub(super) async fn reconcile_provisioned_environment(
     if let Some(termination) = observation.as_ref().and_then(|observation| observation.termination.as_ref()) {
         return mark_unavailable_environment(
             state,
-            namespace,
             &env_id,
             BackingDisposition::Lost,
             &format!("Docker container {container_id} {termination}"),
@@ -300,7 +296,6 @@ pub(super) async fn reconcile_provisioned_environment(
         | flotilla_environment::environment::ObservationState::Gone { .. }) => {
             return mark_unavailable_environment(
                 state,
-                namespace,
                 &env_id,
                 BackingDisposition::Lost,
                 &format!("Docker container {container_id} is not running (observation: {observed_state:?})"),
@@ -347,7 +342,6 @@ pub(super) async fn reconcile_provisioned_environment(
         if let Err(error) = adoption {
             return mark_unavailable_environment(
                 state,
-                namespace,
                 &env_id,
                 BackingDisposition::Failed,
                 &format!("environment adoption failed: {error}"),
@@ -366,11 +360,7 @@ pub(super) async fn reconcile_provisioned_environment(
 /// re-enters ordinary idempotent provisioning so forwarding and credentials are
 /// restored together; a cached image/SSH recipe never proves liveness. A sandbox
 /// present but unhealthy is logged, never recorded: only its absence ends the launch.
-async fn reconcile_cloud_environment(
-    state: &Arc<ControllerRuntimeState>,
-    namespace: &str,
-    environment: &EnvironmentRecord,
-) -> Result<(), String> {
+async fn reconcile_cloud_environment(state: &Arc<ControllerRuntimeState>, environment: &EnvironmentRecord) -> Result<(), String> {
     use flotilla_environment::environment::ObservationState;
     let provider = state.provider_for_environment(&environment.name).await?;
     let id = EnvironmentId::new(&environment.name);
@@ -403,13 +393,11 @@ async fn reconcile_cloud_environment(
                 Ok(())
             }
             ObservationState::Gone { cause } => {
-                mark_unavailable_environment(state, namespace, &id, BackingDisposition::Lost, &format!("cloud sandbox gone: {cause:?}"))
-                    .await
+                mark_unavailable_environment(state, &id, BackingDisposition::Lost, &format!("cloud sandbox gone: {cause:?}")).await
             }
             ObservationState::Stopped { cause } => {
                 mark_unavailable_environment(
                     state,
-                    namespace,
                     &id,
                     BackingDisposition::Lost,
                     &format!("cloud sandbox stopped and resume is unavailable: {cause:?}"),
@@ -425,7 +413,6 @@ async fn reconcile_cloud_environment(
         None => {
             mark_unavailable_environment(
                 state,
-                namespace,
                 &id,
                 BackingDisposition::Lost,
                 "cloud sandbox missing from authoritative provider inventory",
@@ -490,7 +477,6 @@ pub(super) enum BackingDisposition {
 
 pub(super) async fn mark_unavailable_environment(
     state: &Arc<ControllerRuntimeState>,
-    namespace: &str,
     env_id: &EnvironmentId,
     disposition: BackingDisposition,
     message: &str,
@@ -501,24 +487,16 @@ pub(super) async fn mark_unavailable_environment(
     if let Some(container_id) = registered_container {
         state.provisioned_environments.lock().await.remove(&container_id);
     }
-    let mut retained_paths = Vec::new();
-    let backend = state.daemon.resource_backend();
-    for vessel in backend.using::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?.items {
-        let Some(status) = vessel.status.as_ref().filter(|status| status.environment_ref.as_deref() == Some(env_id.as_str())) else {
-            continue;
-        };
-        for checkout in status.checkout_refs.values() {
-            match backend.using::<Checkout>(namespace).get(checkout).await {
-                Ok(checkout) => {
-                    if let Some(path) = checkout.status.as_ref().and_then(|status| status.path.clone()) {
-                        retained_paths.push(path);
-                    }
-                }
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-    }
+    // The checkouts launched in this environment, at any home, keep its work.
+    let reads = state.daemon.lifecycle_reads();
+    let environment = env_id.as_str().to_owned();
+    let launches = tokio::task::spawn_blocking(move || reads.checkouts()?.in_environment(&environment, None))
+        .await
+        .map_err(|error| error.to_string())??;
+    let mut retained_paths: Vec<String> = flotilla_resources::checkout_records::latest_launches(launches)
+        .into_values()
+        .filter_map(|checkout| checkout.path().map(str::to_owned))
+        .collect();
     retained_paths.sort();
     retained_paths.dedup();
     let cause = message;

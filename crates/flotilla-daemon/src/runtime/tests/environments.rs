@@ -1,5 +1,7 @@
 use super::*;
 use crate::environment_tools::EnvironmentToolProvisioner;
+use crate::runtime::environments::{mark_unavailable_environment, BackingDisposition};
+use crate::testkits::engine::runtime_checkouts;
 use flotilla_provisioning::engine::controller::{Backing, BackingEvent};
 
 #[tokio::test]
@@ -339,6 +341,56 @@ async fn environment_readoption_marks_missing_container_lost() {
         }]
     );
     assert!(daemon.environment_registry_for_environment(&env_id).is_none());
+}
+
+#[tokio::test]
+async fn a_failed_environment_names_the_engine_checkouts_made_in_it() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_base = temp.path().join("config");
+    fs::create_dir_all(&config_base).expect("config directory");
+    fs::write(config_base.join("daemon.toml"), "machine_id = \"failed-environment-checkouts-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(config_base));
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+        flotilla_protocol::HostName::new("udder"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
+    let env_id = EnvironmentId::new("env-failed");
+    create_ready_docker_environment(&daemon, env_id.as_str(), "failed-container", BTreeSet::new()).await;
+    // A checkout made in the environment, and one made elsewhere.
+    let checkouts = runtime_checkouts(&daemon);
+    let worktree = |env_ref: &str, path: &str| {
+        CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+            repo_ref: RepositoryKey("test-repository".into()),
+            env_ref: env_ref.to_string(),
+            r#ref: "fix/kept".to_string(),
+            base_ref: None,
+            target_path: path.to_string(),
+            clone_ref: "clone-abc#1".to_string(),
+        })
+    };
+    checkouts.put_ready("kept-work", &worktree(env_id.as_str(), "/hulls/kept"), None);
+    checkouts.put_ready("elsewhere", &worktree("env-other", "/hulls/elsewhere"), None);
+    engine_environments(&daemon);
+    let state = Arc::new(ControllerRuntimeState::new(
+        Arc::clone(&daemon),
+        config,
+        adoption_registry(Vec::new()),
+        None,
+        daemon.local_host_id().expect("local host identity").to_string(),
+        "host-direct-test".to_string(),
+    ));
+
+    mark_unavailable_environment(&state, &env_id, BackingDisposition::Failed, "no container identity").await.expect("mark failed");
+
+    let observed = observed_backings(&state);
+    let [BackingEvent { observed: Backing::Failed { reason }, .. }] = observed.as_slice() else {
+        panic!("the failed backing is reported with its reason: {observed:?}");
+    };
+    assert_eq!(reason, "no container identity; recover work from retained checkout(s): /hulls/kept");
 }
 
 #[tokio::test]
