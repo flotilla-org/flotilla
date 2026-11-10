@@ -8,6 +8,7 @@
 pub mod archive;
 pub mod follow;
 pub mod plain;
+pub mod watch;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

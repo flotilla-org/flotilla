@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use flotilla_provisioning::engine::watch::EngineWatch;
+use flotilla_engine_store::watch::EngineWatch;
 use flotilla_resources::{
     engine_records::{EngineObject, EngineRecords},
     Message as OldMessage, MessageSpec as OldSpec, ReadResourceObject, ResourceProvenance,

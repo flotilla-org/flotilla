@@ -15,7 +15,8 @@ use flotilla_store::ResourceBackend;
 
 use super::fixture_with_message_path;
 use crate::leaf_engine::CrewTurnIntent;
-use crate::ports::{EngineMessages, MessagePath};
+use crate::ports::MessagePath;
+use flotilla_messaging::EngineMessages;
 
 /// An engine Message path at "home-a" that admits into memory, fails its
 /// first `failures` record writes, and records what it is asked to end.

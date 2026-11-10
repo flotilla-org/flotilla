@@ -374,7 +374,7 @@ struct Turns {
 }
 
 #[async_trait]
-impl flotilla_crew::ports::EngineMessages for Turns {
+impl flotilla_messaging::EngineMessages for Turns {
     async fn view(
         &self,
         _: &str,
@@ -473,7 +473,7 @@ async fn an_undelivered_turn_holds_the_engines_derived_done() {
         backend.serve_engine_in(NAMESPACE);
         let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
         let messages: flotilla_crew::ports::MessagePath = Arc::new(OnceLock::new());
-        let turns: Arc<dyn flotilla_crew::ports::EngineMessages> = Arc::new(Turns { backend: backend.clone(), awaiting });
+        let turns: Arc<dyn flotilla_messaging::EngineMessages> = Arc::new(Turns { backend: backend.clone(), awaiting });
         assert!(messages.set(turns).is_ok());
         let engine = Arc::new(Recording { holds: true, held: Some(held), ..Default::default() });
         let reconciler = reconciler(&backend, engine)

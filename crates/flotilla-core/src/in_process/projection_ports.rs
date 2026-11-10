@@ -225,9 +225,9 @@ mod agent_sessions {
 
     use chrono::{DateTime, Utc};
     use flotilla_engine_store::follow::Followed;
+    use flotilla_engine_store::watch::EngineWatch;
     use flotilla_projections::ports::{AgentSessionFollow, AgentSessionKey, AgentSessionUpdate};
     use flotilla_protocol::{AgentActivity, AgentSessionEnd, AgentSessionReading, NodeId};
-    use flotilla_provisioning::engine::watch::EngineWatch;
     use flotilla_resources::agent_activity::{home_current, AgentActivityView, AgentSessionReads, ProgressFacts};
     use flotilla_schema::Kind as StoredKind;
     use flotilla_schema_sqlite::{stream::Service, Read, StoreError};

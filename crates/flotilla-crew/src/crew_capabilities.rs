@@ -304,7 +304,7 @@ impl CapabilityCardTracker {
         Self(Mutex::default(), path)
     }
 
-    fn primitives(&self) -> Option<Arc<dyn crate::ports::EngineMessages>> {
+    fn primitives(&self) -> Option<Arc<dyn flotilla_messaging::EngineMessages>> {
         self.1.get().cloned()
     }
 

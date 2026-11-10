@@ -180,7 +180,7 @@ impl LeafSubscriptionTable {
         self
     }
 
-    pub(crate) fn message_primitives(&self) -> Option<Arc<dyn crate::ports::EngineMessages>> {
+    pub(crate) fn message_primitives(&self) -> Option<Arc<dyn flotilla_messaging::EngineMessages>> {
         self.inner.message_path.get().cloned()
     }
 

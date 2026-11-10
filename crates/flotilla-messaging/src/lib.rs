@@ -4,6 +4,8 @@
 // resources and store helpers keep their existing ownership.
 use flotilla_resources::*;
 use flotilla_store::*;
+mod engine_messages;
+pub use engine_messages::EngineMessages;
 mod framing;
 pub use framing::frame_message;
 mod message_inbox;

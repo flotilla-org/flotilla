@@ -63,7 +63,7 @@ pub mod terminals;
 #[cfg(test)]
 mod tests;
 pub mod vessel;
-pub mod watch;
+pub use flotilla_engine_store::watch;
 
 use std::sync::{Arc, Mutex};
 

@@ -2793,6 +2793,7 @@ name = "flotilla-engine-store"
 version = "0.1.0"
 dependencies = [
  "flotilla-build-features",
+ "flotilla-build-features-async",
  "flotilla-build-features-base",
  "flotilla-build-features-hmac",
  "flotilla-build-features-os",
@@ -2804,10 +2805,12 @@ dependencies = [
  "flotilla-schema",
  "flotilla-schema-sqlite",
  "flotilla-state-machines",
+ "futures",
  "hegeltest",
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 

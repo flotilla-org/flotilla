@@ -1463,9 +1463,9 @@ fn admitted_intent(namespace: &str, name: &str, intent: &OldSpec) -> ResourceObj
     }
 }
 
-/// Crew code's port onto this path (`flotilla_crew::ports::EngineMessages`).
+/// Crew code's port onto this path (`flotilla_messaging::EngineMessages`).
 #[async_trait::async_trait]
-impl flotilla_crew::ports::EngineMessages for MessagePrimitives {
+impl flotilla_messaging::EngineMessages for MessagePrimitives {
     async fn view(&self, namespace: &str, record: &str) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
         MessagePrimitives::view(self, namespace, record).await
     }

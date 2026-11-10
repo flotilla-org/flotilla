@@ -11,7 +11,7 @@ use flotilla_store::StoreQuery;
 use crate::crew_ops::CrewService;
 
 impl CrewService {
-    pub(crate) fn message_primitives(&self) -> Option<std::sync::Arc<dyn crate::ports::EngineMessages>> {
+    pub(crate) fn message_primitives(&self) -> Option<std::sync::Arc<dyn flotilla_messaging::EngineMessages>> {
         self.message_path.get().cloned()
     }
 

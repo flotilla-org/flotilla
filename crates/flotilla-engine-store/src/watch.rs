@@ -4,7 +4,7 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use flotilla_engine_store::follow::{Followed, Follower};
+use crate::follow::{Followed, Follower};
 use flotilla_schema::KindCode;
 use flotilla_schema_sqlite::{
     stream::{CommitListener, Committed, Service},

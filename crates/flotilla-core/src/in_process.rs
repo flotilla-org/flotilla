@@ -2427,7 +2427,7 @@ impl InProcessDaemon {
         self.resource_backend.install_attentions(Arc::clone(&primitives) as Arc<dyn flotilla_resources::attentions::Attentions>);
         self.resource_backend
             .install_engine_records(Arc::new(MessageRecords::new(Arc::clone(&primitives), Arc::clone(&self.provisioning_namespace))));
-        let engine: Arc<dyn flotilla_crew::ports::EngineMessages> = primitives;
+        let engine: Arc<dyn flotilla_messaging::EngineMessages> = primitives;
         self.crew_message_path.set(engine).map_err(|_| "the crew's Message path is already installed".to_owned())
     }
 
