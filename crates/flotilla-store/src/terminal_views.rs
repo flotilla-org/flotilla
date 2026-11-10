@@ -279,7 +279,7 @@ impl EngineRecords for TerminalViews {
 }
 
 /// A tick per message on `changes`, and one when it lagged: a reader reads everything again.
-fn ticks<T: Clone + Send + 'static>(changes: tokio::sync::broadcast::Receiver<T>) -> BoxStream<'static, ()> {
+pub(crate) fn ticks<T: Clone + Send + 'static>(changes: tokio::sync::broadcast::Receiver<T>) -> BoxStream<'static, ()> {
     futures::stream::unfold(changes, |mut changes| async move {
         match changes.recv().await {
             Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some(((), changes)),

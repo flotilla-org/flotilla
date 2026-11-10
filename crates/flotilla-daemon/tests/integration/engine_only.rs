@@ -76,36 +76,42 @@ async fn an_applied_account_provision_wakes_its_controller_on_the_engine() {
     assert!(!report.contains("Account"), "the provision reached the old store:\n{report}");
 }
 
-// The resource commands refuse a kind the engine serves through a port of its own, naming the
-// commands that read or change it, rather than reading or writing the old store.
+// The resource commands read a crew's clones and environments from the engine. The provisioning
+// reconcilers alone write them, so a delete is refused, naming the command that shows them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_resource_commands_refuse_kinds_served_through_their_own_ports() {
+async fn the_resource_commands_read_clones_and_environments_from_the_engine() {
     use flotilla_protocol::{CommandAction, CommandValue};
+    use flotilla_resources::{Clone, Environment};
     let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
-    daemon.stage("refusals");
-    let refusal = |value: CommandValue| match value {
-        CommandValue::Error { message } => message,
-        other => panic!("not refused: {other:?}"),
+    daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    daemon.stage("lifecycle");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (clones, environments) = loop {
+        let (clones, environments) = (daemon.list::<Clone>().await, daemon.list::<Environment>().await);
+        if !clones.is_empty() && !environments.is_empty() {
+            break (clones, environments);
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the crew's clone and environment are listed: {clones:?} {environments:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
-    let clone = refusal(
-        daemon.execute(CommandAction::QueryResourceGet { namespace: "flotilla".into(), kind: "clones".into(), name: "any".into() }).await,
-    );
-    assert!(clone.contains("Clone is served by the engine") && clone.contains("flotilla convoy explain"), "{clone}");
-    let environment = refusal(
-        daemon
-            .execute(CommandAction::ResourceDelete {
-                namespace: "flotilla".into(),
-                kind: "Environment".into(),
-                name: "any".into(),
-                replica_origin: None,
-            })
-            .await,
-    );
-    assert!(environment.contains("Environment is served by the engine"), "{environment}");
+    let clone = daemon.get::<Clone>(&clones[0].metadata.name).await.expect("the listed clone reads by name");
+    assert_eq!(clone.spec, clones[0].spec);
+    let environment = daemon.get::<Environment>(&environments[0].metadata.name).await.expect("the listed environment reads by name");
+    assert_eq!(environment.metadata.name, environments[0].metadata.name);
+    let deleted = daemon
+        .execute(CommandAction::ResourceDelete {
+            namespace: "flotilla".into(),
+            kind: "Environment".into(),
+            name: environment.metadata.name.clone(),
+            replica_origin: None,
+        })
+        .await;
+    let CommandValue::Error { message } = deleted else { panic!("an environment delete is refused: {deleted:?}") };
+    assert!(message.contains("flotilla convoy explain"), "{message}");
     let report = daemon.old_store_report().expect("recorded");
-    let refusals = report.split("stage refusals:").nth(1).unwrap_or_default();
+    let lifecycle = report.split("stage lifecycle:").nth(1).unwrap_or_default();
     for kind in ["Clone", "Environment"] {
-        assert!(!refusals.contains(&format!("  {kind} ")), "{kind} reached the old store:\n{report}");
+        assert!(!lifecycle.contains(&format!("  {kind} ")), "{kind} reached the old store:\n{report}");
     }
 }
 
@@ -135,9 +141,70 @@ async fn the_resource_commands_read_messages_from_the_engine() {
         .await;
     let CommandValue::Error { message } = deleted else { panic!("a message delete is refused: {deleted:?}") };
     assert!(message.contains("flotilla message acknowledge"), "{message}");
+    // Messages reach other homes by log following, so no digest is kept of them.
+    let digest = daemon
+        .execute(CommandAction::QueryResourceDigest {
+            namespace: "flotilla".into(),
+            kind: "Message".into(),
+            query: flotilla_protocol::ResourceDigestQuery::Root,
+        })
+        .await;
+    let CommandValue::Error { message } = digest else { panic!("a message digest is refused: {digest:?}") };
+    assert!(message.contains("log following"), "{message}");
     let report = daemon.old_store_report().expect("recorded");
     let messages = report.split("stage messages:").nth(1).unwrap_or_default();
     assert!(!messages.contains("  Message "), "Message reached the old store:\n{report}");
+}
+
+// A home's messages reach a peer by following its log: listed there through the resource
+// commands, with the old store's replication never consulted for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn messages_reach_a_peer_by_log_following() {
+    let (a, b) = tokio::join!(
+        TestDaemon::builder().settings("host_name = \"engine-a\"\n").old_store(OldStoreMode::Recording).start(),
+        TestDaemon::builder().settings("host_name = \"engine-b\"\n").old_store(OldStoreMode::Recording).start()
+    );
+    a.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let sent = loop {
+        let sent = message_names(&a).await;
+        if !sent.is_empty() {
+            break sent;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no message listed at its home");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    a.stage("peered");
+    b.stage("peered");
+    let _peering = TestDaemon::peer(&a, &b).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let missing: Vec<_> = sent.difference(&message_names(&b).await).cloned().collect();
+        if missing.is_empty() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let got = b
+                .execute(flotilla_protocol::CommandAction::QueryResourceGet {
+                    namespace: "flotilla".into(),
+                    kind: "Message".into(),
+                    name: missing[0].clone(),
+                })
+                .await;
+            panic!("messages not listed at the peer: {missing:?}; get: {got:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    for daemon in [&a, &b] {
+        let report = daemon.old_store_report().expect("recorded");
+        let peered = report.split("stage peered:").nth(1).unwrap_or_default();
+        assert!(!peered.contains("  Message "), "Message reached the old store:\n{report}");
+    }
+}
+
+/// The names of the Messages `daemon` lists.
+async fn message_names(daemon: &TestDaemon) -> std::collections::BTreeSet<String> {
+    daemon.list::<flotilla_resources::Message>().await.into_iter().map(|message| message.metadata.name).collect()
 }
 
 async fn delivered_convoy(daemon: &TestDaemon) {

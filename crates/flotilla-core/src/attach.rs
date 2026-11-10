@@ -1811,21 +1811,6 @@ mod tests {
         let engine = flotilla_provisioning_testkit::EngineFixture::default();
         engine.environments.put_ready("pre-agent", &held_spec, None, "backing", Default::default());
         daemon.install_lifecycle_reads(engine.reads()).expect("engine reads");
-        // An old record's copied status beside it, which attach never reads or writes.
-        let environments = backend.using::<flotilla_resources::Environment>("flotilla");
-        let environment = environments.create(&test_meta("pre-agent"), &spec).await.unwrap();
-        environments
-            .update_status(
-                "pre-agent",
-                &environment.metadata.resource_version,
-                &flotilla_resources::EnvironmentStatus {
-                    docker_container_id: Some("backing".into()),
-                    message: Some("resident vessel agent unavailable; recovery required".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
         let endpoint = real.as_ref().map(|real| real.endpoint.clone()).unwrap_or(flotilla_protocol::result_set::CleatEndpoint {
             runtime_root: "/tmp/cleat".into(),
             daemon: "crew@7".into(),
@@ -1924,11 +1909,6 @@ mod tests {
                 real.attach(&plan, &secondary);
             }
             assert!(handle.agent().ready().await.is_err(), "successful degraded attach does not repair agent health");
-            assert_eq!(
-                environments.get("pre-agent").await.unwrap().status.as_ref().and_then(|status| status.message.as_deref()),
-                Some("resident vessel agent unavailable; recovery required"),
-                "degraded terminal access preserves the resident-agent recovery diagnostic"
-            );
 
             // The environment's reading, overridden; its record is the engine's.
             struct BackingReading(&'static str, Arc<dyn flotilla_projections::ports::LifecycleReads>);
@@ -1953,16 +1933,7 @@ mod tests {
             let error = resolver.resolve_attach("crew", None, false, AttachMode::Default, None).await.unwrap_err();
             assert!(error.contains("current-backing"), "the engine's realised identity overrides older resource status: {error}");
 
-            // Copied legacy status cannot override the realised identity; a changed physical endpoint revokes access.
-            let mut environment = environments.get("pre-agent").await.unwrap();
-            let original = environment.status.clone().unwrap();
-            environment.status.as_mut().unwrap().docker_container_id = Some("replaced-backing".into());
-            let updated = environments
-                .update_status("pre-agent", &environment.metadata.resource_version, environment.status.as_ref().unwrap())
-                .await
-                .unwrap();
-            held.resolve_attach("crew", None, false, AttachMode::Default, None).await.expect("stale copied status is ignored");
-            environments.update_status("pre-agent", &updated.metadata.resource_version, &original).await.unwrap();
+            // A changed physical endpoint revokes access.
             for wrong in [
                 flotilla_protocol::result_set::CleatEndpoint { session: "another-terminal".into(), ..endpoint.clone() },
                 flotilla_protocol::result_set::CleatEndpoint { daemon: "crew@6".into(), ..endpoint.clone() },
@@ -2013,11 +1984,6 @@ mod tests {
                             matches!(mode, AttachMode::Take | AttachMode::PreferTake)
                         );
                         assert_eq!(args.contains(&Arg::Literal("--strict".into())), mode == AttachMode::Strict);
-                        assert_eq!(
-                            environments.get("pre-agent").await.unwrap().status,
-                            Some(original.clone()),
-                            "terminal access leaves health status untouched"
-                        );
                     }
                 }
             }

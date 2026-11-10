@@ -297,6 +297,10 @@ impl EnvironmentRecords for LiveEnvironments {
         self.0.clone()
     }
 
+    fn every(&self) -> Result<Vec<EnvironmentRecord>, String> {
+        self.0.clone()
+    }
+
     fn held(&self, _: &str) -> Result<Vec<EnvironmentRecord>, String> {
         unreachable!("the sweep reads live environments only")
     }

@@ -193,6 +193,10 @@ mod tests {
             unreachable!("the sweep reads live environments only")
         }
 
+        fn every(&self) -> Result<Vec<EnvironmentRecord>, String> {
+            self.live()
+        }
+
         fn live(&self) -> Result<Vec<EnvironmentRecord>, String> {
             let record = |name: &String| EnvironmentRecord {
                 name: name.clone(),

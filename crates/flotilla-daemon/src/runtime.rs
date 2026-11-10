@@ -1360,10 +1360,10 @@ async fn open_provisioning_lifecycles(
     .await
     .map_err(|error| error.to_string())??;
     // Every environment reader and requester goes through the engine's environments.
-    let environments = Arc::new(EngineEnvironments::new(Arc::clone(&lifecycles.environments), Arc::clone(&store)));
+    let environments = Arc::new(EngineEnvironments::over(Arc::clone(&lifecycles.environments), daemon.decided_store()?));
     let environment_changes = environments.follow(daemon.decided_store()?)?;
     // Every clone reader and requester goes through the engine's clones.
-    let clones = Arc::new(EngineClones::new(Arc::clone(&lifecycles.clones) as _, Arc::clone(&store)));
+    let clones = Arc::new(EngineClones::over(Arc::clone(&lifecycles.clones) as _, daemon.decided_store()?));
     let clone_changes = clones.follow(daemon.decided_store()?)?;
     // Every checkout reader and requester goes through the engine's checkouts.
     let checkout_changes = lifecycles.checkout_records.follow(daemon.decided_store()?)?;

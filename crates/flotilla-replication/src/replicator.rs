@@ -286,6 +286,10 @@ fn spawn_kind<T: Resource>(
     if T::REPLICATION_CLASS == ReplicationClass::None {
         return;
     }
+    // An engine-served kind reaches this home by following the peer's log.
+    if host.stores().backend(store).engine_serves(T::API_PATHS.kind) {
+        return;
+    }
     match transport.clone() {
         ReplicationTransport::Direct(socket_path_source, connector) => {
             let relay_host = Arc::clone(host);

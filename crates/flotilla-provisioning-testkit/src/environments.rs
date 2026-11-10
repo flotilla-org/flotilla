@@ -54,7 +54,8 @@ impl EnvironmentFixture {
         let log = StoreLog::new(Arc::clone(&store));
         let lifecycles: Arc<dyn Lifecycles<EnvironmentKind>> =
             Arc::new(LifecycleHome::new(home, open_home_with(&log, LaunchLog::new(log.clone(), staged.clone())).expect("environments")));
-        let environments = Arc::new(EngineEnvironments::new(Arc::clone(&lifecycles), Arc::clone(&store)));
+        let only = home.to_owned();
+        let environments = Arc::new(EngineEnvironments::new(Arc::clone(&lifecycles), Arc::clone(&store), move || vec![only.clone()]));
         let reads = Arc::new(
             LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), home.to_owned())
                 .with_environments(Arc::clone(&environments) as Arc<dyn EnvironmentRecords>),

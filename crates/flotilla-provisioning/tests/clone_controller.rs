@@ -178,7 +178,7 @@ impl World {
             controller.run(receiver).await;
         });
         Self {
-            clones: Arc::new(EngineClones::new(lifecycles, service.store())),
+            clones: Arc::new(EngineClones::over(lifecycles, Arc::clone(&service))),
             _directory: directory,
             service,
             runtime,

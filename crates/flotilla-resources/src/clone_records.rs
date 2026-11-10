@@ -88,6 +88,8 @@ pub trait CloneRecords: Send + Sync {
     fn of_repository(&self, repository: &RepositoryKey) -> Result<Vec<CloneRecord>, String>;
     /// Every launch held at this home, ended or not.
     fn here(&self) -> Result<Vec<CloneRecord>, String>;
+    /// Every launch at every home this one follows.
+    fn every(&self) -> Result<Vec<CloneRecord>, String>;
     /// The launch that serves a request for `spec`, a clone of `repository`, at this home: the
     /// latest launch of [`clone_name`] when that has not ended, else its next launch, requested
     /// now. The clone is named for the repository's identity, never by the caller, and a spec

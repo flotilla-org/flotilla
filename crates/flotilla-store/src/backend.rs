@@ -94,6 +94,12 @@ impl ResourceBackend {
     pub fn generic_verb_refusal(&self, kind: &str) -> Option<String> {
         self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).refused.get(kind).cloned()
     }
+    /// Whether an engine port serves `kind`: its records reach other homes by log following,
+    /// never through the old store's replication.
+    pub fn engine_serves(&self, kind: &str) -> bool {
+        self.engine_records(kind).is_some()
+    }
+
     /// The engine port serving `kind`, when one is installed.
     pub(crate) fn engine_records(&self, kind: &str) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>> {
         self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).ports.get(kind).cloned()
@@ -552,6 +558,10 @@ impl<T: Resource> ReplicaReadResolver<T> {
         &self,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
         ensure_replication_enabled::<T>()?;
+        if let Some(watch) = self.backend.definitions::<T>(&self.namespace).engine_watch().await {
+            // Every home's records stream their changes; the current ones are read by `list_sources`.
+            return watch.map(|(_, stream)| stream);
+        }
         if self.backend.serves_read_views() {
             return Err(ResourceError::invalid("HTTP replica-source watches use the resource API"));
         }
@@ -760,6 +770,12 @@ impl<T: Resource> TypedResolver<T> {
 
     pub async fn digest(&self, query: &crate::DigestQuery) -> Result<crate::PartitionDigest, ResourceError> {
         ensure_replication_enabled::<T>()?;
+        if self.backend.engine_serves(T::API_PATHS.kind) {
+            return Err(ResourceError::invalid(format!(
+                "{} is served by the engine: it reaches other homes by log following, not digests",
+                T::API_PATHS.kind
+            )));
+        }
         dispatch_backend!(self, digest_typed, query)
     }
 

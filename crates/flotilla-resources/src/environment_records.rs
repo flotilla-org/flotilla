@@ -77,6 +77,8 @@ pub trait EnvironmentRecords: Send + Sync {
     fn find(&self, name: &str) -> Result<Option<EnvironmentRecord>, String>;
     /// This home's environments that have not ended.
     fn live(&self) -> Result<Vec<EnvironmentRecord>, String>;
+    /// Every environment at every home this one follows, ended or not.
+    fn every(&self) -> Result<Vec<EnvironmentRecord>, String>;
     /// The environments held for `vessel`, across homes, every one, ended or not.
     fn held(&self, vessel: &str) -> Result<Vec<EnvironmentRecord>, String>;
     /// Requests `name` at this home with `spec`, held for `vessel`. An environment already held

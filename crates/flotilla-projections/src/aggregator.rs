@@ -7161,6 +7161,9 @@ mod tests {
         fn here(&self) -> Result<Vec<flotilla_resources::clone_records::CloneRecord>, String> {
             Ok(Vec::new())
         }
+        fn every(&self) -> Result<Vec<flotilla_resources::clone_records::CloneRecord>, String> {
+            Ok(Vec::new())
+        }
         fn request(&self, _: &flotilla_resources::RepositorySpec, _: &flotilla_resources::CloneSpec, _: bool) -> Result<String, String> {
             Err("readiness requests no clone".into())
         }

@@ -65,6 +65,7 @@ fn record(read: &mut Read<'_>, view: View<CloneKind>) -> Result<CloneRecord, Rea
 pub struct EngineClones {
     lifecycles: Arc<dyn Lifecycles<CloneKind>>,
     reads: StoreReads,
+    homes: Box<dyn Fn() -> Vec<String> + Send + Sync>,
     changes: tokio::sync::broadcast::Sender<CloneChange>,
 }
 
@@ -75,8 +76,37 @@ const CHANGES: usize = 256;
 const REQUEST_ATTEMPTS: usize = 3;
 
 impl EngineClones {
-    pub fn new(lifecycles: Arc<dyn Lifecycles<CloneKind>>, store: Arc<Mutex<Store>>) -> Self {
-        Self { lifecycles, reads: StoreReads::new(store), changes: tokio::sync::broadcast::channel(CHANGES).0 }
+    /// The port over `store`, whose homes `homes` names.
+    pub fn new(
+        lifecycles: Arc<dyn Lifecycles<CloneKind>>,
+        store: Arc<Mutex<Store>>,
+        homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self { lifecycles, reads: StoreReads::new(store), homes: Box::new(homes), changes: tokio::sync::broadcast::channel(CHANGES).0 }
+    }
+
+    /// The port over `service`'s store and homes.
+    pub fn over(lifecycles: Arc<dyn Lifecycles<CloneKind>>, service: Arc<flotilla_schema_sqlite::stream::Service>) -> Self {
+        let store = service.store();
+        Self::new(lifecycles, store, move || service.homes())
+    }
+
+    /// Every launch `home` holds.
+    fn scan(read: &mut Read<'_>, home: &str) -> Result<Vec<CloneRecord>, ReadError> {
+        let mut records = Vec::new();
+        let mut after = None;
+        loop {
+            let page = read.scan::<Resource<Clone>>(home, after, 64)?;
+            for id in page.ids {
+                if let Some(view) = view::<CloneKind>(read, id)? {
+                    records.push(record(read, view)?);
+                }
+            }
+            after = page.next;
+            if after.is_none() {
+                return Ok(records);
+            }
+        }
     }
 
     /// Follows the clones' records in `service`'s log, at every home, telling
@@ -159,24 +189,20 @@ impl CloneRecords for EngineClones {
 
     fn here(&self) -> Result<Vec<CloneRecord>, String> {
         let home = self.home().to_owned();
+        self.reads.read(|read| Self::scan(read, &home)).map_err(|error| format!("engine clones at {home}: {error}"))
+    }
+
+    fn every(&self) -> Result<Vec<CloneRecord>, String> {
+        let homes = (self.homes)();
         self.reads
             .read(|read| {
                 let mut records = Vec::new();
-                let mut after = None;
-                loop {
-                    let page = read.scan::<Resource<Clone>>(&home, after, 64)?;
-                    for id in page.ids {
-                        if let Some(view) = view::<CloneKind>(read, id)? {
-                            records.push(record(read, view)?);
-                        }
-                    }
-                    after = page.next;
-                    if after.is_none() {
-                        return Ok(records);
-                    }
+                for home in &homes {
+                    records.extend(Self::scan(read, home)?);
                 }
+                Ok(records)
             })
-            .map_err(|error| format!("engine clones at {home}: {error}"))
+            .map_err(|error| format!("engine clones at every home: {error}"))
     }
 
     fn request(&self, repository: &RepositorySpec, spec: &CloneSpec, discovered: bool) -> Result<String, String> {

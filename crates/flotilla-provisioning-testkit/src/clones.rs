@@ -56,7 +56,8 @@ impl CloneFixture {
         let log = StoreLog::new(Arc::clone(&store));
         let lifecycles: Arc<dyn Lifecycles<CloneKind>> =
             Arc::new(LifecycleHome::new(home, open_home_with(&log, LaunchLog::new(log.clone(), staged.clone())).expect("clones")));
-        let clones = Arc::new(EngineClones::new(Arc::clone(&lifecycles), Arc::clone(&store)));
+        let only = home.to_owned();
+        let clones = Arc::new(EngineClones::new(Arc::clone(&lifecycles), Arc::clone(&store), move || vec![only.clone()]));
         let reads = Arc::new(
             LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), home.to_owned())
                 .with_clones(Arc::clone(&clones) as Arc<dyn CloneRecords>),
@@ -235,7 +236,7 @@ impl RunningClones {
         let lifecycles: Arc<dyn Lifecycles<CloneKind>> =
             Arc::new(LifecycleHome::new(home, open_home_with(&log, LaunchLog::new(log.clone(), staged.clone())).expect("clones")));
         let environments = crate::EnvironmentFixture::over(home, service.store());
-        let clones = Arc::new(EngineClones::new(Arc::clone(&lifecycles), service.store()));
+        let clones = Arc::new(EngineClones::over(Arc::clone(&lifecycles), Arc::clone(&service)));
         let follower = clones.follow(Arc::clone(&service)).expect("follow the clones");
         let checkouts = crate::CheckoutFixture::over(home, service.store());
         let mut terminals = crate::TerminalsFixture::over(home, service.store());

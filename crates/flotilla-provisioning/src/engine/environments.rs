@@ -204,6 +204,7 @@ fn record(read: &mut Read<'_>, view: View<EnvironmentKind>) -> Result<Environmen
 pub struct EngineEnvironments {
     lifecycles: Arc<dyn Lifecycles<EnvironmentKind>>,
     reads: StoreReads,
+    homes: Box<dyn Fn() -> Vec<String> + Send + Sync>,
     changes: tokio::sync::broadcast::Sender<EnvironmentChange>,
 }
 
@@ -211,8 +212,19 @@ pub struct EngineEnvironments {
 const CHANGES: usize = 256;
 
 impl EngineEnvironments {
-    pub fn new(lifecycles: Arc<dyn Lifecycles<EnvironmentKind>>, store: Arc<Mutex<Store>>) -> Self {
-        Self { lifecycles, reads: StoreReads::new(store), changes: tokio::sync::broadcast::channel(CHANGES).0 }
+    /// The port over `store`, whose homes `homes` names.
+    pub fn new(
+        lifecycles: Arc<dyn Lifecycles<EnvironmentKind>>,
+        store: Arc<Mutex<Store>>,
+        homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self { lifecycles, reads: StoreReads::new(store), homes: Box::new(homes), changes: tokio::sync::broadcast::channel(CHANGES).0 }
+    }
+
+    /// The port over `service`'s store and homes.
+    pub fn over(lifecycles: Arc<dyn Lifecycles<EnvironmentKind>>, service: Arc<flotilla_schema_sqlite::stream::Service>) -> Self {
+        let store = service.store();
+        Self::new(lifecycles, store, move || service.homes())
     }
 
     /// Follows the environments' records in `service`'s log, at every home, telling
@@ -294,6 +306,31 @@ impl EnvironmentRecords for EngineEnvironments {
                 Ok(records)
             })
             .map_err(|error| format!("engine live environments: {error}"))
+    }
+
+    fn every(&self) -> Result<Vec<EnvironmentRecord>, String> {
+        let homes = (self.homes)();
+        self.reads
+            .read(|read| {
+                let mut records = Vec::new();
+                for home in &homes {
+                    let mut after = None;
+                    loop {
+                        let page = read.scan::<Resource<Environment>>(home, after, 64)?;
+                        for id in page.ids {
+                            if let Some(view) = view::<EnvironmentKind>(read, id)? {
+                                records.push(record(read, view)?);
+                            }
+                        }
+                        after = page.next;
+                        if after.is_none() {
+                            break;
+                        }
+                    }
+                }
+                Ok(records)
+            })
+            .map_err(|error| format!("engine environments at every home: {error}"))
     }
 
     fn held(&self, vessel: &str) -> Result<Vec<EnvironmentRecord>, String> {

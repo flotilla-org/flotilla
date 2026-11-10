@@ -945,20 +945,23 @@ macro_rules! replication_kinds {
     };
 }
 
-// Clone, Environment and Message live only on the engine, behind ports the resource commands
-// refuse, so `flotilla get` lists none of them here.
+// Each kind the stalled crew and the fixtures make. Clone and Environment are home-local by
+// design (ReplicationClass::None): checked to stay home. Not here, as no stalled dummy crew makes
+// them: AccountBinding and AccountProvision (written only by the account controllers),
+// ManifestRoot (only by a home's manifest reconciler) and Checkout, whose engine records the
+// resource commands do not yet read. Message's log following is engine_only's
+// `messages_reach_a_peer_by_log_following`.
 replication_kinds!(
     AccessDelivery,
-    AccountBinding,
-    AccountProvision,
     Artifact,
     ChangeRequest,
-    Checkout,
+    Clone,
     Convoy,
     ConvoyEnsure,
     CredentialGrant,
     CredentialSpec,
     CrewDefaults,
+    Environment,
     FleetDesignation,
     Forge,
     FulfilmentKind,
@@ -966,7 +969,6 @@ replication_kinds!(
     ImageBuild,
     ImageLayer,
     Issue,
-    ManifestRoot,
     Project,
     Repository,
     TerminalSession,
@@ -1045,10 +1047,8 @@ async fn two_daemons_replicate_every_kind() {
     apply_transport_fixtures(&a, "engine-a").await;
     apply_transport_fixtures(&b, "engine-b").await;
     let (before_a, before_b) = tokio::join!(inventories(&a), inventories(&b));
-    // `get` lists no Checkout here, and only their controllers write AccountBinding,
-    // AccountProvision and ManifestRoot, which make none for a stalled dummy crew.
     let unmade: Vec<_> = before_a.iter().filter(|(_, records)| records.is_empty()).map(|(kind, _)| *kind).collect();
-    assert_eq!(unmade, ["AccountBinding", "AccountProvision", "Checkout", "ManifestRoot"], "every other kind has a record to replicate");
+    assert!(unmade.is_empty(), "every kind has a record to replicate: {unmade:?}");
     let _peering = TestDaemon::peer(&a, &b).await;
     assert_every_kind_replicated(&before_a, &before_b, &b).await;
     assert_every_kind_replicated(&before_b, &before_a, &a).await;

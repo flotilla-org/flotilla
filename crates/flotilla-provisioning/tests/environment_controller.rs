@@ -215,7 +215,7 @@ impl World {
         let (backing, receiver) = tokio::sync::mpsc::channel(8);
         tokio::spawn(controller.run(receiver));
         Self {
-            environments: Arc::new(EngineEnvironments::new(lifecycles, service.store())),
+            environments: Arc::new(EngineEnvironments::over(lifecycles, Arc::clone(&service))),
             vessels: Arc::new(LifecycleHome::new(HOME, open_home(log()).expect("vessels"))),
             builds: Arc::new(LifecycleHome::new(HOME, open_home(log()).expect("builds"))),
             checkouts: Arc::new(LifecycleHome::new(HOME, open_home(log()).expect("checkouts"))),
