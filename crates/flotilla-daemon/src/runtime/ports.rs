@@ -8,8 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_core::in_process::InProcessDaemon;
-use flotilla_core::in_process::OperatorReconciler;
+use flotilla_core::in_process::{InProcessDaemon, OperatorReconciler};
 use flotilla_credentials::CloneDelivery;
 use flotilla_crew::reconcilers::vessel::WorktreeMetadataResolver;
 use flotilla_protocol::RepoSelector;
@@ -20,27 +19,15 @@ use flotilla_provisioning::checkout_runtime::{
 };
 use flotilla_provisioning::reconcilers::clone::runtime::CloneControllerRuntime;
 use flotilla_provisioning::reconcilers::{CloneRuntime, ForgeDefaultBranchResolver};
-use flotilla_resources::attentions::{Attention, Fact, Sender, Subject};
-use flotilla_resources::{
-    canonicalize_repo_url, ChangeRequest, CloneCredentials, Convoy, ConvoyTeardownRuntime, Forge, ForgeIdentity, InputMeta, Resource,
-    ResourceObject,
-};
+use flotilla_resources::{canonicalize_repo_url, ChangeRequest, CloneCredentials, Convoy, Forge, ForgeIdentity, InputMeta, Resource};
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
 use flotilla_vcs::vcs::CheckoutMaterialisationError;
 use flotilla_vcs::vcs::CheckoutRegistration;
 use flotilla_vcs::vcs::WorktreeMetadata;
-use tracing::{info, warn};
+use tracing::warn;
 
 use super::state::ControllerRuntimeState;
 use crate::resource_manifest::ResourceManifestReconciler;
-
-/// Whether an ended convoy's vessels may be released. Until the vessel requester lands with its
-/// release gate (#3108 C4'), nothing in production asks.
-#[cfg_attr(not(test), expect(dead_code, reason = "the vessel release gate once the vessel requester lands (#3108 C4')"))]
-pub(super) struct DaemonConvoyTeardownRuntime {
-    pub(super) daemon: Arc<InProcessDaemon>,
-    pub(super) reclaim_refusals: StdMutex<HashMap<String, ReclaimRefusal>>,
-}
 
 /// The vessel requester's release gate: an ended convoy's vessels are released here once its
 /// teardown gate passes over the checkouts held for it, the same judgement its home's reclaim makes.
@@ -81,14 +68,6 @@ impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for Dae
         let checkouts = flotilla_resources::checkout_records::latest_launches(held).into_values().collect::<Vec<_>>();
         self.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, &checkouts, false).await
     }
-}
-
-#[cfg_attr(not(test), expect(dead_code, reason = "the vessel release gate once the vessel requester lands (#3108 C4')"))]
-pub(super) struct ReclaimRefusal {
-    pub(super) error: String,
-    pub(super) attempts: u64,
-    /// When this run of refusals began: the episode its attention tells.
-    pub(super) since: DateTime<Utc>,
 }
 
 pub(super) struct RuntimeOperatorReconciler {
@@ -174,93 +153,6 @@ pub(super) async fn wake_controller_resource<T: Resource>(
     meta.annotations.insert(RECONCILE_NOW_ANNOTATION.to_string(), Utc::now().to_rfc3339());
     resources.update(&meta, &object.metadata.resource_version, &object.spec).await.map_err(|error| error.to_string())?;
     Ok(format!("{}/{} woken", T::API_PATHS.kind, name))
-}
-
-#[cfg_attr(not(test), expect(dead_code, reason = "the vessel release gate once the vessel requester lands (#3108 C4')"))]
-impl DaemonConvoyTeardownRuntime {
-    pub(super) fn new(daemon: Arc<InProcessDaemon>) -> Self {
-        Self { daemon, reclaim_refusals: StdMutex::new(HashMap::new()) }
-    }
-
-    pub(super) async fn raise_attention(&self, convoy: &ResourceObject<Convoy>, reason: &str, since: DateTime<Utc>) -> Result<(), String> {
-        let fact = Fact::ReclaimRefused { convoy: convoy.metadata.name.clone() };
-        self.daemon.attentions().raise(&convoy.metadata.namespace, &Attention::new(fact, reason, since)).await
-    }
-
-    pub(super) async fn clear_attention(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
-        self.daemon.attentions().clear(&convoy.metadata.namespace, Sender::Teardown, &Subject::convoy(convoy.metadata.name.clone())).await
-    }
-}
-
-#[async_trait]
-impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
-    async fn verify_reclaim(
-        &self,
-        convoy: &ResourceObject<Convoy>,
-        checkouts: &[flotilla_resources::checkout_records::CheckoutRecord],
-    ) -> Result<(), String> {
-        let result = self.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, checkouts, false).await;
-        let key = format!("{}/{}", convoy.metadata.namespace, convoy.metadata.name);
-        match &result {
-            Err(error) => {
-                let (attempts, since) = {
-                    let mut refusals = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned");
-                    match refusals.get_mut(&key) {
-                        Some(refusal) => {
-                            refusal.error.clone_from(error);
-                            refusal.attempts += 1;
-                            (refusal.attempts, refusal.since)
-                        }
-                        _ => {
-                            let since = Utc::now();
-                            refusals.insert(key, ReclaimRefusal { error: error.clone(), attempts: 1, since });
-                            (1, since)
-                        }
-                    }
-                };
-                if attempts == 1 {
-                    warn!(
-                        namespace = %convoy.metadata.namespace,
-                        convoy = %convoy.metadata.name,
-                        attempts,
-                        %error,
-                        "automatic convoy reclaim refused"
-                    );
-                }
-                if attempts >= RECLAIM_REFUSAL_ATTENTION_AFTER {
-                    if let Err(attention_error) = self.raise_attention(convoy, error, since).await {
-                        warn!(
-                            namespace = %convoy.metadata.namespace,
-                            convoy = %convoy.metadata.name,
-                            %attention_error,
-                            "could not raise persistent reclaim refusal attention"
-                        );
-                    }
-                }
-            }
-            Ok(()) => {
-                if let Some(refusal) = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned").remove(&key) {
-                    if refusal.attempts > 1 {
-                        info!(
-                            namespace = %convoy.metadata.namespace,
-                            convoy = %convoy.metadata.name,
-                            refused_attempts = refusal.attempts,
-                            "automatic convoy reclaim recovered after repeated refusal"
-                        );
-                    }
-                }
-                if let Err(attention_error) = self.clear_attention(convoy).await {
-                    warn!(
-                        namespace = %convoy.metadata.namespace,
-                        convoy = %convoy.metadata.name,
-                        %attention_error,
-                        "could not clear recovered reclaim refusal attention"
-                    );
-                }
-            }
-        }
-        result
-    }
 }
 
 /// Process-local six-hour successes, keyed by service/repository. Per-key locks
@@ -586,9 +478,6 @@ pub(super) fn unauthorised_clone(url: &str, credentials: &CloneCredentials, erro
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "the vessel release gate once the vessel requester lands (#3108 C4')"))]
-pub(super) const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
-
 pub(super) const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-at";
 
 #[cfg(test)]
@@ -670,8 +559,11 @@ mod chained_default_branch_tests {
     }
     async fn default_branch_fixture(
         failures: usize,
-    ) -> (Arc<DefaultBranchRunner>, flotilla_provisioning::reconcilers::RepositoryReconciler, ResourceObject<flotilla_resources::Repository>)
-    {
+    ) -> (
+        Arc<DefaultBranchRunner>,
+        flotilla_provisioning::reconcilers::RepositoryReconciler,
+        flotilla_resources::ResourceObject<flotilla_resources::Repository>,
+    ) {
         let runner = Arc::new(DefaultBranchRunner { calls: Default::default(), failures: failures.into(), error: None });
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let spec = flotilla_resources::RepositorySpec::remote("https://github.com/org/repo.git").expect("spec");

@@ -74,7 +74,7 @@ use flotilla_resources::environment_records::EnvironmentRecords;
 use flotilla_resources::{
     clone_key, Checkout, Checkout as ResourceCheckout, CheckoutSpec, CheckoutSpec as ResourceCheckoutSpec, CheckoutWorktreeSpec, Clone,
     CloneSpec, ConditionValue, Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CredentialConsumer, CredentialGrant, CredentialLifecycle,
+    ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, EnvironmentSpec, Forge,
     ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec,
     HostStatus, HostStatusPatch, InputMeta, ModelProbeState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementStatus,

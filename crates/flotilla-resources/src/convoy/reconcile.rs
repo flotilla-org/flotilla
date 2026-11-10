@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
 use serde::{Deserialize, Serialize};
@@ -10,25 +9,16 @@ use super::{
     InstantiatedExit, VesselRequirement, WorkPhase, WorkflowSnapshot,
 };
 use crate::{
-    address::{artifact_slot_record_name, leaf_record_name},
+    address::leaf_record_name,
     checkout_records::CheckoutRecord,
     resource::ResourceObject,
     vessel::{Vessel, VesselPhase},
-    workflow_template::{
-        validate, visit_template_tokens, ArtifactSubjectBinding, CompletionCondition, CrewSource, CrewSpec, ExitDeclaration,
-    },
-    Actuation, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, ForgeSpec, InputValue, ObservedChangeRequestState,
-    PlacementStatus, ThreeValue, ENSURED_FROM_ANNOTATION,
+    workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ExitDeclaration},
+    ChangeRequest, ChangeRequestLeafSubject, ForgeSpec, InputValue, ObservedChangeRequestState, ThreeValue, ENSURED_FROM_ANNOTATION,
 };
 
 pub fn is_ensured(convoy: &ResourceObject<Convoy>) -> bool {
     convoy.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION)
-}
-
-#[async_trait]
-pub trait ConvoyTeardownRuntime: Send + Sync {
-    /// Re-verify ADR 0017 teardown eligibility at the execution edge.
-    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[CheckoutRecord]) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,198 +103,6 @@ pub enum UnmetSettlementExpectation {
         claimed: String,
         observed: String,
     },
-}
-
-/// Preconditions for a crew member's claim, selected by the pinned workflow
-/// role. World-terminal exit leaves remain separate: a PR need not be merged
-/// when its author files the claim.
-pub struct CrewCompletionClaim<'a> {
-    pub vessel: &'a str,
-    pub role: &'a str,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn evaluate_crew_completion(
-    convoy: &ResourceObject<Convoy>,
-    claim: CrewCompletionClaim<'_>,
-    change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
-    artifacts: &BTreeMap<String, ResourceObject<Artifact>>,
-    forges: &[ForgeSpec],
-    stale_after: std::time::Duration,
-    now: DateTime<Utc>,
-) -> Result<Vec<UnmetSettlementExpectation>, String> {
-    let CrewCompletionClaim { vessel, role } = claim;
-    let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else {
-        return Ok(Vec::new());
-    };
-    let crew = snapshot
-        .vessels
-        .iter()
-        .find(|candidate| candidate.name == vessel)
-        .and_then(|requirement| requirement.crew.iter().find(|candidate| candidate.role == role))
-        .ok_or_else(|| format!("workflow has no crew role `{vessel}/{role}`"))?;
-    let mut unmet = Vec::new();
-    let pr = super::promises::PromiseKind::Pr;
-    if !crew.promise_exclusions.contains(&pr) && (crew.deliverer || crew.promises.iter().any(|promise| promise.kind == pr)) {
-        if let Some(condition) = pr.readiness_condition() {
-            if let Some(expectation) =
-                evaluate_declared_completion_condition(convoy, &condition, change_requests, artifacts, forges, stale_after, now)?
-            {
-                unmet.push(expectation);
-            }
-        }
-    }
-    for expectation in &crew.completion_conditions {
-        match expectation {
-            crate::CrewCompletionExpectation::Condition(condition) => {
-                let result =
-                    evaluate_declared_completion_condition(convoy, condition, change_requests, artifacts, forges, stale_after, now)?;
-                if let Some(expectation) = result {
-                    unmet.push(expectation);
-                }
-            }
-            crate::CrewCompletionExpectation::Legacy(_) => {
-                return Err("legacy completion expectation was not normalized on decode".to_string());
-            }
-        }
-    }
-    Ok(unmet)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn evaluate_declared_completion_condition(
-    convoy: &ResourceObject<Convoy>,
-    condition: &CompletionCondition,
-    change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
-    artifacts: &BTreeMap<String, ResourceObject<Artifact>>,
-    forges: &[ForgeSpec],
-    stale_after: std::time::Duration,
-    now: DateTime<Utc>,
-) -> Result<Option<UnmetSettlementExpectation>, String> {
-    let change_request_leaves = || expected_change_request_leaves(convoy, forges);
-    let evaluate = |leaf: Leaf, subject: Option<&dyn crate::LeafSubject>| -> Result<Option<UnmetSettlementExpectation>, String> {
-        let result = crate::evaluate_leaf(&leaf, subject, None)?;
-        Ok((result.result != ThreeValue::True).then(|| UnmetSettlementExpectation::CompletionConditionUnsatisfied {
-            subject: leaf.address.to_string(),
-            field_path: leaf.field_path,
-            value: result.value.map(|value| value.to_string()),
-            causes: Vec::new(),
-        }))
-    };
-    match condition {
-        CompletionCondition::Artifact { producer, kind, about, field_path, operator, literal } => {
-            let subject = match about {
-                ArtifactSubjectBinding::Convoy => convoy.metadata.name.clone(),
-                ArtifactSubjectBinding::ChangeRequestHead => {
-                    let leaves = change_request_leaves()?;
-                    let Some(leaf) = leaves.first() else {
-                        return Err("head-bound artifact condition requires exactly one change request".to_string());
-                    };
-                    if leaves.iter().any(|candidate| candidate.address != leaf.address) {
-                        return Err("head-bound artifact condition requires exactly one change request".to_string());
-                    }
-                    if !matches!(leaf.address, LeafAddress::ChangeRequest { .. }) {
-                        return Err("expected change request leaf has another subject".to_string());
-                    }
-                    let name = leaf_record_name(&leaf.address, forges)?;
-                    let head = change_requests.get(&name).and_then(|record| record.status.as_ref()).and_then(|status| {
-                        now.signed_duration_since(status.head_sha.observed_at)
-                            .to_std()
-                            .ok()
-                            .filter(|age| *age <= stale_after)
-                            .and(status.head_sha.value.as_ref())
-                    });
-                    let Some(head) = head else {
-                        return Ok(Some(UnmetSettlementExpectation::CompletionConditionUnsatisfied {
-                            subject: format!("cr/{name}"),
-                            field_path: ".head-sha".to_string(),
-                            value: None,
-                            causes: Vec::new(),
-                        }));
-                    };
-                    head.clone()
-                }
-            };
-            let name = artifact_slot_record_name(&convoy.metadata.name, producer, kind, &subject)?;
-            let address =
-                LeafAddress::Artifact { convoy: convoy.metadata.name.clone(), producer: producer.clone(), kind: kind.clone(), subject };
-            let leaf = Leaf { address, field_path: field_path.clone(), operator: *operator, literal: literal.clone() };
-            let subject = artifacts.get(&name).map(ArtifactLeafSubject);
-            evaluate(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject))
-        }
-        CompletionCondition::ChangeRequest { field_path, operator, literal, optional_when_absent } => {
-            let leaves = change_request_leaves()?;
-            if leaves.is_empty() && *optional_when_absent {
-                let checkouts_expected = !expected_checkout_refs(convoy)?.is_empty();
-                // Discovery gets one observation freshness window by policy;
-                // keep its grace named separately from bound-record freshness.
-                let discovery_grace = stale_after;
-                let discovery_complete = convoy.status.as_ref().is_some_and(|status| {
-                    status.branch_subject_scan_error.is_none()
-                        && status.branch_subject_scan_at.is_some_and(|at| {
-                            at >= convoy.metadata.creation_timestamp
-                                && now.signed_duration_since(at).to_std().is_ok_and(|age| age <= stale_after)
-                        })
-                });
-                // An empty subject set is pending discovery only for one freshness
-                // window after admission. Do not reset this deadline on retries:
-                // failed or missing discovery must not make optional PRs mandatory.
-                // A subject discovered later always takes the ordinary bound path.
-                let discovery_expired =
-                    now.signed_duration_since(convoy.metadata.creation_timestamp).to_std().is_ok_and(|age| age >= discovery_grace);
-                if checkouts_expected && !discovery_complete && discovery_expired {
-                    tracing::debug!(
-                        convoy = %convoy.metadata.name,
-                        discovery_grace_seconds = discovery_grace.as_secs(),
-                        discovery_failed = convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_error.is_some()),
-                        "optional change-request completion condition satisfied after discovery grace expired"
-                    );
-                }
-                if !checkouts_expected || discovery_complete || discovery_expired {
-                    return Ok(None);
-                }
-            }
-            if leaves.is_empty() {
-                return Ok(Some(UnmetSettlementExpectation::CompletionConditionUnsatisfied {
-                    subject: "cr/unbound".to_string(),
-                    field_path: field_path.clone(),
-                    value: None,
-                    causes: Vec::new(),
-                }));
-            }
-            for expected in leaves {
-                let LeafAddress::ChangeRequest { service, scope, number } = &expected.address else { continue };
-                // A leaf that names no record, such as a host no Forge
-                // declares, has no observation.
-                let record = leaf_record_name(&expected.address, forges).ok().and_then(|name| change_requests.get(&name));
-                let subject = record.map(|change_request| ChangeRequestLeafSubject { change_request, now, stale_after });
-                let cause = match record.and_then(|record| record.status.as_ref()) {
-                    None => Some(CrewCompletionRefusalCause::MissingChangeRequestObservation {
-                        service: service.clone(),
-                        scope: scope.clone(),
-                        number: *number,
-                    }),
-                    Some(status) if status.mergeable.value == Some(crate::ObservedMergeability::Conflicting) => {
-                        Some(CrewCompletionRefusalCause::ConflictingChangeRequest {
-                            service: service.clone(),
-                            scope: scope.clone(),
-                            number: *number,
-                        })
-                    }
-                    _ => None,
-                };
-                let leaf =
-                    Leaf { address: expected.address, field_path: field_path.clone(), operator: *operator, literal: literal.clone() };
-                if let Some(mut unmet) = evaluate(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject))? {
-                    if let UnmetSettlementExpectation::CompletionConditionUnsatisfied { causes, .. } = &mut unmet {
-                        causes.extend(cause);
-                    }
-                    return Ok(Some(unmet));
-                }
-            }
-            Ok(None)
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
