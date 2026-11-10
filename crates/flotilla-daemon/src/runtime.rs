@@ -61,7 +61,7 @@ use self::seed::register_startup_resources;
 use self::state::ControllerRuntimeState;
 use self::tasks::{
     run_artifact_gc, run_checkout_archive_gc, spawn_adopted_checkout_projection_task, spawn_aggregator_task,
-    spawn_convoy_ensure_reconciler_task, spawn_dispatch_reconciler_task, spawn_environment_orphan_sweep_task, spawn_event_expiry_task,
+    spawn_convoy_ensure_reconciler_task, spawn_dispatch_reconciler_task, spawn_environment_orphan_sweep_task,
     spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task, spawn_local_fulfilment_probe_task,
     spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task, spawn_provisioned_environment_reconciliation_task,
     spawn_sleep_inhibitor_task, spawn_ssh_fulfilment_probe_task, spawn_startup_restoration, spawn_vessel_placement_projector,
@@ -348,7 +348,6 @@ impl DaemonRuntime {
                 options.heartbeat_interval,
             ),
             spawn_host_description_projection_task(Arc::clone(&daemon), options.namespace.clone(), options.heartbeat_interval),
-            spawn_event_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_projection_parity_task(
                 daemon.resource_backend(),
                 options.namespace.clone(),

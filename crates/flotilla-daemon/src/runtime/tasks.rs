@@ -738,19 +738,6 @@ where
     (task, ready_rx)
 }
 
-pub(super) fn spawn_event_expiry_task(backend: ResourceBackend, namespace: String, interval: Duration) -> JoinHandle<()> {
-    let recorder = flotilla_store::EventRecorder::new(backend);
-    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
-        let recorder = recorder.clone();
-        let namespace = namespace.clone();
-        async move {
-            if let Err(error) = recorder.prune_expired(&namespace, Utc::now()).await {
-                warn!(%error, %namespace, "failed to prune expired events");
-            }
-        }
-    })
-}
-
 /// Keeps the adopted checkouts' projection in the observed store current as the engine's
 /// checkouts change (#3108): each change projects the adopted checkouts held here again.
 pub(super) fn spawn_adopted_checkout_projection_task(daemon: Arc<InProcessDaemon>, namespace: String) -> JoinHandle<()> {

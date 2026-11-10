@@ -112,6 +112,7 @@ mod tests {
     #[test]
     fn a_retired_unregistered_kind_listed_by_an_older_daemon_is_dropped() {
         assert!(is_retired("crewimagebaselines"));
-        assert!(!is_retired("events"), "a retired kind still registered keeps its decoder");
+        assert!(is_retired("events"));
+        assert!(!is_retired("demands"), "an imported kind is not retired");
     }
 }

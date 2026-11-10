@@ -312,12 +312,11 @@ pub async fn standing_backing_inspection_holds_empty_evidence_after_provisioning
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("hold without backing evidence"),
         vec!["ConvoyEnsure/quartermaster held for operator attention"]
     );
-    let events = backend.using::<Event>("flotilla").list().await.expect("list object events").items;
-    assert!(events.iter().any(|event| {
-        event.spec.regarding.name == convoy_ref
-            && event.spec.reason == "BackingEvidenceRefused"
-            && event.spec.message.contains("no backing environment evidence is available")
-    }));
+    let status = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.expect("ensure status");
+    assert!(
+        status.last_failure.as_deref().is_some_and(|failure| failure.contains("no backing environment evidence is available")),
+        "{status:?}"
+    );
 }
 
 pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts_after_verified_death(

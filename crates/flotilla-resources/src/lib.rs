@@ -63,7 +63,6 @@ pub mod environment_records;
 #[doc(hidden)]
 pub mod error;
 #[doc(hidden)]
-pub mod event;
 #[doc(hidden)]
 pub mod field_ownership;
 mod fleet_designation;
@@ -167,7 +166,6 @@ pub use environment::{
     HOST_DIRECT_NAME_PREFIX,
 };
 pub use error::{FinalizerWaitReason, ResourceError};
-pub use event::{Event, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};
 pub use field_ownership::{FieldOwnershipViolation, WriterIdentity, WriterRole};
 pub use fleet_designation::{FleetDesignation, FleetDesignationSpec, FLEET_DESIGNATION_NAME};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
@@ -275,7 +273,6 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::FleetDesignation>($($argument),*);
         $callback::<$crate::Forge>($($argument),*);
-        $callback::<$crate::Event>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
         $callback::<$crate::ManifestRoot>($($argument),*);
         $callback::<$crate::Project>($($argument),*);

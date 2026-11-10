@@ -36,7 +36,6 @@ use flotilla_resources::CrewWorkState;
 use flotilla_resources::Demand as ResourceDemand;
 use flotilla_resources::DemandStatusPatch;
 use flotilla_resources::EnvironmentSpec as ResourceEnvironmentSpec;
-use flotilla_resources::Event;
 use flotilla_resources::FulfilmentKindSpec;
 use flotilla_resources::FulfilmentRealisation;
 use flotilla_resources::HarnessFacts;

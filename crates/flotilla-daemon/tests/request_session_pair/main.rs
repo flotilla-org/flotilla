@@ -72,14 +72,14 @@ use flotilla_resources::terminal_records::{
     AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords,
 };
 use flotilla_resources::{
-    Artifact, ArtifactSubjectBinding, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus,
-    CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    Artifact, ArtifactSpec, ArtifactSubjectBinding, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec,
+    ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSource, CrewSpec,
-    CrewWorkPhase, CrewWorkState, Event, EventRegarding, EventSpec, FulfilmentKind, FulfilmentKindSpec, Host, HostSpec, HostStatus,
-    InputMeta, Message, RepositoryKey, Resource, ResourceError, ResourceProvenance, Selector, SystemClock, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement, VesselSpec,
-    WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
+    CrewWorkPhase, CrewWorkState, FulfilmentKind, FulfilmentKindSpec, Host, HostSpec, HostStatus, InputMeta, Message, RepositoryKey,
+    Resource, ResourceError, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority,
+    WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
 };
 use flotilla_store::off_frame;
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, old_store_resource_kinds, ResourceBackend};
@@ -403,31 +403,23 @@ async fn assert_no_orphaned_finalizers(hosts: &[Arc<InProcessDaemon>]) {
 }
 
 /// The home-bound kind the replication scenarios author to follow one record, and its deletion,
-/// through the router. Host was that kind until Hosts moved to the engine, where a daemon writes
-/// only its own; Event is a home-bound kind the old store still replicates.
-type Sample = Event;
+/// through the router. Artifact is written at its home on the engine and reaches the other homes
+/// by log following.
+type Sample = Artifact;
 
-fn sample_record(name: &str) -> (InputMeta, EventSpec) {
-    sample_record_with_finalizers(name, Vec::new())
-}
-
-fn sample_record_with_finalizers(name: &str, finalizers: Vec<String>) -> (InputMeta, EventSpec) {
+fn sample_record(name: &str) -> (InputMeta, ArtifactSpec) {
     let at = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
-    let spec = EventSpec {
-        regarding: EventRegarding {
-            api_version: "flotilla.work/v1".into(),
-            kind: Convoy::API_PATHS.kind.into(),
-            namespace: "flotilla".into(),
-            name: name.into(),
-        },
-        reason: "Sample".into(),
-        message: "a record replication follows".into(),
-        count: 1,
-        first_seen: at,
-        last_seen: at,
-        expires_at: at + chrono::Duration::days(365 * 1000),
-    };
-    (InputMeta::builder().name(name.to_string()).finalizers(finalizers).build(), spec)
+    let spec = ArtifactSpec::builder()
+        .convoy(name.to_string())
+        .producer("sample".to_string())
+        .kind("note".to_string())
+        .subject("a record replication follows".to_string())
+        .digest(format!("sha256:{}", "0".repeat(64)))
+        .size(0)
+        .media_type("text/plain".to_string())
+        .expires_at(at + chrono::Duration::days(365 * 1000))
+        .build();
+    (InputMeta::builder().name(name.to_string()).build(), spec)
 }
 
 async fn create_sample(host: &InProcessDaemon, name: &str) -> Result<(), ResourceError> {
@@ -436,7 +428,7 @@ async fn create_sample(host: &InProcessDaemon, name: &str) -> Result<(), Resourc
 }
 
 async fn wait_for_host_resource_visibility(hosts: &[Arc<InProcessDaemon>], name: &str, should_exist: bool) {
-    let failure_message = format!("Event {name} did not become {} on every host", if should_exist { "visible" } else { "absent" });
+    let failure_message = format!("Artifact {name} did not become {} on every host", if should_exist { "visible" } else { "absent" });
     eventually(Duration::from_secs(5), Duration::from_millis(10), &failure_message, || async {
         for host in hosts {
             let read = host.resource_backend().including_replicas::<Sample>("flotilla").get(name).await;
@@ -454,9 +446,10 @@ async fn wait_for_host_resource_visibility(hosts: &[Arc<InProcessDaemon>], name:
 async fn finalizer_oracle_detects_a_stuck_registered_resource() {
     let host = empty_daemon_named("orphaned-finalizer").await;
     let hosts = vec![Arc::clone(&host)];
-    let resources = host.resource_backend().using::<Sample>("flotilla");
-    let (meta, spec) = sample_record_with_finalizers("stuck", vec!["test/stuck".to_string()]);
-    resources.create(&meta, &spec).await.expect("create resource with finalizer");
+    // Convoy is a kind the old store still holds, so finalizers still apply to it.
+    let resources = host.resource_backend().using::<Convoy>("flotilla");
+    let meta = InputMeta::builder().name("stuck".to_string()).finalizers(vec!["test/stuck".to_string()]).build();
+    resources.create(&meta, &convoy_spec("workflow", "coder")).await.expect("create resource with finalizer");
     resources.delete("stuck").await.expect("mark deleting");
     let detected = tokio::spawn(async move { assert_no_orphaned_finalizers(&hosts).await }).await;
     assert!(detected.is_err_and(|error| error.is_panic()), "orphaned finalizer escaped registry scan");

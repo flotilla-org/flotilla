@@ -14,7 +14,7 @@ use crate::{
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     AccessDelivery, AccountBinding, AccountProvision, Artifact, ChangeRequest, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
-    CredentialGrant, CredentialSpec, CrewDefaults, Demand, Environment, Event, FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild,
+    CredentialGrant, CredentialSpec, CrewDefaults, Demand, Environment, FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild,
     ImageLayer, InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project, ReadResourceList, ReadWatchEvent, Regard,
     ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
     ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
@@ -53,7 +53,6 @@ enum RegisteredResource {
     AccountProvision,
     AccessDelivery,
     Environment,
-    Event,
     FleetDesignation,
     Forge,
     FulfilmentKind,
@@ -134,7 +133,6 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<AccountProvision>(RegisteredResource::AccountProvision, &["account-provision"]),
     kind::<AccessDelivery>(RegisteredResource::AccessDelivery, &["access-delivery"]),
     engine_kind::<Environment>(RegisteredResource::Environment, &[]),
-    kind::<Event>(RegisteredResource::Event, &[]),
     kind::<FleetDesignation>(RegisteredResource::FleetDesignation, &["fleet-designation"]),
     kind::<Forge>(RegisteredResource::Forge, &[]),
     kind::<FulfilmentKind>(
@@ -184,6 +182,8 @@ pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
     // Remove one roll after this generation ships, once the corpus is refreshed.
     RetiredResourceKind { kind: "ForgeRead", plural: "forgereads", api_version: "flotilla.work/v1" },
     RetiredResourceKind { kind: "ForgeReadHeartbeat", plural: "forgereadheartbeats", api_version: "flotilla.work/v1" },
+    // Deleted by #3108 (its writers became warnings); remove one roll after this generation ships.
+    RetiredResourceKind { kind: "Event", plural: "events", api_version: "flotilla.work/v1" },
 ];
 
 /// What a stored document decoded as.
@@ -252,7 +252,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::AccountProvision => poll_typed_resource!($body::<AccountProvision>($($arg),*)),
             RegisteredResource::AccessDelivery => poll_typed_resource!($body::<AccessDelivery>($($arg),*)),
             RegisteredResource::Environment => poll_typed_resource!($body::<Environment>($($arg),*)),
-            RegisteredResource::Event => poll_typed_resource!($body::<Event>($($arg),*)),
             RegisteredResource::FleetDesignation => poll_typed_resource!($body::<FleetDesignation>($($arg),*)),
             RegisteredResource::Forge => poll_typed_resource!($body::<Forge>($($arg),*)),
             RegisteredResource::FulfilmentKind => poll_typed_resource!($body::<FulfilmentKind>($($arg),*)),
@@ -286,7 +285,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::AccountProvision => $body::<AccountProvision>(),
             RegisteredResource::AccessDelivery => $body::<AccessDelivery>(),
             RegisteredResource::Environment => $body::<Environment>(),
-            RegisteredResource::Event => $body::<Event>(),
             RegisteredResource::FleetDesignation => $body::<FleetDesignation>(),
             RegisteredResource::Forge => $body::<Forge>(),
             RegisteredResource::FulfilmentKind => $body::<FulfilmentKind>(),
@@ -320,7 +318,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::AccountProvision => $body::<AccountProvision>($($arg),*),
             RegisteredResource::AccessDelivery => $body::<AccessDelivery>($($arg),*),
             RegisteredResource::Environment => $body::<Environment>($($arg),*),
-            RegisteredResource::Event => $body::<Event>($($arg),*),
             RegisteredResource::FleetDesignation => $body::<FleetDesignation>($($arg),*),
             RegisteredResource::Forge => $body::<Forge>($($arg),*),
             RegisteredResource::FulfilmentKind => $body::<FulfilmentKind>($($arg),*),
@@ -423,7 +420,6 @@ pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
             RegisteredResource::AccountProvision => crate::ResourceKind::of::<AccountProvision>(),
             RegisteredResource::AccessDelivery => crate::ResourceKind::of::<AccessDelivery>(),
             RegisteredResource::Environment => crate::ResourceKind::of::<Environment>(),
-            RegisteredResource::Event => crate::ResourceKind::of::<Event>(),
             RegisteredResource::FleetDesignation => crate::ResourceKind::of::<FleetDesignation>(),
             RegisteredResource::Forge => crate::ResourceKind::of::<Forge>(),
             RegisteredResource::FulfilmentKind => crate::ResourceKind::of::<FulfilmentKind>(),

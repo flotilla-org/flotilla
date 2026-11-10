@@ -22,8 +22,6 @@ mod definition;
 mod manifest_roots;
 pub use definition::*;
 pub use manifest_roots::{OldStoreManifestRoots, SwitchedManifestRoots};
-mod event;
-pub use event::*;
 mod lifecycle_views;
 mod terminal_views;
 mod vessel_lifecycle;

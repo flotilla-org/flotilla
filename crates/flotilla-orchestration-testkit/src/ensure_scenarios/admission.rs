@@ -1057,22 +1057,10 @@ pub async fn driverless_ensure_home_case(
             before[index],
             "non-home writes no status or retry state"
         );
-        assert!(backend.using::<Event>("flotilla").list().await.expect("events").items.is_empty(), "non-home writes no Event");
         assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("demands").items.is_empty(), "non-home raises no stall");
         assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.is_empty(), "non-home never admits");
     }
     if refused {
-        assert!(
-            acting_backend
-                .using::<Event>("flotilla")
-                .list()
-                .await
-                .expect("home events")
-                .items
-                .iter()
-                .any(|event| event.spec.reason == "EnsureAdmissionRefused"),
-            "only home attempts refused admission"
-        );
         let status = acting_backend
             .using::<ConvoyEnsure>("flotilla")
             .get("quartermaster")
@@ -1080,7 +1068,7 @@ pub async fn driverless_ensure_home_case(
             .expect("acting ensure")
             .status
             .expect("retry status");
-        assert!(status.retry.is_some(), "home persists refusal retry state");
+        assert!(status.retry.is_some(), "only home attempts refused admission, and persists its retry state");
     } else {
         assert_eq!(acting_backend.using::<ResourceConvoy>("flotilla").list().await.expect("home convoys").items.len(), 1);
     }

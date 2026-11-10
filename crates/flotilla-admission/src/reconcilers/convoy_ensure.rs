@@ -25,10 +25,10 @@ use flotilla_resources::attentions::{Attention, Attentions, Fact, OpenAttention,
 use flotilla_resources::{
     Clock, ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift,
     ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch, ConvoyPhase, FulfilmentKind,
-    Host as ResourceHost, ObjectEvent, Project, ReadResourceObject, Repository, ResourceError, ResourceObject, ResourceProvenance,
-    WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
+    Host as ResourceHost, Project, ReadResourceObject, Repository, ResourceError, ResourceObject, ResourceProvenance, WorkflowTemplate,
+    DRIVER_ADMISSION_CONDITION_TYPE,
 };
-use flotilla_store::{apply_status_patch as apply_resource_status_patch, EventRecorder, ResourceBackend, StoreQuery};
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -843,10 +843,7 @@ impl EnsurePass<'_> {
         if !operator_forced && !force_now {
             if let Err(reason) = backing_inspector.verify_backing_dead(latest).await {
                 let failure = format!("standing convoy teardown held: {reason}");
-                EventRecorder::new(self.resource_backend.clone())
-                    .record(ObjectEvent::for_object(latest, "BackingEvidenceRefused", failure.clone()), now)
-                    .await
-                    .map_err(|error| format!("record backing-evidence event: {error}"))?;
+                warn!(ensure = %ensure.metadata.name, convoy = %latest.metadata.name, %failure, "standing convoy backing evidence refused");
                 self.raise_ensure_attention(ensure, latest, &failure, hold_began_at(&status, now)).await?;
                 if status.retry_at.is_some() || status.last_failure.as_deref() != Some(&failure) {
                     self.patch_convoy_ensure(
@@ -929,7 +926,7 @@ impl EnsurePass<'_> {
         }
     }
 
-    /// Records a refused admission: an event on the ensure, the in-memory refusal backoff, and
+    /// Records a refused admission: a warning with its cause, the in-memory refusal backoff, and
     /// the status the person reads. A refusal is no strike: no generation was admitted.
     #[allow(clippy::too_many_arguments)]
     async fn admission_refused(
@@ -943,10 +940,7 @@ impl EnsurePass<'_> {
         now: DateTime<Utc>,
         error: String,
     ) -> Result<Option<String>, String> {
-        EventRecorder::new(self.resource_backend.clone())
-            .record(ObjectEvent::for_object(ensure, "EnsureAdmissionRefused", error.clone()), now)
-            .await
-            .map_err(|record_error| format!("record ensure admission event: {record_error}"))?;
+        warn!(ensure = %ensure.metadata.name, %error, "standing convoy admission refused");
         let (refusals, retry_at) = {
             let mut retries = self.ensure_admission_retries.lock().await;
             record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, status.retry.as_ref())
