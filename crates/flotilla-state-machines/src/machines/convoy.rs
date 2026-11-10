@@ -269,6 +269,9 @@ pub enum LinkSource {
     /// A relay linked it on an observed event.
     #[store(code = "rl")]
     Relay,
+    /// The convoy's home found it on one of the convoy's branches.
+    #[store(code = "br")]
+    Branch,
 }
 
 /// One subject link, such as a change request: an unlink marks the row, and a

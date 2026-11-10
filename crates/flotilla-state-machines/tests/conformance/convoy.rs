@@ -114,6 +114,7 @@ fn link_source_of(v: &Value) -> LinkSource {
         "Claim" => LinkSource::Claim,
         "ByOperator" => LinkSource::Operator,
         "Relay" => LinkSource::Relay,
+        "Branch" => LinkSource::Branch,
         other => panic!("link source {other}"),
     }
 }

@@ -36,7 +36,7 @@ module convoy {
   // How a subject was linked after admission. The store keeps every link row
   // with its source; the rules read only which subjects are linked now, so the
   // spec holds that set (a map of rows here pushes the IR past Apalache's limit).
-  type LinkSource = Claim | ByOperator | Relay
+  type LinkSource = Claim | ByOperator | Relay | Branch
   // Why a convoy ended without delivery: its work failed, or an operator decided.
   type AbandonCause = WorkFailed | OperatorDecision
   // projectKnown is admission's recorded read of the project address.

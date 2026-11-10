@@ -275,6 +275,7 @@ fn record(read: &mut Read<'_>, convoy: Resource<Convoy>, home: &str, version: u6
             LinkSource::Claim => SubjectDiscoverySource::Claim,
             LinkSource::Operator => SubjectDiscoverySource::Operator,
             LinkSource::Relay => SubjectDiscoverySource::Relay,
+            LinkSource::Branch => SubjectDiscoverySource::Branch,
         };
         subjects.push(DiscoveredSubject { subject, relationship, sources: vec![SubjectDiscovery { source, at }] });
     }

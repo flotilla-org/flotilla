@@ -99,7 +99,7 @@ module convoy_conformance {
     .union(if (w.retiredSeats.contains("b")) Set(C::Declare({ promise: 1, definition: definition, owner: "b" }),
       C::AddSeat({ seat: "c", parent: "b", supervisedBy: "a", authorised: true })) else Set())
     .union(Set(C::Link({ subject: "cr", source: C::Claim, authorised: false }), C::Unlink({ subject: "other", authorised: true })))
-    .union(if (seatProbe(w)) Set(C::Claim, C::ByOperator, C::Relay).map(src => C::Link({ subject: "cr", source: src, authorised: true }))
+    .union(if (seatProbe(w)) Set(C::Claim, C::ByOperator, C::Relay, C::Branch).map(src => C::Link({ subject: "cr", source: src, authorised: true }))
       .union(Set(C::Unlink({ subject: "cr", authorised: true }), C::Unlink({ subject: "cr", authorised: false }))) else Set())
     .union(if (failProbe(w)) Set(C::FailSeat({ seat: "b", reason: "", authorised: true }),
       C::FailSeat({ seat: "b", reason: "failed", authorised: true })) else Set())

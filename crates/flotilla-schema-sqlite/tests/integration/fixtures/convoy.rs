@@ -49,7 +49,11 @@ fn seat(tc: &TestCase, pick: Pick) -> Seat {
 
 fn subject(tc: &TestCase, pick: Pick) -> SubjectLink {
     use LinkSource::*;
-    SubjectLink { subject: address(tc), source: code_enum(tc, pick, &[Claim, Operator, Relay]), unlinked: pick.some(tc, SHAPES / 2) }
+    SubjectLink {
+        subject: address(tc),
+        source: code_enum(tc, pick, &[Claim, Operator, Relay, Branch]),
+        unlinked: pick.some(tc, SHAPES / 2),
+    }
 }
 
 fn submission(tc: &TestCase) -> Submission {

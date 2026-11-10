@@ -331,6 +331,13 @@ async fn subjects_link_and_unlink_on_the_engine() {
     fixture.engine.unlink(&convoy, &subject, "alice").await.expect("unlinked");
     fixture.engine.unlink(&convoy, &subject, "alice").await.expect("not linked now");
     assert_eq!(linked(&fixture), 0);
+    // A change request found on the convoy's branch is linked as the branch found it.
+    fixture
+        .engine
+        .link(&convoy, &subject, flotilla_resources::SubjectDiscoverySource::Branch, "convoy-controller")
+        .await
+        .expect("branch link");
+    assert_eq!(linked(&fixture), 1);
 }
 
 // Behaviour (#3721 look-over ruling): a label names one deliverable in its convoy. A second

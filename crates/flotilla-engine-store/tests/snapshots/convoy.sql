@@ -149,7 +149,7 @@ CREATE TABLE "convoy_subjects" (
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
   "subject" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "source" TEXT NOT NULL CHECK ("source" IN ('cl', 'op', 'rl')),
+  "source" TEXT NOT NULL CHECK ("source" IN ('br', 'cl', 'op', 'rl')),
   "unlinked" INTEGER NOT NULL CHECK ("unlinked" IN (0, 1)),
   PRIMARY KEY ("convoy", "pos"),
   FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
@@ -241,6 +241,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'state', 'op', 'Open'),
   ('cv', 'cause', 'fa', 'Failed'),
   ('cv', 'cause', 'op', 'Operator'),
+  ('cv', 'subjects.source', 'br', 'Branch'),
   ('cv', 'subjects.source', 'cl', 'Claim'),
   ('cv', 'subjects.source', 'op', 'Operator'),
   ('cv', 'subjects.source', 'rl', 'Relay'),

@@ -485,7 +485,7 @@ impl EngineConvoys for ConvoyEngine {
             SubjectDiscoverySource::Claim => LinkSource::Claim,
             SubjectDiscoverySource::Operator => LinkSource::Operator,
             SubjectDiscoverySource::Relay => LinkSource::Relay,
-            SubjectDiscoverySource::Branch => return Err("the engine records no branch-found link yet".into()),
+            SubjectDiscoverySource::Branch => LinkSource::Branch,
         };
         let address = subject_address(subject, &self.forges(&convoy.metadata.namespace).await?)?;
         let (name, by) = (map::engine_name(convoy)?, operator(principal));
