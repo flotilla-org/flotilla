@@ -120,6 +120,7 @@ use crate::host_identity::resolve_or_create_remote_environment_id;
 use crate::host_identity::resolve_or_create_remote_host_id;
 use crate::model::repo_name;
 use crate::model::RepoModel;
+use crate::primitives::records::MessageRecords;
 use crate::repo_state::RepoRootState;
 use crate::repo_state::RepoState;
 use crate::repository_inspection::GitRepositoryInspector;
@@ -2335,7 +2336,6 @@ impl InProcessDaemon {
             self.resource_backend.refuse_generic_verbs(
                 kind,
                 "the provisioning reconcilers write it for a convoy's vessels; see them with `flotilla convoy explain`",
-                false,
             );
         }
         // The old store's TerminalSession reads are served from the engine's launches.
@@ -2414,11 +2414,8 @@ impl InProcessDaemon {
         let convoys: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> = primitives.convoy_engine().clone();
         self.convoy_engine_path.set(convoys).map_err(|_| "the Convoy path is already installed".to_owned())?;
         self.resource_backend.install_attentions(Arc::clone(&primitives) as Arc<dyn flotilla_resources::attentions::Attentions>);
-        self.resource_backend.refuse_generic_verbs(
-            "Message",
-            "apply admits one through the engine; read messages with `flotilla message inbox`",
-            true,
-        );
+        self.resource_backend
+            .install_engine_records(Arc::new(MessageRecords::new(Arc::clone(&primitives), Arc::clone(&self.provisioning_namespace))));
         let engine: Arc<dyn flotilla_crew::ports::EngineMessages> = primitives;
         self.crew_message_path.set(engine).map_err(|_| "the crew's Message path is already installed".to_owned())
     }
@@ -5098,15 +5095,9 @@ impl InProcessDaemon {
             _ => None,
         };
         let Some((namespace, kind, name)) = target else { return Ok(None) };
-        // A kind the engine serves through a port of its own has no old object to read: a
-        // Message is admitted at its creation origin, and every other verb is refused locally.
-        if flotilla_store::generic_verb_refusal(&self.resource_backend, kind, false).is_some() {
-            return match action {
-                CommandAction::ResourceApply { document, .. } if kind == "Message" => {
-                    off_frame(|| self.message_creation_origin(namespace, document)).await
-                }
-                _ => Ok(None),
-            };
+        // A kind the generic verbs refuse has no object to read: the refusal is local.
+        if flotilla_store::generic_verb_refusal(&self.resource_backend, kind).is_some() {
+            return Ok(None);
         }
         let object = match get_resource_kind_including_replicas(&self.resource_backend, namespace, kind, name).await {
             Ok(object) => object,

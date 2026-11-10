@@ -369,7 +369,8 @@ pub async fn quarantine_undecodable_stored_objects(backend: &ResourceBackend, na
     if !backend.durable_local() {
         return Ok(());
     }
-    for registered in REGISTERED_RESOURCE_KINDS {
+    // A kind an engine port serves holds no old-store records to decode.
+    for registered in REGISTERED_RESOURCE_KINDS.iter().filter(|registered| backend.engine_records(registered.kind).is_none()) {
         list_resource_kind(backend, namespace, registered.kind).await?;
     }
     Ok(())
@@ -1045,12 +1046,11 @@ pub fn canonical_resource_kind(kind: &str) -> Result<&'static str, ResourceError
 }
 
 /// The refusal of a generic resource verb for `requested_kind` (a kind, plural or alias): the
-/// engine serves it through a port of its own. `apply` asks for apply, which some such kinds still
-/// serve.
-pub fn generic_verb_refusal(backend: &ResourceBackend, requested_kind: &str, apply: bool) -> Option<ResourceError> {
+/// engine serves it through a port of its own.
+pub fn generic_verb_refusal(backend: &ResourceBackend, requested_kind: &str) -> Option<ResourceError> {
     let kind = lookup_resource_kind(requested_kind).ok()?.kind;
-    let refusal = backend.generic_verb_refusal(kind).filter(|refusal| !(apply && refusal.applies))?;
-    Some(ResourceError::invalid(format!("{kind} is served by the engine, not the resource commands; {}", refusal.instead)))
+    let instead = backend.generic_verb_refusal(kind)?;
+    Some(ResourceError::invalid(format!("{kind} is served by the engine, not the resource commands; {instead}")))
 }
 
 fn lookup_resource_kind(kind: &str) -> Result<&'static RegisteredResourceKind, ResourceError> {
@@ -1200,6 +1200,20 @@ async fn get_all_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, 
 
 async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceDelete, ResourceError> {
     let resolver = backend.using::<T>(namespace);
+    if backend.engine_records(T::API_PATHS.kind).is_some() {
+        // The engine keeps its own deletions: no old-store tombstone or decode quarantine.
+        let object = resolver.get(name).await?;
+        resolver.delete(name).await?;
+        return Ok(DynamicResourceDelete {
+            object: DynamicResourceObject {
+                kind: T::API_PATHS.kind.to_string(),
+                plural: T::API_PATHS.plural.to_string(),
+                namespace: namespace.to_string(),
+                value: object_value(&object)?,
+            },
+            already_deleted: false,
+        });
+    }
     let (value, already_deleted) = match resolver.get(name).await {
         Ok(object) => {
             resolver.delete(name).await?;

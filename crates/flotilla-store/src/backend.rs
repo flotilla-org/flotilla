@@ -39,15 +39,7 @@ struct EngineSlots {
     namespace: Option<String>,
     /// Kinds the engine serves through ports of their own, which the generic resource verbs
     /// refuse: what to use instead.
-    refused: std::collections::BTreeMap<&'static str, GenericVerbRefusal>,
-}
-
-/// A kind the generic resource verbs refuse, because the engine serves it through a port of its
-/// own: what to use instead, and whether apply is still served (Message admission).
-#[derive(Debug, Clone)]
-pub struct GenericVerbRefusal {
-    pub instead: String,
-    pub applies: bool,
+    refused: std::collections::BTreeMap<&'static str, String>,
 }
 
 #[derive(Default)]
@@ -92,18 +84,14 @@ impl ResourceBackend {
         let engines = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         engines.ports.contains_key(kind).then(|| engines.namespace.clone()).flatten()
     }
-    /// Refuses the generic resource verbs (get, list, watch, digest, apply, status patch, delete)
-    /// for `kind`, which the engine serves through a port of its own; `instead` names the commands
-    /// that read or change it. With `applies`, apply is still served.
-    pub fn refuse_generic_verbs(&self, kind: &'static str, instead: impl Into<String>, applies: bool) {
-        self.engines
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .refused
-            .insert(kind, GenericVerbRefusal { instead: instead.into(), applies });
+    /// Refuses the generic resource verbs (get, list, apply, status patch, delete) for `kind`,
+    /// which the engine serves through a port of its own; `instead` names the commands that read
+    /// or change it. Watch and digest still serve the old store, for replication.
+    pub fn refuse_generic_verbs(&self, kind: &'static str, instead: impl Into<String>) {
+        self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner).refused.insert(kind, instead.into());
     }
     /// Why the generic resource verbs refuse `kind`, by its kind name, when they do.
-    pub fn generic_verb_refusal(&self, kind: &str) -> Option<GenericVerbRefusal> {
+    pub fn generic_verb_refusal(&self, kind: &str) -> Option<String> {
         self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).refused.get(kind).cloned()
     }
     /// The engine port serving `kind`, when one is installed.
@@ -116,7 +104,7 @@ impl ResourceBackend {
     pub fn install_attentions(&self, attentions: std::sync::Arc<dyn flotilla_resources::attentions::Attentions>) {
         *self.attentions.0.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attentions);
         // A Demand is an attention Message on the engine.
-        self.refuse_generic_verbs("Demand", "use `flotilla message inbox` and `flotilla message acknowledge`", false);
+        self.refuse_generic_verbs("Demand", "use `flotilla message inbox` and `flotilla message acknowledge`");
     }
 
     /// Whether the engine's attentions are installed, so Demand is written by no one.

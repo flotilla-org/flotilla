@@ -22,6 +22,7 @@ pub mod demand_import;
 pub mod ensures;
 pub mod import;
 pub mod ports;
+pub mod records;
 pub mod roles;
 pub mod sweep;
 pub mod view;

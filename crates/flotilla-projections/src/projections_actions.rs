@@ -299,7 +299,7 @@ impl ProjectionsActions<'_> {
                 }
             }
             CommandAction::QueryResourceList { namespace, kind, include_replicas } => {
-                if let Some(refused) = flotilla_store::generic_verb_refusal(self.resource_backend, kind, false) {
+                if let Some(refused) = flotilla_store::generic_verb_refusal(self.resource_backend, kind) {
                     return Ok(CommandValue::Error { message: refused.to_string() });
                 }
                 let listed = if *include_replicas {
@@ -355,7 +355,7 @@ impl ProjectionsActions<'_> {
                 Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryResourceGet { namespace, kind, name } => {
-                if let Some(refused) = flotilla_store::generic_verb_refusal(self.resource_backend, kind, false) {
+                if let Some(refused) = flotilla_store::generic_verb_refusal(self.resource_backend, kind) {
                     return Ok(CommandValue::Error { message: refused.to_string() });
                 }
                 // Take the collection cursor before reading the object. A

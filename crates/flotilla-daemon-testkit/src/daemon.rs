@@ -87,6 +87,8 @@ struct Composition {
     host: HostName,
     clock: Arc<dyn Clock>,
     backend: ResourceBackend,
+    /// The same store with no engine ports installed: what the old store itself holds.
+    old: ResourceBackend,
     /// The old store's accesses, when they are recorded.
     old_store: Option<Arc<OldStoreAccesses>>,
     /// Whether an access fails the scenario.
@@ -153,18 +155,18 @@ impl TestDaemon {
         let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
         let mode = old_store;
         let old_store = (mode != OldStoreMode::Available).then(|| Arc::new(OldStoreAccesses::default()));
-        let backend = match (&old_store, mode) {
-            (Some(accesses), OldStoreMode::Unavailable) => ResourceBackend::from_arc(Arc::new(OldStore::unavailable(Arc::clone(accesses)))),
-            (Some(accesses), _) => ResourceBackend::from_arc(Arc::new(OldStore::recording(
-                Arc::clone(accesses),
-                Arc::new(InMemoryBackend::default()) as Arc<dyn flotilla_store::Store>,
-            ))),
-            (None, _) => ResourceBackend::new(InMemoryBackend::default()),
+        let store: Arc<dyn flotilla_store::Store> = match (&old_store, mode) {
+            (Some(accesses), OldStoreMode::Unavailable) => Arc::new(OldStore::unavailable(Arc::clone(accesses))),
+            (Some(accesses), _) => {
+                Arc::new(OldStore::recording(Arc::clone(accesses), Arc::new(InMemoryBackend::default()) as Arc<dyn flotilla_store::Store>))
+            }
+            (None, _) => Arc::new(InMemoryBackend::default()),
         };
         let composition = Composition {
             host: HostName::new(daemon_config.host_name.as_deref().expect("a host name")),
             clock: clock.unwrap_or_else(|| Arc::new(SystemClock)),
-            backend,
+            backend: ResourceBackend::from_arc(Arc::clone(&store)),
+            old: ResourceBackend::from_arc(store),
             old_store,
             old_store_refused: mode == OldStoreMode::Unavailable,
             resync,
@@ -358,7 +360,7 @@ impl TestDaemon {
     /// kind the engine serves through a port of its own, so a scenario that
     /// checks nothing reached the old store reads it here.
     pub async fn old_store_list<T: Resource>(&self) -> Vec<ResourceObject<T>> {
-        let listed = self.composition.backend.using::<T>(NAMESPACE).list().await;
+        let listed = self.composition.old.using::<T>(NAMESPACE).list().await;
         listed.unwrap_or_else(|error| panic!("old store list {}: {error}", T::API_PATHS.kind)).items
     }
 

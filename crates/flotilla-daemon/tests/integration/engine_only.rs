@@ -91,12 +91,6 @@ async fn the_resource_commands_refuse_kinds_served_through_their_own_ports() {
         daemon.execute(CommandAction::QueryResourceGet { namespace: "flotilla".into(), kind: "clones".into(), name: "any".into() }).await,
     );
     assert!(clone.contains("Clone is served by the engine") && clone.contains("flotilla convoy explain"), "{clone}");
-    let messages = refusal(
-        daemon
-            .execute(CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: "Message".into(), include_replicas: true })
-            .await,
-    );
-    assert!(messages.contains("flotilla message inbox"), "{messages}");
     let environment = refusal(
         daemon
             .execute(CommandAction::ResourceDelete {
@@ -110,9 +104,40 @@ async fn the_resource_commands_refuse_kinds_served_through_their_own_ports() {
     assert!(environment.contains("Environment is served by the engine"), "{environment}");
     let report = daemon.old_store_report().expect("recorded");
     let refusals = report.split("stage refusals:").nth(1).unwrap_or_default();
-    for kind in ["Clone", "Message", "Environment"] {
+    for kind in ["Clone", "Environment"] {
         assert!(!refusals.contains(&format!("  {kind} ")), "{kind} reached the old store:\n{report}");
     }
+}
+
+// The resource commands read a crew's messages from the engine. A message's state moves only
+// through its machine, so a delete is refused, naming the command that does change it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_resource_commands_read_messages_from_the_engine() {
+    use flotilla_protocol::{CommandAction, CommandValue};
+    use flotilla_resources::Message;
+    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
+    daemon.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
+    daemon.stage("messages");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let listed = loop {
+        let listed = daemon.list::<Message>().await;
+        if !listed.is_empty() {
+            break listed;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no message listed for the dispatched crew");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let name = listed[0].metadata.name.clone();
+    let got = daemon.get::<Message>(&name).await.expect("the listed message reads by name");
+    assert_eq!(got.spec, listed[0].spec);
+    let deleted = daemon
+        .execute(CommandAction::ResourceDelete { namespace: "flotilla".into(), kind: "Message".into(), name, replica_origin: None })
+        .await;
+    let CommandValue::Error { message } = deleted else { panic!("a message delete is refused: {deleted:?}") };
+    assert!(message.contains("flotilla message acknowledge"), "{message}");
+    let report = daemon.old_store_report().expect("recorded");
+    let messages = report.split("stage messages:").nth(1).unwrap_or_default();
+    assert!(!messages.contains("  Message "), "Message reached the old store:\n{report}");
 }
 
 async fn delivered_convoy(daemon: &TestDaemon) {
