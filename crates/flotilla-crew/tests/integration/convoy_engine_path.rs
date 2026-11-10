@@ -240,6 +240,89 @@ async fn engine_changes_wake_the_convoy_reconciler() {
     watch.abort();
 }
 
+// Behaviour: an evidence change wakes each open convoy and no terminal one, and the open set
+// follows convoys that open or close after the wake starts (the set is read once, then watched).
+#[tokio::test]
+async fn evidence_changes_wake_the_open_convoys() {
+    use flotilla_crew::convoy::EvidenceWake;
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    let phase = |phase| ConvoyStatus { phase, ..Default::default() };
+    let make = |name: &'static str, status: ConvoyStatus| {
+        let convoys = convoys.clone();
+        async move {
+            let spec = ConvoySpec::builder().workflow_ref("w".to_string()).build();
+            let created = convoys.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await.expect("convoy");
+            convoys.update_status(name, &created.metadata.resource_version, &status).await.expect("status")
+        }
+    };
+    let open = make("open", phase(ConvoyPhase::Active)).await;
+    make("landed", phase(ConvoyPhase::Landed)).await;
+
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(EvidenceWake {
+        evidence: backend.including_replicas::<Artifact>(NAMESPACE),
+        convoys: backend.including_replicas::<Convoy>(NAMESPACE),
+    });
+    let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
+    let artifacts = backend.clone().using::<Artifact>(NAMESPACE);
+    let evidence = |n: usize| {
+        let artifacts = artifacts.clone();
+        async move {
+            let spec = ArtifactSpec::builder()
+                .convoy("open".to_string())
+                .producer("coder".to_string())
+                .kind("decision-ledger".to_string())
+                .subject("open".to_string())
+                .digest("sha256:test".to_string())
+                .size(1)
+                .media_type("text/markdown".to_string())
+                .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
+                .build();
+            artifacts.create(&InputMeta::builder().name(format!("evidence-{n}")).build(), &spec).await.expect("artifact");
+        }
+    };
+    // The wake opens its watches when it starts: write evidence until one wakes it.
+    let mut written = 0;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            written += 1;
+            evidence(written).await;
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                return name;
+            }
+        }
+    })
+    .await
+    .expect("woken");
+    assert_eq!(first, "open");
+    while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+        assert_eq!(name, "open", "a landed convoy is not woken");
+    }
+
+    convoys.update_status("open", &open.metadata.resource_version, &phase(ConvoyPhase::Landed)).await.expect("landed");
+    make("later", phase(ConvoyPhase::Active)).await;
+    // Convoy changes and evidence arrive on separate watches: write evidence until the set has
+    // caught up with both, then expect only the convoy still open.
+    let caught_up = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            written += 1;
+            evidence(written).await;
+            let mut woken = Vec::new();
+            while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                woken.push(name);
+            }
+            if woken == ["later"] {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(caught_up.is_ok(), "only the convoy still open is woken");
+    watch.abort();
+}
+
 /// The engine Message path's one answer the hold reads: whether the crew has
 /// an undelivered turn. The convoy reconciler asks it nothing else.
 struct Turns {

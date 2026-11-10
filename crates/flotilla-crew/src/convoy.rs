@@ -301,23 +301,79 @@ impl<W: Resource> SecondaryWatch for EvidenceWake<W> {
         Box::pin(async move {
             // What is already held was read by the convoys' own first pass; only changes wake.
             let mut watch = self.evidence.watch().await?;
-            while let Some(event) = futures::StreamExt::next(&mut watch).await {
-                if let Err(error) = event {
-                    tracing::warn!(%error, kind = W::API_PATHS.kind, "a convoy evidence watch failed");
-                    return Err(error);
-                }
-                for convoy in self.convoys.list().await?.items {
-                    let convoy = convoy.object;
-                    if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-                        continue;
-                    }
-                    if sender.send(convoy.metadata.name).await.is_err() {
-                        return Ok(());
-                    }
+            // The open convoys are read once and kept current by their own watch, opened before
+            // the read so no change falls between them.
+            let mut convoy_watch = self.convoys.watch().await?;
+            let mut open = OpenConvoys::default();
+            for convoy in self.convoys.list().await?.items {
+                open.apply(ReadWatchEvent::Added(convoy));
+            }
+            loop {
+                tokio::select! {
+                    event = futures::StreamExt::next(&mut convoy_watch) => match event {
+                        Some(Ok(event)) => open.apply(event),
+                        Some(Err(error)) => {
+                            tracing::warn!(%error, "a convoy evidence wake's convoy watch failed");
+                            return Err(error);
+                        }
+                        None => return Ok(()),
+                    },
+                    event = futures::StreamExt::next(&mut watch) => match event {
+                        Some(Ok(_)) => {
+                            for name in open.names() {
+                                if sender.send(name.clone()).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(%error, kind = W::API_PATHS.kind, "a convoy evidence watch failed");
+                            return Err(error);
+                        }
+                        None => return Ok(()),
+                    },
                 }
             }
-            Ok(())
         })
+    }
+}
+
+/// The convoys an evidence change wakes: each name with a copy (this home's or a replica) that is
+/// not terminal. Waking a convoy whose chosen copy is terminal finds nothing to do.
+#[derive(Default)]
+struct OpenConvoys {
+    copies: BTreeMap<String, std::collections::BTreeSet<Option<flotilla_protocol::NodeId>>>,
+}
+
+impl OpenConvoys {
+    fn apply(&mut self, event: ReadWatchEvent<Convoy>) {
+        let (name, copy, open) = match event {
+            ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) => {
+                let open = !read.object.status.as_ref().is_some_and(|status| status.phase.is_terminal());
+                (read.object.metadata.name, Self::copy(read.provenance), open)
+            }
+            ReadWatchEvent::Deleted(read) => (read.object.metadata.name, Self::copy(read.provenance), false),
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => (tombstone.name, Self::copy(provenance), false),
+        };
+        if open {
+            self.copies.entry(name).or_default().insert(copy);
+        } else if let Some(copies) = self.copies.get_mut(&name) {
+            copies.remove(&copy);
+            if copies.is_empty() {
+                self.copies.remove(&name);
+            }
+        }
+    }
+
+    fn copy(provenance: ResourceProvenance) -> Option<flotilla_protocol::NodeId> {
+        match provenance {
+            ResourceProvenance::Local => None,
+            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root),
+        }
+    }
+
+    fn names(&self) -> impl Iterator<Item = &String> {
+        self.copies.keys()
     }
 }
 
