@@ -29,11 +29,12 @@ use flotilla_state_machines::{
     Resource, StoredState, Version,
 };
 
-use super::{
+use flotilla_engine_messages::{
     attention::{Attention, Cause, Read},
     convert::Conversion,
-    import::{check, imported_name, ImportDrop, ImportRefusal, Imported, ImportedMessage},
 };
+
+use super::import::{check, imported_name, ImportDrop, ImportRefusal, Imported, ImportedMessage};
 
 const HOLD: &str = "ensure-attention-";
 const RECLAIM: &str = "reclaim-refusal-";

@@ -1,0 +1,32 @@
+[package]
+name = "flotilla-engine-messages"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Message on the engine behind the [primitives] switch: admission, the inbox, consumer records, attentions and the old-shape views (#3317)"
+
+[dependencies]
+flotilla-address = { path = "../flotilla-address" }
+flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-inbox = { path = "../flotilla-inbox" }
+flotilla-messaging = { path = "../flotilla-messaging" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-schema = { path = "../flotilla-schema" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-state-machines = { path = "../flotilla-state-machines" }
+flotilla-store = { path = "../flotilla-store" }
+flotilla-tracing = { path = "../flotilla-tracing" }
+async-trait = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+hegeltest = { workspace = true }
+
+[lints]
+workspace = true

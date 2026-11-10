@@ -366,7 +366,7 @@ fn view_spelled(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::primitives::convert::{Conversion, NoRecords};
+    use crate::convert::{Conversion, NoRecords};
 
     struct Charter;
     impl ViewLookups for Charter {

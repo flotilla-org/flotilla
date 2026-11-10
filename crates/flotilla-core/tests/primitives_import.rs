@@ -4,11 +4,11 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use chrono::{DateTime, TimeZone, Utc};
-use flotilla_core::primitives::{
+use flotilla_core::primitives::import::{
+    admission_order, check, import_all, import_message, ImportDrop, ImportRefusal, Imported, ImportedMessage, OldMessage, ReadRecords,
+};
+use flotilla_engine_messages::{
     convert::{Conversion, NoRecords, ReferenceAddresses},
-    import::{
-        admission_order, check, import_all, import_message, ImportDrop, ImportRefusal, Imported, ImportedMessage, OldMessage, ReadRecords,
-    },
     roles::FleetRoles,
     view::ViewLookups,
     OldStoreRecords,
@@ -637,7 +637,8 @@ fn stored_record_corpus_imports_with_no_refusals() {
 // fleet-role senders and inboxes under fleet:, independently of the charter Project.
 #[tokio::test]
 async fn named_designation_imports_fleet_role_messages() {
-    use flotilla_core::primitives::{import::rehearse, roles::designated_fleet_roles};
+    use flotilla_core::primitives::import::rehearse;
+    use flotilla_engine_messages::roles::designated_fleet_roles;
     use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec};
     use flotilla_store::ResourceBackend;
     use flotilla_store_memory::InMemoryBackend;

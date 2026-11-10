@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use flotilla_core::primitives::{
+use flotilla_engine_messages::{
     roles::{checkout_inspector, CHECKOUT_INSPECTOR},
     sweep::OpenMessages,
     MessagePrimitives, RequestAnswer,

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use flotilla_core::primitives::MessagePrimitives;
+use flotilla_engine_messages::MessagePrimitives;
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
     FleetDesignation, FleetDesignationSpec, InputMeta, MessageReference, MessageRelation, MessageSpec, Project, ProjectSpec, SystemClock,
@@ -138,7 +138,7 @@ async fn a_reply_to_a_fleet_role_reaches_its_inbox() {
 // through the sweep's incremental log index, which holds only open messages.
 #[tokio::test]
 async fn the_sweep_reconciles_receipts_and_settles_replies_from_open_messages_only() {
-    use flotilla_core::primitives::sweep::OpenMessages;
+    use flotilla_engine_messages::sweep::OpenMessages;
     let dir = tempfile::tempdir().expect("tempdir");
     let primitives = primitives(&dir).await;
     let mut turn = intent("system:turn-rules", CREW);
@@ -180,7 +180,7 @@ async fn the_sweep_reconciles_receipts_and_settles_replies_from_open_messages_on
 // naming the condition as the authority.
 #[tokio::test]
 async fn the_sweep_settles_held_outcomes_and_withdraws_on_a_false_delivery_condition() {
-    use flotilla_core::primitives::sweep::OpenMessages;
+    use flotilla_engine_messages::sweep::OpenMessages;
     use flotilla_resources::{Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus};
     use flotilla_state_machines::machines::message::DropReason;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -227,7 +227,7 @@ async fn the_sweep_settles_held_outcomes_and_withdraws_on_a_false_delivery_condi
 // once that message expires, the next earliest.
 #[tokio::test]
 async fn the_sweep_wakes_at_the_earliest_of_several_deadlines() {
-    use flotilla_core::primitives::sweep::OpenMessages;
+    use flotilla_engine_messages::sweep::OpenMessages;
     let dir = tempfile::tempdir().expect("tempdir");
     let start = chrono::Utc::now();
     // The expiry gate reads the store's clock: it moves with the sweep.
@@ -255,7 +255,7 @@ async fn the_sweep_wakes_at_the_earliest_of_several_deadlines() {
 // message last written long ago is still swept.
 #[tokio::test]
 async fn a_fresh_sweep_index_seeds_open_messages_from_a_scan() {
-    use flotilla_core::primitives::sweep::OpenMessages;
+    use flotilla_engine_messages::sweep::OpenMessages;
     let dir = tempfile::tempdir().expect("tempdir");
     let primitives = primitives(&dir).await;
     let mut names = Vec::new();
@@ -465,7 +465,7 @@ async fn a_sender_with_no_inbox_records_nothing() {
 // resolution rather than silently using the Project name.
 #[tokio::test]
 async fn fleet_identity_is_independent_of_the_designated_project() {
-    use flotilla_core::primitives::roles::designated_fleet_roles;
+    use flotilla_engine_messages::roles::designated_fleet_roles;
     let backend = ResourceBackend::new(InMemoryBackend::default());
     for project in ["project-map", "renamed-charter"] {
         backend

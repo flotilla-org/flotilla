@@ -2683,7 +2683,7 @@ async fn active_convoy_delete_names_the_host_owning_an_unreachable_checkout_envi
     apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, topology.follower_host.clone()).await;
 
     // The inspection is asked of the owning host's checkout inspector.
-    let inspector = flotilla_core::primitives::roles::checkout_inspector(&owner_home).expect("inspector inbox");
+    let inspector = flotilla_engine_messages::roles::checkout_inspector(&owner_home).expect("inspector inbox");
     let mut asked = primitives.inbox().watch(&inspector, None).await.expect("watch the owning host's inspector");
     topology
         .client
@@ -2707,7 +2707,7 @@ async fn active_convoy_delete_names_the_host_owning_an_unreachable_checkout_envi
     // Unreachable, the host never answers: the delete waits on the request, it does not proceed.
     assert!(matches!(
         primitives.request_answer(change.message.as_str()).await.expect("answer"),
-        flotilla_core::primitives::RequestAnswer::Waiting
+        flotilla_engine_messages::RequestAnswer::Waiting
     ));
     convoys.get(convoy_name).await.expect("an unanswered inspection keeps the convoy at its home");
 }

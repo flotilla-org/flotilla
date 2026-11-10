@@ -8,7 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_address::Address;
-use flotilla_core::primitives::MessagePrimitives;
+use flotilla_engine_messages::MessagePrimitives;
 use flotilla_inbox::{InboxBackend, Pending};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::machines::{consumer::Receiver, message::Deliver};

@@ -386,7 +386,7 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
         .unwrap(),
     );
     let primitives = Arc::new(
-        flotilla_core::primitives::MessagePrimitives::open(
+        flotilla_engine_messages::MessagePrimitives::open(
             "home",
             Arc::clone(&service),
             daemon.resource_backend(),

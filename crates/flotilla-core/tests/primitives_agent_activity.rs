@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use flotilla_core::primitives::{MessagePrimitives, HOOK_STANDS_FOR, SCREEN_CAUSE};
+use flotilla_engine_messages::{MessagePrimitives, HOOK_STANDS_FOR, SCREEN_CAUSE};
 use flotilla_resources::SystemClock;
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::Service;

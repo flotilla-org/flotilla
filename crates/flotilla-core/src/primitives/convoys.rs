@@ -5,7 +5,7 @@
 //! snapshot its gates read. The caller records what the gates take as given
 //! (a project's existence, an authorisation, a reference's durability) in
 //! the world before it applies the edge, the way the Message gates read
-//! [`super::GateWorld`].
+//! [`flotilla_engine_messages::GateWorld`].
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 

@@ -122,7 +122,7 @@ impl EnvironmentSummaries for InProcessDaemon {
 
 /// Receiver evidence, and the Messages on the engine path when the
 /// `[primitives]` switch is on.
-pub(super) struct MessageReceivers(pub(super) crate::primitives::MessagePath);
+pub(super) struct MessageReceivers(pub(super) flotilla_engine_messages::MessagePath);
 #[async_trait]
 impl flotilla_projections::read_projections::MessageReceiverLoader for MessageReceivers {
     async fn load(

@@ -156,17 +156,27 @@ class BuildGraphContract(unittest.TestCase):
             )), ["flotilla-controllers: production dependency on flotilla-inbox outside the Message switch's composition"])
 
     def test_the_message_switch_composes_the_engine_inbox(self):
-        # #3317: the composition root and daemon compose the engine inbox and
-        # state machines behind `[primitives]`; crates above reach it only
+        # #3317: the daemon and the engine Message path compose the engine inbox
+        # and state machines behind `[primitives]`; crates above reach it only
         # through them, and old admission still never reaches the engine.
         self.assertEqual(violations(graph(
             package("flotilla", normal=("flotilla-daemon",)),
             package("flotilla-daemon", normal=("flotilla-core", "flotilla-inbox", STATE_MACHINES)),
-            package("flotilla-core", normal=("flotilla-inbox", "flotilla-engine-store", STATE_MACHINES)),
+            package("flotilla-core", normal=("flotilla-engine-messages", "flotilla-engine-store", STATE_MACHINES)),
+            package("flotilla-engine-messages", normal=("flotilla-inbox", "flotilla-engine-store", STATE_MACHINES)),
             package("flotilla-engine-store", normal=(STATE_MACHINES,)),
             package("flotilla-inbox", normal=(STATE_MACHINES,)),
             package(STATE_MACHINES),
         )), [])
+        self.assertEqual(violations(graph(
+            package("flotilla-core", normal=("flotilla-inbox",)),
+            package("flotilla-inbox"),
+        )), ["flotilla-core: production dependency on flotilla-inbox outside the Message switch's composition"])
+        # #3108: the engine Message path sits below the composition root and beside the capabilities.
+        self.assertEqual(violations(graph(
+            package("flotilla-engine-messages", normal=("flotilla-crew",)),
+            package("flotilla-crew"),
+        )), ["flotilla-engine-messages: must not depend on flotilla-crew, directly or transitively"])
         self.assertEqual(violations(graph(
             package("flotilla-admission", normal=("flotilla-messaging",)),
             package("flotilla-messaging", normal=(STATE_MACHINES,)),

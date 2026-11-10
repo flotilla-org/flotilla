@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_core::primitives::roles;
+use flotilla_engine_messages::roles;
 use flotilla_inbox::Pending;
 use flotilla_projections::ports::LifecycleReads;
 use flotilla_protocol::RepositoryKey;
@@ -401,7 +401,7 @@ mod tests {
     use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
-    use flotilla_core::primitives::{MessagePrimitives, RequestAnswer};
+    use flotilla_engine_messages::{MessagePrimitives, RequestAnswer};
 
     const NAMESPACE: &str = "flotilla";
     const HOME: &str = "home-a";

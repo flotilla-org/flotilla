@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 
-use flotilla_core::primitives::{view::record_name, MessagePrimitives};
+use flotilla_engine_messages::{view::record_name, MessagePrimitives};
 use flotilla_resources::{
     attentions::{Attention, Attentions, Fact, Sender, Subject},
     Convoy, ConvoyEnsure, FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec, SystemClock, TerminalSession, Vessel,

@@ -702,7 +702,7 @@ pub(super) async fn handle_agent_hook(
 /// blocking pool. The machine's gate remains authoritative across races.
 pub(super) async fn record_hook_activity(
     reads: Option<std::sync::Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>>,
-    primitives: &flotilla_core::primitives::MessagePrimitives,
+    primitives: &flotilla_engine_messages::MessagePrimitives,
     event: &AgentHookEvent,
 ) -> Result<(), String> {
     use flotilla_protocol::AgentEventType;

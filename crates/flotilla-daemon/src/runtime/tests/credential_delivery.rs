@@ -1,6 +1,6 @@
 use super::*;
 use crate::testkits::engine::runtime_terminals;
-use flotilla_core::primitives::view::record_name;
+use flotilla_engine_messages::view::record_name;
 use flotilla_resources::attentions::Subject;
 use flotilla_state_machines::machines::message::MessageState;
 use flotilla_store_memory::InMemoryBackend;

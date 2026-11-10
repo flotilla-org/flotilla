@@ -2,10 +2,10 @@
 //! admitted at the demand's home after the messages imported there.
 
 use flotilla_core::primitives::{
-    convert::Conversion,
     demand_import::{import_demands, DemandRecords, OldDemand},
     import::{write_messages, ImportRefusal as MessageRefusal, ImportReport as MessageReport, Imported},
 };
+use flotilla_engine_messages::convert::Conversion;
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport};
 use flotilla_resources::{Convoy, ConvoyEnsure, Demand, TerminalSession, Vessel};

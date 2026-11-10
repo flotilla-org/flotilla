@@ -124,7 +124,7 @@ pub(super) struct DecidedHomeReads {
 }
 
 #[async_trait::async_trait]
-impl flotilla_core::primitives::ports::HomeReads for DecidedHomeReads {
+impl flotilla_engine_messages::ports::HomeReads for DecidedHomeReads {
     async fn find(&self, kind: KindCode, name: &str) -> Result<Option<stream::ReadResult>, String> {
         let peers = self.peers.lock().expect("decided peers").clone();
         self.clients.lock().expect("home clients").retain(|socket, _| peers.values().any(|live| live.as_ref() == Some(socket)));

@@ -6,7 +6,7 @@
 //! abandoned composer draft is set aside in memory and typed back after the turn; and delivery
 //! passes run on events, never on a timer.
 
-use flotilla_core::primitives::MessagePrimitives;
+use flotilla_engine_messages::MessagePrimitives;
 use flotilla_resources::{MessagePhase, MessageRelation, MessageSpec};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::machines::agent_session::Activity;

@@ -8,7 +8,7 @@ use flotilla_resources::{MessageRelation, MessageSpec};
 use flotilla_state_machines::machines::message::{Expectation, MessageBody};
 
 use super::InProcessDaemon;
-use crate::primitives::view::record_name;
+use flotilla_engine_messages::view::record_name;
 
 impl InProcessDaemon {
     pub(super) async fn execute_action_person(&self, id: u64, command: &Command) -> Result<u64, String> {

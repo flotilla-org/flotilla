@@ -315,7 +315,7 @@ fn an_open_stall_becomes_the_seats_stall_record() {
     let mut store =
         flotilla_schema_sqlite::Store::open(connection, HOME, flotilla_engine_store::registry().expect("registry")).expect("store");
     flotilla_core::primitives::convoy_import::write(&mut store, &convoy).expect("written");
-    let name = flotilla_core::primitives::awaiting::record_name(&record.message);
+    let name = flotilla_engine_messages::awaiting::record_name(&record.message);
     let mut read = store.read().expect("read");
     let code = <flotilla_state_machines::Resource<flotilla_state_machines::machines::awaiting_reply::AwaitingReply> as flotilla_schema::Kind>::CODE;
     let id = read.resolve(code, &name, HOME).expect("resolve").expect("the stall record is written");

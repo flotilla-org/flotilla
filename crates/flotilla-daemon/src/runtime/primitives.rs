@@ -33,7 +33,7 @@ use std::{
 use super::terminal::{TerminalDeliveryFailure, TerminalDeliveryOutcome};
 use chrono::Utc;
 use flotilla_address::Address;
-use flotilla_core::primitives::{
+use flotilla_engine_messages::{
     sweep::{held_turns_superseded, OpenMessages, TurnHolds},
     view::old_view,
     MessagePrimitives,
@@ -259,10 +259,10 @@ impl MessageDelivery {
     /// gates at any home ask it for an inspection there, and a request that finds the inbox unbound
     /// is dropped as undeliverable, which the gate takes as a failed inspection.
     async fn inspector(&self) -> Result<(Address, Receiver), String> {
-        let inbox = flotilla_core::primitives::roles::checkout_inspector(self.primitives.home())?;
+        let inbox = flotilla_engine_messages::roles::checkout_inspector(self.primitives.home())?;
         let consumer = self
             .primitives
-            .register_service(flotilla_core::primitives::roles::CHECKOUT_INSPECTOR, Timestamp::from_datetime(&Utc::now()))
+            .register_service(flotilla_engine_messages::roles::CHECKOUT_INSPECTOR, Timestamp::from_datetime(&Utc::now()))
             .await?;
         Ok((inbox, consumer))
     }
@@ -508,8 +508,8 @@ impl MessageDelivery {
         &mut self,
         due: &[(String, flotilla_resources::MessageSpec)],
         held: Vec<String>,
-        roles: &flotilla_core::primitives::roles::FleetRoles,
-        records: &flotilla_core::primitives::OldStoreRecords,
+        roles: &flotilla_engine_messages::roles::FleetRoles,
+        records: &flotilla_engine_messages::OldStoreRecords,
     ) -> Result<(), String> {
         if held.is_empty() || !due.iter().any(|(_, spec)| spec.is_operator_or_supervisor()) {
             return Ok(());

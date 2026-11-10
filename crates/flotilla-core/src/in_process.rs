@@ -120,7 +120,7 @@ use crate::host_identity::resolve_or_create_remote_environment_id;
 use crate::host_identity::resolve_or_create_remote_host_id;
 use crate::model::repo_name;
 use crate::model::RepoModel;
-use crate::primitives::records::MessageRecords;
+use crate::primitives::{convoy_engine::ConvoyEngine, convoys::Convoys};
 use crate::repo_state::RepoRootState;
 use crate::repo_state::RepoState;
 use crate::repository_inspection::GitRepositoryInspector;
@@ -145,6 +145,7 @@ use flotilla_discovery::run_host_detectors;
 use flotilla_discovery::status::provider_names_from_registry;
 use flotilla_discovery::DiscoveryResult;
 use flotilla_discovery::DiscoveryRuntime;
+use flotilla_engine_messages::records::MessageRecords;
 use flotilla_environment::environment::EnvironmentHandle;
 use flotilla_executor::executor;
 use flotilla_executor::executor::checkout::CheckoutResolutionScope;
@@ -776,7 +777,7 @@ pub struct InProcessDaemon {
     crew: Arc<CrewService>,
     leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics,
     /// The `[primitives]` Message path, installed once at composition.
-    message_path: crate::primitives::MessagePath,
+    message_path: flotilla_engine_messages::MessagePath,
     /// What this daemon has seen of its crews' progress beside their AgentSessions: in memory
     /// only, for its stall check and delivery confirmation (#3108).
     crew_progress: Arc<flotilla_resources::agent_activity::ProgressFacts>,
@@ -1330,7 +1331,7 @@ impl InProcessDaemon {
             flotilla_observation::issue_observer::IssueRefreshCadence::default(),
         );
         let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
-        let message_path = crate::primitives::MessagePath::default();
+        let message_path = flotilla_engine_messages::MessagePath::default();
         let crew_message_path = flotilla_crew::ports::MessagePath::default();
         let convoy_engine_path = flotilla_resources::convoy::engine::EngineConvoyPath::default();
         let vessel_seats_path = flotilla_resources::vessel_seats::VesselSeatsPath::default();
@@ -2405,10 +2406,10 @@ impl InProcessDaemon {
 
     /// Opens the Message path over the decided store composed with this daemon and installs it
     /// (#3317). Blocking: restoring the path reads the store.
-    pub fn open_message_primitives(&self) -> Result<Arc<crate::primitives::MessagePrimitives>, String> {
+    pub fn open_message_primitives(&self) -> Result<Arc<flotilla_engine_messages::MessagePrimitives>, String> {
         let service =
             self.decided_store().map_err(|error| format!("[primitives] needs the decided store composed with the daemon: {error}"))?;
-        let primitives = Arc::new(crate::primitives::MessagePrimitives::open(
+        let primitives = Arc::new(flotilla_engine_messages::MessagePrimitives::open(
             self.node_id().as_str(),
             service,
             self.resource_backend(),
@@ -2419,10 +2420,13 @@ impl InProcessDaemon {
     }
 
     /// Installs the `[primitives]` Message path during composition (#3317),
-    /// after its decided store. Absent, every Message stays in the old store.
-    pub fn install_message_primitives(&self, primitives: Arc<crate::primitives::MessagePrimitives>) -> Result<(), String> {
+    /// after its decided store, with the Convoy path over the same store and
+    /// home (#3587 layer 6). Absent, every Message stays in the old store.
+    pub fn install_message_primitives(&self, primitives: Arc<flotilla_engine_messages::MessagePrimitives>) -> Result<(), String> {
+        let records = Arc::new(Convoys::open(primitives.home(), primitives.service())?);
+        let convoys: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> =
+            Arc::new(ConvoyEngine::new(records, self.resource_backend(), self.clock_for_scenarios()));
         self.message_path.set(Arc::clone(&primitives)).map_err(|_| "the Message path is already installed".to_owned())?;
-        let convoys: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> = primitives.convoy_engine().clone();
         self.convoy_engine_path.set(convoys).map_err(|_| "the Convoy path is already installed".to_owned())?;
         self.resource_backend.install_attentions(Arc::clone(&primitives) as Arc<dyn flotilla_resources::attentions::Attentions>);
         self.resource_backend
@@ -2452,7 +2456,7 @@ impl InProcessDaemon {
     }
 
     /// The `[primitives]` Message path, when the switch is on.
-    pub fn message_primitives(&self) -> Option<Arc<crate::primitives::MessagePrimitives>> {
+    pub fn message_primitives(&self) -> Option<Arc<flotilla_engine_messages::MessagePrimitives>> {
         self.message_path.get().cloned()
     }
 
@@ -5120,7 +5124,7 @@ impl InProcessDaemon {
     /// the original was sent to; with neither, the original's home.
     async fn fleet_role_reply_origin(
         &self,
-        primitives: &crate::primitives::MessagePrimitives,
+        primitives: &flotilla_engine_messages::MessagePrimitives,
         namespace: &str,
         reply: &flotilla_resources::MessageSpec,
         original_id: &str,
@@ -5128,7 +5132,7 @@ impl InProcessDaemon {
         // The original was sent to the replying role: its inbox names it at its home on a replica miss.
         let roles = primitives.roles(namespace).await?;
         let records = primitives.records(namespace).await.map_err(|error| error.to_string())?;
-        let conversion = crate::primitives::convert::Conversion { roles: &roles, forges: &records.forges, records: &*records };
+        let conversion = flotilla_engine_messages::convert::Conversion { roles: &roles, forges: &records.forges, records: &*records };
         let original = primitives
             .read_view(namespace, original_id, conversion.sender_of(reply).ok())
             .await

@@ -35,7 +35,7 @@ pub(crate) fn observe_hook_attention(
 /// gate remains authoritative across races.
 pub(crate) async fn record_agent_activity(
     reads: Arc<dyn LifecycleReads>,
-    primitives: &flotilla_core::primitives::MessagePrimitives,
+    primitives: &flotilla_engine_messages::MessagePrimitives,
     session_name: &str,
     activity: flotilla_state_machines::machines::agent_session::Activity,
     cause: &str,

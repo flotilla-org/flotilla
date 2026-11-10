@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use flotilla_core::primitives::awaiting::{AwaitingReplies, STALL};
+use flotilla_engine_messages::awaiting::{AwaitingReplies, STALL};
 use flotilla_schema::{Address, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::machines::{

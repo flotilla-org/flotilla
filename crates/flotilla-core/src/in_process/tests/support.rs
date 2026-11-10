@@ -688,9 +688,9 @@ pub(super) async fn stall_test_daemon_with_clock(clock: Arc<dyn flotilla_resourc
 
 /// The daemon's AgentSessions, where its harness hooks and screen reads record a crew's activity
 /// beside the TerminalSession's attention; stall judgement reads them (#3108).
-pub(super) fn agent_sessions(daemon: &InProcessDaemon) -> Arc<crate::primitives::Sessions> {
+pub(super) fn agent_sessions(daemon: &InProcessDaemon) -> Arc<flotilla_engine_messages::Sessions> {
     let service = daemon.decided_store().expect("decided store");
-    let primitives = crate::primitives::MessagePrimitives::open(
+    let primitives = flotilla_engine_messages::MessagePrimitives::open(
         daemon.node_id().as_str(),
         service,
         daemon.resource_backend(),
@@ -842,10 +842,10 @@ impl IssueProvider for SuspendedBoardProvider {
 pub(in crate::in_process) fn engine_messages(
     service: Arc<flotilla_schema_sqlite::stream::Service>,
     backend: &ResourceBackend,
-) -> Arc<crate::primitives::MessagePrimitives> {
+) -> Arc<flotilla_engine_messages::MessagePrimitives> {
     let home = service.home().to_owned();
     let primitives = Arc::new(
-        crate::primitives::MessagePrimitives::open(&home, service, backend.clone(), Arc::new(flotilla_resources::SystemClock))
+        flotilla_engine_messages::MessagePrimitives::open(&home, service, backend.clone(), Arc::new(flotilla_resources::SystemClock))
             .expect("message path"),
     );
     backend.install_attentions(Arc::clone(&primitives) as Arc<dyn flotilla_resources::attentions::Attentions>);
@@ -855,7 +855,7 @@ pub(in crate::in_process) fn engine_messages(
 /// `daemon`'s Message path over its decided store, installed as its runtime installs it.
 pub(in crate::in_process) fn install_engine_messages(
     daemon: &crate::in_process::InProcessDaemon,
-) -> Arc<crate::primitives::MessagePrimitives> {
+) -> Arc<flotilla_engine_messages::MessagePrimitives> {
     daemon.open_message_primitives().expect("message path")
 }
 

@@ -73,14 +73,18 @@ STATE_MACHINES_ALLOWED = ("flotilla-schema", "flotilla-schema-derive", *SCHEMA_A
 STATE_MACHINE_DEPENDENTS = frozenset({
     "flotilla-engine-store", "flotilla-inbox", "flotilla-inbox-testkit", "flotilla-quint-testkit",
     # #3317: the composition root and its Message path, behind `[primitives]`.
-    "flotilla-core", "flotilla-daemon",
+    "flotilla-core", "flotilla-daemon", "flotilla-engine-messages",
     # #3629: the provisioning lifecycle kinds declare their specs beside their requests.
     "flotilla-provisioning",
     # Dev-only reader contracts drive the real provisioning engine.
     "flotilla-provisioning-testkit",
 })
 # #3317: the Message switch composes the engine inbox; only these use it directly.
-INBOX_DEPENDENTS = frozenset({"flotilla-core", "flotilla-daemon"})
+INBOX_DEPENDENTS = frozenset({"flotilla-daemon", "flotilla-engine-messages"})
+# #3108: the engine Message path sits beside the capabilities, below the composition root;
+# crew takes it only as a dev-dependency for its tests.
+ENGINE_MESSAGES = "flotilla-engine-messages"
+ENGINE_MESSAGES_FORBIDDEN = (*CAPABILITY_FORBIDDEN, *sorted(CAPABILITY_CRATES))
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a
 # compiler without these drivers need an explicit entry when introduced.
@@ -179,6 +183,9 @@ def violations(metadata):
     for target in TERMINAL_FORBIDDEN:
         if "flotilla-terminal" in packages and target in production["flotilla-terminal"]:
             errors.append(f"flotilla-terminal: must not depend directly on {target}")
+    for target in ENGINE_MESSAGES_FORBIDDEN:
+        if ENGINE_MESSAGES in packages and target in packages and reaches(ENGINE_MESSAGES, target):
+            errors.append(f"{ENGINE_MESSAGES}: must not depend on {target}, directly or transitively")
     for target in DISCOVERY_FORBIDDEN:
         if DISCOVERY in packages and target in packages and reaches(DISCOVERY, target):
             errors.append(f"{DISCOVERY}: must not depend on {target}, directly or transitively")

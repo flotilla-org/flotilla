@@ -6,8 +6,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::Utc;
-use flotilla_core::{in_process::InProcessDaemon, primitives::MessagePrimitives};
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_engine_messages::MessagePrimitives;
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
     Convoy, ConvoySpec, FleetDesignation, FleetDesignationSpec, Host, InputMeta, MessageExpectation, MessageReference, MessageRelation,
@@ -66,7 +67,7 @@ struct StoreReads {
 }
 
 #[async_trait::async_trait]
-impl flotilla_core::primitives::ports::HomeReads for StoreReads {
+impl flotilla_engine_messages::ports::HomeReads for StoreReads {
     async fn find(
         &self,
         kind: flotilla_schema::KindCode,
@@ -325,7 +326,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     engine_b.world().update(|world| world.reply.put(&flotilla_state_machines::Ref::new(sent.name()), ()));
     inbox_b.settle(sent.name(), Settle { by: Settlement::Answered }).await.expect("answered");
     assert!(matches!(homed(&engine_b, &request).expect("sent").1.state(), MessageState::Settled { .. }));
-    use flotilla_core::primitives::sweep::OpenMessages;
+    use flotilla_engine_messages::sweep::OpenMessages;
     use flotilla_state_machines::machines::{awaiting_reply::AwaitingReplyLabel, message::MessageRef};
     let mut observer = OpenMessages::default();
     for (step, DropStep { action, late_record, restart }) in operations.iter().enumerate() {

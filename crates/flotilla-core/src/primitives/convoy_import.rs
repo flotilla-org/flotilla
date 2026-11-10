@@ -502,12 +502,12 @@ pub fn check(resource: &Resource<Convoy>) -> Result<(), String> {
 }
 
 /// The open stall record an imported convoy carries, as the machine creates
-/// it, under the name the send path gives it ([`super::awaiting::record_name`]).
+/// it, under the name the send path gives it ([`flotilla_engine_messages::awaiting::record_name`]).
 pub fn stall_record(convoy: &ImportedConvoy) -> Result<Option<Resource<AwaitingReply>>, String> {
     let Some(stall) = convoy.stall.as_ref() else {
         return Ok(None);
     };
-    let name = super::awaiting::record_name(&stall.spec.message);
+    let name = flotilla_engine_messages::awaiting::record_name(&stall.spec.message);
     let mut home = Home::<AwaitingReply>::new(&convoy.home).map_err(|error| format!("{error:?}"))?;
     home.create(&name, stall.spec.clone(), &MemoryAwaitingReplyWorld::default(), convoy.resource.since())
         .map_err(|error| format!("the machine refuses stall `{name}`: {error:?}"))?;
@@ -632,7 +632,7 @@ pub fn rehearse(imported: &[ImportedConvoy]) -> Vec<RehearsalRefusal> {
             Err(error) => refusals.push(refuse(convoy, error.to_string())),
         }
         if let Some(stall) = &convoy.stall {
-            let name = super::awaiting::record_name(&stall.spec.message);
+            let name = flotilla_engine_messages::awaiting::record_name(&stall.spec.message);
             let read = store.read().and_then(|mut read| {
                 let id = read.resolve(Resource::<AwaitingReply>::CODE, &name, &convoy.home)?;
                 id.map(|id| read.load::<Resource<AwaitingReply>>(id)).transpose().map(Option::flatten)

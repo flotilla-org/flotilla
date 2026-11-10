@@ -6324,7 +6324,7 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
             .unwrap(),
         );
         let primitives = Arc::new(
-            flotilla_core::primitives::MessagePrimitives::open(
+            flotilla_engine_messages::MessagePrimitives::open(
                 "home",
                 Arc::clone(&service),
                 daemon.resource_backend(),
@@ -6433,7 +6433,7 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
             }
         }
         // Reopening from the actual store preserves current activity and its cause.
-        let reopened = flotilla_core::primitives::MessagePrimitives::open(
+        let reopened = flotilla_engine_messages::MessagePrimitives::open(
             "home",
             service,
             daemon.resource_backend(),
@@ -6452,7 +6452,7 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
 
 /// A daemon whose session `agent` runs, and the launch its AgentSession is named by.
 async fn activity_failure_test_daemon(
-) -> (tempfile::TempDir, Arc<InProcessDaemon>, Arc<flotilla_core::primitives::MessagePrimitives>, String) {
+) -> (tempfile::TempDir, Arc<InProcessDaemon>, Arc<flotilla_engine_messages::MessagePrimitives>, String) {
     let (tmp, daemon) = empty_daemon().await;
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(
@@ -6463,7 +6463,7 @@ async fn activity_failure_test_daemon(
         .unwrap(),
     );
     let primitives = Arc::new(
-        flotilla_core::primitives::MessagePrimitives::open(
+        flotilla_engine_messages::MessagePrimitives::open(
             "home",
             service,
             daemon.resource_backend(),
@@ -6758,7 +6758,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         assert_eq!(snapshot(&source), snapshot(&target));
     }
     // Neither a routed-only home nor a broken socket proves a record absent.
-    use flotilla_core::primitives::ports::HomeReads;
+    use flotilla_engine_messages::ports::HomeReads;
     let peers = Arc::new(StdMutex::new(std::collections::BTreeMap::from([("home".to_owned(), None)])));
     let reads = super::change_stream::DecidedHomeReads {
         service: Arc::clone(&target),

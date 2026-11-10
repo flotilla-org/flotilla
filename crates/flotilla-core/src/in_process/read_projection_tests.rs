@@ -289,7 +289,7 @@ mod tests {
             )
             .expect("store"),
         );
-        use crate::primitives::awaiting::AwaitingReplies;
+        use flotilla_engine_messages::awaiting::AwaitingReplies;
         let records = AwaitingReplies::open("home-a", &service).expect("records");
         let seat: flotilla_address::Address = "project:flotilla/convoy:demo/role:coder".parse().expect("seat");
         assert!(!records.stalled(&seat).expect("read"), "no engine stall record at the operator rung");
@@ -315,7 +315,7 @@ mod tests {
         /// The engine's environments the projections read.
         engine: flotilla_provisioning_testkit::EnvironmentFixture,
         /// The engine's Message path, whose attentions the projections read.
-        _messages: Arc<crate::primitives::MessagePrimitives>,
+        _messages: Arc<flotilla_engine_messages::MessagePrimitives>,
     }
 
     #[async_trait]

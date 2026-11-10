@@ -32,7 +32,7 @@ use flotilla_state_machines::{
     Home, Ref, Resource, StoredState, Transport, Version,
 };
 
-use super::convert::{timestamp, Conversion};
+use flotilla_engine_messages::convert::{timestamp, Conversion};
 
 /// One old record, as the import reads it: the record and the host it is homed at.
 pub struct OldMessage<'a> {
