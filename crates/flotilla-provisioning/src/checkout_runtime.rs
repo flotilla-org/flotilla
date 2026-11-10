@@ -7,10 +7,10 @@ use std::{collections::BTreeSet, path::Path, sync::Arc};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
-    canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutSpec, Convoy,
+    canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutSpec,
     LandedEvidence,
 };
-use flotilla_store::{ReplicaReadResolver, ResourceBackend};
+use flotilla_store::ReplicaReadResolver;
 use flotilla_vcs::checkout_integration::{inspect_recorded_checkout_integration, ChangeRequestIntegrationInput, RecordedAssociation};
 use flotilla_vcs::vcs as core_vcs;
 use flotilla_vcs::vcs::CheckoutRegistration;
@@ -331,29 +331,17 @@ async fn cleanup_convoy_checkout_parents(runner: &dyn CommandRunner, target: &Pa
 }
 
 pub async fn sweep_host_empty_convoy_directories(
-    backend: &ResourceBackend,
+    convoys: &dyn flotilla_resources::convoy_records::ConvoyRecords,
     environments: &dyn flotilla_resources::environment_records::EnvironmentRecords,
     host: &str,
 ) -> Result<(), String> {
-    // Repository roots are shared across namespaces. Include replicated convoys,
-    // and fail closed on any listing error before touching the filesystem.
-    // VesselPlanning reads its existing Convoy before creating Checkouts;
-    // checkout provisioning therefore starts after the owner is in this store.
-    // A late Git materialisation after owner deletion recreates missing parents;
+    // Repository roots are shared by every home's convoys: include each launch this store holds,
+    // and fail closed on any listing error before touching the filesystem. A launch is held
+    // before its checkouts are requested, so provisioning starts after it is listed here.
+    // A late Git materialisation after the launch is gone recreates missing parents;
     // rmdir can race only while empty and cannot remove materialised files.
-    let mut live = BTreeSet::new();
-    for namespace in backend.stored_namespaces::<Convoy>().await.map_err(|error| error.to_string())? {
-        live.extend(
-            backend
-                .including_replicas::<Convoy>(&namespace)
-                .list()
-                .await
-                .map_err(|error| error.to_string())?
-                .items
-                .into_iter()
-                .map(|convoy| flotilla_resources::convoy::engine::launch_slug(&convoy.object.metadata.name)),
-        );
-    }
+    let live =
+        convoys.every()?.into_iter().map(|launch| flotilla_resources::convoy::engine::launch_slug(&launch.name)).collect::<BTreeSet<_>>();
     // The host's own environments are homed here, and never released.
     let mut roots = BTreeSet::new();
     for environment in environments.live()? {

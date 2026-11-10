@@ -327,15 +327,12 @@ impl DaemonRuntime {
             ),
             tokio::spawn(Arc::clone(&blob_store).run_sync()),
             tokio::spawn(run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store))),
-            tokio::spawn(run_checkout_archive_gc(
-                daemon.resource_backend(),
-                CheckoutArchiveSweep {
-                    daemon: Arc::clone(&daemon),
-                    catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
-                    roots: archive_roots,
-                    retention_days: daemon_config.checkout_archive_retention_days,
-                },
-            )),
+            tokio::spawn(run_checkout_archive_gc(CheckoutArchiveSweep {
+                daemon: Arc::clone(&daemon),
+                catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
+                roots: archive_roots,
+                retention_days: daemon_config.checkout_archive_retention_days,
+            })),
             spawn_heartbeat_task_with_credentials(
                 Arc::clone(&daemon),
                 options.namespace.clone(),

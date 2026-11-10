@@ -76,7 +76,6 @@ pub fn run(
                     .durable_vessels(durable.including_replicas::<flotilla_resources::Vessel>(namespace))
                     .durable_hosts(durable.including_replicas::<flotilla_resources::Host>(namespace))
                     // Clone has no replication contract; remote failures arrive through Checkout status.
-                    .observed_convoys(observed.clone().using::<Convoy>(namespace))
                     .observed_sessions(observed.including_replicas::<flotilla_resources::TerminalSession>(namespace))
                     .observed_checkouts(observed.using::<Checkout>(namespace))
                     .build(),

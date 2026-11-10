@@ -143,7 +143,7 @@ pub(super) async fn run_artifact_gc(backend: ResourceBackend, namespace: String,
     }
 }
 
-pub(super) async fn run_checkout_archive_gc(backend: ResourceBackend, archive_sweep: CheckoutArchiveSweep) {
+pub(super) async fn run_checkout_archive_gc(archive_sweep: CheckoutArchiveSweep) {
     let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -151,9 +151,9 @@ pub(super) async fn run_checkout_archive_gc(backend: ResourceBackend, archive_sw
         {
             if let Some(host) = archive_sweep.daemon.local_host_id() {
                 let reads = archive_sweep.daemon.lifecycle_reads();
-                let swept = match reads.environments() {
-                    Ok(environments) => sweep_host_empty_convoy_directories(&backend, environments, host.as_str()).await,
-                    Err(error) => Err(error),
+                let swept = match (reads.convoys(), reads.environments()) {
+                    (Ok(convoys), Ok(environments)) => sweep_host_empty_convoy_directories(convoys, environments, host.as_str()).await,
+                    (Err(error), _) | (_, Err(error)) => Err(error),
                 };
                 if let Err(error) = swept {
                     warn!(%error, "empty convoy directory sweep failed");

@@ -453,18 +453,15 @@ async fn archive_sweep_continues_to_the_next_remote_root_after_a_timeout() {
     daemon
         .register_direct_environment_for_test(EnvironmentId::new("remote"), runner.clone(), EnvironmentBag::new(), None)
         .expect("register remote sweep runner");
-    let task = tokio::spawn(run_checkout_archive_gc(
-        daemon.resource_backend(),
-        CheckoutArchiveSweep {
-            daemon,
-            catalog_path: temp.path().join("missing-catalog"),
-            roots: vec![
-                CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/a".into() },
-                CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/b".into() },
-            ],
-            retention_days: 14,
-        },
-    ));
+    let task = tokio::spawn(run_checkout_archive_gc(CheckoutArchiveSweep {
+        daemon,
+        catalog_path: temp.path().join("missing-catalog"),
+        roots: vec![
+            CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/a".into() },
+            CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/b".into() },
+        ],
+        retention_days: 14,
+    }));
     tokio::time::timeout(Duration::from_secs(5), runner.finished.notified()).await.expect("later root swept");
     assert_eq!(*runner.roots.lock().expect("roots"), ["/archives/a", "/archives/b"]);
     task.abort();

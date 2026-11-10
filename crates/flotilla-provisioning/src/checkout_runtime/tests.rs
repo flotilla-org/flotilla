@@ -1,5 +1,4 @@
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::BTreeSet,
     fs,
@@ -18,7 +17,7 @@ use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_resources::{
     environment_records::{EnvironmentRecord, EnvironmentRecords},
-    CheckoutBranchProvenance, Convoy, ConvoySpec, EnvironmentSpec, HostDirectEnvironmentSpec,
+    CheckoutBranchProvenance, EnvironmentSpec, HostDirectEnvironmentSpec,
 };
 use flotilla_store::ResourceBackend;
 use tempfile::TempDir;
@@ -314,61 +313,126 @@ impl EnvironmentRecords for LiveEnvironments {
     }
 }
 
-// #2610: a convoy in another namespace protects its shared host root,
-// using the same sanitized directory name as checkout provisioning.
-// Roots belonging to another host must never be swept by this daemon.
+/// The launches this store holds, at every home, or the error their listing fails with.
+struct Launches(Result<Vec<String>, String>, flotilla_resources::convoy_records::ConvoyMemory);
+
+impl Launches {
+    fn named(names: &[&str]) -> Self {
+        Self(Ok(names.iter().map(|name| (*name).to_owned()).collect()), Default::default())
+    }
+
+    fn record(name: &str) -> flotilla_resources::convoy_records::ConvoyRecord {
+        use flotilla_resources::convoy::admission::AdmissionDocument;
+        let snapshot = flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+            vessels: Vec::new(),
+        };
+        let (launch_of, launch) = flotilla_resources::convoy::engine::split_launch(name).expect("a launch name");
+        flotilla_resources::convoy_records::ConvoyRecord {
+            name: name.into(),
+            home: "elsewhere".into(),
+            version: 1,
+            launch_of: launch_of.into(),
+            launch,
+            project: "another-project".into(),
+            workflow_ref: "test".into(),
+            admission: AdmissionDocument {
+                workflow_snapshot: snapshot,
+                placement_decision: None,
+                placement_policy: None,
+                role: String::new(),
+                ensure_admission: None,
+                naming: None,
+                dispatching_principal_ref: flotilla_protocol::PrincipalRef { namespace: NAMESPACE.into(), name: "robert".into() },
+                continuation: None,
+                inputs: Default::default(),
+                repositories: Vec::new(),
+                r#ref: None,
+                adopted_checkout_refs: Default::default(),
+                subjects: Vec::new(),
+                instruction: None,
+                workflow_template: None,
+                placement_snapshot: None,
+                vessel_placements: Default::default(),
+                brief_artifacts: false,
+                adopted_checkout: None,
+                provenance: Default::default(),
+            },
+            admitted_at: chrono::Utc::now(),
+            ended: None,
+            seats: Default::default(),
+            promises: Default::default(),
+            subjects: Vec::new(),
+            unlinked: Vec::new(),
+        }
+    }
+}
+
+impl flotilla_resources::convoy_records::ConvoyRecords for Launches {
+    fn home(&self) -> &str {
+        "home"
+    }
+    fn get(&self, _: &str, _: Option<&str>) -> Result<Option<flotilla_resources::convoy_records::ConvoyRecord>, String> {
+        unreachable!("the sweep lists every launch")
+    }
+    fn newest(&self, _: &str, _: &str, _: Option<&str>) -> Result<Option<flotilla_resources::convoy_records::ConvoyRecord>, String> {
+        unreachable!("the sweep lists every launch")
+    }
+    fn at(&self, _: &str) -> Result<Vec<flotilla_resources::convoy_records::ConvoyRecord>, String> {
+        unreachable!("the sweep lists every launch")
+    }
+    fn every(&self) -> Result<Vec<flotilla_resources::convoy_records::ConvoyRecord>, String> {
+        self.0.clone().map(|names| names.iter().map(|name| Self::record(name)).collect())
+    }
+    fn memory(&self) -> &flotilla_resources::convoy_records::ConvoyMemory {
+        &self.1
+    }
+}
+
+// #2610: another home's launch protects its shared host root, using the same path-safe
+// directory name as checkout provisioning. Roots belonging to another host are never swept by
+// this daemon.
 #[tokio::test]
-async fn empty_convoy_sweep_respects_namespaces_and_hosts() {
+async fn empty_convoy_sweep_respects_other_homes_and_hosts() {
     let temp = TempDir::new().expect("test fixture operation succeeds");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
     let local = temp.path().join("local");
     let remote = temp.path().join("remote");
-    fs::create_dir_all(local.join("convoy-live")).expect("test fixture operation succeeds");
+    let live = flotilla_resources::convoy::engine::launch_slug("convoy-live#3");
+    fs::create_dir_all(local.join(&live)).expect("test fixture operation succeeds");
     fs::create_dir_all(local.join("convoy-gone")).expect("test fixture operation succeeds");
     fs::create_dir_all(remote.join("convoy-gone")).expect("test fixture operation succeeds");
     let environments = LiveEnvironments::host_direct([("local-env", "local", local.as_path()), ("remote-env", "remote", remote.as_path())]);
-    backend
-        .using::<Convoy>("another-project")
-        .create(&empty_meta("convoy/live"), &ConvoySpec::builder().workflow_ref("test".into()).build())
+    sweep_host_empty_convoy_directories(&Launches::named(&["convoy-live#3"]), &environments, "local")
         .await
         .expect("test fixture operation succeeds");
-    sweep_host_empty_convoy_directories(&backend, &environments, "local").await.expect("test fixture operation succeeds");
-    assert!(local.join("convoy-live").exists());
+    assert!(local.join(&live).exists());
     assert!(!local.join("convoy-gone").exists());
     assert!(remote.join("convoy-gone").exists());
 }
 
-// #2610: failed resource discovery must leave every candidate untouched.
-// Corrupt the real SQLite store's sequence table to make the Convoy listing
-// fail after namespace discovery; with no Convoy namespace, the engine's
-// listing of this home's environments fails instead.
+// #2610: a failed listing of launches or environments leaves every candidate untouched.
 #[tokio::test]
 async fn empty_convoy_sweep_fails_closed_on_listing_errors() {
-    for has_convoy_namespace in [false, true] {
+    for launches_fail in [false, true] {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("repos");
         let candidate = root.join("convoy-orphan");
         fs::create_dir_all(&candidate).expect("empty stale convoy directory");
-        let database = temp.path().join("resources.sqlite");
-        let backend = ResourceBackend::new(SqliteBackend::open(&database).expect("resource store"));
-        if has_convoy_namespace {
-            backend
-                .using::<Convoy>(NAMESPACE)
-                .create(&empty_meta("convoy-live"), &ConvoySpec::builder().workflow_ref("test".into()).build())
-                .await
-                .expect("live convoy");
-        }
-        let connection = rusqlite::Connection::open(&database).expect("fault injection connection");
-        connection.execute("DROP TABLE resource_sequences", []).expect("inject listing failure");
-        drop(connection);
-        let environments = if has_convoy_namespace {
-            LiveEnvironments::host_direct([("host-direct", "local", root.as_path())])
+        let (launches, environments) = if launches_fail {
+            (
+                Launches(Err("launch listing failed".into()), Default::default()),
+                LiveEnvironments::host_direct([("host-direct", "local", root.as_path())]),
+            )
         } else {
-            LiveEnvironments(Err("environment listing failed".into()))
+            (Launches::named(&[]), LiveEnvironments(Err("environment listing failed".into())))
         };
         let error =
-            sweep_host_empty_convoy_directories(&backend, &environments, "local").await.expect_err("failed listing must stop sweep");
-        let expected = if has_convoy_namespace { "resource_sequences" } else { "environment listing failed" };
+            sweep_host_empty_convoy_directories(&launches, &environments, "local").await.expect_err("failed listing must stop sweep");
+        let expected = if launches_fail { "launch listing failed" } else { "environment listing failed" };
         assert!(error.contains(expected), "{error}");
         assert!(candidate.exists(), "listing failure must preserve empty candidates");
     }
@@ -1317,10 +1381,6 @@ async fn fresh_clone_checkout_refuses_an_existing_convoy_branch() {
         .expect_err("existing branch must be refused");
     assert!(error.contains("feature/existing"), "{error}");
     assert!(!target.exists(), "refusal must leave no clone");
-}
-
-fn empty_meta(name: &str) -> flotilla_resources::InputMeta {
-    flotilla_resources::InputMeta::builder().name(name.to_string()).build()
 }
 
 // #3090: teardown preserves dirty local clones, including nested subagent work,
