@@ -4,6 +4,7 @@ Kind tables only; the shared tables are in `definitions.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
+| `convoy_ensure` | root | 11 | – | – | – |
 | `credential_spec` | root | 27 | 23: `consumer` 16, `source` 7 | `credential_spec_binaries` (child) | – |
 | `credential_spec_binaries` | child | 2 | – | – | – |
 | `crew_defaults` | root | 6 | – | `crew_defaults_roles` (child) | – |

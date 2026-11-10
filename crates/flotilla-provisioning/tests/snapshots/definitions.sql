@@ -55,6 +55,32 @@ CREATE TABLE snapshot_cause (
 CREATE TABLE codes (
   kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
   PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
+CREATE TABLE "convoy_ensure" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "project" TEXT NOT NULL,
+  "role" TEXT NOT NULL,
+  "driver" TEXT,
+  "workflow" TEXT NOT NULL,
+  "placement" TEXT,
+  "escalation_reason" TEXT,
+  "presents_as" TEXT,
+  "repositories" BLOB NOT NULL,
+  "agent_overrides" BLOB NOT NULL
+) STRICT;
+CREATE VIEW "convoy_ensure_view" AS SELECT
+  "convoy_ensure"."id",
+  "convoy_ensure"."version",
+  "convoy_ensure"."project",
+  "convoy_ensure"."role",
+  "convoy_ensure"."driver",
+  "convoy_ensure"."workflow",
+  "convoy_ensure"."placement",
+  "convoy_ensure"."escalation_reason",
+  "convoy_ensure"."presents_as",
+  "convoy_ensure"."repositories",
+  "convoy_ensure"."agent_overrides"
+FROM "convoy_ensure";
 CREATE TABLE "credential_spec" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

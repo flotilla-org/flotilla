@@ -10,12 +10,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_protocol::RepositoryKey;
+use flotilla_protocol::{AgentOverride, RepositoryKey};
 use flotilla_resources::{
-    CredentialConsumer, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements,
-    CredentialSource, CredentialSpecSpec, CrewDefaultsSpec, FleetDesignationSpec, ForgeKind, ForgeSpec, HostActionSelector,
-    HostImageAction, ImageCacheBinding, ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageSelection, LandingCredentialScope,
-    RepositoryTrust, RoleDefinition, WorkflowTemplateSpec,
+    ConvoyEnsureSpec, CredentialConsumer, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpecSpec, CrewDefaultsSpec, FleetDesignationSpec, ForgeKind, ForgeSpec,
+    HostActionSelector, HostImageAction, ImageCacheBinding, ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageSelection,
+    LandingCredentialScope, RepositoryTrust, RoleDefinition, WorkflowTemplateSpec,
 };
 use flotilla_schema::{Frozen, KindRegistry, RegistryError, Stored};
 
@@ -300,9 +300,59 @@ impl WorkflowTemplateDefinition {
     }
 }
 
+/// A standing convoy's declaration, as the engine stores it: kind code `ce`. Project operations
+/// materialise it from a project's operational entries. It holds no status: the ensure pass derives
+/// that from the role's launches and the engine Ensure. The repositories and agent overrides keep
+/// their authored order, which the configuration-drift comparison reads, so each is a document.
+#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+#[store(kind = "ConvoyEnsure", code = "ce")]
+pub struct ConvoyEnsureDefinition {
+    pub project: String,
+    pub role: String,
+    pub driver: Option<String>,
+    pub workflow: String,
+    pub placement: Option<String>,
+    pub escalation_reason: Option<String>,
+    pub presents_as: Option<String>,
+    #[store(cbor)]
+    pub repositories: Vec<String>,
+    #[store(cbor)]
+    pub agent_overrides: Vec<AgentOverride>,
+}
+
+impl ConvoyEnsureDefinition {
+    pub fn new(spec: &ConvoyEnsureSpec) -> Self {
+        Self {
+            project: spec.project_ref.clone(),
+            role: spec.role.clone(),
+            driver: spec.driver_ref.clone(),
+            workflow: spec.workflow_ref.clone(),
+            placement: spec.placement_policy.clone(),
+            escalation_reason: spec.escalation_reason.clone(),
+            presents_as: spec.presents_as.clone(),
+            repositories: spec.repositories.iter().map(|key| key.0.clone()).collect(),
+            agent_overrides: spec.agent_overrides.clone(),
+        }
+    }
+
+    pub fn spec(&self) -> ConvoyEnsureSpec {
+        ConvoyEnsureSpec {
+            project_ref: self.project.clone(),
+            role: self.role.clone(),
+            driver_ref: self.driver.clone(),
+            workflow_ref: self.workflow.clone(),
+            placement_policy: self.placement.clone(),
+            escalation_reason: self.escalation_reason.clone(),
+            repositories: self.repositories.iter().map(|key| RepositoryKey(key.clone())).collect(),
+            presents_as: self.presents_as.clone(),
+            agent_overrides: self.agent_overrides.clone(),
+        }
+    }
+}
+
 /// Registers the definition kinds into `registry` under their codes: Forge `fo`,
 /// FleetDesignation `fl`, CredentialSpec `cp`, CredentialGrant `gt`, CrewDefaults `dc`,
-/// ImageLayer `il` and WorkflowTemplate `wt`. All are plain kinds.
+/// ImageLayer `il`, WorkflowTemplate `wt` and ConvoyEnsure `ce`. All are plain kinds.
 pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     registry.register::<ForgeDefinition>()?;
     registry.register::<FleetDesignationDefinition>()?;
@@ -311,6 +361,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     registry.register::<CrewDefaultsDefinition>()?;
     registry.register::<ImageLayerDefinition>()?;
     registry.register::<WorkflowTemplateDefinition>()?;
+    registry.register::<ConvoyEnsureDefinition>()?;
     Ok(())
 }
 
