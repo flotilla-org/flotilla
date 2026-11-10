@@ -14,6 +14,10 @@ pub async fn standing_ensure_holds_after_three_failed_generations_and_resumes_wh
             .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
             .await
             .expect("record failed generation");
+        // The pass tells its caller when the backoff ends, as nothing else wakes it then.
+        let retry_at =
+            backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.expect("status").retry_at;
+        assert_eq!(daemon.convoy_ensure_next_due("flotilla").await.expect("next due"), retry_at);
         clock.advance(ChronoDuration::seconds(delay));
         daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("admit replacement");
     }
@@ -36,6 +40,7 @@ pub async fn standing_ensure_holds_after_three_failed_generations_and_resumes_wh
         .await
         .expect("remain held")
         .is_empty());
+    assert_eq!(daemon.convoy_ensure_next_due("flotilla").await.expect("next due"), None, "a hold waits for a person, not a time");
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 3);
 
     apply_resource_status_patch(

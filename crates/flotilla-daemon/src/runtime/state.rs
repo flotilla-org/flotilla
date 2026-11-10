@@ -4,10 +4,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex as StdMutex,
-    },
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use async_trait::async_trait;
@@ -71,8 +68,9 @@ pub(super) struct ControllerRuntimeState {
     pub(super) image_build_service: Option<Arc<dyn flotilla_environment::environment::ImageBuildService>>,
     pub(super) provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     /// Latched after one complete post-startup local Docker adoption pass.
-    /// A fresh provider listing is still required for each absence judgement.
-    pub(super) local_backing_observed: AtomicBool,
+    /// A fresh provider listing is still required for each absence judgement. Subscribers wake
+    /// when it latches.
+    pub(super) local_backing_observed: tokio::sync::watch::Sender<bool>,
     pub(super) clone_flights: Arc<CloneFlights>,
     pub(super) terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
     /// Composer drafts set aside for machinery turns, held only in memory.
@@ -326,7 +324,7 @@ impl ControllerRuntimeState {
             image_inventory: None,
             image_build_service: None,
             provisioned_environments: Mutex::new(HashMap::new()),
-            local_backing_observed: AtomicBool::new(false),
+            local_backing_observed: tokio::sync::watch::Sender::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
             composer_drafts: Arc::default(),
@@ -553,7 +551,7 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 .as_ref()
                 .and_then(|status| status.placement_decision.as_ref())
                 .map(|decision| &decision.target_host.reference);
-            if home != Some(&local_host_id) || !self.local_backing_observed.load(Ordering::Acquire) {
+            if home != Some(&local_host_id) || !*self.local_backing_observed.borrow() {
                 return Err("no backing environment evidence is available".to_string());
             }
             // Unlike the general provisioning profile's per_vessel capability

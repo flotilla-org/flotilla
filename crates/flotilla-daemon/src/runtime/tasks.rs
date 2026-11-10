@@ -939,6 +939,19 @@ pub(super) async fn convoy_ensure_dependency_watches(
         }
         Err(error) => warn!(kind = "Clone", %error, "could not watch standing convoy admission trigger"),
     }
+    // An ended environment is the backing evidence a standing convoy's successor waits for.
+    match reads.environments() {
+        Ok(environments) => {
+            let changed = futures::stream::unfold(environments.changes(), |mut changes| async move {
+                match changes.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((Ok(Value::Null), changes)),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                }
+            });
+            watches.push(Box::pin(changed) as BoxStream<'static, Result<Value, ResourceError>>);
+        }
+        Err(error) => warn!(kind = "Environment", %error, "could not watch standing convoy backing evidence"),
+    }
     // Clone and ConvoyEnsure lifecycle changes are trigger dependencies:
     // renewed clone demand and ensure readmission can unblock work even
     // though their payloads are not part of the admission hash.
@@ -954,7 +967,14 @@ pub(super) async fn convoy_ensure_dependency_watches(
         "Host",
     ] {
         match watch_resource_kind_including_replicas(backend, namespace, kind).await {
-            Ok(watch) => watches.push(watch.stream),
+            // A watch that ends is told as a failure, so the task subscribes again rather than
+            // silently losing the kind's changes.
+            Ok(watch) => watches.push(
+                watch
+                    .stream
+                    .chain(futures::stream::once(async move { Err(ResourceError::other(format!("the {kind} watch ended"))) }))
+                    .boxed(),
+            ),
             Err(error) => warn!(%kind, %error, "could not watch standing convoy admission dependency"),
         }
     }
@@ -975,53 +995,112 @@ pub(super) async fn convoy_ensure_dependency_watches(
     futures::stream::select_all(watches)
 }
 
+/// A failed ensure pass retries from one second to a minute, and after this many failures waits
+/// for the next change.
+const CONVOY_ENSURE_RETRY_LIMIT: u32 = 10;
+const CONVOY_ENSURE_RETRY: RetryBackoff = RetryBackoff { initial: Duration::from_secs(1), maximum: Duration::from_secs(60) };
+
+/// The ensure pass wakes on its dependencies' changes, at the time it last deferred an ensure to
+/// (a strike or admission retry, or a backoff reset), and to retry its own failure.
 pub(super) fn spawn_convoy_ensure_reconciler_task(
     state: Arc<ControllerRuntimeState>,
     namespace: String,
-    interval: Duration,
+    overrun_after: Duration,
     runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let backend = state.daemon.resource_backend();
-        let mut dependency_events = convoy_ensure_dependency_watches(&backend, &namespace, &state.daemon.lifecycle_reads()).await;
-        let mut resync = tokio::time::interval(interval);
-        resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let dependencies = || async {
+            let mut events = convoy_ensure_dependency_watches(&backend, &namespace, &state.daemon.lifecycle_reads()).await;
+            // The local backing inventory latching is backing evidence too.
+            let observed = futures::stream::unfold(state.local_backing_observed.subscribe(), |mut observed| async move {
+                observed.changed().await.ok().map(|()| (Ok(Value::Null), observed))
+            });
+            events.push(Box::pin(observed) as BoxStream<'static, Result<Value, ResourceError>>);
+            events
+        };
+        let mut dependency_events = dependencies().await;
+        let clock = state.daemon.clock_for_scenarios();
+        let mut jumps = clock.jumps();
+        let mut failures = 0_u32;
+        let mut watch_failures = 0_u32;
         loop {
-            let mut restart_watches = dependency_events.is_empty();
-            tokio::select! {
-                _ = resync.tick() => {}
-                event = dependency_events.next(), if !dependency_events.is_empty() => {
-                    if let Some(Err(error)) = event {
-                        warn!(%error, "standing convoy admission dependency watch failed");
-                        restart_watches = true;
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    while let Some(Some(event)) = dependency_events.next().now_or_never() {
-                        if let Err(error) = event {
-                            warn!(%error, "standing convoy admission dependency watch failed");
-                            restart_watches = true;
-                        }
-                    }
-                }
-            }
-            if restart_watches {
-                // Reconciliation below is level-triggered; re-arm dependencies
-                // after overflow so subsequent changes still wake admission.
-                dependency_events = convoy_ensure_dependency_watches(&backend, &namespace, &state.daemon.lifecycle_reads()).await;
-            }
             let result = run_watched_operation(
-                interval,
+                overrun_after,
                 state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state),
                 || {
-                    runtime_health.report_convoy_ensure_timeout(interval);
-                    warn!(timeout_secs = interval.as_secs(), "standing convoy ensure reconciliation pass overran its interval");
+                    runtime_health.report_convoy_ensure_timeout(overrun_after);
+                    warn!(timeout_secs = overrun_after.as_secs(), "standing convoy ensure reconciliation pass overran its budget");
                 },
             )
             .await;
             runtime_health.clear_convoy_ensure_timeout();
-            match result {
-                Ok(changes) => info!(changes = changes.len(), "standing convoy ensure reconciler alive"),
-                Err(error) => warn!(%error, "standing convoy ensure reconciliation pass failed"),
+            let retry = match result {
+                Ok(changes) => {
+                    failures = 0;
+                    info!(changes = changes.len(), "standing convoy ensure reconciler alive");
+                    None
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    if failures >= CONVOY_ENSURE_RETRY_LIMIT {
+                        error!(%error, failures, "standing convoy ensure reconciliation keeps failing; waiting for the next change");
+                        None
+                    } else {
+                        warn!(%error, failures, "standing convoy ensure reconciliation pass failed");
+                        Some(tokio::time::Instant::now() + CONVOY_ENSURE_RETRY.delay(failures))
+                    }
+                }
+            };
+            let due = state.daemon.convoy_ensure_next_due(&namespace).await.unwrap_or_else(|error| {
+                warn!(%error, "standing convoy ensure due time is unavailable");
+                None
+            });
+            let mut restart_watches = dependency_events.is_empty();
+            loop {
+                // Measured on the daemon's clock, again whenever that clock jumps.
+                let due_wait = due.map(|due| (due - clock.now()).to_std().unwrap_or_default());
+                tokio::select! {
+                    _ = tokio::time::sleep_until(retry.unwrap_or_else(tokio::time::Instant::now)), if retry.is_some() => {}
+                    _ = tokio::time::sleep(due_wait.unwrap_or_default()), if due_wait.is_some() => {}
+                    jumped = async { jumps.as_mut().expect("guarded").changed().await }, if jumps.is_some() && due.is_some() => {
+                        if jumped.is_err() {
+                            jumps = None;
+                        }
+                        continue;
+                    }
+                    event = dependency_events.next(), if !dependency_events.is_empty() => {
+                        if let Some(Err(error)) = event {
+                            warn!(%error, "standing convoy admission dependency watch failed");
+                            restart_watches = true;
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        while let Some(Some(event)) = dependency_events.next().now_or_never() {
+                            if let Err(error) = event {
+                                warn!(%error, "standing convoy admission dependency watch failed");
+                                restart_watches = true;
+                            }
+                        }
+                        // A change revives a pass that gave up.
+                        if failures >= CONVOY_ENSURE_RETRY_LIMIT {
+                            failures = 0;
+                        }
+                    }
+                    else => {
+                        // Every dependency stream ended: re-arm them, paced.
+                        watch_failures = watch_failures.saturating_add(1);
+                        tokio::time::sleep(CONVOY_ENSURE_RETRY.delay(watch_failures)).await;
+                        restart_watches = true;
+                    }
+                }
+                break;
+            }
+            if restart_watches {
+                // Reconciliation is level-triggered; re-arm dependencies
+                // after overflow so subsequent changes still wake admission.
+                dependency_events = dependencies().await;
+            } else {
+                watch_failures = 0;
             }
         }
     })

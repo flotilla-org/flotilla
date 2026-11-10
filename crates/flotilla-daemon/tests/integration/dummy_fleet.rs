@@ -526,17 +526,22 @@ async fn a_daemon_restart_restores_an_active_convoy_and_lands() {
 
 /// Wall time moved forward by however much a test skips, so retry backoff passes at once.
 #[derive(Default)]
-struct SkippingClock(std::sync::Mutex<chrono::Duration>);
+struct SkippingClock(std::sync::Mutex<chrono::Duration>, tokio::sync::watch::Sender<()>);
 
 impl SkippingClock {
     fn skip(&self, by: chrono::Duration) {
         *self.0.lock().expect("clock") += by;
+        self.1.send_replace(());
     }
 }
 
 impl flotilla_resources::Clock for SkippingClock {
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now() + *self.0.lock().expect("clock")
+    }
+
+    fn jumps(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        Some(self.1.subscribe())
     }
 }
 

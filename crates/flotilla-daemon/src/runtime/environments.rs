@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     time::Duration,
 };
 
@@ -118,7 +118,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
             observed = true;
         }
         if observed {
-            state.local_backing_observed.store(true, Ordering::Release);
+            state.local_backing_observed.send_if_modified(|observed| !std::mem::replace(observed, true));
         }
         return collect_cloud_reconciliations(cloud_reconciliations, Vec::new()).await;
     }
@@ -173,7 +173,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     // Cloud uncertainty must not suppress the successful Docker inventory
     // barrier used by standing-convoy teardown.
     if results.iter().all(Result::is_ok) {
-        state.local_backing_observed.store(true, Ordering::Release);
+        state.local_backing_observed.send_if_modified(|observed| !std::mem::replace(observed, true));
     }
     let mut results = results;
     if let Err(error) = collect_cloud_reconciliations(cloud_reconciliations, Vec::new()).await {
