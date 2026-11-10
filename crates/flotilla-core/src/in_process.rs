@@ -3439,48 +3439,40 @@ impl InProcessDaemon {
         Ok(())
     }
 
-    pub async fn link_convoy_subject(
-        &self,
-        namespace: &str,
-        convoy_name: &str,
-        reference: &str,
-        relationship: Option<flotilla_protocol::Relationship>,
-    ) -> Result<(), String> {
+    /// Links the subject `reference` names to convoy `convoy_name`, as an operator. How it relates
+    /// to the convoy follows from its kind: an issue is worked on, anything else produced.
+    pub async fn link_convoy_subject(&self, namespace: &str, convoy_name: &str, reference: &str) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
         let context = self.convoy_reference_context(namespace, &convoy).await?;
         let subject = context.parse(reference)?;
-        if let Some(relationship) = relationship {
-            // Produced and adopted PRs participate in settlement. Reject a
-            // mistyped repository instead of adding an unobservable terminal leaf.
-            if subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
-                && !context.repositories.iter().any(|repository| repository.source == subject.source)
-            {
-                return Err(format!("change request `{reference}` is outside this convoy's repositories"));
-            }
-            let derived = match subject.kind {
-                flotilla_protocol::SubjectKind::Issue => flotilla_protocol::Relationship::WorksOn,
-                _ => flotilla_protocol::Relationship::Produces,
-            };
-            if relationship != derived {
-                return Err(format!("a linked {:?} is related as {derived:?}", subject.kind));
-            }
-            self.link_convoy_subjects(&convoy, [subject], flotilla_resources::SubjectDiscoverySource::Operator, "operator").await?;
-        } else {
-            if convoy.spec.subjects.iter().any(|entry| entry.subject == subject) {
-                return Err("declared convoy subjects cannot be unlinked; change the convoy spec".to_string());
-            }
-            flotilla_resources::convoy::engine::deciding(&self.convoy_engine_path, &convoy)
-                .ok_or_else(|| format!("convoy `{convoy_name}` is not held at this home"))?
-                .unlink(&convoy, &subject, "operator")
-                .await?;
-            // Explicit unlink must release retention even for terminal convoys,
-            // which the live-demand watch intentionally does not list. If cleanup
-            // fails, the marker remains persisted; retrying this command is safe,
-            // and the observer also retries cleanup independently.
-            self.leaf_subscription_diagnostics.0.release_unlinked_change_request_claims(namespace).await?;
+        // Produced and adopted PRs participate in settlement. Reject a
+        // mistyped repository instead of adding an unobservable terminal leaf.
+        if subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+            && !context.repositories.iter().any(|repository| repository.source == subject.source)
+        {
+            return Err(format!("change request `{reference}` is outside this convoy's repositories"));
         }
-        Ok(())
+        self.link_convoy_subjects(&convoy, [subject], flotilla_resources::SubjectDiscoverySource::Operator, "operator").await
+    }
+
+    /// Unlinks the subject `reference` names from convoy `convoy_name`, as an operator.
+    pub async fn unlink_convoy_subject(&self, namespace: &str, convoy_name: &str, reference: &str) -> Result<(), String> {
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+        let subject = self.convoy_reference_context(namespace, &convoy).await?.parse(reference)?;
+        if convoy.spec.subjects.iter().any(|entry| entry.subject == subject) {
+            return Err("declared convoy subjects cannot be unlinked; change the convoy spec".to_string());
+        }
+        flotilla_resources::convoy::engine::deciding(&self.convoy_engine_path, &convoy)
+            .ok_or_else(|| format!("convoy `{convoy_name}` is not held at this home"))?
+            .unlink(&convoy, &subject, "operator")
+            .await?;
+        // Explicit unlink must release retention even for terminal convoys,
+        // which the live-demand watch intentionally does not list. If cleanup
+        // fails, the marker remains persisted; retrying this command is safe,
+        // and the observer also retries cleanup independently.
+        self.leaf_subscription_diagnostics.0.release_unlinked_change_request_claims(namespace).await
     }
 
     /// Resolve the first change request whose head matches a convoy branch
@@ -6071,14 +6063,12 @@ mod person_inbox;
 
 #[async_trait]
 impl crew_actions::CrewActionPort for InProcessDaemon {
-    async fn link_convoy_subject(
-        &self,
-        namespace: &str,
-        convoy_name: &str,
-        reference: &str,
-        relationship: Option<flotilla_protocol::Relationship>,
-    ) -> Result<(), String> {
-        InProcessDaemon::link_convoy_subject(self, namespace, convoy_name, reference, relationship).await
+    async fn link_convoy_subject(&self, namespace: &str, convoy_name: &str, reference: &str) -> Result<(), String> {
+        InProcessDaemon::link_convoy_subject(self, namespace, convoy_name, reference).await
+    }
+
+    async fn unlink_convoy_subject(&self, namespace: &str, convoy_name: &str, reference: &str) -> Result<(), String> {
+        InProcessDaemon::unlink_convoy_subject(self, namespace, convoy_name, reference).await
     }
 }
 

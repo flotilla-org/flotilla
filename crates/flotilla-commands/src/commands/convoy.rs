@@ -72,8 +72,6 @@ pub struct ConvoyDeleteArgs {
 pub struct ConvoyLinkArgs {
     pub name: String,
     pub reference: String,
-    #[arg(long = "as", value_parser = parse_relationship)]
-    pub relationship: flotilla_protocol::Relationship,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
@@ -267,10 +265,6 @@ fn parse_pr_number(raw: &str) -> Result<String, String> {
     }
 }
 
-fn parse_relationship(raw: &str) -> Result<flotilla_protocol::Relationship, String> {
-    raw.parse()
-}
-
 fn resolve_adopted_checkout(path: PathBuf) -> Result<Box<PathBuf>, String> {
     std::fs::canonicalize(&path).map(Box::new).map_err(|err| format!("adopted checkout path {} cannot be resolved: {err}", path.display()))
 }
@@ -408,12 +402,12 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
-            ConvoyVerb::Link(ConvoyLinkArgs { name, reference, relationship }) => Ok(Resolved::NeedsContext {
+            ConvoyVerb::Link(ConvoyLinkArgs { name, reference }) => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
                     provisioning_target: None,
                     context_repo: None,
-                    action: CommandAction::ConvoyLink { namespace: None, name, reference, relationship },
+                    action: CommandAction::ConvoyLink { namespace: None, name, reference },
                 },
                 repo: RepoContext::None,
                 host: HostResolution::Local,
@@ -680,8 +674,8 @@ impl std::fmt::Display for ConvoyNoun {
                     write!(f, " --force")?;
                 }
             }
-            ConvoyVerb::Link(ConvoyLinkArgs { name, reference, relationship }) => {
-                write!(f, " link {} {} --as {}", quote_value(name), quote_value(reference), relationship.as_str())?;
+            ConvoyVerb::Link(ConvoyLinkArgs { name, reference }) => {
+                write!(f, " link {} {}", quote_value(name), quote_value(reference))?;
             }
             ConvoyVerb::Unlink(ConvoyUnlinkArgs { name, reference }) => {
                 write!(f, " unlink {} {}", quote_value(name), quote_value(reference))?;
@@ -843,7 +837,7 @@ mod tests {
     use clap::Parser;
     use flotilla_protocol::{
         AgentOverride, Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, DispatchPromiseRequest, IssueRef, IssueSelector,
-        IssueSource, PromiseOwner, Relationship,
+        IssueSource, PromiseOwner,
     };
 
     use super::ConvoyNoun;
@@ -896,20 +890,14 @@ mod tests {
 
     #[test]
     fn convoy_subject_link_and_unlink_resolve() {
-        let link =
-            parse(&["convoy", "link", "work@lab", "lab:robert/project-map!12", "--as", "supersedes"]).resolve().expect("link command");
+        let link = parse(&["convoy", "link", "work@lab", "lab:robert/project-map!12"]).resolve().expect("link command");
         crate::test_utils::assert_needs_context(
             link,
-            CommandAction::ConvoyLink {
-                namespace: None,
-                name: "work@lab".into(),
-                reference: "lab:robert/project-map!12".into(),
-                relationship: Relationship::Supersedes,
-            },
+            CommandAction::ConvoyLink { namespace: None, name: "work@lab".into(), reference: "lab:robert/project-map!12".into() },
             RepoContext::None,
             HostResolution::Local,
         );
-        assert_round_trip::<ConvoyNoun>(&["convoy", "link", "work@lab", "lab:robert/project-map!12", "--as", "supersedes"]);
+        assert_round_trip::<ConvoyNoun>(&["convoy", "link", "work@lab", "lab:robert/project-map!12"]);
         let unlink = parse(&["convoy", "unlink", "work@lab", "lab:robert/project-map!12"]).resolve().expect("unlink command");
         crate::test_utils::assert_needs_context(
             unlink,

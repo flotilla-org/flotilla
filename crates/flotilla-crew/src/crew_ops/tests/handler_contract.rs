@@ -9,7 +9,10 @@ use flotilla_resources::{Vessel, VesselSpec};
 struct UnusedSubjects;
 #[async_trait]
 impl CrewActionPort for UnusedSubjects {
-    async fn link_convoy_subject(&self, _: &str, _: &str, _: &str, _: Option<flotilla_protocol::Relationship>) -> Result<(), String> {
+    async fn link_convoy_subject(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+        panic!("lifecycle handlers must not resolve subject references")
+    }
+    async fn unlink_convoy_subject(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
         panic!("lifecycle handlers must not resolve subject references")
     }
 }

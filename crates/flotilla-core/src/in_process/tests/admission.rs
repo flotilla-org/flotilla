@@ -205,27 +205,17 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     let leaves = flotilla_resources::expected_change_request_leaves(&with_followup, &[]).expect("subject leaves");
     assert_eq!(leaves.len(), 6, "all three produced change requests require terminal observations");
     assert!(daemon
-        .link_convoy_subject("flotilla", "multi-repo", "wheelhouze/cleat!12", Some(flotilla_protocol::Relationship::Produces))
+        .link_convoy_subject("flotilla", "multi-repo", "wheelhouze/cleat!12")
         .await
         .expect_err("unknown GitHub repository must be rejected")
         .contains("outside this convoy's repositories"));
     assert!(daemon
-        .link_convoy_subject(
-            "flotilla",
-            "multi-repo",
-            "https://forgejo.lab.flotilla.work/robert/foreign/pulls/12",
-            Some(flotilla_protocol::Relationship::Produces)
-        )
+        .link_convoy_subject("flotilla", "multi-repo", "https://forgejo.lab.flotilla.work/robert/foreign/pulls/12",)
         .await
         .expect_err("foreign Forgejo repository must be rejected")
         .contains("outside this convoy's repositories"));
-    daemon
-        .link_convoy_subject("flotilla", "multi-repo", "lab:robert/ghostty-ops!18", Some(flotilla_protocol::Relationship::Supersedes))
-        .await
-        .expect("operator resolution");
-    let superseded = convoys.get("multi-repo").await.expect("convoy with superseded request");
-    let leaves = flotilla_resources::expected_change_request_leaves(&superseded, &[]).expect("subject leaves");
-    assert_eq!(leaves.len(), 4, "supersedes releases only the replaced change request");
+    // An operator link no longer takes a relationship (TL-4): a linked change request is
+    // produced, so a supersedes link and its release of the replaced request are gone.
 }
 
 struct ConcurrentCreateRepositoryInspector;

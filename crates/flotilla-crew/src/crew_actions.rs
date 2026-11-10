@@ -11,7 +11,6 @@ use flotilla_protocol::CommandAction;
 use flotilla_protocol::CommandCaller;
 use flotilla_protocol::CommandValue;
 use flotilla_protocol::PrincipalRef;
-use flotilla_protocol::Relationship;
 use flotilla_resources::Clock;
 use flotilla_resources::Convoy as ResourceConvoy;
 use flotilla_resources::ResourceError;
@@ -30,13 +29,8 @@ use flotilla_daemon_api::action_events::ActionEvents;
 /// directly rather than calling back through the composition root.
 #[async_trait]
 pub trait CrewActionPort: Send + Sync {
-    async fn link_convoy_subject(
-        &self,
-        namespace: &str,
-        convoy_name: &str,
-        reference: &str,
-        relationship: Option<Relationship>,
-    ) -> Result<(), String>;
+    async fn link_convoy_subject(&self, namespace: &str, convoy_name: &str, reference: &str) -> Result<(), String>;
+    async fn unlink_convoy_subject(&self, namespace: &str, convoy_name: &str, reference: &str) -> Result<(), String>;
 }
 
 pub struct CrewActions<'a> {
@@ -251,14 +245,14 @@ impl CrewActions<'_> {
     }
 
     pub async fn execute_action_convoy_link(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let CommandAction::ConvoyLink { namespace, name, reference, relationship } = &command.action {
+        if let CommandAction::ConvoyLink { namespace, name, reference } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let namespace = match namespace {
                 Some(namespace) => namespace.clone(),
                 None => self.crew.provisioning_namespace().await,
             };
             let result = match resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
-                Ok(record_name) => self.port.link_convoy_subject(&namespace, &record_name, reference, Some(*relationship)).await,
+                Ok(record_name) => self.port.link_convoy_subject(&namespace, &record_name, reference).await,
                 Err(error) => Err(error),
             };
             self.events.finish(id, empty_identity, result.map_or_else(|message| CommandValue::Error { message }, |()| CommandValue::Ok));
@@ -275,7 +269,7 @@ impl CrewActions<'_> {
                 None => self.crew.provisioning_namespace().await,
             };
             let result = match resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
-                Ok(record_name) => self.port.link_convoy_subject(&namespace, &record_name, reference, None).await,
+                Ok(record_name) => self.port.unlink_convoy_subject(&namespace, &record_name, reference).await,
                 Err(error) => Err(error),
             };
             self.events.finish(id, empty_identity, result.map_or_else(|message| CommandValue::Error { message }, |()| CommandValue::Ok));

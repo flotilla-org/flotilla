@@ -1014,7 +1014,6 @@ pub enum CommandAction {
         namespace: Option<String>,
         name: String,
         reference: String,
-        relationship: crate::Relationship,
     },
     ConvoyUnlink {
         #[serde(default, skip_serializing_if = "Option::is_none")]

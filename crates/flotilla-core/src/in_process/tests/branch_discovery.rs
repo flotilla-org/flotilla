@@ -147,17 +147,13 @@ async fn inspected_change_request_is_discovered_and_unlink_wins() {
     let convoy = convoys.get("switch-work").await.expect("convoy");
     assert_eq!(convoy.status.expect("subjects").subjects[0].subject.id, "8");
     // Repair an already persisted stale produces link, as in the operator's report.
-    fixture
-        .daemon
-        .link_convoy_subject("flotilla", "switch-work", "repo0!7", Some(flotilla_protocol::Relationship::Produces))
-        .await
-        .expect("stale link");
-    fixture.daemon.link_convoy_subject("flotilla", "switch-work", "repo0!7", None).await.expect("unlink stale merged subject");
+    fixture.daemon.link_convoy_subject("flotilla", "switch-work", "repo0!7").await.expect("stale link");
+    fixture.daemon.unlink_convoy_subject("flotilla", "switch-work", "repo0!7").await.expect("unlink stale merged subject");
     fixture.daemon.discover_convoy_branch_subjects("flotilla", "switch-work", "requested").await.expect("repair discovery");
     let repaired = convoys.get("switch-work").await.expect("convoy").status.expect("subjects");
     assert_eq!(repaired.subjects.len(), 1);
     assert_eq!(repaired.subjects[0].subject.id, "8");
-    fixture.daemon.link_convoy_subject("flotilla", "switch-work", "repo0!8", None).await.expect("unlink");
+    fixture.daemon.unlink_convoy_subject("flotilla", "switch-work", "repo0!8").await.expect("unlink");
     fixture.daemon.discover_convoy_branch_subjects("flotilla", "switch-work", "requested").await.expect("repeat discovery");
     assert!(convoys.get("switch-work").await.expect("convoy").status.expect("subjects").subjects.is_empty());
 }
