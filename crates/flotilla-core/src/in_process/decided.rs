@@ -54,6 +54,21 @@ pub fn opener_with(state_dir: impl Into<PathBuf>, before: BeforeOpen) -> EngineO
     })
 }
 
+/// What an operator does about a store this build refuses for its shape: the old store is the
+/// source the decided store is imported from at first start, so a fresh import replaces it.
+fn remedy(error: &flotilla_schema_sqlite::StoreError) -> &'static str {
+    use flotilla_schema_sqlite::StoreError::*;
+    match error {
+        LegacyDictionarySchema
+        | LegacyLogSchema
+        | KindTableDrift { .. }
+        | KindCodeDrift { .. }
+        | KindCodeRemoved { .. }
+        | KindCodeUnreadable { .. } => "; delete it and restart to re-import from the old store",
+        _ => "",
+    }
+}
+
 /// Opens the decided store at `state_dir`, homed at this daemon's node id, and the ports serving
 /// its kinds, so nothing the daemon composes reads them anywhere else.
 pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine, String> {
@@ -64,7 +79,7 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
     let path = state_dir.join(ENGINE_STORE);
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)
-            .map_err(|error| format!("open decided store {}: {error}", path.display()))?,
+            .map_err(|error| format!("open decided store {}: {error}{}", path.display(), remedy(&error)))?,
     );
     let clock = || Arc::clone(&identity.clock);
     let records: Vec<Arc<dyn EngineRecords>> = vec![
@@ -96,4 +111,28 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
         accounts,
         manifest_roots,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Behaviour: a decided store this build refuses for its shape names the file and tells the
+    // operator to delete it and restart, which re-imports it from the old store.
+    #[test]
+    fn a_refused_store_names_its_remedy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(ENGINE_STORE);
+        let conn = rusqlite::Connection::open(&path).expect("connection");
+        conn.execute_batch("CREATE TABLE strings (id INTEGER PRIMARY KEY, s TEXT NOT NULL UNIQUE) STRICT;").expect("old dictionary");
+        drop(conn);
+        let identity = EngineIdentity {
+            node_id: flotilla_protocol::NodeId::new("node"),
+            host_id: flotilla_protocol::qualified_path::HostId::new("host"),
+            clock: Arc::new(flotilla_resources::SystemClock),
+        };
+        let Err(error) = open(dir.path(), identity) else { panic!("an old dictionary is refused") };
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.ends_with("; delete it and restart to re-import from the old store"), "{error}");
+    }
 }
