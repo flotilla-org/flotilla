@@ -508,57 +508,63 @@ pub(super) fn binding_controller(
 /// The first retry delay of a provision whose reconcile failed, doubling to [`RETRY_CAP`].
 const RETRY_BASE: Duration = Duration::from_secs(1);
 const RETRY_CAP: Duration = Duration::from_secs(60);
+/// Failed reconciles of one provision before it is left until it or its binding changes.
+const RETRY_LIMIT: u32 = 10;
 
-/// The provision controller: reconciles each provision at this place when it or its binding
-/// changes, every provision once a `resync` and at start, and a failed one again with backoff.
-/// A failure to read the changes ends the run, for the supervisor to restart it.
-pub(super) async fn run_provision_controller(
-    state: Arc<ControllerRuntimeState>,
-    namespace: String,
-    resync: Duration,
-) -> Result<(), ResourceError> {
+/// The provision controller: reconciles every provision at this place at start, each one again
+/// when it or its binding changes, and a failed one again with backoff, up to [`RETRY_LIMIT`]
+/// tries; a change starts its count again. A failure to read the changes ends the run, for the
+/// supervisor to restart it.
+pub(super) async fn run_provision_controller(state: Arc<ControllerRuntimeState>, namespace: String) -> Result<(), ResourceError> {
     let accounts = state.daemon.account_records();
     let mut changes = accounts.changes(&namespace).await.map_err(ResourceError::other)?;
     let mut retries: BTreeMap<String, (u32, tokio::time::Instant)> = BTreeMap::new();
-    let mut due: BTreeSet<String> = BTreeSet::new();
-    let mut resync_at = tokio::time::Instant::now();
+    let mut failures: BTreeMap<String, u32> = BTreeMap::new();
+    // The changes stream opened first, so nothing changed since is missed by this list.
+    let mut due: BTreeSet<String> =
+        accounts.local_provisions(&namespace).await.map_err(ResourceError::other)?.into_iter().map(|provision| provision.name).collect();
     loop {
         let now = tokio::time::Instant::now();
-        if now >= resync_at {
-            due.extend(
-                accounts.local_provisions(&namespace).await.map_err(ResourceError::other)?.into_iter().map(|provision| provision.name),
-            );
-            resync_at = now + resync;
+        let ready: Vec<String> = retries.iter().filter(|(_, (_, at))| *at <= now).map(|(name, _)| name.clone()).collect();
+        for name in ready {
+            retries.remove(&name);
+            due.insert(name);
         }
-        due.extend(retries.iter().filter(|(_, (_, at))| *at <= now).map(|(name, _)| name.clone()));
         for name in std::mem::take(&mut due) {
             match reconcile_provision(&state, &namespace, &name).await {
                 Ok(()) => {
-                    retries.remove(&name);
+                    failures.remove(&name);
                 }
                 Err(error) => {
-                    let failures = retries.get(&name).map_or(0, |(failures, _)| *failures) + 1;
-                    let delay = RETRY_BASE.saturating_mul(1 << failures.min(6)).min(RETRY_CAP);
-                    tracing::warn!(provision = %name, %error, failures, "account provision reconcile failed; retrying");
-                    retries.insert(name, (failures, tokio::time::Instant::now() + delay));
+                    let failed = failures.entry(name.clone()).or_insert(0);
+                    *failed += 1;
+                    if *failed >= RETRY_LIMIT {
+                        tracing::error!(provision = %name, %error, failures = *failed, "account provision reconcile failed; left until it changes");
+                        continue;
+                    }
+                    let delay = RETRY_BASE.saturating_mul(1 << (*failed).min(6)).min(RETRY_CAP);
+                    tracing::warn!(provision = %name, %error, failures = *failed, "account provision reconcile failed; retrying");
+                    retries.insert(name, (*failed, tokio::time::Instant::now() + delay));
                 }
             }
         }
-        let wake = retries.values().map(|(_, at)| *at).chain([resync_at]).min().unwrap_or(resync_at);
+        let wake = retries.values().map(|(_, at)| *at).min();
         tokio::select! {
             change = changes.next() => match change {
                 Some(Ok(AccountChange::Provision { name, .. })) => {
+                    failures.remove(&name);
                     due.insert(name);
                 }
                 Some(Ok(AccountChange::Binding { name, .. })) => {
-                    due.extend(
-                        accounts.binding_provisions(&namespace, &[name], true).await.map_err(ResourceError::other)?.into_iter().map(|provision| provision.name),
-                    );
+                    for provision in accounts.binding_provisions(&namespace, &[name], true).await.map_err(ResourceError::other)? {
+                        failures.remove(&provision.name);
+                        due.insert(provision.name);
+                    }
                 }
                 Some(Err(error)) => return Err(ResourceError::other(error)),
                 None => return Err(ResourceError::other("account changes closed")),
             },
-            () = tokio::time::sleep_until(wake) => {}
+            () = async { match wake { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {}
         }
     }
 }
