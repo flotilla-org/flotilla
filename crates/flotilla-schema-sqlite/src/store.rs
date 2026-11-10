@@ -1507,8 +1507,8 @@ impl Ctx<'_> {
                 RowEdit::Delete { key } => sql.removed(index, &full(key)),
             });
         }
-        // A rollover drops ended-generation rows before inserting the compacted
-        // live generation. Version/from checks above cover the entire replacement.
+        // A replaced collection drops its old rows before inserting the new ones.
+        // Version/from checks above cover the entire replacement.
         for collection in collections {
             let table = self.child_table(K::CODE, 0, collection.table, collection.role)?;
             let sql = self.sql(K::CODE)?;
