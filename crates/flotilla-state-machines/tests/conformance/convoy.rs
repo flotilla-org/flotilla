@@ -44,7 +44,7 @@ use flotilla_state_machines::{
         PromiseSource, Quota, Readmit, Reassign, Reject, ReplaceSeat, Resupervise, RetireDuty, RetireSeat, Retract, Seat, SeatName, Submit,
         Terms, Unlink, VesselClass,
     },
-    Home, Ref, WriteError,
+    Home, Ref, Resource, WriteError,
 };
 use serde_json::{json, Map, Value};
 
@@ -53,7 +53,8 @@ use crate::{
     itf::{address, boolean, int, list, map_of, normalise, number, pairs, payload, set, set_of, show, tag, text, variant},
 };
 
-const NAME: &str = "c";
+/// The name every request is a launch of; its convoy is that name's newest launch.
+const LAUNCH_OF: &str = "c";
 const DECIDER: &str = "decider";
 const REVISION: &str = "r";
 
@@ -217,7 +218,7 @@ fn request_of(request: &Value) -> ConvoyRequest {
     let mut seats: Vec<Seat> = named(&request["seats"]).into_iter().map(|(name, v)| seat_of(name, v)).collect();
     seats.sort_by_key(|seat| seat.parent.is_some());
     ConvoyRequest {
-        launch_of: "c".into(),
+        launch_of: LAUNCH_OF.into(),
         workflow_ref: "w".into(),
         admission: flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new()))
             .expect("freeze"),
@@ -343,6 +344,11 @@ fn projects(request: &ConvoyRequest, known: bool) -> MemoryConvoyWorld {
     }
 }
 
+/// The convoy under test: a create names it as a launch of [`LAUNCH_OF`].
+fn convoy(home: &Home<Convoy>) -> &Resource<Convoy> {
+    home.newest_launch(LAUNCH_OF, None).expect("exists")
+}
+
 struct ConvoyConformance;
 
 impl Conformance for ConvoyConformance {
@@ -355,12 +361,13 @@ impl Conformance for ConvoyConformance {
         let mut home = Home::<Convoy>::new("home").expect("valid declaration");
         let request = admitted_request(&state["work"]);
         // An admitted convoy's project was known.
-        home.create(NAME, request.clone(), &projects(&request, true), Timestamp(0)).expect("admitted");
+        home.create(LAUNCH_OF, request.clone(), &projects(&request, true), Timestamp(0)).expect("admitted");
         home
     }
 
     fn apply(home: &mut Home<Convoy>, event: &Value) -> Step {
         let o = payload(event);
+        let name = convoy(home).name().to_owned();
         let mut world = MemoryConvoyWorld::default().with_limits(4, 1);
         let authority = Ref::new(DECIDER);
         let by = SeatName::new(DECIDER, "");
@@ -380,16 +387,16 @@ impl Conformance for ConvoyConformance {
                     target: address(&definition["target"]),
                     owner: seat(&o["owner"]),
                 };
-                outcome(home.apply(NAME, declare, &world, at))
+                outcome(home.apply(&name, declare, &world, at))
             }
             "Submit" => {
                 let reference = address(&o["reference"]);
                 let durable = Ref::new(reference.as_str());
                 world.durable.put(&durable, boolean(&o["durable"]));
                 let submit = Submit { promise: promise(), by: seat(&o["by"]), address: reference, revision: REVISION.into(), durable };
-                outcome(home.apply(NAME, submit, &world, at))
+                outcome(home.apply(&name, submit, &world, at))
             }
-            "Reject" => outcome(home.apply(NAME, Reject { promise: promise() }, &world, at)),
+            "Reject" => outcome(home.apply(&name, Reject { promise: promise() }, &world, at)),
             "Keep" => {
                 let k = payload(o);
                 let keep = match tag(o) {
@@ -401,7 +408,7 @@ impl Conformance for ConvoyConformance {
                         reason: text(&k["reason"]).into(),
                     },
                 };
-                outcome(home.apply(NAME, keep, &world, at))
+                outcome(home.apply(&name, keep, &world, at))
             }
             "Retract" => {
                 let retract = Retract {
@@ -410,14 +417,14 @@ impl Conformance for ConvoyConformance {
                     authority: authority_of(&o["authority"]),
                     reason: text(&o["reason"]).into(),
                 };
-                outcome(home.apply(NAME, retract, &world, at))
+                outcome(home.apply(&name, retract, &world, at))
             }
             "Reassign" => {
                 let reassign =
                     Reassign { promise: promise(), to: seat(&o["to"]), by: seat(&o["by"]), authority: authority_of(&o["authority"]) };
-                outcome(home.apply(NAME, reassign, &world, at))
+                outcome(home.apply(&name, reassign, &world, at))
             }
-            "RetireDuty" => outcome(home.apply(NAME, RetireDuty { duty: DutyId(id(&o["duty"])), by, authority }, &world, at)),
+            "RetireDuty" => outcome(home.apply(&name, RetireDuty { duty: DutyId(id(&o["duty"])), by, authority }, &world, at)),
             "AddSeat" => {
                 let add = AddSeat {
                     seat: seat(&o["seat"]),
@@ -426,35 +433,35 @@ impl Conformance for ConvoyConformance {
                     by,
                     authority,
                 };
-                outcome(home.apply(NAME, add, &world, at))
+                outcome(home.apply(&name, add, &world, at))
             }
             "Resupervise" => {
                 let change = Resupervise { seat: seat(&o["seat"]), supervised_by: address(&o["supervisedBy"]), by, authority };
-                outcome(home.apply(NAME, change, &world, at))
+                outcome(home.apply(&name, change, &world, at))
             }
-            "RetireSeat" => outcome(home.apply(NAME, RetireSeat { seat: seat(&o["seat"]), by, authority }, &world, at)),
+            "RetireSeat" => outcome(home.apply(&name, RetireSeat { seat: seat(&o["seat"]), by, authority }, &world, at)),
             "FailSeat" => {
                 let fail = FailSeat { seat: seat(&o["seat"]), reason: text(&o["reason"]).into(), by, authority };
-                outcome(home.apply(NAME, fail, &world, at))
+                outcome(home.apply(&name, fail, &world, at))
             }
-            "ReplaceSeat" => outcome(home.apply(NAME, ReplaceSeat(seat(o)), &world, at)),
+            "ReplaceSeat" => outcome(home.apply(&name, ReplaceSeat(seat(o)), &world, at)),
             "Link" => {
                 let link = Link { subject: address(&o["subject"]), source: link_source_of(&o["source"]), by, authority };
-                outcome(home.apply(NAME, link, &world, at))
+                outcome(home.apply(&name, link, &world, at))
             }
-            "Unlink" => outcome(home.apply(NAME, Unlink { subject: address(&o["subject"]), by, authority }, &world, at)),
-            "Deliver" => outcome(home.apply(NAME, Deliver { disposition: text(&o["disposition"]).into() }, &world, at)),
+            "Unlink" => outcome(home.apply(&name, Unlink { subject: address(&o["subject"]), by, authority }, &world, at)),
+            "Deliver" => outcome(home.apply(&name, Deliver { disposition: text(&o["disposition"]).into() }, &world, at)),
             "Abandon" => {
                 let abandon = Abandon { by, cause: cause_of(&o["cause"]), reason: text(&o["reason"]).into(), authority };
-                outcome(home.apply(NAME, abandon, &world, at))
+                outcome(home.apply(&name, abandon, &world, at))
             }
-            "Readmit" => outcome(home.apply(NAME, Readmit { quota: quota_of(&o["quota"]), by, authority }, &world, at)),
+            "Readmit" => outcome(home.apply(&name, Readmit { quota: quota_of(&o["quota"]), by, authority }, &world, at)),
             other => panic!("convoy event {other}"),
         }
     }
 
     fn encode(home: &Home<Convoy>) -> Value {
-        let c = home.get(NAME).expect("exists");
+        let c = convoy(home);
         let phase = match c.state() {
             ConvoyState::Open { .. } => bare("Open"),
             ConvoyState::Delivered { disposition, .. } => variant("Delivered", json!(disposition)),
@@ -466,7 +473,7 @@ impl Conformance for ConvoyConformance {
     }
 
     fn version(home: &Home<Convoy>) -> u64 {
-        home.get(NAME).expect("exists").version().0
+        convoy(home).version().0
     }
 }
 
@@ -479,7 +486,7 @@ fn check_admissions(nodes: &[Value], report: &mut Report) {
         let request_value = request;
         let request = request_of(request_value);
         let world = projects(&request, boolean(&request_value["projectKnown"]));
-        let rust = match home.create(NAME, request.clone(), &world, Timestamp(0)) {
+        let rust = match home.create(LAUNCH_OF, request.clone(), &world, Timestamp(0)) {
             Ok(_) => variant("Moved", ConvoyConformance::encode(&home)),
             Err(WriteError::Refused(r)) => variant("Refused", refusal_of(r)),
             Err(other) => panic!("admission of {}: {other:?}", show(request_value)),

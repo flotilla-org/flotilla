@@ -22,9 +22,11 @@ pub fn moment(ticks: i64) -> Timestamp {
     Timestamp::from_micros(ticks * UNIT)
 }
 
-/// A resource name as the model integer it stands for.
+/// A resource name as the model integer it stands for; a launch (`<id>#<n>`) stands for the id
+/// it is a launch of.
 pub fn id_of(name: &str) -> i64 {
-    name.parse().unwrap_or_else(|_| panic!("resource name {name} is not a model id"))
+    let id = name.split_once('#').map_or(name, |(of, _)| of);
+    id.parse().unwrap_or_else(|_| panic!("resource name {name} is not a model id"))
 }
 
 /// A canonical address; the world is keyed by its text.

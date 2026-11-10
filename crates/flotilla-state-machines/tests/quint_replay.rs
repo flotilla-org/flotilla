@@ -179,7 +179,8 @@ fn check_store<M: Machine>(home: &Home<M>, model: &Value, render: impl Fn(&Home<
     let ids: BTreeSet<i64> = pairs(model).iter().map(|pair| number(&pair[0])).collect();
     let stray: Vec<&str> = home.resources().map(Resource::name).filter(|name| !ids.contains(&id_of(name))).collect();
     assert!(stray.is_empty(), "{step}: {what} {stray:?} exist in Rust only");
-    same(&slots(model, |id| home.get(&id.to_string()).map(|resource| render(home, resource))), model, step, what);
+    let held = |id: i64| home.resources().find(|resource| id_of(resource.name()) == id);
+    same(&slots(model, |id| held(id).map(|resource| render(home, resource))), model, step, what);
 }
 
 // ---------------------------------------------------------------------------
@@ -661,7 +662,8 @@ fn authority_of(v: &Value) -> convoy::Authority {
 /// The request the model admitted, from the state it admitted: its fixed
 /// fields, its promises as admitted, its seats, and the quota in force at
 /// admission.
-fn convoy_request(state: &Value) -> ConvoyRequest {
+/// The request the model admitted as convoy `id`: a launch of the id's text.
+fn convoy_request(id: i64, state: &Value) -> ConvoyRequest {
     let work = convoy_work(state);
     let spec = &work["spec"];
     let promises = pairs(&work["promises"])
@@ -704,7 +706,7 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
         .collect();
     seats.sort_by_key(|seat| seat.parent.is_some());
     ConvoyRequest {
-        launch_of: "c".into(),
+        launch_of: id.to_string(),
         workflow_ref: "w".into(),
         admission: flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new()))
             .expect("freeze"),
@@ -833,10 +835,15 @@ fn abandon(reason: &str) -> convoy::Abandon {
 
 fn admit(home: &mut Home<Convoy>, step: &Step, id: i64, tally: &mut Tally) {
     let model = slot_at(step.after, "::convoys", id).expect("admitted convoy");
-    let request = convoy_request(model);
+    let request = convoy_request(id, model);
     // The model admitted it, so its project was known.
     let world = MemoryConvoyWorld::default().with_limits(3, 1).with_project(&request.project);
     create(home, &id.to_string(), request, &world, step, tally);
+}
+
+/// Model convoy `id`'s resource name: its newest launch, once admitted.
+fn convoy_name(home: &Home<Convoy>, id: i64) -> String {
+    home.newest_launch(&id.to_string(), None).map(|convoy| convoy.name().to_owned()).unwrap_or_else(|| id.to_string())
 }
 
 /// From the reached state: an Open convoy delivers only with nothing open
@@ -848,7 +855,7 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
     let operator = SeatName::new("operator", "");
     for (id, model) in entries(state, "::convoys") {
         let Some(model) = model else { continue };
-        let name = id.to_string();
+        let name = convoy_name(home, id);
         let work = convoy_work(model);
         let current = home.get(&name).expect("convoy").state().quota().clone();
         let retract =
@@ -901,7 +908,7 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
         tally.steps += 1;
         // The scenario has one convoy, 1.
         let id = 1;
-        let name = id.to_string();
+        let name = convoy_name(&home, id);
         let now = moment(number(&step.before["now"]));
         // `durable` is picked only inside the submit branch.
         let durable = matches!(&step.after["mbt::nondetPicks"]["durable"], picked if picked.get("tag").and_then(Value::as_str) == Some("Some") && boolean(payload(picked)));
