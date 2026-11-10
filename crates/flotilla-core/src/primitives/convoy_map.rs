@@ -179,7 +179,7 @@ pub fn clash(request: &ConvoyRequest) -> Option<String> {
 }
 
 /// A seat as views show it: its role, and `~<seat>` when it has one.
-fn seat_key(seat: &SeatName) -> String {
+pub(crate) fn seat_key(seat: &SeatName) -> String {
     if seat.seat.is_empty() {
         seat.role.clone()
     } else {
@@ -384,6 +384,7 @@ pub fn admission(convoy: &ResourceObject<OldConvoy>) -> Result<(String, Frozen<A
         workflow_snapshot,
         placement_decision: status.placement_decision.clone(),
         placement_policy: spec.placement_policy.clone(),
+        role: spec.role.clone(),
         ensure_admission: status.ensure_admission.clone(),
         naming: status.naming.clone(),
         dispatching_principal_ref: spec.dispatching_principal_ref.clone(),

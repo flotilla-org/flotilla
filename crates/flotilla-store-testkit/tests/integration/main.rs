@@ -2,6 +2,7 @@
 // Tests share a process: isolate state and keep process-wide mutations in separate targets.
 mod controller_loop;
 mod convoy_status_patch;
+mod convoy_views;
 mod decode_once;
 mod digest;
 mod forge_identity;

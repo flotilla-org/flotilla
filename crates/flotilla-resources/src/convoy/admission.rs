@@ -27,6 +27,9 @@ pub struct AdmissionDocument {
     /// The FulfilmentKind admission placed vessels by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_policy: Option<String>,
+    /// The role it was admitted for: a finite convoy's; a standing one's is its ensure's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
     /// The ensure configuration that admitted a standing convoy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensure_admission: Option<ConvoyEnsureSpec>,
@@ -126,6 +129,7 @@ mod tests {
             workflow_snapshot: snapshot(),
             placement_decision: None,
             placement_policy: Some("docker-on-kiwi".into()),
+            role: String::new(),
             ensure_admission: None,
             naming: None,
             dispatching_principal_ref: PrincipalRef { namespace: "flotilla".into(), name: "robert".into() },

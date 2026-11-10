@@ -222,6 +222,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for WithAgentSessions {
     fn vessels(&self) -> Result<&dyn flotilla_resources::vessel_records::VesselRecords, String> {
         self.reads.vessels()
     }
+
+    fn convoys(&self) -> Result<&dyn flotilla_resources::convoy_records::ConvoyRecords, String> {
+        self.reads.convoys()
+    }
 }
 
 mod agent_sessions {

@@ -27,6 +27,7 @@ mod controller_retry;
 #[doc(hidden)]
 pub mod convoy;
 mod convoy_ensure;
+pub mod convoy_records;
 mod credential;
 pub mod crew_defaults;
 pub use crew_defaults::{

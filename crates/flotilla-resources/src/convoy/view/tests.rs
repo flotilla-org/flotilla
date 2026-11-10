@@ -32,7 +32,6 @@ fn snapshot(vessels: Vec<VesselRequirement>) -> WorkflowSnapshot {
 /// One convoy's facts, built up per test.
 struct Case {
     ended: Option<Ended>,
-    standing: bool,
     snapshot: WorkflowSnapshot,
     vessels: BTreeMap<String, VesselReading>,
     crew: BTreeMap<String, BTreeMap<String, CrewReading>>,
@@ -43,7 +42,6 @@ impl Case {
     fn two_works() -> Self {
         Case {
             ended: None,
-            standing: false,
             snapshot: snapshot(vec![requirement("build", &[], &["coder"]), requirement("review", &["build"], &["reviewer"])]),
             vessels: BTreeMap::new(),
             crew: BTreeMap::new(),
@@ -61,13 +59,7 @@ impl Case {
     }
 
     fn derive(&self) -> ConvoyReading {
-        derive(&ConvoyFacts {
-            ended: self.ended,
-            standing: self.standing,
-            snapshot: &self.snapshot,
-            vessels: &self.vessels,
-            crew: &self.crew,
-        })
+        derive(&ConvoyFacts { ended: self.ended, snapshot: &self.snapshot, vessels: &self.vessels, crew: &self.crew })
     }
 }
 
@@ -189,32 +181,23 @@ fn a_failed_vessel_fails_a_finite_convoy_and_cancels_its_unfinished_work() {
 }
 
 #[test]
-fn a_failed_crew_member_fails_a_finite_work_and_stalls_a_standing_one() {
+fn a_failed_crew_member_fails_its_work_and_convoy_standing_or_not() {
+    // A standing role's generation ends failed too: a strike, and its next launch replaces it.
     let failed = CrewReading { failed: true, ..WORKING };
-    let case = Case::two_works().vessel("build", ready()).crew("build", "coder", failed);
-    let reading = case.derive();
+    let reading = Case::two_works().vessel("build", ready()).crew("build", "coder", failed).derive();
     assert_eq!(reading.crew["build"]["coder"], CrewWorkPhase::Failed);
     assert_eq!(reading.work["build"], WorkPhase::Failed);
     assert_eq!(reading.phase, ConvoyPhase::Failed);
-    let mut standing = case;
-    standing.standing = true;
-    let reading = standing.derive();
-    assert_eq!(reading.work["build"], WorkPhase::Stalled);
-    assert_eq!(reading.phase, ConvoyPhase::Active);
 }
 
 #[test]
-fn a_standing_convoys_failed_vessel_fails_it_and_a_vanished_one_interrupts_it() {
-    // Failed costs a strike: the convoy fails and the role's next launch replaces it. Lost is
-    // replaced within the convoy.
-    let mut failed = Case::two_works().vessel("build", VesselReading::At(VesselPhase::Failed));
-    failed.standing = true;
-    let derived = failed.derive();
+fn a_failed_vessel_fails_its_convoy_and_a_vanished_one_interrupts_it() {
+    // Failed (after the Vessel's own finite retries) costs a standing role a strike: the convoy
+    // fails and the role's next launch replaces it. Lost is replaced within the convoy.
+    let derived = Case::two_works().vessel("build", VesselReading::At(VesselPhase::Failed)).derive();
     assert_eq!(derived.work["build"], WorkPhase::Failed);
     assert_eq!(derived.phase, ConvoyPhase::Failed);
-    let mut gone = Case::two_works().vessel("build", VesselReading::Gone);
-    gone.standing = true;
-    let derived = gone.derive();
+    let derived = Case::two_works().vessel("build", VesselReading::Gone).derive();
     assert_eq!(derived.work["build"], WorkPhase::Interrupted);
     assert_eq!(derived.phase, ConvoyPhase::Interrupted);
 }

@@ -65,8 +65,6 @@ pub struct CrewReading {
 #[derive(Debug, Clone, Copy)]
 pub struct ConvoyFacts<'a> {
     pub ended: Option<Ended>,
-    /// A standing convoy's: a failed crew member stalls its work rather than failing it.
-    pub standing: bool,
     pub snapshot: &'a WorkflowSnapshot,
     pub vessels: &'a BTreeMap<String, VesselReading>,
     /// Seat readings by work, then role, including seats a handoff added. A role with no
@@ -173,8 +171,10 @@ fn work_phase(
     derived: &BTreeMap<String, WorkPhase>,
 ) -> WorkPhase {
     let crew = crew.filter(|crew| !crew.is_empty());
+    // A failed seat fails its work, standing or not: a standing role's generation ends failed,
+    // a strike, and its next launch replaces it.
     if crew.is_some_and(|crew| crew.values().any(|phase| *phase == CrewWorkPhase::Failed)) {
-        return if facts.standing { WorkPhase::Stalled } else { WorkPhase::Failed };
+        return WorkPhase::Failed;
     }
     let (promises, open) = owed(facts.crew.get(name).into_iter().flat_map(BTreeMap::values));
     if promises > 0 && open == 0 {

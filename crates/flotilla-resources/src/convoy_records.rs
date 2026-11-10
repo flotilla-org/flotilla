@@ -1,0 +1,410 @@
+//! Convoys in the old Convoy shape, read from the engine's launches (#3108).
+//!
+//! The engine holds each convoy as a launch (`<launch_of>#<n>`, [`ConvoyRecord`]). Nothing about
+//! a convoy's phases is stored: [`ConvoyRecord::read_view`] derives its phase, each work's and
+//! each crew member's with [`super::convoy::view::derive`] from the launch, the Vessels of its
+//! works and its seats' readings, so every reader sees the same phases at the same inputs.
+//!
+//! What only the convoy's home observes (attention, turn-delivery failures, stall supervision,
+//! a branch scan's error, a work's provisioning retry) is held in that home's memory
+//! ([`ConvoyMemory`]) and traced on each change; it is lost on restart, and each judgement then
+//! starts again from observation. Readers at other homes see none of it.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Mutex, PoisonError},
+};
+
+use chrono::{DateTime, Utc};
+
+use crate::{
+    convoy::{
+        admission::AdmissionDocument,
+        promises,
+        view::{self, ConvoyFacts, CrewReading, Ended, VesselReading},
+        ConvoyAttention, ConvoyIssue, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, DiscoveredSubject,
+        NudgeObligation, StalledCondition, TurnDeliveryStatus, WorkCompletionAuthority, WorkPhase, WorkState, ENSURED_FROM_ANNOTATION,
+    },
+    labels::{PROJECT_LABEL, ROLE_LABEL},
+    ControllerRetry, Convoy, ObjectMeta, ResourceObject,
+};
+
+/// How a launch ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvoyEnd {
+    /// Delivered, with the disposition it was delivered with.
+    Delivered { disposition: String },
+    /// Abandoned because its work failed: a standing role's strike.
+    Failed { reason: String },
+    /// Abandoned by an operator.
+    Abandoned { reason: String },
+}
+
+/// One seat as the launch records it, by its old crew `(work, role)`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeatRecord {
+    /// A supervisor's or operator's Fail verdict, its reason.
+    pub failed: Option<String>,
+    /// Its promises were reassigned to another seat (a handoff).
+    pub handed_back: bool,
+    /// An open AwaitingReply is raised about it.
+    pub stalled: bool,
+}
+
+/// One launch of a convoy, as its home's engine holds it, in the old shapes its readers take.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConvoyRecord {
+    /// The launch: `<launch_of>#<n>`.
+    pub name: String,
+    /// The home that holds it: its only writer.
+    pub home: String,
+    /// Its version at its home; it moves with each write.
+    pub version: u64,
+    /// The name this is a launch of: a standing role's name, or a finite convoy's own.
+    pub launch_of: String,
+    pub launch: u64,
+    /// The project it belongs to, by name.
+    pub project: String,
+    pub workflow_ref: String,
+    pub admission: AdmissionDocument,
+    /// When it was admitted: its creation's log time.
+    pub admitted_at: DateTime<Utc>,
+    /// How and when it ended; none while it is open.
+    pub ended: Option<(ConvoyEnd, DateTime<Utc>)>,
+    /// Its seats by work, then role.
+    pub seats: BTreeMap<String, BTreeMap<String, SeatRecord>>,
+    /// Its promises by work, then role.
+    pub promises: BTreeMap<String, BTreeMap<String, Vec<promises::Promise>>>,
+    /// The subjects linked to it (an unlinked one is in `unlinked`).
+    pub subjects: Vec<DiscoveredSubject>,
+    pub unlinked: Vec<flotilla_protocol::Subject>,
+}
+
+/// What a work's Vessel says, for the read view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkFacts {
+    pub reading: VesselReading,
+    /// When the Vessel was requested, became ready, and ended.
+    pub ready_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    /// The Vessel's reason, while it says one.
+    pub message: Option<String>,
+}
+
+/// What the convoy's home observes of one crew member, in memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrewNotes {
+    pub task_assigned: bool,
+    pub pending_follow_up: Option<flotilla_protocol::ResourceRef>,
+    pub resumed_at: Option<DateTime<Utc>>,
+    pub resume_brief_id: Option<String>,
+}
+
+/// What the convoy's home observes of one launch, in memory (owner's ruling: local observations
+/// stay local, #3108). Traced where each changes; empty after a restart.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConvoyNotes {
+    pub attention: Option<ConvoyAttention>,
+    /// Turn delivery's failures and episodes, by source.
+    pub turn_deliveries: BTreeMap<String, TurnDeliveryStatus>,
+    pub nudge_obligations: Vec<NudgeObligation>,
+    /// The stall the home judged, with its supervision's progress. A seat's stall is replicated
+    /// as the open stall AwaitingReply about it ([`SeatRecord::stalled`]); what the judge saw
+    /// and how far it has escalated is the home's own.
+    pub stall: Option<StalledCondition>,
+    pub branch_subject_scan_error: Option<String>,
+    /// A work's provisioning retry, by work.
+    pub provisioning_retry: BTreeMap<String, ControllerRetry>,
+    /// By work, then role.
+    pub crew: BTreeMap<String, BTreeMap<String, CrewNotes>>,
+}
+
+/// The facts a read view joins to a launch.
+#[derive(Debug, Clone, Copy)]
+pub struct ConvoyJoins<'a> {
+    /// Each work's Vessel, by work name; a work with none has never had one.
+    pub works: &'a BTreeMap<String, WorkFacts>,
+    /// The seats `(work, role)` whose session is launched and has its task.
+    pub working: &'a BTreeSet<(String, String)>,
+    /// The home's notes, at the launch's own home only.
+    pub notes: Option<&'a ConvoyNotes>,
+}
+
+impl ConvoyRecord {
+    /// Whether this is a standing role's generation.
+    pub fn standing(&self) -> bool {
+        self.admission.ensure_admission.is_some()
+    }
+
+    /// The role it was admitted for.
+    pub fn role(&self) -> &str {
+        self.admission.ensure_admission.as_ref().map_or(self.admission.role.as_str(), |ensure| ensure.role.as_str())
+    }
+
+    /// The seats `(work, role)` at work: each whose session is `live`, an eager role from its
+    /// launch and any other once its task is delivered (`notes`, at the launch's home).
+    pub fn working(&self, live: &BTreeSet<(String, String)>, notes: Option<&ConvoyNotes>) -> BTreeSet<(String, String)> {
+        let eager: BTreeSet<(String, String)> = self
+            .admission
+            .workflow_snapshot
+            .vessels
+            .iter()
+            .flat_map(|vessel| vessel.eagerly_started_roles().into_iter().map(|role| (vessel.name.clone(), role)))
+            .collect();
+        let assigned = |work: &str, role: &str| {
+            notes.and_then(|notes| notes.crew.get(work)).and_then(|roles| roles.get(role)).is_some_and(|crew| crew.task_assigned)
+        };
+        live.iter().filter(|(work, role)| eager.contains(&(work.clone(), role.clone())) || assigned(work, role)).cloned().collect()
+    }
+
+    fn end(&self) -> Option<Ended> {
+        self.ended.as_ref().map(|(end, _)| match end {
+            ConvoyEnd::Delivered { .. } => Ended::Delivered,
+            ConvoyEnd::Failed { .. } => Ended::Failed,
+            ConvoyEnd::Abandoned { .. } => Ended::Abandoned,
+        })
+    }
+
+    fn crew_readings(&self, working: &BTreeSet<(String, String)>) -> BTreeMap<String, BTreeMap<String, CrewReading>> {
+        let mut readings: BTreeMap<String, BTreeMap<String, CrewReading>> = BTreeMap::new();
+        for (work, roles) in &self.promises {
+            for (role, owned) in roles {
+                let reading = readings.entry(work.clone()).or_default().entry(role.clone()).or_default();
+                reading.promises = owned.len() as u32;
+                reading.open = owned.iter().filter(|promise| !promise.state.terminal()).count() as u32;
+            }
+        }
+        for (work, roles) in &self.seats {
+            for (role, seat) in roles {
+                let reading = readings.entry(work.clone()).or_default().entry(role.clone()).or_default();
+                reading.failed = seat.failed.is_some();
+                reading.handed_back = seat.handed_back;
+                reading.stalled = seat.stalled;
+            }
+        }
+        for (work, role) in working {
+            readings.entry(work.clone()).or_default().entry(role.clone()).or_default().working = true;
+        }
+        readings
+    }
+
+    /// The launch as an old Convoy object in `namespace`, its phases derived from `joins`.
+    pub fn read_view(&self, namespace: &str, joins: ConvoyJoins<'_>) -> ResourceObject<Convoy> {
+        let snapshot = &self.admission.workflow_snapshot;
+        let readings = self.crew_readings(joins.working);
+        let vessels: BTreeMap<String, VesselReading> = joins.works.iter().map(|(work, facts)| (work.clone(), facts.reading)).collect();
+        let derived = view::derive(&ConvoyFacts { ended: self.end(), snapshot, vessels: &vessels, crew: &readings });
+        let notes = joins.notes.cloned().unwrap_or_default();
+        let finished_at = self.ended.as_ref().map(|(_, at)| *at);
+
+        let work = derived
+            .work
+            .iter()
+            .map(|(name, phase)| {
+                let facts = joins.works.get(name);
+                let state = WorkState {
+                    provisioning_retry: notes.provisioning_retry.get(name).cloned(),
+                    phase: *phase,
+                    completion_authority: if *phase == WorkPhase::Complete {
+                        WorkCompletionAuthority::Promises
+                    } else {
+                        WorkCompletionAuthority::default()
+                    },
+                    ready_at: facts.and_then(|facts| facts.ready_at),
+                    started_at: facts.and_then(|facts| facts.started_at),
+                    finished_at: facts.and_then(|facts| facts.finished_at).or(finished_at.filter(|_| phase.is_terminal())),
+                    message: facts.and_then(|facts| facts.message.clone()),
+                    placement: None,
+                };
+                (name.clone(), state)
+            })
+            .collect();
+        let crew_work = derived
+            .crew
+            .iter()
+            .map(|(work, roles)| {
+                let roles = roles
+                    .iter()
+                    .map(|(role, phase)| {
+                        let noted = notes.crew.get(work).and_then(|roles| roles.get(role)).cloned().unwrap_or_default();
+                        let failed = self.seats.get(work).and_then(|seats| seats.get(role)).and_then(|seat| seat.failed.clone());
+                        let state = CrewWorkState::builder()
+                            .task_assigned(noted.task_assigned)
+                            .maybe_pending_follow_up(noted.pending_follow_up)
+                            .phase(*phase)
+                            .completion_authority(if *phase == CrewWorkPhase::Done {
+                                WorkCompletionAuthority::Promises
+                            } else {
+                                WorkCompletionAuthority::default()
+                            })
+                            .maybe_resumed_at(noted.resumed_at)
+                            .maybe_resume_brief_id(noted.resume_brief_id)
+                            .maybe_message(failed)
+                            .build();
+                        (role.clone(), state)
+                    })
+                    .collect();
+                (work.clone(), roles)
+            })
+            .collect();
+
+        let (disposition, message) = match self.ended.as_ref().map(|(end, _)| end) {
+            Some(ConvoyEnd::Delivered { disposition }) => (Some(disposition.clone()), None),
+            Some(ConvoyEnd::Failed { reason } | ConvoyEnd::Abandoned { reason }) => (None, Some(reason.clone())),
+            None => (None, None),
+        };
+        let status = ConvoyStatus {
+            naming: self.admission.naming.clone(),
+            ensure_admission: self.admission.ensure_admission.clone(),
+            phase: derived.phase,
+            subjects: self.subjects.clone(),
+            branch_subject_scan_error: notes.branch_subject_scan_error.clone(),
+            unlinked_subjects: self.unlinked.clone(),
+            stalled: notes.stall.clone().filter(|_| !derived.phase.is_terminal()),
+            nudge_obligations: notes.nudge_obligations.clone(),
+            placement_decision: self.admission.placement_decision.clone(),
+            workflow_snapshot: Some(snapshot.clone()),
+            work,
+            crew_work,
+            promises: self.promises.clone(),
+            message,
+            started_at: Some(self.admitted_at),
+            finished_at,
+            disposition,
+            observed_workflow_ref: Some(self.workflow_ref.clone()),
+            turn_deliveries: notes.turn_deliveries.clone(),
+            attention: notes.attention.clone().filter(|_| derived.phase != ConvoyPhase::Landed),
+            ..ConvoyStatus::default()
+        };
+
+        let mut labels =
+            BTreeMap::from([(PROJECT_LABEL.to_owned(), self.project.clone()), (ROLE_LABEL.to_owned(), self.role().to_owned())]);
+        labels.retain(|_, value| !value.is_empty());
+        let mut annotations = BTreeMap::new();
+        if let Some(ensure) = &self.admission.ensure_admission {
+            annotations.insert(ENSURED_FROM_ANNOTATION.to_owned(), ensure.role.clone());
+        }
+        let document = &self.admission;
+        let spec = ConvoySpec {
+            continuation: document.continuation.clone(),
+            workflow_ref: self.workflow_ref.clone(),
+            role: self.role().to_owned(),
+            generation: self.launch,
+            dispatching_principal_ref: document.dispatching_principal_ref.clone(),
+            inputs: document.inputs.clone(),
+            placement_policy: document.placement_policy.clone(),
+            repositories: document.repositories.clone(),
+            r#ref: document.r#ref.clone(),
+            project_ref: (!self.project.is_empty()).then(|| self.project.clone()),
+            adopted_checkout_refs: document.adopted_checkout_refs.clone(),
+            subjects: document.subjects.clone(),
+            issues: document.subjects.iter().filter_map(|subject| subject.issue.clone()).collect::<Vec<ConvoyIssue>>(),
+            change_request: document.subjects.iter().find_map(|subject| subject.change_request.clone()),
+            instruction: document.instruction.clone(),
+            promises: Vec::new(),
+        };
+        ResourceObject {
+            metadata: ObjectMeta {
+                name: self.name.clone(),
+                namespace: namespace.to_owned(),
+                resource_version: self.version.to_string(),
+                labels,
+                annotations,
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: self.admitted_at,
+                merge: None,
+            },
+            spec,
+            status: Some(status),
+        }
+    }
+}
+
+/// A change to the convoys' records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvoyChange {
+    /// Launch `name` held at `home`, or a record about it, was written.
+    Changed { name: String, home: String },
+    /// A home's records moved without entries to read: read them all again.
+    Rescanned,
+}
+
+/// The convoys' records at this home and the replicas of other homes', with this home's notes.
+pub trait ConvoyRecords: Send + Sync {
+    /// This home.
+    fn home(&self) -> &str;
+    /// Launch `name` held at `home`, or at this home when `None`.
+    fn get(&self, name: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String>;
+    /// The newest launch of `of` in `project` held at `home`, or at this home when `None`.
+    fn newest(&self, of: &str, project: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String>;
+    /// Every launch held at `home`.
+    fn at(&self, home: &str) -> Result<Vec<ConvoyRecord>, String>;
+    /// Every launch at every home this store holds.
+    fn every(&self) -> Result<Vec<ConvoyRecord>, String>;
+    /// The launches whose records change, as they are written or replicated here, from now on.
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<ConvoyChange> {
+        tokio::sync::broadcast::channel(1).1
+    }
+    /// What this home observes of its own launches.
+    fn memory(&self) -> &ConvoyMemory;
+}
+
+/// This home's notes on its launches, in memory.
+#[derive(Debug)]
+pub struct ConvoyMemory {
+    notes: Mutex<BTreeMap<String, ConvoyNotes>>,
+    changes: tokio::sync::broadcast::Sender<String>,
+}
+
+impl Default for ConvoyMemory {
+    fn default() -> Self {
+        Self { notes: Mutex::default(), changes: tokio::sync::broadcast::channel(256).0 }
+    }
+}
+
+impl ConvoyMemory {
+    /// The launches whose notes change, from now on.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.changes.subscribe()
+    }
+
+    /// The notes on launch `name`; empty when none are held.
+    pub fn get(&self, name: &str) -> ConvoyNotes {
+        self.notes.lock().unwrap_or_else(PoisonError::into_inner).get(name).cloned().unwrap_or_default()
+    }
+
+    /// Changes the notes on launch `name` with `change`; returns whether they changed. Each change
+    /// is traced, as the only record of it.
+    pub fn update<T>(&self, name: &str, change: impl FnOnce(&mut ConvoyNotes) -> T) -> (T, bool) {
+        let mut held = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+        let notes = held.entry(name.to_owned()).or_default();
+        let before = notes.clone();
+        let output = change(notes);
+        let changed = *notes != before;
+        if changed {
+            tracing::info!(convoy = %name, notes = ?notes, "convoy notes changed");
+        }
+        if *notes == ConvoyNotes::default() {
+            held.remove(name);
+        }
+        drop(held);
+        if changed {
+            // No follower is no reason to fail: one may subscribe later.
+            drop(self.changes.send(name.to_owned()));
+        }
+        (output, changed)
+    }
+
+    /// Drops the notes on launch `name`, once it has ended and its home no longer judges it.
+    pub fn forget(&self, name: &str) {
+        if self.notes.lock().unwrap_or_else(PoisonError::into_inner).remove(name).is_some() {
+            drop(self.changes.send(name.to_owned()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

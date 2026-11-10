@@ -78,6 +78,12 @@ pub trait LifecycleReads: Send + Sync {
         Err("vessels are not served without the engine".into())
     }
 
+    /// The engine's convoys (#3108): every convoy reader goes through them. Unavailable where no
+    /// engine is installed.
+    fn convoys(&self) -> Result<&dyn crate::convoy_records::ConvoyRecords, String> {
+        Err("convoys are not served without the engine".into())
+    }
+
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
     /// `None` when the engine holds no such resource: the switch is off, or it was written before.
     ///
@@ -154,6 +160,10 @@ impl LifecycleReads for LateLifecycleReads {
 
     fn vessels(&self) -> Result<&dyn crate::vessel_records::VesselRecords, String> {
         self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.vessels()
+    }
+
+    fn convoys(&self) -> Result<&dyn crate::convoy_records::ConvoyRecords, String> {
+        self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.convoys()
     }
 
     fn try_reading(

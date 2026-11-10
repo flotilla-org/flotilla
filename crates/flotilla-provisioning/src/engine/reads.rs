@@ -148,11 +148,22 @@ pub struct LifecycleReadPort {
     agent_sessions: Option<Arc<dyn flotilla_resources::agent_activity::AgentSessionReads>>,
     terminals: Option<Arc<dyn flotilla_resources::terminal_records::TerminalRecords>>,
     vessels: Option<Arc<dyn flotilla_resources::vessel_records::VesselRecords>>,
+    convoys: Option<Arc<dyn flotilla_resources::convoy_records::ConvoyRecords>>,
 }
 
 impl LifecycleReadPort {
     pub fn new(reads: StoreReads, home: String) -> Self {
-        Self { reads, home, environments: None, clones: None, checkouts: None, agent_sessions: None, terminals: None, vessels: None }
+        Self {
+            reads,
+            home,
+            environments: None,
+            clones: None,
+            checkouts: None,
+            agent_sessions: None,
+            terminals: None,
+            vessels: None,
+            convoys: None,
+        }
     }
 
     /// Serves `sessions` as the engine's AgentSessions.
@@ -164,6 +175,12 @@ impl LifecycleReadPort {
     /// Serves `terminals` as the engine's terminal sessions.
     pub fn with_terminals(mut self, terminals: Arc<dyn flotilla_resources::terminal_records::TerminalRecords>) -> Self {
         self.terminals = Some(terminals);
+        self
+    }
+
+    /// Serves `convoys` as the engine's convoys.
+    pub fn with_convoys(mut self, convoys: Arc<dyn flotilla_resources::convoy_records::ConvoyRecords>) -> Self {
+        self.convoys = Some(convoys);
         self
     }
 
@@ -215,6 +232,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
 
     fn vessels(&self) -> Result<&dyn flotilla_resources::vessel_records::VesselRecords, String> {
         self.vessels.as_deref().ok_or_else(|| "this read port serves no vessels".to_owned())
+    }
+
+    fn convoys(&self) -> Result<&dyn flotilla_resources::convoy_records::ConvoyRecords, String> {
+        self.convoys.as_deref().ok_or_else(|| "this read port serves no convoys".to_owned())
     }
 
     fn try_reading(

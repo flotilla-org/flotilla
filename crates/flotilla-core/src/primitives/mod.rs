@@ -4,6 +4,7 @@
 pub mod convoy_engine;
 pub mod convoy_import;
 pub mod convoy_map;
+pub mod convoy_records;
 pub mod convoys;
 pub mod demand_import;
 pub mod ensures;
