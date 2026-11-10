@@ -118,11 +118,11 @@ impl ResourceBackend {
         self.attentions.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
     }
 
-    /// The attentions: the engine's once installed, the old store's before.
+    /// The engine's attentions; before they are installed, every attention call is refused.
     pub fn attentions(&self) -> std::sync::Arc<dyn flotilla_resources::attentions::Attentions> {
         match self.attentions.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
             Some(engine) => std::sync::Arc::clone(engine),
-            None => std::sync::Arc::new(crate::OldStoreAttentions::new(self.clone())),
+            None => std::sync::Arc::new(crate::attentions::Uncomposed),
         }
     }
 

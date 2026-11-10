@@ -836,3 +836,45 @@ impl IssueProvider for SuspendedBoardProvider {
 
 // #2842: realistic Project status and 400 serving convoys must not turn a
 // board read into per-issue forge calls or wait on an unfinished bulk fetch.
+
+/// The engine's Message path over `service`, its attentions installed on `backend`, as the
+/// runtime opens it (#3108).
+pub(in crate::in_process) fn engine_messages(
+    service: Arc<flotilla_schema_sqlite::stream::Service>,
+    backend: &ResourceBackend,
+) -> Arc<crate::primitives::MessagePrimitives> {
+    let home = service.home().to_owned();
+    let primitives = Arc::new(
+        crate::primitives::MessagePrimitives::open(&home, service, backend.clone(), Arc::new(flotilla_resources::SystemClock))
+            .expect("message path"),
+    );
+    backend.install_attentions(Arc::clone(&primitives) as Arc<dyn flotilla_resources::attentions::Attentions>);
+    primitives
+}
+
+/// `daemon`'s Message path over its decided store, installed as its runtime installs it.
+pub(in crate::in_process) fn install_engine_messages(
+    daemon: &crate::in_process::InProcessDaemon,
+) -> Arc<crate::primitives::MessagePrimitives> {
+    daemon.open_message_primitives().expect("message path")
+}
+
+/// Declare and designate the fleet whose roles the engine's Message delivery reads.
+pub(in crate::in_process) async fn designate_fleet(backend: &ResourceBackend) {
+    backend
+        .definitions::<flotilla_resources::Project>("flotilla")
+        .apply(
+            &InputMeta::builder().name("fleet".into()).build(),
+            &flotilla_resources::ProjectSpec::builder().display_name("Fleet".into()).default_workflow_ref("work".into()).build(),
+        )
+        .await
+        .expect("fleet project");
+    backend
+        .definitions::<flotilla_resources::FleetDesignation>("flotilla")
+        .apply(
+            &InputMeta::builder().name("fleet".into()).build(),
+            &flotilla_resources::FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
+        )
+        .await
+        .expect("fleet designation");
+}

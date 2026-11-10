@@ -31,12 +31,10 @@ pub enum MessageAdmission {
 pub struct MessageInbox {
     pub(crate) backend: ResourceBackend,
     pub(crate) namespace: String,
-    pub(crate) audit_retention_days: u64,
     pub(crate) change_request_stale_after: std::time::Duration,
     pub(crate) issue_stale_after: std::time::Duration,
     pub(crate) messages: TypedResolver<Message>,
     pub(crate) admission: Arc<Mutex<()>>,
-    pub(crate) delivery: Arc<Mutex<()>>,
     pub(crate) charter_notifications: Arc<Mutex<()>>,
 }
 
@@ -46,18 +44,11 @@ impl MessageInbox {
             messages: backend.using::<Message>(namespace),
             backend,
             namespace: namespace.into(),
-            audit_retention_days: 30,
             admission: Arc::new(Mutex::new(())),
-            delivery: Arc::new(Mutex::new(())),
             charter_notifications: Arc::new(Mutex::new(())),
             change_request_stale_after: std::time::Duration::from_secs(300),
             issue_stale_after: std::time::Duration::from_secs(300),
         }
-    }
-
-    pub fn with_audit_retention_days(mut self, days: u64) -> Self {
-        self.audit_retention_days = days;
-        self
     }
 
     pub fn with_observation_staleness(mut self, change_request: std::time::Duration, issue: std::time::Duration) -> Self {

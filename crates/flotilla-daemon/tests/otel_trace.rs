@@ -16,7 +16,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[path = "request_session_pair/message_homes.rs"]
 mod message_homes;
 
-async fn empty_daemon_named(name: &str) -> Arc<InProcessDaemon> {
+/// A daemon whose Message path [`message_homes::engine`] opens once its mesh is up.
+async fn message_home_daemon(name: &str) -> Arc<InProcessDaemon> {
     let dir = tempfile::tempdir().expect("config").keep();
     std::fs::write(dir.join("daemon.toml"), "machine_id = 'test-machine'\n").expect("config");
     InProcessDaemon::new(

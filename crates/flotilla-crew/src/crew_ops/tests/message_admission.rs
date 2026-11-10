@@ -535,48 +535,5 @@ async fn fresh_idle_admission_keeps_delivery_evidence_receiver_owned() {
     }
 }
 
-// A controller replay must keep the original Message identity and settled
-// workflow state even after terminal audit retention has removed its body.
-#[tokio::test]
-async fn turn_admission_replays_compacted_message_without_reopening_work() {
-    use flotilla_messaging::MessageInbox;
-    use flotilla_resources::{Message, MessagePhase, MessageRelation, MessageSpec};
-
-    use crate::leaf_engine::CrewTurnIntent;
-    let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;
-    probe.fail.store(false, Ordering::SeqCst);
-    let intent = MessageSpec::builder()
-        .sender("system:turn-rules".into())
-        .receiver("flotilla/crew/work/coder".into())
-        .relation(MessageRelation::System)
-        .body("review".into())
-        .build();
-    let name = flotilla_resources::message_record_name(&intent.receiver, &intent.sender, "turn-delivery:review:revision");
-    let inbox = MessageInbox::new(backend.clone(), "flotilla").with_audit_retention_days(1);
-    inbox.accept(&InputMeta::builder().name(name.clone()).build(), &intent, Utc::now()).await.unwrap();
-    let messages = backend.using::<Message>("flotilla");
-    let record = messages.get(&name).await.unwrap();
-    let mut status = record.status.unwrap();
-    status.phase = MessagePhase::Expired;
-    status.since = Utc::now() - chrono::Duration::days(2);
-    messages.update_status(&name, &record.metadata.resource_version, &status).await.unwrap();
-    assert_eq!(inbox.compact_audit(Utc::now()).await.unwrap(), 1);
-    let before = backend.using::<ResourceConvoy>("flotilla").get("crew").await.unwrap().status;
-    let request = CrewTurnIntent::builder()
-        .namespace("flotilla".into())
-        .convoy("crew".into())
-        .source("review".into())
-        .vessel("work".into())
-        .role("coder".into())
-        .brief("review".into())
-        .subject_revision("revision".into())
-        .sender("system:turn-rules".into())
-        .build();
-    let replay = crew.deliver_turn(&request).await.unwrap();
-    assert!(!replay.new_turn);
-    assert_eq!(replay.message.name, name);
-    assert_eq!(backend.using::<ResourceConvoy>("flotilla").get("crew").await.unwrap().status, before);
-}
-
 // A live capability source is queried on every orientation, and changes create
 // superseding system Messages without delivering duplicate launch observations.

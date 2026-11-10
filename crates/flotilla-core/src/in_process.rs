@@ -2403,6 +2403,21 @@ impl InProcessDaemon {
         self.lifecycle_reads.clone()
     }
 
+    /// Opens the Message path over the decided store composed with this daemon and installs it
+    /// (#3317). Blocking: restoring the path reads the store.
+    pub fn open_message_primitives(&self) -> Result<Arc<crate::primitives::MessagePrimitives>, String> {
+        let service =
+            self.decided_store().map_err(|error| format!("[primitives] needs the decided store composed with the daemon: {error}"))?;
+        let primitives = Arc::new(crate::primitives::MessagePrimitives::open(
+            self.node_id().as_str(),
+            service,
+            self.resource_backend(),
+            self.clock_for_scenarios(),
+        )?);
+        self.install_message_primitives(Arc::clone(&primitives))?;
+        Ok(primitives)
+    }
+
     /// Installs the `[primitives]` Message path during composition (#3317),
     /// after its decided store. Absent, every Message stays in the old store.
     pub fn install_message_primitives(&self, primitives: Arc<crate::primitives::MessagePrimitives>) -> Result<(), String> {

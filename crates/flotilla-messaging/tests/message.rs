@@ -614,61 +614,6 @@ fn receiver_snapshot_is_pure_and_refreshes(tc: hegel::TestCase) {
     });
 }
 
-async fn delivery_inbox() -> (ResourceBackend, flotilla_messaging::MessageInbox) {
-    delivery_inbox_from(&["flotilla/checks"; 3]).await
-}
-
-/// The standard holder with one Message per sender, `message-0` first.
-async fn delivery_inbox_from(senders: &[&str]) -> (ResourceBackend, flotilla_messaging::MessageInbox) {
-    use flotilla_resources::*;
-    use flotilla_store::*;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("convoy".into()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build(),
-        )
-        .await
-        .expect("convoy");
-    let terminals = backend.using::<TerminalSession>("flotilla");
-    let holder = terminals
-        .create(
-            &InputMeta::builder()
-                .name("terminal".into())
-                .labels(std::collections::BTreeMap::from([
-                    (CONVOY_LABEL.into(), "convoy".into()),
-                    (ROLE_LABEL.into(), "coder".into()),
-                    (VESSEL_LABEL.into(), "work".into()),
-                ]))
-                .build(),
-            &holder_spec("convoy"),
-        )
-        .await
-        .expect("holder");
-    terminals
-        .update_status(
-            "terminal",
-            &holder.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("session".into()),
-                crew: Some(CrewSessionStatus { id: "crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("running");
-    let inbox = MessageInbox::new(backend.clone(), "flotilla");
-    for (index, sender) in senders.iter().enumerate() {
-        let mut intent = spec(None, MessageExpectation::None);
-        intent.body = format!("body-{index}");
-        intent.sender = (*sender).into();
-        inbox.accept(&InputMeta::builder().name(format!("message-{index}")).build(), &intent, at(10)).await.expect("message");
-    }
-    (backend, inbox)
-}
-
 // Explicit replacement closes even an open delivered expectation. It never
 // aliases the replacement ID to the original or treats it as a subject repeat.
 #[tokio::test]
@@ -765,7 +710,7 @@ async fn migration_guard_accepts_resolved_legacy_launches() {
 }
 
 // Both backing stores exclude terminal history, retain batch members/replies,
-// and preserve exact producer replay after age-based body compaction.
+// and preserve exact producer replay.
 #[tokio::test]
 async fn indexed_message_history_and_retention_contract() {
     use flotilla_messaging::MessageInbox;
@@ -776,7 +721,7 @@ async fn indexed_message_history_and_retention_contract() {
         ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")),
     ] {
         let resolver = backend.using::<Message>("flotilla");
-        let inbox = MessageInbox::new(backend.clone(), "flotilla").with_audit_retention_days(1);
+        let inbox = MessageInbox::new(backend.clone(), "flotilla");
         let intent = spec(None, MessageExpectation::None);
         for index in 0..256 {
             let meta = InputMeta::builder().name(format!("history-{index}")).build();
@@ -808,20 +753,12 @@ async fn indexed_message_history_and_retention_contract() {
         );
         resolver.update_status("active", &active.metadata.resource_version, &status).await.unwrap();
         assert_eq!(resolver.query(&MessageQuery::Batch { id: "recovery".into() }).await.unwrap().len(), 1);
-        assert_eq!(inbox.compact_audit(at(86420)).await.unwrap(), 0, "exact retention boundary keeps bodies");
-        assert_eq!(inbox.compact_audit(at(86421)).await.unwrap(), 255, "active recovery protects its terminal member");
-        let compacted = resolver.get("history-1").await.unwrap();
-        assert!(compacted.spec.body.is_empty());
-        assert!(compacted.spec.body_digest.is_some());
-        assert_eq!(compacted.status.unwrap().phase, MessagePhase::Expired);
         let replay = inbox.accept(&InputMeta::builder().name("history-1".into()).build(), &intent, at(90000)).await.unwrap();
         assert!(matches!(replay, flotilla_messaging::MessageAdmission::Accepted(_)));
         let suppressed = inbox.accept(&InputMeta::builder().name("history-2".into()).build(), &intent, at(90000)).await.unwrap();
         assert!(
             matches!(suppressed, flotilla_messaging::MessageAdmission::Suppressed { predecessor } if predecessor.metadata.name == "history-1")
         );
-        assert!(!resolver.get("history-0").await.unwrap().spec.body.is_empty());
-        assert_eq!(inbox.compact_audit(at(90000)).await.unwrap(), 0, "compaction is idempotent");
         let reply_spec = MessageSpec::builder()
             .sender("flotilla/receiver".into())
             .receiver("flotilla/checks".into())
@@ -833,66 +770,6 @@ async fn indexed_message_history_and_retention_contract() {
         assert_eq!(backend.query_messages("flotilla", &MessageQuery::ReplyTo { name: "active".into() }).await.unwrap().len(), 1);
         resolver.delete("reply").await.unwrap();
         assert!(backend.query_messages("flotilla", &MessageQuery::ReplyTo { name: "active".into() }).await.unwrap().is_empty());
-    }
-}
-
-// New-shape submissions retain receiver-owned receipts across compaction;
-// unresolved transport evidence is retained with its body for explicit recovery.
-#[tokio::test]
-async fn audit_compaction_keeps_receipts_and_uncertain_submissions() {
-    use flotilla_messaging::MessageInbox;
-    use flotilla_resources::MessageSubmission;
-    let (backend, _) = delivery_inbox().await;
-    let inbox = MessageInbox::new(backend.clone(), "flotilla").with_audit_retention_days(1);
-    let messages = backend.using::<Message>("flotilla");
-    for uncertain in [false, true] {
-        let name = if uncertain { "uncertain" } else { "receipt" };
-        let intent = spec(None, MessageExpectation::None);
-        inbox.accept(&InputMeta::builder().name(name.into()).build(), &intent, at(10)).await.unwrap();
-        let record = messages.get(name).await.unwrap();
-        let mut status = record.status.unwrap();
-        status.phase = if uncertain { MessagePhase::DeadLettered } else { MessagePhase::Satisfied };
-        status.since = at(20);
-        status.submission = Some(
-            MessageSubmission::builder()
-                .batch_id(name.into())
-                .crew_id("crew".into())
-                .session("session".into())
-                .started_at(at(10))
-                .members(vec![name.into()])
-                .build(),
-        );
-        if !uncertain {
-            status.resolved_receiver = Some(
-                ResolvedMessageReceiver::builder()
-                    .crew_id("crew".into())
-                    .session("session".into())
-                    .delivered_at(at(15))
-                    .evidence("receipt".into())
-                    .build(),
-            );
-        }
-        messages.update_status(name, &record.metadata.resource_version, &status).await.unwrap();
-        if !uncertain {
-            let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
-            let convoy = convoys.get("convoy").await.unwrap();
-            let mut convoy_status = convoy.status.unwrap_or_default();
-            let state = flotilla_resources::CrewWorkState::builder()
-                .phase(flotilla_resources::CrewWorkPhase::Done)
-                .pending_follow_up(ResourceRef::new("flotilla.work/v1", "Message", "flotilla", name))
-                .build();
-            convoy_status.crew_work.entry("work".into()).or_default().insert("coder".into(), state);
-            let convoy = convoys.update_status("convoy", &convoy.metadata.resource_version, &convoy_status).await.unwrap();
-            assert_eq!(inbox.compact_audit(at(90000)).await.unwrap(), 0, "pending workflow continuation keeps its body");
-            assert!(!messages.get(name).await.unwrap().spec.body.is_empty());
-            convoy_status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().pending_follow_up = None;
-            convoys.update_status("convoy", &convoy.metadata.resource_version, &convoy_status).await.unwrap();
-        }
-        inbox.compact_audit(at(90000)).await.unwrap();
-        let compacted = messages.get(name).await.unwrap();
-        assert_eq!(compacted.status.as_ref(), Some(&status));
-        assert_eq!(compacted.spec.body.is_empty(), !uncertain);
-        assert_eq!(MessageInbox::new(backend.clone(), "flotilla").with_audit_retention_days(0).compact_audit(at(900000)).await.unwrap(), 0);
     }
 }
 

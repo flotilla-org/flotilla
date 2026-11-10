@@ -161,6 +161,8 @@ async fn repeated_reclaim_refusal_with_changing_reason_raises_demand() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    daemon.open_message_primitives().expect("message path");
+    designate_fleet(&daemon).await;
     let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
     let convoy = convoys
         .create(

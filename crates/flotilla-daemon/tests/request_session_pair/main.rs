@@ -174,6 +174,20 @@ async fn empty_daemon_named(host_name: &str) -> Arc<InProcessDaemon> {
 }
 
 async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Option<u64>) -> Arc<InProcessDaemon> {
+    let daemon = message_home_daemon_with_floor(host_name, free_space_floor_gib).await;
+    // Its Message path, over the designated fleet's roles, as the runtime composes it.
+    message_homes::seed_fleet(&daemon.resource_backend()).await;
+    daemon.open_message_primitives().expect("message path");
+    daemon
+}
+
+/// A daemon composed with its engine, whose Message path [`message_homes::engine`] opens once
+/// its mesh is up.
+async fn message_home_daemon(host_name: &str) -> Arc<InProcessDaemon> {
+    message_home_daemon_with_floor(host_name, None).await
+}
+
+async fn message_home_daemon_with_floor(host_name: &str, free_space_floor_gib: Option<u64>) -> Arc<InProcessDaemon> {
     let daemon = daemon_named_without_engine(host_name, free_space_floor_gib).await;
     // Composed with its engine, as the runtime composes a daemon.
     flotilla_daemon_testkit::engine::engine(&daemon);
@@ -3945,10 +3959,25 @@ async fn check_supervision_escalation_pass(a: &InProcessDaemon, b: &InProcessDae
     assert_eq!(stall.supervisor.expect("governor").convoy, "governor");
     let messages = b_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver inbox");
     assert_eq!(messages.items.len(), 1, "repeat passes must not publish duplicates");
-    assert!(a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source inbox").items.is_empty());
+    // Homed at the governor's home, and listed at A too once A follows B's log.
     let message = &messages.items[0];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let listed = a_backend.including_replicas::<flotilla_resources::Message>("flotilla").list().await.expect("source replica");
+            if listed.items.iter().any(|read| {
+                read.object.metadata.name == message.metadata.name
+                    && matches!(&read.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == b.node_id())
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the escalation lists at A as B's");
+    assert!(a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source inbox").items.is_empty());
     assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::Supervisor);
-    assert_eq!(message.spec.sender, "project/stalled-work/work/coder");
+    assert_eq!(message.spec.sender, "project:project/convoy:stalled-work/role:coder");
     assert!(message.spec.body.starts_with("Escalated from coder@work in coder@project:"), "{}", message.spec.body);
     assert!(message.spec.body.contains("Supervise stalled crew coder@work in convoy coder@project (resource ref: stalled-work)"));
     assert!(message.spec.body.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"));
@@ -4037,7 +4066,7 @@ async fn message_resource_apply_rejects_invalid_intent() {
         .await
         .unwrap();
     for (sender, relation, interrupting, reason) in
-        [("invalid/address/shape", "system", false, "invalid role address"), ("system:test", "peer", true, "interrupt")]
+        [("invalid/address/shape", "system", false, "invalid role address"), ("system:turn-rules", "peer", true, "interrupt")]
     {
         let mut events = daemon.subscribe();
         let admission = daemon.execute(Command::builder().action(CommandAction::ResourceApply {
@@ -4157,7 +4186,8 @@ async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {
     let inbox = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
     assert_eq!(inbox.items.len(), 1);
     assert!(inbox.items[0].spec.body.contains("finish the review"));
-    assert_eq!(inbox.items[0].spec.sender, "principal:implicit");
+    // A person sends as the role they hold (#3938): the record names the role, not the principal.
+    assert_eq!(inbox.items[0].spec.sender, "project:flotilla/role:operator");
     assert!(inbox.items[0].status.as_ref().unwrap().resolved_receiver.is_none());
 }
 
@@ -4474,21 +4504,23 @@ async fn run_message_role_waiting_home_case(remote: bool, admitted: bool) {
     for (name, intent) in [
         (
             "request",
-            serde_json::json!({"sender":"system:checks","receiver":"flotilla/governor","relation":"system","body":"settled checks","expectation":{"kind":"reply"}}),
+            serde_json::json!({"sender":"system:turn-rules","receiver":"flotilla/governor","relation":"system","body":"settled checks","expectation":{"kind":"reply"}}),
         ),
         (
             "reply",
-            serde_json::json!({"sender":"flotilla/standing/work/coder","receiver":"system:checks","relation":"peer","body":"received","in_reply_to":"request"}),
+            serde_json::json!({"sender":"flotilla/governor","receiver":"system:turn-rules","relation":"peer","body":"received","in_reply_to":"request"}),
         ),
     ] {
         if remote && name == "reply" {
-            topology
-                .leader
-                .resource_backend()
-                .replica_writer::<Message>(home.node_id().clone(), "flotilla")
-                .replace(&home_backend.using::<Message>("flotilla").list().await.expect("system request feed"), Utc::now())
-                .await
-                .expect("replicate reply routing witness");
+            // The reply is routed by its original, which the caller reads once it follows the home's log.
+            let caller = topology.leader.message_primitives().expect("caller message path");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while caller.locate("request").expect("locate").is_none() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the caller follows the request from its home");
         }
         let mut events = topology.leader.subscribe();
         let id = topology.client.execute(Command::builder().action(CommandAction::ResourceApply { namespace: "flotilla".into(), document: serde_json::json!({"apiVersion":"flotilla.work/v1","kind":"Message","metadata":{"name":name},"spec":intent}) }).build()).await.expect("ordinary Message mutation");
@@ -4506,7 +4538,8 @@ async fn run_message_role_waiting_home_case(remote: bool, admitted: bool) {
         .expect("receiver-home admission completes");
         assert!(matches!(result, CommandValue::ResourceObject(_)), "{name}: {result:?}");
         let record = home_backend.using::<Message>("flotilla").get(name).await.expect("home-authored Message");
-        assert_eq!(record.status.expect("accepted status").phase, MessagePhase::Accepted);
+        // Admitted at its home on the engine: pending there, which reads as deliverable.
+        assert_eq!(record.status.expect("admitted status").phase, MessagePhase::Deliverable);
         if remote {
             assert!(
                 topology.leader.resource_backend().using::<Message>("flotilla").get(name).await.is_err(),

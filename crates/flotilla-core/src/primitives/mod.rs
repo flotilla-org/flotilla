@@ -901,6 +901,12 @@ impl MessagePrimitives {
     /// the engine spec and enqueues it as `<inbox>/message:<record name>`.
     /// A repeated name is the message already admitted.
     pub async fn admit(&self, namespace: &str, name: &str, intent: &OldSpec) -> Result<ResourceObject<OldMessage>, ResourceError> {
+        // The producer's intent is still the old spec: it is held to that spec's rules first, as
+        // the old store held it (an interrupt only from a supervisor, references holding the subject).
+        <OldMessage as flotilla_resources::Resource>::validate_spec(
+            &flotilla_resources::InputMeta::builder().name(name.to_owned()).build(),
+            intent,
+        )?;
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
         let records = self.records(namespace).await?;
         let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
@@ -931,6 +937,13 @@ impl MessagePrimitives {
         let in_reply_to = spec.in_reply_to.clone();
         let id = self.inbox.enqueue_as(spec, name).await.map_err(|error| ResourceError::invalid(error.to_string()))?;
         self.located.lock().expect("located").insert(name.to_owned(), (id.clone(), self.home.clone()));
+        // Who acted is audit (#3938): a person sends as the role they hold, so the record names the
+        // role and the admission trace names the principal as given, or that none was named.
+        if let Some(principal) = intent.sender.strip_prefix("principal:") {
+            let principal = if principal == flotilla_protocol::PrincipalRef::IMPLICIT_NAME { "none named" } else { principal };
+            flotilla_tracing::queued_span(&id, "principal")
+                .in_scope(|| tracing::info!(message.principal = principal, "message sent by a person"));
+        }
         // A reply landing in its sender's inbox here answers the sender's record (#3587 layer 7).
         if in_reply_to.is_some() {
             let awaiting = Arc::clone(&self.awaiting);
@@ -1341,8 +1354,28 @@ impl MessagePrimitives {
         }))
     }
 
-    /// One message by its old record name, in the old shape.
-    pub async fn view(&self, namespace: &str, record: &str) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
+    /// Every message this home holds, its own and those it follows, as the generic resource
+    /// verbs show it: the record as the engine stores it, with no lookup ([`view::Stored`]).
+    pub fn stored_views(&self, namespace: &str) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
+        self.messages()
+            .map_err(ResourceError::other)?
+            .into_iter()
+            .map(|(home, resource)| {
+                let object = view::stored_view(&resource, namespace).map_err(ResourceError::invalid)?;
+                Ok(ReadResourceObject { object, provenance: self.provenance(&home) })
+            })
+            .collect()
+    }
+
+    /// One message by its old record name, as [`Self::stored_views`] shows it.
+    pub fn stored_view(&self, namespace: &str, record: &str) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
+        let Some((home, resource)) = self.load(record)? else { return Ok(None) };
+        let object = view::stored_view(&resource, namespace).map_err(ResourceError::invalid)?;
+        Ok(Some(ReadResourceObject { object, provenance: self.provenance(&home) }))
+    }
+
+    /// The message `record` names, and its home.
+    fn load(&self, record: &str) -> Result<Option<(String, Resource<Message>)>, ResourceError> {
         let Some((id, home)) = self.locate(record).map_err(ResourceError::other)? else { return Ok(None) };
         let resource = self
             .service
@@ -1352,7 +1385,12 @@ impl MessagePrimitives {
                 Ok(read.load::<Resource<Message>>(stored)?.map(|loaded| loaded.value))
             })
             .map_err(|error| ResourceError::other(error.to_string()))?;
-        let Some(resource) = resource else { return Ok(None) };
+        Ok(resource.map(|resource| (home, resource)))
+    }
+
+    /// One message by its old record name, in the old shape.
+    pub async fn view(&self, namespace: &str, record: &str) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
+        let Some((home, resource)) = self.load(record)? else { return Ok(None) };
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
         let object = self.view_of(&resource, namespace, &roles).await?.map_err(ResourceError::invalid)?;
         Ok(Some(ReadResourceObject { object, provenance: self.provenance(&home) }))

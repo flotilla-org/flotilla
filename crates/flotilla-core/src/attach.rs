@@ -1397,7 +1397,7 @@ mod tests {
     use crate::in_process::tests::create_identity_convoy;
     use crate::in_process::tests::test_meta;
     use crate::in_process::tests::{create_running_session, ensure_vessel};
-    use crate::in_process::tests::{create_test_environment, test_engine};
+    use crate::in_process::tests::{create_test_environment, install_engine_messages, test_engine};
     use crate::in_process::InProcessDaemon;
     use crate::testkits::discovery::fake_discovery;
     use flotilla_config::ConfigStore;
@@ -2233,6 +2233,7 @@ mod tests {
             )
             .await
             .expect("local host resource");
+        let _messages = install_engine_messages(&daemon);
         let engine = test_engine(&daemon);
         let environment = create_test_environment(&engine.environments, "coder-env", &host);
         create_running_session(&engine, &backend, &environment, "coder-session", "convoy-failed", "coder").await;

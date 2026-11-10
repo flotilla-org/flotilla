@@ -18,7 +18,8 @@ use flotilla_store::ResourceBackend;
 
 use super::support::{
     create_host_direct_host, create_host_direct_placement, create_identity_convoy, create_running_session, create_test_environment,
-    ensure_vessel, host_direct_kind, host_direct_kind_spec, put_host, read_host, test_engine, test_meta, trusted_codex_workflow,
+    ensure_vessel, host_direct_kind, host_direct_kind_spec, install_engine_messages, put_host, read_host, test_engine, test_meta,
+    trusted_codex_workflow,
 };
 use crate::in_process::{placement_actuator_host_ref, placement_target_host, ConditionValue, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
@@ -502,6 +503,7 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
     )
     .await;
     let local_host = daemon.local_host_id().expect("local host id").to_string();
+    let _messages = install_engine_messages(&daemon);
     let engine = test_engine(&daemon);
     let local_env = create_test_environment(&engine.environments, "local-env", &local_host);
     let ambiguous_env = create_test_environment(&engine.environments, "ambiguous-env", "shared-host");
@@ -533,6 +535,7 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
     )
     .await;
     let host = daemon.local_host_id().expect("local host id").to_string();
+    let _messages = install_engine_messages(&daemon);
     let engine = test_engine(&daemon);
     let env = create_test_environment(&engine.environments, "local-env", &host);
     let backend = daemon.resource_backend();

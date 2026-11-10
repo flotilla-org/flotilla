@@ -27,6 +27,7 @@ use super::roles::FleetRoles;
 /// What a view needs beyond the message: names the engine drops.
 pub trait ViewLookups {
     /// The vessel holding `role` in `convoy`, which the old receiver spelling names.
+    // Goes when crew compares engine addresses (#3108 gate task).
     fn vessel(&self, convoy: &str, role: &str) -> Option<String>;
     /// The crew id and session id of the session a receipt names.
     fn session(&self, receiver: &Receiver) -> Option<(String, String)>;
@@ -36,7 +37,56 @@ pub trait ViewLookups {
     fn principal_of(&self, _project: &str, _role: &str) -> Option<String> {
         None
     }
+    /// Whether the view keeps what it cannot spell without a lookup in annotations, as the
+    /// generic view does ([`Stored`]), rather than failing.
+    fn stored(&self) -> bool {
+        false
+    }
 }
+
+/// The generic view's lookups (#3108): none. Every address is shown as the engine stores it, a
+/// reference or condition the old shape cannot hold without a lookup is kept in an annotation
+/// instead ([`ENGINE_REFERENCES_ANNOTATION`], [`ENGINE_CONDITION_ANNOTATION`],
+/// [`ENGINE_OUTCOME_ANNOTATION`]), and a receipt names its consumer.
+pub struct Stored {
+    pub namespace: String,
+}
+
+impl ViewLookups for Stored {
+    fn vessel(&self, _: &str, _: &str) -> Option<String> {
+        None
+    }
+    fn session(&self, _: &Receiver) -> Option<(String, String)> {
+        None
+    }
+    fn record(&self, address: &Address, revision: &str) -> Option<OldReference> {
+        let resource = |kind: &str, name: &str| ResourceRef::new("flotilla.work/v1", kind, &self.namespace, name);
+        match address.kind() {
+            Kind::Convoy => {
+                Some(OldReference::ControlRecord { resource: resource("Convoy", address.name()), revision: revision.to_owned() })
+            }
+            Kind::Project => {
+                Some(OldReference::ControlRecord { resource: resource("Project", address.name()), revision: revision.to_owned() })
+            }
+            Kind::Artifact => Some(OldReference::Artifact {
+                resource: resource("Artifact", &flotilla_resources::address::record_name(address)?),
+                revision: revision.to_owned(),
+            }),
+            _ => None,
+        }
+    }
+    fn stored(&self) -> bool {
+        true
+    }
+}
+
+/// The references a generic view could not spell in the old shape: their engine addresses,
+/// one per line.
+pub const ENGINE_REFERENCES_ANNOTATION: &str = "flotilla.work/engine-references";
+/// A delivery condition the generic view could not spell as a Leaf: the engine's condition.
+pub const ENGINE_CONDITION_ANNOTATION: &str = "flotilla.work/engine-delivery-condition";
+/// An outcome expectation whose condition the generic view could not spell as a Leaf.
+pub const ENGINE_OUTCOME_ANNOTATION: &str = "flotilla.work/engine-outcome-condition";
 
 /// An engine message's id under its inbox: the old record name.
 pub fn record_name(message: &str) -> Option<String> {
@@ -152,19 +202,55 @@ pub fn old_view(
     roles: &FleetRoles,
     lookups: &dyn ViewLookups,
 ) -> Result<ResourceObject<OldMessage>, String> {
+    view_spelled(resource, namespace, &|address| old_address(address, roles, lookups), lookups)
+}
+
+/// An engine message as the generic resource verbs show it: the old shape with each address as
+/// the engine stores it, read with no lookup ([`Stored`]).
+pub fn stored_view(resource: &Resource<Message>, namespace: &str) -> Result<ResourceObject<OldMessage>, String> {
+    view_spelled(resource, namespace, &|address| Ok(address.to_string()), &Stored { namespace: namespace.to_owned() })
+}
+
+fn view_spelled(
+    resource: &Resource<Message>,
+    namespace: &str,
+    spell: &dyn Fn(&Address) -> Result<String, String>,
+    lookups: &dyn ViewLookups,
+) -> Result<ResourceObject<OldMessage>, String> {
     let name = record_name(resource.name()).ok_or_else(|| format!("`{}` is not a message address", resource.name()))?;
     let spec = resource.spec();
-    let receiver = old_address(&spec.inbox, roles, lookups)?;
-    let sender = old_address(&spec.sender, roles, lookups)?;
+    let receiver = spell(&spec.inbox)?;
+    let sender = spell(&spec.sender)?;
+    let mut annotations = std::collections::BTreeMap::new();
     let mut references = Vec::with_capacity(spec.references.len());
+    let mut unspelled = Vec::new();
     let mut subject = None;
     for reference in &spec.references {
-        let old = old_reference(reference, lookups)?;
+        let old = match old_reference(reference, lookups) {
+            Ok(old) => old,
+            Err(_) if lookups.stored() => {
+                unspelled.push(reference.address.to_string());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if reference.subject {
             subject = Some(old.clone());
         }
         references.push(old);
     }
+    if !unspelled.is_empty() {
+        annotations.insert(ENGINE_REFERENCES_ANNOTATION.to_owned(), unspelled.join("\n"));
+    }
+    // A condition the old shape holds only through a lookup is kept as the engine states it.
+    let mut leaf = |condition: &Condition, annotation: &str| match old_leaf(condition, lookups) {
+        Ok(leaf) => Ok(Some(leaf)),
+        Err(_) if lookups.stored() => {
+            annotations.insert(annotation.to_owned(), condition.to_string());
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    };
     let body = match spec.body.value() {
         MessageBody::Text(text) => text.clone(),
         MessageBody::Request(request) => format!("{request:?}"),
@@ -172,7 +258,10 @@ pub fn old_view(
     let expectation = match &spec.expectation {
         Expectation::Nothing => MessageExpectation::None,
         Expectation::Reply => MessageExpectation::Reply,
-        Expectation::Outcome { condition } => MessageExpectation::Outcome { condition: old_leaf(condition, lookups)? },
+        Expectation::Outcome { condition } => match leaf(condition, ENGINE_OUTCOME_ANNOTATION)? {
+            Some(condition) => MessageExpectation::Outcome { condition },
+            None => MessageExpectation::None,
+        },
     };
     let old_message = |reference: &flotilla_state_machines::machines::message::MessageRef| {
         record_name(&reference.name).ok_or_else(|| format!("`{}` is not a message address", reference.name))
@@ -196,7 +285,10 @@ pub fn old_view(
         deadline: spec.deadline.and_then(|deadline| deadline.to_datetime()),
         supersedes: spec.supersedes.as_ref().map(old_message).transpose()?,
         interrupting: false,
-        delivery_condition: spec.delivery_condition.as_ref().map(|condition| old_leaf(condition, lookups)).transpose()?,
+        delivery_condition: match &spec.delivery_condition {
+            Some(condition) => leaf(condition, ENGINE_CONDITION_ANNOTATION)?,
+            None => None,
+        },
     };
     let since = resource.since().to_datetime().unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
     let state = resource.state();
@@ -245,7 +337,7 @@ pub fn old_view(
             namespace: namespace.to_owned(),
             resource_version: resource.version().0.to_string(),
             labels: Default::default(),
-            annotations: Default::default(),
+            annotations,
             owner_references: Vec::new(),
             finalizers: Vec::new(),
             deletion_timestamp: None,

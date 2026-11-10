@@ -926,6 +926,7 @@ pub(super) async fn daemon_with_decided_store(
     )
     .await
     .expect("compose the daemon with the test's decided store");
+    daemon.open_message_primitives().expect("message path");
     (tmp, daemon)
 }
 

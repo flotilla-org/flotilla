@@ -1,5 +1,6 @@
 //! Message as the old store's typed paths see it (#3108): the generic resource verbs read the
-//! engine's messages in their old shape, and an apply admits one. A message's state moves only
+//! engine's messages in their old shape, with each address as the engine stores it, at every home
+//! that holds them, and an apply admits one. A message's state moves only
 //! through its machine, so a status write or delete through those verbs is refused.
 
 use std::{
@@ -71,12 +72,12 @@ impl EngineRecords for MessageRecords {
     }
 
     async fn get(&self, _kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        let view = self.primitives.view(&self.namespace(), name).await.map_err(|error| error.to_string())?;
+        let view = self.primitives.stored_view(&self.namespace(), name).map_err(|error| error.to_string())?;
         view.map(|read| self.object(read)).transpose()
     }
 
     async fn list(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
-        let views = self.primitives.views(&self.namespace()).await.map_err(|error| error.to_string())?;
+        let views = self.primitives.stored_views(&self.namespace()).map_err(|error| error.to_string())?;
         views.into_iter().map(|read| self.object(read)).collect()
     }
 
@@ -96,7 +97,7 @@ impl EngineRecords for MessageRecords {
         let namespace = self.namespace();
         let spec: OldSpec = serde_json::from_value(spec).map_err(|error| format!("Message spec: {error}"))?;
         self.primitives.admit(&namespace, name, &spec).await.map_err(|error| error.to_string())?;
-        let view = self.primitives.view(&namespace, name).await.map_err(|error| error.to_string())?;
+        let view = self.primitives.stored_view(&namespace, name).map_err(|error| error.to_string())?;
         self.object(view.ok_or_else(|| format!("Message {name} is not readable after its admission"))?)
     }
 

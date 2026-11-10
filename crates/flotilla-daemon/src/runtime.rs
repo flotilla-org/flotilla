@@ -658,29 +658,6 @@ impl StartupRestoration {
         let Some(state) = self.state.as_ref() else {
             return futures::future::pending::<Result<(), ResourceError>>().await;
         };
-        let audit_daemon = Arc::clone(daemon);
-        // The old store's audit sweep compacts old Messages; on the engine path there are none.
-        if daemon.message_primitives().is_none() {
-            controller_tasks.push(AbortOnDropHandle::new(spawn_periodic_task(
-                Duration::from_secs(60 * 60),
-                PeriodicTaskStart::Immediate,
-                move || {
-                    let daemon = Arc::clone(&audit_daemon);
-                    async move {
-                        match daemon.resource_backend().local_namespaces::<flotilla_resources::Message>().await {
-                            Ok(namespaces) => {
-                                for namespace in namespaces {
-                                    if let Err(error) = daemon.message_inbox(&namespace).await.compact_audit(Utc::now()).await {
-                                        warn!(%error, %namespace, "Message audit retention sweep failed");
-                                    }
-                                }
-                            }
-                            Err(error) => warn!(%error, "Message retention namespace inventory failed"),
-                        }
-                    }
-                },
-            )));
-        }
         controller_tasks.push(AbortOnDropHandle::new(spawn_dispatch_reconciler_task(Arc::clone(daemon), options.namespace.clone())));
         controller_tasks.push(AbortOnDropHandle::new(spawn_convoy_ensure_reconciler_task(
             Arc::clone(state),
@@ -1074,20 +1051,12 @@ pub fn engine_opener(config: &ConfigStore) -> flotilla_core::in_process::EngineO
 /// Opens the Message path over the decided store composed with the daemon (#3317). Installed
 /// before peer tasks start, so every peer's log is followed from the first connection.
 pub(crate) async fn open_message_primitives(daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
-    let service =
-        daemon.decided_store().map_err(|error| format!("[primitives] needs the decided store composed with the daemon: {error}"))?;
-    let home = daemon.node_id().as_str().to_owned();
-    let primitives = retry_phase("restore_message_primitives", || async {
-        let backend = daemon.resource_backend();
-        let clock = daemon.clock_for_scenarios();
-        let home = home.clone();
-        let service = Arc::clone(&service);
-        tokio::task::spawn_blocking(move || flotilla_core::primitives::MessagePrimitives::open(&home, service, backend, clock))
-            .await
-            .map_err(|error| error.to_string())?
+    retry_phase("restore_message_primitives", || async {
+        let daemon = Arc::clone(daemon);
+        tokio::task::spawn_blocking(move || daemon.open_message_primitives()).await.map_err(|error| error.to_string())?
     })
-    .await?;
-    daemon.install_message_primitives(Arc::new(primitives))
+    .await
+    .map(|_| ())
 }
 
 /// The archive shipper over the decided store (#3939), uploading to every configured fleet blob

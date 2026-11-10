@@ -8,7 +8,6 @@ use flotilla_resources::{error, host, labels, resource, retention};
 mod account_records;
 mod attentions;
 pub use account_records::{OldStoreAccounts, SwitchedAccounts};
-pub use attentions::OldStoreAttentions;
 mod backend;
 pub use backend::*;
 pub mod controller;

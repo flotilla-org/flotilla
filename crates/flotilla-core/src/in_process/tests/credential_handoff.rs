@@ -10,7 +10,7 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{test_engine, test_meta, SessionStagingProbe};
+use super::support::{designate_fleet, install_engine_messages, test_engine, test_meta, SessionStagingProbe};
 use crate::in_process::{InProcessDaemon, TerminalSessionIdentity};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_provisioning_testkit::{Ending, TerminalsFixture};
@@ -30,6 +30,8 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    let _messages = install_engine_messages(&daemon);
+    designate_fleet(&backend).await;
     let engine = test_engine(&daemon);
     let repository = RepositoryKey("github.com-flotilla-org-flotilla".to_string());
     let requirement = VesselRequirement::builder()
@@ -231,6 +233,8 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
+        let _messages = install_engine_messages(&daemon);
+        designate_fleet(&backend).await;
         let agent = |role: &str| {
             CrewSpec::builder()
                 .role(role.to_string())
@@ -351,7 +355,9 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
         assert_eq!(brief.content, "Created by the vessel controller.", "the controller's session is kept");
         let messages = backend.clone().using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items;
         assert!(
-            messages.iter().any(|message| message.spec.receiver.ends_with("/work/aide") && message.spec.body == "Task 1."),
+            messages.iter().any(|message| {
+                message.spec.receiver == "project:flotilla/convoy:convoy-concurrent/role:aide" && message.spec.body == "Task 1."
+            }),
             "the handoff is queued for the aide: {:?}",
             messages.iter().map(|message| (&message.spec.receiver, &message.spec.body)).collect::<Vec<_>>()
         );

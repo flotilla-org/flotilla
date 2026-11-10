@@ -1,6 +1,8 @@
 use super::*;
 use crate::testkits::engine::runtime_terminals;
+use flotilla_core::primitives::view::record_name;
 use flotilla_resources::attentions::Subject;
+use flotilla_state_machines::machines::message::MessageState;
 use flotilla_store_memory::InMemoryBackend;
 
 #[tokio::test]
@@ -8,6 +10,8 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     let temp = tempfile::tempdir().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"credential-refresh-test\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    daemon.open_message_primitives().expect("message path");
+    designate_fleet(&daemon).await;
     let backend = daemon.resource_backend();
     let convoys = backend.using::<Convoy>(NAMESPACE);
     let convoy = convoys
@@ -79,6 +83,15 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     };
     let attentions = daemon.attentions();
     let open = || async { attentions.open(NAMESPACE, None, None).await.expect("open attentions") };
+    // A person acknowledges every open attention: each is a Message pending at this home.
+    let primitives = daemon.message_primitives().expect("message path");
+    let acknowledge_all = || async {
+        for (_, message) in primitives.messages().expect("messages") {
+            if *message.state() == MessageState::Pending {
+                primitives.acknowledge(NAMESPACE, &record_name(message.name()).expect("record")).await.expect("acknowledge attention");
+            }
+        }
+    };
     reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[transient])
         .await
         .expect("ignore transient failure");
@@ -105,15 +118,7 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     assert_eq!(told.len(), 1);
     assert_eq!(told[0].subject, Subject::Vessel { convoy: "credential-convoy".into(), vessel: "work".into() });
     assert!(told[0].reason.contains("expires in 120 seconds"));
-    let demands = backend.using::<Demand>(NAMESPACE);
-    let raised_demand = demands.list().await.expect("list demands").items.remove(0);
-    flotilla_store::apply_status_patch(
-        &demands,
-        &raised_demand.metadata.name,
-        &flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "operator".to_string() },
-    )
-    .await
-    .expect("acknowledge demand");
+    acknowledge_all().await;
     reconcile_credential_refresh_attention_in(
         &*daemon.attentions(),
         &backend,
@@ -162,11 +167,7 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true), forgejo])
         .await
         .expect("two fail");
-    for demand in demands.list().await.expect("list demands").items {
-        let acknowledge =
-            flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "operator".to_string() };
-        flotilla_store::apply_status_patch(&demands, &demand.metadata.name, &acknowledge).await.expect("acknowledge demand");
-    }
+    acknowledge_all().await;
     reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true)])
         .await
         .expect("partial fix");
@@ -180,13 +181,6 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
 
     // Owner decision of 2026-11-02: a credential that starts failing while the attention is
     // acknowledged begins a new episode, and the person is told again.
-    let acknowledge_all = || async {
-        for demand in demands.list().await.expect("list demands").items {
-            let acknowledge =
-                flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "operator".to_string() };
-            flotilla_store::apply_status_patch(&demands, &demand.metadata.name, &acknowledge).await.expect("acknowledge demand");
-        }
-    };
     acknowledge_all().await;
     reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true)])
         .await
@@ -1074,8 +1068,9 @@ async fn credential_attention_reads_only_live_convoys() {
         should_surface: true,
         first_failure_at: None,
     };
+    // Only the convoy reads are measured: the attentions hold nothing and take every raise.
     let (result, reads) = measure_reads(super::super::credentials::reconcile_credential_refresh_attention_in(
-        &flotilla_store::OldStoreAttentions::new(backend.clone()),
+        &flotilla_store_testkit::NoAttentions,
         &backend,
         "flotilla",
         &[failure],

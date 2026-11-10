@@ -11,8 +11,8 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
     Convoy, ConvoySpec, FleetDesignation, FleetDesignationSpec, Host, InputMeta, MessageExpectation, MessageReference, MessageRelation,
-    MessageSpec, Project, ProjectSpec, Resource, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext,
-    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, FLEET_DESIGNATION_NAME,
+    MessageSpec, Project, ProjectSpec, Resource, ResourceProvenance, Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSource,
+    TerminalSessionSpec, Vessel, VesselSpec, FLEET_DESIGNATION_NAME,
 };
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::{Follower, Service};
@@ -25,11 +25,21 @@ const NS: &str = "flotilla";
 
 /// The engine path at one daemon: its decided store homed at its node id.
 pub(super) async fn engine(daemon: &Arc<InProcessDaemon>) -> (Arc<Service>, Arc<MessagePrimitives>) {
-    let backend = daemon.resource_backend();
+    seed_fleet(&daemon.resource_backend()).await;
+    // The daemon's Message path, opened over its decided store as its runtime opens it.
+    let service = daemon.decided_store().expect("decided store");
+    let primitives = match daemon.message_primitives() {
+        Some(primitives) => primitives,
+        None => daemon.open_message_primitives().expect("message path"),
+    };
+    (service, primitives)
+}
+
+/// The fleet the engine's Message delivery reads its roles from: Project `fleet`, designated.
+pub(super) async fn seed_fleet(backend: &flotilla_store::ResourceBackend) {
     backend
-        .clone()
-        .using::<Project>(NS)
-        .create(
+        .definitions::<Project>(NS)
+        .apply(
             &InputMeta::builder().name("fleet".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("Fleet".to_string())
@@ -41,19 +51,12 @@ pub(super) async fn engine(daemon: &Arc<InProcessDaemon>) -> (Arc<Service>, Arc<
         .expect("fleet project");
     backend
         .definitions::<FleetDesignation>(NS)
-        .create(
+        .apply(
             &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
             &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
         )
         .await
         .expect("fleet designation");
-    // The daemon composes with its decided store; the Message path opens over it as its runtime does.
-    let home = daemon.node_id().as_str().to_owned();
-    let service = daemon.decided_store().expect("decided store");
-    let primitives =
-        Arc::new(MessagePrimitives::open(&home, Arc::clone(&service), backend, Arc::new(SystemClock)).expect("message primitives"));
-    daemon.install_message_primitives(Arc::clone(&primitives)).expect("message path");
-    (service, primitives)
 }
 
 /// A home read served by another home's store, as its record socket serves one.
@@ -156,7 +159,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         _ => Some(message),
     });
     let mesh = flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_filter(
-        vec![super::empty_daemon_named("home-a").await, super::empty_daemon_named("home-b").await],
+        vec![super::message_home_daemon("home-a").await, super::message_home_daemon("home-b").await],
         Some(&[Host::API_PATHS.kind]),
         drop_change_streams,
     )

@@ -8,7 +8,7 @@ use flotilla_protocol::{CommandAction, HostName, NodeId};
 use flotilla_resources::{Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ResourceError};
 use flotilla_store::ResourceBackend;
 
-use super::support::test_meta;
+use super::support::{designate_fleet, install_engine_messages, test_meta};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
@@ -350,4 +350,52 @@ async fn message_send_reads_ignore_unrelated_history() {
         (routing, admission)
     }
     assert_flat_reads([0, 40], send_reads).await;
+}
+
+// #3938: a person sends as the role they hold, so the record names the role; who acted is audit,
+// and the admission trace names the principal as given, or that none was named.
+#[tokio::test]
+async fn a_persons_message_traces_its_principal_and_records_its_role() {
+    #[derive(Clone, Default)]
+    struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lines").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let lines = Lines::default();
+    let writer = lines.clone();
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish());
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"principal-trace-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+        Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let primitives = install_engine_messages(&daemon);
+    designate_fleet(&backend).await;
+    for (name, principal, traced) in [("from-nobody", "principal:implicit", "none named"), ("from-alice", "principal:alice", "alice")] {
+        let intent = flotilla_resources::MessageSpec::builder()
+            .sender(principal.into())
+            .receiver("system:turn-rules".into())
+            .relation(flotilla_resources::MessageRelation::Peer)
+            .body("ruling".into())
+            .build();
+        primitives.admit("flotilla", name, &intent).await.expect("admitted");
+        let stored = primitives.stored_view("flotilla", name).expect("read").expect("stored");
+        assert_eq!(stored.object.spec.sender, "fleet:lab/role:operator", "the record names the role");
+        let logged = String::from_utf8(lines.0.lock().expect("lines").clone()).expect("UTF-8");
+        assert!(logged.contains(&format!("message.principal=\"{traced}\"")), "{logged}");
+    }
 }

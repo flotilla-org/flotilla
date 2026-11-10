@@ -195,6 +195,17 @@ async fn messages_reach_a_peer_by_log_following() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    // A host role's message (A's forge observer's) lists at both homes with its receiver as the
+    // engine stores it: no convoy, vessel or project names a host role.
+    let receivers = |listed: Vec<flotilla_resources::ResourceObject<flotilla_resources::Message>>| {
+        listed.into_iter().map(|message| (message.metadata.name, message.spec.receiver)).collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let (at_a, at_b) = (receivers(a.list().await), receivers(b.list().await));
+    let host_role = at_a
+        .iter()
+        .find(|(_, receiver)| receiver.starts_with("host:") && receiver.contains("/role:"))
+        .unwrap_or_else(|| panic!("a message to a host role: {at_a:?}"));
+    assert_eq!(at_b.get(host_role.0), Some(host_role.1), "the host role's message at the peer");
     for daemon in [&a, &b] {
         let report = daemon.old_store_report().expect("recorded");
         let peered = report.split("stage peered:").nth(1).unwrap_or_default();

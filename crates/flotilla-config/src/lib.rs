@@ -365,9 +365,6 @@ pub struct DaemonConfig {
     /// OTLP tracing export; absent means no network export.
     #[serde(default)]
     pub tracing: Option<DaemonTracingConfig>,
-    /// Compact terminal Message bodies after this many days; zero disables compaction.
-    #[serde(default = "default_message_audit_retention_days")]
-    pub message_audit_retention_days: u64,
     #[serde(default)]
     pub machine_id: Option<String>,
     pub host_name: Option<String>,
@@ -467,7 +464,6 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             tracing: None,
-            message_audit_retention_days: default_message_audit_retention_days(),
             machine_id: None,
             host_name: None,
             admission: AdmissionConfig::default(),
@@ -488,10 +484,6 @@ impl Default for DaemonConfig {
             docker_vessels: None,
         }
     }
-}
-
-fn default_message_audit_retention_days() -> u64 {
-    30
 }
 
 fn default_checkout_archive_retention_days() -> u64 {

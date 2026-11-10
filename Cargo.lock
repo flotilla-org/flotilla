@@ -2290,6 +2290,7 @@ dependencies = [
  "flotilla-store-sqlite",
  "flotilla-store-testkit",
  "flotilla-terminal",
+ "flotilla-tracing",
  "flotilla-vcs",
  "futures",
  "hegeltest",

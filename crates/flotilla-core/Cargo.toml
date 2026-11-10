@@ -21,6 +21,7 @@ rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-messaging = { path = "../flotilla-messaging" }
+flotilla-tracing = { path = "../flotilla-tracing" }
 flotilla-observation = { path = "../flotilla-observation" }
 flotilla-projections = { path = "../flotilla-projections" }
 flotilla-executor = { path = "../flotilla-executor" }

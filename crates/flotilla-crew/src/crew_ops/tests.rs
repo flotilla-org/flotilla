@@ -86,6 +86,7 @@ async fn fixture_with_message_path(
     message_path: crate::ports::MessagePath,
 ) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, tempfile::TempDir) {
     let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
+    backend.install_attentions(Arc::new(flotilla_store_testkit::NoAttentions));
     let config_dir = tempfile::tempdir().expect("config directory");
     let config = Arc::new(ConfigStore::with_base(config_dir.path()));
     let environment = EnvironmentId::new("local");

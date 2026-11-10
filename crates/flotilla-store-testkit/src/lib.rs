@@ -7,6 +7,8 @@ mod read_counts;
 pub use read_counts::{
     assert_flat_reads, measure_reads, ReadBudget, ReadCountsBackendExt, ReadOperation, ReadSnapshot, ReadTally, ScopedReads, ZeroReadGuard,
 };
+mod attentions;
+pub use attentions::NoAttentions;
 mod message;
 pub use message::LegacyMessageFixture;
 

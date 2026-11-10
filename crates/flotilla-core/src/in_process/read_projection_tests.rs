@@ -1,4 +1,4 @@
-use crate::in_process::tests::engine_fixture;
+use crate::in_process::tests::{engine_fixture, engine_messages};
 use flotilla_projections::ports::EnvironmentSummaries;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -314,6 +314,8 @@ mod tests {
         manifest_roots: flotilla_store::OldStoreManifestRoots,
         /// The engine's environments the projections read.
         engine: flotilla_provisioning_testkit::EnvironmentFixture,
+        /// The engine's Message path, whose attentions the projections read.
+        _messages: Arc<crate::primitives::MessagePrimitives>,
     }
 
     #[async_trait]
@@ -368,7 +370,17 @@ mod tests {
             let fleet = FleetService::new(AggregatorProjectionState::new(), host_name.clone(), None);
             let accounts = flotilla_store::OldStoreAccounts::new(backend.clone());
             let manifest_roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+            let service = Arc::new(
+                flotilla_schema_sqlite::stream::Service::open(
+                    &temp.path().join("decided.sqlite"),
+                    node_id.as_str(),
+                    flotilla_engine_store::registry().expect("engine kinds"),
+                )
+                .expect("decided store"),
+            );
+            let _messages = engine_messages(service, &backend);
             Self {
+                _messages,
                 temp,
                 backend,
                 config,
@@ -383,6 +395,12 @@ mod tests {
                 manifest_roots,
                 engine: engine_fixture().environments,
             }
+        }
+
+        /// Read through `backend`, with the engine's attentions installed on it.
+        fn use_backend(&mut self, backend: ResourceBackend) {
+            backend.install_attentions(Arc::clone(&self._messages) as Arc<dyn flotilla_resources::attentions::Attentions>);
+            self.backend = backend;
         }
 
         fn projections(&self) -> ReadProjections<'_> {
@@ -1400,7 +1418,7 @@ mod tests {
             let mut measurements = Vec::new();
             let mut fixture = ProjectionFixture::new();
             let memory = InMemoryBackend::default().with_read_counts();
-            fixture.backend = ResourceBackend::new(memory.clone());
+            fixture.use_backend(ResourceBackend::new(memory.clone()));
             for index in 0..=n {
                 let name = if index == 0 { "target".to_string() } else { format!("unrelated-{index}") };
                 let project = if index == 0 { "app" } else { "other" };
@@ -1517,7 +1535,7 @@ mod tests {
         async fn explain(n: usize, adopted: bool) -> ReadSnapshot {
             let mut fixture = ProjectionFixture::new();
             let memory = InMemoryBackend::default().with_read_counts();
-            fixture.backend = ResourceBackend::new(memory.clone());
+            fixture.use_backend(ResourceBackend::new(memory.clone()));
             fixture
                 .backend
                 .using::<ResourceConvoy>("flotilla")

@@ -635,7 +635,6 @@ impl CrewService {
                 let (change_request, issue) = self.message_observation_staleness();
                 flotilla_messaging::MessageInbox::new(self.resource_backend.clone(), namespace)
                     .with_observation_staleness(change_request, issue)
-                    .with_audit_retention_days(self.config.load_daemon_config().unwrap_or_default().message_audit_retention_days)
             })
             .clone()
     }
