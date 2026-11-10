@@ -897,49 +897,22 @@ fn bootstrap_outcome(
         };
     };
 
-    if let Err(errors) = validate(&template.spec) {
-        return InternalReconcileOutcome {
-            patch: Some(controller_patches::fail_init(
-                ConvoyPhase::Failed,
-                format!("WorkflowTemplate '{}' is invalid: {errors:?}", convoy.spec.workflow_ref),
-                now,
-            )),
-            actuations: Vec::new(),
-            events: vec![ConvoyEvent::TemplateInvalid { name: template.metadata.name.clone(), errors }],
-        };
-    }
-
-    for input in &template.spec.inputs {
-        if !convoy.spec.inputs.contains_key(&input.name) {
+    let workflow_snapshot = match admitted_snapshot(&convoy.metadata.name, &convoy.metadata.namespace, &convoy.spec, &template.spec) {
+        Ok(snapshot) => snapshot,
+        Err(refusal) => {
+            let (message, event) = match refusal {
+                SnapshotRefusal::Invalid(errors) => (
+                    format!("WorkflowTemplate '{}' is invalid: {errors:?}", convoy.spec.workflow_ref),
+                    ConvoyEvent::TemplateInvalid { name: template.metadata.name.clone(), errors },
+                ),
+                SnapshotRefusal::MissingInput(name) => (format!("missing input '{name}'"), ConvoyEvent::MissingInput { name }),
+            };
             return InternalReconcileOutcome {
-                patch: Some(controller_patches::fail_init(ConvoyPhase::Failed, format!("missing input '{}'", input.name), now)),
+                patch: Some(controller_patches::fail_init(ConvoyPhase::Failed, message, now)),
                 actuations: Vec::new(),
-                events: vec![ConvoyEvent::MissingInput { name: input.name.clone() }],
+                events: vec![event],
             };
         }
-    }
-
-    let workflow_snapshot = WorkflowSnapshot {
-        cascade: template.spec.cascade.clone(),
-        stall_nudges: template.spec.stall_nudges.clone(),
-        supervision: template.spec.supervision.clone(),
-        exit: template.spec.exit.clone(),
-        turn_delivery: template.spec.turn_delivery.clone(),
-        vessels: template
-            .spec
-            .vessels
-            .iter()
-            .map(|vessel| VesselRequirement {
-                name: vessel.name.clone(),
-                depends_on: vessel.depends_on.clone(),
-                repository_refs: vessel.repository_refs.clone(),
-                credential_refs: vessel.credential_refs.clone(),
-                credential_scopes: vessel.credential_scopes.clone(),
-                credential_permissions: vessel.credential_permissions.clone(),
-                crew: vessel.crew.iter().map(|member| instantiate_process(convoy, member)).collect(),
-                needs: vessel.needs.clone(),
-            })
-            .collect(),
     };
     let work = template
         .spec
@@ -1031,7 +1004,60 @@ fn backfill_crew_work_outcome(status: &super::ConvoyStatus) -> Option<InternalRe
     })
 }
 
-fn instantiate_process(convoy: &ResourceObject<Convoy>, process: &CrewSpec) -> CrewSpec {
+/// Why a workflow cannot be admitted as a convoy's frozen snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotRefusal {
+    /// The template is invalid.
+    Invalid(Vec<crate::workflow_template::ValidationError>),
+    /// The convoy names no value for this input of the template.
+    MissingInput(String),
+}
+
+/// The workflow snapshot a convoy named `name` in `namespace` with `spec` freezes from `template`:
+/// its crews' prompts and commands interpolated with the convoy's inputs and name. Refused when
+/// the template is invalid or an input it declares has no value.
+pub fn admitted_snapshot(
+    name: &str,
+    namespace: &str,
+    spec: &crate::ConvoySpec,
+    template: &crate::workflow_template::WorkflowTemplateSpec,
+) -> Result<WorkflowSnapshot, SnapshotRefusal> {
+    validate(template).map_err(SnapshotRefusal::Invalid)?;
+    if let Some(input) = template.inputs.iter().find(|input| !spec.inputs.contains_key(&input.name)) {
+        return Err(SnapshotRefusal::MissingInput(input.name.clone()));
+    }
+    let names = Interpolation { name, namespace, inputs: &spec.inputs };
+    Ok(WorkflowSnapshot {
+        cascade: template.cascade.clone(),
+        stall_nudges: template.stall_nudges.clone(),
+        supervision: template.supervision.clone(),
+        exit: template.exit.clone(),
+        turn_delivery: template.turn_delivery.clone(),
+        vessels: template
+            .vessels
+            .iter()
+            .map(|vessel| VesselRequirement {
+                name: vessel.name.clone(),
+                depends_on: vessel.depends_on.clone(),
+                repository_refs: vessel.repository_refs.clone(),
+                credential_refs: vessel.credential_refs.clone(),
+                credential_scopes: vessel.credential_scopes.clone(),
+                credential_permissions: vessel.credential_permissions.clone(),
+                crew: vessel.crew.iter().map(|member| instantiate_process(&names, member)).collect(),
+                needs: vessel.needs.clone(),
+            })
+            .collect(),
+    })
+}
+
+/// What a template's `{{ ... }}` tokens read: the convoy's name, namespace and inputs.
+struct Interpolation<'a> {
+    name: &'a str,
+    namespace: &'a str,
+    inputs: &'a BTreeMap<String, InputValue>,
+}
+
+fn instantiate_process(convoy: &Interpolation<'_>, process: &CrewSpec) -> CrewSpec {
     let mut process = process.clone();
     match &mut process.source {
         CrewSource::Agent { prompt, .. } => {
@@ -1046,7 +1072,7 @@ fn instantiate_process(convoy: &ResourceObject<Convoy>, process: &CrewSpec) -> C
     process
 }
 
-fn interpolate_template_text(convoy: &ResourceObject<Convoy>, text: &str) -> String {
+fn interpolate_template_text(convoy: &Interpolation<'_>, text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut search_from = 0;
     visit_template_tokens(text, |token| {
@@ -1070,12 +1096,12 @@ fn interpolate_template_text(convoy: &ResourceObject<Convoy>, text: &str) -> Str
     output
 }
 
-fn interpolation_value(convoy: &ResourceObject<Convoy>, token: &str) -> Option<String> {
+fn interpolation_value(convoy: &Interpolation<'_>, token: &str) -> Option<String> {
     let segments = token.split('.').collect::<Vec<_>>();
     match segments.as_slice() {
-        ["inputs", input_name] => convoy.spec.inputs.get(*input_name).map(input_value_string),
-        ["workflow", "name"] => Some(convoy.metadata.name.clone()),
-        ["workflow", "namespace"] => Some(convoy.metadata.namespace.clone()),
+        ["inputs", input_name] => convoy.inputs.get(*input_name).map(input_value_string),
+        ["workflow", "name"] => Some(convoy.name.to_owned()),
+        ["workflow", "namespace"] => Some(convoy.namespace.to_owned()),
         _ => None,
     }
 }
