@@ -713,7 +713,7 @@ impl StartupRestoration {
             runtime_health.clone(),
         )));
         let (supervisor_turn_task, _supervisor_turn_ready) =
-            spawn_pending_supervisor_turn_task(Arc::clone(daemon), options.namespace.clone(), options.controller_resync_interval);
+            spawn_pending_supervisor_turn_task(Arc::clone(daemon), options.namespace.clone());
         controller_tasks.push(AbortOnDropHandle::new(supervisor_turn_task));
         controller_tasks.push(AbortOnDropHandle::new(spawn_provisioned_environment_reconciliation_task(
             Arc::clone(state),

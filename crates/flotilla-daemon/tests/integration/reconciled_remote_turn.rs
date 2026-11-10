@@ -205,10 +205,9 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     );
     replicate::<Vessel>(&placement, &home, placement_daemon.node_id()).await;
 
-    // #2287: replication wakes delivery and acknowledgment well before the 300s resync.
+    // #2287: replication wakes delivery and acknowledgment; no timer does.
     // Await the subscribed startup scan so delivery cannot accidentally come from startup.
-    let (home_task, home_ready) =
-        spawn_pending_supervisor_turn_task(Arc::clone(&home_daemon), "flotilla".to_string(), Duration::from_secs(300));
+    let (home_task, home_ready) = spawn_pending_supervisor_turn_task(Arc::clone(&home_daemon), "flotilla".to_string());
     let _home_task = AbortOnDropHandle::new(home_task);
     let subscriptions = Arc::new(AtomicUsize::new(0));
     let before_retry = Arc::new(StdMutex::new(None));
@@ -216,39 +215,34 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         let backend = placement.clone();
         let subscriptions = Arc::clone(&subscriptions);
         let before_retry = Arc::clone(&before_retry);
-        spawn_pending_supervisor_turn_task_with_watches(
-            Arc::clone(&placement_daemon),
-            "flotilla".to_string(),
-            Duration::from_secs(300),
-            move || {
-                let backend = backend.clone();
-                let before_retry = Arc::clone(&before_retry);
-                let attempt = subscriptions.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    if attempt == 1 {
-                        // Capture the real store before replacing the failed watch.
-                        // Assert from the test body so failures do not hide in the spawned task.
-                        let stored = backend.clone().using::<TerminalSession>("flotilla").list().await?;
-                        *before_retry.lock().expect("retry observation lock") = Some(stored.items);
-                    }
-                    let convoys = backend.including_replicas::<Convoy>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
-                    let sessions =
-                        backend.including_replicas::<TerminalSession>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
-                    // Stand in only for a failed resource-notification stream;
-                    // both stores and the delivery/acknowledgment pass remain real.
-                    Ok(if attempt == 0 {
-                        match closed_watch {
-                            ClosedWatch::Convoy => (futures::stream::empty().boxed(), sessions),
-                            ClosedWatch::TerminalSession => (convoys, futures::stream::empty().boxed()),
-                        }
-                    } else {
-                        (convoys, sessions)
-                    })
+        spawn_pending_supervisor_turn_task_with_watches(Arc::clone(&placement_daemon), "flotilla".to_string(), move || {
+            let backend = backend.clone();
+            let before_retry = Arc::clone(&before_retry);
+            let attempt = subscriptions.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 1 {
+                    // Capture the real store before replacing the failed watch.
+                    // Assert from the test body so failures do not hide in the spawned task.
+                    let stored = backend.clone().using::<TerminalSession>("flotilla").list().await?;
+                    *before_retry.lock().expect("retry observation lock") = Some(stored.items);
                 }
-            },
-        )
+                let convoys = backend.including_replicas::<Convoy>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
+                let sessions =
+                    backend.including_replicas::<TerminalSession>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
+                // Stand in only for a failed resource-notification stream;
+                // both stores and the delivery/acknowledgment pass remain real.
+                Ok(if attempt == 0 {
+                    match closed_watch {
+                        ClosedWatch::Convoy => (futures::stream::empty().boxed(), sessions),
+                        ClosedWatch::TerminalSession => (convoys, futures::stream::empty().boxed()),
+                    }
+                } else {
+                    (convoys, sessions)
+                })
+            }
+        })
     } else {
-        spawn_pending_supervisor_turn_task(Arc::clone(&placement_daemon), "flotilla".to_string(), Duration::from_secs(300))
+        spawn_pending_supervisor_turn_task(Arc::clone(&placement_daemon), "flotilla".to_string())
     };
     let _placement_task = AbortOnDropHandle::new(placement_task);
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -283,7 +277,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
             }
         })
         .await
-        .expect("closed dependency watch resubscribes before the 300-second resync");
+        .expect("closed dependency watch resubscribes without a timer");
     }
     let records = placement.using::<Message>("flotilla").list().await.expect("receiver inbox").items;
     assert_eq!(records.len(), 1);
