@@ -196,8 +196,8 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     .expect("checkout scopes become available");
 
     let mut events = daemon.subscribe();
-    // An adopted checkout is the engine's, held for its convoy; the daemon projects it into the
-    // observed store, and removes an adopted projection whose launch has ended.
+    // An adopted checkout is the engine's, held for its convoy; its row follows its launches, and
+    // goes once its launch has ended.
     let engine = flotilla_daemon_testkit::engine::runtime_checkouts(&daemon);
     engine.open_convoy("ship-it");
     let ship_it = engine.holder("ship-it");
@@ -214,7 +214,6 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         )
     };
     let launch = engine.put_ready("checkout-widgets", &adopted("feature/query", "/work/widgets"), Some(&ship_it));
-    daemon.project_adopted_checkouts("flotilla").await.expect("project adopted checkout");
 
     let mut additions = HashMap::new();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -241,7 +240,6 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     // A checkout's spec is its launch's: the revision is the checkout's next launch.
     engine.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
     let launch = engine.put_ready("checkout-widgets", &adopted("feature/revised", "/work/widgets-revised"), Some(&ship_it));
-    daemon.project_adopted_checkouts("flotilla").await.expect("project modified checkout");
     let mut modifications = HashMap::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         while modifications.len() < 2 {
@@ -296,7 +294,6 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     assert!(current_replay.is_empty());
 
     engine.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
-    daemon.project_adopted_checkouts("flotilla").await.expect("remove adopted projection");
     let mut removals = HashMap::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         while removals.len() < 2 {
@@ -1054,15 +1051,15 @@ async fn cleanup_checkout_rows(daemon: &InProcessDaemon) -> Vec<flotilla_protoco
         .expect("checkout result set")
 }
 
-// #768: both ways an adopted checkout goes remove adopted projections and their Aggregator
-// rows without periodic reconciliation. Non-adopted observations survive.
+// #768: both ways an adopted checkout goes remove its Aggregator row without periodic
+// reconciliation. Non-adopted observations survive.
 #[tokio::test]
-async fn ended_adopted_checkout_removes_projection_and_aggregator_row() {
+async fn ended_adopted_checkout_removes_its_aggregator_row() {
     assert_adopted_checkout_cleanup(false).await;
 }
 
 #[tokio::test]
-async fn admission_conflict_removes_adopted_projection_and_aggregator_row() {
+async fn admission_conflict_leaves_no_adopted_aggregator_row() {
     assert_adopted_checkout_cleanup(true).await;
 }
 
@@ -1153,7 +1150,6 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
         assert!(matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated"), "{remaining:?}");
     } else {
         let launch = engine.put_ready("adopted", &spec, None);
-        daemon.project_adopted_checkouts("flotilla").await.expect("project adopted checkout");
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if cleanup_checkout_rows(&daemon).await.iter().any(|row| row.authority == LifecycleAuthority::Adopted) {
@@ -1164,28 +1160,8 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
         })
         .await
         .expect("adopted Aggregator row");
-        // The checkout's launch ends: its change alone removes the adopted projection.
+        // The checkout's launch ends: its change alone removes the adopted row.
         engine.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let remaining = observed.list().await.expect("observed checkouts").items;
-                if matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated") {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the ended checkout's projection is removed");
-        // A cleanup failure can leave an orphan projection after the launch ended. The next
-        // projection removes it.
-        observed
-            .create(&InputMeta::builder().name("adopted".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Adopted), &spec)
-            .await
-            .expect("orphan left by interrupted cleanup");
-        daemon.project_adopted_checkouts("flotilla").await.expect("project adopted checkouts again");
-        let remaining = observed.list().await.expect("observed checkouts after retry").items;
-        assert!(matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated"), "{remaining:?}");
     }
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

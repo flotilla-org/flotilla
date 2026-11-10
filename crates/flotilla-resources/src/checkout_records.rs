@@ -294,6 +294,10 @@ pub trait CheckoutRecords: Send + Sync {
     fn in_environment(&self, environment: &str, home: Option<&str>) -> Result<Vec<CheckoutRecord>, String>;
     /// Every launch held at this home, ended or not.
     fn here(&self) -> Result<Vec<CheckoutRecord>, String>;
+    /// This home.
+    fn home(&self) -> &str;
+    /// Every launch at every home this one follows, ended or not.
+    fn every(&self) -> Result<Vec<CheckoutRecord>, String>;
     /// The launch that serves a request for checkout `name` with `spec`, held for `holder`, at
     /// this home: the latest launch of `name` when that has not ended, else its next launch,
     /// requested now. A live launch requested otherwise is refused: one name is one checkout.

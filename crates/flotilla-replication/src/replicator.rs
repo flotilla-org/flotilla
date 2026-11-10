@@ -189,15 +189,6 @@ impl PeerReplicatorSupervisors {
             ReplicationStore::Durable,
             self.options.clone()
         );
-        spawn_kind::<flotilla_resources::Checkout>(
-            host,
-            &peer,
-            generation,
-            &transport,
-            &cancellation,
-            ReplicationStore::Observed,
-            self.options.clone(),
-        );
         spawn_kind::<flotilla_resources::TerminalSession>(
             host,
             &peer,

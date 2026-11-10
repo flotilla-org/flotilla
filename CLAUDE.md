@@ -219,7 +219,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-executor/src/executor/` | Executor submodules: checkout, session actions and tests |
 | `crates/flotilla-core/src/model.rs` | `RepoModel` and provider label/name helpers |
 | `crates/flotilla-executor/src/data.rs` | Checkout status inspection |
-| `crates/flotilla-observation/src/observed_resources.rs` | Projects discovered and adopted Checkouts into the ephemeral observed-resource store |
+| `crates/flotilla-observation/src/observed_resources.rs` | Projects discovered Checkouts into the ephemeral observed-resource store; adopted ones are the engine's Checkout records |
 | `crates/flotilla-executor/src/step.rs` | Step planning and execution system |
 | `crates/flotilla-agent/src/adapter.rs` | Agent harness adapters, `AgentAdapterRegistry`, capability table and crew brief rendering |
 | `crates/flotilla-agent/src/hooks.rs`, `crates/flotilla-agent/src/store.rs` | Agent hook handling and state management |

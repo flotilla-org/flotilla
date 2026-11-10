@@ -87,7 +87,9 @@ impl CheckoutFixture {
             home,
             open_home_with(&log, LaunchLog::new(log.clone(), staged.clone()).with_inputs(inputs.clone())).expect("checkouts"),
         ));
-        let checkouts = Arc::new(EngineCheckouts::new(Arc::clone(&lifecycles), Arc::clone(&store), inputs.clone()));
+        let only = home.to_owned();
+        let checkouts =
+            Arc::new(EngineCheckouts::new(Arc::clone(&lifecycles), Arc::clone(&store), inputs.clone(), move || vec![only.clone()]));
         let convoys = Mutex::new(open_home_with::<Convoy, _>(&log, log.clone()).expect("convoys"));
         let reads = Arc::new(
             LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), home.to_owned())

@@ -79,7 +79,6 @@ pub fn run(
                     .observed_convoys(observed.clone().using::<Convoy>(namespace))
                     .observed_sessions(observed.including_replicas::<flotilla_resources::TerminalSession>(namespace))
                     .observed_checkouts(observed.using::<Checkout>(namespace))
-                    .observed_checkout_replicas(observed.including_replicas::<Checkout>(namespace))
                     .build(),
             )
             .await

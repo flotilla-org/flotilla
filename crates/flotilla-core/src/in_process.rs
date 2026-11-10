@@ -2609,17 +2609,6 @@ impl InProcessDaemon {
         self.observed_resource_backend.clone()
     }
 
-    /// Projects the adopted checkouts the engine holds at this home into the observed store, and
-    /// removes projections of ones it no longer holds (#3108). Their inspections are the engine's.
-    pub async fn project_adopted_checkouts(&self, namespace: &str) -> Result<(), String> {
-        let _reconciliation = self.observed_checkout_reconciliation.lock().await;
-        let reads = self.lifecycle_reads();
-        let held = tokio::task::spawn_blocking(move || reads.checkouts()?.here()).await.map_err(|error| error.to_string())??;
-        flotilla_observation::observed_resources::project_adopted_checkouts(held, &self.observed_resource_backend, namespace)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
     /// Returns the current connection status for a peer host.
     pub async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState {
         self.host_registry.peer_connection_status(node_id).await

@@ -858,10 +858,10 @@ async fn a_peer_relays_another_origins_home_bound_runtime_resource() {
     drop(feta_gouda);
 }
 
-// #742: remote checkout queries and independent attach targets retain their
-// content through resource replication, including updates and removals.
+// #742: another host's adopted checkouts reach checkout queries by following its log, and
+// independent attach targets through resource replication, including updates and removals.
 #[tokio::test]
-async fn observed_resources_replicate_checkout_queries_and_independent_attach_targets() {
+async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hosts() {
     let temp = tempfile::tempdir().expect("tempdir");
     let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
     let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
@@ -873,16 +873,19 @@ async fn observed_resources_replicate_checkout_queries_and_independent_attach_ta
     )
     .await
     .expect("start query projection");
-    let checkouts = feta.observed_resource_backend().using::<Checkout>("flotilla");
+    let checkouts = flotilla_daemon_testkit::engine::runtime_checkouts(&feta);
     let sessions = feta.observed_resource_backend().using::<TerminalSession>("flotilla");
-    let spec = CheckoutSpec::Observed(ObservedCheckoutSpec {
-        repo_ref: RepositoryKey("widgets".into()),
-        path: "/srv/widgets".into(),
-        r#ref: "main".into(),
-        host_ref: "feta".into(),
-        is_main: true,
-    });
-    checkouts.create(&InputMeta::builder().name("checkout".to_string()).build(), &spec).await.expect("create remote checkout");
+    let adopted = |branch: &str| {
+        CheckoutSpec::Observed(ObservedCheckoutSpec {
+            repo_ref: RepositoryKey("widgets".into()),
+            path: "/srv/widgets".into(),
+            r#ref: branch.into(),
+            host_ref: "feta".into(),
+            is_main: true,
+        })
+    };
+    let spec = adopted("main");
+    let mut launch = checkouts.put_ready("checkout", &spec, None);
     // Identical names on different origins remain distinct rows.
     kiwi.observed_resource_backend()
         .using::<Checkout>("flotilla")
@@ -917,17 +920,9 @@ async fn observed_resources_replicate_checkout_queries_and_independent_attach_ta
     let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect daemons");
     let state = kiwi.aggregator_projection_state().await;
     for branch in ["main", "feature", "main"] {
-        let current = checkouts.get("checkout").await.expect("checkout");
-        let CheckoutSpec::Observed(mut updated) = current.spec else { unreachable!() };
-        updated.r#ref = branch.into();
-        checkouts
-            .update(
-                &InputMeta::builder().name("checkout".to_string()).build(),
-                &current.metadata.resource_version,
-                &CheckoutSpec::Observed(updated),
-            )
-            .await
-            .expect("update branch");
+        // A checkout's spec is its launch's: the revision is the checkout's next launch.
+        checkouts.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
+        launch = checkouts.put_ready("checkout", &adopted(branch), None);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let set = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout query");
@@ -982,7 +977,7 @@ async fn observed_resources_replicate_checkout_queries_and_independent_attach_ta
     assert_eq!(binding.resource_ref(), None);
     assert!(serde_json::to_string(&checkout_attach.plan).expect("attach plan").contains("/srv/widgets"));
     assert!(kiwi.resource_backend().including_replicas::<Checkout>("flotilla").list().await.expect("durable checkouts").items.is_empty());
-    checkouts.delete("checkout").await.expect("delete remote checkout");
+    checkouts.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
     sessions.delete("terminal-independent").await.expect("delete independent");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

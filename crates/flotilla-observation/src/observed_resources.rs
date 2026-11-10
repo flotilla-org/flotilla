@@ -4,84 +4,12 @@ use std::{
 };
 
 use flotilla_protocol::{qualified_path::QualifiedPath, ProviderData};
-use flotilla_resources::checkout_records::{latest_launches, CheckoutRecord};
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, RepositoryKey,
-    ResourceError, ResourceObject, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
+    ResourceError, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
-
-/// Rebuild the query-facing projection of the adopted checkouts from the engine's (#3108): each
-/// adopted checkout held here whose latest launch has not ended is published into the ephemeral
-/// observed store, and every adopted projection of another name is removed. Callers serialize this
-/// with the observed-checkout refresh.
-pub async fn project_adopted_checkouts(
-    held_here: Vec<CheckoutRecord>,
-    observed_backend: &ResourceBackend,
-    namespace: &str,
-) -> Result<(), ResourceError> {
-    let selector = BTreeMap::from([(AUTHORITY_LABEL.to_string(), LifecycleAuthority::Adopted.as_label_value().to_string())]);
-    let observed_checkouts = observed_backend.clone().using::<ResourceCheckout>(namespace);
-    let adopted = latest_launches(held_here)
-        .into_values()
-        .filter(|record| matches!(record.spec, ResourceCheckoutSpec::Observed(_)) && !record.ended())
-        .map(|record| {
-            let mut view = record.read_view();
-            view.metadata.namespace = namespace.to_owned();
-            (view.metadata.name.clone(), view)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut failures = Vec::new();
-    for (name, view) in &adopted {
-        if let Err(error) = project_adopted_checkout_with(&observed_checkouts, view).await {
-            failures.push(format!("{name}: {error}"));
-        }
-    }
-    for checkout in observed_checkouts.list_matching_labels(&selector).await?.items {
-        let name = &checkout.metadata.name;
-        if adopted.contains_key(name) {
-            continue;
-        }
-        match observed_checkouts.delete(name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => failures.push(format!("{name}: {error}")),
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(ResourceError::other(format!("failed to project adopted checkouts: {}", failures.join("; "))))
-    }
-}
-
-async fn project_adopted_checkout_with(
-    checkouts: &flotilla_store::TypedResolver<ResourceCheckout>,
-    adopted: &ResourceObject<ResourceCheckout>,
-) -> Result<(), ResourceError> {
-    let meta = InputMeta::from(&adopted.metadata);
-    let projected = match checkouts.create(&meta, &adopted.spec).await {
-        Ok(created) => created,
-        Err(ResourceError::Conflict { .. }) => {
-            let existing = checkouts.get(&adopted.metadata.name).await?;
-            if existing.metadata.lifecycle_authority()? != Some(LifecycleAuthority::Adopted) {
-                return Err(ResourceError::invalid(format!(
-                    "checkout {} already exists in the observed store but is not adopted",
-                    adopted.metadata.name
-                )));
-            }
-            if existing.spec == adopted.spec && existing.metadata.labels == meta.labels && existing.status == adopted.status {
-                return Ok(());
-            }
-            checkouts.update(&meta, &existing.metadata.resource_version, &adopted.spec).await?
-        }
-        Err(error) => return Err(error),
-    };
-    if let Some(status) = &adopted.status {
-        checkouts.update_status(&adopted.metadata.name, &projected.metadata.resource_version, status).await?;
-    }
-    Ok(())
-}
 
 /// Publish the checkout facts discovered for one local repository into the
 /// daemon's ephemeral observed-resource store.
@@ -261,84 +189,5 @@ mod tests {
 
         let stored = checkouts.list().await.expect("checkout list should succeed").items;
         assert!(matches!(stored.as_slice(), [checkout] if checkout.spec.repo_ref() == &repository_key));
-    }
-
-    // #768, on the engine's records (#3108): the projection removes only adopted
-    // projections with no live adopted launch held here. Generate authority
-    // traversal order and projection repeats; exhaust launch/observation presence
-    // and authorities in each draw so the profile's case limit cannot miss
-    // deletion or preservation boundaries.
-    #[hegel::test]
-    fn adopted_projection_cleanup_preserves_other_authorities(tc: hegel::TestCase) {
-        use flotilla_resources::{CheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec};
-        let authority_start = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
-        let repeats = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        runtime.block_on(async {
-            let spec = CheckoutSpec::Observed(
-                ObservedCheckoutSpec::builder()
-                    .r#ref("main".to_string())
-                    .path("/work/repo".to_string())
-                    .repo_ref(RepositoryKey("repo".to_string()))
-                    .host_ref("host".to_string())
-                    .is_main(false)
-                    .build(),
-            );
-            let authorities =
-                [None, Some(LifecycleAuthority::Observed), Some(LifecycleAuthority::Managed), Some(LifecycleAuthority::Adopted)];
-            for offset in 0..authorities.len() {
-                let authority = authorities[(authority_start + offset) % authorities.len()];
-                for observed_present in [false, true] {
-                    let launches = [
-                        None,
-                        Some(flotilla_protocol::LifecycleReading::Ready { identity: "/work/repo".into() }),
-                        Some(flotilla_protocol::LifecycleReading::Released),
-                    ];
-                    for launch in launches {
-                        let live = launch.as_ref().is_some_and(|reading| !matches!(reading, flotilla_protocol::LifecycleReading::Released));
-                        let held_here = launch
-                            .iter()
-                            .map(|reading| flotilla_resources::checkout_records::CheckoutRecord {
-                                name: "checkout#1".into(),
-                                home: "host".into(),
-                                spec: spec.clone(),
-                                holder: None,
-                                requested_at: chrono::DateTime::UNIX_EPOCH,
-                                reading: reading.clone(),
-                                degraded: None,
-                                integration: None,
-                            })
-                            .collect::<Vec<_>>();
-                        let observed = ResourceBackend::new(InMemoryBackend::observed());
-                        let mut meta = InputMeta::builder().name("checkout".to_string()).build();
-                        if let Some(authority) = authority {
-                            meta = meta.with_lifecycle_authority(authority);
-                        }
-                        let original = if observed_present {
-                            Some(observed.using::<ResourceCheckout>("flotilla").create(&meta, &spec).await.expect("observation"))
-                        } else {
-                            None
-                        };
-                        for _ in 0..repeats {
-                            let result = super::project_adopted_checkouts(held_here.clone(), &observed, "flotilla").await;
-                            if observed_present && live && authority != Some(LifecycleAuthority::Adopted) {
-                                assert!(result.is_err(), "non-adopted name collisions are refused");
-                            } else {
-                                result.expect("reconcile");
-                            }
-                            let stored = observed.using::<ResourceCheckout>("flotilla").list().await.expect("list").items;
-                            let should_remain = (observed_present && authority != Some(LifecycleAuthority::Adopted)) || live;
-                            assert_eq!(stored.len(), usize::from(should_remain));
-                            if observed_present && authority != Some(LifecycleAuthority::Adopted) {
-                                let original = original.as_ref().expect("original observation");
-                                assert_eq!(stored[0].metadata, original.metadata, "unrelated metadata is untouched");
-                                assert_eq!(stored[0].spec, original.spec, "unrelated specs are untouched");
-                                assert_eq!(stored[0].status, original.status, "unrelated statuses are untouched");
-                            }
-                        }
-                    }
-                }
-            }
-        });
     }
 }

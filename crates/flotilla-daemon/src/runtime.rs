@@ -60,12 +60,12 @@ use self::ports::{
 use self::seed::register_startup_resources;
 use self::state::ControllerRuntimeState;
 use self::tasks::{
-    run_artifact_gc, run_checkout_archive_gc, spawn_adopted_checkout_projection_task, spawn_aggregator_task,
-    spawn_convoy_ensure_reconciler_task, spawn_dispatch_reconciler_task, spawn_environment_orphan_sweep_task,
-    spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task, spawn_local_fulfilment_probe_task,
-    spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task, spawn_provisioned_environment_reconciliation_task,
-    spawn_sleep_inhibitor_task, spawn_ssh_fulfilment_probe_task, spawn_startup_restoration, spawn_vessel_placement_projector,
-    supervise_controller, CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart, MANIFEST_RECONCILE_INTERVAL,
+    run_artifact_gc, run_checkout_archive_gc, spawn_aggregator_task, spawn_convoy_ensure_reconciler_task, spawn_dispatch_reconciler_task,
+    spawn_environment_orphan_sweep_task, spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task,
+    spawn_local_fulfilment_probe_task, spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task,
+    spawn_provisioned_environment_reconciliation_task, spawn_sleep_inhibitor_task, spawn_ssh_fulfilment_probe_task,
+    spawn_startup_restoration, spawn_vessel_placement_projector, supervise_controller, CheckoutArchiveRoot, CheckoutArchiveSweep,
+    PeriodicTaskStart, MANIFEST_RECONCILE_INTERVAL,
 };
 use self::terminal::TerminalControllerRuntime;
 use crate::server::environment_sockets::EnvironmentSocketService;
@@ -622,9 +622,6 @@ impl StartupRestoration {
         } else if config.state_dir().as_path().join("credential-runtime").exists() {
             warn!("Docker credential cache sweep deferred because Docker backing liveness is unavailable");
         }
-        if let Err(error) = phase("project_adopted_checkouts", daemon.project_adopted_checkouts(&options.namespace)).await {
-            warn!(%error, "failed to project adopted checkouts during startup; the next checkout change projects them");
-        }
         let Some(state) = self.state.as_ref() else {
             return;
         };
@@ -652,8 +649,7 @@ impl StartupRestoration {
         let daemon = &self.daemon;
         let options = &self.options;
         let runtime_health = &self.runtime_health;
-        let mut controller_tasks =
-            vec![AbortOnDropHandle::new(spawn_adopted_checkout_projection_task(Arc::clone(daemon), options.namespace.clone()))];
+        let mut controller_tasks = Vec::new();
         let observation_daemon = Arc::clone(daemon);
         let observation_namespace = options.namespace.clone();
         controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
@@ -1335,7 +1331,9 @@ async fn open_provisioning_lifecycles(
             &home,
             open_home_with(&log(), LaunchLog::new(log(), checkout_facts.clone()).with_inputs(checkout_inputs.clone()))?,
         ));
-        let checkout_records = Arc::new(EngineCheckouts::new(Arc::clone(&checkouts), Arc::clone(&store), checkout_inputs));
+        let followed = Arc::clone(&service);
+        let checkout_records =
+            Arc::new(EngineCheckouts::new(Arc::clone(&checkouts), Arc::clone(&store), checkout_inputs, move || followed.homes()));
         // A terminal launch's facts are written in the transaction that realises it.
         let terminal_facts = StagedFacts::default();
         let terminal_sessions: Arc<dyn flotilla_provisioning::engine::Lifecycles<_>> =

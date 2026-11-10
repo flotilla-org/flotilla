@@ -738,31 +738,6 @@ where
     (task, ready_rx)
 }
 
-/// Keeps the adopted checkouts' projection in the observed store current as the engine's
-/// checkouts change (#3108): each change projects the adopted checkouts held here again.
-pub(super) fn spawn_adopted_checkout_projection_task(daemon: Arc<InProcessDaemon>, namespace: String) -> JoinHandle<()> {
-    let changes = daemon.lifecycle_reads().checkouts().map(|checkouts| checkouts.changes());
-    tokio::spawn(async move {
-        let mut changes = match changes {
-            Ok(changes) => changes,
-            Err(error) => {
-                warn!(%error, "adopted checkouts are not projected: the engine's checkouts are unavailable");
-                return;
-            }
-        };
-        loop {
-            // Projected once on subscribing, so a change before it is not missed.
-            if let Err(error) = daemon.project_adopted_checkouts(&namespace).await {
-                warn!(%error, "failed to project adopted checkouts; the next checkout change projects them");
-            }
-            match changes.recv().await {
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            }
-        }
-    })
-}
-
 pub(super) fn spawn_provisioned_environment_reconciliation_task(
     state: Arc<ControllerRuntimeState>,
     namespace: String,

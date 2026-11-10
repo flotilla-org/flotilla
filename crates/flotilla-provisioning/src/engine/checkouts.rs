@@ -222,6 +222,7 @@ pub struct EngineCheckouts {
     log: PlainLog,
     /// What each launch is created under, staged here for the launch log that creates it.
     inputs: StagedFacts<Vec<ChangeItem>>,
+    homes: Box<dyn Fn() -> Vec<String> + Send + Sync>,
     changes: tokio::sync::broadcast::Sender<CheckoutChange>,
 }
 
@@ -233,14 +234,36 @@ const REQUEST_ATTEMPTS: usize = 3;
 
 impl EngineCheckouts {
     /// The port over `lifecycles`, whose launch log creates each launch under the items staged
-    /// in `inputs` ([`super::launch_log::LaunchLog::with_inputs`]).
-    pub fn new(lifecycles: Arc<dyn Lifecycles<CheckoutKind>>, store: Arc<Mutex<Store>>, inputs: StagedFacts<Vec<ChangeItem>>) -> Self {
+    /// in `inputs` ([`super::launch_log::LaunchLog::with_inputs`]), reading the homes `homes` names.
+    pub fn new(
+        lifecycles: Arc<dyn Lifecycles<CheckoutKind>>,
+        store: Arc<Mutex<Store>>,
+        inputs: StagedFacts<Vec<ChangeItem>>,
+        homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             lifecycles,
             log: PlainLog::new(Arc::clone(&store)),
             reads: StoreReads::new(store),
             inputs,
+            homes: Box::new(homes),
             changes: tokio::sync::broadcast::channel(CHANGES).0,
+        }
+    }
+
+    /// Every launch `home` holds.
+    fn scan(read: &mut Read<'_>, home: &str) -> Result<Vec<View<CheckoutKind>>, ReadError> {
+        let mut views = Vec::new();
+        let mut after = None;
+        loop {
+            let page = read.scan::<Resource<Checkout>>(home, after, 64)?;
+            for id in page.ids {
+                views.extend(view::<CheckoutKind>(read, id)?);
+            }
+            after = page.next;
+            if after.is_none() {
+                return Ok(views);
+            }
         }
     }
 
@@ -271,10 +294,6 @@ impl EngineCheckouts {
                 }
             }
         }))
-    }
-
-    fn home(&self) -> &str {
-        self.lifecycles.home()
     }
 
     fn now() -> Timestamp {
@@ -380,6 +399,10 @@ impl EngineCheckouts {
 }
 
 impl CheckoutRecords for EngineCheckouts {
+    fn home(&self) -> &str {
+        self.lifecycles.home()
+    }
+
     fn changes(&self) -> tokio::sync::broadcast::Receiver<CheckoutChange> {
         self.changes.subscribe()
     }
@@ -414,19 +437,17 @@ impl CheckoutRecords for EngineCheckouts {
 
     fn here(&self) -> Result<Vec<CheckoutRecord>, String> {
         let home = self.home().to_owned();
-        self.records(&format!("at {home}"), |read| {
+        self.records(&format!("at {home}"), |read| Self::scan(read, &home))
+    }
+
+    fn every(&self) -> Result<Vec<CheckoutRecord>, String> {
+        let homes = (self.homes)();
+        self.records("at every home", |read| {
             let mut views = Vec::new();
-            let mut after = None;
-            loop {
-                let page = read.scan::<Resource<Checkout>>(&home, after, 64)?;
-                for id in page.ids {
-                    views.extend(view::<CheckoutKind>(read, id)?);
-                }
-                after = page.next;
-                if after.is_none() {
-                    return Ok(views);
-                }
+            for home in &homes {
+                views.extend(Self::scan(read, home)?);
             }
+            Ok(views)
         })
     }
 
