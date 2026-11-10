@@ -147,7 +147,6 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
             reconciler: ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla"))
                 .with_lifecycle_reads(remote_checkouts.reads.clone())
                 .with_change_requests(authority.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
-            resync_interval: Duration::from_secs(3600),
             backend: authority.clone(),
         }
         .run(),

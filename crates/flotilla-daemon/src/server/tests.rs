@@ -2233,7 +2233,6 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
             .with_hosts(placed.including_replicas::<Host>("flotilla"))
             .with_vessels(placed.using::<Vessel>("flotilla"))
             .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
-        resync_interval: Duration::from_millis(20),
         backend: placed.clone(),
     };
     let controller_task = tokio::spawn(controller.run());
@@ -2273,7 +2272,6 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
             secondaries: flotilla_crew::reconcilers::vessel::VesselReconciler::secondary_watches(),
             reconciler: flotilla_crew::reconcilers::vessel::VesselReconciler::new(placed.clone(), "flotilla")
                 .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
-            resync_interval: Duration::from_millis(20),
             backend: placed.clone(),
         }
         .run(),

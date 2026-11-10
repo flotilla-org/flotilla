@@ -1259,7 +1259,6 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                 reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
                     .with_lifecycle_reads(agent_reads())
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(60)),
-                resync_interval: Duration::from_secs(3600),
                 backend: backend.clone(),
             }
             .run(),

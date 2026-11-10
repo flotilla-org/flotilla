@@ -458,7 +458,6 @@ async fn vessel_controller_finalizer_preserves_the_convoys_checkout() {
             primary: workspaces.clone(),
             secondaries: VesselReconciler::secondary_watches(),
             reconciler: VesselReconciler::new(backend.clone(), NAMESPACE).with_lifecycle_reads(engine.reads.clone()),
-            resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
         }
         .run(),
@@ -517,7 +516,6 @@ fn full_controller_harness(backend: ResourceBackend, engine: &RunningClones) -> 
             reconciler: VesselReconciler::new(backend.clone(), NAMESPACE).with_lifecycle_reads(reads),
             // This must progress through checkout wakes rather than a periodic Vessel relist;
             // production resync is also deliberately slow.
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),

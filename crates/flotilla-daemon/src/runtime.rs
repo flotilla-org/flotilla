@@ -827,7 +827,6 @@ fn spawn_controller_loops(
                             .with_lifecycle_status_reads(Arc::clone(&write_lifecycle_reads)),
                         secondaries,
                         reconciler,
-                        resync_interval: controller_resync_interval,
                         backend,
                     };
                     let metrics = loop_metrics.for_kind($name);

@@ -57,7 +57,6 @@ async fn vessel_finalizer_contract(backend: ResourceBackend) {
             primary: vessels.clone(),
             secondaries: Vec::new(),
             reconciler: VesselReconciler::new(backend.clone(), NS),
-            resync_interval: Duration::from_secs(3600),
             backend,
         }
         .run(),
@@ -184,7 +183,6 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
             primary: vessels.clone(),
             secondaries: Vec::new(),
             reconciler: VesselReconciler::new(backend.clone(), "flotilla"),
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),

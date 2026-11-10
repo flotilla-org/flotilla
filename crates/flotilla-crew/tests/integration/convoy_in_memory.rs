@@ -128,7 +128,6 @@ async fn missing_template_transitions_convoy_to_failed() {
             secondaries: Vec::new(),
             reconciler: ConvoyReconciler::new(templates.clone())
                 .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
-            resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
         .run(),
@@ -170,7 +169,6 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
             reconciler: ConvoyReconciler::new(templates.clone())
                 .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
                 .with_vessels(backend.clone().using::<Vessel>("flotilla")),
-            resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
         .run(),
@@ -255,7 +253,6 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
             reconciler: ConvoyReconciler::new(templates.clone())
                 .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
                 .with_vessels(workspaces.clone()),
-            resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
         }
         .run(),
@@ -448,7 +445,6 @@ async fn controller_loop_finalizer_deletes_vessels_and_waits_for_its_checkouts()
                 .with_vessels(workspaces.clone())
                 .with_lifecycle_reads(checkouts.reads.clone())
                 .with_prepared_snapshot_gc(PreparedSnapshotGarbageCollector::new(backend.clone(), "flotilla")),
-            resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
         }
         .run(),

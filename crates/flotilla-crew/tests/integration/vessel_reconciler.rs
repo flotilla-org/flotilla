@@ -127,7 +127,6 @@ async fn landed_convoy_does_not_recreate_a_missing_checkout() {
             primary: vessels,
             secondaries: VesselReconciler::secondary_watches(),
             reconciler: test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine),
-            resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
         .run(),

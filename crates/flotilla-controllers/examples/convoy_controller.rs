@@ -1,7 +1,7 @@
 use flotilla_store_http::ensure_crd;
 use flotilla_store_http::ensure_namespace;
 use flotilla_store_http::HttpBackend;
-use std::{env, path::PathBuf, time::Duration};
+use std::{env, path::PathBuf};
 
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
@@ -54,7 +54,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 primary: vessels,
                 secondaries: VesselReconciler::secondary_watches(),
                 reconciler: VesselReconciler::new(backend.clone(), &namespace),
-                resync_interval: Duration::from_secs(60),
                 backend: backend.clone(),
             }
             .run()
@@ -68,7 +67,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 primary: convoys,
                 secondaries: ConvoyReconciler::secondary_watches(),
                 reconciler: ConvoyReconciler::new(templates).with_vessels(convoy_backend.clone().using::<Vessel>(&namespace)),
-                resync_interval: Duration::from_secs(60),
                 backend: convoy_backend,
             }
             .run()

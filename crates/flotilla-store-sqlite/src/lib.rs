@@ -159,7 +159,6 @@ mod read_pressure_contract {
                 primary: backend.using::<Convoy>("flotilla"),
                 secondaries: vec![],
                 reconciler: Reconcile(reconciles.clone()),
-                resync_interval: Duration::from_secs(60),
                 backend: backend.clone(),
             }
             .run(),
@@ -246,7 +245,6 @@ mod read_pressure_contract {
                 primary: backend.using::<Convoy>("flotilla"),
                 secondaries: vec![Box::new(BusyWatch { attempts: attempts.clone(), dropped: dropped.clone() })],
                 reconciler: Reconcile(Arc::default()),
-                resync_interval: Duration::from_secs(60),
                 backend,
             }
             .run(),

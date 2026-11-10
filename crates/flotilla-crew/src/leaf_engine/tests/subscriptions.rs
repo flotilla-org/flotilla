@@ -403,7 +403,6 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
             reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
                 .with_lifecycle_reads(agent_reads())
                 .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
-            resync_interval: Duration::from_secs(3600),
             backend: backend.clone(),
         }
         .run(),

@@ -117,7 +117,6 @@ async fn deleting_mis_homed_convoy_finalizes_it_at_its_home() {
             secondaries: ConvoyReconciler::federated_secondary_watches(&parent_backend, namespace),
             reconciler: ConvoyReconciler::new(parent_backend.definitions::<WorkflowTemplate>(namespace))
                 .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
-            resync_interval: Duration::from_secs(3600),
             backend: parent_backend.clone(),
         }
         .run(),
@@ -985,7 +984,6 @@ async fn forced_convoy_teardown_from_another_host_finalizes_at_its_home() {
         secondaries: ConvoyReconciler::federated_secondary_watches(&convoy_backend, namespace),
         reconciler: ConvoyReconciler::new(convoy_backend.definitions::<WorkflowTemplate>(namespace))
             .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
-        resync_interval: Duration::from_millis(20),
         backend: convoy_backend,
     };
     let convoy_task = tokio::spawn(convoy_controller.run());
@@ -2968,7 +2966,6 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
             .with_hosts(placement.including_replicas::<Host>(namespace))
             .with_vessels(placement.using::<Vessel>(namespace))
             .with_lifecycle_reads(topology.follower.lifecycle_reads()),
-        resync_interval: Duration::from_millis(20),
         backend: placement.clone(),
     };
     let controller_task = tokio::spawn(controller.run());

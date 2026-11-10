@@ -430,7 +430,8 @@ pub struct ControllerLoadMetrics {
     pub requeues: Counter,
     pub requeues_coalesced: Counter,
     pub failures: Counter,
-    /// Periodic full resyncs and the objects each enqueued.
+    /// Full resyncs (a change naming no resource, or an expired secondary watch) and the
+    /// objects each enqueued.
     pub resyncs: Counter,
     pub resync_enqueued: Counter,
     /// Work queue length, observed as each wake starts.

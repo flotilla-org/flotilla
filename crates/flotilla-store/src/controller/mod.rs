@@ -45,15 +45,16 @@ pub trait Reconciler: Send + Sync + 'static {
 
     fn finalizer_name(&self) -> Option<&'static str>;
 
-    /// Opt an object reconciler into bounded retries for repeated identical
-    /// errors. Controllers without a policy retain the ordinary resync retry
-    /// behaviour.
+    /// Opt an object reconciler into a budget for repeated identical errors.
+    /// Controllers without a policy are retried at a backoff capped at a
+    /// minute for as long as they fail.
     fn reconcile_error_policy(&self) -> Option<ReconcileErrorPolicy> {
         None
     }
 
-    /// A durable retry wake can suppress watch/resync attempts until its due
-    /// time. Explicit reconcile-now clears the resource's retry record.
+    /// A durable retry wake suppresses attempts until its due time, when the
+    /// loop wakes the resource itself. Explicit reconcile-now clears the
+    /// resource's retry record.
     fn retry_disposition(&self, _obj: &ResourceObject<Self::Resource>) -> Option<crate::ControllerRetryDisposition> {
         None
     }
@@ -83,8 +84,8 @@ pub trait Reconciler: Send + Sync + 'static {
 
     /// Map a finalizer failure to a status update.
     ///
-    /// Other object-scoped errors remain isolated and are retried on a later
-    /// event or resync without forcing the resource into a terminal state.
+    /// Other object-scoped errors remain isolated and are retried with backoff
+    /// without forcing the resource into a terminal state.
     fn finalizer_error_patch(
         &self,
         _obj: &ResourceObject<Self::Resource>,
@@ -114,6 +115,15 @@ pub enum ReconcileErrorExhaustion {
 }
 
 impl ReconcileErrorPolicy {
+    /// What a reconciler without its own policy gets: it is retried at a backoff capped at a
+    /// minute for as long as it fails, and is never parked or marked degraded.
+    const UNBUDGETED: Self = Self {
+        max_consecutive_failures: u32::MAX,
+        initial_backoff: Duration::from_secs(1),
+        max_backoff: Duration::from_secs(60),
+        exhaustion: ReconcileErrorExhaustion::Retry,
+    };
+
     fn backoff(&self, consecutive_failures: u32) -> Duration {
         let exponent = consecutive_failures.saturating_sub(1).min(31);
         self.initial_backoff.saturating_mul(1_u32 << exponent).min(self.max_backoff)
@@ -500,7 +510,6 @@ pub struct ControllerLoop<R: Reconciler> {
     pub primary: TypedResolver<R::Resource>,
     pub secondaries: Vec<Box<dyn SecondaryWatch<Primary = R::Resource>>>,
     pub reconciler: R,
-    pub resync_interval: Duration,
     pub backend: ResourceBackend,
 }
 
@@ -637,6 +646,28 @@ impl<R: Reconciler> ControllerLoop<R> {
         })
     }
 
+    /// Queues `name` again after `delay`, unless a requeue of it is already scheduled.
+    async fn requeue_after(
+        scheduled_requeues: &Arc<Mutex<HashSet<String>>>,
+        sender: &WorkQueueSender,
+        name: &str,
+        delay: Duration,
+    ) -> bool {
+        let mut scheduled = scheduled_requeues.lock().await;
+        if !scheduled.insert(name.to_owned()) {
+            return false;
+        }
+        let scheduled_requeues = Arc::clone(scheduled_requeues);
+        let sender = sender.clone();
+        let name = name.to_owned();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            scheduled_requeues.lock().await.remove(&name);
+            let _ = sender.send(name).await;
+        });
+        true
+    }
+
     async fn resync_all(primary: &TypedResolver<R::Resource>, sender: &WorkQueueSender) -> Result<HashSet<String>, ResourceError> {
         let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.list()).await?;
         let mut live_names = HashSet::with_capacity(listed.items.len());
@@ -677,7 +708,7 @@ impl<R: Reconciler> ControllerLoop<R> {
     where
         <R::Resource as Resource>::Status: Default,
     {
-        let ControllerLoop { primary, secondaries, reconciler, resync_interval, backend } = self;
+        let ControllerLoop { primary, secondaries, reconciler, backend } = self;
         let (sender, mut receiver) = WorkQueueSender::channel();
         let every = Arc::clone(&sender.every);
         let (watch_exited_tx, mut watch_exited_rx) = mpsc::unbounded_channel();
@@ -701,12 +732,11 @@ impl<R: Reconciler> ControllerLoop<R> {
         let mut watches = ControllerWatches { primary: primary_watch, secondaries: secondary_watches };
         let mut secondary_started = vec![Instant::now(); secondary_templates.len()];
         let mut secondary_backoff = vec![WATCH_RESTART_BACKOFF / 2; secondary_templates.len()];
-        let mut resync = tokio::time::interval(resync_interval);
-        resync.tick().await;
         let mut pending: VecDeque<String> = VecDeque::new();
         let scheduled_requeues = Arc::new(Mutex::new(HashSet::new()));
         let mut object_failures = BTreeMap::<String, ObjectFailure>::new();
         let mut finalizer_failures = BTreeMap::<String, FinalizerFailure>::new();
+        let mut read_failures = BTreeMap::<String, u32>::new();
 
         loop {
             sender.made_progress();
@@ -718,19 +748,28 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let _busy = metrics.busy();
                 let object =
                     match crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.get(&name)).await {
-                        Ok(object) => object,
+                        Ok(object) => {
+                            read_failures.remove(&name);
+                            object
+                        }
                         Err(ResourceError::NotFound { .. }) => {
+                            read_failures.remove(&name);
                             object_failures.remove(&name);
                             finalizer_failures.remove(&name);
                             continue;
                         }
                         Err(err) => {
+                            let failures = read_failures.entry(name.clone()).or_insert(0);
+                            *failures = failures.saturating_add(1);
+                            let delay = ReconcileErrorPolicy::UNBUDGETED.backoff(*failures);
                             warn!(
                                 resource_kind = R::Resource::API_PATHS.kind,
                                 resource = %name,
                                 %err,
-                                "controller failed to read object; leaving it for a later resync",
+                                retry_in = ?delay,
+                                "controller failed to read object; retrying it",
                             );
+                            Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await;
                             continue;
                         }
                     };
@@ -810,13 +849,17 @@ impl<R: Reconciler> ControllerLoop<R> {
                     if let Some(disposition) = reconciler.retry_disposition(&object) {
                         match disposition {
                             crate::ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at => {
+                                let delay = (next_attempt_at - Utc::now()).to_std().unwrap_or_default();
+                                Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await;
                                 return Ok(());
                             }
                             crate::ControllerRetryDisposition::Terminal { .. } => return Ok(()),
                             _ => {}
                         }
                     }
-                    if let Some(failure) = object_failures.get(&name) {
+                    // A budgeted failure holds the object until its retry; an unbudgeted one is only
+                    // retried, and any change still wakes it at once.
+                    if let Some(failure) = object_failures.get(&name).filter(|_| reconciler.reconcile_error_policy().is_some()) {
                         if !degraded_needs_reconcile && (failure.terminal || Instant::now() < failure.retry_at) {
                             return Ok(());
                         }
@@ -832,18 +875,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                     if let Some(delay) = outcome.requeue_after {
                         metrics.requeues.increment();
-                        let mut scheduled = scheduled_requeues.lock().await;
-                        if !scheduled.insert(name.clone()) {
+                        if !Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await {
                             metrics.requeues_coalesced.increment();
-                        } else {
-                            let scheduled_requeues = Arc::clone(&scheduled_requeues);
-                            let sender = sender.clone();
-                            let name = name.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(delay).await;
-                                scheduled_requeues.lock().await.remove(&name);
-                                let _ = sender.send(name).await;
-                            });
                         }
                     }
                     Ok(())
@@ -857,16 +890,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                 }
                 match result {
                     Err(ResourceError::FinalizerPending) => {
-                        let mut scheduled = scheduled_requeues.lock().await;
-                        if scheduled.insert(name.clone()) {
-                            let scheduled_requeues = Arc::clone(&scheduled_requeues);
-                            let sender = sender.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                scheduled_requeues.lock().await.remove(&name);
-                                let _ = sender.send(name).await;
-                            });
-                        }
+                        Self::requeue_after(&scheduled_requeues, &sender, &name, Duration::from_secs(1)).await;
                     }
                     Ok(()) if attempted_reconcile => {
                         object_failures.remove(&name);
@@ -883,7 +907,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                         let mut terminal = false;
                         // A finalizer or its removal write may fail without
                         // changing status. Retry it with bounded backoff instead
-                        // of waiting for resync or spinning on a watch event.
+                        // of spinning on a watch event.
                         let mut retry_after = attempted_finalizer.then(|| {
                             let consecutive_failures =
                                 finalizer_failures.get(&name).map_or(1, |failure| failure.consecutive_failures.saturating_add(1));
@@ -899,51 +923,50 @@ impl<R: Reconciler> ControllerLoop<R> {
                             delay
                         });
                         if attempted_reconcile {
-                            if let Some(policy) = reconciler.reconcile_error_policy() {
-                                let message = err.to_string();
-                                let previous = object_failures.get(&name);
-                                let consecutive_failures = previous
-                                    .filter(|previous| previous.failure.message == message)
-                                    .map_or(1, |previous| previous.failure.consecutive_failures.saturating_add(1));
-                                let failure = ReconcileFailure { message, consecutive_failures };
-                                let exhausted = consecutive_failures >= policy.max_consecutive_failures;
-                                terminal = exhausted && policy.exhaustion == ReconcileErrorExhaustion::Park;
-                                let delay = policy.backoff(consecutive_failures);
-                                if exhausted {
-                                    if let Some(patch) = reconciler.reconcile_degraded_patch(&object, &failure) {
-                                        match apply_status_patch(&primary, &name, &patch).await {
-                                            Ok(_) => {}
-                                            Err(ResourceError::NotFound { .. }) => {
-                                                object_failures.remove(&name);
-                                                continue;
-                                            }
-                                            Err(patch_error) => {
-                                                terminal = false;
-                                                warn!(
-                                                    resource_kind = R::Resource::API_PATHS.kind,
-                                                    resource = %name,
-                                                    %patch_error,
-                                                    "controller failed to record degraded reconcile condition; retrying",
-                                                );
-                                            }
+                            let policy = reconciler.reconcile_error_policy().unwrap_or(ReconcileErrorPolicy::UNBUDGETED);
+                            let message = err.to_string();
+                            let previous = object_failures.get(&name);
+                            let consecutive_failures = previous
+                                .filter(|previous| previous.failure.message == message)
+                                .map_or(1, |previous| previous.failure.consecutive_failures.saturating_add(1));
+                            let failure = ReconcileFailure { message, consecutive_failures };
+                            let exhausted = consecutive_failures >= policy.max_consecutive_failures;
+                            terminal = exhausted && policy.exhaustion == ReconcileErrorExhaustion::Park;
+                            let delay = policy.backoff(consecutive_failures);
+                            if exhausted {
+                                if let Some(patch) = reconciler.reconcile_degraded_patch(&object, &failure) {
+                                    match apply_status_patch(&primary, &name, &patch).await {
+                                        Ok(_) => {}
+                                        Err(ResourceError::NotFound { .. }) => {
+                                            object_failures.remove(&name);
+                                            continue;
                                         }
-                                    } else {
-                                        terminal = false;
+                                        Err(patch_error) => {
+                                            terminal = false;
+                                            warn!(
+                                                resource_kind = R::Resource::API_PATHS.kind,
+                                                resource = %name,
+                                                %patch_error,
+                                                "controller failed to record degraded reconcile condition; retrying",
+                                            );
+                                        }
                                     }
+                                } else {
+                                    terminal = false;
                                 }
-                                if !terminal {
-                                    retry_after = Some(delay);
-                                }
-                                object_failures.insert(
-                                    name.clone(),
-                                    ObjectFailure {
-                                        failure,
-                                        creation_timestamp: object.metadata.creation_timestamp,
-                                        retry_at: Instant::now() + delay,
-                                        terminal,
-                                    },
-                                );
                             }
+                            if !terminal {
+                                retry_after = Some(delay);
+                            }
+                            object_failures.insert(
+                                name.clone(),
+                                ObjectFailure {
+                                    failure,
+                                    creation_timestamp: object.metadata.creation_timestamp,
+                                    retry_at: Instant::now() + delay,
+                                    terminal,
+                                },
+                            );
                         }
                         warn!(
                             resource_kind = R::Resource::API_PATHS.kind,
@@ -953,17 +976,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                             "controller failed to reconcile object; other objects will continue",
                         );
                         if let Some(delay) = retry_after {
-                            let mut scheduled = scheduled_requeues.lock().await;
-                            if scheduled.insert(name.clone()) {
-                                let scheduled_requeues = Arc::clone(&scheduled_requeues);
-                                let sender = sender.clone();
-                                let name = name.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(delay).await;
-                                    scheduled_requeues.lock().await.remove(&name);
-                                    let _ = sender.send(name).await;
-                                });
-                            }
+                            Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await;
                         }
                     }
                 }
@@ -980,16 +993,11 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                     pending.push_front(name);
                 }
-                _ = resync.tick() => {
+                _ = every.notified() => {
                     let _busy = metrics.busy();
                     let live_names = Self::resync_all(&primary, &sender).await?;
                     metrics.resyncs.increment();
                     metrics.resync_enqueued.add(live_names.len() as u64);
-                    finalizer_failures.retain(|name, _| live_names.contains(name));
-                }
-                _ = every.notified() => {
-                    let _busy = metrics.busy();
-                    let live_names = Self::resync_all(&primary, &sender).await?;
                     finalizer_failures.retain(|name, _| live_names.contains(name));
                 }
                 Some(exited) = watch_exited_rx.recv() => {
@@ -1009,6 +1017,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                             // Relisting a secondary can enqueue objects that still exist, but
                             // cannot reveal a deletion missed while its watch was expired.
                             let live_names = Self::resync_all(&primary, &sender).await?;
+                            metrics.resyncs.increment();
+                            metrics.resync_enqueued.add(live_names.len() as u64);
                             finalizer_failures.retain(|name, _| live_names.contains(name));
                             let backoff = next_secondary_backoff(secondary_backoff[index], secondary_started[index].elapsed());
                             secondary_backoff[index] = backoff;

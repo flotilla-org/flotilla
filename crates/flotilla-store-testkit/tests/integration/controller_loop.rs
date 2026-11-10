@@ -642,7 +642,6 @@ async fn controller_loop_reconciles_existing_primary_objects_from_initial_list()
             primary: primaries,
             secondaries: Vec::new(),
             reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -679,7 +678,6 @@ async fn controller_loop_watches_survive_resume_on_a_generational_backend() {
                 _marker: std::marker::PhantomData,
             })],
             reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
-            resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
         .run(),
@@ -739,7 +737,6 @@ async fn resolver_label_mapped_watch_resumes_on_a_generational_observed_backend(
                 _marker: std::marker::PhantomData,
             })],
             reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -797,7 +794,6 @@ async fn label_mapped_watch_enqueues_primary_named_in_secondary_label() {
                 _marker: std::marker::PhantomData,
             })],
             reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
-            resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
         .run(),
@@ -867,7 +863,6 @@ async fn label_join_watch_enqueues_each_primary_sharing_the_label_value() {
                 _marker: std::marker::PhantomData,
             })],
             reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
-            resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
         .run(),
@@ -933,7 +928,6 @@ async fn duplicate_secondary_events_for_the_same_primary_are_deduped_per_burst()
                 _marker: std::marker::PhantomData,
             })],
             reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
-            resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
         .run(),
@@ -1001,7 +995,6 @@ async fn flooded_secondary_queue_does_not_block_resync_or_other_primaries() {
                 first: Arc::new(AtomicBool::new(true)),
                 reconciled: Arc::clone(&reconciled),
             },
-            resync_interval: Duration::from_millis(10),
             backend,
         }
         .run(),
@@ -1043,7 +1036,6 @@ async fn a_secondary_asking_for_every_primary_reconciles_each_once_more() {
             secondaries: vec![Box::new(EverySecondaryWatch { fire: Arc::clone(&fire) })],
             reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
             // No resync falls due in the test: only the secondary's request wakes both.
-            resync_interval: Duration::from_secs(3600),
             backend,
         }
         .run(),
@@ -1088,7 +1080,6 @@ async fn event_during_reconcile_requeues_the_same_name() {
                 first: Arc::new(AtomicBool::new(true)),
                 reconciled: Arc::clone(&reconciled),
             },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1144,7 +1135,6 @@ async fn finalizer_failure_does_not_stop_other_objects_from_reconciling() {
             primary: primaries,
             secondaries: Vec::new(),
             reconciler: FailingObjectReconciler { failed_name: "alpha-failing".to_string(), reconciled: Arc::clone(&reconciled) },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1182,7 +1172,6 @@ async fn controller_loop_runs_finalizer_and_deletes_resource_after_finalizer_com
             primary: primaries.clone(),
             secondaries: Vec::new(),
             reconciler: FinalizingReconciler { finalized: Arc::clone(&finalized) },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1223,7 +1212,6 @@ async fn controller_loop_survives_notfound_when_removing_finalizer() {
             primary: primaries.clone(),
             secondaries: Vec::new(),
             reconciler: RacingFinalizerRemovalReconciler { finalized: Arc::clone(&finalized), primaries: primaries.clone() },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1274,7 +1262,6 @@ async fn controller_loop_survives_notfound_when_attaching_finalizer() {
                 target: "alpha".to_string(),
                 raced: Arc::new(AtomicBool::new(false)),
             },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1320,7 +1307,6 @@ async fn controller_loop_survives_notfound_when_patching_status() {
                 target: "alpha".to_string(),
                 reconciled: Arc::clone(&reconciled),
             },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1363,7 +1349,6 @@ async fn controller_loop_adds_finalizer_to_managed_resources() {
             primary: primaries.clone(),
             secondaries: Vec::new(),
             reconciler: FinalizingReconciler { finalized: Arc::new(Mutex::new(Vec::new())) },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1405,7 +1390,6 @@ async fn controller_loop_skips_reconcile_for_observed_and_adopted_resources() {
             primary: primaries,
             secondaries: Vec::new(),
             reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1448,7 +1432,6 @@ async fn controller_loop_does_not_add_finalizers_to_observed_or_adopted_resource
             primary: primaries.clone(),
             secondaries: Vec::new(),
             reconciler: FinalizingReconciler { finalized: Arc::new(Mutex::new(Vec::new())) },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1491,7 +1474,6 @@ async fn controller_loop_removes_existing_adopted_finalizer_without_running_tear
             primary: primaries.clone(),
             secondaries: Vec::new(),
             reconciler: FinalizingReconciler { finalized: Arc::clone(&finalized) },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1532,7 +1514,6 @@ async fn repeated_identical_reconcile_errors_back_off_and_park_as_degraded() {
                 persist_degraded: true,
                 wake_degraded: Arc::new(AtomicBool::new(false)),
             },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1617,7 +1598,6 @@ async fn explicit_lifecycle_wake_bypasses_a_parked_objects_remaining_backoff() {
                 persist_degraded: true,
                 wake_degraded: Arc::clone(&wake_degraded),
             },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1676,7 +1656,6 @@ async fn exhausted_budget_keeps_retrying_until_degraded_status_is_persistable() 
                 persist_degraded: false,
                 wake_degraded: Arc::new(AtomicBool::new(false)),
             },
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1710,7 +1689,6 @@ async fn secondary_watch_restart_is_backed_off() {
             primary: primaries,
             secondaries: vec![Box::new(RestartingSecondaryWatch { spawns: Arc::clone(&spawns) })],
             reconciler: RecordingReconciler::new(Arc::new(Mutex::new(Vec::new()))),
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1750,7 +1728,6 @@ async fn secondary_watch_that_keeps_exiting_backs_off_with_a_cap() {
             primary: primaries,
             secondaries: vec![Box::new(RestartingSecondaryWatch { spawns: Arc::clone(&spawns) })],
             reconciler: RecordingReconciler::new(Arc::new(Mutex::new(Vec::new()))),
-            resync_interval: Duration::from_secs(3600),
             backend,
         }
         .run(),
@@ -1796,7 +1773,6 @@ async fn expired_secondary_watch_resyncs_primaries_without_restarting_controller
                 spawned: Arc::clone(&spawned),
             })],
             reconciler: RecordingReconciler::with_notify(Arc::clone(&reconciled), Arc::clone(&reconciled_notify)),
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1830,7 +1806,6 @@ async fn non_expiry_secondary_watch_error_still_exits_controller_loop() {
             primary: primaries,
             secondaries: vec![Box::new(FailingSecondaryWatch)],
             reconciler: RecordingReconciler::new(Arc::new(Mutex::new(Vec::new()))),
-            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),
@@ -1867,7 +1842,6 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
             primary: primaries,
             secondaries: Vec::new(),
             reconciler: ActuatingReconciler { actuation: Actuation::DeleteVessel { name: "alpha-task".to_string() }, reconciled: None },
-            resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
         .run(),
@@ -1918,7 +1892,6 @@ async fn controller_loop_delete_actuations_preserve_observed_resources() {
                 actuation: Actuation::DeleteVessel { name: "observed-task".to_string() },
                 reconciled: Some(Arc::clone(&reconciled)),
             },
-            resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
         .run(),
@@ -1977,7 +1950,7 @@ impl Reconciler for RequeuingReconciler {
 
 // Behaviour (#3206): an observed loop counts every object it takes from its
 // queue, times each reconcile, counts the requeues reconciles ask for, and
-// counts each periodic resync with the objects it enqueued.
+// counts each full resync (here a change naming no primary) with the objects it enqueued.
 #[tokio::test]
 async fn an_observed_controller_loop_records_wakes_requeues_and_resyncs() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -1986,20 +1959,21 @@ async fn an_observed_controller_loop_records_wakes_requeues_and_resyncs() {
         primaries.create(&primary_meta(name), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
     }
     let passes = Arc::new(AtomicUsize::new(0));
+    let fire = Arc::new(Notify::new());
     let metrics = Arc::new(flotilla_store::load_metrics::ControllerLoadMetrics::default());
     let mut harness = TestLoopHarness::new();
     harness.spawn(
         ControllerLoop {
             primary: primaries,
-            secondaries: Vec::new(),
+            secondaries: vec![Box::new(EverySecondaryWatch { fire: Arc::clone(&fire) })],
             reconciler: RequeuingReconciler { passes: Arc::clone(&passes) },
-            resync_interval: Duration::from_millis(50),
             backend,
         }
         .run_observed(Arc::clone(&metrics)),
     );
     timeout(Duration::from_secs(5), async {
         while metrics.resyncs.get() < 2 || passes.load(Ordering::SeqCst) < 6 {
+            fire.notify_one();
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -2015,4 +1989,104 @@ async fn an_observed_controller_loop_records_wakes_requeues_and_resyncs() {
     assert_eq!(snapshot.resync_enqueued, snapshot.resyncs * 2, "each resync enqueues both objects");
     assert_eq!(snapshot.failures, 0);
     assert!(snapshot.queue_peak >= 1);
+}
+
+/// Fails its first `failures` prepares, as a transient read would, then reconciles; or holds each
+/// object behind a durable retry wake until `due`.
+struct RetriedReconciler {
+    failures: Arc<AtomicUsize>,
+    due: Option<chrono::DateTime<chrono::Utc>>,
+    reconciled: Arc<AtomicUsize>,
+}
+
+impl Reconciler for RetriedReconciler {
+    type Resource = PrimaryResource;
+    type Prepared = ();
+
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        if self.failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
+            return Err(ResourceError::other("transient prepare failure"));
+        }
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Prepared,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        self.reconciled.fetch_add(1, Ordering::SeqCst);
+        ReconcileOutcome::new(None)
+    }
+
+    fn retry_disposition(&self, _obj: &ResourceObject<Self::Resource>) -> Option<flotilla_resources::ControllerRetryDisposition> {
+        self.due.map(|next_attempt_at| flotilla_resources::ControllerRetryDisposition::Retryable { next_attempt_at })
+    }
+
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+// With no periodic resync, a reconciler without an error policy that fails is retried by the
+// loop itself, with no change to wake it.
+#[tokio::test]
+async fn a_failed_reconcile_without_a_policy_is_retried_without_an_event() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+    let reconciled = Arc::new(AtomicUsize::new(0));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: RetriedReconciler { failures: Arc::new(AtomicUsize::new(2)), due: None, reconciled: Arc::clone(&reconciled) },
+            backend,
+        }
+        .run(),
+    );
+    // Two failures back off 1 s, then 2 s.
+    timeout(Duration::from_secs(10), async {
+        while reconciled.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the loop retries the failed object");
+    harness.shutdown().await;
+}
+
+// With no periodic resync, an object held behind a durable retry wake is woken at its due time.
+#[tokio::test]
+async fn a_retry_wake_is_woken_at_its_due_time() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+    let reconciled = Arc::new(AtomicUsize::new(0));
+    let due = chrono::Utc::now() + chrono::Duration::milliseconds(300);
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: RetriedReconciler { failures: Arc::new(AtomicUsize::new(0)), due: Some(due), reconciled: Arc::clone(&reconciled) },
+            backend,
+        }
+        .run(),
+    );
+    timeout(Duration::from_secs(5), async {
+        while reconciled.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the due retry wakes the object");
+    assert!(chrono::Utc::now() >= due, "not before its due time");
+    harness.shutdown().await;
 }
