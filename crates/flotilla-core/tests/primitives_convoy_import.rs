@@ -11,8 +11,8 @@ use flotilla_core::primitives::convoy_import::{
 use flotilla_resources::{
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict},
     AdmissionDocument, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, LeafMaker,
-    ObjectMeta, ResourceObject, Selector, StallEvidenceSource, StallRung, StalledCondition, VesselRequirement, WorkflowSnapshot,
-    ENSURED_FROM_ANNOTATION,
+    ObjectMeta, ResourceObject, Selector, StallEvidenceSource, StallRung, StalledCondition, VesselRequirement, WorkCompletionAuthority,
+    WorkPhase, WorkState, WorkflowSnapshot, ENSURED_FROM_ANNOTATION,
 };
 use flotilla_schema::Address;
 use flotilla_state_machines::machines::{
@@ -66,7 +66,7 @@ fn convoy(name: &str, phase: ConvoyPhase, crew: Vec<CrewSpec>) -> ResourceObject
         )]),
         ..Default::default()
     };
-    for (vessel, role, operation) in promises::admitted_declarations(&[], &status) {
+    for (vessel, role, operation) in promises::admitted_declarations(&[], &status, false) {
         promises::apply(&mut status, &vessel, &role, &operation);
     }
     ResourceObject {
@@ -133,8 +133,11 @@ fn repeated_old_ids_import_seat_qualified() {
     let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
     let promises: Vec<_> = convoy.resource.spec().promises.iter().map(|row| row.record.clone()).collect();
     let labels: Vec<_> = promises.iter().map(|promise| promise.label.as_str()).collect();
-    assert_eq!(labels, vec!["template/pr", "@coder/notes", "@reviewer/notes"]);
-    assert!(promises.iter().skip(1).all(|promise| flotilla_core::primitives::convoy_map::old_id(promise) == "notes"));
+    // The reviewer owed nothing at admission, so it holds the default decision ledger.
+    assert_eq!(labels, vec!["template/pr", "@coder/notes", "template/decision-ledger", "@reviewer/notes"]);
+    let qualified: Vec<_> = promises.iter().filter(|promise| promise.label.starts_with('@')).collect();
+    assert_eq!(qualified.len(), 2);
+    assert!(qualified.iter().all(|promise| flotilla_core::primitives::convoy_map::old_id(promise) == "notes"));
 }
 
 // Behaviour: a convoy with history imports one to one: each promise keeps its progress and
@@ -167,6 +170,7 @@ fn a_convoy_with_history_imports_one_to_one() {
         progress,
         vec![
             ("template/pr".to_owned(), SeatName::new("coder", ""), Progress::Kept, 1),
+            ("template/decision-ledger".to_owned(), SeatName::new("reviewer", ""), Progress::Pending, 0),
             ("l2".to_owned(), SeatName::new("reviewer", ""), Progress::Pending, 1),
             ("spike".to_owned(), SeatName::new("reviewer", ""), Progress::Retracted, 0),
         ]
@@ -185,17 +189,62 @@ fn a_convoy_with_history_imports_one_to_one() {
     assert_eq!(document.dispatching_principal_ref, old.spec.dispatching_principal_ref);
 }
 
-// Behaviour: a finite, unfinished convoy with no promise is the named refusal NoObligations; an ended
-// or unbootstrapped convoy stays on the old path.
+// Behaviour: a finite, unfinished convoy with no promise is the named refusal NoObligations (its
+// only agent is done, so admission owes it no default ledger); an ended or unbootstrapped convoy
+// stays on the old path.
 #[test]
 fn unfinished_convoys_without_promises_are_refused_by_name() {
-    let idle = convoy("idle", ConvoyPhase::Active, vec![agent("reviewer", false)]);
+    let mut idle = convoy("idle", ConvoyPhase::Active, vec![agent("reviewer", false)]);
+    let status = idle.status.as_mut().expect("status");
+    status.promises.clear();
+    status.crew_work.get_mut("work").and_then(|crew| crew.get_mut("reviewer")).expect("reviewer").phase = CrewWorkPhase::Done;
     assert_eq!(import_convoy(&idle, HOME, &[], &WORLD), Err(ConvoyImportRefusal::NoObligations { convoy: "idle".into() }));
     let landed = convoy("landed", ConvoyPhase::Landed, vec![agent("reviewer", false)]);
     assert!(matches!(import_convoy(&landed, HOME, &[], &WORLD), Ok(ImportOutcome::StaysOld(_))));
     let mut fresh = convoy("fresh", ConvoyPhase::Pending, vec![agent("coder", true)]);
     fresh.status.as_mut().expect("status").workflow_snapshot = None;
     assert!(matches!(import_convoy(&fresh, HOME, &[], &WORLD), Ok(ImportOutcome::StaysOld(_))));
+}
+
+// Behaviour (owner ruling, #3108): an agent seat bootstrapped before the default ledger existed, and
+// owing nothing, imports with the Pending template decision ledger admission now gives it.
+#[test]
+fn an_agent_owing_nothing_imports_with_its_default_ledger() {
+    let mut old = convoy("c", ConvoyPhase::Active, vec![agent("coder", true), agent("reviewer", false)]);
+    old.status.as_mut().expect("status").promises.get_mut("work").expect("work").remove("reviewer");
+    let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
+    let ledger = convoy.resource.spec().promises.iter().find(|row| row.record.owner == SeatName::new("reviewer", "")).expect("ledger");
+    assert_eq!((ledger.record.label.as_str(), ledger.record.progress.value), ("template/decision-ledger", Progress::Pending));
+    check(&convoy.resource).expect("the machine reaches it");
+}
+
+// Behaviour (owner ruling, #3108): completion is promises only, so a work an operator forced
+// complete imports as the operator's verdict keeping its open promises; settled ones keep their
+// progress.
+#[test]
+fn a_forced_work_imports_as_kept_promises() {
+    let mut old = convoy("c", ConvoyPhase::Active, vec![agent("coder", true), agent("reviewer", false)]);
+    operate(&mut old, "coder", submit("template/pr", PromiseKind::Pr, PR));
+    operate(&mut old, "reviewer", PromiseOperation::Declare { id: "spike".into(), kind: PromiseKind::Pr, source: PromiseSource::Crew });
+    operate(&mut old, "reviewer", PromiseOperation::Retract { id: "spike".into(), reason: "folded".into() });
+    let forced = WorkState::builder()
+        .phase(WorkPhase::Complete)
+        .completion_authority(WorkCompletionAuthority::HumanOverride)
+        .finished_at(Utc::now())
+        .build();
+    old.status.as_mut().expect("status").work.insert("work".into(), forced);
+    let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
+    let progress: Vec<_> =
+        convoy.resource.spec().promises.iter().map(|row| (row.record.label.clone(), row.record.progress.value)).collect();
+    assert_eq!(
+        progress,
+        vec![
+            ("template/pr".to_owned(), Progress::Kept),
+            ("template/decision-ledger".to_owned(), Progress::Kept),
+            ("spike".to_owned(), Progress::Retracted),
+        ]
+    );
+    check(&convoy.resource).expect("the machine reaches it");
 }
 
 // Behaviour: a standing convoy waits for the seat-growth ruling; once it is ruled, it imports with a

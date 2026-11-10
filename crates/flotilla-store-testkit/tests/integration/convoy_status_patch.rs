@@ -952,6 +952,7 @@ fn bootstrap_sets_snapshot_and_initial_work_map() {
         work.clone(),
         BTreeMap::new(),
         Vec::new(),
+        false,
         ConvoyPhase::Pending,
         None,
     );

@@ -1753,9 +1753,10 @@ mod tests {
             .content;
             assert!(content.contains("--propose <resume|reduce-scope|fail>"), "{template}");
             assert!(!content.contains("crew fail"), "{template}");
-            // #3703: each task variant must teach settlement even with no admitted promises.
+            // #3703: each task variant teaches settlement. Admission gives every agent seat a
+            // promise (#3108 owner ruling), so no variant asks a crew to declare its own ledger.
             assert!(!content.contains("flotilla crew complete"), "{template}");
-            assert!(content.contains("flotilla crew promise --promise"), "{template}");
+            assert!(!content.contains("If you hold no promises"), "{template}");
             assert!(content.contains("every promise is kept or retracted"), "{template}");
         }
     }

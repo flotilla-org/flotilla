@@ -150,7 +150,7 @@ async fn prless_decision_ledger_promise_settles_without_a_claim() {
         .expect("vessel");
     // #3586: the ledger promise is observed and kept by reconciliation, with no completion claim.
     let current = convoys.get("ledger-claim").await.unwrap();
-    for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], current.status.as_ref().unwrap()) {
+    for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], current.status.as_ref().unwrap(), false) {
         flotilla_store::apply_status_patch(
             &convoys,
             "ledger-claim",

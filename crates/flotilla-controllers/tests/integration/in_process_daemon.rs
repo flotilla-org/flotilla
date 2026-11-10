@@ -5683,6 +5683,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
             BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Pending).build())]),
             BTreeMap::new(),
             Vec::new(),
+            false,
             ConvoyPhase::Pending,
             None,
         ),
@@ -9610,7 +9611,7 @@ async fn operator_forced_completion_settles_a_ledger_less_crew() {
         .expect("create vessel");
 
     let admitted = convoys.get("missing-ledger").await.unwrap();
-    for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], admitted.status.as_ref().unwrap()) {
+    for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], admitted.status.as_ref().unwrap(), false) {
         apply_status_patch(&convoys, "missing-ledger", &flotilla_resources::ConvoyStatusPatch::Promise { vessel, role, operation })
             .await
             .unwrap();

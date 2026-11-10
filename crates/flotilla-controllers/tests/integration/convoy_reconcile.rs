@@ -1002,6 +1002,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
         expected_tasks,
         expected_crew_work,
         Vec::new(),
+        false,
         ConvoyPhase::Pending,
         None,
     );
@@ -1046,7 +1047,7 @@ fn bootstrap_opens_frozen_dispatch_promises() {
     outcome.patch.expect("bootstrap patch").apply(&mut status);
     let promise = promises::owned(&status, &vessel, &role).iter().find(|p| p.id == "api-split").expect("dispatch promise seeded");
     assert_eq!((promise.source, promise.kind, promise.state), (PromiseSource::Dispatch, PromiseKind::Pr, PromiseState::Open));
-    assert!(promises::admitted_declarations(&spec.promises, &status).is_empty());
+    assert!(promises::admitted_declarations(&spec.promises, &status, false).is_empty());
 }
 
 #[test]
@@ -3436,7 +3437,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
             )]),
             ..Default::default()
         };
-        for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], &status) {
+        for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], &status, false) {
             flotilla_resources::promises::apply(&mut status, &vessel, &role, &operation);
         }
         for number in 1..=3 {

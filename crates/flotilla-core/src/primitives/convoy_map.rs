@@ -306,7 +306,7 @@ pub fn declarations(convoy: &ResourceObject<OldConvoy>, status: &ConvoyStatus) -
             })
         })
         .collect();
-    for (vessel, role, operation) in old::admitted_declarations(&convoy.spec.promises, status) {
+    for (vessel, role, operation) in old::admitted_declarations(&convoy.spec.promises, status, is_ensured(convoy)) {
         if let old::PromiseOperation::Declare { id, kind, source } = operation {
             if !out.iter().any(|known| known.vessel == vessel && known.role == role && known.id == id) {
                 out.push(OldDeclaration { vessel, role, id, kind, source });

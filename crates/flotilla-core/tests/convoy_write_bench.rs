@@ -61,7 +61,7 @@ fn status() -> ConvoyStatus {
         )]),
         ..Default::default()
     };
-    for (vessel, role, operation) in promises::admitted_declarations(&[], &status) {
+    for (vessel, role, operation) in promises::admitted_declarations(&[], &status, false) {
         promises::apply(&mut status, &vessel, &role, &operation);
     }
     status

@@ -12,6 +12,8 @@
 //! | crew `(vessel, role)` | its seat ([`super::convoy_map::Crews`]) |
 //! | promise, its submissions | the same promise, owned by the seat, under its label |
 //! | Open / Submitted / Kept / Retracted | Pending / Submitted / Kept / Retracted |
+//! | an open promise of a work an operator forced complete (HumanOverride) | Kept: the operator's verdict, at the work's `finished_at` |
+//! | an agent seat of a finite convoy owing nothing | a Pending template decision ledger, as admission gives one |
 //! | crew Done, HandedBack | dropped: derived from the promises |
 //! | crew Failed | dropped: its promises stay, for an operator verdict |
 //! | an open stall with a supervision message | an open stall record ([`ImportedStall`]), written beside the convoy |
@@ -30,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_resources::{
     convoy::reconcile::is_ensured, promises::PromiseState as OldState, Convoy as OldConvoy, ConvoyPhase, CrewSource, ForgeSpec,
-    ResourceObject,
+    ResourceObject, WorkCompletionAuthority,
 };
 use flotilla_schema::{Records, State, Timestamp};
 use flotilla_state_machines::{
@@ -168,12 +170,35 @@ pub fn import_convoy(
     let project = map::project(convoy).map_err(refuse)?;
     let since = timestamp(&status.started_at.unwrap_or(convoy.metadata.creation_timestamp));
 
+    // The status's promises, then those admission owes that the status lacks: an agent seat owing
+    // nothing gets its default decision ledger (owner ruling, #3108).
+    let owed: Vec<(String, String, flotilla_resources::promises::Promise)> =
+        flotilla_resources::promises::admitted_declarations(&convoy.spec.promises, status, standing)
+            .into_iter()
+            .filter_map(|(vessel, role, operation)| match operation {
+                flotilla_resources::promises::PromiseOperation::Declare { id, kind, source } => {
+                    let promise = flotilla_resources::promises::Promise {
+                        id,
+                        vessel: vessel.clone(),
+                        role: role.clone(),
+                        source,
+                        kind,
+                        state: OldState::Open,
+                        retraction_reason: None,
+                        submissions: Vec::new(),
+                    };
+                    Some((vessel, role, promise))
+                }
+                _ => None,
+            })
+            .collect();
     let declared: Vec<(&String, &String, &flotilla_resources::promises::Promise)> = status
         .promises
         .iter()
         .flat_map(|(vessel, crew)| {
             crew.iter().flat_map(move |(role, promises)| promises.iter().map(move |promise| (vessel, role, promise)))
         })
+        .chain(owed.iter().map(|(vessel, role, promise)| (vessel, role, promise)))
         .collect();
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for (_, _, promise) in &declared {
@@ -200,7 +225,17 @@ pub fn import_convoy(
         if progress == Progress::Submitted && submissions.is_empty() {
             return Err(refuse(format!("promise `{}` is Submitted with no submission", old.id)));
         }
-        let at = old.submissions.last().map(|submission| timestamp(&submission.submitted_at)).unwrap_or(since);
+        let mut at = old.submissions.last().map(|submission| timestamp(&submission.submitted_at)).unwrap_or(since);
+        // An operator's forced completion of the work is a verdict keeping its open promises
+        // (owner ruling, #3108): completion is promises only.
+        let forced = status.work.get(vessel.as_str()).filter(|work| work.completion_authority == WorkCompletionAuthority::HumanOverride);
+        let progress = match (forced, progress) {
+            (Some(work), Progress::Pending | Progress::Submitted) => {
+                at = work.finished_at.as_ref().map(timestamp).unwrap_or(at);
+                Progress::Kept
+            }
+            (_, progress) => progress,
+        };
         let row = Promise {
             id: PromiseId(u32::try_from(index).map_err(|_| refuse("more promises than ids".into()))?),
             label,

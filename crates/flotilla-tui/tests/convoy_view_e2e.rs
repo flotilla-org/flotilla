@@ -229,6 +229,7 @@ async fn generated_table_action_completes_work() {
             work,
             BTreeMap::new(),
             Vec::new(),
+            false,
             ConvoyPhase::Active,
             None,
         ),

@@ -2050,7 +2050,8 @@ async fn artifact_environment_reference_contract() {
             .await
             .expect("active crew work");
         let admitted = convoys.get(convoy).await.unwrap();
-        for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], admitted.status.as_ref().unwrap()) {
+        for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], admitted.status.as_ref().unwrap(), false)
+        {
             flotilla_store::apply_status_patch(
                 &convoys,
                 convoy,

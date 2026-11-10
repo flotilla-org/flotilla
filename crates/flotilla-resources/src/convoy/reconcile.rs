@@ -1021,6 +1021,7 @@ fn bootstrap_outcome(
             work,
             crew_work,
             convoy.spec.promises.clone(),
+            is_ensured(convoy),
             ConvoyPhase::Pending,
             None,
         )),

@@ -1884,6 +1884,8 @@ pub enum ConvoyStatusPatch {
         /// The spec's frozen dispatch promises, carried so Bootstrap seeds them
         /// in the same patch as the template declarations.
         dispatch_promises: Vec<promises::DispatchPromise>,
+        /// A standing convoy's seats get no default decision ledger.
+        standing: bool,
         phase: ConvoyPhase,
         started_at: Option<DateTime<Utc>>,
     },
@@ -2250,6 +2252,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 work,
                 crew_work,
                 dispatch_promises,
+                standing,
                 phase,
                 started_at,
             } => {
@@ -2259,7 +2262,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.observed_workflows = Some(observed_workflows.clone());
                 status.work = work.clone();
                 status.crew_work = crew_work.clone();
-                for (vessel, role, operation) in promises::admitted_declarations(dispatch_promises, status) {
+                for (vessel, role, operation) in promises::admitted_declarations(dispatch_promises, status, *standing) {
                     promises::apply(status, &vessel, &role, &operation);
                 }
                 status.phase = *phase;
@@ -2928,6 +2931,7 @@ pub mod controller_patches {
         work: BTreeMap<String, WorkState>,
         crew_work: BTreeMap<String, BTreeMap<String, CrewWorkState>>,
         dispatch_promises: Vec<promises::DispatchPromise>,
+        standing: bool,
         phase: ConvoyPhase,
         started_at: Option<DateTime<Utc>>,
     ) -> ConvoyStatusPatch {
@@ -2938,6 +2942,7 @@ pub mod controller_patches {
             work,
             crew_work,
             dispatch_promises,
+            standing,
             phase,
             started_at,
         }

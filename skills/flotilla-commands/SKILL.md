@@ -61,8 +61,9 @@ Retract your own crew-sourced promise with
 submissions. Once anything has been submitted, or for a template or dispatch
 promise, retraction proposes a stall for the supplier to decide.
 
-Deliverers receive a template `pr` promise at admission. Submit your PR and
-ledger; your part ends when every promise is kept or retracted. A role holding
-no promises is never automatically Done. Report a PR with `crew submit`;
+Deliverers receive a template `pr` promise at admission, and an agent role the
+workflow and dispatcher promise nothing for receives a template
+`decision-ledger` promise. Submit your PR and ledger; your part ends when every
+promise is kept or retracted. Report a PR with `crew submit`;
 `crew complete --force` is the operator's forced settlement, and crews do not
 run it.

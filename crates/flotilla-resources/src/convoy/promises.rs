@@ -602,7 +602,11 @@ fn dispatch_origin(mut id: &str) -> &str {
 /// Idempotent: a dispatch promise already present anywhere in its vessel,
 /// including after a handoff moved it to another role, is never re-declared,
 /// nor is an ID its owner already holds from another source.
-pub fn admitted_declarations(dispatch: &[DispatchPromise], status: &ConvoyStatus) -> Vec<(String, String, PromiseOperation)> {
+pub fn admitted_declarations(
+    dispatch: &[DispatchPromise],
+    status: &ConvoyStatus,
+    standing: bool,
+) -> Vec<(String, String, PromiseOperation)> {
     let mut declarations = template_declarations(status);
     declarations.extend(
         dispatch
@@ -633,7 +637,43 @@ pub fn admitted_declarations(dispatch: &[DispatchPromise], status: &ConvoyStatus
                 )
             }),
     );
+    if !standing {
+        let ledgers = default_ledgers(status, &declarations);
+        declarations.extend(ledgers);
+    }
     declarations
+}
+
+/// Owner ruling (#3108): admission gives every agent seat of a non-standing
+/// convoy a promise, so a convoy never reads Landing while one of its agents
+/// owes nothing. A seat the template and dispatch declare nothing for, and
+/// that owns nothing yet, owes a template decision ledger, unless its dispatch
+/// excluded the template ledger. A standing convoy's seats owe nothing: it
+/// stays open across tasks.
+fn default_ledgers(status: &ConvoyStatus, declared: &[(String, String, PromiseOperation)]) -> Vec<(String, String, PromiseOperation)> {
+    status
+        .workflow_snapshot
+        .iter()
+        .flat_map(|snapshot| &snapshot.vessels)
+        .flat_map(|vessel| {
+            vessel
+                .crew
+                .iter()
+                .filter(|crew| matches!(crew.source, crate::CrewSource::Agent { .. }))
+                .filter(|crew| !crew.promise_exclusions.contains(&PromiseKind::DecisionLedger))
+                .filter(|crew| seeds_open_promises(status, &vessel.name, &crew.role))
+                .filter(|crew| !declared.iter().any(|(owner, role, _)| owner == &vessel.name && role == &crew.role))
+                .filter(|crew| owned(status, &vessel.name, &crew.role).is_empty())
+                .map(|crew| {
+                    let kind = PromiseKind::DecisionLedger;
+                    (
+                        vessel.name.clone(),
+                        crew.role.clone(),
+                        PromiseOperation::Declare { id: format!("template/{}", kind.as_str()), kind, source: PromiseSource::Template },
+                    )
+                })
+        })
+        .collect()
 }
 
 /// Discovery and explicit claim attribution share the same submission transition.
@@ -969,11 +1009,11 @@ mod tests {
                 )]),
                 ..Default::default()
             };
-            for (vessel, role, operation) in admitted_declarations(&[], &status) {
+            for (vessel, role, operation) in admitted_declarations(&[], &status, false) {
                 apply(&mut status, &vessel, &role, &operation);
             }
             assert_eq!(owned(&status, "work", "coder").iter().filter(|p| p.kind == PromiseKind::Pr).count(), 1);
-            assert!(admitted_declarations(&[], &status).is_empty());
+            assert!(admitted_declarations(&[], &status, false).is_empty());
             status
                 .promises
                 .get_mut("work")
@@ -1621,6 +1661,66 @@ mod tests {
         assert!(error.contains("`work/reviewer` is a tool crew member"), "{error}");
     }
 
+    // Owner ruling (#3108): admission gives every agent seat of a non-standing convoy a promise.
+    // An agent the template and dispatch declare nothing for owes a template decision ledger; a
+    // tool seat, a seat whose dispatch excluded the ledger, and a standing convoy's seats do not.
+    // Seeding again adds nothing.
+    #[test]
+    fn an_agent_seat_owing_nothing_gets_a_template_decision_ledger() {
+        let agent = |role: &str| {
+            crate::CrewSpec::builder()
+                .role(role.to_string())
+                .source(crate::CrewSource::Agent { selector: crate::Selector::for_capability("code"), prompt: None, brief_template: None })
+                .build()
+        };
+        let mut excluded = agent("excluded");
+        excluded.promise_exclusions.push(PromiseKind::DecisionLedger);
+        let tool = crate::CrewSpec::builder()
+            .role("tool".to_string())
+            .source(crate::CrewSource::Tool { command: "sleep infinity".into() })
+            .build();
+        let mut owing = agent("owing");
+        owing.promises.push(crate::TemplatePromise { owner: "owing".into(), kind: PromiseKind::Pr });
+        let status = ConvoyStatus {
+            workflow_snapshot: Some(crate::WorkflowSnapshot {
+                cascade: None,
+                exit: None,
+                turn_delivery: Default::default(),
+                stall_nudges: Default::default(),
+                supervision: None,
+                vessels: vec![crate::VesselRequirement::builder()
+                    .name("work".to_string())
+                    .crew(vec![agent("idle"), excluded, tool, owing, agent("dispatched")])
+                    .build()],
+            }),
+            ..Default::default()
+        };
+        let dispatch = vec![dispatched("notes", PromiseKind::Pr, "dispatched")];
+        let seeded = |standing| {
+            admitted_declarations(&dispatch, &status, standing)
+                .into_iter()
+                .map(|(_, role, operation)| match operation {
+                    PromiseOperation::Declare { id, kind, source } => (role, id, kind, source),
+                    other => panic!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            seeded(false),
+            vec![
+                ("owing".into(), "template/pr".into(), PromiseKind::Pr, PromiseSource::Template),
+                ("dispatched".into(), "notes".into(), PromiseKind::Pr, PromiseSource::Dispatch),
+                ("idle".into(), "template/decision-ledger".into(), PromiseKind::DecisionLedger, PromiseSource::Template),
+            ]
+        );
+        assert!(seeded(true).iter().all(|(role, ..)| role != "idle"), "a standing convoy's seats owe nothing by default");
+        let mut admitted = status.clone();
+        for (vessel, role, operation) in admitted_declarations(&dispatch, &status, false) {
+            apply(&mut admitted, &vessel, &role, &operation);
+        }
+        assert!(admitted_declarations(&dispatch, &admitted, false).is_empty());
+    }
+
     // ADR 0061: Bootstrap seeds frozen dispatch promises beside template ones,
     // open and dispatch-sourced, under the label the crew submits against.
     // Re-seeding is idempotent, including after handoff moves (and renames)
@@ -1646,6 +1746,7 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), pending()), ("reviewer".into(), pending())]))]),
             dispatch.clone(),
+            false,
             super::super::ConvoyPhase::Pending,
             None,
         )
@@ -1668,7 +1769,7 @@ mod tests {
                 ("notes".into(), PromiseSource::Dispatch, PromiseKind::DecisionLedger, PromiseState::Open),
             ]
         );
-        assert!(admitted_declarations(&dispatch, &status).is_empty());
+        assert!(admitted_declarations(&dispatch, &status, false).is_empty());
         // A colliding handoff renames the moved promise; it is still seeded.
         let mut collided = status.clone();
         apply(
@@ -1681,7 +1782,7 @@ mod tests {
         assert!(owned(&collided, "work", "reviewer")
             .iter()
             .any(|p| p.id == "handoff/coder/api-split/1" && p.source == PromiseSource::Dispatch));
-        assert!(admitted_declarations(&dispatch, &collided)
+        assert!(admitted_declarations(&dispatch, &collided, false)
             .iter()
             .all(|(_, _, operation)| !matches!(operation, PromiseOperation::Declare { source: PromiseSource::Dispatch, .. })));
         // Finished crew are skipped; promises outside the snapshot are ignored.
@@ -1689,7 +1790,7 @@ mod tests {
         fresh.promises.clear();
         fresh.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = super::super::CrewWorkPhase::Done;
         let stray = DispatchPromise { label: "stray".into(), kind: PromiseKind::Pr, vessel: "work".into(), role: "designer".into() };
-        let seeded = admitted_declarations(&[dispatch.clone(), vec![stray]].concat(), &fresh);
+        let seeded = admitted_declarations(&[dispatch.clone(), vec![stray]].concat(), &fresh, false);
         assert_eq!(
             seeded.iter().map(|(vessel, role, _)| format!("{vessel}/{role}")).collect::<Vec<_>>(),
             vec!["work/reviewer", "work/reviewer"]

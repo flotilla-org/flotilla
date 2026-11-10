@@ -399,6 +399,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     work: status.work.clone(),
                     crew_work: status.crew_work.clone(),
                     dispatch_promises: Vec::new(),
+                    standing: false,
                     phase: ConvoyPhase::Active,
                     started_at: Some(ts(30)),
                 };
