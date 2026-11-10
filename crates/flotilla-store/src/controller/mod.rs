@@ -15,7 +15,7 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     apply_status_patch,
@@ -47,7 +47,8 @@ pub trait Reconciler: Send + Sync + 'static {
 
     /// Opt an object reconciler into a budget for repeated identical errors.
     /// Controllers without a policy are retried at a backoff capped at a
-    /// minute for as long as they fail.
+    /// minute, and parked after ten identical failures until a change wakes
+    /// the object (see [`WorkQueueSender::parked`]).
     fn reconcile_error_policy(&self) -> Option<ReconcileErrorPolicy> {
         None
     }
@@ -115,13 +116,15 @@ pub enum ReconcileErrorExhaustion {
 }
 
 impl ReconcileErrorPolicy {
-    /// What a reconciler without its own policy gets: it is retried at a backoff capped at a
-    /// minute for as long as it fails, and is never parked or marked degraded.
+    /// What a reconciler without its own policy gets, and what a failed read of an object gets:
+    /// retried at a backoff capped at a minute, then parked after ten identical failures, with
+    /// the error told by [`WorkQueueSender::parked`]. Any change to the object wakes it at once
+    /// and starts its count again.
     const UNBUDGETED: Self = Self {
-        max_consecutive_failures: u32::MAX,
+        max_consecutive_failures: 10,
         initial_backoff: Duration::from_secs(1),
         max_backoff: Duration::from_secs(60),
-        exhaustion: ReconcileErrorExhaustion::Retry,
+        exhaustion: ReconcileErrorExhaustion::Park,
     };
 
     fn backoff(&self, consecutive_failures: u32) -> Duration {
@@ -202,6 +205,8 @@ struct QueueProgress {
     queued: BTreeMap<String, Instant>,
     processing: Option<String>,
     last_progress: Option<DateTime<Utc>>,
+    /// Objects that stopped being retried, with the error that parked them.
+    parked: BTreeMap<String, String>,
 }
 
 impl WorkQueueSender {
@@ -248,6 +253,20 @@ impl WorkQueueSender {
         let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
         progress.processing = None;
         progress.last_progress = Some(Utc::now());
+    }
+
+    /// Why the controller stopped retrying `name`, if it has: its last error, repeated until the
+    /// retries ran out. A change to the object wakes it again.
+    pub fn parked(&self, name: &str) -> Option<String> {
+        self.progress.lock().expect("controller work queue lock poisoned").parked.get(name).cloned()
+    }
+
+    fn park(&self, name: &str, error: String) {
+        self.progress.lock().expect("controller work queue lock poisoned").parked.insert(name.to_owned(), error);
+    }
+
+    fn unpark(&self, name: &str) {
+        self.progress.lock().expect("controller work queue lock poisoned").parked.remove(name);
     }
 
     /// Queue age alone is not a failure: a busy loop making progress is able.
@@ -756,11 +775,25 @@ impl<R: Reconciler> ControllerLoop<R> {
                             read_failures.remove(&name);
                             object_failures.remove(&name);
                             finalizer_failures.remove(&name);
+                            sender.unpark(&name);
                             continue;
                         }
                         Err(err) => {
+                            let limit = ReconcileErrorPolicy::UNBUDGETED.max_consecutive_failures;
                             let failures = read_failures.entry(name.clone()).or_insert(0);
-                            *failures = failures.saturating_add(1);
+                            // A parked object is read again only when a change wakes it: count afresh.
+                            *failures = if *failures >= limit { 1 } else { failures.saturating_add(1) };
+                            if *failures >= limit {
+                                error!(
+                                    resource_kind = R::Resource::API_PATHS.kind,
+                                    resource = %name,
+                                    %err,
+                                    failures = *failures,
+                                    "controller could not read object; parked until it changes",
+                                );
+                                sender.park(&name, format!("reading it failed {} times: {err}", *failures));
+                                continue;
+                            }
                             let delay = ReconcileErrorPolicy::UNBUDGETED.backoff(*failures);
                             warn!(
                                 resource_kind = R::Resource::API_PATHS.kind,
@@ -894,6 +927,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                     Ok(()) if attempted_reconcile => {
                         object_failures.remove(&name);
+                        sender.unpark(&name);
                     }
                     Ok(()) if attempted_finalizer => {
                         finalizer_failures.remove(&name);
@@ -923,11 +957,14 @@ impl<R: Reconciler> ControllerLoop<R> {
                             delay
                         });
                         if attempted_reconcile {
+                            let unbudgeted = reconciler.reconcile_error_policy().is_none();
                             let policy = reconciler.reconcile_error_policy().unwrap_or(ReconcileErrorPolicy::UNBUDGETED);
                             let message = err.to_string();
                             let previous = object_failures.get(&name);
+                            // A parked unbudgeted object is reconciled again only when a change
+                            // wakes it: count afresh.
                             let consecutive_failures = previous
-                                .filter(|previous| previous.failure.message == message)
+                                .filter(|previous| previous.failure.message == message && !(unbudgeted && previous.terminal))
                                 .map_or(1, |previous| previous.failure.consecutive_failures.saturating_add(1));
                             let failure = ReconcileFailure { message, consecutive_failures };
                             let exhausted = consecutive_failures >= policy.max_consecutive_failures;
@@ -951,12 +988,24 @@ impl<R: Reconciler> ControllerLoop<R> {
                                             );
                                         }
                                     }
-                                } else {
+                                } else if !unbudgeted {
                                     terminal = false;
                                 }
                             }
                             if !terminal {
                                 retry_after = Some(delay);
+                            } else if unbudgeted {
+                                error!(
+                                    resource_kind = R::Resource::API_PATHS.kind,
+                                    resource = %name,
+                                    %err,
+                                    failures = failure.consecutive_failures,
+                                    "controller parked object until it changes",
+                                );
+                                sender.park(
+                                    &name,
+                                    format!("reconciling it failed {} times: {}", failure.consecutive_failures, failure.message),
+                                );
                             }
                             object_failures.insert(
                                 name.clone(),

@@ -2090,3 +2090,82 @@ async fn a_retry_wake_is_woken_at_its_due_time() {
     assert!(chrono::Utc::now() >= due, "not before its due time");
     harness.shutdown().await;
 }
+
+/// Holds the controller's work queue, as a watch that registers with it would.
+#[derive(Clone)]
+struct QueueHoldingSecondaryWatch {
+    queue: Arc<Mutex<Option<flotilla_store::controller::WorkQueueSender>>>,
+}
+
+impl flotilla_store::controller::SecondaryWatch for QueueHoldingSecondaryWatch {
+    type Primary = PrimaryResource;
+
+    fn clone_box(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            *self.queue.lock().expect("queue lock") = Some(sender);
+            std::future::pending().await
+        })
+    }
+}
+
+// A reconciler without an error policy is retried a finite number of times, then parked with its
+// error told; a change to the object wakes it at once and starts its count again.
+#[tokio::test(start_paused = true)]
+async fn a_failing_reconcile_without_a_policy_parks_after_ten_tries_and_a_change_revives_it() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+    let failures = Arc::new(AtomicUsize::new(usize::MAX));
+    let reconciled = Arc::new(AtomicUsize::new(0));
+    let queue = Arc::new(Mutex::new(None));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: vec![Box::new(QueueHoldingSecondaryWatch { queue: Arc::clone(&queue) })],
+            reconciler: RetriedReconciler { failures: Arc::clone(&failures), due: None, reconciled: Arc::clone(&reconciled) },
+            backend,
+        }
+        .run(),
+    );
+    let parked = || queue.lock().expect("queue lock").as_ref().and_then(|queue| queue.parked("alpha"));
+    // Ten failures back off 1, 2, 4 ... 60 s: well within an hour.
+    timeout(Duration::from_secs(3600), async {
+        while parked().is_none() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the failing object parks");
+    assert_eq!(usize::MAX - failures.load(Ordering::SeqCst), 10, "ten tries before parking");
+    assert!(parked().expect("parked").contains("transient prepare failure"), "the parked error is told");
+    // Parked: nothing retries it.
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert_eq!(usize::MAX - failures.load(Ordering::SeqCst), 10, "a parked object is not retried");
+
+    // A change wakes it at once; this time it succeeds and is no longer parked.
+    failures.store(0, Ordering::SeqCst);
+    let current = primaries.get("alpha").await.expect("alpha");
+    primaries
+        .update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("change alpha");
+    timeout(Duration::from_secs(5), async {
+        while reconciled.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the change revives the parked object");
+    assert_eq!(parked(), None, "a reconciled object is no longer parked");
+    harness.shutdown().await;
+}
