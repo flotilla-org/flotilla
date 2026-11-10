@@ -878,21 +878,21 @@ fn reconcile_internal_without_landing_event(
         return with_cleanup(convoy, &status, vessels, conditions.reclaim_eligible, outcome);
     }
 
-    // The engine decided the convoy when it delivered it. A work that fails afterwards (its
-    // vessel refused a checkout because the convoy has ended) does not undo that.
-    if let (ConvoyPhase::Landing, Some(delivered)) = (status.phase, conditions.engine_delivered.as_deref()) {
-        let disposition = conditions.exit_disposition.as_deref().unwrap_or(delivered);
-        let outcome = settle_landing(convoy, checkouts, &conditions, disposition, now);
-        return with_cleanup(
-            convoy,
-            &status,
-            vessels,
-            conditions.reclaim_eligible,
-            InternalReconcileOutcome { patch: outcome.patch, actuations: Vec::new(), events: outcome.events },
-        );
-    }
-
     if let Some(outcome) = fail_fast_outcome(&status, now) {
+        // The engine decided the convoy when it delivered it. A work that fails afterwards (its
+        // vessel refused a checkout because the convoy has ended) does not undo that: the convoy
+        // settles as delivered instead of failing. Without a failed work it rolls up as usual.
+        if let (ConvoyPhase::Landing, Some(delivered)) = (status.phase, conditions.engine_delivered.as_deref()) {
+            let disposition = conditions.exit_disposition.as_deref().unwrap_or(delivered);
+            let outcome = settle_landing(convoy, checkouts, &conditions, disposition, now);
+            return with_cleanup(
+                convoy,
+                &status,
+                vessels,
+                conditions.reclaim_eligible,
+                InternalReconcileOutcome { patch: outcome.patch, actuations: Vec::new(), events: outcome.events },
+            );
+        }
         return with_cleanup(convoy, &status, vessels, conditions.reclaim_eligible, outcome);
     }
 
