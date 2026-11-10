@@ -198,8 +198,7 @@ pub use platform::Platform;
 pub use prepared_snapshot::{content_hash, is_prepared_snapshot, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND};
 pub use principal_attention::{
     Demand, DemandAddressee, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DemandStatus, DemandStatusPatch,
-    DemandTransition, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
-    CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION,
+    DemandTransition, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION,
     ENSURE_DRIFT_ATTENTION_PREFIX, ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION,
 };
 pub use project::{
@@ -276,7 +275,6 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Host>($($argument),*);
         $callback::<$crate::ManifestRoot>($($argument),*);
         $callback::<$crate::Project>($($argument),*);
-        $callback::<$crate::Regard>($($argument),*);
         $callback::<$crate::Repository>($($argument),*);
         $callback::<$crate::TerminalSession>($($argument),*);
         $callback::<$crate::Vessel>($($argument),*);

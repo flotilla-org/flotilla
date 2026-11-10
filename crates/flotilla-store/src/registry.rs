@@ -15,7 +15,7 @@ use crate::{
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     AccessDelivery, AccountBinding, AccountProvision, Artifact, ChangeRequest, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
     CredentialGrant, CredentialSpec, CrewDefaults, Demand, Environment, FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild,
-    ImageLayer, InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project, ReadResourceList, ReadWatchEvent, Regard,
+    ImageLayer, InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project, ReadResourceList, ReadWatchEvent,
     ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
     ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
@@ -60,7 +60,6 @@ enum RegisteredResource {
     ManifestRoot,
     Message,
     Project,
-    Regard,
     Repository,
     TerminalSession,
     Vessel,
@@ -143,7 +142,6 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<ManifestRoot>(RegisteredResource::ManifestRoot, &["manifest-root", "manifest_root"]),
     kind::<Message>(RegisteredResource::Message, &[]),
     kind::<Project>(RegisteredResource::Project, &[]),
-    kind::<Regard>(RegisteredResource::Regard, &[]),
     kind::<Repository>(RegisteredResource::Repository, &[]),
     kind::<TerminalSession>(
         RegisteredResource::TerminalSession,
@@ -184,6 +182,8 @@ pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
     RetiredResourceKind { kind: "ForgeReadHeartbeat", plural: "forgereadheartbeats", api_version: "flotilla.work/v1" },
     // Deleted by #3108 (its writers became warnings); remove one roll after this generation ships.
     RetiredResourceKind { kind: "Event", plural: "events", api_version: "flotilla.work/v1" },
+    // Deleted by #3108 with its salience boost (#3824 layer 8); remove one roll after this generation ships.
+    RetiredResourceKind { kind: "Regard", plural: "regards", api_version: "flotilla.work/v1" },
 ];
 
 /// What a stored document decoded as.
@@ -262,7 +262,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ManifestRoot => poll_typed_resource!($body::<ManifestRoot>($($arg),*)),
             RegisteredResource::Message => poll_typed_resource!($body::<Message>($($arg),*)),
             RegisteredResource::Project => poll_typed_resource!($body::<Project>($($arg),*)),
-            RegisteredResource::Regard => poll_typed_resource!($body::<Regard>($($arg),*)),
             RegisteredResource::Repository => poll_typed_resource!($body::<Repository>($($arg),*)),
             RegisteredResource::TerminalSession => poll_typed_resource!($body::<TerminalSession>($($arg),*)),
             RegisteredResource::Vessel => poll_typed_resource!($body::<Vessel>($($arg),*)),
@@ -295,7 +294,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ManifestRoot => $body::<ManifestRoot>(),
             RegisteredResource::Message => $body::<Message>(),
             RegisteredResource::Project => $body::<Project>(),
-            RegisteredResource::Regard => $body::<Regard>(),
             RegisteredResource::Repository => $body::<Repository>(),
             RegisteredResource::TerminalSession => $body::<TerminalSession>(),
             RegisteredResource::Vessel => $body::<Vessel>(),
@@ -328,7 +326,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ManifestRoot => $body::<ManifestRoot>($($arg),*),
             RegisteredResource::Message => $body::<Message>($($arg),*),
             RegisteredResource::Project => $body::<Project>($($arg),*),
-            RegisteredResource::Regard => $body::<Regard>($($arg),*),
             RegisteredResource::Repository => $body::<Repository>($($arg),*),
             RegisteredResource::TerminalSession => $body::<TerminalSession>($($arg),*),
             RegisteredResource::Vessel => $body::<Vessel>($($arg),*),
@@ -430,7 +427,6 @@ pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
             RegisteredResource::ManifestRoot => crate::ResourceKind::of::<ManifestRoot>(),
             RegisteredResource::Message => crate::ResourceKind::of::<Message>(),
             RegisteredResource::Project => crate::ResourceKind::of::<Project>(),
-            RegisteredResource::Regard => crate::ResourceKind::of::<Regard>(),
             RegisteredResource::Repository => crate::ResourceKind::of::<Repository>(),
             RegisteredResource::TerminalSession => crate::ResourceKind::of::<TerminalSession>(),
             RegisteredResource::Vessel => crate::ResourceKind::of::<Vessel>(),
@@ -1628,10 +1624,7 @@ mod tests {
     use flotilla_protocol::{NodeId, ResourceRef};
 
     use super::*;
-    use crate::{
-        Convoy, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandSpec, HostSpec, InputMeta, PrincipalRef, Regard, RegardExpiryPolicy,
-        RegardSource, RegardSpec,
-    };
+    use crate::{Convoy, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandSpec, HostSpec, InputMeta, PrincipalRef};
 
     // Finite authoring contract: missing, null and string decisions are invalid;
     // both boolean choices work. Stored legacy records remain readable.
@@ -1858,19 +1851,6 @@ mod tests {
     async fn attention_resource_kinds_are_registered_for_dynamic_listing() {
         let backend = ResourceBackend::new(crate::test_store::memory_backend());
         backend
-            .using::<Regard>("flotilla")
-            .create(
-                &InputMeta::builder().name("principal-default-convoy-demo".to_string()).build(),
-                &RegardSpec::builder()
-                    .principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
-                    .target(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo"))
-                    .source(RegardSource::Expressed)
-                    .expiry(RegardExpiryPolicy::Pin)
-                    .build(),
-            )
-            .await
-            .expect("create regard");
-        backend
             .using::<Demand>("flotilla")
             .create(
                 &InputMeta::builder().name("demo-permission".to_string()).build(),
@@ -1883,11 +1863,8 @@ mod tests {
             .await
             .expect("create demand");
 
-        let regards = list_resource_kind(&backend, "flotilla", "regards").await.expect("list regards dynamically");
         let demands = list_resource_kind(&backend, "flotilla", "demands").await.expect("list demands dynamically");
 
-        assert_eq!(regards.kind, "Regard");
-        assert_eq!(regards.value["items"][0]["kind"], "Regard");
         assert_eq!(demands.kind, "Demand");
         assert_eq!(demands.value["items"][0]["kind"], "Demand");
     }

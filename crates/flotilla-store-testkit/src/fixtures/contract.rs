@@ -8,10 +8,9 @@ use chrono::Utc;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
     Convoy, Demand, DemandAddressee, DemandKind, DemandSpec, Host, HostSpec, HostStatus, InputMeta, IssueSource, OwnerReference,
-    PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RepositoryKey,
-    Resource, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, WatchEvent, WatchStart, WorkflowTemplate, CONVOY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL,
+    PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, RepositoryKey, Resource, ResourceError, ResourceObject, ResourceProvenance,
+    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+    WatchEvent, WatchStart, WorkflowTemplate, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{delete_resource_kind, ResourceBackend, TypedResolver};
 use futures::StreamExt;
@@ -167,48 +166,6 @@ impl ResourceContractFixture for WorkflowTemplateFixture {
             flotilla_resources::CrewSource::Tool { command } => assert_eq!(command, "cargo check --all-targets"),
             other => panic!("expected tool process, got {other:?}"),
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct RegardFixture;
-
-impl ResourceContractFixture for RegardFixture {
-    type Resource = Regard;
-
-    fn label() -> &'static str {
-        "Regard"
-    }
-
-    fn meta(name: &str) -> InputMeta {
-        InputMeta::builder().name(name.to_string()).build()
-    }
-
-    fn spec() -> <Self::Resource as Resource>::Spec {
-        RegardSpec::builder()
-            .principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
-            .target(resource_ref("Convoy", "alpha"))
-            .source(RegardSource::Expressed)
-            .expiry(RegardExpiryPolicy::Decaying { expires_after_seconds: 300 })
-            .build()
-    }
-
-    fn updated_spec() -> <Self::Resource as Resource>::Spec {
-        RegardSpec::builder()
-            .principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
-            .target(resource_ref("Convoy", "alpha"))
-            .source(RegardSource::Implicit { policy: "convoy-start".to_string() })
-            .expiry(RegardExpiryPolicy::Pin)
-            .build()
-    }
-
-    fn assert_created(created: &ResourceObject<Self::Resource>) {
-        assert_eq!(created.spec.principal_ref, PrincipalRef::implicit_for_namespace("flotilla"));
-        assert!(created.status.is_none());
-    }
-
-    fn assert_updated(updated: &ResourceObject<Self::Resource>) {
-        assert_eq!(updated.spec.expiry, RegardExpiryPolicy::Pin);
     }
 }
 

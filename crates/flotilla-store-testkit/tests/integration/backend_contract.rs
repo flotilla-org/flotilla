@@ -56,7 +56,6 @@ async fn request(
         "convoys" => ResourceKind::of::<Convoy>(),
         "environments" => ResourceKind::of::<Environment>(),
         "demands" => ResourceKind::of::<Demand>(),
-        "regards" => ResourceKind::of::<Regard>(),
         other => panic!("unexpected fixture resource {other}"),
     };
     assert_eq!(path["group"], kind.paths.group);
@@ -179,7 +178,6 @@ macro_rules! contract {
 }
 contract!(convoy, ConvoyFixture);
 contract!(demand, DemandFixture);
-contract!(regard, RegardFixture);
 
 // A request-scoped observer reports the same decoded objects and read calls
 // through every adapter, while an unobserved handle has no counters attached.

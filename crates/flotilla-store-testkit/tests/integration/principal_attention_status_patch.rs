@@ -1,21 +1,8 @@
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    DemandAddressee, DemandKind, DemandSpec, DemandState, DemandStatus, DemandStatusPatch, PrincipalRef, RegardStatus, RegardStatusPatch,
-    StatusPatch,
+    DemandAddressee, DemandKind, DemandSpec, DemandState, DemandStatus, DemandStatusPatch, PrincipalRef, StatusPatch,
 };
 use flotilla_store_testkit::fixtures::timestamp;
-
-#[test]
-fn regard_refresh_records_created_and_latest_refreshed_time() {
-    let mut status = RegardStatus::default();
-
-    RegardStatusPatch::Refresh { as_of: timestamp(10) }.apply(&mut status);
-    RegardStatusPatch::Refresh { as_of: timestamp(8) }.apply(&mut status);
-    RegardStatusPatch::Refresh { as_of: timestamp(20) }.apply(&mut status);
-
-    assert_eq!(status.created_at, Some(timestamp(10)));
-    assert_eq!(status.refreshed_at, Some(timestamp(20)));
-}
 
 #[test]
 fn demand_raise_stamps_lifecycle_authority_once() {

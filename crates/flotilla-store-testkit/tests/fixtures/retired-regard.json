@@ -1,0 +1,17 @@
+{
+  "apiVersion": "flotilla.work/v1",
+  "kind": "Regard",
+  "metadata": {
+    "name": "principal-default-convoy-demo",
+    "namespace": "flotilla",
+    "resourceVersion": "1",
+    "creationTimestamp": "2026-10-17T00:00:00Z"
+  },
+  "spec": {
+    "principal_ref": { "namespace": "flotilla", "name": "implicit" },
+    "target": { "api_version": "flotilla.work/v1", "kind": "Convoy", "namespace": "flotilla", "name": "demo" },
+    "source": { "kind": "expressed" },
+    "expiry": { "kind": "pin" }
+  },
+  "status": { "created_at": "2026-10-17T00:00:00Z", "refreshed_at": "2026-10-17T00:00:00Z" }
+}

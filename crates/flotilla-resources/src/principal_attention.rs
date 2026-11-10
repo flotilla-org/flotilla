@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::StatusPatch};
 
-define_resource!(Regard, "regards", RegardSpec, RegardStatus, RegardStatusPatch);
 define_resource!(
     Demand,
     "demands",
@@ -27,54 +26,6 @@ pub const ENSURE_DRIFT_ATTENTION_PREFIX: &str = "ensure-config-drift-";
 pub const ENSURE_CONFIG_DRIFT_REASON_ANNOTATION: &str = "flotilla.work/ensure-config-drift-reason";
 /// The convoy's name for the vessel whose credential stopped refreshing.
 pub const CREDENTIAL_REFRESH_VESSEL_ANNOTATION: &str = "flotilla.work/credential-refresh-vessel";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct RegardSpec {
-    pub principal_ref: PrincipalRef,
-    pub target: ResourceRef,
-    pub source: RegardSource,
-    pub expiry: RegardExpiryPolicy,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RegardSource {
-    Expressed,
-    Implicit { policy: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RegardExpiryPolicy {
-    Decaying { expires_after_seconds: u64 },
-    Pin,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegardStatus {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refreshed_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RegardStatusPatch {
-    Refresh { as_of: DateTime<Utc> },
-}
-
-impl StatusPatch<RegardStatus> for RegardStatusPatch {
-    fn apply(&self, status: &mut RegardStatus) {
-        match self {
-            Self::Refresh { as_of } => {
-                status.created_at.get_or_insert(*as_of);
-                if status.refreshed_at.is_none_or(|current| *as_of > current) {
-                    status.refreshed_at = Some(*as_of);
-                }
-            }
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct DemandSpec {
