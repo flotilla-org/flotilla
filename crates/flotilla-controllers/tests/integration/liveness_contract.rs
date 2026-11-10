@@ -160,7 +160,7 @@ impl WorldBuilder for ConvoyWorldBuilder {
             .map_err(|error| error.to_string())?;
         backend.reset_writes();
 
-        let reconciler = ConvoyReconciler::new(inner.definitions(NAMESPACE))
+        let reconciler = ConvoyReconciler::new()
             .with_lifecycle_reads(checkouts.reads.clone())
             .with_change_requests(inner.including_replicas(NAMESPACE), LANDING_TTL.to_std().expect("positive TTL"))
             .with_clock(self.clock.clone() as Arc<dyn Clock>);

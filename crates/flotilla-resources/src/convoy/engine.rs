@@ -101,6 +101,10 @@ pub trait EngineConvoys: Send + Sync {
     /// An operator's abandonment, with a reason.
     async fn abandon(&self, convoy: &ResourceObject<Convoy>, principal: &str, reason: &str) -> Result<(), String>;
 
+    /// Ends `convoy` as failed, as `principal` judged its work, with a reason. An ended convoy is
+    /// left as it is.
+    async fn fail(&self, convoy: &ResourceObject<Convoy>, principal: &str, reason: &str) -> Result<(), String>;
+
     /// `(vessel, role)`'s seat failed, as `principal` ruled, with a reason.
     async fn fail_seat(
         &self,
@@ -360,6 +364,9 @@ mod tests {
         }
         fn delivered(&self, _: &ResourceObject<Convoy>) -> Option<String> {
             None
+        }
+        async fn fail(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
+            unreachable!()
         }
         async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
             Ok(())

@@ -485,6 +485,13 @@ impl ConvoyMemory {
         (output, changed)
     }
 
+    /// How many launches wait for capacity on a host their placement chose.
+    pub fn capacity_waits(&self) -> u64 {
+        let held = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+        held.values().filter(|notes| notes.stall.as_ref().is_some_and(|stall| stall.cause == Some(crate::StallCause::Capacity))).count()
+            as u64
+    }
+
     /// Drops the notes on launch `name`, once it has ended and its home no longer judges it.
     pub fn forget(&self, name: &str) {
         if self.notes.lock().unwrap_or_else(PoisonError::into_inner).remove(name).is_some() {

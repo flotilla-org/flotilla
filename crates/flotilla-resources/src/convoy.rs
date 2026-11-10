@@ -23,8 +23,8 @@ pub mod reconcile;
 pub mod view;
 
 pub use reconcile::{
-    evaluate_crew_completion, evaluate_landing_settlement, observed_digest_claims, reconcile, ConvoyEvent, ConvoyTeardownRuntime,
-    CrewCompletionClaim, ReconcileOutcome, SettlementEvaluation, SettlementMode, SettlementSubject, UnmetSettlementExpectation,
+    evaluate_crew_completion, evaluate_landing_settlement, observed_digest_claims, ConvoyTeardownRuntime, CrewCompletionClaim,
+    SettlementEvaluation, SettlementMode, SettlementSubject, UnmetSettlementExpectation,
 };
 
 define_resource!(

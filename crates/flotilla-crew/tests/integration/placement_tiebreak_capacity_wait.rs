@@ -4,11 +4,8 @@ use std::collections::BTreeMap;
 use chrono::Utc;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_protocol::{CanonicalHostId, FulfilmentAllocation, FulfilmentAllocationCandidate, PlacementDecision, PlacementTargetHost};
-use flotilla_resources::{
-    Convoy, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, FulfilmentFacts, Host, HostSpec, HostStatus, InputMeta, StallCause, StatusPatch,
-    WorkflowTemplate,
-};
-use flotilla_store::{controller::Reconciler, ResourceBackend};
+use flotilla_resources::{Convoy, ConvoySpec, ConvoyStatus, FulfilmentFacts, Host, HostSpec, HostStatus, InputMeta};
+use flotilla_store::ResourceBackend;
 
 #[tokio::test]
 async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resumes_when_capacity_returns() {
@@ -74,31 +71,14 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
         )
         .await
         .expect("decision");
-    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
-        .with_hosts(backend.including_replicas::<Host>("flotilla"));
-    let prepared = reconciler.prepare(&convoy).await.expect("prepare full");
-    let outcome = reconciler.reconcile(&convoy, &prepared, Utc::now());
-    assert!(outcome.actuations.is_empty());
-    assert!(outcome.requeue_after.is_some());
-    let mut status = convoy.status.expect("convoy status");
-    outcome.patch.expect("stall patch").apply(&mut status);
-    assert!(status
-        .stalled
-        .as_ref()
-        .is_some_and(|stall| stall.evidence.contains("linux-docker") && stall.evidence.contains("no free vessel slots")));
-    let stall = status.stalled.as_mut().expect("capacity stall");
-    assert_eq!(stall.cause, Some(StallCause::Capacity));
-    stall.evidence = "capacity message with revised wording".to_string();
+    let reconciler = ConvoyReconciler::new().with_hosts(backend.including_replicas::<Host>("flotilla"));
+    let wait = reconciler.capacity_wait(&convoy).await.expect("judge full");
+    assert!(wait.as_ref().is_some_and(|wait| wait.contains("linux-docker") && wait.contains("no free vessel slots")), "{wait:?}");
 
     let mut free = full;
     free.fulfilment_facts.get_mut("linux-docker").expect("facts").free_vessel_slots = Some(1);
     hosts.update_status("host-id", &host.metadata.resource_version, &free).await.expect("capacity restored");
-    let convoy = convoys.get("waiting").await.expect("convoy");
-    let convoy = convoys.update_status("waiting", &convoy.metadata.resource_version, &status).await.expect("persist stall");
-    let prepared = reconciler.prepare(&convoy).await.expect("prepare free");
-    let outcome = reconciler.reconcile(&convoy, &prepared, Utc::now());
-    assert!(matches!(outcome.patch, Some(ConvoyStatusPatch::SetStalled { condition: None })));
+    assert_eq!(reconciler.capacity_wait(&convoy).await.expect("judge free"), None, "restored capacity ends the wait");
 
     hosts
         .create(
@@ -107,9 +87,6 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
         )
         .await
         .expect("second host with same display name");
-    let prepared = reconciler.prepare(&convoy).await.expect("ambiguous host waits instead of failing prepare");
-    let outcome = reconciler.reconcile(&convoy, &prepared, Utc::now());
-    let mut status = convoy.status.expect("convoy status");
-    outcome.patch.expect("ambiguity stall patch").apply(&mut status);
-    assert!(status.stalled.as_ref().is_some_and(|stall| stall.evidence.contains("ambiguous")));
+    let wait = reconciler.capacity_wait(&convoy).await.expect("an ambiguous host waits instead of failing");
+    assert!(wait.as_ref().is_some_and(|wait| wait.contains("ambiguous")), "{wait:?}");
 }

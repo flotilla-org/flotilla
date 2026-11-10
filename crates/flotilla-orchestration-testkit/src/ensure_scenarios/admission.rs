@@ -11,7 +11,6 @@ pub async fn two_origins_admit_identical_placements_without_authorship_collision
 pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_second_convoy(factory: &dyn EnsureScenarioController) {
     use flotilla_admission::reconcilers::vessel_requests::{VesselReleaseGate, VesselRequests};
     use flotilla_resources::vessel_records::{VesselRecords, VesselStep};
-    use flotilla_store::controller::Reconciler;
 
     /// The governor's convoy never ends here: no release is asked of the gate.
     struct NeverReleased;
@@ -95,16 +94,6 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
             restarted.clock_for_scenarios(),
         ))
         .await;
-
-    // The lost launch interrupts the work, keeping the cause; the convoy does not fail.
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-        .with_vessels(backend.clone().using::<Vessel>("flotilla"))
-        .with_lifecycle_reads(restarted.lifecycle_reads());
-    let convoy = convoys.get(&convoy_name).await.expect("governor after reboot");
-    let outcome = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("reboot observations"), clock.now());
-    flotilla_store::apply_status_patch(&convoys, &convoy_name, &outcome.patch.expect("interrupt work")).await.expect("interrupt work");
-    let convoy = convoys.get(&convoy_name).await.expect("interrupted governor");
-    assert_eq!(convoy.status.as_ref().expect("status").work["work"].phase, flotilla_resources::WorkPhase::Interrupted);
 
     // #2875: the replacement waits out the backoff from the loss, rather than relaunching at
     // every pass; then exactly one launch replaces it.

@@ -44,7 +44,6 @@ use flotilla_resources::ProjectRepositoryRole;
 use flotilla_resources::ProjectRepositorySpec;
 use flotilla_resources::RepositoryStatus;
 use flotilla_resources::Selector;
-use flotilla_resources::Vessel;
 use flotilla_resources::VesselRequirement;
 use flotilla_resources::WorkflowTemplateSpec;
 use flotilla_resources::DRIVER_ADMISSION_CONDITION_TYPE;

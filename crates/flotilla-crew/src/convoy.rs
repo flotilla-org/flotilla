@@ -1,88 +1,75 @@
-//! The Convoy phase and landing reconciler, kept apart from crew operations.
+//! The engine Convoy controller (#3108 C4'), kept apart from crew operations.
 //!
-//! This module calls no other crew module. Its one interface to crew
-//! operations is [`ConvoyTeardownRuntime`], the reclaim gate that the daemon
-//! implements over the crew service's teardown verification. Redesigning that
-//! boundary is #3519.
+//! A convoy is its engine launch, read through its view. This controller turns what its home
+//! observes of a launch into the launch's edges and the home's notes on it: observed promises
+//! become the engine's Observer edges, change requests found on its branches are linked, landing's
+//! settlement delivers it, and a convoy whose work failed ends Failed. It writes no status: the
+//! view derives phases from the launch and its joins, and a capacity wait or settlement attention
+//! is a note in the home's memory. Once the launch has ended and its checkouts are released, its
+//! prepared snapshots are collected and its notes dropped. It creates and deletes no vessels; the
+//! vessel requester does, from the convoys' works.
 //!
-//! Behind `[primitives]` it also reaches the engine Convoy through the
-//! old-shaped [`EngineConvoys`](flotilla_resources::convoy::engine::EngineConvoys)
-//! port (#3587 layers 6 and 8): a freshly bootstrapped convoy is admitted on
-//! the engine, each pass reads the convoy with the engine's promises in place
-//! of the stored ones ([`viewed`]), its observations become engine edges
-//! instead of old promise patches, and landing's settlement fires `Deliver`
-//! first.
+//! This module calls no other crew module.
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{Relationship, Subject};
+use flotilla_protocol::Subject;
 use flotilla_resources::address::record_name;
-use flotilla_resources::convoy::engine::{deciding, viewed, Actor, EngineConvoyPath};
+use flotilla_resources::convoy::engine::{deciding, note, Actor, EngineConvoyPath, EngineConvoys};
 use flotilla_resources::convoy::reconcile::*;
 use flotilla_resources::*;
 use flotilla_store::{
-    controller::{
-        delete_lifecycle_owned_matching, LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler,
-        ReplicaLabelMappedWatch, SecondaryWatch,
-    },
+    controller::{LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
     DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, TypedResolver,
 };
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
-/// How soon a crew's Done held on its undelivered turn is rechecked (#3894):
-/// the engine delivery adapter's pace. The hold itself lasts at most one
-/// delivery hold (`DELIVERY_HOLD_FOR`), after which an untyped turn no longer
-/// holds its crew and may be lost to teardown; the stall judge reports it.
+/// How soon a landing convoy held on an undelivered turn is rechecked (#3894): the engine delivery
+/// adapter's pace, since no Message watch wakes this controller when the turn is delivered. The
+/// hold itself lasts at most one delivery hold (`DELIVERY_HOLD_FOR`), after which an untyped turn
+/// no longer holds its crew and may be lost to teardown; the stall judge reports it.
 const TURN_HOLD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How soon a convoy waiting on capacity checks its hosts again: no Host watch wakes it.
+const CAPACITY_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The principal this controller acts as on the engine.
+const CONVOY_CONTROLLER: &str = "convoy-controller";
 
 #[derive(Clone)]
 pub struct ConvoyReconciler {
-    templates: DefinitionResolver<WorkflowTemplate>,
-    vessels: Option<TypedResolver<Vessel>>,
-    federated_vessels: Option<ReplicaReadResolver<Vessel>>,
+    vessels: Option<ReplicaReadResolver<Vessel>>,
     terminal_sessions: Option<TypedResolver<TerminalSession>>,
     artifacts: Option<ReplicaReadResolver<Artifact>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
     forges: Option<DefinitionResolver<Forge>>,
     hosts: Option<ReplicaReadResolver<Host>>,
-    /// Every convoy, to count an SSH host's vessels against its cap.
+    /// Every convoy, to count a host's vessels against its cap.
     convoys: Option<ReplicaReadResolver<Convoy>>,
     change_request_stale_after: std::time::Duration,
     landing_evidence_stale_after: std::time::Duration,
     clock: Arc<dyn Clock>,
     prepared_snapshot_gc: Option<PreparedSnapshotGarbageCollector>,
-    teardown_runtime: Option<Arc<dyn ConvoyTeardownRuntime>>,
-    /// The `[primitives]` switch's Convoy path; empty while it is off.
+    /// The engine's convoys; empty until startup installs them.
     engine: EngineConvoyPath,
     /// The `[primitives]` switch's Message path; empty while it is off.
     messages: crate::ports::MessagePath,
     lifecycle_reads: Arc<dyn lifecycle_reads::LifecycleReads>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ConvoyPrepared {
-    template: Option<ResourceObject<WorkflowTemplate>>,
-    vessels: BTreeMap<String, ResourceObject<Vessel>>,
-    /// The checkouts held for the convoy, each its latest launch, by checkout name.
-    checkouts: BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>,
-    observed_subjects: Vec<Subject>,
-    promise_patch: Option<ConvoyStatusPatch>,
-    exit_disposition: Option<String>,
-    /// The disposition the engine delivered the convoy with, once it has.
-    engine_delivered: Option<String>,
-    settlement_evidence: Option<SettlementEvaluation>,
-    settlement_attention: Option<ConvoyAttention>,
-    reclaim_eligible: bool,
-    capacity_wait: Option<String>,
-    /// The convoy with the engine's promises, when the engine holds it.
-    viewed: Option<ResourceObject<Convoy>>,
-    /// A crew's derived Done waits on its undelivered turn (#3894).
-    turn_hold: bool,
+/// What one pass did to the launch, and when it must look again without a change.
+#[derive(Debug, Clone, Default)]
+pub struct ConvoyPass {
+    requeue_after: Option<std::time::Duration>,
+}
+
+impl Default for ConvoyReconciler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConvoyReconciler {
-    pub fn new(templates: DefinitionResolver<WorkflowTemplate>) -> Self {
+    pub fn new() -> Self {
         Self {
-            templates,
             vessels: None,
-            federated_vessels: None,
             terminal_sessions: None,
             artifacts: None,
             change_requests: None,
@@ -93,14 +80,13 @@ impl ConvoyReconciler {
             landing_evidence_stale_after: std::time::Duration::from_secs(30),
             clock: Arc::new(SystemClock),
             prepared_snapshot_gc: None,
-            teardown_runtime: None,
             engine: EngineConvoyPath::default(),
             messages: crate::ports::MessagePath::default(),
             lifecycle_reads: Arc::new(lifecycle_reads::NoLifecycleReads),
         }
     }
 
-    /// The `[primitives]` switch's Convoy path, set at startup when it is on.
+    /// The engine's convoys, installed at startup.
     pub fn with_engine(mut self, engine: EngineConvoyPath) -> Self {
         self.engine = engine;
         self
@@ -112,34 +98,10 @@ impl ConvoyReconciler {
         self
     }
 
-    /// The engine's lifecycle readings of vessels and sessions; none while `[primitives]` is off.
+    /// The engine's lifecycle readings of vessels, sessions and checkouts.
     pub fn with_lifecycle_reads(mut self, reads: Arc<dyn lifecycle_reads::LifecycleReads>) -> Self {
         self.lifecycle_reads = reads;
         self
-    }
-
-    /// A live crew session has an engine turn not yet delivered to it (#3894).
-    async fn turn_awaits(&self, obj: &ResourceObject<Convoy>, vessel: &str, role: &str) -> Result<bool, ResourceError> {
-        let (Some(messages), Some(sessions)) = (self.messages.get(), &self.terminal_sessions) else { return Ok(false) };
-        let sessions = sessions
-            .list_matching_labels(&BTreeMap::from([
-                (CONVOY_LABEL.to_string(), obj.metadata.name.clone()),
-                (VESSEL_LABEL.to_string(), vessel.to_string()),
-                (ROLE_LABEL.to_string(), role.to_string()),
-            ]))
-            .await?
-            .items
-            .into_iter()
-            .collect::<Vec<_>>();
-        let live =
-            sessions.iter().any(|session| session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running));
-        if !live {
-            return Ok(false);
-        }
-        let namespace = &obj.metadata.namespace;
-        let receiver =
-            crate::leaf_engine::crew_role_address(obj.spec.project_ref.as_deref().unwrap_or(namespace), &obj.metadata.name, vessel, role);
-        messages.awaits_delivery(namespace, &receiver).await.map_err(ResourceError::other)
     }
 
     pub fn with_artifacts(mut self, artifacts: ReplicaReadResolver<Artifact>) -> Self {
@@ -147,7 +109,8 @@ impl ConvoyReconciler {
         self
     }
 
-    pub fn with_vessels(mut self, vessels: TypedResolver<Vessel>) -> Self {
+    /// Every home's vessels, read for a convoy's own.
+    pub fn with_vessels(mut self, vessels: ReplicaReadResolver<Vessel>) -> Self {
         self.vessels = Some(vessels);
         self
     }
@@ -159,43 +122,6 @@ impl ConvoyReconciler {
 
     pub fn with_convoys(mut self, convoys: ReplicaReadResolver<Convoy>) -> Self {
         self.convoys = Some(convoys);
-        self
-    }
-
-    /// What `host` holds against its vessel cap, or None without the
-    /// convoy and vessel reads to count it.
-    async fn vessel_occupancy(&self, host: &str) -> Result<Option<HostOccupancy>, ResourceError> {
-        let (Some(convoys), Some(vessels)) = (&self.convoys, &self.federated_vessels) else {
-            return Ok(None);
-        };
-        let convoys = home_copies_first(convoys.list().await?.items);
-        let vessels = home_copies_first(vessels.list().await?.items);
-        // A convoy not yet bootstrapped names its vessels only in its frozen
-        // workflow snapshot record.
-        let snapshots = convoys
-            .iter()
-            .filter(|convoy| HostOccupancy::needs_workflow_vessels(convoy, host))
-            .map(|convoy| (convoy.metadata.name.clone(), pinned_workflow_ref(convoy).to_string()))
-            .collect::<BTreeMap<_, _>>();
-        let templates = if snapshots.is_empty() { Vec::new() } else { self.templates.list_names(snapshots.values().cloned()).await? };
-        let templates = templates.into_iter().map(|template| (template.metadata.name.clone(), template)).collect::<BTreeMap<_, _>>();
-        let workflow_vessels = snapshots
-            .into_iter()
-            // A convoy whose snapshot record is missing is left out, and `count`
-            // falls back to its pins and convoy-wide decision.
-            .filter_map(|(convoy, template)| {
-                let Some(template) = templates.get(template.as_str()) else {
-                tracing::warn!(%convoy, %template, "workflow snapshot missing; counting the convoy's pins and convoy-wide decision instead");
-                return None;
-            };
-                Some((convoy, template.spec.vessels.iter().map(|vessel| vessel.name.clone()).collect()))
-            })
-            .collect();
-        Ok(Some(HostOccupancy::count(host, &convoys, &vessels, &workflow_vessels)))
-    }
-
-    pub fn with_federated_vessels(mut self, vessels: ReplicaReadResolver<Vessel>) -> Self {
-        self.federated_vessels = Some(vessels);
         self
     }
 
@@ -230,28 +156,10 @@ impl ConvoyReconciler {
         self
     }
 
-    pub fn with_teardown_runtime(mut self, runtime: Arc<dyn ConvoyTeardownRuntime>) -> Self {
-        self.teardown_runtime = Some(runtime);
-        self
-    }
-
-    pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
+    /// What wakes a convoy besides its engine records: its sessions (a turn's delivery holds its
+    /// landing) and the evidence its promises are observed from.
+    pub fn secondary_watches(backend: &flotilla_store::ResourceBackend, namespace: &str) -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
         vec![
-            Box::new(LabelMappedWatch::<Vessel, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
-            Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
-        ]
-    }
-
-    pub fn federated_secondary_watches(
-        backend: &flotilla_store::ResourceBackend,
-        namespace: &str,
-    ) -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
-        vec![
-            Box::new(ReplicaLabelMappedWatch::<Vessel, Convoy> {
-                label_key: CONVOY_LABEL,
-                resolver: backend.including_replicas::<Vessel>(namespace),
-                _marker: PhantomData,
-            }),
             Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(EvidenceWake {
                 evidence: backend.including_replicas::<ChangeRequest>(namespace),
@@ -262,6 +170,200 @@ impl ConvoyReconciler {
                 convoys: backend.including_replicas::<Convoy>(namespace),
             }),
         ]
+    }
+
+    /// A live crew session has an engine turn not yet delivered to it (#3894).
+    async fn turn_awaits(&self, obj: &ResourceObject<Convoy>, vessel: &str, role: &str) -> Result<bool, ResourceError> {
+        let (Some(messages), Some(sessions)) = (self.messages.get(), &self.terminal_sessions) else { return Ok(false) };
+        let sessions = sessions
+            .list_matching_labels(&BTreeMap::from([
+                (CONVOY_LABEL.to_string(), obj.metadata.name.clone()),
+                (VESSEL_LABEL.to_string(), vessel.to_string()),
+                (ROLE_LABEL.to_string(), role.to_string()),
+            ]))
+            .await?
+            .items;
+        let live =
+            sessions.iter().any(|session| session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running));
+        if !live {
+            return Ok(false);
+        }
+        let namespace = &obj.metadata.namespace;
+        let receiver =
+            crate::leaf_engine::crew_role_address(obj.spec.project_ref.as_deref().unwrap_or(namespace), &obj.metadata.name, vessel, role);
+        messages.awaits_delivery(namespace, &receiver).await.map_err(ResourceError::other)
+    }
+
+    /// Some crew of `obj` has a turn not yet delivered to its live session (#3894): delivering the
+    /// convoy now would let teardown drop the turn and its receipt.
+    async fn any_turn_awaits(&self, obj: &ResourceObject<Convoy>) -> Result<bool, ResourceError> {
+        let seats = obj
+            .status
+            .iter()
+            .flat_map(|status| status.crew_work.iter())
+            .flat_map(|(vessel, roles)| roles.keys().map(move |role| (vessel.clone(), role.clone())))
+            .collect::<Vec<_>>();
+        for (vessel, role) in seats {
+            if self.turn_awaits(obj, &vessel, &role).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// What `host` holds against its vessel cap, or None without the convoy and vessel reads to
+    /// count it. Every convoy's view carries its admitted workflow, so no template is read.
+    async fn vessel_occupancy(&self, host: &str) -> Result<Option<HostOccupancy>, ResourceError> {
+        let (Some(convoys), Some(vessels)) = (&self.convoys, &self.vessels) else {
+            return Ok(None);
+        };
+        let convoys = home_copies_first(convoys.list().await?.items);
+        let vessels = home_copies_first(vessels.list().await?.items);
+        Ok(Some(HostOccupancy::count(host, &convoys, &vessels, &BTreeMap::new())))
+    }
+
+    /// Why `obj` waits for capacity on a host its placement chose, if it does: the host is not
+    /// ready, is asleep, or has no free vessel slot.
+    pub async fn capacity_wait(&self, obj: &ResourceObject<Convoy>) -> Result<Option<String>, ResourceError> {
+        let Some(hosts) = &self.hosts else { return Ok(None) };
+        let available_hosts = hosts.list().await?;
+        let mut decisions = obj.status.as_ref().and_then(|status| status.placement_decision.as_ref()).into_iter().collect::<Vec<_>>();
+        let vessel_pins = obj
+            .metadata
+            .annotations
+            .get(flotilla_resources::convoy::VESSEL_PLACEMENTS_ANNOTATION)
+            .and_then(|encoded| serde_json::from_str::<BTreeMap<String, flotilla_resources::convoy::VesselPlacementPin>>(encoded).ok())
+            .unwrap_or_default();
+        decisions.extend(vessel_pins.values().map(|pin| &pin.decision));
+        for allocation in decisions.into_iter().filter_map(|decision| decision.allocation.as_ref()) {
+            let Some(selected) = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind) else {
+                continue;
+            };
+            let canonical = match canonical_host_id(available_hosts.items.iter().map(|host| &host.object), &selected.host) {
+                Ok(canonical) => canonical,
+                Err(error) => {
+                    return Ok(Some(format!(
+                        "capacity for fulfilment `{}` on host `{}` is unavailable: {error}",
+                        selected.kind, selected.host
+                    )));
+                }
+            };
+            let host = canonical.as_ref().and_then(|id| {
+                available_hosts.items.iter().find(|host| host.object.metadata.name == id.as_str()).map(|host| host.object.clone())
+            });
+            // A daemon host's cap bounds only the Docker placements admission recorded as capped
+            // (#4002). The live cap's value wins: lowering it holds admitted convoys, removing it
+            // releases them.
+            let vessel_cap = host.as_ref().and_then(|host| match host.spec.connection {
+                HostConnection::SshHost { .. } => host.spec.max_vessels,
+                HostConnection::Daemon => selected.max_vessels.and(host.spec.max_vessels),
+            });
+            let status = host.and_then(|host| host.status).map(|mut status| {
+                status.apply_heartbeat_readiness(self.clock.now());
+                status
+            });
+            let sleeping = status.as_ref().and_then(|status| status.sleeping_until).is_some_and(|until| until > self.clock.now());
+            let slots =
+                status.as_ref().and_then(|status| status.fulfilment_facts.get(&selected.kind)).and_then(|facts| facts.free_vessel_slots);
+            // A capped host admits convoys in admission order while its live vessels leave room
+            // (#3793, #4002).
+            let full = match (vessel_cap, canonical.as_ref()) {
+                (Some(cap), Some(host)) => match self.vessel_occupancy(host.as_str()).await {
+                    Ok(Some(occupancy)) => !occupancy.admits(&obj.metadata.name, cap),
+                    Ok(None) => slots == Some(0),
+                    // An unreadable count waits rather than failing the pass.
+                    Err(error) => {
+                        return Ok(Some(format!(
+                            "capacity for fulfilment `{}` on host `{}` is unavailable: cannot count its vessels: {error}",
+                            selected.kind, selected.host
+                        )));
+                    }
+                },
+                _ => slots == Some(0),
+            };
+            if status.as_ref().is_none_or(|status| !status.ready) || sleeping || full {
+                return Ok(Some(format!(
+                    "capacity for fulfilment `{}` on host `{}` is unavailable{}{}",
+                    selected.kind,
+                    selected.host,
+                    if sleeping { " (sleeping)" } else { "" },
+                    if full { " (no free vessel slots)" } else { "" }
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Notes `wait` as the convoy's capacity stall, or clears a capacity stall that has passed. The
+    /// stall is the home's note; its count is the convoys-waiting-for-capacity gauge.
+    fn note_capacity(&self, obj: &ResourceObject<Convoy>, wait: Option<&String>, now: DateTime<Utc>) -> Result<(), String> {
+        let prior = obj.status.as_ref().and_then(|status| status.stalled.as_ref());
+        let patch = match wait {
+            Some(evidence) if prior.is_some_and(|stalled| stalled.cause == Some(StallCause::Capacity) && stalled.evidence == *evidence) => {
+                return Ok(());
+            }
+            Some(evidence) => ConvoyStatusPatch::SetStalled {
+                condition: Some(StalledCondition {
+                    leaves: Vec::new(),
+                    maker: Some(LeafMaker::Controller {
+                        resource_kind: "Convoy".to_string(),
+                        name: None,
+                        retry: ControllerRetry::retryable(None, now, RetryBackoff { initial: CAPACITY_RETRY, maximum: CAPACITY_RETRY }),
+                        ceiling: RetryCeiling::default(),
+                    }),
+                    evidence: evidence.clone(),
+                    source: StallEvidenceSource::LeafEngine,
+                    cause: Some(StallCause::Capacity),
+                    began_at: prior.filter(|stalled| stalled.cause == Some(StallCause::Capacity)).map_or(now, |stalled| stalled.began_at),
+                    rung: StallRung::Operator,
+                    supervisor: None,
+                    supervision_message: None,
+                    supervision_index: None,
+                    supervision_exhausted: false,
+                    reason: None,
+                    proposed_disposition: None,
+                    nudge_history: Vec::new(),
+                }),
+            },
+            None if prior.is_some_and(|stalled| stalled.cause == Some(StallCause::Capacity)) => {
+                ConvoyStatusPatch::SetStalled { condition: None }
+            }
+            None => return Ok(()),
+        };
+        note(&self.engine, obj, &patch).map(drop)
+    }
+
+    /// The checkouts held for `obj`'s launch, at any home, each its latest launch.
+    async fn held_checkouts(
+        &self,
+        obj: &ResourceObject<Convoy>,
+    ) -> Result<BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>, ResourceError> {
+        let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(obj) else { return Ok(BTreeMap::new()) };
+        let reads = Arc::clone(&self.lifecycle_reads);
+        let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
+            .await
+            .map_err(|error| ResourceError::other(format!("read held checkouts: {error}")))?
+            .map_err(ResourceError::other)?;
+        Ok(flotilla_resources::checkout_records::latest_launches(held))
+    }
+
+    /// An ended launch's teardown: once the checkouts held for it are released, its prepared
+    /// snapshots are collected and its home's notes on it dropped.
+    async fn tear_down(&self, engine: &dyn EngineConvoys, obj: &ResourceObject<Convoy>) -> Result<(), ResourceError> {
+        let holding = self
+            .held_checkouts(obj)
+            .await?
+            .into_values()
+            .any(|checkout| !checkout.ended() && !matches!(checkout.spec, CheckoutSpec::Observed(_)));
+        if holding {
+            // The Checkout controller releases them; their changes wake the convoy again.
+            return Ok(());
+        }
+        if let Some(collector) = &self.prepared_snapshot_gc {
+            collector.collect(Some(&obj.metadata.name)).await?;
+        }
+        engine.memory().forget(&obj.metadata.name);
+        Ok(())
     }
 }
 
@@ -423,199 +525,54 @@ impl SecondaryWatch for EngineConvoyWake {
     }
 }
 
-impl ConvoyReconciler {
-    /// The checkouts held for `obj`'s engine launch, at any home, each its latest launch.
-    async fn held_checkouts(
-        &self,
-        obj: &ResourceObject<Convoy>,
-    ) -> Result<BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>, ResourceError> {
-        let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(obj) else { return Ok(BTreeMap::new()) };
-        let reads = Arc::clone(&self.lifecycle_reads);
-        let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
-            .await
-            .map_err(|error| ResourceError::other(format!("read held checkouts: {error}")))?
-            .map_err(ResourceError::other)?;
-        Ok(flotilla_resources::checkout_records::latest_launches(held))
-    }
-}
-
-impl ConvoyReconciler {
-    /// Ends a convoy that failed, or was abandoned without the engine hearing of it, as abandoned
-    /// on the engine (#3108): an engine convoy is Delivered or Abandoned, and what it holds (its
-    /// checkouts) is released once it has ended. Abandoning an ended engine convoy changes
-    /// nothing.
-    async fn abandon_failed_on_engine(&self, obj: &ResourceObject<Convoy>) {
-        let Some(engine) = self.engine.get() else { return };
-        let Some(status) = obj.status.as_ref().filter(|status| matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Abandoned)) else {
-            return;
-        };
-        if !engine.holds(obj) {
-            return;
-        }
-        let reason = status.message.clone().unwrap_or_else(|| format!("the convoy ended {:?}", status.phase));
-        if let Err(error) = engine.abandon(obj, FAILED_CONVOY_PRINCIPAL, &reason).await {
-            tracing::warn!(convoy = %obj.metadata.name, %error, "the engine did not abandon the ended convoy; retrying on the next pass");
-        }
-    }
-}
-
-/// The principal a convoy that failed is abandoned on the engine by: the convoy's controller.
-const FAILED_CONVOY_PRINCIPAL: &str = "convoy-controller";
-
 impl Reconciler for ConvoyReconciler {
     type Resource = Convoy;
-    type Prepared = ConvoyPrepared;
+    type Prepared = ConvoyPass;
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
-        self.abandon_failed_on_engine(obj).await;
-        // With the engine holding the convoy, every promise read below is the engine's.
-        let engine = deciding(&self.engine, obj);
-        let viewed = match engine {
-            Some(_) => Some(viewed(&self.engine, obj).map_err(ResourceError::other)?.into_owned()),
-            None => None,
-        };
-        let obj = viewed.as_ref().unwrap_or(obj);
-        let capacity_wait = if obj.status.as_ref().is_none_or(|status| {
-            status.provisioning.is_none_or(|state| state == flotilla_resources::convoy::ConvoyProvisioningState::NotStarted)
-        }) {
-            match &self.hosts {
-                Some(hosts) => {
-                    let available_hosts = hosts.list().await?;
-                    let mut decisions =
-                        obj.status.as_ref().and_then(|status| status.placement_decision.as_ref()).into_iter().collect::<Vec<_>>();
-                    let vessel_pins = obj
-                        .metadata
-                        .annotations
-                        .get(flotilla_resources::convoy::VESSEL_PLACEMENTS_ANNOTATION)
-                        .and_then(|encoded| {
-                            serde_json::from_str::<BTreeMap<String, flotilla_resources::convoy::VesselPlacementPin>>(encoded).ok()
-                        })
-                        .unwrap_or_default();
-                    decisions.extend(vessel_pins.values().map(|pin| &pin.decision));
-                    let mut wait = None;
-                    for allocation in decisions.into_iter().filter_map(|decision| decision.allocation.as_ref()) {
-                        let Some(selected) = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind) else {
-                            continue;
-                        };
-                        let canonical = match canonical_host_id(available_hosts.items.iter().map(|host| &host.object), &selected.host) {
-                            Ok(canonical) => canonical,
-                            Err(error) => {
-                                wait = Some(format!(
-                                    "capacity for fulfilment `{}` on host `{}` is unavailable: {error}",
-                                    selected.kind, selected.host
-                                ));
-                                break;
-                            }
-                        };
-                        let host = canonical.as_ref().and_then(|id| {
-                            available_hosts
-                                .items
-                                .iter()
-                                .find(|host| host.object.metadata.name == id.as_str())
-                                .map(|host| host.object.clone())
-                        });
-                        // A daemon host's cap bounds only the Docker
-                        // placements admission recorded as capped (#4002).
-                        // The live cap's value wins: lowering it holds admitted
-                        // convoys, removing it releases them.
-                        let vessel_cap = host.as_ref().and_then(|host| match host.spec.connection {
-                            HostConnection::SshHost { .. } => host.spec.max_vessels,
-                            HostConnection::Daemon => selected.max_vessels.and(host.spec.max_vessels),
-                        });
-                        let status = host.and_then(|host| host.status).map(|mut status| {
-                            status.apply_heartbeat_readiness(self.clock.now());
-                            status
-                        });
-                        let sleeping =
-                            status.as_ref().and_then(|status| status.sleeping_until).is_some_and(|until| until > self.clock.now());
-                        let slots = status
-                            .as_ref()
-                            .and_then(|status| status.fulfilment_facts.get(&selected.kind))
-                            .and_then(|facts| facts.free_vessel_slots);
-                        // A capped host admits convoys in admission order
-                        // while its live vessels leave room (#3793, #4002).
-                        let full = match (vessel_cap, canonical.as_ref()) {
-                            (Some(cap), Some(host)) => match self.vessel_occupancy(host.as_str()).await {
-                                Ok(Some(occupancy)) => !occupancy.admits(&obj.metadata.name, cap),
-                                Ok(None) => slots == Some(0),
-                                // An unreadable count waits rather than failing the pass.
-                                Err(error) => {
-                                    wait = Some(format!(
-                                        "capacity for fulfilment `{}` on host `{}` is unavailable: cannot count its vessels: {error}",
-                                        selected.kind, selected.host
-                                    ));
-                                    break;
-                                }
-                            },
-                            _ => slots == Some(0),
-                        };
-                        if status.as_ref().is_none_or(|status| !status.ready) || sleeping || full {
-                            wait = Some(format!(
-                                "capacity for fulfilment `{}` on host `{}` is unavailable{}{}",
-                                selected.kind,
-                                selected.host,
-                                if sleeping { " (sleeping)" } else { "" },
-                                if full { " (no free vessel slots)" } else { "" }
-                            ));
-                            break;
-                        }
-                    }
-                    wait
-                }
-                None => None,
+        // Another home's convoy is its home's to judge.
+        let Some(engine) = deciding(&self.engine, obj) else { return Ok(ConvoyPass::default()) };
+        let Some(status) = obj.status.as_ref() else { return Ok(ConvoyPass::default()) };
+        let now = self.clock.now();
+        if status.phase.is_terminal() {
+            if status.finished_at.is_none() {
+                // The view derived the failure from a failed work; the launch has not ended yet.
+                let reason = status.message.clone().unwrap_or_else(|| format!("the convoy's work {:?}", status.phase));
+                engine.fail(obj, CONVOY_CONTROLLER, &reason).await.map_err(ResourceError::other)?;
+                return Ok(ConvoyPass::default());
             }
-        } else {
-            None
-        };
-        let template = if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() {
-            None
-        } else {
-            match self.templates.get(pinned_workflow_ref(obj)).await {
-                Ok(template) => Some(template),
-                Err(ResourceError::NotFound { .. }) => None,
-                Err(err) => return Err(err),
-            }
-        };
-        let vessels = match (&self.federated_vessels, &self.vessels) {
-            (Some(vessels), _) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => {
-                select_convoy_child_sources(obj, &vessels.list().await?.items).into_values().collect()
-            }
-            (None, Some(vessels)) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => vessels
-                .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]))
-                .await?
-                .items
-                .into_iter()
-                .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
-                .collect(),
-            _ => Vec::new(),
-        };
-        let vessels = select_convoy_children(obj, &vessels);
+            self.tear_down(engine.as_ref(), obj).await?;
+            return Ok(ConvoyPass::default());
+        }
 
-        let checkouts = if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() {
-            self.held_checkouts(obj).await?
-        } else {
-            BTreeMap::new()
+        let vessels = match &self.vessels {
+            Some(vessels) => select_convoy_children(obj, &vessels.list().await?.items),
+            None => BTreeMap::new(),
         };
+        // A convoy waits for capacity until its first vessel is placed.
+        let capacity_wait = if vessels.is_empty() { self.capacity_wait(obj).await? } else { None };
+        self.note_capacity(obj, capacity_wait.as_ref(), now).map_err(ResourceError::other)?;
+        if capacity_wait.is_some() {
+            return Ok(ConvoyPass { requeue_after: Some(CAPACITY_RETRY) });
+        }
+
+        let checkouts = self.held_checkouts(obj).await?;
         let forges = match &self.forges {
             Some(forges) => forges.list().await?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>(),
             None => Vec::new(),
         };
-        let is_landing = obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing);
+        let is_landing = status.phase == ConvoyPhase::Landing;
         // A checkout's inspection names the change request its branch is associated with; what
         // that request came to is the forge observation's.
         let names_change_request =
             checkouts.values().any(|checkout| checkout.inspection().is_some_and(|inspection| inspection.change_request.is_some()));
         let needs_pr = is_landing
             || names_change_request
-            || obj.status.as_ref().is_some_and(|status| {
-                flotilla_resources::convoy::promises::needs_observation(status, flotilla_resources::convoy::promises::PromiseKind::Pr)
-            });
-        let needs_ledger = obj.status.as_ref().is_some_and(|status| {
-            flotilla_resources::convoy::promises::needs_observation(
-                status,
-                flotilla_resources::convoy::promises::PromiseKind::DecisionLedger,
-            )
-        });
+            || flotilla_resources::convoy::promises::needs_observation(status, flotilla_resources::convoy::promises::PromiseKind::Pr);
+        let needs_ledger = flotilla_resources::convoy::promises::needs_observation(
+            status,
+            flotilla_resources::convoy::promises::PromiseKind::DecisionLedger,
+        );
         let change_requests = match &self.change_requests {
             Some(change_requests) if needs_pr => {
                 let sources = change_requests.list().await?.items;
@@ -633,66 +590,41 @@ impl Reconciler for ConvoyReconciler {
             let address = flotilla_resources::address::subject_address(subject, &forges).ok()?;
             change_requests.get(&record_name(&address)?)?.status.as_ref()?.state.value
         };
-        let observed_subjects = observed_change_request_subjects(obj, &checkouts, &forges, &state_of).map_err(ResourceError::other)?;
+
+        // Change requests found on the convoy's branches are linked as what it produces.
+        for subject in observed_change_request_subjects(obj, &checkouts, &forges, &state_of).map_err(ResourceError::other)? {
+            if status.unlinked_subjects.contains(&subject) || status.produces(&subject) {
+                continue;
+            }
+            if let Err(error) = engine.link(obj, &subject, SubjectDiscoverySource::Branch, CONVOY_CONTROLLER).await {
+                tracing::debug!(convoy = %obj.metadata.name, ?subject, %error, "the engine did not link a branch's change request");
+            }
+        }
+
         let artifacts = match &self.artifacts {
             Some(artifacts) if needs_ledger => {
                 artifacts.list().await?.items.into_iter().map(|item| (item.object.metadata.name.clone(), item.object)).collect()
             }
             _ => BTreeMap::new(),
         };
-        let observation = obj.status.as_ref().filter(|status| !status.phase.is_terminal()).and_then(|status| {
-            flotilla_resources::convoy::promises::next_observation(
-                status,
-                &obj.metadata.name,
-                &change_requests,
-                &artifacts,
-                &forges,
-                self.clock.now(),
-                self.change_request_stale_after,
-            )
-        });
-        let observation = match (engine, observation) {
-            // The engine decides: an observation is its edge, and no old
-            // promise patch is written.
-            (Some(engine), Some(ConvoyStatusPatch::ObservePromise { vessel, role, operation })) => {
-                if let Err(error) = engine.promise(obj, &vessel, &role, &operation, Actor::Observer).await {
-                    tracing::info!(convoy = %obj.metadata.name, %vessel, %role, %error, "the engine refused an observed promise edge");
-                }
-                None
+        // One observation a pass: the engine's edge wakes the next.
+        if let Some(ConvoyStatusPatch::ObservePromise { vessel, role, operation }) = flotilla_resources::convoy::promises::next_observation(
+            status,
+            &obj.metadata.name,
+            &change_requests,
+            &artifacts,
+            &forges,
+            now,
+            self.change_request_stale_after,
+        ) {
+            if let Err(error) = engine.promise(obj, &vessel, &role, &operation, Actor::Observer).await {
+                tracing::info!(convoy = %obj.metadata.name, %vessel, %role, %error, "the engine refused an observed promise edge");
             }
-            (_, observation) => observation,
-        };
-        let promise_patch = observation.or_else(|| {
-            obj.status
-                .as_ref()
-                .filter(|status| !status.phase.is_terminal())
-                .and_then(|status| flotilla_resources::promises::next_completion(status, self.clock.now()))
-                .map(|patch| match patch {
-                    // The stored status holds no engine promises to recheck.
-                    ConvoyStatusPatch::DeriveCrewDone { vessel, role, at, .. } => {
-                        ConvoyStatusPatch::DeriveCrewDone { vessel, role, at, engine: engine.is_some() }
-                    }
-                    other => other,
-                })
-        });
-        // A crew reopened for a turn is not done before that turn reaches its
-        // live session, so teardown cannot drop the turn or its receipt (#3894).
-        let derived = match &promise_patch {
-            Some(ConvoyStatusPatch::DeriveCrewDone { vessel, role, .. }) if engine.is_some() => obj
-                .status
-                .as_ref()
-                .and_then(|status| status.crew_work.get(vessel)?.get(role))
-                .filter(|work| !work.phase.is_terminal())
-                .map(|_| (vessel.clone(), role.clone())),
-            _ => None,
-        };
-        let turn_hold = match derived {
-            Some((vessel, role)) => self.turn_awaits(obj, &vessel, &role).await?,
-            None => false,
-        };
-        let promise_patch = if turn_hold { None } else { promise_patch };
-        let settlement = if is_landing {
-            Some(evaluate_landing_settlement_with_disposition(
+        }
+
+        let mut pass = ConvoyPass::default();
+        let settlement = is_landing.then(|| {
+            evaluate_landing_settlement_with_disposition(
                 obj,
                 &vessels,
                 &checkouts,
@@ -700,230 +632,59 @@ impl Reconciler for ConvoyReconciler {
                 &forges,
                 self.change_request_stale_after,
                 self.landing_evidence_stale_after,
-                self.clock.now(),
-            ))
-        } else {
-            None
-        };
-        let mut exit_disposition = settlement.as_ref().and_then(|settlement| settlement.disposition.clone());
-        if let (Some(engine), Some(_)) = (engine, exit_disposition.as_ref()) {
-            // Landing settles only once the engine has delivered the convoy.
-            if let Err(error) = engine.deliver(obj).await {
+                now,
+            )
+        });
+        if settlement.as_ref().is_some_and(|settlement| settlement.disposition.is_some()) {
+            if self.any_turn_awaits(obj).await? {
+                pass.requeue_after = Some(TURN_HOLD_RETRY);
+            } else if let Err(error) = engine.deliver(obj).await {
                 tracing::info!(convoy = %obj.metadata.name, %error, "the engine refused delivery; landing holds");
-                exit_disposition = None;
             }
         }
-        let engine_delivered = engine.and_then(|engine| engine.delivered(obj));
-        let settlement_attention = settlement.as_ref().and_then(|settlement| {
+        let attention = settlement.as_ref().and_then(|settlement| {
             settlement.evaluation.unmet.iter().find_map(|unmet| match unmet {
                 UnmetSettlementExpectation::ObservedDigestMismatch { reference, claimed, observed } => Some(
                     ConvoyAttention::builder()
                         .source("observed-digest".to_string())
                         .reason(format!("remote ref {reference} is at {observed}, but the approved claim names {claimed}"))
-                        .raised_at(self.clock.now())
+                        .raised_at(now)
                         .build(),
                 ),
                 _ => None,
             })
         });
-        let reclaim_eligible = if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-            let result = match &self.teardown_runtime {
-                Some(runtime) => {
-                    let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();
-                    runtime.verify_reclaim(obj, &checkout_list).await
-                }
-                None => Err("convoy reclaim verifier unavailable".to_string()),
-            };
-            result.is_ok()
-        } else {
-            false
+        let held = status.attention.as_ref();
+        let attention_patch = match attention {
+            Some(attention) if held.is_none_or(|held| held.source != attention.source || held.reason != attention.reason) => {
+                Some(ConvoyStatusPatch::SetSettlementAttention { attention: Some(attention) })
+            }
+            None if held.is_some_and(|held| held.source == "observed-digest") => {
+                Some(ConvoyStatusPatch::SetSettlementAttention { attention: None })
+            }
+            _ => None,
         };
-        Ok(ConvoyPrepared {
-            template,
-            vessels,
-            checkouts,
-            observed_subjects,
-            promise_patch,
-            exit_disposition,
-            engine_delivered,
-            settlement_evidence: settlement.map(|settlement| settlement.evaluation),
-            settlement_attention,
-            reclaim_eligible,
-            capacity_wait,
-            viewed: viewed.clone(),
-            turn_hold,
-        })
+        if let Some(patch) = attention_patch {
+            note(&self.engine, obj, &patch).map_err(ResourceError::other)?;
+        }
+        Ok(pass)
     }
 
     fn reconcile(
         &self,
-        obj: &ResourceObject<Self::Resource>,
+        _obj: &ResourceObject<Self::Resource>,
         prepared: &Self::Prepared,
-        now: DateTime<Utc>,
+        _now: DateTime<Utc>,
     ) -> ControllerReconcileOutcome<Self::Resource> {
-        // The engine's promises in place of the stored ones, when it holds the convoy.
-        let obj = prepared.viewed.as_ref().unwrap_or(obj);
-        if !obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-            let prior = obj.status.as_ref().and_then(|status| status.stalled.as_ref());
-            if let Some(evidence) = &prepared.capacity_wait {
-                let retry = ControllerRetry::retryable(
-                    None,
-                    now,
-                    RetryBackoff { initial: std::time::Duration::from_secs(30), maximum: std::time::Duration::from_secs(30) },
-                );
-                let condition = StalledCondition {
-                    leaves: Vec::new(),
-                    maker: Some(LeafMaker::Controller {
-                        resource_kind: "Convoy".to_string(),
-                        name: None,
-                        retry,
-                        ceiling: RetryCeiling::default(),
-                    }),
-                    evidence: evidence.clone(),
-                    source: StallEvidenceSource::LeafEngine,
-                    cause: Some(StallCause::Capacity),
-                    began_at: prior.filter(|stalled| stalled.cause == Some(StallCause::Capacity)).map_or(now, |stalled| stalled.began_at),
-                    rung: StallRung::Operator,
-                    supervisor: None,
-                    supervision_message: None,
-                    supervision_index: None,
-                    supervision_exhausted: false,
-                    reason: None,
-                    proposed_disposition: None,
-                    nudge_history: Vec::new(),
-                };
-                return ControllerReconcileOutcome {
-                    patch: prior
-                        .filter(|stalled| stalled.cause == Some(StallCause::Capacity) && stalled.evidence == *evidence)
-                        .is_none()
-                        .then_some(ConvoyStatusPatch::SetStalled { condition: Some(condition) }),
-                    actuations: Vec::new(),
-                    requeue_after: Some(std::time::Duration::from_secs(30)),
-                };
-            }
-            if prior.is_some_and(|stalled| stalled.cause == Some(StallCause::Capacity)) {
-                return ControllerReconcileOutcome {
-                    patch: Some(ConvoyStatusPatch::SetStalled { condition: None }),
-                    actuations: Vec::new(),
-                    requeue_after: None,
-                };
-            }
-        }
-        let missing = prepared
-            .observed_subjects
-            .iter()
-            .filter(|subject| {
-                !obj.status.as_ref().is_some_and(|status| status.unlinked_subjects.contains(*subject) || status.produces(subject))
-            })
-            .cloned()
-            .map(|subject| (subject, Relationship::Produces))
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return ControllerReconcileOutcome {
-                patch: Some(ConvoyStatusPatch::DiscoverSubjects { subjects: missing, source: SubjectDiscoverySource::Branch, at: now }),
-                actuations: Vec::new(),
-                requeue_after: None,
-            };
-        }
-        if let Some(patch) = &prepared.promise_patch {
-            return ControllerReconcileOutcome { patch: Some(patch.clone()), actuations: Vec::new(), requeue_after: None };
-        }
-        let mut outcome = reconcile_internal(
-            obj,
-            prepared.template.as_ref(),
-            &prepared.vessels,
-            &prepared.checkouts,
-            LifecycleConditions {
-                exit_disposition: prepared.exit_disposition.clone(),
-                engine_delivered: prepared.engine_delivered.clone(),
-                reclaim_eligible: prepared.reclaim_eligible,
-                settlement_evidence: prepared.settlement_evidence.clone(),
-            },
-            now,
-        );
-        if outcome.patch.is_none() {
-            if let Some(attention) = &prepared.settlement_attention {
-                let changed = obj
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.attention.as_ref())
-                    .is_none_or(|existing| existing.source != attention.source || existing.reason != attention.reason);
-                if changed {
-                    outcome.patch = Some(ConvoyStatusPatch::SetSettlementAttention { attention: Some(attention.clone()) });
-                }
-            } else if obj
-                .status
-                .as_ref()
-                .and_then(|status| status.attention.as_ref())
-                .is_some_and(|attention| attention.source == "observed-digest")
-            {
-                outcome.patch = Some(ConvoyStatusPatch::SetSettlementAttention { attention: None });
-            }
-        }
-        // A refused reclaim must retry on its own schedule: the refusal is
-        // often transient (integration evidence mid-refresh, a checkout
-        // cascade in flight) and no watch event is guaranteed to arrive once
-        // the convoy is terminal. Retry at the evidence-staleness horizon —
-        // the freshness the gate is waiting on.
-        let reclaim_refused = self.teardown_runtime.is_some()
-            && obj.status.as_ref().is_some_and(|status| status.phase.is_terminal())
-            && !prepared.reclaim_eligible;
-        for event in outcome.events {
-            trace_convoy_event(obj, event);
-        }
-        ControllerReconcileOutcome {
-            patch: outcome.patch,
-            actuations: outcome.actuations,
-            // A held Done rechecks at the engine delivery adapter's pace: no
-            // Message watch wakes this reconciler when the turn is delivered.
-            requeue_after: prepared
-                .turn_hold
-                .then_some(TURN_HOLD_RETRY)
-                .or_else(|| reclaim_refused.then_some(self.landing_evidence_stale_after)),
-        }
+        ControllerReconcileOutcome { patch: None, actuations: Vec::new(), requeue_after: prepared.requeue_after }
     }
 
-    async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
-        let selector = BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]);
-
-        if let Some(vessels) = &self.vessels {
-            delete_lifecycle_owned_matching(vessels, &selector).await?;
-        }
-        // A convoy's checkouts are held for its own launch, a standing role's generation included:
-        // the Checkout controller releases them once that launch has ended, and the convoy waits.
-        let remaining = self
-            .held_checkouts(obj)
-            .await?
-            .into_values()
-            .filter(|checkout| !checkout.ended() && !matches!(checkout.spec, CheckoutSpec::Observed(_)))
-            .map(|checkout| FinalizerWaitReason::CheckoutAuthority {
-                message: match &checkout.reading {
-                    flotilla_protocol::LifecycleReading::Retrying { cause, .. }
-                    | flotilla_protocol::LifecycleReading::Exhausted { cause } => Some(cause.clone()),
-                    _ => None,
-                },
-                checkout: checkout.checkout_name().to_owned(),
-            })
-            .collect::<Vec<_>>();
-        if !remaining.is_empty() {
-            return Err(ResourceError::FinalizerWait { reasons: remaining });
-        }
-        if let Some(collector) = &self.prepared_snapshot_gc {
-            collector.collect(Some(&obj.metadata.name)).await?;
-        }
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         Ok(())
     }
 
+    /// A launch is torn down once it has ended, not by deletion: there is no finalizer.
     fn finalizer_name(&self) -> Option<&'static str> {
-        Some(flotilla_resources::convoy::CONVOY_TEARDOWN_FINALIZER)
-    }
-
-    fn finalizer_error_patch(&self, obj: &ResourceObject<Self::Resource>, error: &ResourceError) -> Option<ConvoyStatusPatch> {
-        let ResourceError::FinalizerWait { .. } = error else { return None };
-        let message = error.to_string();
-        if obj.status.as_ref().and_then(|status| status.message.as_deref()) == Some(message.as_str()) {
-            return None;
-        }
-        Some(ConvoyStatusPatch::SetTeardownWait { message })
+        None
     }
 }

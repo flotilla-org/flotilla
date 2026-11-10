@@ -36,7 +36,7 @@ use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, FulfilmentFacts, FulfilmentKind,
     FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
     ResourceError, ResourceList, ResourceProvenance, Selector, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, WatchEvent, WatchStart,
 };
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, ResourceBackend};
 use flotilla_test_support::TestSocketDir;
@@ -2201,9 +2201,9 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     let controller = ControllerLoop {
         primary: placed.using::<Convoy>("flotilla"),
         secondaries: Vec::new(),
-        reconciler: flotilla_crew::convoy::ConvoyReconciler::new(placed.definitions::<WorkflowTemplate>("flotilla"))
+        reconciler: flotilla_crew::convoy::ConvoyReconciler::new()
             .with_hosts(placed.including_replicas::<Host>("flotilla"))
-            .with_vessels(placed.using::<Vessel>("flotilla"))
+            .with_vessels(placed.including_replicas::<Vessel>("flotilla"))
             .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
         backend: placed.clone(),
     };

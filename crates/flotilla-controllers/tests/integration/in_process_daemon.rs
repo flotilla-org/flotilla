@@ -10208,7 +10208,7 @@ async fn convoy_resume_milliseconds_after_complete_still_lands() {
         CommandValue::ConvoyBriefInformational { message: "crew already claimed; delivered without reopening".into() }
     );
     assert_eq!(convoys.get("claimed-resume").await.unwrap().status.unwrap(), claimed);
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
         .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads);
     for _ in 0..3 {
         let current = convoys.get("claimed-resume").await.unwrap();

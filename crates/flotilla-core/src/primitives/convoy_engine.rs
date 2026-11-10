@@ -163,6 +163,24 @@ fn holds_generation(convoy: &ResourceObject<OldConvoy>, current: &Resource<Convo
         || convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())
 }
 
+impl ConvoyEngine {
+    /// Ends `convoy` without delivering it, for `cause`; an ended convoy is left as it is.
+    async fn end(&self, convoy: &ResourceObject<OldConvoy>, principal: &str, reason: &str, cause: AbandonCause) -> Result<(), String> {
+        let (name, by, reason) = (map::engine_name(convoy)?, operator(principal), reason.to_owned());
+        self.edit(convoy, move |current, world| {
+            // An ended engine convoy has nothing left to abandon.
+            if current.label() != ConvoyLabel::Open {
+                return Ok((Vec::new(), ()));
+            }
+            let authority = input(&name, if cause == AbandonCause::Failed { "fail" } else { "abandon" });
+            world.authority.put(&Ref::new(authority.as_str()), true);
+            let abandon = flotilla_state_machines::machines::convoy::Abandon { by, cause, reason, authority: Ref::new(authority) };
+            Ok((vec![abandon.into()], ()))
+        })
+        .await
+    }
+}
+
 #[async_trait]
 impl EngineConvoys for ConvoyEngine {
     fn holds(&self, convoy: &ResourceObject<OldConvoy>) -> bool {
@@ -428,23 +446,11 @@ impl EngineConvoys for ConvoyEngine {
     }
 
     async fn abandon(&self, convoy: &ResourceObject<OldConvoy>, principal: &str, reason: &str) -> Result<(), String> {
-        let (name, by, reason) = (map::engine_name(convoy)?, operator(principal), reason.to_owned());
-        self.edit(convoy, move |current, world| {
-            // An ended engine convoy has nothing left to abandon.
-            if current.label() != ConvoyLabel::Open {
-                return Ok((Vec::new(), ()));
-            }
-            let authority = input(&name, "abandon");
-            world.authority.put(&Ref::new(authority.as_str()), true);
-            let abandon = flotilla_state_machines::machines::convoy::Abandon {
-                by,
-                cause: AbandonCause::Operator,
-                reason,
-                authority: Ref::new(authority),
-            };
-            Ok((vec![abandon.into()], ()))
-        })
-        .await
+        self.end(convoy, principal, reason, AbandonCause::Operator).await
+    }
+
+    async fn fail(&self, convoy: &ResourceObject<OldConvoy>, principal: &str, reason: &str) -> Result<(), String> {
+        self.end(convoy, principal, reason, AbandonCause::Failed).await
     }
 
     async fn fail_seat(

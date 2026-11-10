@@ -777,13 +777,10 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
         checkout_home.replicate_to(&target);
     }
     let current = convoys.get("cross-host").await.expect("get Landing convoy");
-    let reconciler = ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>(NAMESPACE))
-        .with_lifecycle_reads(at_authority.reads.clone())
-        .with_change_requests(
-            authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
-            authority_daemon.change_request_stale_after(),
-        )
-        .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(Arc::clone(&authority_daemon))));
+    let reconciler = ConvoyReconciler::new().with_lifecycle_reads(at_authority.reads.clone()).with_change_requests(
+        authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
+        authority_daemon.change_request_stale_after(),
+    );
     let dependencies = reconciler.prepare(&current).await.expect("consume replicated checkout evidence");
     let outcome = reconciler.reconcile(&current, &dependencies, chrono::Utc::now());
     let patch = outcome.patch.expect("fresh replicated evidence should settle the convoy");

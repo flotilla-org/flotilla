@@ -4,7 +4,6 @@
 #[path = "../../../flotilla-controllers/tests/common/mod.rs"]
 mod common;
 mod convoy_engine_path;
-mod convoy_in_memory;
 mod placement_tiebreak_capacity_wait;
 mod review_bundle;
 mod review_bundle_aggregator;

@@ -114,9 +114,8 @@ async fn deleting_mis_homed_convoy_finalizes_it_at_its_home() {
     let parent_controller = tokio::spawn(
         ControllerLoop {
             primary: convoys.clone(),
-            secondaries: ConvoyReconciler::federated_secondary_watches(&parent_backend, namespace),
-            reconciler: ConvoyReconciler::new(parent_backend.definitions::<WorkflowTemplate>(namespace))
-                .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
+            secondaries: ConvoyReconciler::secondary_watches(&parent_backend, namespace),
+            reconciler: ConvoyReconciler::new().with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
             backend: parent_backend.clone(),
         }
         .run(),
@@ -988,9 +987,8 @@ async fn forced_convoy_teardown_from_another_host_finalizes_at_its_home() {
     let convoy_backend = mesh.hosts[0].resource_backend();
     let convoy_controller = ControllerLoop {
         primary: convoy_backend.using::<Convoy>(namespace),
-        secondaries: ConvoyReconciler::federated_secondary_watches(&convoy_backend, namespace),
-        reconciler: ConvoyReconciler::new(convoy_backend.definitions::<WorkflowTemplate>(namespace))
-            .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
+        secondaries: ConvoyReconciler::secondary_watches(&convoy_backend, namespace),
+        reconciler: ConvoyReconciler::new().with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
         backend: convoy_backend,
     };
     let convoy_task = tokio::spawn(convoy_controller.run());
@@ -2210,9 +2208,7 @@ async fn artifact_environment_reference_contract() {
         // contract. Drive the real convoy reconciler after transferring evidence.
         use flotilla_store::controller::Reconciler;
         let backend = leader.resource_backend();
-        let reconciler =
-            flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>(namespace))
-                .with_artifacts(backend.including_replicas::<Artifact>(namespace));
+        let reconciler = flotilla_crew::convoy::ConvoyReconciler::new().with_artifacts(backend.including_replicas::<Artifact>(namespace));
         for _ in 0..16 {
             let current = convoys.get(convoy).await.unwrap();
             let prepared = reconciler.prepare(&current).await.unwrap();
@@ -2957,9 +2953,9 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
     let controller = ControllerLoop {
         primary: placement.using::<Convoy>(namespace),
         secondaries: Vec::new(),
-        reconciler: ConvoyReconciler::new(placement.definitions::<WorkflowTemplate>(namespace))
+        reconciler: ConvoyReconciler::new()
             .with_hosts(placement.including_replicas::<Host>(namespace))
-            .with_vessels(placement.using::<Vessel>(namespace))
+            .with_vessels(placement.including_replicas::<Vessel>(namespace))
             .with_lifecycle_reads(topology.follower.lifecycle_reads()),
         backend: placement.clone(),
     };

@@ -34,6 +34,9 @@ use tracing::{info, warn};
 use super::state::ControllerRuntimeState;
 use crate::resource_manifest::ResourceManifestReconciler;
 
+/// Whether an ended convoy's vessels may be released. Until the vessel requester lands with its
+/// release gate (#3108 C4'), nothing in production asks.
+#[cfg_attr(not(test), expect(dead_code, reason = "the vessel release gate once the vessel requester lands (#3108 C4')"))]
 pub(super) struct DaemonConvoyTeardownRuntime {
     pub(super) daemon: Arc<InProcessDaemon>,
     pub(super) reclaim_refusals: StdMutex<HashMap<String, ReclaimRefusal>>,
@@ -80,6 +83,7 @@ impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for Dae
     }
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "the vessel release gate once the vessel requester lands (#3108 C4')"))]
 pub(super) struct ReclaimRefusal {
     pub(super) error: String,
     pub(super) attempts: u64,
@@ -172,6 +176,7 @@ pub(super) async fn wake_controller_resource<T: Resource>(
     Ok(format!("{}/{} woken", T::API_PATHS.kind, name))
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "the vessel release gate once the vessel requester lands (#3108 C4')"))]
 impl DaemonConvoyTeardownRuntime {
     pub(super) fn new(daemon: Arc<InProcessDaemon>) -> Self {
         Self { daemon, reclaim_refusals: StdMutex::new(HashMap::new()) }
@@ -581,6 +586,7 @@ pub(super) fn unauthorised_clone(url: &str, credentials: &CloneCredentials, erro
     }
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "the vessel release gate once the vessel requester lands (#3108 C4')"))]
 pub(super) const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
 
 pub(super) const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-at";

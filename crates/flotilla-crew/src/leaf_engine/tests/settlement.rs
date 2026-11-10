@@ -51,7 +51,7 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: vec![table.reconciler_wake_watch()],
-            reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+            reconciler: ConvoyReconciler::new()
                 .with_lifecycle_reads(agent_reads())
                 .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
             backend: backend.clone(),
@@ -200,7 +200,7 @@ async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: vec![table.reconciler_wake_watch()],
-            reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")).with_lifecycle_reads(agent_reads()),
+            reconciler: ConvoyReconciler::new().with_lifecycle_reads(agent_reads()),
             backend,
         }
         .run(),
@@ -286,7 +286,7 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: vec![table.reconciler_wake_watch()],
-            reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+            reconciler: ConvoyReconciler::new()
                 .with_lifecycle_reads(agent_reads())
                 .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
             backend: backend.clone(),

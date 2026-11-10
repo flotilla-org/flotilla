@@ -29,7 +29,7 @@ use flotilla_resources::{
 use flotilla_resources::{
     BoundChangeRequest, CheckoutSpec, ControllerRetry, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase,
     CrewWorkState, ExitDeclaration, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementStatus, RepositoryKey, WorkPhase,
-    WorkState, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
+    WorkState, WorkflowSnapshot, CONVOY_LABEL,
 };
 use flotilla_store::controller::ControllerLoop;
 use flotilla_store::ResourceBackend;
@@ -1256,7 +1256,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                 // Primary status watches drive completion rollup; use the
                 // explicit merged observation rather than a network refresher.
                 secondaries: Vec::new(),
-                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+                reconciler: ConvoyReconciler::new()
                     .with_lifecycle_reads(agent_reads())
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(60)),
                 backend: backend.clone(),

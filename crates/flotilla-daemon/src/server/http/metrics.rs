@@ -55,6 +55,7 @@ impl Exposition {
             "flotilla_store_read_contention_total" => "Busy read refusals returned to callers; each refusal counts once.",
             "flotilla_store_queue_wait_seconds" => "Time queued before a store read or write starts, in seconds.",
             "flotilla_store_execution_seconds" => "Store read or write execution time, excluding queue wait, in seconds.",
+            "flotilla_convoys_waiting_capacity" => "Convoys this home holds that wait for capacity on a host their placement chose.",
             "flotilla_dispatch_time_from_ready_seconds" => {
                 "Time from an issue entering the dispatch queue to its convoy's creation, in seconds."
             }
@@ -117,6 +118,9 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
             out.number("flotilla_controller_queue_peak", "gauge", &labels, snapshot.queue_peak);
             out.number("flotilla_controller_parked", "gauge", &labels, snapshot.parked);
         }
+    }
+    if let Some(convoys) = daemon.engine_convoys() {
+        out.number("flotilla_convoys_waiting_capacity", "gauge", "", convoys.memory().capacity_waits());
     }
     for ((project, workflow), histogram) in crate::dispatch_reconciler::DispatchMetrics::global().snapshot() {
         let labels = format!(",project=\"{}\",workflow=\"{}\"", escaped(&project), escaped(&workflow));

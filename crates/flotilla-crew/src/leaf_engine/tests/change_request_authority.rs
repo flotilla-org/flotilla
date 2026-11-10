@@ -144,7 +144,7 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: vec![table.reconciler_wake_watch()],
-            reconciler: ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla"))
+            reconciler: ConvoyReconciler::new()
                 .with_lifecycle_reads(remote_checkouts.reads.clone())
                 .with_change_requests(authority.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
             backend: authority.clone(),

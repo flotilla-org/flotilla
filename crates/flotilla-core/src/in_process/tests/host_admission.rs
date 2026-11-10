@@ -867,25 +867,16 @@ async fn capped_ssh_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
     let chosen = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind).expect("chosen candidate");
     assert_eq!((chosen.free_vessel_slots, chosen.max_vessels, chosen.available), (Some(0), Some(1), false), "{allocation:?}");
 
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
         .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
         .with_convoys(backend.including_replicas::<ResourceConvoy>("flotilla"))
-        .with_federated_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
-    let capacity_stall = |outcome: flotilla_store::controller::ReconcileOutcome<ResourceConvoy>| match outcome.patch {
-        Some(flotilla_resources::ConvoyStatusPatch::SetStalled { condition: Some(condition) })
-            if condition.cause == Some(flotilla_resources::StallCause::Capacity) =>
-        {
-            Some(condition.evidence)
-        }
-        _ => None,
-    };
+        .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
     let gate = |name: String| {
         let reconciler = &reconciler;
         let convoys = convoys.clone();
         async move {
             let convoy = convoys.get(&name).await.expect("convoy");
-            let prepared = flotilla_store::controller::Reconciler::prepare(reconciler, &convoy).await.expect("prepare");
-            capacity_stall(flotilla_store::controller::Reconciler::reconcile(reconciler, &convoy, &prepared, Utc::now()))
+            reconciler.capacity_wait(&convoy).await.expect("capacity")
         }
     };
     for (name, _) in &placed[..3] {
@@ -1056,20 +1047,15 @@ async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order()
             .await
             .expect("admitted placement");
     }
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
         .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
         .with_convoys(backend.including_replicas::<ResourceConvoy>("flotilla"))
-        .with_federated_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
+        .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
     let mut waits = Vec::new();
     for name in ["convoy-0", "convoy-1"] {
         let convoy = convoys.get(name).await.expect("convoy");
-        let prepared = flotilla_store::controller::Reconciler::prepare(&reconciler, &convoy).await.expect("prepare");
-        let outcome = flotilla_store::controller::Reconciler::reconcile(&reconciler, &convoy, &prepared, Utc::now());
-        waits.push(matches!(
-            outcome.patch,
-            Some(flotilla_resources::ConvoyStatusPatch::SetStalled { condition: Some(condition) })
-                if condition.cause == Some(flotilla_resources::StallCause::Capacity) && condition.evidence.contains("no free vessel slots")
-        ));
+        let wait = reconciler.capacity_wait(&convoy).await.expect("capacity");
+        waits.push(wait.is_some_and(|wait| wait.contains("no free vessel slots")));
     }
     assert_eq!(waits, [false, true], "the older admission provisions; the newer waits for the slot");
 }
@@ -1208,20 +1194,11 @@ async fn all_candidates_full_means_the_convoy_waits() {
     assert!(allocation.candidates.iter().all(|candidate| !candidate.available), "{allocation:?}");
     // Equal candidates break ties by name, so the Docker host's gate is the one under test.
     assert_eq!(third.kind, "docker-feta");
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
         .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
         .with_convoys(backend.including_replicas::<ResourceConvoy>("flotilla"))
-        .with_federated_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
+        .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
     let convoy = backend.clone().using::<ResourceConvoy>("flotilla").get("third").await.expect("third convoy");
-    let prepared = flotilla_store::controller::Reconciler::prepare(&reconciler, &convoy).await.expect("prepare");
-    let outcome = flotilla_store::controller::Reconciler::reconcile(&reconciler, &convoy, &prepared, Utc::now());
-    assert!(
-        matches!(
-            outcome.patch,
-            Some(flotilla_resources::ConvoyStatusPatch::SetStalled { condition: Some(ref condition) })
-                if condition.cause == Some(flotilla_resources::StallCause::Capacity) && condition.evidence.contains("no free vessel slots")
-        ),
-        "{:?}",
-        outcome.patch
-    );
+    let wait = reconciler.capacity_wait(&convoy).await.expect("capacity");
+    assert!(wait.as_ref().is_some_and(|wait| wait.contains("no free vessel slots")), "{wait:?}");
 }

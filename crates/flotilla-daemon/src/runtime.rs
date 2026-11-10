@@ -38,7 +38,6 @@ use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryR
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
     host_direct_environment_name, Checkout, Convoy, Forge, Host, Repository, Resource, ResourceError, TerminalSession, Vessel,
-    WorkflowTemplate,
 };
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tokio::{sync::watch, task::JoinHandle};
@@ -54,8 +53,7 @@ use self::docker::DockerControllerRuntime;
 use self::environments::reconcile_provisioned_environments;
 use self::health::{apply_host_heartbeat_with_credentials, spawn_projection_parity_task, DaemonHealthIdentity, RuntimeHealth};
 use self::ports::{
-    ChainedForgeDefaultBranchResolver, DaemonConvoyTeardownRuntime, GhForgeDefaultBranchResolver, RoutingCheckoutRuntime,
-    RoutingCloneRuntime, RuntimeOperatorReconciler,
+    ChainedForgeDefaultBranchResolver, GhForgeDefaultBranchResolver, RoutingCheckoutRuntime, RoutingCloneRuntime, RuntimeOperatorReconciler,
 };
 use self::seed::register_startup_resources;
 use self::state::ControllerRuntimeState;
@@ -835,7 +833,7 @@ fn spawn_controller_loops(
             let daemon = Arc::clone(&state.daemon);
             move |backend: ResourceBackend, namespace_string: String| {
                 let daemon = Arc::clone(&daemon);
-                let mut secondaries = ConvoyReconciler::federated_secondary_watches(&backend, &namespace_string);
+                let mut secondaries = ConvoyReconciler::secondary_watches(&backend, &namespace_string);
                 secondaries.push(daemon.reconciler_wake_watch());
                 secondaries.push(Box::new(flotilla_crew::convoy::EngineConvoyWake { engine: daemon.convoy_engine_path() }));
                 // A convoy's checkouts are the engine's: their changes wake the convoy holding them.
@@ -846,14 +844,13 @@ fn spawn_controller_loops(
                 }
                 (
                     secondaries,
-                    ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(&namespace_string))
+                    ConvoyReconciler::new()
                         .with_engine(daemon.convoy_engine_path())
                         .with_messages(daemon.crew_message_path())
                         .with_lifecycle_reads(daemon.lifecycle_reads())
                         .with_hosts(backend.including_replicas::<Host>(&namespace_string))
                         .with_convoys(backend.including_replicas::<Convoy>(&namespace_string))
-                        .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
-                        .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
+                        .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))
                         .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
                         .with_forges(backend.definitions::<Forge>(&namespace_string))
                         .with_change_requests(
@@ -862,7 +859,6 @@ fn spawn_controller_loops(
                         )
                         .with_artifacts(backend.including_replicas::<flotilla_resources::Artifact>(&namespace_string))
                         .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
-                        .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
                         .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(
                             backend.clone(),
                             &namespace_string,

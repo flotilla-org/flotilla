@@ -170,7 +170,6 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     assert_eq!(observation.termination.as_ref().expect("termination").cause, EnvironmentExitCause::HostOomd);
     // The Vessel controller, the launch's single writer, adopts it and ends it Lost with the
     // backing's cause and where the work is.
-    let vessels = backend.using::<Vessel>(NAMESPACE);
     let _running = flotilla_orchestration_testkit::run_vessels(
         &backend,
         NAMESPACE,
@@ -192,8 +191,8 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     };
     assert!(message.contains("host oomd") && message.contains("exit code 137") && message.contains("/hulls/work/flotilla"), "{message}");
     let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
-        .with_vessels(vessels.clone())
+    let convoy_reconciler = ConvoyReconciler::new()
+        .with_vessels(backend.including_replicas::<Vessel>(NAMESPACE))
         .with_lifecycle_reads(daemon.lifecycle_reads());
     // Reconciliations interrupt work and crew.
     for _ in 0..2 {

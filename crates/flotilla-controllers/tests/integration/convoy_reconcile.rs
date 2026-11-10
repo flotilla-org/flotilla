@@ -1,68 +1,25 @@
 use flotilla_protocol::{IssueSource, Relationship, Subject, SubjectKind};
-use flotilla_resources::convoy::reconcile::{evaluate_landing_settlement_with_disposition, reconcile_internal, LifecycleConditions};
+use flotilla_resources::convoy::reconcile::{evaluate_landing_settlement_with_disposition, LandingSettlement};
 use flotilla_resources::ResumeIntent;
 use flotilla_resources::{ConvoySpec, DeclaredSubject, ExitDeclaration, ResourceObject};
 use flotilla_store_memory::InMemoryBackend;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
-use async_trait::async_trait;
-use common::{
-    bootstrapped_convoy_status, bootstrapped_tool_only_convoy_status, convoy_meta, convoy_object, pending_task_state,
-    task_provisioning_convoy_spec, timestamp, tool_only_workflow_template_object, valid_convoy_spec, valid_workflow_template_object,
-    workflow_template_meta,
-};
+use common::{bootstrapped_convoy_status, convoy_meta, convoy_object, task_provisioning_convoy_spec, timestamp, valid_convoy_spec};
 use flotilla_resources::{
-    controller_patches, evaluate_crew_completion, evaluate_landing_settlement, external_patches, implement_review_workflow_spec,
-    interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec,
-    ChangeRequestStatus, CheckoutSpec, CheckoutWorktreeSpec, Clock, Convoy, ConvoyEvent, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch,
-    ConvoyTeardownRuntime, CrewCompletionRefusalCause, CrewSource, CrewWorkPhase, InputMeta, InputValue, Observation,
+    evaluate_crew_completion, evaluate_landing_settlement, external_patches, implement_review_workflow_spec, select_convoy_children,
+    BoundChangeRequest, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, CheckoutSpec, Convoy,
+    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewCompletionRefusalCause, CrewWorkPhase, InputMeta, Observation,
     ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, OwnerReference, RepositoryKey, ReviewRefPair,
-    SettlementClaimEvidence, StatusPatch, TargetMismatch, UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec,
-    VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, WORKFLOW_SNAPSHOT_ANNOTATION,
+    SettlementClaimEvidence, StatusPatch, UnmetSettlementExpectation, Vessel, VesselSpec, WorkPhase, WorkflowSnapshot,
 };
-use flotilla_store::{
-    controller::{ReconcileOutcome as ControllerReconcileOutcome, Reconciler},
-    ResourceBackend,
-};
+use flotilla_store::ResourceBackend;
 
-use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_provisioning_testkit::{CheckoutFixture, Ending};
 use flotilla_resources::checkout_records::{latest_launches, CheckoutRecord, CheckoutRecords as _, Inspection, Landed};
 use flotilla_store_testkit::fixtures as common;
 
 use crate::common::cr_name;
-
-struct AlwaysEligible;
-
-#[test]
-fn convoy_finalizer_does_not_treat_arbitrary_error_text_as_a_teardown_wait() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads);
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
-    let error = flotilla_resources::ResourceError::other("teardown waiting on checkout misleading-error");
-    assert!(reconciler.finalizer_error_patch(&convoy, &error).is_none());
-}
-
-#[test]
-fn convoy_finalizer_renders_multiple_typed_waits_at_the_status_boundary() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads);
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
-    let error = flotilla_resources::ResourceError::FinalizerWait {
-        reasons: vec![
-            flotilla_resources::FinalizerWaitReason::CheckoutAuthority { checkout: "first".into(), message: Some("archiving".into()) },
-            flotilla_resources::FinalizerWaitReason::CheckoutAuthority { checkout: "second".into(), message: None },
-        ],
-    };
-    let patch = reconciler.finalizer_error_patch(&convoy, &error).expect("typed waits become status");
-    let mut status = ConvoyStatus::default();
-    patch.apply(&mut status);
-    assert_eq!(status.message.as_deref(), Some("teardown waiting on checkout first: archiving; teardown waiting on checkout second"));
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-    assert!(reconciler.finalizer_error_patch(&convoy, &error).is_none(), "unchanged waits do not rewrite status");
-}
 
 // Completion requires the role's ledger and every bound PR's readiness;
 // optional unbound PRs only hold completion during the discovery grace period.
@@ -500,113 +457,6 @@ fn declared_artifact_completion_accepts_a_new_kind_and_rebinds_to_current_head()
     assert!(evaluate(&change_requests, &artifacts).is_empty());
 }
 
-#[async_trait]
-impl ConvoyTeardownRuntime for AlwaysEligible {
-    async fn verify_reclaim(
-        &self,
-        _convoy: &flotilla_resources::ResourceObject<Convoy>,
-        _checkouts: &[flotilla_resources::checkout_records::CheckoutRecord],
-    ) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn convoy_reconciler_bootstraps_from_a_replica_only_workflow_snapshot() {
-    let source_root = flotilla_protocol::NodeId::new("snapshot-source");
-    let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(source_root.clone());
-    let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("driver"));
-    let snapshot_name = "workflow-snapshot-replica";
-    let template = valid_workflow_template_object(snapshot_name);
-    source
-        .definitions::<WorkflowTemplate>("flotilla")
-        .apply(&workflow_template_meta(snapshot_name), &template.spec)
-        .await
-        .expect("author snapshot");
-    driver
-        .replica_writer::<WorkflowTemplate>(source_root, "flotilla")
-        .replace(&source.using::<WorkflowTemplate>("flotilla").list().await.expect("source templates"), chrono::Utc::now())
-        .await
-        .expect("replicate snapshot");
-    assert!(driver.using::<WorkflowTemplate>("flotilla").list().await.expect("driver local templates").items.is_empty());
-
-    let convoy = driver
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("replica-bootstrap".to_string())
-                .annotations(BTreeMap::from([(WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), snapshot_name.to_string())]))
-                .build(),
-            &valid_convoy_spec(),
-        )
-        .await
-        .expect("create convoy");
-    let reconciler = ConvoyReconciler::new(driver.definitions::<WorkflowTemplate>("flotilla"))
-        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads);
-    let prepared = reconciler.prepare(&convoy).await.expect("read replica-only snapshot");
-    let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
-
-    assert!(outcome.patch.is_some(), "replica-only snapshot should bootstrap the convoy");
-}
-
-async fn reconcile_once_with_resources(
-    convoy: &flotilla_resources::ResourceObject<Convoy>,
-    template: Option<&flotilla_resources::ResourceObject<WorkflowTemplate>>,
-    workspaces: Vec<flotilla_resources::ResourceObject<Vessel>>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
-    reconcile_once_with_reads(convoy, template, workspaces, CheckoutFixture::default().reads, now).await
-}
-
-async fn reconcile_once_with_reads(
-    convoy: &flotilla_resources::ResourceObject<Convoy>,
-    template: Option<&flotilla_resources::ResourceObject<WorkflowTemplate>>,
-    workspaces: Vec<flotilla_resources::ResourceObject<Vessel>>,
-    reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
-    let convoys = backend.clone().using::<Convoy>("flotilla");
-    let vessels = backend.clone().using::<Vessel>("flotilla");
-
-    if let Some(template) = template {
-        templates.create(&workflow_template_meta(&template.metadata.name), &template.spec).await.expect("template create should succeed");
-    }
-
-    let mut meta = convoy_meta(&convoy.metadata.name);
-    meta.annotations = convoy.metadata.annotations.clone();
-    let created = convoys.create(&meta, &convoy.spec).await.expect("convoy create should succeed");
-    if let Some(status) = convoy.status.as_ref() {
-        convoys
-            .update_status(&convoy.metadata.name, &created.metadata.resource_version, status)
-            .await
-            .expect("convoy status update should succeed");
-    }
-
-    for workspace in workspaces {
-        let mut meta = vessel_meta(&workspace.metadata.name, &workspace.spec.convoy_ref, &workspace.spec.vessel_name);
-        meta.deletion_timestamp = workspace.metadata.deletion_timestamp;
-        let created = vessels.create(&meta, &workspace.spec).await.expect("workspace create should succeed");
-        if let Some(status) = workspace.status.as_ref() {
-            vessels
-                .update_status(&workspace.metadata.name, &created.metadata.resource_version, status)
-                .await
-                .expect("workspace status update should succeed");
-        }
-    }
-
-    let current = convoys.get(&convoy.metadata.name).await.expect("convoy get should succeed");
-    let reconciler = ConvoyReconciler::new(templates.clone())
-        .with_vessels(vessels.clone())
-        .with_lifecycle_reads(reads)
-        .with_teardown_runtime(Arc::new(AlwaysEligible));
-    let deps = reconciler.prepare(&current).await.expect("dependency fetch should succeed");
-    reconciler.reconcile(&current, &deps, now)
-}
-
-struct FixedClock(chrono::DateTime<chrono::Utc>);
-
 /// The engine's checkouts for one convoy at home `home`: engine Convoy `convoy` admitted there,
 /// whose checkouts the convoy reads.
 fn engine_checkouts(home: &str, convoy: &str) -> CheckoutFixture {
@@ -644,12 +494,6 @@ fn held_checkouts(checkouts: &CheckoutFixture) -> BTreeMap<String, CheckoutRecor
     latest_launches(checkouts.checkouts.here().expect("checkouts"))
 }
 
-impl Clock for FixedClock {
-    fn now(&self) -> chrono::DateTime<chrono::Utc> {
-        self.0
-    }
-}
-
 fn merged_change_request_status(observed_at: chrono::DateTime<chrono::Utc>) -> ChangeRequestStatus {
     ChangeRequestStatus {
         title: Default::default(),
@@ -672,9 +516,8 @@ async fn reconcile_with_observed_change_request(
     landed: Option<Option<bool>>,
     observed_target_ref: Option<&str>,
     failing: bool,
-) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
+) -> LandingSettlement {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
     let checkouts = engine_checkouts("host-a", "convoy-a");
@@ -748,19 +591,41 @@ async fn reconcile_with_observed_change_request(
     }
 
     let current = convoys.get("convoy-a").await.expect("convoy");
-    let reconciler = ConvoyReconciler::new(templates)
-        .with_vessels(vessels)
-        .with_lifecycle_reads(checkouts.reads.clone())
-        .with_clock(Arc::new(FixedClock(timestamp(40))));
-    let deps = reconciler.prepare(&current).await.expect("dependencies");
-    reconciler.reconcile(&current, &deps, timestamp(40))
+    landing_judgement(&backend, &current, &checkouts, timestamp(40)).await
 }
 
-async fn reconcile_with_observed_digest(
-    phase: ConvoyPhase,
-    observed_digest: Option<&str>,
-    existing_attention: bool,
-) -> (flotilla_store::controller::ReconcileOutcome<Convoy>, chrono::DateTime<chrono::Utc>) {
+/// The settlement judgement the convoy controller makes of `convoy` at `now`: from its vessels, the
+/// checkouts held for it and the change requests observed, with the controller's default windows.
+/// A disposition is what the controller delivers the launch with.
+async fn landing_judgement(
+    backend: &ResourceBackend,
+    convoy: &ResourceObject<Convoy>,
+    checkouts: &CheckoutFixture,
+    now: chrono::DateTime<chrono::Utc>,
+) -> LandingSettlement {
+    let vessels = select_convoy_children(convoy, &backend.including_replicas::<Vessel>("flotilla").list().await.expect("vessels").items);
+    let change_requests = backend
+        .using::<ChangeRequest>("flotilla")
+        .list()
+        .await
+        .expect("change requests")
+        .items
+        .into_iter()
+        .map(|record| (record.metadata.name.clone(), record))
+        .collect();
+    evaluate_landing_settlement_with_disposition(
+        convoy,
+        &vessels,
+        &held_checkouts(checkouts),
+        &change_requests,
+        &[],
+        Duration::from_secs(180),
+        Duration::from_secs(30),
+        now,
+    )
+}
+
+async fn reconcile_with_observed_digest(phase: ConvoyPhase, observed_digest: Option<&str>, existing_attention: bool) -> LandingSettlement {
     // The engine confirms this home's inspection as of now: the reconcile runs now.
     let now = chrono::Utc::now();
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -814,82 +679,39 @@ async fn reconcile_with_observed_digest(
         Inspection { remote_digest: observed_digest.map(str::to_string), ..Inspection::default() },
     );
 
-    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-        .with_lifecycle_reads(checkouts.reads.clone())
-        .with_clock(Arc::new(FixedClock(now)));
-    let prepared = reconciler.prepare(&convoy).await.expect("prepare convoy");
-    (reconciler.reconcile(&convoy, &prepared, now), now)
+    landing_judgement(&backend, &convoy, &checkouts, now).await
 }
 
 #[tokio::test]
 async fn approved_claim_settles_when_remote_ref_is_observed_at_claimed_digest() {
-    let (outcome, now) = reconcile_with_observed_digest(ConvoyPhase::Landing, Some("claimed-digest"), false).await;
-    assert_eq!(
-        settlement_transition(outcome.patch.clone()),
-        Some(controller_patches::settle("observed-digest".to_string(), Vec::new(), now))
-    );
+    let settlement = reconcile_with_observed_digest(ConvoyPhase::Landing, Some("claimed-digest"), false).await;
+    assert!(settlement.evaluation.satisfied, "{:?}", settlement.evaluation.unmet);
+    assert_eq!(settlement.disposition.as_deref(), Some("observed-digest"));
 }
 
 #[tokio::test]
 async fn different_observed_digest_holds_settlement_and_raises_attention() {
-    let (outcome, _) = reconcile_with_observed_digest(ConvoyPhase::Landing, Some("different-digest"), false).await;
-    let Some(ConvoyStatusPatch::SetSettlementAttention { attention }) = outcome.patch else {
-        panic!("digest mismatch should raise convoy attention")
-    };
-    let attention = attention.expect("mismatch attention");
-    assert_eq!(attention.source, "observed-digest");
-    assert!(attention.reason.contains("different-digest"));
-    assert!(attention.reason.contains("claimed-digest"));
-}
-
-#[tokio::test]
-async fn post_settlement_force_push_does_not_unsettle_convoy() {
-    let (outcome, _) = reconcile_with_observed_digest(ConvoyPhase::Landed, Some("different-digest"), false).await;
-    assert!(outcome.patch.is_none(), "Landed is terminal for the settled claim even after the remote ref moves");
+    let settlement = reconcile_with_observed_digest(ConvoyPhase::Landing, Some("different-digest"), false).await;
+    assert_eq!(settlement.disposition, None, "a mismatched digest holds settlement");
+    // The mismatch is what the controller notes as the convoy's observed-digest attention.
+    assert!(
+        settlement.evaluation.unmet.iter().any(|unmet| matches!(unmet,
+            UnmetSettlementExpectation::ObservedDigestMismatch { claimed, observed, .. }
+                if claimed == "claimed-digest" && observed == "different-digest")),
+        "{:?}",
+        settlement.evaluation.unmet
+    );
 }
 
 #[tokio::test]
 async fn observed_digest_attention_clears_when_mismatch_is_no_longer_observed() {
-    let (outcome, _) = reconcile_with_observed_digest(ConvoyPhase::Landing, None, true).await;
-    assert_eq!(outcome.patch, Some(ConvoyStatusPatch::SetSettlementAttention { attention: None }));
-}
-
-#[tokio::test]
-async fn convoy_finalizer_waits_for_remote_checkout_authority() {
-    let authority = ResourceBackend::new(InMemoryBackend::default());
-    let convoy =
-        authority.clone().using::<Convoy>("flotilla").create(&convoy_meta("convoy-a"), &valid_convoy_spec()).await.expect("create convoy");
-    // The checkout is held for the convoy at its own home, feta; its removal there was refused
-    // (preserved dirty work), so it stays realised.
-    let remote_checkouts = engine_checkouts("feta", "convoy-a");
-    let mut convoy = convoy;
-    convoy.status = Some(ConvoyStatus { engine_launch: Some(remote_checkouts.launch("convoy-a")), ..Default::default() });
-    let launch = remote_checkouts.put_ready(
-        "checkout-convoy-a-feta",
-        &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-            repo_ref: RepositoryKey("repo-a".to_string()),
-            env_ref: "host-direct-feta".to_string(),
-            r#ref: "feature/a".to_string(),
-            base_ref: Some("main".to_string()),
-            target_path: "/checkouts/a".to_string(),
-            clone_ref: "clone-a".to_string(),
-        }),
-        Some(&remote_checkouts.holder("convoy-a")),
+    let settlement = reconcile_with_observed_digest(ConvoyPhase::Landing, None, true).await;
+    // No mismatch is observed, so the controller clears the observed-digest attention it holds.
+    assert!(
+        !settlement.evaluation.unmet.iter().any(|unmet| matches!(unmet, UnmetSettlementExpectation::ObservedDigestMismatch { .. })),
+        "{:?}",
+        settlement.evaluation.unmet
     );
-    let reconciler =
-        ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla")).with_lifecycle_reads(remote_checkouts.reads.clone());
-
-    let error = reconciler.run_finalizer(&convoy).await.expect_err("remote checkout should hold convoy finalization");
-    assert!(matches!(&error, flotilla_resources::ResourceError::FinalizerWait { reasons } if reasons.len() == 1));
-    assert!(error.to_string().contains("teardown waiting on checkout checkout-convoy-a-feta"));
-    let patch = reconciler.finalizer_error_patch(&convoy, &error).expect("waiting reason should reach convoy status");
-    let mut status = ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() };
-    patch.apply(&mut status);
-    assert_eq!(status.message.as_deref(), Some("teardown waiting on checkout checkout-convoy-a-feta"));
-
-    // Its home releases it once the work is cleaned up.
-    remote_checkouts.finish(&launch, Ending::Released);
-    reconciler.run_finalizer(&convoy).await.expect("finalizer should complete after authority cleanup");
 }
 
 fn vessel_meta(name: &str, convoy_name: &str, task: &str) -> InputMeta {
@@ -916,432 +738,12 @@ fn vessel_meta(name: &str, convoy_name: &str, task: &str) -> InputMeta {
     }
 }
 
-fn vessel_object(convoy_name: &str, task: &str, phase: VesselPhase, message: Option<&str>) -> flotilla_resources::ResourceObject<Vessel> {
-    vessel_object_with_local_image_id(convoy_name, task, phase, message, "sha256:first")
-}
-
-fn vessel_object_with_local_image_id(
-    convoy_name: &str,
-    task: &str,
-    phase: VesselPhase,
-    message: Option<&str>,
-    local_image_id: &str,
-) -> flotilla_resources::ResourceObject<Vessel> {
-    let repository_key =
-        flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository identity").key();
-    flotilla_resources::ResourceObject {
-        metadata: common::object_meta(&format!("{convoy_name}-{task}"), "flotilla", "17"),
-        spec: VesselSpec {
-            convoy_ref: convoy_name.to_string(),
-            vessel_name: task.to_string(),
-            fulfilment_kind_ref: "laptop-docker".to_string(),
-            adopted_checkout_refs: Default::default(),
-        },
-        status: Some(VesselStatus {
-            image: None,
-            degraded: Default::default(),
-            configured_limits: None,
-            placement_decision: None,
-            phase,
-            message: message.map(str::to_string),
-            observed_kind_ref: Some("laptop-docker".to_string()),
-            observed_kind_version: Some("19".to_string()),
-            environment_ref: Some(format!("env-{task}")),
-            image_ref: Some("registry.example/crew:latest".to_string()),
-            local_image_id: Some(local_image_id.to_string()),
-            registry_digest: None,
-            checkout_refs: BTreeMap::from([(repository_key, format!("checkout-{task}"))]),
-            terminal_session_refs: vec![format!("terminal-{task}-coder")],
-            interrupted_roles: (phase == VesselPhase::Interrupted).then(|| "coder".to_string()).into_iter().collect(),
-            started_at: Some(timestamp(16)),
-            ready_at: (phase == VesselPhase::Ready).then(|| timestamp(18)),
-            requested_stance: None,
-            effective_stance: None,
-        }),
-    }
-}
-
 fn mark_crew_done(status: &mut flotilla_resources::ConvoyStatus, vessel: &str, role: &str) {
     let crew = status.crew_work.get_mut(vessel).expect("vessel crew work");
     let member = crew.get_mut(role).expect("crew member work");
     member.phase = CrewWorkPhase::Done;
     member.started_at = Some(timestamp(7));
     member.finished_at = Some(timestamp(8));
-}
-
-#[test]
-fn bootstrap_from_valid_template_returns_bootstrap_patch() {
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
-    let template = tool_only_workflow_template_object("review-and-fix");
-
-    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
-
-    let expected_snapshot = flotilla_resources::WorkflowSnapshot {
-        cascade: None,
-        stall_nudges: Default::default(),
-        supervision: None,
-        exit: template.spec.exit.clone(),
-        turn_delivery: template.spec.turn_delivery.clone(),
-        vessels: template
-            .spec
-            .vessels
-            .iter()
-            .map(|task| flotilla_resources::VesselRequirement {
-                needs: Default::default(),
-                name: task.name.clone(),
-                repository_refs: task.repository_refs.clone(),
-                credential_refs: task.credential_refs.clone(),
-                credential_scopes: task.credential_scopes.clone(),
-                depends_on: task.depends_on.clone(),
-                credential_permissions: Default::default(),
-                crew: task.crew.clone(),
-            })
-            .collect(),
-    };
-    let expected_tasks =
-        [("implement".to_string(), pending_task_state()), ("review".to_string(), pending_task_state())].into_iter().collect();
-    let expected_crew_work = BTreeMap::from([("implement".to_string(), BTreeMap::new()), ("review".to_string(), BTreeMap::new())]);
-    let expected_patch = controller_patches::bootstrap(
-        expected_snapshot,
-        "review-and-fix".to_string(),
-        [("review-and-fix".to_string(), "42".to_string())].into_iter().collect(),
-        expected_tasks,
-        expected_crew_work,
-        Vec::new(),
-        false,
-        ConvoyPhase::Pending,
-        None,
-    );
-
-    assert_eq!(outcome.patch, Some(expected_patch));
-    assert!(outcome.events.is_empty());
-}
-
-// ADR 0061: freezing copies the chosen declarations, exclusions, and deliverer
-// marker. Later template edits cannot add promises to an admitted convoy.
-#[test]
-fn bootstrap_freezes_template_promise_selection() {
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
-    let mut template = tool_only_workflow_template_object("review-and-fix");
-    let role = template.spec.vessels[0].crew[0].role.clone();
-    template.spec.vessels[0].crew[0].promises = vec![flotilla_resources::TemplatePromise::decision_ledger(&role)];
-    template.spec.vessels[0].crew[0].deliverer = true;
-    template.spec.exclude_template_promises(&[flotilla_resources::TemplatePromise::decision_ledger(&role)]).expect("winnow");
-    let expected = template.spec.vessels[0].crew[0].clone();
-    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
-    let mut status = flotilla_resources::ConvoyStatus::default();
-    outcome.patch.expect("bootstrap patch").apply(&mut status);
-    template.spec.vessels[0].crew[0].promise_exclusions.clear();
-    let snapshot = status.workflow_snapshot.as_ref().expect("frozen workflow");
-    assert_eq!(snapshot.vessels[0].crew[0], expected);
-    assert!(flotilla_resources::promises::template_declarations(&status).is_empty());
-}
-
-// ADR 0061 (#2987): the reconciler carries the spec's frozen dispatch
-// promises into Bootstrap, which opens them as dispatch-sourced promises.
-#[test]
-fn bootstrap_opens_frozen_dispatch_promises() {
-    use flotilla_resources::promises::{self, DispatchPromise, PromiseKind, PromiseSource, PromiseState};
-    let template = valid_workflow_template_object("review-and-fix");
-    let vessel = template.spec.vessels[0].name.clone();
-    let role = template.spec.vessels[0].crew[0].role.clone();
-    let mut spec = valid_convoy_spec();
-    spec.promises = vec![DispatchPromise { label: "api-split".into(), kind: PromiseKind::Pr, vessel: vessel.clone(), role: role.clone() }];
-    let convoy = convoy_object("convoy-a", spec.clone(), None);
-    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
-    let mut status = ConvoyStatus::default();
-    outcome.patch.expect("bootstrap patch").apply(&mut status);
-    let promise = promises::owned(&status, &vessel, &role).iter().find(|p| p.id == "api-split").expect("dispatch promise seeded");
-    assert_eq!((promise.source, promise.kind, promise.state), (PromiseSource::Dispatch, PromiseKind::Pr, PromiseState::Open));
-    assert!(promises::admitted_declarations(&spec.promises, &status, false).is_empty());
-}
-
-#[test]
-fn existing_convoy_backfills_agent_work_without_inventing_tool_state() {
-    let mut status = bootstrapped_convoy_status();
-    status.crew_work.clear();
-    status.work.get_mut("implement").expect("implement work").phase = WorkPhase::Running;
-    status.work.get_mut("implement").expect("implement work").started_at = Some(timestamp(9));
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(10));
-    let Some(ConvoyStatusPatch::BackfillCrewWork { crew_work, completion_overrides }) = outcome.patch else {
-        panic!("expected crew work backfill");
-    };
-
-    assert_eq!(crew_work["implement"].keys().map(String::as_str).collect::<Vec<_>>(), vec!["coder"]);
-    assert_eq!(crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
-    assert_eq!(crew_work["implement"]["coder"].started_at, Some(timestamp(9)));
-    assert_eq!(crew_work["review"].keys().map(String::as_str).collect::<Vec<_>>(), vec!["reviewer"]);
-    assert!(completion_overrides.is_empty());
-}
-
-#[test]
-fn existing_completed_work_backfills_as_a_rollup_override() {
-    let mut status = bootstrapped_convoy_status();
-    status.crew_work.clear();
-    let implement = status.work.get_mut("implement").expect("implement work");
-    implement.phase = WorkPhase::Complete;
-    implement.finished_at = Some(timestamp(9));
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(10));
-    let Some(ConvoyStatusPatch::BackfillCrewWork { crew_work, completion_overrides }) = outcome.patch else {
-        panic!("expected crew work backfill");
-    };
-
-    assert_eq!(crew_work["implement"]["coder"].phase, CrewWorkPhase::Pending);
-    assert!(completion_overrides.contains("implement"));
-}
-
-#[test]
-fn bootstrap_interpolates_tool_process_commands() {
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
-    let mut template = tool_only_workflow_template_object("review-and-fix");
-    if let CrewSource::Tool { command } = &mut template.spec.vessels[0].crew[0].source {
-        *command = "printf '{{workflow.namespace}}/{{workflow.name}}/{{inputs.feature}}/{{inputs.branch}}/{{.metadata.name}}'".to_string();
-    }
-
-    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
-
-    let Some(ConvoyStatusPatch::Bootstrap { workflow_snapshot, .. }) = outcome.patch else {
-        panic!("expected bootstrap patch");
-    };
-    let CrewSource::Tool { command } = &workflow_snapshot.vessels[0].crew[0].source else {
-        panic!("expected tool process");
-    };
-    assert_eq!(command, "printf 'flotilla/convoy-a/Retry logic/fix-retry-logic/{{.metadata.name}}'");
-}
-
-#[test]
-fn missing_template_fails_init() {
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
-
-    let outcome = reconcile(&convoy, None, timestamp(10));
-
-    assert!(matches!(outcome.patch, Some(ConvoyStatusPatch::FailInit { phase: ConvoyPhase::Failed, .. })));
-    assert!(matches!(
-        outcome.events.as_slice(),
-        [ConvoyEvent::TemplateNotFound { name }] if name == "review-and-fix"
-    ));
-}
-
-#[test]
-fn invalid_template_fails_init_with_validation_error_event() {
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
-    let mut template = valid_workflow_template_object("review-and-fix");
-    template.spec.vessels[1].depends_on = vec!["missing".to_string()];
-
-    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
-
-    assert!(matches!(outcome.patch, Some(ConvoyStatusPatch::FailInit { phase: ConvoyPhase::Failed, .. })));
-    assert!(matches!(
-        outcome.events.as_slice(),
-        [ConvoyEvent::TemplateInvalid { name, errors }]
-            if name == "review-and-fix"
-                && matches!(errors.as_slice(), [ValidationError::UnknownDependency { vessel, missing }] if vessel == "review" && missing == "missing")
-    ));
-}
-
-#[test]
-fn missing_required_input_fails_init() {
-    let mut spec = valid_convoy_spec();
-    spec.inputs.remove("branch");
-    let convoy = convoy_object("convoy-a", spec, None);
-    let template = tool_only_workflow_template_object("review-and-fix");
-
-    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
-
-    assert!(matches!(outcome.patch, Some(ConvoyStatusPatch::FailInit { phase: ConvoyPhase::Failed, .. })));
-    assert!(matches!(
-        outcome.events.as_slice(),
-        [ConvoyEvent::MissingInput { name }] if name == "branch"
-    ));
-}
-
-#[test]
-fn extra_input_is_allowed() {
-    let mut spec = valid_convoy_spec();
-    spec.inputs.insert("extra".to_string(), InputValue::String("ignored".to_string()));
-    let convoy = convoy_object("convoy-a", spec, None);
-    let template = tool_only_workflow_template_object("review-and-fix");
-
-    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
-
-    assert!(matches!(outcome.patch, Some(ConvoyStatusPatch::Bootstrap { .. })));
-    assert!(outcome.events.is_empty());
-}
-
-#[test]
-fn fan_out_advances_all_newly_ready_tasks() {
-    let spec = valid_convoy_spec();
-    let mut status = bootstrapped_convoy_status();
-    status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
-        cascade: None,
-        stall_nudges: Default::default(),
-        supervision: None,
-        exit: None,
-        turn_delivery: Default::default(),
-        vessels: vec![
-            flotilla_resources::VesselRequirement {
-                needs: Default::default(),
-                name: "a".to_string(),
-                repository_refs: None,
-                credential_refs: Default::default(),
-                credential_scopes: Default::default(),
-                depends_on: Vec::new(),
-                credential_permissions: Default::default(),
-                crew: Vec::new(),
-            },
-            flotilla_resources::VesselRequirement {
-                needs: Default::default(),
-                name: "b".to_string(),
-                repository_refs: None,
-                credential_refs: Default::default(),
-                credential_scopes: Default::default(),
-                depends_on: Vec::new(),
-                credential_permissions: Default::default(),
-                crew: Vec::new(),
-            },
-            flotilla_resources::VesselRequirement {
-                needs: Default::default(),
-                name: "c".to_string(),
-                repository_refs: None,
-                credential_refs: Default::default(),
-                credential_scopes: Default::default(),
-                depends_on: Vec::new(),
-                credential_permissions: Default::default(),
-                crew: Vec::new(),
-            },
-        ],
-    });
-    status.crew_work =
-        BTreeMap::from([("a".to_string(), BTreeMap::new()), ("b".to_string(), BTreeMap::new()), ("c".to_string(), BTreeMap::new())]);
-    status.work =
-        [("a".to_string(), pending_task_state()), ("b".to_string(), pending_task_state()), ("c".to_string(), pending_task_state())]
-            .into_iter()
-            .collect();
-
-    let convoy = convoy_object("convoy-a", spec, Some(status));
-    let outcome = reconcile(&convoy, None, timestamp(20));
-
-    assert_eq!(
-        outcome.patch,
-        Some(controller_patches::advance_work_to_ready(
-            [("a".to_string(), timestamp(20)), ("b".to_string(), timestamp(20)), ("c".to_string(), timestamp(20)),].into_iter().collect()
-        ))
-    );
-}
-
-#[test]
-fn fan_in_waits_until_all_dependencies_complete() {
-    let mut status = bootstrapped_convoy_status();
-    status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
-        cascade: None,
-        stall_nudges: Default::default(),
-        supervision: None,
-        exit: None,
-        turn_delivery: Default::default(),
-        vessels: vec![
-            flotilla_resources::VesselRequirement {
-                needs: Default::default(),
-                name: "implement".to_string(),
-                repository_refs: None,
-                credential_refs: Default::default(),
-                credential_scopes: Default::default(),
-                depends_on: Vec::new(),
-                credential_permissions: Default::default(),
-                crew: Vec::new(),
-            },
-            flotilla_resources::VesselRequirement {
-                needs: Default::default(),
-                name: "verify".to_string(),
-                repository_refs: None,
-                credential_refs: Default::default(),
-                credential_scopes: Default::default(),
-                depends_on: Vec::new(),
-                credential_permissions: Default::default(),
-                crew: Vec::new(),
-            },
-            flotilla_resources::VesselRequirement {
-                needs: Default::default(),
-                name: "review".to_string(),
-                repository_refs: None,
-                credential_refs: Default::default(),
-                credential_scopes: Default::default(),
-                depends_on: vec!["implement".to_string(), "verify".to_string()],
-                credential_permissions: Default::default(),
-                crew: Vec::new(),
-            },
-        ],
-    });
-    status.crew_work = BTreeMap::from([
-        ("implement".to_string(), BTreeMap::new()),
-        ("verify".to_string(), BTreeMap::new()),
-        ("review".to_string(), BTreeMap::new()),
-    ]);
-    status.work.insert("verify".to_string(), pending_task_state());
-    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Complete;
-    status.work.get_mut("implement").expect("implement").finished_at = Some(timestamp(8));
-    status.work.get_mut("verify").expect("verify").phase = WorkPhase::Running;
-    status.work.get_mut("verify").expect("verify").started_at = Some(timestamp(9));
-    status.work.get_mut("review").expect("review").phase = WorkPhase::Pending;
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status.clone()));
-
-    let first = reconcile(&convoy, None, timestamp(20));
-    assert_eq!(first.patch, Some(controller_patches::roll_up_phase(ConvoyPhase::Active, Some(timestamp(20)), None)));
-
-    status.work.get_mut("verify").expect("verify").phase = WorkPhase::Complete;
-    status.work.get_mut("verify").expect("verify").finished_at = Some(timestamp(10));
-    status.phase = ConvoyPhase::Active;
-
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-    let second = reconcile(&convoy, None, timestamp(21));
-
-    assert_eq!(
-        second.patch,
-        Some(controller_patches::advance_work_to_ready([("review".to_string(), timestamp(21))].into_iter().collect()))
-    );
-}
-
-#[test]
-fn failed_task_triggers_fail_fast() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Failed;
-    status.work.get_mut("implement").expect("implement").finished_at = Some(timestamp(12));
-    status.work.get_mut("implement").expect("implement").message = Some("agent adapter codex unavailable".to_string());
-    status.work.get_mut("review").expect("review").phase = WorkPhase::Running;
-    status.work.get_mut("review").expect("review").started_at = Some(timestamp(11));
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(30));
-
-    assert_eq!(
-        outcome.patch,
-        Some(controller_patches::fail_convoy(
-            [("review".to_string(), timestamp(30))].into_iter().collect(),
-            timestamp(30),
-            Some("agent adapter codex unavailable".to_string())
-        ))
-    );
-}
-
-#[test]
-fn reconciler_does_not_write_the_completion_claim_edge() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    for task in status.work.values_mut() {
-        task.phase = WorkPhase::Complete;
-        task.finished_at = Some(timestamp(12));
-    }
-    mark_crew_done(&mut status, "implement", "coder");
-    mark_crew_done(&mut status, "review", "reviewer");
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(40));
-
-    assert_eq!(outcome.patch, None);
 }
 
 #[test]
@@ -1356,9 +758,18 @@ fn landing_convoy_with_no_declared_exit_never_settles() {
     mark_crew_done(&mut status, "review", "reviewer");
     let convoy = convoy_object("standing", valid_convoy_spec(), Some(status));
 
-    let outcome = reconcile(&convoy, None, timestamp(40));
+    let settlement = evaluate_landing_settlement_with_disposition(
+        &convoy,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &[],
+        Duration::from_secs(180),
+        Duration::from_secs(30),
+        timestamp(40),
+    );
 
-    assert_eq!(outcome.patch, None, "an absent exit must not synthesize a Landed transition");
+    assert_eq!(settlement.disposition, None, "an absent exit must not synthesize a delivery");
 }
 
 #[test]
@@ -1466,7 +877,7 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
     let evaluation = evaluate(&records);
     assert!(evaluation.satisfied, "old merged observations must settle: {:?}", evaluation.unmet);
     assert!(evaluation.unmet.is_empty(), "explain must not report merged observations as stale");
-    // The satisfied exit must drive the real lifecycle transition to Landed.
+    // The satisfied exit must drive delivery.
     let settlement = evaluate_landing_settlement_with_disposition(
         &convoy,
         &BTreeMap::new(),
@@ -1477,22 +888,7 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
         Duration::from_secs(180),
         now,
     );
-    let outcome = reconcile_internal(
-        &convoy,
-        None,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        LifecycleConditions {
-            exit_disposition: settlement.disposition,
-            engine_delivered: None,
-            reclaim_eligible: false,
-            settlement_evidence: Some(settlement.evaluation),
-        },
-        now,
-    );
-    let mut landed = convoy.status.clone().expect("status");
-    outcome.patch.expect("landing transition").apply(&mut landed);
-    assert_eq!(landed.phase, ConvoyPhase::Landed);
+    assert!(settlement.disposition.is_some(), "the satisfied exit yields the disposition the launch is delivered with");
     // An unmatched exit explains a false condition, never stale Merged evidence.
     let mut closed_only = convoy.clone();
     if let Some(ExitDeclaration::Table(entries)) =
@@ -1699,7 +1095,7 @@ async fn produced_subject_discovery_completes_branch_scan_from_every_source() {
 }
 
 // A historical scan error is diagnostic once a produced PR is known; without
-// subjects, discovery still gates Landing. Exercise both through the real reconciler.
+// subjects, discovery still gates Landing. Exercise both through the controller's judgement.
 #[tokio::test]
 async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
     for known_subject in [false, true] {
@@ -1764,51 +1160,33 @@ async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
             .update_status(&name, &record.metadata.resource_version, &merged_change_request_status(timestamp(40)))
             .await
             .expect("merged");
-        let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-            .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
-            .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
-            .with_clock(Arc::new(FixedClock(timestamp(40))));
         let current = convoys.get("stale-scan").await.expect("convoy");
-        let deps = reconciler.prepare(&current).await.expect("deps");
-        let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
+        let settlement = landing_judgement(&backend, &current, &CheckoutFixture::default(), timestamp(40)).await;
+        let discovery_pending =
+            settlement.evaluation.unmet.iter().any(|unmet| matches!(unmet, UnmetSettlementExpectation::SubjectDiscoveryPending { .. }));
         if known_subject {
-            // Discovery first creates its submission, then the merge keeps it,
-            // and only then can the exit table settle despite the old scan error.
-            if let Some(patch) = outcome.patch {
-                flotilla_store::apply_status_patch(&convoys, "stale-scan", &patch).await.unwrap();
-            }
-            for _ in 0..5 {
-                let current = convoys.get("stale-scan").await.unwrap();
-                let prepared = reconciler.prepare(&current).await.unwrap();
-                if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(40)).patch {
-                    flotilla_store::apply_status_patch(&convoys, "stale-scan", &patch).await.unwrap();
-                }
-            }
-            assert_eq!(convoys.get("stale-scan").await.unwrap().status.unwrap().phase, ConvoyPhase::Landed);
+            // Settling also waits for the discovered PR's promise to be kept; the old scan error
+            // no longer holds it.
+            assert!(!discovery_pending, "a known subject is not held by the old scan error: {:?}", settlement.evaluation.unmet);
         } else {
-            assert!(outcome.patch.is_none(), "no subjects must still wait for discovery");
+            assert!(discovery_pending, "no subjects must still wait for discovery: {:?}", settlement.evaluation.unmet);
+            assert_eq!(settlement.disposition, None);
         }
     }
 }
 
 #[tokio::test]
 async fn landing_discharges_checkout_without_change_request_despite_false_landed_condition() {
-    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(false)), None, false).await;
+    let settlement = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(false)), None, false).await;
 
-    assert_eq!(
-        settlement_transition(outcome.patch.clone()),
-        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
-    );
+    assert_eq!(settlement.disposition.as_deref(), Some("merged"));
 }
 
 #[tokio::test]
 async fn landing_with_settled_change_request_becomes_landed() {
-    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(true)), Some("main"), false).await;
+    let settlement = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(true)), Some("main"), false).await;
 
-    assert_eq!(
-        settlement_transition(outcome.patch.clone()),
-        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
-    );
+    assert_eq!(settlement.disposition.as_deref(), Some("merged"));
 }
 
 #[tokio::test]
@@ -1847,8 +1225,7 @@ async fn completed_crew_cannot_stall_landing_while_change_request_merges() {
     assert!(status.stalled.is_none());
 
     let merged = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(true)), Some("main"), false).await;
-    merged.patch.expect("merged change request settles landing").apply(&mut status);
-    assert_eq!(status.phase, ConvoyPhase::Landed);
+    assert_eq!(merged.disposition.as_deref(), Some("merged"), "the merged change request settles landing");
 }
 
 // #3145: a resume milliseconds after an accepted claim must preserve Landing
@@ -1892,51 +1269,38 @@ async fn resume_after_claim_preserves_landing() {
     assert_eq!(explicitly_reopened.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
     assert!(explicitly_reopened.crew_work["implement"]["coder"].finished_at.is_none());
 
+    assert_eq!(status.phase, ConvoyPhase::Landing);
     let merged = reconcile_with_observed_change_request(status.phase, Some(Some(true)), Some("main"), false).await;
-    merged.patch.expect("settlement remains reachable").apply(&mut status);
-    assert_eq!(status.phase, ConvoyPhase::Landed);
+    assert_eq!(merged.disposition.as_deref(), Some("merged"), "settlement remains reachable");
 }
 
 #[tokio::test]
 async fn landing_on_a_different_target_records_a_fact_and_still_becomes_landed() {
-    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(true)), Some("release"), false).await;
+    let settlement = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(true)), Some("release"), false).await;
 
-    let expected_mismatch = TargetMismatch::builder()
-        .repo_ref(RepositoryKey("repo-a".to_string()))
-        .change_request_id("42".to_string())
-        .declared_target_ref("main".to_string())
-        .observed_target_ref("release".to_string())
-        .build();
-    assert_eq!(
-        settlement_transition(outcome.patch.clone()),
-        Some(controller_patches::settle("merged".to_string(), vec![expected_mismatch.clone()], timestamp(40)))
-    );
-    let mut status = ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
-    outcome.patch.expect("settlement patch").apply(&mut status);
-    assert_eq!(status.phase, ConvoyPhase::Landed);
-    assert_eq!(status.target_mismatches, [expected_mismatch]);
+    // The landed target that differs from the declared one no longer becomes a stored fact: the
+    // engine's delivery carries no target mismatch (#3108 C4').
+    assert_eq!(settlement.disposition.as_deref(), Some("merged"));
 }
 
 #[tokio::test]
 async fn landing_without_checkout_evidence_stays_landing() {
-    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, None, None, false).await;
+    let settlement = reconcile_with_observed_change_request(ConvoyPhase::Landing, None, None, false).await;
 
-    assert_eq!(outcome.patch, None);
+    assert_eq!(settlement.disposition, None);
 }
 
 #[tokio::test]
 async fn landing_discharges_checkout_without_change_request_despite_stale_landed_evidence() {
-    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(true)), None, true).await;
+    let settlement = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(true)), None, true).await;
 
-    assert_eq!(
-        settlement_transition(outcome.patch.clone()),
-        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
-    );
+    assert_eq!(settlement.disposition.as_deref(), Some("merged"));
 }
 
 struct TerminalChangeRequestReconcile {
     evaluation: flotilla_resources::SettlementEvaluation,
-    outcome: ControllerReconcileOutcome<Convoy>,
+    /// The controller's judgement: its vessels, held checkouts and change requests.
+    settlement: LandingSettlement,
     backend: ResourceBackend,
     /// The engine's checkouts the convoy reads, and the launch of `checkout-a` when present.
     checkouts: CheckoutFixture,
@@ -1949,7 +1313,6 @@ async fn reconcile_terminal_bound_change_request(
     untouched_checkout: bool,
 ) -> TerminalChangeRequestReconcile {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let checkouts = engine_checkouts("host-a", "convoy-a");
     let change_requests = backend.clone().using::<ChangeRequest>("flotilla");
@@ -2076,29 +1439,15 @@ async fn reconcile_terminal_bound_change_request(
         Duration::from_secs(30),
         timestamp(40),
     );
-    let reconciler = ConvoyReconciler::new(templates)
-        .with_vessels(vessels)
-        .with_lifecycle_reads(checkouts.reads.clone())
-        .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), std::time::Duration::from_secs(180))
-        .with_clock(Arc::new(FixedClock(timestamp(40))));
-    let deps = reconciler.prepare(&current).await.expect("dependencies");
-    TerminalChangeRequestReconcile {
-        evaluation,
-        outcome: reconciler.reconcile(&current, &deps, timestamp(40)),
-        backend,
-        checkouts,
-        checkout_launch,
-    }
+    let settlement = landing_judgement(&backend, &current, &checkouts, timestamp(40)).await;
+    TerminalChangeRequestReconcile { evaluation, settlement, backend, checkouts, checkout_launch }
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_settles_checkout_without_own_landed_evidence() {
-    let TerminalChangeRequestReconcile { outcome, .. } = reconcile_terminal_bound_change_request(true, true, false).await;
+    let TerminalChangeRequestReconcile { settlement, .. } = reconcile_terminal_bound_change_request(true, true, false).await;
 
-    assert_eq!(
-        settlement_transition(outcome.patch.clone()),
-        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
-    );
+    assert_eq!(settlement.disposition.as_deref(), Some("merged"));
 }
 
 // #3710: a merged record older than the observer TTL still settles Landing;
@@ -2116,53 +1465,31 @@ async fn landing_settles_on_merged_record_older_than_stale_after() {
         records.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("old merge");
     }
     let current = backend.using::<Convoy>("flotilla").get("convoy-a").await.expect("convoy");
-    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-        .with_vessels(backend.using::<Vessel>("flotilla"))
-        .with_lifecycle_reads(checkouts.reads.clone())
-        .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
-        .with_clock(Arc::new(FixedClock(timestamp(40))));
-    let prepared = reconciler.prepare(&current).await.expect("prepare");
-    assert!(settlement_transition(reconciler.reconcile(&current, &prepared, timestamp(40)).patch).is_some());
+    let settlement = landing_judgement(&backend, &current, &checkouts, timestamp(40)).await;
+    assert!(settlement.disposition.is_some(), "{:?}", settlement.evaluation.unmet);
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_discharges_missing_checkout_after_vessel_teardown() {
-    let TerminalChangeRequestReconcile { outcome, .. } = reconcile_terminal_bound_change_request(false, false, false).await;
+    let TerminalChangeRequestReconcile { settlement, .. } = reconcile_terminal_bound_change_request(false, false, false).await;
 
-    assert_eq!(
-        settlement_transition(outcome.patch.clone()),
-        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
-    );
+    assert_eq!(settlement.disposition.as_deref(), Some("merged"));
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_keeps_missing_checkout_expectation_for_live_vessel() {
-    let TerminalChangeRequestReconcile { outcome, .. } = reconcile_terminal_bound_change_request(false, true, false).await;
+    let TerminalChangeRequestReconcile { settlement, .. } = reconcile_terminal_bound_change_request(false, true, false).await;
 
-    assert_eq!(outcome.patch, None);
+    assert_eq!(settlement.disposition, None);
 }
 
 #[tokio::test]
 async fn merged_change_request_discharges_present_context_checkout_without_change_request() {
-    let TerminalChangeRequestReconcile { evaluation, outcome, .. } = reconcile_terminal_bound_change_request(true, true, true).await;
+    let TerminalChangeRequestReconcile { evaluation, settlement, .. } = reconcile_terminal_bound_change_request(true, true, true).await;
 
     assert!(evaluation.satisfied, "the untouched context checkout must not block the merged exit: {:?}", evaluation.unmet);
     assert!(evaluation.unmet.is_empty());
-    let patch = outcome.patch.expect("merged disposition should settle the convoy");
-    assert_eq!(
-        settlement_transition(Some(patch.clone())),
-        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
-    );
-    let mut status = ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
-    patch.apply(&mut status);
-    assert_eq!(status.phase, ConvoyPhase::Landed);
-}
-
-#[tokio::test]
-async fn landed_with_reopened_change_request_does_not_write_phase() {
-    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landed, Some(Some(false)), None, false).await;
-
-    assert_eq!(outcome.patch, None);
+    assert_eq!(settlement.disposition.as_deref(), Some("merged"), "the merged disposition settles the convoy");
 }
 
 #[tokio::test]
@@ -2235,722 +1562,47 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
     records.update_status(&record_name, &record.metadata.resource_version, &open).await.expect("open change request");
 
     let current = convoys.get("cross-host").await.expect("get authority convoy");
-    let reconciler = ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla"))
-        .with_lifecycle_reads(remote_checkouts.reads.clone())
-        .with_change_requests(authority.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
-        .with_clock(Arc::new(FixedClock(timestamp(40))));
-    let deps = reconciler.prepare(&current).await.expect("resolve federated dependencies");
-    let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
-    let Some(ConvoyStatusPatch::DiscoverSubjects { subjects, .. }) = outcome.patch else {
-        panic!("remote checkout evidence must be persisted before settlement");
+    // What the controller reads: the remote checkout held for the launch, and the observed record.
+    let change_requests: BTreeMap<_, _> =
+        records.list().await.expect("records").items.into_iter().map(|record| (record.metadata.name.clone(), record)).collect();
+    let state_of = |subject: &Subject| {
+        let address = flotilla_resources::address::subject_address(subject, &[]).ok()?;
+        change_requests.get(&flotilla_resources::address::record_name(&address)?)?.status.as_ref()?.state.value
     };
-    assert_eq!(subjects.len(), 1);
-    flotilla_store::apply_status_patch(
-        &convoys,
+    let subjects = flotilla_resources::observed_change_request_subjects(&current, &held_checkouts(&remote_checkouts), &[], &state_of)
+        .expect("remote checkout evidence");
+    assert_eq!(subjects.len(), 1, "the remote checkout's change request is found on its branch");
+    // The controller links it; the view then reads it as a produced subject.
+    let mut status = current.status.clone().expect("status");
+    ConvoyStatusPatch::DiscoverSubjects {
+        subjects: subjects.into_iter().map(|subject| (subject, Relationship::Produces)).collect(),
+        source: flotilla_resources::SubjectDiscoverySource::Branch,
+        at: timestamp(40),
+    }
+    .apply(&mut status);
+    let Some(observation @ ConvoyStatusPatch::ObservePromise { .. }) = flotilla_resources::promises::next_observation(
+        &status,
         "cross-host",
-        &ConvoyStatusPatch::DiscoverSubjects { subjects, source: flotilla_resources::SubjectDiscoverySource::Branch, at: timestamp(40) },
-    )
-    .await
-    .expect("persist discovered request");
-    let current = convoys.get("cross-host").await.expect("convoy with discovered request");
-    let deps = reconciler.prepare(&current).await.expect("resolve federated dependencies");
-    let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
-    let patch = outcome.patch.expect("discovered PR creates a promise before exit evaluation");
-    flotilla_store::apply_status_patch(&convoys, "cross-host", &patch).await.unwrap();
-    let status = convoys.get("cross-host").await.unwrap().status.unwrap();
-    assert_eq!(status.phase, ConvoyPhase::Landing, "an open remote change request must hold Landing");
+        &change_requests,
+        &BTreeMap::new(),
+        &[],
+        timestamp(40),
+        Duration::from_secs(180),
+    ) else {
+        panic!("the discovered PR is observed as a submission before exit evaluation");
+    };
+    observation.apply(&mut status);
     assert!(status
         .promises
         .values()
         .flat_map(BTreeMap::values)
         .flatten()
         .any(|promise| promise.state == flotilla_resources::promises::PromiseState::Submitted));
+    let mut current = current;
+    current.status = Some(status);
+    let settlement = landing_judgement(&authority, &current, &remote_checkouts, timestamp(40)).await;
+    assert_eq!(settlement.disposition, None, "an open remote change request must hold Landing");
 }
-
-#[test]
-fn terminal_landed_convoy_reconciles_to_noop() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Landed;
-    status.finished_at = Some(timestamp(40));
-    for task in status.work.values_mut() {
-        task.phase = WorkPhase::Complete;
-        task.finished_at = Some(timestamp(12));
-    }
-    mark_crew_done(&mut status, "implement", "coder");
-    mark_crew_done(&mut status, "review", "reviewer");
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(41));
-
-    assert_eq!(outcome.patch, None);
-    assert!(outcome.events.is_empty());
-}
-
-#[test]
-fn terminal_failed_convoy_reconciles_to_noop() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Failed;
-    status.finished_at = Some(timestamp(30));
-    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Failed;
-    status.work.get_mut("implement").expect("implement").finished_at = Some(timestamp(12));
-    status.work.get_mut("review").expect("review").phase = WorkPhase::Cancelled;
-    status.work.get_mut("review").expect("review").finished_at = Some(timestamp(30));
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(31));
-
-    assert_eq!(outcome.patch, None);
-    assert!(outcome.events.is_empty());
-}
-
-#[test]
-fn terminal_failed_init_convoy_reconciles_to_noop() {
-    let mut status = common::convoy_status(ConvoyPhase::Failed);
-    status.message = Some("missing input 'branch'".to_string());
-    status.finished_at = Some(timestamp(30));
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, Some(&tool_only_workflow_template_object("review-and-fix")), timestamp(31));
-
-    assert_eq!(outcome.patch, None);
-    assert!(outcome.events.is_empty());
-}
-
-#[test]
-fn advancing_ready_tasks_emits_task_phase_change_events() {
-    let spec = valid_convoy_spec();
-    let mut status = bootstrapped_convoy_status();
-    status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
-        cascade: None,
-        stall_nudges: Default::default(),
-        supervision: None,
-        exit: None,
-        turn_delivery: Default::default(),
-        vessels: vec![
-            flotilla_resources::VesselRequirement {
-                needs: Default::default(),
-                name: "a".to_string(),
-                repository_refs: None,
-                credential_refs: Default::default(),
-                credential_scopes: Default::default(),
-                depends_on: Vec::new(),
-                credential_permissions: Default::default(),
-                crew: Vec::new(),
-            },
-            flotilla_resources::VesselRequirement {
-                needs: Default::default(),
-                name: "b".to_string(),
-                repository_refs: None,
-                credential_refs: Default::default(),
-                credential_scopes: Default::default(),
-                depends_on: Vec::new(),
-                credential_permissions: Default::default(),
-                crew: Vec::new(),
-            },
-            flotilla_resources::VesselRequirement {
-                needs: Default::default(),
-                name: "c".to_string(),
-                repository_refs: None,
-                credential_refs: Default::default(),
-                credential_scopes: Default::default(),
-                depends_on: Vec::new(),
-                credential_permissions: Default::default(),
-                crew: Vec::new(),
-            },
-        ],
-    });
-    status.work =
-        [("a".to_string(), pending_task_state()), ("b".to_string(), pending_task_state()), ("c".to_string(), pending_task_state())]
-            .into_iter()
-            .collect();
-
-    let convoy = convoy_object("convoy-a", spec, Some(status));
-    let outcome = reconcile(&convoy, None, timestamp(20));
-
-    assert!(matches!(
-        outcome.events.as_slice(),
-        [
-            ConvoyEvent::WorkPhaseChanged { work: a, from: WorkPhase::Pending, to: WorkPhase::Ready },
-            ConvoyEvent::WorkPhaseChanged { work: b, from: WorkPhase::Pending, to: WorkPhase::Ready },
-            ConvoyEvent::WorkPhaseChanged { work: c, from: WorkPhase::Pending, to: WorkPhase::Ready },
-        ] if a == "a" && b == "b" && c == "c"
-    ));
-}
-
-#[test]
-fn fail_fast_emits_phase_and_task_phase_change_events() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Failed;
-    status.work.get_mut("implement").expect("implement").finished_at = Some(timestamp(12));
-    status.work.get_mut("review").expect("review").phase = WorkPhase::Running;
-    status.work.get_mut("review").expect("review").started_at = Some(timestamp(11));
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(30));
-
-    assert!(matches!(
-        outcome.events.as_slice(),
-        [
-            ConvoyEvent::PhaseChanged { from: ConvoyPhase::Active, to: ConvoyPhase::Failed },
-            ConvoyEvent::WorkPhaseChanged { work, from: WorkPhase::Running, to: WorkPhase::Cancelled },
-        ] if work == "review"
-    ));
-}
-
-#[test]
-fn roll_up_to_active_emits_phase_change_event() {
-    let mut status = bootstrapped_convoy_status();
-    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Complete;
-    status.work.get_mut("implement").expect("implement").finished_at = Some(timestamp(8));
-    mark_crew_done(&mut status, "implement", "coder");
-    status.work.get_mut("review").expect("review").phase = WorkPhase::Running;
-    status.work.get_mut("review").expect("review").started_at = Some(timestamp(9));
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(20));
-
-    assert!(matches!(outcome.events.as_slice(), [ConvoyEvent::PhaseChanged { from: ConvoyPhase::Pending, to: ConvoyPhase::Active }]));
-}
-
-#[test]
-fn workflow_ref_change_after_init_fails_defensively() {
-    let mut spec = valid_convoy_spec();
-    spec.workflow_ref = "new-template".to_string();
-    let convoy = convoy_object("convoy-a", spec, Some(bootstrapped_convoy_status()));
-
-    let outcome = reconcile(&convoy, None, timestamp(50));
-
-    assert!(matches!(outcome.patch, Some(ConvoyStatusPatch::FailInit { phase: ConvoyPhase::Failed, .. })));
-    assert!(matches!(
-        outcome.events.as_slice(),
-        [ConvoyEvent::WorkflowRefChanged { from, to }] if from == "review-and-fix" && to == "new-template"
-    ));
-}
-
-#[test]
-fn snapshot_state_allows_advancement_without_template() {
-    let mut status = bootstrapped_convoy_status();
-    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Complete;
-    status.work.get_mut("implement").expect("implement").finished_at = Some(timestamp(12));
-    mark_crew_done(&mut status, "implement", "coder");
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(60));
-
-    assert_eq!(
-        outcome.patch,
-        Some(controller_patches::advance_work_to_ready([("review".to_string(), timestamp(60))].into_iter().collect()))
-    );
-}
-
-#[test]
-fn bootstrap_preserves_agent_processes_for_runtime_resolution() {
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), None);
-    let template = valid_workflow_template_object("review-and-fix");
-
-    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
-
-    let Some(ConvoyStatusPatch::Bootstrap { workflow_snapshot, .. }) = outcome.patch else {
-        panic!("agent workflow should bootstrap");
-    };
-    let CrewSource::Agent { selector, prompt, .. } = &workflow_snapshot.vessels[0].crew[0].source else {
-        panic!("agent source should survive in the workflow snapshot");
-    };
-    assert_eq!(selector.capability, "code");
-    assert_eq!(prompt.as_deref(), Some("Convoy convoy-a - implement Retry logic on branch fix-retry-logic."));
-}
-
-#[test]
-fn bootstrap_seeds_pending_work_for_agents_but_not_support_processes() {
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), None);
-    let template = valid_workflow_template_object("review-and-fix");
-
-    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
-
-    let Some(ConvoyStatusPatch::Bootstrap { crew_work, .. }) = outcome.patch else {
-        panic!("agent workflow should bootstrap");
-    };
-    assert_eq!(crew_work["implement"]["coder"].phase, CrewWorkPhase::Pending);
-    assert!(!crew_work["implement"].contains_key("build"));
-    assert_eq!(crew_work["review"]["reviewer"].phase, CrewWorkPhase::Pending);
-    assert!(!crew_work["review"].contains_key("tests"));
-}
-
-#[test]
-fn all_agent_crew_done_rolls_vessel_work_complete() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.work.get_mut("implement").expect("implement work").phase = WorkPhase::Running;
-    let coder = status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder work");
-    coder.phase = CrewWorkPhase::Done;
-    coder.started_at = Some(timestamp(10));
-    coder.finished_at = Some(timestamp(20));
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(21));
-
-    assert_eq!(outcome.patch, Some(controller_patches::roll_up_work("implement".to_string(), WorkPhase::Complete, timestamp(21), None,)));
-}
-
-#[test]
-fn interactive_convoy_stays_active_until_crew_reports_complete() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.workflow_snapshot = Some(WorkflowSnapshot {
-        cascade: None,
-        stall_nudges: Default::default(),
-        supervision: None,
-        exit: None,
-        turn_delivery: Default::default(),
-        vessels: interactive_single_workflow_spec().vessels,
-    });
-    let mut work = status.work.remove("implement").expect("seed work");
-    work.phase = WorkPhase::Running;
-    status.work = BTreeMap::from([("work".to_string(), work)]);
-    let mut crew = status.crew_work.remove("implement").expect("seed crew");
-    crew.get_mut("coder").expect("coder work").phase = CrewWorkPhase::Working;
-    status.crew_work = BTreeMap::from([("work".to_string(), crew)]);
-    status.observed_workflow_ref = Some("interactive-single".to_string());
-    status.observed_workflows = Some(BTreeMap::from([("interactive-single".to_string(), "42".to_string())]));
-    let mut spec = valid_convoy_spec();
-    spec.workflow_ref = "interactive-single".to_string();
-
-    let waiting = convoy_object("interactive", spec.clone(), Some(status.clone()));
-    assert_eq!(reconcile(&waiting, None, timestamp(21)).patch, None);
-
-    status.crew_work.get_mut("work").expect("work crew").get_mut("coder").expect("coder work").phase = CrewWorkPhase::Done;
-    let completed = convoy_object("interactive", spec, Some(status));
-    assert_eq!(
-        reconcile(&completed, None, timestamp(22)).patch,
-        Some(controller_patches::roll_up_work("work".to_string(), WorkPhase::Complete, timestamp(22), None))
-    );
-}
-
-#[test]
-fn failed_agent_crew_rolls_vessel_work_failed() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.work.get_mut("implement").expect("implement work").phase = WorkPhase::Running;
-    let coder = status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder work");
-    coder.phase = CrewWorkPhase::Failed;
-    coder.finished_at = Some(timestamp(20));
-    coder.message = Some("blocked by credentials".to_string());
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(21));
-
-    assert_eq!(
-        outcome.patch,
-        Some(controller_patches::roll_up_work(
-            "implement".to_string(),
-            WorkPhase::Failed,
-            timestamp(21),
-            Some("blocked by credentials".to_string()),
-        ))
-    );
-}
-
-#[test]
-fn support_only_work_does_not_complete_vacuously() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.work.get_mut("implement").expect("implement work").phase = WorkPhase::Running;
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(21));
-
-    assert_eq!(outcome.patch, None);
-}
-
-#[test]
-fn human_completion_override_is_not_reopened_by_crew_rollup() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    let implement = status.work.get_mut("implement").expect("implement work");
-    implement.phase = WorkPhase::Complete;
-    implement.completion_authority = WorkCompletionAuthority::HumanOverride;
-    implement.finished_at = Some(timestamp(20));
-    status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(21));
-
-    assert!(!matches!(outcome.patch, Some(ConvoyStatusPatch::RollUpWork { phase: WorkPhase::Running, .. })));
-}
-
-#[test]
-fn handed_back_crew_reopens_completed_vessel_work() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Landing;
-    status.finished_at = Some(timestamp(20));
-    status.work.get_mut("implement").expect("implement work").phase = WorkPhase::Complete;
-    status.work.get_mut("implement").expect("implement work").finished_at = Some(timestamp(20));
-    status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder work").phase = CrewWorkPhase::HandedBack;
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(21));
-
-    assert_eq!(outcome.patch, Some(controller_patches::roll_up_work("implement".to_string(), WorkPhase::Running, timestamp(21), None,)));
-}
-
-#[test]
-fn landing_convoy_stays_landing_when_vessel_work_reopens() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Landing;
-    status.finished_at = Some(timestamp(20));
-    status.work.get_mut("implement").expect("implement work").phase = WorkPhase::Running;
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    let outcome = reconcile(&convoy, None, timestamp(21));
-
-    assert_eq!(outcome.patch, None);
-    assert!(outcome.events.is_empty());
-}
-
-// Ready work's vessel is requested by the vessel requester, not the convoy (#3108); its launch
-// requests are pinned in flotilla-admission's vessel_requests tests.
-#[tokio::test]
-async fn ready_task_rolls_its_convoy_active() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Ready;
-    status.work.get_mut("implement").expect("implement task").ready_at = Some(timestamp(12));
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(20)).await;
-
-    assert!(matches!(
-        outcome.patch,
-        Some(ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, started_at: Some(started_at), finished_at: None })
-            if started_at == timestamp(20)
-    ));
-}
-
-#[tokio::test]
-async fn ready_task_with_ready_workspace_moves_to_launching() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Ready;
-    status.work.get_mut("implement").expect("implement task").ready_at = Some(timestamp(12));
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome =
-        reconcile_once_with_resources(&convoy, None, vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)], timestamp(20))
-            .await;
-    let expected_checkout_refs = serde_json::to_value(BTreeMap::from([(
-        flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository identity").key(),
-        "checkout-implement".to_string(),
-    )]))
-    .expect("checkout refs should serialize");
-
-    assert!(matches!(
-        outcome.patch,
-        Some(ConvoyStatusPatch::WorkLaunching { ref work, started_at, ref placement })
-            if work == "implement"
-                && started_at == timestamp(20)
-                && placement.fields.get("environment_ref") == Some(&serde_json::Value::String("env-implement".to_string()))
-                && placement.fields.get("image_ref")
-                    == Some(&serde_json::Value::String("registry.example/crew:latest".to_string()))
-                && placement.fields.get("local_image_id") == Some(&serde_json::Value::String("sha256:first".to_string()))
-                && placement.fields.get("checkout_refs") == Some(&expected_checkout_refs)
-    ));
-}
-
-#[tokio::test]
-async fn same_image_tag_moving_between_convoys_produces_distinct_settlement_testimony() {
-    async fn testimony(convoy_name: &str, digest: &str) -> flotilla_resources::PlacementStatus {
-        let mut status = bootstrapped_tool_only_convoy_status();
-        status.work.get_mut("implement").expect("implement work").phase = WorkPhase::Ready;
-        status.work.get_mut("implement").expect("implement work").ready_at = Some(timestamp(12));
-        let convoy = convoy_object(convoy_name, task_provisioning_convoy_spec(), Some(status));
-        let outcome = reconcile_once_with_resources(
-            &convoy,
-            None,
-            vec![vessel_object_with_local_image_id(convoy_name, "implement", VesselPhase::Ready, None, digest)],
-            timestamp(20),
-        )
-        .await;
-        match outcome.patch {
-            Some(ConvoyStatusPatch::WorkLaunching { placement, .. }) => placement,
-            other => panic!("expected placement testimony, got {other:?}"),
-        }
-    }
-
-    let first = testimony("convoy-first", "sha256:first").await;
-    let second = testimony("convoy-second", "sha256:second").await;
-
-    assert_eq!(first.fields.get("image_ref"), second.fields.get("image_ref"));
-    assert_eq!(first.fields.get("local_image_id"), Some(&serde_json::json!("sha256:first")));
-    assert_eq!(second.fields.get("local_image_id"), Some(&serde_json::json!("sha256:second")));
-    assert_ne!(first.fields.get("local_image_id"), second.fields.get("local_image_id"));
-}
-
-#[tokio::test]
-async fn launching_task_with_ready_workspace_moves_to_running() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Launching;
-    status.work.get_mut("implement").expect("implement task").ready_at = Some(timestamp(12));
-    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome =
-        reconcile_once_with_resources(&convoy, None, vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)], timestamp(20))
-            .await;
-
-    assert!(matches!(outcome.patch, Some(ConvoyStatusPatch::WorkRunning { ref work, .. }) if work == "implement"));
-}
-
-#[tokio::test]
-async fn running_task_with_failed_workspace_marks_task_failed() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Running;
-    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("convoy-a", "implement", VesselPhase::Failed, Some("terminal session crashed"))],
-        timestamp(21),
-    )
-    .await;
-
-    assert!(matches!(
-        outcome.patch,
-        Some(ConvoyStatusPatch::MarkWorkFailed { ref work, finished_at, ref message })
-            if work == "implement" && finished_at == timestamp(21) && message == "terminal session crashed"
-    ));
-}
-
-// #2875's governor create/delete churn tests are gone with the convoy's vessel actuations and its
-// provisioning retry counter (#3108): the convoy neither creates nor deletes vessels, a failed launch
-// fails its work, and a lost one is replaced by the vessel requester (orchestration-testkit's
-// rebooted-governor scenario pins one replacement per loss).
-
-// A lost launch interrupts its ensured work without failing it; the work runs again once its
-// replacement (requested by the vessel requester) is ready.
-#[tokio::test]
-async fn ensured_work_with_lost_vessel_interrupts_and_recovers_on_its_replacement() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Running;
-    let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
-    convoy.metadata.annotations.insert("flotilla.work/ensured-from".to_string(), "governor".to_string());
-    // An ensured convoy is admitted under its ensure's role.
-    convoy.spec.role = "governor".into();
-
-    let lost = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("standing", "implement", VesselPhase::Lost, Some("container stopped after reboot"))],
-        timestamp(21),
-    )
-    .await;
-    let patch = lost.patch.expect("interrupted work");
-    assert!(
-        matches!(&patch, ConvoyStatusPatch::WorkInterrupted { message, .. } if message == "container stopped after reboot"),
-        "{patch:?}"
-    );
-    patch.apply(convoy.status.as_mut().expect("status"));
-    assert_ne!(convoy.status.as_ref().expect("status").phase, ConvoyPhase::Failed);
-
-    let absent = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(51)).await;
-    assert!(!matches!(absent.patch, Some(ConvoyStatusPatch::MarkWorkFailed { .. })));
-    let provisioning = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("standing", "implement", VesselPhase::Provisioning, None)],
-        timestamp(52),
-    )
-    .await;
-    assert!(!matches!(provisioning.patch, Some(ConvoyStatusPatch::WorkRunning { .. } | ConvoyStatusPatch::MarkWorkFailed { .. })));
-    let recovered =
-        reconcile_once_with_resources(&convoy, None, vec![vessel_object("standing", "implement", VesselPhase::Ready, None)], timestamp(53))
-            .await;
-    assert!(matches!(recovered.patch, Some(ConvoyStatusPatch::WorkRunning { .. })));
-}
-
-#[tokio::test]
-async fn ensured_work_with_missing_vessel_observation_stalls_without_admitting_a_duplicate() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.work.get_mut("implement").expect("work").phase = WorkPhase::Running;
-    let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
-    convoy.metadata.annotations.insert("flotilla.work/ensured-from".to_string(), "governor".to_string());
-    // An ensured convoy is admitted under its ensure's role.
-    convoy.spec.role = "governor".into();
-
-    let first = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(21)).await;
-    assert!(matches!(first.patch, Some(ConvoyStatusPatch::RollUpWork { phase: WorkPhase::Stalled, .. })));
-    first.patch.expect("stall patch").apply(convoy.status.as_mut().expect("status"));
-    let second = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(22)).await;
-    assert!(second.patch.is_none(), "missing observation stays stalled");
-}
-
-// interrupted_non_ensured_work_without_a_vessel_does_not_create_one is gone: the convoy creates no
-// vessels (#3108).
-
-#[tokio::test]
-async fn running_agent_work_with_an_interrupted_vessel_becomes_recoverable() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Running;
-    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("convoy-a", "implement", VesselPhase::Interrupted, Some("crew terminal session disappeared; relaunching"))],
-        timestamp(21),
-    )
-    .await;
-
-    let Some(ConvoyStatusPatch::WorkInterrupted { work, roles, message }) = outcome.patch else {
-        panic!("expected interrupted work patch");
-    };
-    assert_eq!(work, "implement");
-    assert_eq!(roles, ["coder".to_string()].into_iter().collect());
-    assert_eq!(message, "crew terminal session disappeared; relaunching");
-}
-
-#[tokio::test]
-async fn interrupted_agent_work_returns_to_running_only_after_its_vessel_is_ready() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Interrupted;
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Interrupted;
-    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    status.work.get_mut("implement").expect("implement task").message = Some("crew terminal session disappeared; relaunching".to_string());
-    status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Interrupted;
-    status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder").message =
-        Some("crew session for `coder` was interrupted".to_string());
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome =
-        reconcile_once_with_resources(&convoy, None, vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)], timestamp(22))
-            .await;
-
-    let patch = outcome.patch.expect("running work patch");
-    assert!(matches!(patch, ConvoyStatusPatch::WorkRunning { ref work, .. } if work == "implement"));
-    let mut recovered = convoy.status.expect("convoy status");
-    patch.apply(&mut recovered);
-    assert_eq!(recovered.work["implement"].phase, WorkPhase::Running);
-    assert_eq!(recovered.work["implement"].message, None);
-    assert_eq!(recovered.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
-    assert_eq!(recovered.crew_work["implement"]["coder"].message, None);
-}
-
-#[tokio::test]
-async fn completed_work_without_a_landing_claim_keeps_resources_warm() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.started_at = Some(timestamp(18));
-    for task in status.work.values_mut() {
-        task.phase = WorkPhase::Complete;
-        task.finished_at = Some(timestamp(19));
-    }
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![
-            vessel_object("convoy-a", "implement", VesselPhase::Ready, None),
-            vessel_object("convoy-a", "review", VesselPhase::Ready, None),
-        ],
-        timestamp(20),
-    )
-    .await;
-
-    assert_eq!(outcome.patch, None);
-}
-
-#[tokio::test]
-async fn completed_agent_work_without_a_landing_claim_keeps_vessel_available_for_hand_back() {
-    let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.started_at = Some(timestamp(18));
-    for task in status.work.values_mut() {
-        task.phase = WorkPhase::Complete;
-        task.finished_at = Some(timestamp(19));
-    }
-    mark_crew_done(&mut status, "implement", "coder");
-    mark_crew_done(&mut status, "review", "reviewer");
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![
-            vessel_object("convoy-a", "implement", VesselPhase::Ready, None),
-            vessel_object("convoy-a", "review", VesselPhase::Ready, None),
-        ],
-        timestamp(20),
-    )
-    .await;
-
-    assert_eq!(outcome.patch, None);
-}
-
-// The terminal-convoy reclaim tests are gone with the convoy's DeleteVessel actuation (#3108): the
-// vessel requester releases an ended convoy's launches once its gate sanctions it (flotilla-admission
-// vessel_requests and the daemon's #1413 release-race test).
-
-struct NeverEligible;
-
-#[async_trait]
-impl ConvoyTeardownRuntime for NeverEligible {
-    async fn verify_reclaim(
-        &self,
-        _convoy: &flotilla_resources::ResourceObject<Convoy>,
-        _checkouts: &[flotilla_resources::checkout_records::CheckoutRecord],
-    ) -> Result<(), String> {
-        Err("integration evidence mid-refresh".to_string())
-    }
-}
-
-/// #1413 leg 2: a refused reclaim must retry on its own schedule instead of
-/// waiting on a watch event that nothing is guaranteed to send once the
-/// convoy is terminal.
-#[tokio::test]
-async fn refused_reclaim_requeues_at_the_evidence_staleness_horizon() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
-    let convoys = backend.clone().using::<Convoy>("flotilla");
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.phase = ConvoyPhase::Landed;
-    status.finished_at = Some(timestamp(20));
-    for task in status.work.values_mut() {
-        task.phase = WorkPhase::Complete;
-        task.finished_at = Some(timestamp(19));
-    }
-    let source = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-    let created = convoys.create(&convoy_meta("convoy-a"), &source.spec).await.expect("convoy create");
-    convoys
-        .update_status("convoy-a", &created.metadata.resource_version, source.status.as_ref().expect("convoy status"))
-        .await
-        .expect("convoy status update");
-    let convoy = convoys.get("convoy-a").await.expect("convoy get");
-
-    let refused = ConvoyReconciler::new(templates.clone())
-        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
-        .with_teardown_runtime(Arc::new(NeverEligible))
-        .with_landing_evidence_stale_after(Duration::from_secs(7));
-    let deps = refused.prepare(&convoy).await.expect("dependencies");
-    let outcome = refused.reconcile(&convoy, &deps, timestamp(21));
-    assert_eq!(outcome.requeue_after, Some(Duration::from_secs(7)), "a refused reclaim must requeue at the staleness horizon");
-
-    let eligible = ConvoyReconciler::new(templates)
-        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
-        .with_teardown_runtime(Arc::new(AlwaysEligible))
-        .with_landing_evidence_stale_after(Duration::from_secs(7));
-    let deps = eligible.prepare(&convoy).await.expect("dependencies");
-    let outcome = eligible.reconcile(&convoy, &deps, timestamp(21));
-    assert_eq!(outcome.requeue_after, None, "an eligible reclaim pass must not keep requeueing");
-}
-
-// completing_one_task_keeps_active_convoy_resources_warm is gone: the convoy deletes no vessels,
-// and the requester keeps a live convoy's launches (vessel_requests' unit tests).
 
 // #2613: settlement is terminal once merge has been recognised. Collecting the
 // evidence afterwards must not undo it; without recognition, absence still holds.
@@ -2963,15 +1615,16 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
     let legacy_disposition = tc.draw(hegel::generators::booleans());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let TerminalChangeRequestReconcile { outcome, backend, checkouts, checkout_launch, .. } =
+        let TerminalChangeRequestReconcile { settlement, backend, checkouts, checkout_launch, .. } =
             reconcile_terminal_bound_change_request(true, true, false).await;
         let convoys = backend.using::<Convoy>("flotilla");
         let changes = backend.using::<ChangeRequest>("flotilla");
-        let vessels = backend.using::<Vessel>("flotilla");
         if recognise_merge {
+            // The engine delivered the launch: its view reads Landed with the disposition.
             let current = convoys.get("convoy-a").await.expect("convoy");
             let mut status = current.status.clone().expect("status");
-            outcome.patch.expect("merged exit").apply(&mut status);
+            status.phase = ConvoyPhase::Landed;
+            status.disposition = Some(settlement.disposition.clone().expect("merged exit"));
             if legacy_disposition {
                 status.disposition = None;
             }
@@ -2984,12 +1637,6 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
             status.state = Observation::known(ObservedChangeRequestState::Open, timestamp(40));
             changes.update_status(&name, &record.metadata.resource_version, &status).await.expect("publish open CR");
         }
-        let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-            .with_vessels(vessels.clone())
-            .with_lifecycle_reads(checkouts.reads.clone())
-            .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
-            .with_teardown_runtime(Arc::new(AlwaysEligible))
-            .with_clock(Arc::new(FixedClock(timestamp(40))));
         for delete_checkout in [checkout_first, !checkout_first] {
             if delete_checkout {
                 // Its home releases it: the launch ends.
@@ -3011,110 +1658,21 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
                 Duration::from_secs(30),
                 timestamp(40),
             );
-            let prepared = reconciler.prepare(&current).await.expect("prepare after collection");
-            let outcome = reconciler.reconcile(&current, &prepared, timestamp(40));
             if recognise_merge {
                 assert!(evaluation.satisfied, "Landed settlement must survive collection: {:?}", evaluation.unmet);
                 assert!(evaluation.unmet.is_empty());
-                assert_eq!(outcome.requeue_after, None);
             } else {
                 assert!(!evaluation.satisfied, "unrecognised merge cannot discharge missing evidence");
-                assert!(outcome.patch.is_none());
+                let judgement = landing_judgement(&backend, &current, &checkouts, timestamp(40)).await;
+                assert_eq!(judgement.disposition, None, "an unrecognised merge is not delivered");
             }
-        }
-        if recognise_merge {
-            let current = convoys.get("convoy-a").await.expect("convoy");
-            reconciler.run_finalizer(&current).await.expect("teardown after evidence collection");
         }
     });
 }
 
-// Environment loss is recoverable interruption at every live work phase. It
-// carries the reason to work and crew and never fails the work; the replacement
-// launch is the vessel requester's. Existing in-memory reconciliation is the collaborator.
-#[tokio::test]
-async fn lost_vessel_interrupts_work_without_failing_it() {
-    for phase in [WorkPhase::Ready, WorkPhase::Launching, WorkPhase::Running, WorkPhase::Stalled, WorkPhase::Interrupted] {
-        let mut status = bootstrapped_convoy_status();
-        status.phase = ConvoyPhase::Active;
-        status.work.get_mut("implement").expect("work").phase = phase;
-        status.crew_work.get_mut("implement").expect("crew").get_mut("coder").expect("coder").phase =
-            if phase == WorkPhase::Stalled { CrewWorkPhase::Stalled } else { CrewWorkPhase::Working };
-        let message = "lost, recoverable: container gone; rehydration is not available yet (#2872)";
-        let vessel = vessel_object("convoy-a", "implement", VesselPhase::Lost, Some(message));
-        let mut convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-        let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel.clone()], timestamp(21)).await;
-        let patch = outcome.patch.expect("loss interrupts work");
-        assert!(matches!(&patch, ConvoyStatusPatch::WorkInterrupted { message: reason, .. } if reason == message), "{patch:?}");
-        patch.apply(convoy.status.as_mut().expect("status"));
-        let status = convoy.status.as_ref().expect("status");
-        assert_eq!(status.work["implement"].phase, WorkPhase::Interrupted);
-        assert_eq!(status.work["implement"].message.as_deref(), Some(message));
-        assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Interrupted);
-        assert!(status.crew_work["implement"]["coder"].message.as_ref().expect("reason").contains(message));
-        // Reconstruct persisted evidence into a fresh backend, as on restart.
-        let convoy = serde_json::from_value(serde_json::to_value(convoy).expect("persist convoy")).expect("restore convoy");
-        let vessel = serde_json::from_value(serde_json::to_value(vessel).expect("persist vessel")).expect("restore vessel");
-        let again = reconcile_once_with_resources(&convoy, None, vec![vessel], timestamp(22)).await;
-        assert!(!matches!(again.patch, Some(ConvoyStatusPatch::WorkInterrupted { .. })), "restart must not repeat loss roll-up");
-        assert!(!matches!(again.patch, Some(ConvoyStatusPatch::MarkWorkFailed { .. })));
-    }
-}
-
-// A launch's engine ending reaches its seat through the vessel's read view: a lost or released
-// launch interrupts the work, one given up fails it.
-#[tokio::test]
-async fn engine_ended_vessel_ends_its_seat() {
-    use flotilla_resources::vessel_records::{VesselJoins, VesselRecords as _, VesselStep};
-    for phase in [WorkPhase::Launching, WorkPhase::Running, WorkPhase::Stalled] {
-        for ending in ["lost", "gave up", "released"] {
-            let mut status = bootstrapped_convoy_status();
-            status.phase = ConvoyPhase::Active;
-            status.work.get_mut("implement").expect("work").phase = phase;
-            let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-            let fixture = flotilla_provisioning_testkit::VesselsFixture::default();
-            let launch = fixture.request("convoy-a", "implement", "feta");
-            match ending {
-                "lost" => {
-                    fixture.ready(&launch, "env-implement");
-                    fixture.step(&launch, VesselStep::Lost { reason: "env-implement disappeared".into() });
-                }
-                "gave up" => fixture.step(&launch, VesselStep::Failed { cause: "host unreachable".into(), retryable: false }),
-                _ => fixture.step(&launch, VesselStep::Released),
-            }
-            let record = fixture.vessels.get(&launch, None).expect("read").expect("launch");
-            let view =
-                record.read_view("flotilla", VesselJoins { convoy: Some(&convoy), environment: None, terminals: &[], checkouts: &[] });
-
-            let outcome = reconcile_once_with_resources(&convoy, None, vec![view], timestamp(21)).await;
-
-            let patch = outcome.patch.as_ref().unwrap_or_else(|| panic!("{phase:?} {ending}: the ending reaches the seat"));
-            if ending == "gave up" {
-                assert!(
-                    matches!(patch, ConvoyStatusPatch::MarkWorkFailed { message, .. } if message.contains("host unreachable")),
-                    "{phase:?} {ending}: {patch:?}"
-                );
-            } else {
-                assert!(matches!(patch, ConvoyStatusPatch::WorkInterrupted { .. }), "{phase:?} {ending}: {patch:?}");
-            }
-        }
-    }
-}
-
-// The existing settlement transition is unchanged; production additionally retains
-// the exact evaluation. Keep the transition assertions independent of the receipt.
-fn settlement_transition(patch: Option<ConvoyStatusPatch>) -> Option<ConvoyStatusPatch> {
-    patch.map(|mut patch| {
-        if let ConvoyStatusPatch::Settle { evidence, .. } = &mut patch {
-            assert!(evidence.take().expect("production settlement receipt").satisfied);
-        }
-        patch
-    })
-}
-
 // ADR 0061 / #2979: the first merged PR must not settle a three-PR crew.
-// Duplicate reconciliation cannot settle after a partial merge; Landing retains
-// all promise states and submission evidence without any completion command.
+// Duplicate observation cannot settle after a partial merge; the promises keep
+// their states and submission evidence without any completion command.
 #[hegel::test]
 fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
     use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission};
@@ -3194,10 +1752,28 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
             .await
             .unwrap();
         convoys.update_status("three-pr", &created.metadata.resource_version, &status).await.unwrap();
-        let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-            .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
-            .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
-            .with_clock(Arc::new(FixedClock(timestamp(55))));
+        // The controller's observer: each pass observes the next promise the records settle.
+        let observe = |at| {
+            let (convoys, requests) = (convoys.clone(), requests.clone());
+            async move {
+                for _ in 0..16 {
+                    let current = convoys.get("three-pr").await.unwrap();
+                    let records = requests.list().await.unwrap().items.into_iter().map(|cr| (cr.metadata.name.clone(), cr)).collect();
+                    let Some(observation) = flotilla_resources::promises::next_observation(
+                        current.status.as_ref().unwrap(),
+                        "three-pr",
+                        &records,
+                        &BTreeMap::new(),
+                        &[],
+                        at,
+                        Duration::from_secs(180),
+                    ) else {
+                        break;
+                    };
+                    flotilla_store::apply_status_patch(&convoys, "three-pr", &observation).await.unwrap();
+                }
+            }
+        };
         for number in 1..=3 {
             let address = flotilla_protocol::LeafAddress::ChangeRequest {
                 service: "github.com".into(),
@@ -3239,29 +1815,13 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
             )
             .await
             .unwrap();
-            for _ in 0..16 {
-                let current = convoys.get("three-pr").await.unwrap();
-                let prepared = reconciler.prepare(&current).await.unwrap();
-                if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(55)).patch {
-                    flotilla_store::apply_status_patch(&convoys, "three-pr", &patch).await.unwrap();
-                }
-            }
+            observe(timestamp(55)).await;
             let current = convoys.get("three-pr").await.unwrap();
             let promises = &current.status.as_ref().unwrap().promises["work"]["coder"];
             assert_eq!(promises.iter().filter(|p| p.state == PromiseState::Kept).count(), number as usize + 1);
             for _ in 0..duplicates {
+                observe(timestamp(55)).await;
                 let current = convoys.get("three-pr").await.unwrap();
-                let prepared = reconciler.prepare(&current).await.unwrap();
-                if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(55)).patch {
-                    flotilla_store::apply_status_patch(&convoys, "three-pr", &patch).await.unwrap();
-                }
-                let current = convoys.get("three-pr").await.unwrap();
-                let phase = current.status.as_ref().unwrap().phase;
-                if number < 3 {
-                    assert_eq!(phase, if interrupted { ConvoyPhase::Interrupted } else { ConvoyPhase::Active });
-                } else {
-                    assert!(matches!(phase, ConvoyPhase::Landing | ConvoyPhase::Landed));
-                }
                 let evidence = evaluate_landing_settlement(
                     &current,
                     &BTreeMap::new(),
@@ -3276,36 +1836,10 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
                 assert_eq!(evidence.promises.len(), 4);
             }
         }
-        for _ in 0..3 {
-            let current = convoys.get("three-pr").await.unwrap();
-            let prepared = reconciler.prepare(&current).await.unwrap();
-            if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(65)).patch {
-                flotilla_store::apply_status_patch(&convoys, "three-pr", &patch).await.unwrap();
-            }
-        }
-        let landed = convoys.get("three-pr").await.unwrap();
-        let status = landed.status.as_ref().unwrap();
-        assert_eq!(status.phase, ConvoyPhase::Landed);
-        let receipt = status.landing_settlement.as_ref().unwrap();
-        assert_eq!(receipt.promises.len(), 4);
-        assert_eq!(receipt.subjects.len(), 3);
-        assert!(receipt.promises.iter().all(|p| p.state == PromiseState::Kept));
-        assert_eq!(serde_json::from_value::<ConvoyStatus>(serde_json::to_value(status).unwrap()).unwrap(), *status);
-        for number in 1..=3 {
-            requests.delete(&cr_name("github.com", "flotilla-org/flotilla", number)).await.unwrap();
-        }
-        assert_eq!(
-            &evaluate_landing_settlement(
-                &landed,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &[],
-                Duration::from_secs(180),
-                Duration::from_secs(180),
-                timestamp(1000)
-            ),
-            receipt
-        );
+        observe(timestamp(65)).await;
+        let current = convoys.get("three-pr").await.unwrap();
+        let promises = &current.status.as_ref().unwrap().promises["work"]["coder"];
+        assert_eq!(promises.len(), 4);
+        assert!(promises.iter().all(|p| p.state == PromiseState::Kept));
     });
 }

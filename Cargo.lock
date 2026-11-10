@@ -2204,7 +2204,6 @@ dependencies = [
  "flotilla-provisioning-testkit",
  "flotilla-resources",
  "flotilla-store",
- "flotilla-store-http",
  "flotilla-store-memory",
  "flotilla-store-sqlite",
  "flotilla-store-testkit",
@@ -2221,7 +2220,6 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 

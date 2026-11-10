@@ -400,7 +400,7 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: vec![table.reconciler_wake_watch()],
-            reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+            reconciler: ConvoyReconciler::new()
                 .with_lifecycle_reads(agent_reads())
                 .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
             backend: backend.clone(),
