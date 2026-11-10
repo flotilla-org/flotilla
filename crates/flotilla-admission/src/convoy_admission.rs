@@ -1476,6 +1476,10 @@ impl ConvoyAdmission {
             annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_name);
         }
         annotations.extend(self.prepare_vessel_placement_annotations(namespace, &admission.name, &admission.vessel_placements).await?);
+        annotations.insert(
+            flotilla_resources::convoy::ENSURE_ADMISSION_ANNOTATION.to_string(),
+            serde_json::to_string(&ensure.spec).map_err(|error| error.to_string())?,
+        );
         let created = crate::image_build::create_planned_builds(&self.backend, namespace, &admission.image_builds).await?;
         let result = self
             .create_convoy_with_annotations(namespace, &admission.name, &admission.spec, admission.placement_decision, annotations)
@@ -1486,13 +1490,6 @@ impl ConvoyAdmission {
         result?;
         self.accounts.open(namespace, bindings).await?;
         self.record_admission_naming(namespace, &admission.name, admission.naming.clone()).await;
-        apply_resource_status_patch(
-            &self.backend.using::<ResourceConvoy>(namespace),
-            &admission.name,
-            &ConvoyStatusPatch::RecordEnsureAdmission { config: ensure.spec.clone() },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
         Ok(admission.name)
     }
 }

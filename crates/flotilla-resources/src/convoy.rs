@@ -58,11 +58,29 @@ define_resource!(
 /// is historical admission evidence; changing it does not update live placement.
 pub const ADMISSION_PLACEMENT_ANNOTATION: &str = "flotilla.work/admission-placement";
 
+/// The ensure configuration that admitted a standing generation, a creation input like the
+/// placement decision: it seeds `status.ensure_admission` in the create. A later status write
+/// could lose its retry budget to the convoy controller's bootstrap, and the role's strikes are
+/// counted from the generations admitted under its current configuration.
+pub const ENSURE_ADMISSION_ANNOTATION: &str = "flotilla.work/ensure-admission";
+
 fn initial_convoy_status(meta: &InputMeta) -> Result<Option<ConvoyStatus>, ResourceError> {
-    let Some(encoded) = meta.annotations.get(ADMISSION_PLACEMENT_ANNOTATION) else { return Ok(None) };
-    let placement_decision =
-        serde_json::from_str(encoded).map_err(|error| ResourceError::invalid(format!("invalid admission placement decision: {error}")))?;
-    Ok(Some(ConvoyStatus { placement_decision: Some(placement_decision), ..ConvoyStatus::default() }))
+    let placement_decision = meta
+        .annotations
+        .get(ADMISSION_PLACEMENT_ANNOTATION)
+        .map(|encoded| serde_json::from_str(encoded))
+        .transpose()
+        .map_err(|error| ResourceError::invalid(format!("invalid admission placement decision: {error}")))?;
+    let ensure_admission = meta
+        .annotations
+        .get(ENSURE_ADMISSION_ANNOTATION)
+        .map(|encoded| serde_json::from_str(encoded))
+        .transpose()
+        .map_err(|error| ResourceError::invalid(format!("invalid ensure admission: {error}")))?;
+    if placement_decision.is_none() && ensure_admission.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ConvoyStatus { placement_decision, ensure_admission, ..ConvoyStatus::default() }))
 }
 
 pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";
@@ -1850,9 +1868,6 @@ pub enum ConvoyStatusPatch {
     RecordNaming {
         naming: flotilla_protocol::ConvoyNaming,
     },
-    RecordEnsureAdmission {
-        config: crate::ConvoyEnsureSpec,
-    },
     DiscoverSubjects {
         subjects: Vec<(Subject, Relationship)>,
         source: SubjectDiscoverySource,
@@ -2108,7 +2123,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::RestoreTurnActivation { .. } => "RestoreTurnActivation",
             Self::ObserveEnvironment { .. } => "ObserveEnvironment",
             Self::RecordNaming { .. } => "RecordNaming",
-            Self::RecordEnsureAdmission { .. } => "RecordEnsureAdmission",
             Self::DiscoverSubjects { .. } => "DiscoverSubjects",
             Self::RecordBranchSubjectScan { .. } => "RecordBranchSubjectScan",
             Self::RecordBranchSubjectScanFailure { .. } => "RecordBranchSubjectScanFailure",
@@ -2213,9 +2227,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::RecordNaming { naming } => {
                 status.naming = Some(naming.clone());
-            }
-            Self::RecordEnsureAdmission { config } => {
-                status.ensure_admission.get_or_insert_with(|| config.clone());
             }
             Self::Promise { vessel, role, operation } => {
                 if status.crew_work.get(vessel).and_then(|crew| crew.get(role)).is_none_or(|work| work.phase != CrewWorkPhase::Done) {
@@ -4348,6 +4359,26 @@ mod admission_tests {
         }
         let initial = Convoy::initial_status(&meta).expect("valid admission metadata");
         assert_eq!(initial, present.then(|| ConvoyStatus { placement_decision: Some(decision), ..ConvoyStatus::default() }));
+    }
+
+    // A standing generation's ensure configuration is in its status from the create on.
+    #[test]
+    fn initial_status_holds_the_ensure_admission() {
+        let config = crate::ConvoyEnsureSpec {
+            project_ref: "project".into(),
+            role: "role".into(),
+            driver_ref: None,
+            workflow_ref: "workflow".into(),
+            placement_policy: None,
+            escalation_reason: None,
+            repositories: Vec::new(),
+            presents_as: None,
+            agent_overrides: Vec::new(),
+        };
+        let mut meta = crate::InputMeta::builder().name("admitted".into()).build();
+        meta.annotations.insert(ENSURE_ADMISSION_ANNOTATION.into(), serde_json::to_string(&config).unwrap());
+        let initial = Convoy::initial_status(&meta).expect("valid admission metadata");
+        assert_eq!(initial, Some(ConvoyStatus { ensure_admission: Some(config), ..ConvoyStatus::default() }));
     }
 }
 

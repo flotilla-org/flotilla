@@ -20,16 +20,40 @@ use flotilla_state_machines::{
         Realise, Release, Teardown, Vanish,
     },
     machines::vessel::Vessel,
-    Resource,
+    Cause, CauseCategory, Failure, Outcome, Resource,
 };
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
 use super::{
+    code_enum,
     engine::{self, resource, Candidate},
-    ensure::{cause, outcome, tally},
     key, list, name, reference, text, timestamp, Fixture, Pick,
 };
+
+fn cause(tc: &TestCase, pick: Pick) -> Cause {
+    use CauseCategory::*;
+    Cause { category: code_enum(tc, pick, &[Transient, Refused, Misconfigured, MissingCapability, External]), detail: text(tc) }
+}
+
+/// A coherent attempt tally: a latest failure (the base 2 digit at `place`), retryable or not (the
+/// next digit), behind one to three consecutive failures, or none. Covering reaches a tally that
+/// a failure that cannot be retried exhausts.
+fn tally(tc: &TestCase, pick: Pick, place: usize) -> (u32, Option<Failure>) {
+    if pick.digit(tc, 2, place) != 0 {
+        return (0, None);
+    }
+    let failure = Failure { at: timestamp(tc), cause: cause(tc, pick), retryable: pick.digit(tc, 2, place * 2) == 0 };
+    (tc.draw(gs::integers::<u32>().min_value(1).max_value(3)), Some(failure))
+}
+
+/// Both outcomes in turn when covering, every cause category across rounds.
+fn outcome(tc: &TestCase, pick: Pick) -> Outcome {
+    match pick.variant(tc, 2, |index| index) {
+        0 => Outcome::Succeeded,
+        _ => Outcome::Failed { cause: cause(tc, pick), retryable: pick.some(tc, 8) },
+    }
+}
 
 /// The test lifecycle kind: its name, request and the default retry policy.
 pub struct Terminal;

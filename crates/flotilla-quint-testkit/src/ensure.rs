@@ -1,9 +1,7 @@
 //! Ensure against `conformance/ensure.qnt`, over any log: the engine's memory log, or the
 //! decided store's (#3629 layer 6).
 //!
-//! Fulfiller `i` is the reference `f<i>`; the Ensure's policy is exhausted
-//! after two consecutive failures in the current window
-//! ([`AttemptPolicy::immediate`]`(2)`), the spec's `MAX_FAILURES`.
+//! Fulfiller `i` is the reference `f<i>`.
 //!
 //! Event mapping, each with a fresh [`MemoryEnsureWorld`]. The harness
 //! derives `Create` and `Bind` evidence from a world of fulfiller phases in
@@ -13,50 +11,42 @@
 //! - `Create{id, noLive, absent}`: nothing observed when both hold; `f<id>`
 //!   Gone for `noLive and not absent`; another recorded fulfiller Requested
 //!   for `not noLive and absent`; `f<id>` Requested when neither holds.
-//! - `Attempted({id, outcome})`: the attempt edge naming `f<id>`, with
-//!   `Succeeded`, or a failure (a fixed cause) retryable as the spec says.
 //! - `Bind{id, realised, canReceive}`: `f<id>` Realised (else Requested) with
 //!   `canReceive`; the inbox has drained.
 //! - `Unbind{reason, observed, gone}`: `f<observed>` Gone (else Realised).
 //! - `Hold`, `Resume{authorised}`, `Retire{authorised, teardownComplete}`:
 //!   those edges, reading authority and teardown.
 //!
-//! State mapping: the spec's `Work = {recorded, created, history, window}` is
-//! the state's `recorded` and `created`, with `history` the Ensure's
-//! `Attempted` log entries in order and `window` the number of them before
-//! the last `Resume` entry; `Fulfilled { bound, .. }` is
+//! State mapping: the spec's `Work = {recorded, created}` is the state's
+//! `recorded` and `created`; `Fulfilled { bound, .. }` is
 //! `Fulfilled({work, bound})`, and the other labels carry their work.
-//! Fulfiller references `f<i>` encode as `i`. The remaining difference: the
-//! state keeps the window's tally (`failures`, `last_failure`) instead of the
-//! history, so encoding also checks that tally against the spec's
-//! `failureCount` and the window's last outcome. The history is read from
-//! the log the run writes ([`EnsureLogs::history`]).
+//! Fulfiller references `f<i>` encode as `i`.
 
 use flotilla_schema::Timestamp;
 use std::marker::PhantomData;
 
 use flotilla_state_machines::{
     machines::ensure::{
-        Attempted, Bind, Create, Drain, Ensure, EnsureEdge, EnsureRefusal, EnsureSpec, EnsureState, Fulfiller, FulfillerPhase,
-        FulfillerStatus, Fulfillers, Hold, MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
+        Bind, Create, Drain, Ensure, EnsureRefusal, EnsureSpec, EnsureState, Fulfiller, FulfillerPhase, FulfillerStatus, Fulfillers, Hold,
+        MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
     },
-    AttemptPolicy, Cause, CauseCategory, Home, Log, Outcome, Ref, WriteError,
+    Home, Log, Ref, WriteError,
 };
 use serde_json::{json, Value};
 
 use crate::{
     graph::{refusal, tick, Conformance, Step},
-    itf::{boolean, int, number, payload, set_of, tag, unit, variant},
+    itf::{boolean, int, number, payload, set_of, tag, variant},
 };
 
 const NAME: &str = "e";
 
-/// Where a run's Ensure is written, and how its edges are read back.
+/// Where a run's Ensure is written.
 pub trait EnsureLogs: 'static {
     type Log: Log<Ensure>;
     fn log() -> Self::Log;
-    /// The edges of `name`, in order, as the log holds them.
-    fn history(home: &Home<Ensure, Self::Log>, name: &str) -> Vec<EnsureEdge>;
+    /// Checks a subject's stored state against what its home holds (a store's row, say).
+    fn check(_home: &Home<Ensure, Self::Log>) {}
 }
 
 /// The engine's in-memory log.
@@ -66,13 +56,6 @@ impl EnsureLogs for MemoryLogs {
     type Log = flotilla_state_machines::MemoryLog<Ensure>;
     fn log() -> Self::Log {
         flotilla_state_machines::MemoryLog::new()
-    }
-    fn history(home: &Home<Ensure, Self::Log>, name: &str) -> Vec<EnsureEdge> {
-        home.log()
-            .history(name, flotilla_state_machines::Version(0), usize::MAX)
-            .into_iter()
-            .map(|(_, event)| event.arguments.edge.clone())
-            .collect()
     }
 }
 const INBOX: &str = "project:inbox";
@@ -104,7 +87,6 @@ fn outcome<T>(result: Result<T, WriteError<Ensure>>) -> Step {
             EnsureRefusal::NotRecorded => "NotRecorded",
             EnsureRefusal::FulfillerLive => "FulfillerLive",
             EnsureRefusal::MissingEvidence => "MissingEvidence",
-            EnsureRefusal::NotExhausted => "NotExhausted",
             EnsureRefusal::Unauthorised => "Unauthorised",
         },
         Err(other) => return refusal(&format!("{other:?}")),
@@ -112,40 +94,11 @@ fn outcome<T>(result: Result<T, WriteError<Ensure>>) -> Step {
     refusal(name)
 }
 
-/// The spec's `AttemptOutcome`.
-fn outcome_value(outcome: &Outcome) -> Value {
-    match outcome {
-        Outcome::Succeeded => variant("Succeeded", unit()),
-        Outcome::Failed { retryable, .. } => variant("Failed", json!({ "retryable": retryable })),
-    }
-}
-
-/// The spec's `Work`: the state's fulfillers, and the history and window
-/// from the Ensure's log. Checks the state's tally against the window.
+/// The spec's `Work`: the state's fulfillers.
 fn work<F: EnsureLogs>(home: &Home<Ensure, F::Log>) -> Value {
-    let e = home.get(NAME).expect("exists");
-    let mut history = Vec::new();
-    let mut window = 0;
-    let edges = F::history(home, NAME);
-    for edge in &edges {
-        match edge {
-            EnsureEdge::Attempted(attempted) => history.push(attempted),
-            EnsureEdge::Resume(_) => window = history.len(),
-            _ => {}
-        }
-    }
-    let state = e.state();
-    let current = &history[window..];
-    let since_success = current.iter().rev().take_while(|a| matches!(a.outcome, Outcome::Failed { .. })).count();
-    assert_eq!(state.failures() as usize, since_success, "the tally counts the window's failures since its last success");
-    let last_retryable = current.last().and_then(|a| match a.outcome {
-        Outcome::Failed { retryable, .. } => Some(retryable),
-        Outcome::Succeeded => None,
-    });
-    assert_eq!(state.last_failure().map(|f| f.retryable), last_retryable, "the tally keeps the window's last failure");
-    let history: Vec<Value> =
-        history.iter().map(|a| json!({ "id": int(id_of(a.fulfiller.name())), "outcome": outcome_value(&a.outcome) })).collect();
-    json!({ "recorded": ids(state.recorded()), "created": ids(state.created()), "history": history, "window": int(window as i64) })
+    F::check(home);
+    let state = home.get(NAME).expect("exists").state();
+    json!({ "recorded": ids(state.recorded()), "created": ids(state.created()) })
 }
 
 /// `ensure.qnt` against the engine's Ensure over `F`'s logs.
@@ -157,13 +110,8 @@ impl<F: EnsureLogs> Conformance for EnsureConformance<F> {
 
     fn create(_: &Value) -> Home<Ensure, F::Log> {
         let mut home = Home::<Ensure, F::Log>::with_log("home", F::log()).expect("valid declaration");
-        home.create(
-            NAME,
-            EnsureSpec { inbox: INBOX.parse().expect("canonical inbox"), policy: AttemptPolicy::immediate(2) },
-            &MemoryEnsureWorld::default(),
-            Timestamp(0),
-        )
-        .expect("created");
+        home.create(NAME, EnsureSpec { inbox: INBOX.parse().expect("canonical inbox") }, &MemoryEnsureWorld::default(), Timestamp(0))
+            .expect("created");
         home
     }
 
@@ -193,17 +141,6 @@ impl<F: EnsureLogs> Conformance for EnsureConformance<F> {
                     }
                 }
                 outcome(home.apply(NAME, Create { fulfiller: f(id) }, &world, at))
-            }
-            "Attempted" => {
-                let attempt = match tag(&o["outcome"]) {
-                    "Succeeded" => Outcome::Succeeded,
-                    "Failed" => Outcome::Failed {
-                        cause: Cause::new(CauseCategory::Transient, "attempt failed"),
-                        retryable: boolean(&payload(&o["outcome"])["retryable"]),
-                    },
-                    other => panic!("attempt outcome {other}"),
-                };
-                outcome(home.apply(NAME, Attempted { fulfiller: f(number(&o["id"])), outcome: attempt }, &world, at))
             }
             "Bind" => {
                 let id = number(&o["id"]);

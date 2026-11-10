@@ -2,8 +2,7 @@
 //! against the production placement composition and `conformance/ensure.qnt` against the Ensure,
 //! each over [`StoreLog`] on an SQLite store holding the stored kind. The adaptors are the
 //! engine's own (`flotilla_quint_testkit::{vessel, ensure}`); here every write is one store
-//! transaction, the stored row must hold what the home holds, and the Ensure's history is read
-//! back from its log entries.
+//! transaction, and the stored row must hold what the home holds.
 //!
 //! ```text
 //! QUINT_GRAPH_DIR=DIR cargo test -p flotilla-engine-store --test crew_conformance -- --ignored
@@ -20,11 +19,7 @@ use flotilla_quint_testkit::{
 use flotilla_schema::{Kind, KindRegistry};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
-    edge_event,
-    machines::{
-        ensure::{Ensure, EnsureEdge},
-        vessel::Vessel,
-    },
+    machines::{ensure::Ensure, vessel::Vessel},
     Home, Machine, Resource,
 };
 
@@ -76,24 +71,8 @@ impl EnsureLogs for StoreLogs {
     fn log() -> StoreLog {
         store::<Ensure>()
     }
-    fn history(home: &Home<Ensure, StoreLog>, name: &str) -> Vec<EnsureEdge> {
+    fn check(home: &Home<Ensure, StoreLog>) {
         stored_as_held(home);
-        let mut store = home.log().store().lock().expect("store");
-        let mut read = store.read().expect("read");
-        let id = read.resolve(Resource::<Ensure>::CODE, name, HOME).expect("resolve").expect("stored");
-        let mut edges = Vec::new();
-        let mut after = 0;
-        loop {
-            let entries = read.changes(id, after, 64).expect("changes");
-            let Some(last) = entries.last() else { return edges };
-            after = last.home_seq;
-            for entry in &entries {
-                let at = read.change(HOME, entry.change).expect("read").expect("its change").at;
-                if let Some(event) = edge_event::<Ensure>(entry, at).expect("entry decodes") {
-                    edges.push(event.arguments);
-                }
-            }
-        }
     }
 }
 
@@ -175,21 +154,18 @@ mod walk {
         assert_eq!(refused(V::apply(&mut vessel, &realise)), "WrongState");
     }
 
-    // Behaviour: through the store, an Ensure records and creates a fulfiller, fails an attempt
-    // (read back from its log entries), and is held.
+    // Behaviour: through the store, an Ensure records and creates a fulfiller, is held, and its
+    // work is read back from the store.
     #[test]
-    fn an_ensure_records_attempts_and_holds_through_the_store() {
+    fn an_ensure_records_and_holds_through_the_store() {
         type E = EnsureConformance<StoreLogs>;
         let mut ensure = E::create(&Value::Null);
         assert!(matches!(E::apply(&mut ensure, &variant("Record", int(1))), Step::Accepted));
         let create = variant("Create", json!({ "id": int(1), "noLive": true, "absent": true }));
         assert!(matches!(E::apply(&mut ensure, &create), Step::Accepted));
-        let failed = variant("Attempted", json!({ "id": int(1), "outcome": variant("Failed", json!({ "retryable": false })) }));
-        assert!(matches!(E::apply(&mut ensure, &failed), Step::Accepted));
-        let encoded = E::encode(&ensure);
-        assert_eq!(tag(&encoded), "Unfulfilled");
-        assert_eq!(encoded["value"]["history"].as_array().map(Vec::len), Some(1), "the attempt is read back from the store");
         assert!(matches!(E::apply(&mut ensure, &variant("Hold", unit())), Step::Accepted));
-        assert_eq!(tag(&E::encode(&ensure)), "Held");
+        let encoded = E::encode(&ensure);
+        assert_eq!(tag(&encoded), "Held");
+        assert_eq!(encoded["value"]["created"], set_of([int(1)]), "the created fulfiller is read back");
     }
 }

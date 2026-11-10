@@ -4,7 +4,7 @@ use flotilla_resources::canonical_placement_host_ref_from_sources;
 use flotilla_store::ResolvedCascadeStoreExt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use crate::convoy_admission::PreparedConvoyAdmission;
@@ -13,8 +13,9 @@ use crate::convoy_ensure::ConvoyEnsureReconciler;
 use crate::convoy_ensure::EngineEnsures;
 use crate::convoy_ensure::StandingConvoyBackingInspector;
 use crate::ports::ConvoyTeardown;
+use crate::standing::{self, Decision, Ending, Generation, HoldAttention, StandingReading};
 use async_trait::async_trait;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Utc};
 use flotilla_charter::ops_entry::{
     materialized_workflow_name, ENSURED_FROM_ANNOTATION, ENSURE_PROVENANCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION,
     PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
@@ -31,8 +32,6 @@ use flotilla_store::{apply_status_patch as apply_resource_status_patch, EventRec
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
-const ENSURE_BACKOFF_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
-const ENSURE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 #[derive(Debug, Clone)]
 struct EnsureAdmissionRetry {
     config_hash: String,
@@ -44,11 +43,6 @@ struct EnsureAdmissionRetry {
 /// generations of it failed.
 pub fn restart_limit_reason(failures: u32) -> String {
     format!("ensured convoy entered a terminal failure phase; {failures} consecutive generations failed")
-}
-
-fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
-    ChronoDuration::from_std(flotilla_resources::PROVISIONING_RETRY_BACKOFF.delay(restart_count.saturating_add(1)))
-        .expect("ensure retry delay fits chrono")
 }
 
 fn record_ensure_admission_retry(
@@ -72,6 +66,31 @@ enum EnsureConvoyScope {
     IncludingReplicas,
 }
 
+/// Whether a generation has ended: an ended one admits a successor only through the role's
+/// strike run.
+fn ended(convoy: &ResourceObject<ResourceConvoy>) -> bool {
+    convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())
+}
+
+/// A generation as [`standing::derive`] reads it: admitted at its creation, under `declared` when
+/// its admitted configuration is the role's now, and ended as its phase says, at its finish (its
+/// admission when none was recorded).
+fn generation(convoy: &ResourceObject<ResourceConvoy>, declared: &ConvoyEnsureSpec) -> Generation {
+    let status = convoy.status.as_ref();
+    let admitted_at = convoy.metadata.creation_timestamp;
+    let ending = status.and_then(|status| match status.phase {
+        ConvoyPhase::Failed => Some(Ending::Failed),
+        ConvoyPhase::Abandoned => Some(Ending::Operator),
+        ConvoyPhase::Landed => Some(Ending::Delivered),
+        _ => None,
+    });
+    Generation {
+        admitted_at,
+        current_config: status.and_then(|status| status.ensure_admission.as_ref()) == Some(declared),
+        ended: ending.map(|ending| (ending, status.and_then(|status| status.finished_at).unwrap_or(admitted_at))),
+    }
+}
+
 fn ensure_config_hash(spec: &ConvoyEnsureSpec) -> Result<String, String> {
     let encoded = serde_json::to_vec(spec).map_err(|error| format!("serialize ensure config: {error}"))?;
     Ok(format!("{:x}", Sha256::digest(encoded)))
@@ -89,6 +108,9 @@ pub struct EnsureReconciler {
     /// status reads, backing inspection, admission, and status publication.
     #[builder(skip)]
     ensure_reconciliation: Mutex<()>,
+    /// Per namespace, the earliest time the last pass deferred an ensure to.
+    #[builder(skip)]
+    next_due: StdMutex<HashMap<String, DateTime<Utc>>>,
     /// The engine's Ensure behind `[primitives]` (#3629 layer 7); absent with the switch off.
     engine: Option<Arc<dyn EngineEnsures>>,
     /// The daemon's ManifestRoots (#3824 layer 2c); the old store's when absent.
@@ -109,6 +131,7 @@ impl EnsureReconciler {
             .clock(&self.clock)
             .ensure_admission_retries(&self.ensure_admission_retries)
             .ensure_reconciliation(&self.ensure_reconciliation)
+            .next_due(&self.next_due)
             .admission(admission)
             .maybe_engine(self.engine.as_ref())
             .build()
@@ -145,6 +168,7 @@ struct EnsurePass<'a> {
     clock: &'a Arc<dyn Clock>,
     ensure_admission_retries: &'a Mutex<HashMap<(String, String), EnsureAdmissionRetry>>,
     ensure_reconciliation: &'a Mutex<()>,
+    next_due: &'a StdMutex<HashMap<String, DateTime<Utc>>>,
     admission: &'a dyn ConvoyEnsureAdmission,
     engine: Option<&'a Arc<dyn EngineEnsures>>,
 }
@@ -189,9 +213,19 @@ impl ConvoyEnsureReconciler for EnsureReconciler {
     ) -> Result<(), String> {
         self.pass(admission).reap_ensured_convoy(namespace, ensure_name, convoy_name, force).await
     }
+    fn next_due(&self, namespace: &str) -> Option<DateTime<Utc>> {
+        self.next_due.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(namespace).copied()
+    }
 }
 
 impl EnsurePass<'_> {
+    /// Records that an ensure deferred its work until `at`; the pass's caller wakes then.
+    fn due_at(&self, namespace: &str, at: DateTime<Utc>) {
+        let mut due = self.next_due.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let earliest = due.entry(namespace.to_owned()).or_insert(at);
+        *earliest = (*earliest).min(at);
+    }
+
     /// Definitions reads merge every host's copy, so local presence does not
     /// establish home. ManifestRoots are home-bound; undeclared definitions
     /// belong to their earliest creation, before later local reapplications.
@@ -236,6 +270,8 @@ impl EnsurePass<'_> {
         backing_inspector: &dyn StandingConvoyBackingInspector,
     ) -> Result<Vec<String>, String> {
         let _reconciliation = self.ensure_reconciliation.lock().await;
+        // Each full pass tells afresh when it next owes work.
+        self.next_due.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(namespace);
         let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace).list().await.map_err(|e| e.to_string())?;
         let ensure_names = ensures.iter().map(|ensure| ensure.metadata.name.clone()).collect::<HashSet<_>>();
         self.ensure_admission_retries
@@ -495,7 +531,7 @@ impl EnsurePass<'_> {
             self.patch_convoy_ensure(
                 namespace,
                 name,
-                ConvoyEnsureStatusPatch::Running { convoy_ref: replacement.clone(), observed_at: self.clock.now() },
+                ConvoyEnsureStatusPatch::Running { convoy_ref: replacement.clone(), observed_at: self.clock.now(), strikes: 0 },
             )
             .await?;
         }
@@ -608,88 +644,54 @@ impl EnsurePass<'_> {
             return Ok(None);
         }
 
-        let mut generations = self.ensured_convoy_generations(namespace, &ensure.metadata.name).await?;
-        generations.sort_by_key(|convoy| convoy.spec.generation);
-
-        let consecutive_failures = generations
-            .iter()
-            .rev()
-            .take_while(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Failed))
-            .count() as u32;
-
-        // The driver path keeps no hold record: a hold is about the latest generation, and its
-        // episode began with that generation, as a generation is held once.
-        let (resolved_escalation, released) = match generations.last() {
-            Some(latest) if self.hold_is_open(namespace, &latest.metadata.name).await? => {
-                if consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES && !force_now {
-                    return Ok(None);
-                }
-                self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
-                (consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES, false)
-            }
-            // A person's acknowledgement releases the hold; admission keeps its own backoff.
-            Some(latest) => {
-                let subject = Subject::convoy(latest.metadata.name.clone());
-                let began_at = latest.metadata.creation_timestamp;
-                (false, self.attentions.acknowledged(namespace, Sender::Standing, &subject, began_at).await?.is_some())
-            }
-            None => (false, false),
-        };
-
+        let generations = self.newest_generations_first(namespace, ensure).await?;
+        let now = self.clock.now();
+        let (reading, attention) = self.standing_reading(namespace, ensure, &generations, now, force_now).await?;
+        let latest = generations.first();
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
         let config_hash = ensure_config_hash(&ensure.spec)?;
         let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
-        {
-            let mut retries = self.ensure_admission_retries.lock().await;
-            if retries.get(&retry_key).is_some_and(|retry| retry.config_hash != config_hash || retry.dependency_hash != dependency_hash) {
-                retries.remove(&retry_key);
-            }
-            if !resolved_escalation && !force_now {
-                if let Some(retry) = retries.get(&retry_key) {
-                    if retry.retry.next_attempt_at().is_some_and(|retry_at| retry_at > self.clock.now()) {
-                        return Ok(None);
-                    }
+        match reading.decision {
+            Decision::Running => return Ok(None),
+            Decision::Held { raise } => {
+                if raise {
+                    let latest = latest.expect("strikes need a generation");
+                    let failure = restart_limit_reason(reading.strikes);
+                    self.raise_ensure_attention(ensure, latest, &failure, latest.metadata.creation_timestamp).await?;
+                    return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
                 }
-            } else {
-                retries.remove(&retry_key);
+                return Ok(None);
             }
-        }
-
-        let latest = generations.last();
-        if !resolved_escalation && !released && !force_now && consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
-            let latest = latest.expect("a positive failure count requires a generation");
-            let failure = restart_limit_reason(consecutive_failures);
-            self.raise_ensure_attention(ensure, latest, &failure, latest.metadata.creation_timestamp).await?;
-            return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
-        }
-        // `reconcile-now` is the operator's explicit acknowledgement that any
-        // missing backing records were deliberately wiped. Automatic passes
-        // still require positive death evidence before admitting a successor.
-        if !resolved_escalation && !force_now && consecutive_failures > 0 {
-            let latest = latest.expect("a positive failure count requires a generation");
-            backing_inspector.verify_backing_dead(latest).await?;
-            let retry_at = latest
-                .status
-                .as_ref()
-                .and_then(|status| status.finished_at)
-                .map(|failed_at| failed_at + ensure_retry_delay(consecutive_failures - 1))
-                .or_else(|| {
-                    ensure.status.as_ref().filter(|status| status.restart_count == consecutive_failures).and_then(|status| status.retry_at)
-                })
-                .unwrap_or(latest.metadata.creation_timestamp + ensure_retry_delay(consecutive_failures - 1));
-            if !force_now && retry_at > self.clock.now() {
+            Decision::BackOff { until } => {
+                // Automatic passes require positive death evidence before admitting a successor.
+                backing_inspector.verify_backing_dead(latest.expect("strikes need a generation")).await?;
+                self.due_at(namespace, until);
                 self.patch_driver_ensure_status_if_local(
                     namespace,
                     &ensure.metadata.name,
                     ConvoyEnsureStatusPatch::BackoffState {
-                        strikes: consecutive_failures,
-                        retry_at,
+                        strikes: reading.strikes,
+                        retry_at: until,
                         failure: "ensured convoy entered a terminal failure phase".to_string(),
                     },
                 )
                 .await?;
                 return Ok(None);
             }
+            Decision::Admit => {}
+        }
+        // `reconcile-now` is the operator's explicit acknowledgement that any missing backing
+        // records were deliberately wiped; a released hold admits at once.
+        let released = force_now || attention.acknowledged_at.is_some();
+        if attention.open {
+            self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+        }
+        if !released && reading.strikes > 0 {
+            backing_inspector.verify_backing_dead(latest.expect("strikes need a generation")).await?;
+        }
+        if let Some(retry_at) = self.admission_retry_due(&retry_key, &config_hash, &dependency_hash, released, None).await {
+            self.due_at(namespace, retry_at);
+            return Ok(None);
         }
 
         match self.start_ensured_convoy(namespace, ensure).await {
@@ -699,7 +701,6 @@ impl EnsurePass<'_> {
                 Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
             }
             Err(error) => {
-                let now = self.clock.now();
                 let (refusals, retry_at) = {
                     let mut retries = self.ensure_admission_retries.lock().await;
                     record_ensure_admission_retry(
@@ -711,10 +712,11 @@ impl EnsurePass<'_> {
                         ensure.status.as_ref().and_then(|status| status.retry.as_ref()),
                     )
                 };
+                self.due_at(namespace, retry_at);
                 self.patch_driver_ensure_status_if_local(
                     namespace,
                     &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::BackoffState { strikes: consecutive_failures, retry_at, failure: error.clone() },
+                    ConvoyEnsureStatusPatch::BackoffState { strikes: reading.strikes, retry_at, failure: error.clone() },
                 )
                 .await?;
                 Err(format!("driver admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
@@ -773,8 +775,7 @@ impl EnsurePass<'_> {
         force_now: bool,
     ) -> Result<Option<String>, String> {
         let now = self.clock.now();
-        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let mut status = ensure.status.clone().unwrap_or_default();
+        let status = ensure.status.clone().unwrap_or_default();
         let config_hash = ensure_config_hash(&ensure.spec)?;
         if status.observed_config_hash.as_deref() != Some(&config_hash) {
             let changed = status.observed_config_hash.is_some();
@@ -784,36 +785,12 @@ impl EnsurePass<'_> {
                 ConvoyEnsureStatusPatch::ObserveConfig { config_hash: config_hash.clone(), changed },
             )
             .await?;
-            status.observed_config_hash = Some(config_hash.clone());
             if changed {
                 self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
-                status.restart_count = 0;
-                status.retry_at = None;
-                status.last_failure = None;
-                status.hold_reason = None;
-                status.retry = None;
             }
         }
-        let convoy = match status.convoy_ref.as_deref() {
-            Some(convoy_ref) => match convoys.get(convoy_ref).await {
-                Ok(convoy) if convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name) => Some(convoy),
-                Ok(_) => return Err(format!("convoy {convoy_ref} exists without this ensure's provenance")),
-                Err(ResourceError::NotFound { .. }) => None,
-                Err(error) => return Err(error.to_string()),
-            },
-            None => self
-                .active_ensured_convoys(namespace, &ensure.metadata.name, EnsureConvoyScope::Local)
-                .await?
-                .into_iter()
-                .map(|source| source.object)
-                .max_by_key(|convoy| convoy.spec.generation),
-        };
-        let terminal = convoy
-            .as_ref()
-            .and_then(|convoy| convoy.status.as_ref())
-            .is_some_and(|status| matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Abandoned));
-
-        if let Some(convoy) = convoy.as_ref().filter(|_| !terminal) {
+        let generations = self.newest_generations_first(namespace, ensure).await?;
+        if let Some(convoy) = generations.first().filter(|convoy| !ended(convoy)) {
             self.observe_ensure_config_drift(namespace, ensure, convoy).await?;
             self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
             let convoy_ref = convoy.metadata.name.clone();
@@ -821,79 +798,61 @@ impl EnsurePass<'_> {
                 self.patch_convoy_ensure(
                     namespace,
                     &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::Running { convoy_ref, observed_at: now },
+                    ConvoyEnsureStatusPatch::Running { convoy_ref, observed_at: now, strikes: status.restart_count },
                 )
                 .await?;
                 return Ok(Some(format!("ConvoyEnsure/{} observed running", ensure.metadata.name)));
-            }
-            if status.restart_count > 0
-                && status.running_since.is_some_and(|running_since| now - running_since >= ENSURE_BACKOFF_RESET_AFTER)
-            {
-                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
-                return Ok(Some(format!("ConvoyEnsure/{} reset restart backoff", ensure.metadata.name)));
             }
             return Ok(None);
         }
 
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
         let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
-        let dependency_changed = {
-            let mut retries = self.ensure_admission_retries.lock().await;
-            let changed =
-                retries.get(&retry_key).is_some_and(|retry| retry.config_hash != config_hash || retry.dependency_hash != dependency_hash);
-            if changed {
-                retries.remove(&retry_key);
-            }
-            changed
-        };
-
-        if convoy.is_none() {
-            if !force_now && !dependency_changed && status.retry_at.is_some_and(|retry_at| retry_at > now) {
+        let Some(latest) = generations.first() else {
+            if let Some(retry_at) = self.admission_retry_due(&retry_key, &config_hash, &dependency_hash, force_now, status.retry_at).await {
+                self.due_at(namespace, retry_at);
                 return Ok(None);
-            }
-            if force_now {
-                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
-                status.restart_count = 0;
-                status.retry_at = None;
-                status.last_failure = None;
-                status.hold_reason = None;
-                status.retry = None;
             }
             return self.restart_absent_ensured_convoy(namespace, ensure, &status, now).await;
-        }
-
-        let convoy = convoy.expect("terminal branch requires an existing convoy");
-        if status.hold_reason == Some(ConvoyEnsureHoldReason::RestartLimit) {
-            if !force_now && self.hold_is_open(namespace, &convoy.metadata.name).await? {
+        };
+        let (reading, attention) = self.standing_reading(namespace, ensure, &generations, now, force_now).await?;
+        let failure = "ensured convoy entered a terminal failure phase";
+        match reading.decision {
+            Decision::Running => return Ok(None),
+            Decision::Held { raise } => {
+                if raise {
+                    // Raised once, as the hold begins; one on its backing earlier is another episode.
+                    let failure = restart_limit_reason(reading.strikes);
+                    self.raise_ensure_attention(ensure, latest, &failure, now).await?;
+                }
+                if raise || status.hold_reason != Some(ConvoyEnsureHoldReason::RestartLimit) {
+                    let failure = restart_limit_reason(reading.strikes);
+                    let convoy_ref = latest.metadata.name.clone();
+                    let patch = ConvoyEnsureStatusPatch::RestartLimitReached { convoy_ref, strikes: reading.strikes, failure };
+                    self.patch_convoy_ensure(namespace, &ensure.metadata.name, patch).await?;
+                    return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
+                }
                 return Ok(None);
             }
-            self.clear_hold(namespace, &convoy.metadata.name).await?;
-            if !force_now {
-                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
-                return Ok(Some(format!("ConvoyEnsure/{} restart hold cleared", ensure.metadata.name)));
-            }
-            status.restart_count = 0;
-            status.retry_at = None;
-            status.last_failure = None;
-            status.hold_reason = None;
-            status.retry = None;
+            Decision::BackOff { .. } | Decision::Admit => {}
         }
-        let operator_forced = convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned);
+
+        let operator_forced = latest.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned);
         // A forced pass is the recovery boundary for recordless teardown: the
         // operator has acknowledged that raw deletion destroyed the evidence.
         if !operator_forced && !force_now {
-            if let Err(reason) = backing_inspector.verify_backing_dead(&convoy).await {
+            if let Err(reason) = backing_inspector.verify_backing_dead(latest).await {
                 let failure = format!("standing convoy teardown held: {reason}");
                 EventRecorder::new(self.resource_backend.clone())
-                    .record(ObjectEvent::for_object(&convoy, "BackingEvidenceRefused", failure.clone()), now)
+                    .record(ObjectEvent::for_object(latest, "BackingEvidenceRefused", failure.clone()), now)
                     .await
                     .map_err(|error| format!("record backing-evidence event: {error}"))?;
-                self.raise_ensure_attention(ensure, &convoy, &failure, hold_began_at(&status, now)).await?;
+                self.raise_ensure_attention(ensure, latest, &failure, hold_began_at(&status, now)).await?;
                 if status.retry_at.is_some() || status.last_failure.as_deref() != Some(&failure) {
                     self.patch_convoy_ensure(
                         namespace,
                         &ensure.metadata.name,
-                        ConvoyEnsureStatusPatch::Holding { convoy_ref: convoy.metadata.name.clone(), failure },
+                        ConvoyEnsureStatusPatch::Holding { convoy_ref: latest.metadata.name.clone(), failure },
                     )
                     .await?;
                     return Ok(Some(format!("ConvoyEnsure/{} held for operator attention", ensure.metadata.name)));
@@ -901,73 +860,41 @@ impl EnsurePass<'_> {
                 return Ok(None);
             }
         }
+        // The backing is verified dead: a hold on it is answered.
         self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
-        self.clear_hold(namespace, &convoy.metadata.name).await?;
-
-        if status.retry_at.is_none() && !force_now {
-            let failure = "ensured convoy entered a terminal failure phase";
-            if status.restart_count.saturating_add(1) >= ENSURE_MAX_CONSECUTIVE_FAILURES {
-                let failure = restart_limit_reason(ENSURE_MAX_CONSECUTIVE_FAILURES);
-                // Raised once, as the hold begins; one on its backing earlier is another episode.
-                self.raise_ensure_attention(ensure, &convoy, &failure, now).await?;
-                self.patch_convoy_ensure(
-                    namespace,
-                    &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::RestartLimitReached { convoy_ref: convoy.metadata.name.clone(), failure },
-                )
-                .await?;
-                return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
+        self.clear_hold(namespace, &latest.metadata.name).await?;
+        if let Decision::BackOff { until } = reading.decision {
+            self.due_at(namespace, until);
+            if status.retry_at != Some(until) || status.restart_count != reading.strikes || status.convoy_ref.is_some() {
+                let patch = ConvoyEnsureStatusPatch::BackingOff { strikes: reading.strikes, retry_at: until, failure: failure.into() };
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, patch).await?;
+                return Ok(Some(format!("ConvoyEnsure/{} backing off until {until}", ensure.metadata.name)));
             }
-            let retry_at = now + ensure_retry_delay(status.restart_count);
-            self.patch_convoy_ensure(
-                namespace,
-                &ensure.metadata.name,
-                ConvoyEnsureStatusPatch::BackingOff { retry_at, failure: failure.to_string() },
-            )
-            .await?;
-            return Ok(Some(format!("ConvoyEnsure/{} backing off until {retry_at}", ensure.metadata.name)));
-        }
-        if !force_now && !dependency_changed && status.retry_at.is_some_and(|retry_at| retry_at > now) {
             return Ok(None);
         }
-        if force_now {
+        // A released hold, or an operator's reconcile-now, resumes the engine's Ensure.
+        if force_now || status.hold_reason.is_some() || attention.acknowledged_at.is_some() {
             self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
         }
-
-        let restart = async {
-            // The terminal generation remains as history. A successful
-            // restart admits the next generation under a fresh record name.
-            self.start_ensured_convoy(namespace, ensure).await
+        let refused_until = status.retry_at.filter(|_| status.hold_reason.is_none());
+        if let Some(retry_at) = self.admission_retry_due(&retry_key, &config_hash, &dependency_hash, force_now, refused_until).await {
+            self.due_at(namespace, retry_at);
+            return Ok(None);
         }
-        .await;
-        match restart {
+        // The ended generation remains as history. A successful restart admits the next
+        // generation under a fresh record name.
+        match self.start_ensured_convoy(namespace, ensure).await {
             Ok(convoy_ref) => {
                 self.ensure_admission_retries.lock().await.remove(&retry_key);
                 self.patch_convoy_ensure(
                     namespace,
                     &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::Running { convoy_ref: convoy_ref.clone(), observed_at: now },
+                    ConvoyEnsureStatusPatch::Running { convoy_ref, observed_at: now, strikes: reading.strikes },
                 )
                 .await?;
                 Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
             }
-            Err(error) => {
-                EventRecorder::new(self.resource_backend.clone())
-                    .record(ObjectEvent::for_object(ensure, "EnsureAdmissionRefused", error.clone()), now)
-                    .await
-                    .map_err(|record_error| format!("record ensure admission event: {record_error}"))?;
-                let (refusals, retry_at) = {
-                    let mut retries = self.ensure_admission_retries.lock().await;
-                    record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, status.retry.as_ref())
-                };
-                self.patch_convoy_ensure(
-                    namespace,
-                    &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::Retrying { retry_at, failure: error.clone() },
-                )
-                .await?;
-                Err(format!("admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
-            }
+            Err(error) => self.admission_refused(namespace, ensure, &status, retry_key, config_hash, dependency_hash, now, error).await,
         }
     }
 
@@ -982,38 +909,114 @@ impl EnsurePass<'_> {
         // With no running convoy, no admitted configuration can have drifted.
         let role = Subject::StandingRole { project: ensure.spec.project_ref.clone(), role: ensure.spec.role.clone() };
         self.attentions.clear(namespace, Sender::Standing, &role).await?;
+        let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
         match self.start_ensured_convoy(namespace, ensure).await {
             Ok(convoy_ref) => {
-                self.ensure_admission_retries.lock().await.remove(&(namespace.to_string(), ensure.metadata.name.clone()));
+                self.ensure_admission_retries.lock().await.remove(&retry_key);
                 self.patch_convoy_ensure(
                     namespace,
                     &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::Running { convoy_ref, observed_at: now },
+                    ConvoyEnsureStatusPatch::Running { convoy_ref, observed_at: now, strikes: 0 },
                 )
                 .await?;
                 Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
             }
             Err(error) => {
-                EventRecorder::new(self.resource_backend.clone())
-                    .record(ObjectEvent::for_object(ensure, "EnsureAdmissionRefused", error.clone()), now)
-                    .await
-                    .map_err(|record_error| format!("record ensure admission event: {record_error}"))?;
-                let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
                 let config_hash = ensure_config_hash(&ensure.spec)?;
                 let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
-                let (refusals, retry_at) = {
-                    let mut retries = self.ensure_admission_retries.lock().await;
-                    record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, status.retry.as_ref())
-                };
-                self.patch_convoy_ensure(
-                    namespace,
-                    &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::Retrying { retry_at, failure: error.clone() },
-                )
-                .await?;
-                Err(format!("admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
+                self.admission_refused(namespace, ensure, status, retry_key, config_hash, dependency_hash, now, error).await
             }
         }
+    }
+
+    /// Records a refused admission: an event on the ensure, the in-memory refusal backoff, and
+    /// the status the person reads. A refusal is no strike: no generation was admitted.
+    #[allow(clippy::too_many_arguments)]
+    async fn admission_refused(
+        &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+        status: &ConvoyEnsureStatus,
+        retry_key: (String, String),
+        config_hash: String,
+        dependency_hash: String,
+        now: DateTime<Utc>,
+        error: String,
+    ) -> Result<Option<String>, String> {
+        EventRecorder::new(self.resource_backend.clone())
+            .record(ObjectEvent::for_object(ensure, "EnsureAdmissionRefused", error.clone()), now)
+            .await
+            .map_err(|record_error| format!("record ensure admission event: {record_error}"))?;
+        let (refusals, retry_at) = {
+            let mut retries = self.ensure_admission_retries.lock().await;
+            record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, status.retry.as_ref())
+        };
+        self.due_at(namespace, retry_at);
+        self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying { retry_at, failure: error.clone() })
+            .await?;
+        Err(format!("admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
+    }
+
+    /// When a refused admission may next be tried, while that is still to come: `None` once it is
+    /// due, when `released`, or when the configuration or a dependency changed since the refusal.
+    /// `recorded` is the deadline the ensure's status keeps, which outlives this controller.
+    async fn admission_retry_due(
+        &self,
+        retry_key: &(String, String),
+        config_hash: &str,
+        dependency_hash: &str,
+        released: bool,
+        recorded: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let mut retries = self.ensure_admission_retries.lock().await;
+        let changed =
+            retries.get(retry_key).is_some_and(|retry| retry.config_hash != config_hash || retry.dependency_hash != dependency_hash);
+        if changed || released {
+            retries.remove(retry_key);
+            return None;
+        }
+        let held = retries.get(retry_key).and_then(|retry| retry.retry.next_attempt_at());
+        held.or(recorded).filter(|retry_at| *retry_at > self.clock.now())
+    }
+
+    /// The role's generations homed here, newest first.
+    async fn newest_generations_first(
+        &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+    ) -> Result<Vec<ResourceObject<ResourceConvoy>>, String> {
+        let mut generations = self.ensured_convoy_generations(namespace, &ensure.metadata.name).await?;
+        generations.sort_by_key(|convoy| std::cmp::Reverse(convoy.spec.generation));
+        Ok(generations)
+    }
+
+    /// The role's strike run and decision ([`standing::derive`]) from `generations`, newest
+    /// first, and the hold attention about them: whether one is open on the newest, and when the
+    /// newest generation a person acknowledged a hold on was admitted. The acknowledgement ends
+    /// the run, so the walk stops at the first generation that is no strike.
+    async fn standing_reading(
+        &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+        generations: &[ResourceObject<ResourceConvoy>],
+        now: DateTime<Utc>,
+        forced: bool,
+    ) -> Result<(StandingReading, HoldAttention), String> {
+        let read: Vec<Generation> = generations.iter().map(|convoy| generation(convoy, &ensure.spec)).collect();
+        let mut attention = HoldAttention::default();
+        if let Some(newest) = generations.first() {
+            attention.open = self.hold_is_open(namespace, &newest.metadata.name).await?;
+        }
+        for (convoy, generation) in generations.iter().zip(&read) {
+            let Some((Ending::Failed, finished_at)) = generation.ended.filter(|_| generation.current_config) else { break };
+            // A hold on a generation begins once it has ended.
+            let subject = Subject::convoy(convoy.metadata.name.clone());
+            if self.attentions.acknowledged(namespace, Sender::Standing, &subject, finished_at).await?.is_some() {
+                attention.acknowledged_at = Some(generation.admitted_at);
+                break;
+            }
+        }
+        Ok((standing::derive(&read, attention, now, forced), attention))
     }
 
     async fn observe_ensure_config_drift(
@@ -1259,7 +1262,7 @@ fn hold_began_at(status: &ConvoyEnsureStatus, now: DateTime<Utc>) -> DateTime<Ut
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    use chrono::TimeZone;
+    use chrono::{Duration as ChronoDuration, TimeZone};
     use flotilla_protocol::CanonicalHostId;
     use flotilla_resources::ConvoySpec;
     use flotilla_resources::ConvoyStatus;
@@ -1473,13 +1476,14 @@ mod tests {
             .build();
         (controller, admission, clock)
     }
-    async fn fail_current(admission: &Admission) {
+    async fn fail_current(admission: &Admission, clock: &VirtualClock) {
         let ensure = admission.backend.using::<ConvoyEnsure>("test").get("standing").await.expect("ensure fixture");
         let name = ensure.status.expect("resource status").convoy_ref.expect("admitted convoy reference");
         let convoys = admission.backend.using::<ResourceConvoy>("test");
         let convoy = convoys.get(&name).await.expect("admitted convoy");
         let mut status = convoy.status.expect("resource status");
         status.phase = ConvoyPhase::Failed;
+        status.finished_at = Some(clock.now());
         convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("fixture operation succeeds");
     }
 
@@ -1489,7 +1493,7 @@ mod tests {
     async fn driver_readmission_backs_off_from_failure_time() {
         let (controller, admission, clock) = fixture().await;
         controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("admit");
-        fail_current(&admission).await;
+        fail_current(&admission, &clock).await;
         let ensures = admission.backend.using::<ConvoyEnsure>("test");
         let ensure = ensures.get("standing").await.expect("ensure");
         let convoys = admission.backend.using::<ResourceConvoy>("test");
@@ -1564,7 +1568,7 @@ mod tests {
             .reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead)
             .await
             .expect("fixture operation succeeds");
-        fail_current(&admission).await;
+        fail_current(&admission, &clock).await;
         controller
             .reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Live)
             .await
@@ -1584,7 +1588,7 @@ mod tests {
                 .await
                 .expect("fixture operation succeeds");
             assert_eq!(admission.commits.load(Ordering::SeqCst), expected_commits);
-            fail_current(&admission).await;
+            fail_current(&admission, &clock).await;
         }
         controller
             .reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead)
@@ -1608,7 +1612,7 @@ mod tests {
         admission.fails_after_create.store(true, Ordering::SeqCst);
         controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("admitted");
         admission.fails_after_create.store(false, Ordering::SeqCst);
-        fail_current(&admission).await;
+        fail_current(&admission, &clock).await;
         controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("failure counted");
         let status =
             admission.backend.using::<ConvoyEnsure>("test").get("standing").await.expect("ensure fixture").status.expect("resource status");

@@ -125,7 +125,6 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::HoldTurnDelivery { .. } => PatchKind::ConvoyHoldTurnDelivery,
         ConvoyStatusPatch::RestoreTurnActivation { .. } => PatchKind::ConvoyRestoreTurnActivation,
         ConvoyStatusPatch::RecordNaming { .. }
-        | ConvoyStatusPatch::RecordEnsureAdmission { .. }
         | ConvoyStatusPatch::DiscoverSubjects { .. }
         | ConvoyStatusPatch::RecordBranchSubjectScan { .. }
         | ConvoyStatusPatch::RecordBranchSubjectScanFailure { .. }

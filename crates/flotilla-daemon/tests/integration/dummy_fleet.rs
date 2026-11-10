@@ -541,7 +541,7 @@ impl flotilla_resources::Clock for SkippingClock {
 }
 
 // Behaviour (#3824 layer 8b): a standing convoy whose
-// generation ends three times is held, and the hold is an attention from the standing
+// generation fails three times is held, and the hold is an attention from the standing
 // role in its project's operator inbox. The person sees it in `message inbox`;
 // acknowledging it releases the hold, and the next generation is admitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -613,23 +613,33 @@ async fn acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
             latest.as_ref().map(|convoy| (convoy.metadata.name.clone(), convoy.status.as_ref().map(|status| status.phase))),
             ensure().await
         );
-        match latest.as_ref().and_then(|convoy| Some((convoy, convoy.status.as_ref()?))) {
-            // An operator abandons each generation; the standing role counts it a failure.
-            Some((convoy, status)) if !status.phase.is_terminal() => {
-                let abandon = CommandAction::ConvoyAbandon {
-                    namespace: Some(NAMESPACE.into()),
-                    name: convoy.metadata.name.clone(),
-                    reason: "the generation failed".into(),
-                };
-                fleet.execute(abandon).await;
+        // Each generation fails, as its convoy controller records a failure before provisioning:
+        // a strike. An operator's abandon would not be one (decision 78(3)), and a standing
+        // generation's failed vessel is retried in place until Convoy moves onto the engine.
+        // The write is conditional on what was read, as a controller's is; a conflict is retried
+        // on the next turn.
+        if let Some((convoy, status)) = latest.as_ref().and_then(|convoy| Some((convoy, convoy.status.as_ref()?))) {
+            if !status.phase.is_terminal() {
+                let mut status = status.clone();
+                let now = flotilla_resources::Clock::now(&*clock);
+                flotilla_resources::controller_patches::fail_init(ConvoyPhase::Failed, "the generation failed".into(), now)
+                    .apply(&mut status);
+                fleet
+                    .execute(CommandAction::ResourceStatusPatch {
+                        expected_resource_version: Some(convoy.metadata.resource_version.clone()),
+                        namespace: NAMESPACE.into(),
+                        kind: "Convoy".into(),
+                        name: convoy.metadata.name.clone(),
+                        status: serde_json::to_value(status).expect("status"),
+                    })
+                    .await;
             }
-            _ => {}
         }
         // Each ended generation waits out its backoff; skip just that.
         skip_to_retry(&clock, ensure().await.and_then(|status| status.retry_at));
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    assert_eq!(generations().await.len(), 3, "three ended generations, then the hold");
+    assert_eq!(generations().await.len(), 3, "three failed generations, then the hold");
 
     let inbox = CommandAction::PersonInbox { namespace: Some(NAMESPACE.into()) };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);

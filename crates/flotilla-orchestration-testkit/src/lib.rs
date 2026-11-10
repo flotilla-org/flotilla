@@ -369,6 +369,18 @@ impl StandingConvoyBackingInspector for RecordlessBacking {
     }
 }
 
+/// A generation's status once it failed: what it recorded while it ran (its admitted
+/// configuration among it), ended Failed now.
+fn failed_status(status: Option<ConvoyStatus>, clock: &VirtualClock) -> ConvoyStatus {
+    ConvoyStatus {
+        phase: ConvoyPhase::Failed,
+        message: Some("placement failed".to_string()),
+        started_at: Some(clock.now()),
+        finished_at: Some(clock.now()),
+        ..status.unwrap_or_default()
+    }
+}
+
 async fn fail_ensured_generation(backend: &ResourceBackend, clock: &VirtualClock) -> String {
     let convoy_ref = backend
         .using::<ConvoyEnsure>("flotilla")
@@ -381,17 +393,7 @@ async fn fail_ensured_generation(backend: &ResourceBackend, clock: &VirtualClock
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let convoy = convoys.get(&convoy_ref).await.expect("generation");
     convoys
-        .update_status(
-            &convoy_ref,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Failed,
-                message: Some("placement failed".to_string()),
-                started_at: Some(clock.now()),
-                finished_at: Some(clock.now()),
-                ..Default::default()
-            },
-        )
+        .update_status(&convoy_ref, &convoy.metadata.resource_version, &failed_status(convoy.status, clock))
         .await
         .expect("fail generation");
     convoy_ref
@@ -409,17 +411,7 @@ async fn fail_latest_ensured_generation(backend: &ResourceBackend, clock: &Virtu
         .expect("latest generation");
     clock.set(convoy.metadata.creation_timestamp);
     convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Failed,
-                message: Some("placement failed".to_string()),
-                started_at: Some(clock.now()),
-                finished_at: Some(clock.now()),
-                ..Default::default()
-            },
-        )
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &failed_status(convoy.status, clock))
         .await
         .expect("fail generation");
     convoy.metadata.name

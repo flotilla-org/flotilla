@@ -66,7 +66,9 @@ pub async fn reconcile_now_resets_backoff_and_admits_the_next_ensure_generation_
     assert_eq!(outcome, "started quartermaster@standing-project");
     let reconciled = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("reconciled ensure");
     let status = reconciled.status.expect("status");
-    assert_eq!(status.restart_count, 0);
+    // ConvoyEnsure B: reconcile-now skips the wait but does not erase the failed generation the
+    // strike count is derived from.
+    assert_eq!(status.restart_count, 1);
     assert_eq!(status.retry_at, None);
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 2);
 }
@@ -87,7 +89,9 @@ pub async fn reconcile_now_clears_an_active_restart_limit_and_admits_in_one_pass
 
     assert_eq!(outcome, "started quartermaster@standing-project");
     let status = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.expect("status");
-    assert_eq!(status.restart_count, 0);
+    // ConvoyEnsure B: reconcile-now admits whatever the strikes say; only an acknowledgement ends
+    // the run, so the three failed generations still count.
+    assert_eq!(status.restart_count, 3);
     assert_eq!(status.retry_at, None);
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 4);
     assert!(matches!(
@@ -373,19 +377,19 @@ pub async fn changing_ensure_config_starts_a_fresh_retry_episode(factory: &dyn E
     changed_spec.presents_as = Some("updated-fleet".to_string());
     definitions.apply(&InputMeta::from(&ensure.metadata), &changed_spec).await.expect("change ensure config");
 
-    daemon
-        .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
-        .await
-        .expect("config change opens a fresh episode");
+    // ConvoyEnsure B: the held run failed under the old configuration, so under the new one no
+    // generation has struck yet, and the next is admitted at once.
+    assert_eq!(
+        daemon
+            .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+            .await
+            .expect("config change opens a fresh episode"),
+        vec!["started quartermaster@standing-project"]
+    );
     let status = definitions.get("quartermaster").await.expect("ensure").status.expect("status");
-    assert_eq!(status.restart_count, 1);
+    assert_eq!(status.restart_count, 0);
     assert_eq!(status.hold_reason, None);
     assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("demands").items.is_empty());
-    clock.advance(ChronoDuration::seconds(30));
-    daemon
-        .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
-        .await
-        .expect("admit after config change backoff");
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 4);
 }
 
@@ -412,7 +416,7 @@ pub async fn standing_ensure_retries_convoy_that_failed_before_provisioning(fact
                 provisioning: Some(ConvoyProvisioningState::NotStarted),
                 message: Some("workflow validation failed".to_string()),
                 finished_at: Some(clock.now()),
-                ..Default::default()
+                ..convoy.status.clone().unwrap_or_default()
             },
         )
         .await
@@ -434,28 +438,8 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
     let ensures = backend.using::<ConvoyEnsure>("flotilla");
     let ensure = ensures.get("quartermaster").await.expect("ensure");
     let first_ref = ensure.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("first convoy ref");
-    ensures
-        .update_status(
-            &ensure.metadata.name,
-            &ensure.metadata.resource_version,
-            &ConvoyEnsureStatus {
-                convoy_ref: Some(first_ref.clone()),
-                restart_count: 7,
-                running_since: Some(clock.now()),
-                retry_at: None,
-                last_failure: None,
-                hold_reason: None,
-                observed_config_hash: None,
-                declaration_refused: None,
-                admitted_config_hash: None,
-                config_drift: None,
-                conditions: Vec::new(),
-                retry: None,
-                stalled: None,
-            },
-        )
-        .await
-        .expect("seed crash budget");
+    // ConvoyEnsure B: the strike count is derived from the role's generations, so there is no
+    // stored budget to seed; a reap leaves no failed generation behind, and the count stays 0.
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     convoys.delete(&first_ref).await.expect("operator reap");
 
@@ -463,7 +447,7 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("prompt resurrection"),
         vec!["started quartermaster@standing-project"]
     );
-    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
+    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 0);
 
     let materialized_name = flotilla_charter::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
     backend.definitions::<WorkflowTemplate>("flotilla").delete(&materialized_name).await.expect("temporary resolution loss");
@@ -472,7 +456,7 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
     convoys.delete(&second_ref).await.expect("second operator reap");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("unresolved workflow schedules retry");
     let retrying = ensures.get("quartermaster").await.expect("retrying ensure");
-    assert_eq!(retrying.status.as_ref().expect("status").restart_count, 7);
+    assert_eq!(retrying.status.as_ref().expect("status").restart_count, 0);
     let retry_at = retrying.status.as_ref().expect("status").retry_at.expect("durable retry time");
 
     let repository_key = backend.using::<Repository>("flotilla").list().await.expect("repositories").items[0].spec.key();
@@ -514,5 +498,5 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
         restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("past-due retry"),
         vec!["started quartermaster@standing-project"]
     );
-    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
+    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 0);
 }

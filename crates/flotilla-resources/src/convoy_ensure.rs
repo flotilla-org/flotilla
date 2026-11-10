@@ -63,7 +63,8 @@ pub struct ConvoyEnsureStatus {
     pub declaration_refused: Option<crate::DeclarationRefusedCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy_ref: Option<String>,
-    /// Consecutive failed generations in the current retry episode.
+    /// Consecutive failed generations in the current strike run, as the last pass derived them
+    /// from the role's generations; it is shown, and no decision reads it.
     #[serde(default, rename = "strikes")]
     pub restart_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,18 +111,54 @@ pub enum ConvoyEnsureHoldReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyEnsureStatusPatch {
-    ConfigDrift { admitted_hash: Option<String>, observed_hash: String, drift: Option<ConvoyEnsureConfigDrift> },
-    DeclarationRefused { condition: Option<crate::DeclarationRefusedCondition> },
-    Running { convoy_ref: String, observed_at: DateTime<Utc> },
-    BackingOff { retry_at: DateTime<Utc>, failure: String },
-    Retrying { retry_at: DateTime<Utc>, failure: String },
-    Holding { convoy_ref: String, failure: String },
-    RestartLimitReached { convoy_ref: String, failure: String },
-    ObserveConfig { config_hash: String, changed: bool },
-    BackoffState { strikes: u32, retry_at: DateTime<Utc>, failure: String },
+    ConfigDrift {
+        admitted_hash: Option<String>,
+        observed_hash: String,
+        drift: Option<ConvoyEnsureConfigDrift>,
+    },
+    DeclarationRefused {
+        condition: Option<crate::DeclarationRefusedCondition>,
+    },
+    /// `convoy_ref` runs, behind `strikes` consecutive failed generations.
+    Running {
+        convoy_ref: String,
+        observed_at: DateTime<Utc>,
+        strikes: u32,
+    },
+    /// Its convoy ended as the `strikes`th consecutive failure the role's generations show.
+    BackingOff {
+        strikes: u32,
+        retry_at: DateTime<Utc>,
+        failure: String,
+    },
+    Retrying {
+        retry_at: DateTime<Utc>,
+        failure: String,
+    },
+    Holding {
+        convoy_ref: String,
+        failure: String,
+    },
+    /// The role's generations show `strikes` consecutive failures, its limit.
+    RestartLimitReached {
+        convoy_ref: String,
+        strikes: u32,
+        failure: String,
+    },
+    ObserveConfig {
+        config_hash: String,
+        changed: bool,
+    },
+    BackoffState {
+        strikes: u32,
+        retry_at: DateTime<Utc>,
+        failure: String,
+    },
     ResetBackoff,
     DriverManaged,
-    DriverAdmission { condition: Option<ConvoyEnsureCondition> },
+    DriverAdmission {
+        condition: Option<ConvoyEnsureCondition>,
+    },
 }
 
 impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
@@ -133,17 +170,18 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 status.config_drift.clone_from(drift);
             }
             Self::DeclarationRefused { condition } => status.declaration_refused.clone_from(condition),
-            Self::Running { convoy_ref, observed_at } => {
+            Self::Running { convoy_ref, observed_at, strikes } => {
                 status.convoy_ref = Some(convoy_ref.clone());
+                status.restart_count = *strikes;
                 status.running_since = Some(*observed_at);
                 status.retry_at = None;
                 status.last_failure = None;
                 status.hold_reason = None;
                 status.retry = None;
             }
-            Self::BackingOff { retry_at, failure } => {
+            Self::BackingOff { strikes, retry_at, failure } => {
                 status.convoy_ref = None;
-                status.restart_count = status.restart_count.saturating_add(1);
+                status.restart_count = *strikes;
                 status.running_since = None;
                 status.retry_at = Some(*retry_at);
                 status.last_failure = Some(failure.clone());
@@ -165,9 +203,9 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 status.hold_reason = Some(ConvoyEnsureHoldReason::BackingUnverified);
                 status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), Utc::now(), failure.clone()));
             }
-            Self::RestartLimitReached { convoy_ref, failure } => {
+            Self::RestartLimitReached { convoy_ref, strikes, failure } => {
                 status.convoy_ref = Some(convoy_ref.clone());
-                status.restart_count = status.restart_count.saturating_add(1);
+                status.restart_count = *strikes;
                 status.running_since = None;
                 status.retry_at = None;
                 status.last_failure = Some(failure.clone());

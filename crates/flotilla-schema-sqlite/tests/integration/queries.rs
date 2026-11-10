@@ -355,7 +355,7 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
     }
     for n in 0..tc.draw(gs::integers::<usize>().max_value(6)) {
         let ensure = ensure::generate(&tc, Pick::Draw);
-        let ensure = ensure.clone().with_spec(EnsureSpec { inbox: project(&pick(&["i0", "i1"])), ..ensure.spec().clone() });
+        let ensure = ensure.clone().with_spec(EnsureSpec { inbox: project(&pick(&["i0", "i1"])) });
         ensures.insert(write.insert(&format!("e{n}"), &ensure, &origin()).expect("insert").id, ensure);
     }
     write.commit().expect("commit");

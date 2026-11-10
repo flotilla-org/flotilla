@@ -776,8 +776,8 @@ pub async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is
         .await
         .expect("stale reconcile write");
 
-    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("observe abandoned generation");
-    clock.advance(ChronoDuration::seconds(30));
+    // ConvoyEnsure B (decision 78(3)): an operator's abandon is not a strike, so nothing backs off
+    // and the pass that observes it supersedes it.
     assert_eq!(
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("supersede abandoned generation"),
         vec!["started quartermaster@standing-project"]

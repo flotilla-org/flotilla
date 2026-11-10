@@ -100,13 +100,10 @@ fn spec_edits_refuse_what_only_edges_write() {
     assert_eq!(stamps.collect::<Vec<_>>(), [dossier_current.version], "the insert stamps every row");
 
     let mut write = store.write().expect("write");
-    let held = EnsureState::Held { recorded: Default::default(), created: Default::default(), failures: 0, last_failure: None };
+    let held = EnsureState::Held { recorded: Default::default(), created: Default::default() };
     let moved = ensure.clone().with_state(State::new(held, ensure.since()));
     assert_eq!(refused(write.update(&current, &moved, &origin())), "ensure.state");
-    let later = ensure
-        .clone()
-        .with_state(State::new(ensure.state().clone(), Timestamp(9)))
-        .with_spec(EnsureSpec { inbox: addr("edited"), ..ensure.spec().clone() });
+    let later = ensure.clone().with_state(State::new(ensure.state().clone(), Timestamp(9))).with_spec(EnsureSpec { inbox: addr("edited") });
     assert_eq!(refused(write.update(&current, &later, &origin())), "ensure.state_since", "a spec field beside it does not excuse it");
     let deliverables = |f: Edit<Deliverable>| Dossier { deliverables: with_rows(&dossier.deliverables, f), ..dossier.clone() };
     let retracted = deliverables(&|rows| rows[0].1.state = State::new(DeliverableState::Retracted, Timestamp(5)));
@@ -122,7 +119,7 @@ fn spec_edits_refuse_what_only_edges_write() {
 
     // Allowed in the same transaction: a spec edit, then the engine's record edge appending its
     // event and growing the state's recorded set, whatever stamps the caller's rows hold.
-    let edited = ensure.clone().with_spec(EnsureSpec { inbox: addr("edited"), ..ensure.spec().clone() });
+    let edited = ensure.clone().with_spec(EnsureSpec { inbox: addr("edited") });
     let stamp = write.update(&current, &edited, &origin()).expect("spec edit");
     let (edge, next) =
         step(&edited, "dave", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(8)).expect("recorded");

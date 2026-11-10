@@ -108,14 +108,12 @@ state; it does not duplicate a lifecycle store. Placement evidence carries the
 observed caps, live counts, available capacity and waiting requests. A lease
 holds only its request and host. The scenario keeps what each placement's
 priority rule read (available capacity and waiting requests), so the priority
-invariant checks the evidence the rule used. Ensure carries its binding,
-recorded fulfillers, attempt history and window on the relevant variants. Each
-attempt is an `Attempted` edge with its outcome; `Hold` needs the window's
-consecutive failures since its last success to reach `MAX_FAILURES` (2 in the
-model), or its last failure to be non-retryable. The shared lifecycle's
-Requested carries its own attempt history under the same rule, with no
-windows: `GiveUp` needs that history exhausted and its last failure to have
-the cause given up with. A receipt is a consumer's `Receive` edge on its own
+invariant checks the evidence the rule used. Ensure carries its binding and
+recorded fulfillers on the relevant variants, and no failure count: its keeper
+derives a strike run from its fulfillers' endings and holds an unfulfilled
+Ensure on it (ConvoyEnsure B). The shared lifecycle's Requested carries its
+own attempt history: `GiveUp` needs that history exhausted and its last
+failure to have the cause given up with. A receipt is a consumer's `Receive` edge on its own
 resource, whose master is the message; the inbox scenario publishes its stream
 row with that edge, so the message reads the receipts about it. Message stays
 abstract over who consumes it: each consumer kind (an agent session, a
@@ -143,7 +141,7 @@ The scenarios encode these rulings:
 | Convoy | admission of a known project holds an obligation; deliver requires nothing Pending or Submitted and no holding lifetime duty; a submitted promise has a submission; settled promises refuse every promise edge; an owner's retraction closes once anything is submitted | once nothing is open and no lifetime duty holds, fair delivery ends the convoy |
 | Reply exchange | the record exists exactly when its message was sent; Answered names a reply to the awaited message in the sender's inbox; expiry follows the deadline and never beats a reply already in the inbox; ends are final | a reply that lands while the record is open is eventually its answer under fair answering |
 | Inbox / replacement / unbind | turn before receipt; per-session dedupe; drain observed receipts before bind; accept an old session's receipt; one receiver; no undeliverable drop with an observed receipt; unbound timeout starts at unbind | observed receipts make progress under fair home delivery; observed session ends and sustained silence trigger owner unbind reactions |
-| Ensure | record before create; bind only Realised/receiving; release and observe Gone before replacement; retire releases every created fulfiller, including Requested; a hold follows a failure in the current window; resume retains history and moves the window | a bound fulfiller observed Gone is eventually unbound under a fair owner reaction |
+| Ensure | record before create; bind only Realised/receiving; release and observe Gone before replacement; retire releases every created fulfiller, including Requested; a held Ensure is unbound | a bound fulfiller observed Gone is eventually unbound under a fair owner reaction |
 | Message race | outcome may settle Pending; terminal edges refuse; expiry waits for the consumer prefix past the deadline and loses to visible evidence; supersede and withdrawn reasons | visible expected evidence eventually settles under fair settlement; ends remain final |
 | Admission / placement | two convoys, two hosts, three placement requests, two abstract classes and two capacity dimensions; convoy caps, host leases, Gone lease return, priority order | no availability fairness assumed |
 | Machine edges | all lifecycle and session edges (receipts too), matching/missing evidence, exhausted attempts, ended resources | finite gate/edge coverage in the fast tier |

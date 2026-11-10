@@ -39,12 +39,8 @@
 //!   exactly the spec's `bound`, so `bound` renders as "a watermark is
 //!   recorded". The spec's `receipt` is false on every drop it can reach (an
 //!   undeliverable drop is refused with a receipt), and Rust has no field.
-//! - **Ensure `history` and `window`.** Rust keeps the window's tally in the
-//!   state; the history is the Ensure's `Attempted` log entries and the window
-//!   the number before the last `Resume` entry. Rendering checks the tally
-//!   against the window's outcomes.
-//! - **Lifecycle attempts.** As for Ensure, the model's `Requested(history)`
-//!   is the resource's `Attempted` log entries, and Rust keeps their tally in
+//! - **Lifecycle attempts.** The model's `Requested(history)` is the
+//!   resource's `Attempted` log entries, and Rust keeps their tally in
 //!   Requested; rendering checks it.
 //! - **Receipts.** In `inbox_delivery` a receipt is a session's `Receive`
 //!   edge about the message, and its stream row is that entry on its way to
@@ -106,7 +102,7 @@ use flotilla_state_machines::{
             self, Convoy, ConvoyEdge, ConvoyId, ConvoyRequest, ConvoyState, MemoryConvoyWorld, Priority, PromiseId, PromiseSource, Quota,
             SeatName, VesselClass,
         },
-        ensure::{self, Ensure, EnsureEdge, EnsureSpec, EnsureState, FulfillerPhase, FulfillerStatus, MemoryEnsureWorld, UnbindReason},
+        ensure::{self, Ensure, EnsureSpec, EnsureState, FulfillerPhase, FulfillerStatus, MemoryEnsureWorld, UnbindReason},
         lifecycle::{self, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed},
         message::{
             self, DropReason, InboxBinding, MemoryMessageWorld, Message, MessageEdge, MessageEdgeKind, MessageRef, MessageSpec,
@@ -1298,45 +1294,11 @@ fn fulfiller_set(fulfillers: &ensure::Fulfillers) -> Value {
     set_of(fulfillers.iter().map(|fulfiller| int(id_of(fulfiller.name()))))
 }
 
-/// The spec's `AttemptOutcome`.
-fn outcome_value(outcome: &Outcome) -> Value {
-    match outcome {
-        Outcome::Succeeded => constant("Succeeded"),
-        Outcome::Failed { retryable, .. } => variant("Failed", json!({ "retryable": retryable })),
-    }
-}
-
 /// The spec's `Unfulfilled(Work) | Fulfilled({ work, bound }) | Held(Work) | Retired(Work)`
-/// with `Work = { recorded, created, history, window }`: the state's data,
-/// the history as the Ensure's `Attempted` entries, and the window as how
-/// many came before the last `Resume`. The state's tally must agree with
-/// the window's outcomes.
-fn ensure_value(home: &Home<Ensure>, resource: &Resource<Ensure>) -> Value {
-    let mut history = Vec::new();
-    let mut window = 0;
-    for (_, event) in home.log().history(resource.name(), Version(0), usize::MAX) {
-        match &event.arguments.edge {
-            EnsureEdge::Attempted(attempted) => history.push(attempted),
-            EnsureEdge::Resume(_) => window = history.len(),
-            _ => {}
-        }
-    }
+/// with `Work = { recorded, created }`: the state's data.
+fn ensure_value(_: &Home<Ensure>, resource: &Resource<Ensure>) -> Value {
     let state = resource.state();
-    let current = &history[window..];
-    let since_success = current.iter().rev().take_while(|a| matches!(a.outcome, Outcome::Failed { .. })).count();
-    assert_eq!(state.failures() as usize, since_success, "{}: the tally counts the window's failures", resource.name());
-    let last_retryable = current.last().and_then(|a| match a.outcome {
-        Outcome::Failed { retryable, .. } => Some(retryable),
-        Outcome::Succeeded => None,
-    });
-    assert_eq!(state.last_failure().map(|f| f.retryable), last_retryable, "{}: the tally keeps the last failure", resource.name());
-    let history = history.iter().map(|a| json!({ "id": int(id_of(a.fulfiller.name())), "outcome": outcome_value(&a.outcome) }));
-    let work = json!({
-        "recorded": fulfiller_set(state.recorded()),
-        "created": fulfiller_set(state.created()),
-        "history": Value::Array(history.collect()),
-        "window": int(window as i64),
-    });
+    let work = json!({ "recorded": fulfiller_set(state.recorded()), "created": fulfiller_set(state.created()) });
     match state {
         EnsureState::Unfulfilled { .. } => variant("Unfulfilled", work),
         EnsureState::Fulfilled { bound, .. } => variant("Fulfilled", json!({ "work": work, "bound": int(id_of(bound.name())) })),
@@ -1360,7 +1322,6 @@ fn probe_ensure(home: &mut Home<Ensure>, fulfillers: &Fulfillers, state: &Value,
             ensure::Bind { fulfiller: fulfiller(1) }.into(),
             ensure::Unbind { reason: UnbindReason::Gone, fulfiller: fulfiller(1) }.into(),
             ensure::Hold.into(),
-            ensure::Attempted { fulfiller: fulfiller(1), outcome: Outcome::Succeeded }.into(),
             ensure::Resume { by: "owner".into(), authority: owner() }.into(),
             ensure::Retire { by: "owner".into(), authority: owner(), teardown: Ref::new("fulfillers") }.into(),
         ];
@@ -1373,14 +1334,9 @@ fn probe_ensure(home: &mut Home<Ensure>, fulfillers: &Fulfillers, state: &Value,
     assert!(!would_accept(home, ONE, resume, &refused, now, tally), "{step}: resumes without authority");
     let retire = ensure::Retire { by: "owner".into(), authority: owner(), teardown: Ref::new("fulfillers") };
     assert!(!would_accept(home, ONE, retire, &refused, now, tally), "{step}: retires without authority");
-    // `heldAfterWindowFailure`: a hold the Rust gate would allow follows a
-    // failure in the current window.
+    // `heldUnbound`: a hold the Rust gate would allow leaves nothing bound.
     if would_accept(home, ONE, ensure::Hold, &world, now, tally) {
-        let work = ensure_work(model);
-        let history = list(&work["history"]);
-        let window = usize::try_from(number(&work["window"])).expect("window");
-        let last = history.get(window..).and_then(<[Value]>::last);
-        assert!(last.is_some_and(|attempt| tag(&attempt["outcome"]) == "Failed"), "{step}: holds without a failure in the window");
+        assert_eq!(tag(model), "Unfulfilled", "{step}: holds a bound Ensure");
     }
     let recorded: BTreeSet<i64> = set(&ensure_work(model)["recorded"]).iter().map(number).collect();
     for id in [1, 2] {
@@ -1428,10 +1384,7 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
         let world = ensure_world(&fulfillers, step.yes("auth"));
         let fulfiller = Ref::<ensure::Fulfiller>::new(name.clone());
         match step.action() {
-            // The spec's `MAX_FAILURES = 2`.
-            "request" => {
-                create(&mut home, ONE, EnsureSpec { inbox: at_address(INBOX), policy: AttemptPolicy::immediate(2) }, &world, &step, tally)
-            }
+            "request" => create(&mut home, ONE, EnsureSpec { inbox: at_address(INBOX) }, &world, &step, tally),
             "record" => accept(&mut home, ONE, ensure::Record { fulfiller }, &world, now, &step, tally),
             "create" => {
                 accept(&mut home, ONE, ensure::Create { fulfiller }, &world, now, &step, tally);
@@ -1440,16 +1393,6 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
             op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut fulfillers, &name, op, true, true, "model", now, &step, tally),
             "bind" => accept(&mut home, ONE, ensure::Bind { fulfiller }, &world, now, &step, tally),
             "unbind" => accept(&mut home, ONE, ensure::Unbind { reason: UnbindReason::Gone, fulfiller }, &world, now, &step, tally),
-            "attempt" => {
-                let outcome = match tag(step.pick("outcome")) {
-                    "Succeeded" => Outcome::Succeeded,
-                    "Failed" => {
-                        Outcome::Failed { cause: cause("failure"), retryable: boolean(&payload(step.pick("outcome"))["retryable"]) }
-                    }
-                    other => panic!("{step}: attempt outcome {other}"),
-                };
-                accept(&mut home, ONE, ensure::Attempted { fulfiller, outcome }, &world, now, &step, tally);
-            }
             "hold" => accept(&mut home, ONE, ensure::Hold, &world, now, &step, tally),
             "resume" => accept(&mut home, ONE, ensure::Resume { by: "owner".into(), authority: owner() }, &world, now, &step, tally),
             "retire" => {

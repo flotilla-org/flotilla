@@ -357,7 +357,7 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
                     supervision: None,
                     vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
                 }),
-                ..Default::default()
+                ..first.status.clone().unwrap_or_default()
             },
         )
         .await
@@ -407,8 +407,8 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
     environments
         .environments
         .finish("quartermaster-work", flotilla_provisioning_testkit::Ending::Failed("Docker container live-container is not running"));
-    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("record crash backoff");
-    clock.advance(ChronoDuration::seconds(30));
+    // ConvoyEnsure B: the crash backoff runs from the generation's end an hour ago, so the
+    // replacement starts on the pass that sees the backing dead.
     assert_eq!(
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart dead backing"),
         vec!["started quartermaster@standing-project"]
@@ -497,7 +497,8 @@ pub async fn forced_convoy_delete_retains_force_intent_until_checkout_finalizes(
     // A checkout the convoy holds on the engine, made for it and not yet removed.
     let convoy = backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await.expect("standing convoy");
     let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
-    engine(&daemon).checkouts.open_convoy(&engine_convoy);
+    // Named on the convoy's status as admission names it: a checkout is held for that launch.
+    engine(&daemon).checkouts.admit_for(&backend, "flotilla", &engine_convoy, &convoy_ref).await;
     let holder = engine(&daemon).checkouts.holder(&engine_convoy);
     engine(&daemon).checkouts.put_ready(
         "checkout-at-risk",

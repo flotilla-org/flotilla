@@ -57,12 +57,12 @@ use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
-        ensure::{Attempted as EnsureAttempted, Create, Ensure, EnsureSpec, Fulfiller, MemoryEnsureWorld, Record},
+        ensure::{Create, Ensure, EnsureSpec, Fulfiller, Hold, MemoryEnsureWorld, Record},
         lifecycle::{LifecycleState, MemoryLifecycleWorld, Observed, Realise, VanishCause},
         vessel::{Vessel, VesselKind},
     },
     placement::{Dimension, Host, Placements, Request, VesselId},
-    AttemptPolicy, Cause, CauseCategory, Home, Outcome, Ref,
+    Home, Ref,
 };
 use rusqlite::{Connection, StatementStatus};
 
@@ -409,30 +409,19 @@ fn crew_load() {
     }
     per_event("session create, one transaction", locals.len(), started, "the row, its env rows, identity and log entry");
 
-    // Standing roles: an Ensure each, a fulfiller recorded and created, one failed attempt.
-    let policy = AttemptPolicy { max_failures: 3, base: 1_000_000, factor: 2, cap: 60_000_000 };
+    // Standing roles: an Ensure each, a fulfiller recorded and created, then held.
     for role in 0..ROLES {
         let name = format!("ensure-{role}");
-        crew.ensures
-            .create(&name, EnsureSpec { inbox: inbox(role), policy }, &MemoryEnsureWorld::default(), Timestamp(13))
-            .expect("created");
+        crew.ensures.create(&name, EnsureSpec { inbox: inbox(role) }, &MemoryEnsureWorld::default(), Timestamp(13)).expect("created");
         let fulfiller = Ref::<Fulfiller>::new(format!("standing-{role}"));
         crew.ensures.apply(&name, Record { fulfiller: fulfiller.clone() }, &MemoryEnsureWorld::default(), Timestamp(14)).expect("recorded");
         crew.ensures.apply(&name, Create { fulfiller }, &MemoryEnsureWorld::default(), Timestamp(15)).expect("created");
     }
     let started = Instant::now();
     for role in 0..ROLES {
-        let failed = Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "admission refused"), retryable: true };
-        crew.ensures
-            .apply(
-                &format!("ensure-{role}"),
-                EnsureAttempted { fulfiller: Ref::new(format!("standing-{role}")), outcome: failed },
-                &MemoryEnsureWorld::default(),
-                Timestamp(16),
-            )
-            .expect("attempt");
+        crew.ensures.apply(&format!("ensure-{role}"), Hold, &MemoryEnsureWorld::default(), Timestamp(16)).expect("held");
     }
-    per_event("ensure attempt, one transaction", ROLES, started, "the tally and the log entry");
+    per_event("ensure hold, one transaction", ROLES, started, "the state and the log entry");
 
     // The crew sessions' write path (#3629 layer 7): each local convoy's crew session requested
     // and realised as the TerminalSession controller steps it, its process exited, and renewed
@@ -483,15 +472,15 @@ fn crew_load() {
     for role in 0..ROLES {
         let mut obj = standing(role);
         for patch in [
-            ConvoyEnsureStatusPatch::Running { convoy_ref: format!("standing-{role}-1"), observed_at: chrono::Utc::now() },
-            ConvoyEnsureStatusPatch::BackingOff { retry_at: chrono::Utc::now(), failure: "convoy failed".into() },
-            ConvoyEnsureStatusPatch::Running { convoy_ref: format!("standing-{role}-2"), observed_at: chrono::Utc::now() },
+            ConvoyEnsureStatusPatch::Running { convoy_ref: format!("standing-{role}-1"), observed_at: chrono::Utc::now(), strikes: 0 },
+            ConvoyEnsureStatusPatch::BackingOff { strikes: 1, retry_at: chrono::Utc::now(), failure: "convoy failed".into() },
+            ConvoyEnsureStatusPatch::Running { convoy_ref: format!("standing-{role}-2"), observed_at: chrono::Utc::now(), strikes: 1 },
         ] {
             let decided = ensures.decide_now(&obj, patch).expect("decided").expect("taken");
             decided.apply(obj.status.get_or_insert_with(Default::default));
         }
     }
-    per_event("ensure patch decided", ROLES * 3, started, "its edges (record, create, attempt, bind or unbind), one transaction each");
+    per_event("ensure patch decided", ROLES * 3, started, "its edges (record, create, bind or unbind), one transaction each");
 
     // The Vessel write path (#3629 layer 7, Q6): each local convoy's pinned vessel granted as its
     // provisioning starts, realised, then lost, through the engine. Its lease is freed, so the

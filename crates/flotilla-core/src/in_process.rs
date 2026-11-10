@@ -3649,6 +3649,10 @@ impl InProcessDaemon {
             .reconcile_convoy_ensures_once_with_backing_inspector(self, namespace, backing_inspector)
             .await
     }
+    /// The earliest time the last ensure pass deferred work to; nothing else wakes the pass then.
+    pub async fn convoy_ensure_next_due(&self, namespace: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+        Ok(self.convoy_ensure_reconciler().await?.next_due(namespace))
+    }
     pub async fn reconcile_convoy_ensure_now(
         &self,
         namespace: &str,

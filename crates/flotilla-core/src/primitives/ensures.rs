@@ -7,17 +7,19 @@
 //!
 //! | Old patch | Edges |
 //! |---|---|
-//! | `Running { convoy }` | record and create the convoy if new, a successful attempt, bind it |
-//! | `BackingOff` (its convoy failed or was abandoned) | unbind it as gone, a failed retryable attempt |
-//! | `Retrying` (admission refused) | a failed retryable attempt |
-//! | `RestartLimitReached` | unbind, a failed attempt, hold (the window is spent) |
+//! | `Running { convoy }` | record and create the convoy if new, bind it |
+//! | `BackingOff` (its convoy failed or was abandoned) | unbind it as gone |
+//! | `RestartLimitReached` | unbind, hold |
 //! | `ResetBackoff` while held | resume, on the authority that cleared the hold |
-//! | anything else (config, drift, driver, holding for verification) | none |
+//! | anything else (admission refused, config, drift, driver, holding for verification) | none |
+//!
+//! The Ensure counts no failures (ConvoyEnsure B): the pass derives the role's strike run from its
+//! generations ([`flotilla_admission::standing`]) and reports `RestartLimitReached` when the run
+//! reaches its limit, which the engine takes as the hold.
 //!
 //! The evidence each gate reads is what the old pass observed: a convoy it found running is
 //! realised and can receive, its inbox drained (the old pass binds on that and nothing more); one
-//! it found failed or abandoned is gone. An admission refused before any convoy existed is an
-//! attempt named for the Ensure's admission, since no fulfiller was created. This evidence stands
+//! it found failed or abandoned is gone. This evidence stands
 //! in for reads of the convoy itself until the Convoy kind is on the engine (#3587), when its
 //! world reads the engine's Convoy; the operator authority on `Resume` stands in for the hold's
 //! clearer, which the old patch does not name.
@@ -25,10 +27,9 @@
 //! The patch is written only when the engine took every edge; a refused edge writes nothing to the
 //! old status, and the next pass reports again. Each edge is its own transaction, so the edges
 //! before a refused one stay taken: the next pass's edges are computed from the engine's state, so
-//! it resumes after them (a recorded or created convoy is not recorded again). The exception is a
-//! refused `Hold`: its failed attempt counted, and the next `RestartLimitReached` counts another,
-//! which is what spends the window the old pass already judged spent. An Ensure the engine does not hold, written before
-//! the switch, stays on the old path until the import (layer 9).
+//! it resumes after them (a recorded or created convoy is not recorded again). An Ensure the
+//! engine does not hold, written before the switch, stays on the old path until the import
+//! (layer 9).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -45,15 +46,11 @@ use flotilla_schema::{NewChange, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
     machines::ensure::{
-        Attempted, Bind, Create, Ensure, EnsureEdge, EnsureSpec, EnsureState, Fulfiller, FulfillerPhase, FulfillerStatus, Hold,
-        MemoryEnsureWorld, Record, Resume, Unbind, UnbindReason,
+        Bind, Create, Ensure, EnsureEdge, EnsureSpec, EnsureState, Fulfiller, FulfillerPhase, FulfillerStatus, Hold, MemoryEnsureWorld,
+        Record, Resume, Unbind, UnbindReason,
     },
-    AttemptPolicy, Cause, CauseCategory, Failure, Home, Outcome, Ref, Resource, Version, WriteError,
+    Home, Ref, Resource, Version, WriteError,
 };
-
-/// The old pass's restart budget, as the engine judges it: three consecutive failures, backing
-/// off as the old provisioning retry did (30 s doubling, capped at ten minutes).
-pub const ENSURE_POLICY: AttemptPolicy = AttemptPolicy { max_failures: 3, base: 30_000_000, factor: 2, cap: 600_000_000 };
 
 /// Who resumes a held Ensure when the old pass clears its hold: an operator dismissed its
 /// attention demand, or forced a pass.
@@ -101,12 +98,12 @@ fn decide(
             return Ok(Some(patch));
         }
         let inbox = standing_inbox(ensure)?;
-        home.create(name, EnsureSpec { inbox, policy: ENSURE_POLICY }, &MemoryEnsureWorld::default(), now)
+        home.create(name, EnsureSpec { inbox }, &MemoryEnsureWorld::default(), now)
             .map_err(|error| format!("Ensure `{name}`: {error:?}"))?;
     }
     let state = home.get(name).expect("held").state().clone();
     let inbox = home.get(name).expect("held").spec().inbox.clone();
-    for (edge, world) in edges(name, &inbox, &state, &patch)? {
+    for (edge, world) in edges(&inbox, &state, &patch)? {
         match home.apply(name, edge.clone(), &world, now) {
             Ok(_) => {}
             Err(WriteError::Refused(refusal)) => {
@@ -151,17 +148,8 @@ fn fulfiller(convoy: &str) -> Ref<Fulfiller> {
     Ref::new(convoy)
 }
 
-fn failed(detail: &str) -> Outcome {
-    Outcome::Failed { cause: Cause::new(CauseCategory::External, detail), retryable: true }
-}
-
 /// The edges `patch` means for an Ensure in `state`, each with the evidence its gate reads.
-fn edges(
-    name: &str,
-    inbox: &Address,
-    state: &EnsureState,
-    patch: &ConvoyEnsureStatusPatch,
-) -> Result<Vec<(EnsureEdge, MemoryEnsureWorld)>, String> {
+fn edges(inbox: &Address, state: &EnsureState, patch: &ConvoyEnsureStatusPatch) -> Result<Vec<(EnsureEdge, MemoryEnsureWorld)>, String> {
     let gone = |convoy: &Ref<Fulfiller>| {
         let mut world = MemoryEnsureWorld::default();
         world.fulfillers.put(convoy, FulfillerStatus { phase: FulfillerPhase::Gone, can_receive: false });
@@ -172,8 +160,6 @@ fn edges(
             edges.push((Unbind { reason: UnbindReason::Gone, fulfiller: bound.clone() }.into(), gone(bound)));
         }
     };
-    // An attempt names the fulfiller it tried: the bound one, or the admission when none existed.
-    let tried = state.bound().cloned().unwrap_or_else(|| fulfiller(&format!("{name}/admission")));
     let mut edges = Vec::new();
     match patch {
         ConvoyEnsureStatusPatch::Running { .. } => {
@@ -194,22 +180,14 @@ fn edges(
                 }
                 edges.push((Create { fulfiller: convoy.clone() }.into(), world));
             }
-            edges.push((Attempted { fulfiller: convoy.clone(), outcome: Outcome::Succeeded }.into(), MemoryEnsureWorld::default()));
             let mut world = MemoryEnsureWorld::default();
             world.fulfillers.put(&convoy, FulfillerStatus { phase: FulfillerPhase::Realised, can_receive: true });
             world.drains.put(&Ref::new(inbox.to_string()), true);
             edges.push((Bind { fulfiller: convoy }.into(), world));
         }
-        ConvoyEnsureStatusPatch::BackingOff { failure, .. } => {
+        ConvoyEnsureStatusPatch::BackingOff { .. } => unbind(&mut edges),
+        ConvoyEnsureStatusPatch::RestartLimitReached { .. } if !matches!(state, EnsureState::Held { .. }) => {
             unbind(&mut edges);
-            edges.push((Attempted { fulfiller: tried, outcome: failed(failure) }.into(), MemoryEnsureWorld::default()));
-        }
-        ConvoyEnsureStatusPatch::Retrying { failure, .. } => {
-            edges.push((Attempted { fulfiller: tried, outcome: failed(failure) }.into(), MemoryEnsureWorld::default()));
-        }
-        ConvoyEnsureStatusPatch::RestartLimitReached { failure, .. } => {
-            unbind(&mut edges);
-            edges.push((Attempted { fulfiller: tried, outcome: failed(failure) }.into(), MemoryEnsureWorld::default()));
             edges.push((Hold.into(), MemoryEnsureWorld::default()));
         }
         ConvoyEnsureStatusPatch::ResetBackoff if matches!(state, EnsureState::Held { .. }) => {
@@ -224,7 +202,7 @@ fn edges(
 
 /// The Ensure an old ConvoyEnsure imports as (#3629 layer 9), its state derived from its live
 /// convoy: bound to the convoy it records while that convoy is live, held once its restart limit
-/// was reached, else unfulfilled with its strikes as the window's failures. `convoy_live` says
+/// was reached, else unfulfilled. `convoy_live` says
 /// whether the convoy it records is still live (not terminal). Its only refusal is a standing role
 /// with no address; every old status maps.
 pub fn import_ensure(ensure: &ResourceObject<ConvoyEnsure>, convoy_live: bool) -> Result<Resource<Ensure>, String> {
@@ -232,27 +210,15 @@ pub fn import_ensure(ensure: &ResourceObject<ConvoyEnsure>, convoy_live: bool) -
     let status = ensure.status.clone().unwrap_or_default();
     let stable = standing_name(&ensure.spec.project_ref, &ensure.spec.role)?;
     let recorded: BTreeSet<Ref<Fulfiller>> = status.convoy_ref.iter().map(|_| fulfiller(&stable)).collect();
-    let failures = status.restart_count;
-    let last_failure = (failures > 0).then(|| Failure {
-        // Failures with no recorded window read as long past (the epoch): the engine's backoff has
-        // run out and the next pass retries at once, the safe direction.
-        at: status.retry.as_ref().map_or(Timestamp(0), |retry| Timestamp::from_datetime(&retry.first_failure_at)),
-        cause: Cause::new(CauseCategory::External, status.last_failure.clone().unwrap_or_else(|| "the standing convoy failed".into())),
-        retryable: true,
-    });
     let state = match (&status.hold_reason, &status.convoy_ref) {
-        (Some(ConvoyEnsureHoldReason::RestartLimit), _) => {
-            EnsureState::Held { recorded: recorded.clone(), created: recorded, failures, last_failure }
-        }
-        (_, Some(_)) if convoy_live => {
-            EnsureState::Fulfilled { recorded: recorded.clone(), created: recorded, failures, last_failure, bound: fulfiller(&stable) }
-        }
-        _ => EnsureState::Unfulfilled { recorded: recorded.clone(), created: recorded, failures, last_failure },
+        (Some(ConvoyEnsureHoldReason::RestartLimit), _) => EnsureState::Held { recorded: recorded.clone(), created: recorded },
+        (_, Some(_)) if convoy_live => EnsureState::Fulfilled { recorded: recorded.clone(), created: recorded, bound: fulfiller(&stable) },
+        _ => EnsureState::Unfulfilled { recorded: recorded.clone(), created: recorded },
     };
     let since = Timestamp::from_datetime(&ensure.metadata.creation_timestamp);
     Ok(Resource::stored(
         ensure.metadata.name.clone(),
-        EnsureSpec { inbox: standing_inbox(ensure)?, policy: ENSURE_POLICY },
+        EnsureSpec { inbox: standing_inbox(ensure)? },
         flotilla_schema::State::new(state, since),
         Version(1),
     ))
@@ -348,18 +314,19 @@ pub(super) mod tests {
         format!("{:?}", path.get("flotilla-governor").expect("held").label())
     }
 
-    // Behaviour (#3629 layer 7): behind `[primitives]` the engine's Ensure decides a standing
-    // role's convoy: a running convoy is recorded, created and bound; its failure unbinds it and
-    // counts an attempt; its replacement is bound in turn; three failures in a row hold the Ensure,
-    // and the operator clearing the hold resumes it. Each patch is written as the engine took it.
     #[test]
     fn a_running_patch_without_a_project_returns_an_error() {
         let state = import_ensure(&ensure(None), false).unwrap().state().clone();
         let inbox: Address = "convoy:orphan/role:governor".parse().unwrap();
-        let patch = ConvoyEnsureStatusPatch::Running { convoy_ref: "old-generation".into(), observed_at: Utc::now() };
-        assert!(matches!(edges("ensure", &inbox, &state, &patch), Err(error) if error.contains("no project")));
+        let patch = ConvoyEnsureStatusPatch::Running { convoy_ref: "old-generation".into(), observed_at: Utc::now(), strikes: 0 };
+        assert!(matches!(edges(&inbox, &state, &patch), Err(error) if error.contains("no project")));
     }
 
+    // Behaviour (#3629 layer 7, ConvoyEnsure B): the engine's Ensure keeps a standing role's
+    // convoy bound: a running convoy is recorded, created and bound; its failure unbinds it; its
+    // replacement is bound in turn; the pass's restart limit holds the Ensure, and the operator
+    // clearing the hold resumes it. The Ensure counts nothing. Each patch is written as the
+    // engine took it.
     #[test]
     fn the_engine_ensure_keeps_a_standing_convoy_bound() {
         let path = path();
@@ -371,28 +338,25 @@ pub(super) mod tests {
             }
             decided.is_some()
         };
-        let running = |convoy: &str| ConvoyEnsureStatusPatch::Running { convoy_ref: convoy.into(), observed_at: Utc::now() };
-        let failed = || ConvoyEnsureStatusPatch::BackingOff { retry_at: Utc::now(), failure: "convoy failed".into() };
+        let running = |convoy: &str| ConvoyEnsureStatusPatch::Running { convoy_ref: convoy.into(), observed_at: Utc::now(), strikes: 0 };
+        let failed = |strikes| ConvoyEnsureStatusPatch::BackingOff { strikes, retry_at: Utc::now(), failure: "convoy failed".into() };
 
         assert!(write(running("governor-1"), &mut obj));
         assert_eq!(label(&path), "Fulfilled");
         assert_eq!(path.get("flotilla-governor").expect("held").state().bound(), Some(&Ref::new("project:flotilla/convoy:governor")));
         assert!(write(running("governor-1"), &mut obj), "observing the bound convoy again changes nothing");
-        assert!(write(failed(), &mut obj));
+        assert!(write(failed(1), &mut obj));
         assert_eq!(label(&path), "Unfulfilled");
-        assert_eq!(path.get("flotilla-governor").expect("held").state().failures(), 1);
         // A new legacy generation keeps the same engine fulfiller binding.
         assert!(write(running("governor-2"), &mut obj));
         assert_eq!(path.get("flotilla-governor").expect("held").state().bound(), Some(&Ref::new("project:flotilla/convoy:governor")));
-        assert_eq!(path.get("flotilla-governor").expect("held").state().failures(), 0, "a bound replacement is a success");
-
-        for _ in 0..2 {
-            assert!(write(failed(), &mut obj));
-            assert!(write(ConvoyEnsureStatusPatch::Retrying { retry_at: Utc::now(), failure: "admission refused".into() }, &mut obj));
-        }
-        assert_eq!(label(&path), "Unfulfilled");
-        let limit = ConvoyEnsureStatusPatch::RestartLimitReached { convoy_ref: "governor-3".into(), failure: "admission refused".into() };
-        assert!(write(limit, &mut obj), "held once the window is spent");
+        assert!(write(failed(2), &mut obj));
+        assert!(write(ConvoyEnsureStatusPatch::Retrying { retry_at: Utc::now(), failure: "admission refused".into() }, &mut obj));
+        assert_eq!(label(&path), "Unfulfilled", "an admission refusal is no strike and holds nothing");
+        let limit = ConvoyEnsureStatusPatch::RestartLimitReached { convoy_ref: "governor-3".into(), strikes: 3, failure: "failed".into() };
+        assert!(write(limit.clone(), &mut obj), "the pass's limit holds it");
+        assert_eq!(label(&path), "Held");
+        assert!(write(limit, &mut obj), "reporting the hold again changes nothing");
         assert_eq!(label(&path), "Held");
         assert!(write(ConvoyEnsureStatusPatch::ResetBackoff, &mut obj));
         assert_eq!(label(&path), "Unfulfilled", "resumed on the operator's authority");
@@ -404,29 +368,25 @@ pub(super) mod tests {
     fn an_ensure_from_before_the_switch_stays_on_the_old_path() {
         let path = path();
         let obj = ensure(Some(ConvoyEnsureStatus { convoy_ref: Some("governor-7".into()), restart_count: 2, ..Default::default() }));
-        let patch = ConvoyEnsureStatusPatch::BackingOff { retry_at: Utc::now(), failure: "x".into() };
+        let patch = ConvoyEnsureStatusPatch::BackingOff { strikes: 3, retry_at: Utc::now(), failure: "x".into() };
         assert_eq!(path.decide_now(&obj, patch.clone()).expect("decided"), Some(patch));
         assert!(path.get("flotilla-governor").is_none());
     }
 
-    // Behaviour (#3747 review): the edges before a refused one stay taken, and the next pass
-    // resumes from the engine's state. The old pass judges the window spent before the engine
-    // does: each refused `Hold` leaves its failed attempt counted, nothing is written, and the
-    // third report holds the Ensure.
+    // Behaviour (ConvoyEnsure B): the restart limit holds a bound Ensure at once, on the pass's
+    // derived strikes: the engine unbinds the failed convoy and holds, with no count of its own to
+    // agree with first.
     #[test]
-    fn a_refused_edge_keeps_the_edges_before_it_and_the_next_pass_resumes() {
+    fn the_restart_limit_holds_a_bound_ensure_at_once() {
         let path = path();
         let mut obj = ensure(None);
-        let limit = ConvoyEnsureStatusPatch::RestartLimitReached { convoy_ref: "governor-1".into(), failure: "admission refused".into() };
-        for failures in 1..=2 {
-            assert_eq!(path.decide_now(&obj, limit.clone()).expect("decided"), None, "Hold refused: nothing written");
-            assert_eq!(path.get("flotilla-governor").expect("held").state().failures(), failures, "the attempt before it stays");
-            assert_eq!(label(&path), "Unfulfilled");
-        }
-        let decided = path.decide_now(&obj, limit.clone()).expect("decided");
-        assert_eq!(decided, Some(limit.clone()));
-        limit.apply(obj.status.get_or_insert_with(Default::default));
+        let running = ConvoyEnsureStatusPatch::Running { convoy_ref: "governor-1".into(), observed_at: Utc::now(), strikes: 0 };
+        let decided = path.decide_now(&obj, running).expect("decided").expect("bound");
+        decided.apply(obj.status.get_or_insert_with(Default::default));
+        let limit = ConvoyEnsureStatusPatch::RestartLimitReached { convoy_ref: "governor-1".into(), strikes: 3, failure: "failed".into() };
+        assert_eq!(path.decide_now(&obj, limit.clone()).expect("decided"), Some(limit));
         assert_eq!(label(&path), "Held");
+        assert_eq!(path.get("flotilla-governor").expect("held").state().bound(), None);
     }
 }
 
@@ -437,8 +397,9 @@ mod import_tests {
     use super::{tests::ensure, *};
 
     // Behaviour (#3629 layer 9): a ConvoyEnsure imports as an Ensure whose state its live convoy
-    // decides: bound while its convoy is live, unfulfilled once it is not (its strikes the
-    // window's failures), and held once its restart limit was reached.
+    // decides: bound while its convoy is live, unfulfilled once it is not, and held once its
+    // restart limit was reached. Its strikes import as nothing: the pass derives them from the
+    // role's generations.
     #[test]
     fn a_convoy_ensure_imports_with_its_state_derived_from_its_live_convoy() {
         let with = |convoy: Option<&str>, strikes, hold| {
@@ -453,9 +414,9 @@ mod import_tests {
         assert_eq!(bound.state().bound(), Some(&Ref::new("project:flotilla/convoy:governor")));
         assert_eq!(bound.spec().inbox.as_str(), "project:flotilla/role:governor");
         let unbound = import_ensure(&with(Some("governor-3"), 2, None), false).expect("imports");
-        assert!(matches!(unbound.state(), EnsureState::Unfulfilled { failures: 2, .. }));
+        assert!(matches!(unbound.state(), EnsureState::Unfulfilled { .. }));
         let held = import_ensure(&with(None, 3, Some(ConvoyEnsureHoldReason::RestartLimit)), false).expect("imports");
-        assert!(matches!(held.state(), EnsureState::Held { failures: 3, .. }));
+        assert!(matches!(held.state(), EnsureState::Held { .. }));
     }
 
     // Behaviour (#3629 layer 9): the rehearsal restores each imported Ensure into a temporary

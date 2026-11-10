@@ -17,7 +17,7 @@ use flotilla_state_machines::{
             AdmittedPromise, Authority, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyRequest, Deliver, Duty, DutyId, DutyScope, Keep,
             MemoryConvoyWorld, Priority, PromiseId, PromiseKinds, PromiseSource, RetireDuty, Seat, SeatName, Submit, Terms, VesselClass,
         },
-        ensure::{Attempted, Ensure, EnsureSpec, MemoryEnsureWorld, Record},
+        ensure::{Ensure, EnsureSpec, Hold, MemoryEnsureWorld, Record},
         lifecycle::{self, LifecycleLabel, LifecycleState, MemoryLifecycleWorld, Observed, Realisation, Realise, Vanish},
         message::{
             Expectation, MemoryMessageWorld, Message, MessageBody, MessageEdgeKind, MessageRef, MessageReference, MessageSpec, Relation,
@@ -27,7 +27,7 @@ use flotilla_state_machines::{
         vessel::{live_leases, Vessel},
     },
     placement::{Dimension, Host, Lease, Ledger, LedgerError, Request, VesselId},
-    AttemptPolicy, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
+    EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
 };
 
 // Kind codes are stored with every identity and change, so the production registry pins them,
@@ -185,18 +185,12 @@ fn resources_survive_the_codec() {
 
     let mut ensures = Home::<Ensure>::new("home").expect("valid");
     ensures
-        .create(
-            "e",
-            EnsureSpec { inbox: Address::project("i").expect("inbox"), policy: AttemptPolicy::immediate(2) },
-            &MemoryEnsureWorld::default(),
-            Timestamp(0),
-        )
+        .create("e", EnsureSpec { inbox: Address::project("i").expect("inbox") }, &MemoryEnsureWorld::default(), Timestamp(0))
         .expect("created");
     ensures.apply("e", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(4)).expect("recorded");
-    let attempt = Attempted { fulfiller: Ref::new("f"), outcome: Outcome::Succeeded };
-    ensures.apply("e", attempt, &MemoryEnsureWorld::default(), Timestamp(5)).expect("attempted");
+    ensures.apply("e", Hold, &MemoryEnsureWorld::default(), Timestamp(5)).expect("held");
     let ensure = round_trip(&ensures, "e");
-    assert_eq!(ensures.log().history("e", Version(0), usize::MAX).len(), 2, "the attempt is an edge: a log entry, not a row");
+    assert_eq!(ensures.log().history("e", Version(0), usize::MAX).len(), 2, "each edge is a log entry");
     assert_eq!(ensure.state().recorded(), &BTreeSet::from([Ref::new("f")]));
 
     // A vessel's convoy is homed elsewhere: its reference keeps the convoy's home (#3392 G3).

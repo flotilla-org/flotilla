@@ -1,29 +1,19 @@
 // Pure typed rules, followed by this resource kind's store and named operations.
 module ensure {
-  // Policy bound in the model; backoff timing is outside this machine.
-  pure val MAX_FAILURES = 2
-  type AttemptOutcome = Succeeded | Failed({ retryable: bool })
-  type Attempt = { id: int, outcome: AttemptOutcome }
-  type Work = { recorded: Set[int], created: Set[int], history: List[Attempt], window: int }
+  // No failure count: the keeper derives its strike run from its fulfillers'
+  // endings, which are their own record, and holds on it (ConvoyEnsure B).
+  type Work = { recorded: Set[int], created: Set[int] }
   type State = Unfulfilled(Work) | Fulfilled({ work: Work, bound: int }) | Held(Work) | Retired(Work)
   type UnbindReason = Gone | Replaced
-  type Event = Record(int) | Create({ id: int, noLive: bool, absent: bool }) | Attempted(Attempt)
+  type Event = Record(int) | Create({ id: int, noLive: bool, absent: bool })
     | Bind({ id: int, realised: bool, canReceive: bool }) | Unbind({ reason: UnbindReason, observed: int, gone: bool })
     | Hold | Resume({ authorised: bool }) | Retire({ authorised: bool, teardownComplete: bool })
-  type Refusal = Ended | WrongState | NotRecorded | FulfillerLive | MissingEvidence | NotExhausted | Unauthorised
+  type Refusal = Ended | WrongState | NotRecorded | FulfillerLive | MissingEvidence | Unauthorised
   type Next = Moved(State) | Refused(Refusal)
   pure def work(s: State): Work = match s {
     | Unfulfilled(w) => w | Fulfilled(f) => f.work | Held(w) => w | Retired(w) => w
   }
   pure def bound(s: State): int = match s { | Fulfilled(f) => f.bound | _ => 0 }
-  // Only the suffix after the latest success in the current window counts.
-  pure def failureCount(w: Work): int = w.history.indices().filter(i =>
-    i >= w.window and (match w.history[i].outcome { | Failed(_) => true | _ => false }) and
-    not(w.history.indices().exists(j => j > i and (match w.history[j].outcome { | Succeeded => true | _ => false })))) .size()
-  pure def exhausted(w: Work): bool = failureCount(w) >= MAX_FAILURES or
-    (w.history.length() > w.window and (match w.history[w.history.length() - 1].outcome {
-      | Failed(f) => not(f.retryable) | _ => false
-    }))
   pure def step(s: State, e: Event): Next = match s {
     | Retired(_) => Refused(Ended)
     | _ => val w = work(s)
@@ -31,7 +21,7 @@ module ensure {
         | Retire(o) => if (not(o.authorised)) Refused(Unauthorised)
             else if (not(o.teardownComplete)) Refused(MissingEvidence) else Moved(Retired(w))
         | Resume(o) => match s {
-            | Held(_) => if (o.authorised) Moved(Unfulfilled({ ...w, window: w.history.length() })) else Refused(Unauthorised)
+            | Held(_) => if (o.authorised) Moved(Unfulfilled(w)) else Refused(Unauthorised)
             | _ => Refused(WrongState)
           }
         | Unbind(o) => match s {
@@ -44,10 +34,9 @@ module ensure {
                 | Create(o) => if (not(w.recorded.contains(o.id))) Refused(NotRecorded)
                     else if (not(o.noLive) or not(o.absent)) Refused(FulfillerLive)
                     else Moved(Unfulfilled({ ...w, created: w.created.union(Set(o.id)) }))
-                | Attempted(o) => Moved(Unfulfilled({ ...w, history: w.history.append(o) }))
                 | Bind(o) => if (not(w.recorded.contains(o.id))) Refused(NotRecorded)
                     else if (o.realised and o.canReceive) Moved(Fulfilled({ work: w, bound: o.id })) else Refused(MissingEvidence)
-                | Hold => if (exhausted(w)) Moved(Held(w)) else Refused(NotExhausted)
+                | Hold => Moved(Held(w))
                 | _ => Refused(WrongState)
               }
             | _ => Refused(WrongState)
@@ -65,7 +54,7 @@ module ensure {
   action unchanged = ensures' = ensures
   action request(id: int): bool = all {
     ensures.get(id) == Absent,
-    ensures' = ensures.set(id, Present(Unfulfilled({ recorded: Set(), created: Set(), history: [], window: 0 }))),
+    ensures' = ensures.set(id, Present(Unfulfilled({ recorded: Set(), created: Set() }))),
   }
   action fire(id: int, e: Event): bool = match ensures.get(id) {
     | Absent => all { false, ensures' = ensures }
@@ -74,7 +63,6 @@ module ensure {
   }
   action record(id: int, fulfiller: int): bool = fire(id, Record(fulfiller))
   action create(id: int, fulfiller: int, noLive: bool, absent: bool): bool = fire(id, Create({ id: fulfiller, noLive: noLive, absent: absent }))
-  action attempt(id: int, fulfiller: int, outcome: AttemptOutcome): bool = fire(id, Attempted({ id: fulfiller, outcome: outcome }))
   action bind(id: int, fulfiller: int, realised: bool, canReceive: bool): bool = fire(id, Bind({ id: fulfiller, realised: realised, canReceive: canReceive }))
   action unbind(id: int, fulfiller: int, gone: bool): bool = fire(id, Unbind({ reason: Gone, observed: fulfiller, gone: gone }))
   action hold(id: int): bool = fire(id, Hold)

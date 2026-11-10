@@ -570,41 +570,20 @@ CREATE TABLE "ensure" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
   "inbox" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "policy_max_failures" INTEGER NOT NULL,
-  "policy_base" INTEGER NOT NULL,
-  "policy_factor" INTEGER NOT NULL,
-  "policy_cap" INTEGER NOT NULL,
   "state" TEXT NOT NULL CHECK ("state" IN ('fu', 'he', 'rt', 'un')),
   "state_since" INTEGER NOT NULL,
-  "failures" INTEGER,
-  "last_failure_at" INTEGER,
-  "last_failure_cause_category" TEXT CHECK ("last_failure_cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
-  "last_failure_cause_detail" TEXT,
-  "last_failure_retryable" INTEGER CHECK ("last_failure_retryable" IN (0, 1)),
   "bound" INTEGER REFERENCES "strings" ("id"),
-  CHECK (CASE WHEN "last_failure_at" IS NOT NULL
-      THEN "last_failure_cause_category" IS NOT NULL
-      AND "last_failure_cause_detail" IS NOT NULL
-      AND "last_failure_retryable" IS NOT NULL
-      ELSE "last_failure_cause_category" IS NULL
-      AND "last_failure_cause_detail" IS NULL
-      AND "last_failure_retryable" IS NULL
-      END),
   CHECK (CASE WHEN "state" = 'un'
-      THEN "failures" IS NOT NULL
-      AND "bound" IS NULL
+      THEN "bound" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'fu'
-      THEN "failures" IS NOT NULL
-      AND "bound" IS NOT NULL
+      THEN "bound" IS NOT NULL
       END),
   CHECK (CASE WHEN "state" = 'he'
-      THEN "failures" IS NOT NULL
-      AND "bound" IS NULL
+      THEN "bound" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'rt'
-      THEN "failures" IS NOT NULL
-      AND "bound" IS NULL
+      THEN "bound" IS NULL
       END)
 ) STRICT;
 CREATE TABLE "ensure_recorded" (
@@ -625,12 +604,6 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('en', 'state', 'he', 'Held'),
   ('en', 'state', 'rt', 'Retired'),
   ('en', 'state', 'un', 'Unfulfilled'),
-  ('en', 'last_failure_cause_category', 'ex', 'External'),
-  ('en', 'last_failure_cause_category', 'mc', 'Misconfigured'),
-  ('en', 'last_failure_cause_category', 'mx', 'MissingCapability'),
-  ('en', 'last_failure_cause_category', 'rf', 'Refused'),
-  ('en', 'last_failure_cause_category', 'tr', 'Transient'),
-  ('en', 'log:edge', 'at', 'Attempted'),
   ('en', 'log:edge', 'bi', 'Bind'),
   ('en', 'log:edge', 'cr', 'Create'),
   ('en', 'log:edge', 'ho', 'Hold'),
@@ -646,17 +619,8 @@ CREATE VIEW "ensure_view" AS SELECT
   "ensure"."id",
   "ensure"."version",
   (SELECT "s" FROM "strings" WHERE "id" = "ensure"."inbox") AS "inbox",
-  "ensure"."policy_max_failures",
-  "ensure"."policy_base",
-  "ensure"."policy_factor",
-  "ensure"."policy_cap",
   (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'state' AND "code" = "ensure"."state") AS "state",
   "ensure"."state_since",
-  "ensure"."failures",
-  "ensure"."last_failure_at",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'last_failure_cause_category' AND "code" = "ensure"."last_failure_cause_category") AS "last_failure_cause_category",
-  "ensure"."last_failure_cause_detail",
-  "ensure"."last_failure_retryable",
   (SELECT "s" FROM "strings" WHERE "id" = "ensure"."bound") AS "bound"
 FROM "ensure";
 CREATE VIEW "ensure_recorded_view" AS SELECT

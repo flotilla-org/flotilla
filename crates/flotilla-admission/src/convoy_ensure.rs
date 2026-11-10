@@ -41,6 +41,9 @@ pub trait ConvoyEnsureReconciler: Send + Sync {
         convoy_name: &str,
         force: bool,
     ) -> Result<(), String>;
+    /// The earliest time the last full pass deferred an ensure to (a strike's backoff or an
+    /// admission refusal's retry): nothing else wakes the pass then.
+    fn next_due(&self, namespace: &str) -> Option<chrono::DateTime<chrono::Utc>>;
 }
 
 /// Admission and lifecycle operations used by the standing-convoy controller.

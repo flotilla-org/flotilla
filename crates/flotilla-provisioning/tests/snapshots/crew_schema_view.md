@@ -4,7 +4,7 @@ Kind tables only; the shared tables are in `crew.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
-| `ensure` | root | 15 | – | `ensure_recorded` (state data), `ensure_created` (state data) | `by_inbox` (inbox) |
+| `ensure` | root | 6 | – | `ensure_recorded` (state data), `ensure_created` (state data) | `by_inbox` (inbox) |
 | `ensure_recorded` | state data | 2 | – | – | – |
 | `ensure_created` | state data | 2 | – | – | – |
 | `terminal_launch_facts` | root | 8 | – | – | – |
@@ -17,7 +17,7 @@ Tables wider than 30 columns:
 - none
 
 States with data (one label column, then data shared by name across the labels):
-- `ensure`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `bound`; data tables `ensure_recorded`, `ensure_created`
+- `ensure`.`state`: label `state` and `state_since`; data columns `bound`; data tables `ensure_recorded`, `ensure_created`
 - `terminal_session`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `ending`, `ending_reason`, `cause_category`, `cause_detail`; data tables –
 - `vessel`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `ending`, `ending_reason`, `cause_category`, `cause_detail`; data tables –
 

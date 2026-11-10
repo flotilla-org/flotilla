@@ -6,21 +6,20 @@ use std::collections::BTreeSet;
 use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::ensure::{
-        Attempted, Authority, Bind, Create, Ensure, EnsureSpec, EnsureState, EnsureWorld, Fulfiller, FulfillerPhase, FulfillerStatus, Hold,
+        Authority, Bind, Create, Ensure, EnsureSpec, EnsureState, EnsureWorld, Fulfiller, FulfillerPhase, FulfillerStatus, Hold,
         MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
     },
-    AttemptPolicy, Cause, CauseCategory, Failure, Outcome, Ref, Resource,
+    Ref, Resource,
 };
-use hegel::{generators as gs, TestCase};
+use hegel::TestCase;
 
 use super::{
     addr, address, code_enum,
     engine::{self, resource, Candidate},
-    name, text, timestamp, Fixture, Pick,
+    name, timestamp, Fixture, Pick,
 };
 
-/// Covering indexes: the label is digit 0 (base 4) and the tally digits 2 and 3 (base 2); sets take
-/// every size in turn, and attempts both outcomes and every cause category.
+/// Covering indexes: the label is digit 0 (base 4); sets take every size in turn.
 pub const COVERING: usize = 40;
 
 fn fulfillers(tc: &TestCase, pick: Pick) -> BTreeSet<Ref<Fulfiller>> {
@@ -31,64 +30,30 @@ fn fulfillers(tc: &TestCase, pick: Pick) -> BTreeSet<Ref<Fulfiller>> {
 pub fn state_value(tc: &TestCase, pick: Pick) -> EnsureState {
     // Shifted picks, so the sets' sizes do not move with the label's digit.
     let (recorded, created) = (fulfillers(tc, pick.nth(1)), fulfillers(tc, pick.nth(2)));
-    let (failures, last_failure) = tally(tc, pick, 4);
     match pick.digit(tc, 4, 1) {
-        0 => EnsureState::Unfulfilled { recorded, created, failures, last_failure },
-        1 => EnsureState::Fulfilled { recorded, created, failures, last_failure, bound: Ref::new(name(tc)) },
-        2 => EnsureState::Held { recorded, created, failures, last_failure },
-        _ => EnsureState::Retired { recorded, created, failures, last_failure },
-    }
-}
-
-pub fn cause(tc: &TestCase, pick: Pick) -> Cause {
-    use CauseCategory::*;
-    Cause { category: code_enum(tc, pick, &[Transient, Refused, Misconfigured, MissingCapability, External]), detail: text(tc) }
-}
-
-/// A coherent attempt tally: a latest failure (the base 2 digit at `place`), retryable or not (the
-/// next digit), behind one to three consecutive failures, or none. Covering reaches a tally that
-/// a failure that cannot be retried exhausts.
-pub fn tally(tc: &TestCase, pick: Pick, place: usize) -> (u32, Option<Failure>) {
-    if pick.digit(tc, 2, place) != 0 {
-        return (0, None);
-    }
-    let failure = Failure { at: timestamp(tc), cause: cause(tc, pick), retryable: pick.digit(tc, 2, place * 2) == 0 };
-    (tc.draw(gs::integers::<u32>().min_value(1).max_value(3)), Some(failure))
-}
-
-/// Both outcomes in turn when covering, every cause category across rounds.
-pub fn outcome(tc: &TestCase, pick: Pick) -> Outcome {
-    match pick.variant(tc, 2, |index| index) {
-        0 => Outcome::Succeeded,
-        _ => Outcome::Failed { cause: cause(tc, pick), retryable: pick.some(tc, 8) },
-    }
-}
-
-pub fn policy(tc: &TestCase) -> AttemptPolicy {
-    AttemptPolicy {
-        max_failures: tc.draw(gs::integers::<u32>().max_value(3)),
-        base: tc.draw(gs::integers::<i64>()),
-        factor: tc.draw(gs::integers::<u32>()),
-        cap: tc.draw(gs::integers::<i64>()),
+        0 => EnsureState::Unfulfilled { recorded, created },
+        1 => EnsureState::Fulfilled { recorded, created, bound: Ref::new(name(tc)) },
+        2 => EnsureState::Held { recorded, created },
+        _ => EnsureState::Retired { recorded, created },
     }
 }
 
 pub fn spec(tc: &TestCase) -> EnsureSpec {
-    EnsureSpec { inbox: address(tc), policy: policy(tc) }
+    EnsureSpec { inbox: address(tc) }
 }
 
 pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Ensure> {
     resource(spec(tc), State::new(state_value(tc, pick), timestamp(tc)))
 }
 
-/// A fixed spec for example tests: `inbox`, one immediate attempt.
+/// A fixed spec for example tests: `inbox`.
 pub fn sample_spec() -> EnsureSpec {
-    EnsureSpec { inbox: addr("inbox"), policy: AttemptPolicy::immediate(1) }
+    EnsureSpec { inbox: addr("inbox") }
 }
 
-/// An unfulfilled Ensure with nothing recorded and no history.
+/// An unfulfilled Ensure with nothing recorded.
 pub fn sample() -> Resource<Ensure> {
-    let unfulfilled = EnsureState::Unfulfilled { recorded: BTreeSet::new(), created: BTreeSet::new(), failures: 0, last_failure: None };
+    let unfulfilled = EnsureState::Unfulfilled { recorded: BTreeSet::new(), created: BTreeSet::new() };
     resource(sample_spec(), State::new(unfulfilled, Timestamp(0)))
 }
 
@@ -97,9 +62,8 @@ fn boxed(world: MemoryEnsureWorld) -> Box<dyn EnsureWorld> {
 }
 
 /// Every edge the Ensure's state may take: recording a fulfiller; creating or binding a recorded
-/// one (realised, able to receive, its inbox drained); unbinding the bound one once gone; an
-/// attempt of either outcome; holding on the window it has spent; and resuming and retiring on
-/// authority, retiring once torn down.
+/// one (realised, able to receive, its inbox drained); unbinding the bound one once gone; holding;
+/// and resuming and retiring on authority, retiring once torn down.
 pub fn candidates(tc: &TestCase, pick: Pick, ensure: &Resource<Ensure>) -> Vec<Candidate<Ensure>> {
     let now = timestamp(tc);
     let state = ensure.state();
@@ -120,8 +84,6 @@ pub fn candidates(tc: &TestCase, pick: Pick, ensure: &Resource<Ensure>) -> Vec<C
         let reason = code_enum(tc, pick, &[UnbindReason::Gone, UnbindReason::Replaced]);
         candidates.push((Unbind { reason, fulfiller: bound.clone() }.into(), boxed(world), now));
     }
-    let attempted = Attempted { fulfiller: Ref::new(name(tc)), outcome: outcome(tc, pick.nth(4)) };
-    candidates.push((attempted.into(), boxed(MemoryEnsureWorld::default()), now));
     candidates.push((Hold.into(), boxed(MemoryEnsureWorld::default()), now));
     let authority: Ref<Authority> = Ref::new(name(tc));
     let mut world = MemoryEnsureWorld::default();
@@ -142,7 +104,7 @@ impl Fixture for Resource<Ensure> {
         generate(tc, pick)
     }
 
-    /// The inbox and policy drawn afresh; the state and edge log kept.
+    /// The inbox drawn afresh; the state and edge log kept.
     fn evolve(&self, tc: &TestCase, _pick: Pick) -> Resource<Ensure> {
         self.clone().with_spec(spec(tc))
     }
