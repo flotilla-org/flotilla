@@ -300,6 +300,39 @@ async fn abandonment_ends_the_engine_convoy() {
     fixture.engine.abandon(&convoy, "alice", "again").await.expect("already ended");
 }
 
+// Behaviour (#3108 C3'): a supervisor's or operator's Fail ruling is the engine's FailSeat on the
+// crew's seat, with its reason; ruling it again leaves the seat as it failed.
+#[tokio::test]
+async fn a_fail_ruling_fails_the_seat_once() {
+    let fixture = fixture();
+    let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true)])])).await;
+    fixture.engine.fail_seat(&convoy, "work", "coder", "alice", "cannot reach the forge").await.expect("failed");
+    fixture.engine.fail_seat(&convoy, "work", "coder", "bob", "again").await.expect("already failed");
+    let engine = fixture.convoys.get("c").expect("held");
+    let (_, seat) = engine.spec().seat(&SeatName::new("coder", "")).expect("seat");
+    assert_eq!(seat.failed.as_deref(), Some("cannot reach the forge"));
+}
+
+// Behaviour (#3108 C3'): linking and unlinking a subject are the engine's Link and Unlink, each
+// once: a subject linked now is left linked, and one not linked now is left unlinked.
+#[tokio::test]
+async fn subjects_link_and_unlink_on_the_engine() {
+    let fixture = fixture();
+    let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true)])])).await;
+    let subject = flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "org/repo".into() },
+        id: "5".into(),
+    };
+    let linked = |fixture: &Fixture| fixture.convoys.get("c").expect("held").spec().linked().len();
+    fixture.engine.link(&convoy, &subject, flotilla_resources::SubjectDiscoverySource::Operator, "alice").await.expect("linked");
+    fixture.engine.link(&convoy, &subject, flotilla_resources::SubjectDiscoverySource::Relay, "relay").await.expect("linked now");
+    assert_eq!(linked(&fixture), 1);
+    fixture.engine.unlink(&convoy, &subject, "alice").await.expect("unlinked");
+    fixture.engine.unlink(&convoy, &subject, "alice").await.expect("not linked now");
+    assert_eq!(linked(&fixture), 0);
+}
+
 // Behaviour (#3721 look-over ruling): a label names one deliverable in its convoy. A second
 // crew declaring a label already taken is refused with the owner named, never qualified; under its
 // own label it is declared, and the first crew's kept promise is untouched.

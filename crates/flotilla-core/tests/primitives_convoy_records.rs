@@ -120,7 +120,7 @@ fn a_launch_reads_its_seats_links_stalls_and_end() {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = service(&dir);
     let convoys = Convoys::open(HOME, &service).expect("open");
-    let records = EngineConvoyRecords::new(HOME, Arc::clone(&service));
+    let records = EngineConvoyRecords::new(HOME, Arc::clone(&service), Arc::default());
     convoys.world(|world| world.projects.put(&Ref::new(project().as_str()), ()));
     let reserved = convoys.reserve("fix-it", Timestamp(1_000_000)).expect("reserved");
     convoys.create_reserved(&reserved, request(), Timestamp(1_000_000)).expect("admitted");
@@ -194,7 +194,7 @@ fn a_handoff_reads_as_handed_back() {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = service(&dir);
     let convoys = Convoys::open(HOME, &service).expect("open");
-    let records = EngineConvoyRecords::new(HOME, Arc::clone(&service));
+    let records = EngineConvoyRecords::new(HOME, Arc::clone(&service), Arc::default());
     convoys.world(|world| world.projects.put(&Ref::new(project().as_str()), ()));
     let reserved = convoys.reserve("fix-it", Timestamp(1_000_000)).expect("reserved");
     convoys.create_reserved(&reserved, request(), Timestamp(1_000_000)).expect("admitted");

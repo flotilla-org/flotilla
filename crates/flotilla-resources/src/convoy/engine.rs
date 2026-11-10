@@ -101,6 +101,29 @@ pub trait EngineConvoys: Send + Sync {
     /// An operator's abandonment, with a reason.
     async fn abandon(&self, convoy: &ResourceObject<Convoy>, principal: &str, reason: &str) -> Result<(), String>;
 
+    /// `(vessel, role)`'s seat failed, as `principal` ruled, with a reason.
+    async fn fail_seat(
+        &self,
+        convoy: &ResourceObject<Convoy>,
+        vessel: &str,
+        role: &str,
+        principal: &str,
+        reason: &str,
+    ) -> Result<(), String>;
+
+    /// Links `subject`, as `source` found it, on behalf of `principal`; a subject linked now is
+    /// left as it is.
+    async fn link(
+        &self,
+        convoy: &ResourceObject<Convoy>,
+        subject: &flotilla_protocol::Subject,
+        source: super::SubjectDiscoverySource,
+        principal: &str,
+    ) -> Result<(), String>;
+
+    /// Unlinks `subject` on behalf of `principal`; a subject not linked now is left as it is.
+    async fn unlink(&self, convoy: &ResourceObject<Convoy>, subject: &flotilla_protocol::Subject, principal: &str) -> Result<(), String>;
+
     /// The engine's promises of `convoy` in the old status's shape:
     /// `Ok(Some)` when the engine at `home` (the convoy's home; `None` for
     /// this one) holds it, `Ok(None)` when it does not, and `Err` when the
@@ -112,6 +135,41 @@ pub trait EngineConvoys: Send + Sync {
     /// old record is written for an engine edge, so the convoy reconciler
     /// follows these to run again (#3587 layer 8).
     fn changes(&self) -> tokio::sync::broadcast::Receiver<String>;
+
+    /// This home's notes on the launches it holds: what it observes of them, in memory.
+    fn memory(&self) -> &crate::convoy_records::ConvoyMemory;
+}
+
+/// Writes `patch` to this home's notes on `convoy` (#3108 C3'): the old status patch, kept only
+/// where it changes what the home observes ([`ConvoyNotes::apply`](crate::convoy_records::ConvoyNotes::apply)).
+/// Returns `convoy` with the notes as they now stand, which its view shows once it follows them.
+/// A convoy held at another home is refused: its notes are that home's.
+pub fn note<P: crate::StatusPatch<super::ConvoyStatus> + ?Sized>(
+    path: &EngineConvoyPath,
+    convoy: &ResourceObject<Convoy>,
+    patch: &P,
+) -> Result<ResourceObject<Convoy>, String> {
+    let engine = path.get().ok_or("convoys are not served without the engine")?;
+    if !engine.holds(convoy) {
+        return Err(format!("convoy `{}` is not held at this home; its notes are its home's", convoy.metadata.name));
+    }
+    let mut status = convoy.status.clone().unwrap_or_default();
+    let (notes, _) = engine.memory().update(&convoy.metadata.name, |notes| {
+        notes.apply(&status, patch);
+        notes.clone()
+    });
+    notes.write_into(&mut status);
+    let mut noted = convoy.clone();
+    noted.status = Some(status);
+    Ok(noted)
+}
+
+/// Sets this home's notes on convoy `name` to those `status` holds: a view read before a write
+/// that failed to finish, put back, or one a writer changed whole.
+pub fn set_notes(path: &EngineConvoyPath, name: &str, status: &super::ConvoyStatus) -> Result<(), String> {
+    let engine = path.get().ok_or("convoys are not served without the engine")?;
+    engine.memory().update(name, |notes| notes.read_from(status));
+    Ok(())
 }
 
 /// The old status's promises: by vessel, then role.
@@ -257,6 +315,7 @@ mod tests {
     /// home's, recording the homes it was asked about.
     struct Holding {
         asked: Mutex<Vec<Option<String>>>,
+        memory: crate::convoy_records::ConvoyMemory,
     }
 
     fn kept() -> OldPromises {
@@ -316,6 +375,28 @@ mod tests {
         fn changes(&self) -> tokio::sync::broadcast::Receiver<String> {
             tokio::sync::broadcast::channel(1).1
         }
+
+        fn memory(&self) -> &crate::convoy_records::ConvoyMemory {
+            &self.memory
+        }
+
+        async fn fail_seat(&self, _: &ResourceObject<Convoy>, _: &str, _: &str, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn link(
+            &self,
+            _: &ResourceObject<Convoy>,
+            _: &flotilla_protocol::Subject,
+            _: crate::convoy::SubjectDiscoverySource,
+            _: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn unlink(&self, _: &ResourceObject<Convoy>, _: &flotilla_protocol::Subject, _: &str) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     // Behaviour: two launches at one home have different numbers, so their slugs differ even
@@ -371,7 +452,7 @@ mod tests {
         let off = EngineConvoyPath::default();
         assert!(matches!(viewed(&off, &convoy("c")), Ok(Cow::Borrowed(_))), "switch off: as stored");
 
-        let engine = Arc::new(Holding { asked: Mutex::new(Vec::new()) });
+        let engine = Arc::new(Holding { asked: Mutex::new(Vec::new()), memory: Default::default() });
         let on = EngineConvoyPath::default();
         let shared: Arc<dyn EngineConvoys> = engine.clone();
         assert!(on.set(shared).is_ok());

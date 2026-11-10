@@ -1369,7 +1369,8 @@ async fn open_provisioning_lifecycles(
     let vessels = Arc::new(EngineVessels::over(Arc::clone(&lifecycles.vessels), daemon.decided_store()?));
     let vessel_changes = vessels.follow(daemon.decided_store()?)?;
     // Every convoy reader reads the engine's launches.
-    let convoys = Arc::new(flotilla_core::primitives::convoy_records::EngineConvoyRecords::new(&home, daemon.decided_store()?));
+    let memory = Arc::clone(daemon.engine_convoys().ok_or("convoys are not served without the engine")?.memory());
+    let convoys = Arc::new(flotilla_core::primitives::convoy_records::EngineConvoyRecords::new(&home, daemon.decided_store()?, memory));
     let convoy_changes = convoys.follow()?;
     daemon.install_lifecycle_reads(Arc::new(
         LifecycleReadPort::new(StoreReads::new(store), home)

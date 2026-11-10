@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use flotilla_address::Address;
 use flotilla_engine_store::StoreLog;
+use flotilla_resources::convoy_records::ConvoyMemory;
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
@@ -33,6 +34,8 @@ pub struct Convoys {
     service: Arc<Service>,
     home: Mutex<Home<Convoy, StoreLog>>,
     world: Mutex<MemoryConvoyWorld>,
+    /// What this home observes of its launches, shared with their readers.
+    memory: Arc<ConvoyMemory>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -71,12 +74,18 @@ impl Convoys {
             service: Arc::clone(service),
             home: Mutex::new(convoys),
             world: Mutex::new(MemoryConvoyWorld::default()),
+            memory: Arc::default(),
         })
     }
 
     /// The home these records are homed at.
     pub fn home(&self) -> &str {
         &self.home_name
+    }
+
+    /// This home's notes on its launches, which their readers and writers share.
+    pub fn memory(&self) -> &Arc<ConvoyMemory> {
+        &self.memory
     }
 
     /// Another home's newest launch of `of` in `project` as this home's decided store replicates

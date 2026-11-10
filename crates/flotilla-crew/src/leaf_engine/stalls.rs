@@ -149,14 +149,13 @@ impl ReconcilerWake {
         {
             return Ok(());
         }
-        flotilla_store::apply_status_patch_checked(
+        flotilla_store::note_convoy(
+            &self.subscriptions.inner.convoy_engine,
             &self.subscriptions.inner.backend.using::<Convoy>(&convoy.metadata.namespace),
             &convoy.metadata.name,
             &LaunchAttention { attention, expected_crew: &status.crew_work },
-            |_| Ok(()),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
         Ok(())
     }
 }
@@ -764,7 +763,8 @@ impl ReconcilerWake {
         if status.attention.as_ref().is_none_or(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE)
             && prior.map(|attention| &attention.reason) != reason.as_ref()
         {
-            flotilla_store::apply_status_patch(
+            flotilla_store::note_convoy(
+                &self.subscriptions.inner.convoy_engine,
                 &backend.clone().using::<Convoy>(namespace),
                 &convoy.metadata.name,
                 &flotilla_resources::ConvoyStatusPatch::ObserveTurnHookHealth { reason, observed_at: now },
@@ -797,7 +797,8 @@ impl ReconcilerWake {
                 });
                 if source_working {
                     if status.nudge_obligations != *obligations {
-                        flotilla_store::apply_status_patch(
+                        flotilla_store::note_convoy(
+                            &self.subscriptions.inner.convoy_engine,
                             &backend.clone().using::<Convoy>(namespace),
                             &convoy.metadata.name,
                             &flotilla_resources::ConvoyStatusPatch::SetNudgeObligations { obligations: std::mem::take(obligations) },
@@ -805,7 +806,8 @@ impl ReconcilerWake {
                         .await
                         .map_err(|error| error.to_string())?;
                     }
-                    flotilla_store::apply_status_patch(
+                    flotilla_store::note_convoy(
+                        &self.subscriptions.inner.convoy_engine,
                         &backend.clone().using::<Convoy>(namespace),
                         &convoy.metadata.name,
                         &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: None },
@@ -1818,8 +1820,8 @@ impl ReconcilerWake {
         Ok(())
     }
 
-    /// Writes the convoy's nudge obligations and stall condition; the engine's stall records
-    /// follow the stored status.
+    /// Writes the convoy's nudge obligations and stall condition to its home's notes; the engine's
+    /// stall records follow them.
     async fn write_stall_status(
         &self,
         namespace: &str,
@@ -1830,7 +1832,8 @@ impl ReconcilerWake {
     ) -> Result<(), String> {
         let backend = &self.subscriptions.inner.backend;
         if status.nudge_obligations != obligations {
-            flotilla_store::apply_status_patch(
+            flotilla_store::note_convoy(
+                &self.subscriptions.inner.convoy_engine,
                 &backend.clone().using::<Convoy>(namespace),
                 &convoy.metadata.name,
                 &flotilla_resources::ConvoyStatusPatch::SetNudgeObligations { obligations },
@@ -1838,9 +1841,10 @@ impl ReconcilerWake {
             .await
             .map_err(|error| error.to_string())?;
         }
-        // The engine's stall records follow the stored status: only once it is written.
+        // The engine's stall records follow the notes: only once they are written.
         if status.stalled != next {
-            match flotilla_store::apply_status_patch(
+            match flotilla_store::note_convoy(
+                &self.subscriptions.inner.convoy_engine,
                 &backend.clone().using::<Convoy>(namespace),
                 &convoy.metadata.name,
                 &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: next.clone() },

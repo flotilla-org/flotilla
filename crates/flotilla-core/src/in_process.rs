@@ -103,9 +103,7 @@ use flotilla_resources::{
 #[cfg(test)]
 use flotilla_resources::{ConditionValue, TerminalSessionIdentity};
 use flotilla_store::resolve_project_issue_sources;
-use flotilla_store::{
-    apply_resource_document, apply_status_patch as apply_resource_status_patch, get_resource_kind_including_replicas, ResourceBackend,
-};
+use flotilla_store::{apply_resource_document, get_resource_kind_including_replicas, ResourceBackend};
 use futures::{FutureExt, StreamExt};
 pub use image_check::{check_image, image_build_report, ImageCheckSources};
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -786,6 +784,8 @@ pub struct InProcessDaemon {
     /// The `[primitives]` Convoy path (#3587 layer 6), as crew code and the
     /// convoy reconciler reach it.
     convoy_engine_path: flotilla_resources::convoy::engine::EngineConvoyPath,
+    /// The engine Convoys behind that path, for readers of its records and its home's memory.
+    engine_convoys: std::sync::OnceLock<Arc<Convoys>>,
     /// Which seats a vessel serves, the engine's answer behind `[primitives]` (#3629 layer 8).
     vessel_seats_path: flotilla_resources::vessel_seats::VesselSeatsPath,
     message_receivers: projection_ports::MessageReceivers,
@@ -1451,6 +1451,7 @@ impl InProcessDaemon {
             crew_progress: Arc::new(flotilla_resources::agent_activity::ProgressFacts::new(clock.now())),
             crew_message_path,
             convoy_engine_path,
+            engine_convoys: std::sync::OnceLock::new(),
             vessel_seats_path,
             brief_artifact_writer: Arc::clone(&brief_artifact_writer),
             session_id: uuid::Uuid::new_v4(),
@@ -2432,6 +2433,7 @@ impl InProcessDaemon {
     /// home (#3587 layer 6). Absent, every Message stays in the old store.
     pub fn install_message_primitives(&self, primitives: Arc<flotilla_engine_messages::MessagePrimitives>) -> Result<(), String> {
         let records = Arc::new(Convoys::open(primitives.home(), primitives.service())?);
+        self.engine_convoys.set(Arc::clone(&records)).map_err(|_| "the Convoy path is already installed".to_owned())?;
         let convoys: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> =
             Arc::new(ConvoyEngine::new(records, self.resource_backend(), self.clock_for_scenarios()));
         self.message_path.set(Arc::clone(&primitives)).map_err(|_| "the Message path is already installed".to_owned())?;
@@ -2451,6 +2453,11 @@ impl InProcessDaemon {
     /// The crew's `[primitives]` Message path: empty until the switch's primitives are installed.
     pub fn crew_message_path(&self) -> flotilla_crew::ports::MessagePath {
         Arc::clone(&self.crew_message_path)
+    }
+
+    /// The engine Convoys: absent until the switch's primitives are installed.
+    pub fn engine_convoys(&self) -> Option<&Arc<Convoys>> {
+        self.engine_convoys.get()
     }
 
     /// The `[primitives]` Convoy path: empty until the switch's primitives are installed.
@@ -2581,17 +2588,8 @@ impl InProcessDaemon {
                 )
                 .collect::<BTreeSet<_>>();
             if !relationships.is_empty() {
-                apply_resource_status_patch(
-                    &convoys,
-                    &convoy.metadata.name,
-                    &ConvoyStatusPatch::DiscoverSubjects {
-                        subjects: relationships.into_iter().map(|relationship| (subject.clone(), relationship)).collect(),
-                        source: flotilla_resources::SubjectDiscoverySource::Relay,
-                        at: self.clock.now(),
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+                self.link_convoy_subjects(&refreshed, [subject.clone()], flotilla_resources::SubjectDiscoverySource::Relay, "relay")
+                    .await?;
             }
         }
         Ok(())
@@ -3363,17 +3361,8 @@ impl InProcessDaemon {
             }
         }
         if !subjects.is_empty() {
-            apply_resource_status_patch(
-                &convoys,
-                convoy_name,
-                &ConvoyStatusPatch::DiscoverSubjects {
-                    subjects,
-                    source: flotilla_resources::SubjectDiscoverySource::Branch,
-                    at: self.clock.now(),
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            let subjects = subjects.into_iter().map(|(subject, _)| subject);
+            self.link_convoy_subjects(&convoy, subjects, flotilla_resources::SubjectDiscoverySource::Branch, "branch-scan").await?;
         }
         // A convoy whose status admission has not written yet still records
         // its scan; otherwise the next scan waits a whole refresh interval.
@@ -3383,19 +3372,19 @@ impl InProcessDaemon {
                 .as_ref()
                 .is_none_or(|status| status.branch_subject_scan_at.is_none() || status.branch_subject_scan_error.is_some())
         {
-            apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::RecordBranchSubjectScan { at: self.clock.now() })
-                .await
-                .map_err(|error| error.to_string())?;
+            flotilla_resources::convoy::engine::note(
+                &self.convoy_engine_path,
+                &convoy,
+                &ConvoyStatusPatch::RecordBranchSubjectScan { at: self.clock.now() },
+            )?;
         }
         if let Some(error) = errors.into_iter().next() {
             if convoy.status.as_ref().and_then(|status| status.branch_subject_scan_error.as_deref()) != Some(error.as_str()) {
-                apply_resource_status_patch(
-                    &convoys,
-                    convoy_name,
+                flotilla_resources::convoy::engine::note(
+                    &self.convoy_engine_path,
+                    &convoy,
                     &ConvoyStatusPatch::RecordBranchSubjectScanFailure { error: error.clone() },
-                )
-                .await
-                .map_err(|patch_error| patch_error.to_string())?;
+                )?;
             }
             return Err(error);
         }
@@ -3434,6 +3423,22 @@ impl InProcessDaemon {
         ))
     }
 
+    /// Links each of `subjects` to `convoy` on the engine, as `source` found them for `principal`.
+    async fn link_convoy_subjects(
+        &self,
+        convoy: &ResourceObject<ResourceConvoy>,
+        subjects: impl IntoIterator<Item = flotilla_protocol::Subject>,
+        source: flotilla_resources::SubjectDiscoverySource,
+        principal: &str,
+    ) -> Result<(), String> {
+        let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine_path, convoy)
+            .ok_or_else(|| format!("convoy `{}` is not held at this home", convoy.metadata.name))?;
+        for subject in subjects {
+            engine.link(convoy, &subject, source, principal).await?;
+        }
+        Ok(())
+    }
+
     pub async fn link_convoy_subject(
         &self,
         namespace: &str,
@@ -3453,24 +3458,22 @@ impl InProcessDaemon {
             {
                 return Err(format!("change request `{reference}` is outside this convoy's repositories"));
             }
-            apply_resource_status_patch(
-                &convoys,
-                convoy_name,
-                &ConvoyStatusPatch::DiscoverSubjects {
-                    subjects: vec![(subject, relationship)],
-                    source: flotilla_resources::SubjectDiscoverySource::Operator,
-                    at: self.clock.now(),
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            let derived = match subject.kind {
+                flotilla_protocol::SubjectKind::Issue => flotilla_protocol::Relationship::WorksOn,
+                _ => flotilla_protocol::Relationship::Produces,
+            };
+            if relationship != derived {
+                return Err(format!("a linked {:?} is related as {derived:?}", subject.kind));
+            }
+            self.link_convoy_subjects(&convoy, [subject], flotilla_resources::SubjectDiscoverySource::Operator, "operator").await?;
         } else {
             if convoy.spec.subjects.iter().any(|entry| entry.subject == subject) {
                 return Err("declared convoy subjects cannot be unlinked; change the convoy spec".to_string());
             }
-            apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::UnlinkSubject { subject })
-                .await
-                .map_err(|error| error.to_string())?;
+            flotilla_resources::convoy::engine::deciding(&self.convoy_engine_path, &convoy)
+                .ok_or_else(|| format!("convoy `{convoy_name}` is not held at this home"))?
+                .unlink(&convoy, &subject, "operator")
+                .await?;
             // Explicit unlink must release retention even for terminal convoys,
             // which the live-demand watch intentionally does not list. If cleanup
             // fails, the marker remains persisted; retrying this command is safe,

@@ -113,11 +113,81 @@ pub struct ConvoyNotes {
     /// as the open stall AwaitingReply about it ([`SeatRecord::stalled`]); what the judge saw
     /// and how far it has escalated is the home's own.
     pub stall: Option<StalledCondition>,
+    /// When the home last scanned the convoy's branches for subjects, which paces the next scan.
+    pub branch_subject_scan_at: Option<DateTime<Utc>>,
     pub branch_subject_scan_error: Option<String>,
     /// A work's provisioning retry, by work.
     pub provisioning_retry: BTreeMap<String, ControllerRetry>,
     /// By work, then role.
     pub crew: BTreeMap<String, BTreeMap<String, CrewNotes>>,
+}
+
+impl ConvoyNotes {
+    /// Applies `patch` as the old status patch changed the stored status, keeping only what the
+    /// notes hold (#3108 C3'). The patch runs on `view`, the launch as its readers see it, with
+    /// these notes in place of the view's, and the notes are read back from the result. The rest
+    /// of a view is derived from the launch's records, so a patch's change to it is dropped.
+    pub fn apply<P: crate::StatusPatch<ConvoyStatus> + ?Sized>(&mut self, view: &ConvoyStatus, patch: &P) {
+        let mut status = view.clone();
+        self.write_into(&mut status);
+        patch.apply(&mut status);
+        self.read_from(&status);
+    }
+
+    /// Puts these notes into `status`, over whatever it held of them.
+    pub fn write_into(&self, status: &mut ConvoyStatus) {
+        status.attention.clone_from(&self.attention);
+        status.turn_deliveries.clone_from(&self.turn_deliveries);
+        status.nudge_obligations.clone_from(&self.nudge_obligations);
+        status.stalled.clone_from(&self.stall);
+        status.branch_subject_scan_at = self.branch_subject_scan_at;
+        status.branch_subject_scan_error.clone_from(&self.branch_subject_scan_error);
+        for (work, state) in &mut status.work {
+            state.provisioning_retry = self.provisioning_retry.get(work).cloned();
+        }
+        for (work, roles) in &mut status.crew_work {
+            for (role, state) in roles {
+                let noted = self.crew.get(work).and_then(|roles| roles.get(role)).cloned().unwrap_or_default();
+                state.task_assigned = noted.task_assigned;
+                state.pending_follow_up = noted.pending_follow_up;
+                state.resumed_at = noted.resumed_at;
+                state.resume_brief_id = noted.resume_brief_id;
+            }
+        }
+    }
+
+    /// Takes these notes from `status`, as a view held them.
+    pub fn read_from(&mut self, status: &ConvoyStatus) {
+        self.attention.clone_from(&status.attention);
+        self.turn_deliveries.clone_from(&status.turn_deliveries);
+        self.nudge_obligations.clone_from(&status.nudge_obligations);
+        self.stall.clone_from(&status.stalled);
+        self.branch_subject_scan_at = status.branch_subject_scan_at;
+        self.branch_subject_scan_error.clone_from(&status.branch_subject_scan_error);
+        self.provisioning_retry =
+            status.work.iter().filter_map(|(work, state)| Some((work.clone(), state.provisioning_retry.clone()?))).collect();
+        self.crew = status
+            .crew_work
+            .iter()
+            .map(|(work, roles)| {
+                let roles = roles
+                    .iter()
+                    .map(|(role, state)| {
+                        let noted = CrewNotes {
+                            task_assigned: state.task_assigned,
+                            pending_follow_up: state.pending_follow_up.clone(),
+                            resumed_at: state.resumed_at,
+                            resume_brief_id: state.resume_brief_id.clone(),
+                        };
+                        (role.clone(), noted)
+                    })
+                    .filter(|(_, noted)| *noted != CrewNotes::default())
+                    .collect::<BTreeMap<_, _>>();
+                (work.clone(), roles)
+            })
+            .filter(|(_, roles)| !roles.is_empty())
+            .collect();
+    }
 }
 
 /// The facts a read view joins to a launch.
@@ -259,6 +329,7 @@ impl ConvoyRecord {
             ensure_admission: self.admission.ensure_admission.clone(),
             phase: derived.phase,
             subjects: self.subjects.clone(),
+            branch_subject_scan_at: notes.branch_subject_scan_at,
             branch_subject_scan_error: notes.branch_subject_scan_error.clone(),
             unlinked_subjects: self.unlinked.clone(),
             stalled: notes.stall.clone().filter(|_| !derived.phase.is_terminal()),

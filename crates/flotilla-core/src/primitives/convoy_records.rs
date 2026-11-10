@@ -41,14 +41,14 @@ const PAGE: u32 = 64;
 pub struct EngineConvoyRecords {
     home: String,
     service: Arc<Service>,
-    memory: ConvoyMemory,
+    memory: Arc<ConvoyMemory>,
     changes: tokio::sync::broadcast::Sender<ConvoyChange>,
 }
 
 impl EngineConvoyRecords {
-    /// The port at `home` over `service`.
-    pub fn new(home: &str, service: Arc<Service>) -> Self {
-        Self { home: home.to_owned(), service, memory: ConvoyMemory::default(), changes: tokio::sync::broadcast::channel(CHANGES).0 }
+    /// The port at `home` over `service`, with the home's notes in `memory`, which its writers share.
+    pub fn new(home: &str, service: Arc<Service>, memory: Arc<ConvoyMemory>) -> Self {
+        Self { home: home.to_owned(), service, memory, changes: tokio::sync::broadcast::channel(CHANGES).0 }
     }
 
     /// Follows the convoys' records and the stall records about their seats in the store's log,

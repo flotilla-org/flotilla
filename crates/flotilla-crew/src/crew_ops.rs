@@ -20,7 +20,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_protocol::{
     CheckoutArchiveOutcome, CheckoutArchiveStatus, CommandValue, CrewCommandContext, CrewListMember, CrewListResponse, CrewProject,
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
@@ -37,12 +36,12 @@ use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewMessageSender, CrewSource, CrewWorkPhase, Forge, HoldAct, InputMeta,
     ObservedChangeRequestState, Project, Repository, RepositoryKey, ResourceError, ResourceObject, ResourceProvenance,
     TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TurnDeliveryRung, Vessel, WorkCompletionAuthority,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TurnDeliveryRung, Vessel, CONVOY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{CrewMessageDelivery, TerminalCrewMessage};
-use flotilla_store::{apply_status_patch as apply_resource_status_patch, off_frame, ResourceBackend, StoreQuery};
+use flotilla_store::{off_frame, ResourceBackend, StoreQuery};
 use tokio::sync::{Mutex, RwLock};
 #[cfg(test)]
 use tracing::debug;
@@ -552,7 +551,7 @@ async fn queue_crew_message_object(
     existing: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
     next: TerminalCrewMessage,
 ) -> Result<(), String> {
-    sessions.accept_crew_message(existing, &next, Utc::now()).await.map_err(|error| error.to_string())
+    sessions.accept_crew_message(existing, &next, chrono::Utc::now()).await.map_err(|error| error.to_string())
 }
 
 impl CrewService {
@@ -1141,7 +1140,8 @@ impl CrewService {
                     return Err(format!("promise `{id}` is already terminal"));
                 }
                 if promise.source != PromiseSource::Crew || !promise.submissions.is_empty() {
-                    apply_resource_status_patch(
+                    flotilla_store::note_convoy(
+                        &self.convoy_engine,
                         &convoys,
                         name,
                         &convoy_external_patches::mark_crew_stalled(
@@ -1161,28 +1161,10 @@ impl CrewService {
                 PromiseOperation::Retract { id, reason }
             }
         };
-        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
-            // The engine decides (#3587 layer 6): its refusal is the answer, and
-            // the old status follows by the one-way copy.
-            return engine
-                .promise(&convoy, &context.vessel, &context.caller_role, &operation, flotilla_resources::convoy::engine::Actor::Crew)
-                .await;
-        }
-        let updated = apply_resource_status_patch(
-            &convoys,
-            name,
-            &ConvoyStatusPatch::Promise { vessel: context.vessel.clone(), role: context.caller_role.clone(), operation: operation.clone() },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        if updated
-            .status
-            .as_ref()
-            .is_none_or(|status| !flotilla_resources::promises::effect_present(status, &context.vessel, &context.caller_role, &operation))
-        {
-            return Err("promise changed concurrently; inspect convoy explain and retry".into());
-        }
-        Ok(())
+        // The engine decides (#3587 layer 6): its refusal is the answer.
+        let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
+            .ok_or_else(|| format!("convoy `{name}` is not held at this home"))?;
+        engine.promise(&convoy, &context.vessel, &context.caller_role, &operation, flotilla_resources::convoy::engine::Actor::Crew).await
     }
 
     /// An operator's forced completion of the caller's part: a verdict keeping its open promises,
@@ -1216,33 +1198,17 @@ impl CrewService {
         convoy = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, &convoy)?.into_owned();
         ensure_crew_work_is_defined(&convoy, &context)?;
         let principal = principal.ok_or_else(|| "a forced completion requires an operator principal".to_string())?;
-        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
-            // `--force` is an operator's attributed verdict on the crew's open
-            // promises (#3574 decision 8); the engine refuses what it may not keep.
-            let scope = flotilla_resources::convoy::engine::VerdictScope {
-                vessel: context.vessel.clone(),
-                role: Some(context.caller_role.clone()),
-            };
-            let reason = message.clone().unwrap_or_else(|| "operator forced completion".to_string());
-            engine.keep_by_verdict(&convoy, &scope, &principal.name, &reason).await?;
-        }
-        apply_resource_status_patch(
-            &convoys,
-            convoy_name,
-            &convoy_external_patches::mark_crew_completed_with_context(
-                context.vessel.clone(),
-                context.caller_role.clone(),
-                self.clock.now(),
-                message,
-                disposition,
-                decision_ledger_ref,
-                None,
-                completed_while_crew_active,
-                Some(principal),
-            ),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
+            .ok_or_else(|| format!("convoy `{convoy_name}` is not held at this home"))?;
+        // `--force` is an operator's attributed verdict on the crew's open promises (#3574
+        // decision 8); the engine refuses what it may not keep. The crew's completion is its
+        // promises' (#3108): nothing else records it.
+        let scope =
+            flotilla_resources::convoy::engine::VerdictScope { vessel: context.vessel.clone(), role: Some(context.caller_role.clone()) };
+        let reason = message.unwrap_or_else(|| "operator forced completion".to_string());
+        tracing::info!(convoy = %convoy_name, vessel = %context.vessel, role = %context.caller_role, ?disposition, ?decision_ledger_ref,
+            completed_while_crew_active, principal = %principal.name, "operator forced crew completion");
+        engine.keep_by_verdict(&convoy, &scope, &principal.name, &reason).await?;
         Ok(CommandValue::Ok)
     }
 
@@ -1256,10 +1222,14 @@ impl CrewService {
         if !force || principal.is_none() || requested.crew_id.is_some() {
             return Err("crew fail requires an operator principal with --force; crew members should use `flotilla crew stall --reason <infra|scope|decision|access|other> --message '...'` and supervisors should use `flotilla crew supervise … convert-to-failed`".to_string());
         }
-        self.apply_crew_work_patch(requested, |context| {
-            convoy_external_patches::mark_crew_failed(context.vessel.clone(), context.caller_role.clone(), chrono::Utc::now(), message)
-        })
-        .await
+        let principal = principal.expect("checked above");
+        let context = self.resolve_crew_context(requested).await?;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
+        let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
+        ensure_crew_work_is_defined(&convoy, &context)?;
+        let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
+            .ok_or_else(|| format!("convoy `{}` is not held at this home", context.convoy))?;
+        engine.fail_seat(&convoy, &context.vessel, &context.caller_role, &principal.name, &message).await
     }
 
     pub async fn stall(
@@ -1299,7 +1269,8 @@ impl CrewService {
         {
             return Err("only working crew can declare a stall".to_string());
         }
-        apply_resource_status_patch(
+        flotilla_store::note_convoy(
+            &self.convoy_engine,
             &convoys,
             &context.convoy,
             &convoy_external_patches::mark_crew_stalled(
@@ -1401,13 +1372,10 @@ impl CrewService {
                 .await?;
             }
             SupervisorRuling::Fail => {
-                let failed = convoy_external_patches::mark_crew_failed(
-                    vessel.to_string(),
-                    role.to_string(),
-                    chrono::Utc::now(),
-                    message.to_string(),
-                );
-                off_frame(|| apply_resource_status_patch(&convoys, convoy_name, &failed)).await.map_err(|error| error.to_string())?;
+                let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+                let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
+                    .ok_or_else(|| format!("convoy `{convoy_name}` is not held at this home"))?;
+                off_frame(|| engine.fail_seat(&convoy, vessel, role, &sender, message)).await?;
             }
             SupervisorRuling::Escalate { receiver, condition } => {
                 return off_frame(|| self.record_escalation(&convoys, convoy_name, vessel, role, status, receiver, condition)).await;
@@ -1541,7 +1509,7 @@ impl CrewService {
         condition: Box<flotilla_resources::StalledCondition>,
     ) -> Result<CommandValue, String> {
         let current = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
-        let mut updated = current.status.ok_or("convoy has no status")?;
+        let updated = current.status.clone().ok_or("convoy has no status")?;
         // Local supervisor activation legitimately changes this convoy
         // and clears its stall. Accept only the activation proved by the
         // admitted Message, while preserving every other current field.
@@ -1564,8 +1532,11 @@ impl CrewService {
                     .into(),
             );
         }
-        updated.stalled = Some(*condition);
-        convoys.update_status(convoy_name, &current.metadata.resource_version, &updated).await.map_err(|error| error.to_string())?;
+        flotilla_resources::convoy::engine::note(
+            &self.convoy_engine,
+            &current,
+            &ConvoyStatusPatch::SetStalled { condition: Some(*condition) },
+        )?;
         Ok(CommandValue::CrewEscalated { receiver })
     }
 
@@ -1885,83 +1856,28 @@ impl CrewService {
         let archives = self.archive_convoy_checkouts_best_effort(namespace, name).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let current = convoys.get(name).await.map_err(|err| err.to_string())?;
-        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &current) {
-            let principal = principal_ref.map_or("unattributed", |principal| principal.name.as_str());
-            engine.abandon(&current, principal, reason).await?;
-        }
-        let expected_phase = current.status.map_or(ConvoyPhase::Pending, |status| status.phase);
-        let authority = match principal_ref {
-            Some(principal) if principal.name == PrincipalRef::IMPLICIT_NAME => WorkCompletionAuthority::HumanOverride,
-            Some(principal) => WorkCompletionAuthority::Principal(principal.clone()),
-            None => WorkCompletionAuthority::Unattributed,
-        };
-        flotilla_store::apply_status_patch_with_before_update(
-            &convoys,
-            name,
-            &convoy_external_patches::mark_convoy_abandoned(expected_phase, Utc::now(), authority, reason.to_string()),
-            before_update,
-        )
-        .await
-        .map_err(|err| err.to_string())?;
-        if !convoys.get(name).await.map_err(|err| err.to_string())?.status.is_some_and(|status| status.phase == ConvoyPhase::Abandoned) {
-            return Err("convoy phase changed while abandonment was being applied; retry the command".to_string());
-        }
-        // Abandonment is an explicit terminal override: the phase stamp above is
+        let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &current)
+            .ok_or_else(|| format!("convoy `{name}` is not held at this home"))?;
+        before_update().await;
+        let principal = principal_ref.map_or("unattributed", |principal| principal.name.as_str());
+        engine.abandon(&current, principal, reason).await?;
+        // Abandonment is an explicit terminal override: the engine's abandonment is
         // the teardown gate, after the best-effort archive push has run. The
         // lifecycle reconciler reclaims children while retaining the convoy.
         Ok(archives)
     }
 
-    async fn record_lifecycle_mutation(
+    /// Traces who changed convoy `name`'s lifecycle, and how: the record of a mutation is its trace
+    /// (#3108), not the convoy's status.
+    pub(crate) fn record_lifecycle_mutation(
         &self,
         namespace: &str,
         name: &str,
         action: &str,
         caller: Option<&flotilla_protocol::CommandCaller>,
-    ) -> Result<(), String> {
-        let Some(caller) = caller else { return Ok(()) };
-        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        apply_resource_status_patch(
-            &convoys,
-            name,
-            &ConvoyStatusPatch::RecordLifecycleMutation {
-                mutation: flotilla_resources::LifecycleMutation {
-                    action: action.to_string(),
-                    caller: caller.clone(),
-                    at: self.clock.now(),
-                },
-            },
-        )
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-    }
-
-    pub(crate) async fn record_lifecycle_mutation_best_effort(
-        &self,
-        namespace: &str,
-        name: &str,
-        action: &str,
-        caller: Option<&flotilla_protocol::CommandCaller>,
-        missing_expected: bool,
     ) {
-        if let Err(error) = self.record_lifecycle_mutation(namespace, name, action, caller).await {
-            if !missing_expected || !error.contains("not found") {
-                warn!(%error, %namespace, convoy = %name, %action, "failed to persist lifecycle mutation attribution");
-            }
-        }
-    }
-
-    async fn apply_crew_work_patch(
-        &self,
-        requested: &CrewCommandContext,
-        patch: impl FnOnce(&ResolvedCrewContext) -> ConvoyStatusPatch,
-    ) -> Result<(), String> {
-        let context = self.resolve_crew_context(requested).await?;
-        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
-        let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
-        ensure_crew_work_is_defined(&convoy, &context)?;
-        apply_resource_status_patch(&convoys, &context.convoy, &patch(&context)).await.map(|_| ()).map_err(|err| err.to_string())
+        let Some(caller) = caller else { return };
+        tracing::info!(%namespace, convoy = %name, %action, ?caller, "convoy lifecycle mutation");
     }
 
     pub async fn handoff(&self, requested: &CrewCommandContext, target: &str, message: &str) -> Result<(), String> {
@@ -2144,27 +2060,20 @@ impl CrewService {
         };
         let environment_ref = target_session.as_ref().or(anchor.as_ref()).expect("target or anchor session").spec.env_ref.clone();
         let previous_status = convoy.status.clone().ok_or_else(|| format!("convoy `{}` has no status", context.convoy))?;
-        let mut admitted = None;
-        if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
-            // Handoff is the engine's `Reassign` of the sender's open promises (#3574 decision 3).
-            engine.reassign(&convoy, &context.vessel, &context.caller_role, target).await?;
-            // Admit the turn before reopening its recipient: the reopened crew's
-            // derived Done waits on that turn's delivery (#3894).
-            admitted = Some(self.publish_message_intent(&context.namespace, &message_name, &intent).await?);
-        }
-        // Each branch below sends the turn once its target session is settled.
-        // The old path keeps that order, since a failed send restores the crew
-        // work; the engine path already admitted the turn and only reuses it.
-        let send = || async {
-            match &admitted {
-                Some(admitted) => Ok(admitted.clone()),
-                None => self.publish_message_intent(&context.namespace, &message_name, &intent).await,
-            }
-        };
+        let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
+            .ok_or_else(|| format!("convoy `{}` is not held at this home", context.convoy))?;
+        // Handoff is the engine's `Reassign` of the sender's open promises (#3574 decision 3).
+        engine.reassign(&convoy, &context.vessel, &context.caller_role, target).await?;
+        // Admit the turn before reopening its recipient: the reopened crew's
+        // derived Done waits on that turn's delivery (#3894).
+        let admitted = self.publish_message_intent(&context.namespace, &message_name, &intent).await?;
+        // Each branch below reuses the admitted turn once its target session is settled.
+        let send = || async { Ok::<_, String>(admitted.clone()) };
         // A handoff that fails after its engine turn was admitted withdraws that
         // turn, so no orphan turn reaches, or holds, the recipient.
         let handed_off: Result<(), String> = async {
-            let reopened = apply_resource_status_patch(
+            let reopened = flotilla_store::note_convoy(
+                &self.convoy_engine,
                 &convoys,
                 &context.convoy,
                 &convoy_external_patches::handoff_crew_work(
@@ -2183,26 +2092,10 @@ impl CrewService {
             if target_origin.is_some() {
                 return match send().await {
                     Ok(_) => Ok(()),
-                    Err(error) => Err(self
-                        .restore_crew_work_after_delivery_failure(
-                            &convoys,
-                            &context.convoy,
-                            &reopened.metadata.resource_version,
-                            &previous_status,
-                            error,
-                        )
-                        .await),
+                    Err(error) => Err(self.restore_crew_work_after_delivery_failure(&context.convoy, &previous_status, error).await),
                 };
             }
-            self.reconcile_or_restore_crew_work(
-                &context.namespace,
-                &environment_ref,
-                &convoys,
-                &context.convoy,
-                previous_status.clone(),
-                &reopened,
-            )
-            .await?;
+            self.reconcile_or_restore_crew_work(&context.namespace, &environment_ref, &context.convoy, previous_status.clone()).await?;
             let handoff_result: Result<(), String> = async {
                 match sessions.get(&terminal_name).await {
                     Ok(existing) if existing.spec.env_ref != environment_ref => {
@@ -2315,15 +2208,15 @@ impl CrewService {
             }
             .await;
             if let Err(error) = handoff_result {
-                return match convoys.update_status(&context.convoy, &reopened.metadata.resource_version, &previous_status).await {
-                    Ok(_) => Err(error),
+                return match flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, &context.convoy, &previous_status) {
+                    Ok(()) => Err(error),
                     Err(restore_error) => Err(format!("{error}; could not restore crew work after handoff failure: {restore_error}")),
                 };
             }
             Ok(())
         }
         .await;
-        if let (Err(_), Some(_), Some(engine)) = (&handed_off, &admitted, self.message_primitives()) {
+        if let (Err(_), Some(engine)) = (&handed_off, self.message_primitives()) {
             if let Err(error) = engine.withdraw(&context.namespace, &message_name, &context.convoy).await {
                 tracing::warn!(convoy = %context.convoy, message = %message_name, %error, "a failed handoff's admitted turn was not withdrawn");
             }
@@ -2576,7 +2469,8 @@ impl CrewService {
         // returns canonical admission, as it does for subject-based producers.
         let admitted = self.publish_message_intent(namespace, &message_name, &intent).await?;
         if admitted.name == message_name {
-            apply_resource_status_patch(
+            flotilla_store::note_convoy(
+                &self.convoy_engine,
                 &selected.convoys,
                 name,
                 &ConvoyStatusPatch::QueueMessageFollowUp { vessel: vessel.clone(), role: role.clone(), message: Some(admitted) },
@@ -2639,7 +2533,8 @@ impl CrewService {
             )
             .build();
         let message_name = flotilla_resources::message_record_name(&receiver, &sender, &format!("resume:{}", uuid::Uuid::new_v4()));
-        let reopened = apply_resource_status_patch(
+        let reopened = flotilla_store::note_convoy(
+            &self.convoy_engine,
             &selected.convoys,
             name,
             &ConvoyStatusPatch::ResumeCrewWork {
@@ -2671,7 +2566,7 @@ impl CrewService {
         delivery: ResumeDelivery,
     ) -> Result<ConvoyResumeOutcome, String> {
         let ResumeDelivery { session, resume_intent, message_name, reopened, displaced } = delivery;
-        let (vessel, role, convoys, status) = (&selected.vessel, &selected.role, &selected.convoys, selected.status());
+        let (vessel, role, status) = (&selected.vessel, &selected.role, selected.status());
         if intent == ResumeIntent::Reminder && reopened.status.as_ref().is_some_and(|status| status.crew_claim_is_settled(vessel, role)) {
             // The claim guard made the patch a no-op; only the message is published.
             self.publish_message_intent(namespace, &message_name, &resume_intent).await?;
@@ -2679,14 +2574,12 @@ impl CrewService {
         }
         if matches!(session.provenance, ResourceProvenance::Replica { .. }) {
             if let Err(error) = self.publish_message_intent(namespace, &message_name, &resume_intent).await {
-                return Err(self
-                    .restore_crew_work_after_delivery_failure(convoys, name, &reopened.metadata.resource_version, status, error)
-                    .await);
+                return Err(self.restore_crew_work_after_delivery_failure(name, status, error).await);
             }
             return Ok(ConvoyResumeOutcome::Queued { displaced });
         }
         let session = session.object;
-        self.reconcile_or_restore_crew_work(namespace, &session.spec.env_ref, convoys, name, status.clone(), &reopened).await?;
+        self.reconcile_or_restore_crew_work(namespace, &session.spec.env_ref, name, status.clone()).await?;
         let delivery_result: Result<(), String> = async {
             if session.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped) {
                 self.restart_terminal(&session)?;
@@ -2696,9 +2589,7 @@ impl CrewService {
         }
         .await;
         if let Err(error) = delivery_result {
-            return Err(self
-                .restore_crew_work_after_delivery_failure(convoys, name, &reopened.metadata.resource_version, status, error)
-                .await);
+            return Err(self.restore_crew_work_after_delivery_failure(name, status, error).await);
         }
         Ok(ConvoyResumeOutcome::Queued { displaced })
     }
@@ -2799,7 +2690,8 @@ impl CrewService {
                             .is_some_and(|status| status.phase.is_terminal())
                     };
                     if terminal {
-                        apply_resource_status_patch(
+                        flotilla_store::note_convoy(
+                            &self.convoy_engine,
                             &convoys,
                             name,
                             &ConvoyStatusPatch::QueueMessageFollowUp { vessel: vessel.clone(), role: role.clone(), message: None },
@@ -3110,9 +3002,13 @@ impl CrewService {
             if let Some((activated, previous)) = activation {
                 let patch =
                     convoy_external_patches::restore_turn_activation(request.vessel.clone(), request.role.clone(), activated, previous);
-                if let Err(error) =
-                    apply_resource_status_patch(&self.resource_backend.using::<ResourceConvoy>(&request.namespace), &request.convoy, &patch)
-                        .await
+                if let Err(error) = flotilla_store::note_convoy(
+                    &self.convoy_engine,
+                    &self.resource_backend.using::<ResourceConvoy>(&request.namespace),
+                    &request.convoy,
+                    &patch,
+                )
+                .await
                 {
                     let cause = publication.as_ref().err().map_or("receiver suppression", String::as_str);
                     return Err(format!("{cause}; could not restore turn activation: {error}"));
@@ -3149,7 +3045,8 @@ impl CrewService {
         if matches!(target.provenance, ResourceProvenance::Local) {
             if let Some(previous) = target.object.status.as_ref().filter(|_| holder.is_some() || request.source == "handoff") {
                 let convoys = self.resource_backend.using::<ResourceConvoy>(&request.namespace);
-                let reopened = apply_resource_status_patch(
+                let reopened = flotilla_store::note_convoy(
+                    &self.convoy_engine,
                     &convoys,
                     &request.convoy,
                     &convoy_external_patches::resume_crew_work(
@@ -3374,10 +3271,7 @@ impl CrewService {
                     || delivery.pending_supervisor_turn.is_some()
             });
             if current.status.as_ref() != Some(&next) {
-                convoys
-                    .update_status(&current.metadata.name, &current.metadata.resource_version, &next)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, &current.metadata.name, &next)?;
             }
         }
         Ok(())
@@ -3454,10 +3348,7 @@ impl CrewService {
                 .apply(&mut next);
             }
             if current.status.as_ref() != Some(&next) {
-                convoys
-                    .update_status(&current.metadata.name, &current.metadata.resource_version, &next)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, &current.metadata.name, &next)?;
             }
         }
         Ok(())
@@ -3562,14 +3453,13 @@ impl CrewService {
         let HoldAct::State = act; // Also covers previous-generation snapshots through the serde alias.
         let attention =
             flotilla_resources::ConvoyAttention { source: request.source.clone(), reason: reason.into(), raised_at: self.clock.now() };
-        flotilla_store::apply_status_patch(
+        let convoy = flotilla_store::note_convoy(
+            &self.convoy_engine,
             &convoys,
             &request.convoy,
             &ConvoyStatusPatch::HoldTurnDelivery { source: request.source.clone(), hold: attention.clone() },
         )
-        .await
-        .map_err(|error| error.to_string())?;
-        let convoy = convoys.get(&request.convoy).await.map_err(|error| error.to_string())?;
+        .await?;
         let status = convoy.status.as_ref().ok_or("hold convoy has no status")?;
         let Some(attention) = status.turn_deliveries.get(&request.source).and_then(|delivery| delivery.hold.clone()) else {
             // Landing may win the compare-and-swap while a late hold is being applied.
@@ -3685,14 +3575,12 @@ impl CrewService {
         &self,
         namespace: &str,
         environment_ref: &str,
-        convoys: &flotilla_store::TypedResolver<ResourceConvoy>,
         name: &str,
         previous_status: flotilla_resources::ConvoyStatus,
-        reopened: &ResourceObject<ResourceConvoy>,
     ) -> Result<(), String> {
         if let Err(error) = self.reconcile_resumed_work_credentials(namespace, environment_ref).await {
-            return match convoys.update_status(name, &reopened.metadata.resource_version, &previous_status).await {
-                Ok(_) => Err(error),
+            return match flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, name, &previous_status) {
+                Ok(()) => Err(error),
                 Err(restore_error) => Err(format!("{error}; could not restore crew work after credential failure: {restore_error}")),
             };
         }
@@ -3701,14 +3589,12 @@ impl CrewService {
 
     async fn restore_crew_work_after_delivery_failure(
         &self,
-        convoys: &flotilla_store::TypedResolver<ResourceConvoy>,
         name: &str,
-        reopened_version: &str,
         previous_status: &flotilla_resources::ConvoyStatus,
         error: String,
     ) -> String {
-        match convoys.update_status(name, reopened_version, previous_status).await {
-            Ok(_) => error,
+        match flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, name, previous_status) {
+            Ok(()) => error,
             Err(restore_error) => format!("{error}; could not restore crew work after delivery failure: {restore_error}"),
         }
     }

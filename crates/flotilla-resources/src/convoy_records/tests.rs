@@ -158,6 +158,26 @@ fn a_latent_seat_works_once_its_task_is_delivered() {
     assert_eq!(status.attention.map(|attention| attention.reason), Some("a turn is queued".into()));
 }
 
+// Behaviour (#3108 C3'): an old status patch written to a home's notes keeps what the notes hold
+// (here a handoff's task assignment) and drops what the view derives (the crew's phase), so the
+// next view shows the note and its own phases.
+#[test]
+fn a_patch_keeps_only_what_the_notes_hold() {
+    let record = record(PromiseState::Open);
+    let live = BTreeSet::from([seat("work", "coder"), seat("work", "reviewer")]);
+    let working = record.working(&live, None);
+    let view = record.read_view("flotilla", ConvoyJoins { works: &ready(), working: &working, notes: None }).status.expect("status");
+    let mut notes = ConvoyNotes::default();
+    notes.apply(&view, &crate::external_patches::handoff_crew_work("work".into(), "coder".into(), "reviewer".into(), at(130), "go".into()));
+    assert!(notes.crew["work"]["reviewer"].task_assigned, "the handoff assigned the reviewer its task");
+    assert_eq!(notes.attention, None);
+    let working = record.working(&live, Some(&notes));
+    let status =
+        record.read_view("flotilla", ConvoyJoins { works: &ready(), working: &working, notes: Some(&notes) }).status.expect("status");
+    assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Working, "the view derives the phase from the note");
+    assert!(status.crew_work["work"]["reviewer"].message.is_none(), "the patch's message is not a note");
+}
+
 // Behaviour: a seat's verdict fails its work and the convoy, with the verdict's reason on the
 // seat; how a launch ended is read from its end, with the end's reason or disposition.
 #[test]

@@ -34,6 +34,7 @@ struct Recording {
     held: Option<OldPromises>,
     /// The disposition the engine delivered the convoy with, once it has.
     delivered: Option<String>,
+    memory: flotilla_resources::convoy_records::ConvoyMemory,
 }
 
 #[async_trait]
@@ -88,6 +89,24 @@ impl EngineConvoys for Recording {
             Some(sender) => sender.subscribe(),
             None => tokio::sync::broadcast::channel(1).1,
         }
+    }
+    fn memory(&self) -> &flotilla_resources::convoy_records::ConvoyMemory {
+        &self.memory
+    }
+    async fn fail_seat(&self, _: &ResourceObject<Convoy>, _: &str, _: &str, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn link(
+        &self,
+        _: &ResourceObject<Convoy>,
+        _: &flotilla_protocol::Subject,
+        _: flotilla_resources::SubjectDiscoverySource,
+        _: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    async fn unlink(&self, _: &ResourceObject<Convoy>, _: &flotilla_protocol::Subject, _: &str) -> Result<(), String> {
+        Ok(())
     }
 }
 

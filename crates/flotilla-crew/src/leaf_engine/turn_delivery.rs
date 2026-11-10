@@ -214,7 +214,8 @@ impl LeafSubscriptionTable {
         failures: BTreeMap<String, DeliveryError>,
     ) -> Result<(), ResourceError> {
         let patch = FailTurnDeliveries { failures, now: Utc::now(), changed: Default::default() };
-        let written = flotilla_store::apply_status_patch_checked(convoys, convoy, &patch, |_| Ok(())).await?;
+        let written =
+            flotilla_store::note_convoy(&self.inner.convoy_engine, convoys, convoy, &patch).await.map_err(ResourceError::other)?;
         let status = written.status.unwrap_or_default();
         for source in patch.changed.lock().expect("changed turn-delivery failures").iter() {
             let (Some(error), Some(failure)) =
@@ -639,10 +640,7 @@ impl LeafSubscriptionTable {
         // The actuator may reopen the work before publishing the session message.
         // Apply the delivery record to that newer status rather than restoring
         // the pre-delivery snapshot (which would revoke credentials again).
-        let current = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
-        let mut next = current.status.clone().ok_or_else(|| format!("convoy {convoy_name} has no status"))?;
-        patch.apply(&mut next);
-        convoys.update_status(convoy_name, &current.metadata.resource_version, &next).await.map_err(|error| error.to_string())?;
+        flotilla_store::note_convoy(&self.inner.convoy_engine, &convoys, convoy_name, &patch).await?;
         if let Some(row) = self.inner.rows.lock().await.get_mut(&subscription_id) {
             row.episode_key.subject_revision = Some(subject_revision);
         }

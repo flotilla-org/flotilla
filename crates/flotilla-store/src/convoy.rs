@@ -40,6 +40,18 @@ pub async fn resolve_local_convoy_name(backend: &crate::ResourceBackend, namespa
     }
 }
 
+/// Writes `patch` to this home's notes on convoy `name` as its readers now see it (#3108 C3'), and
+/// returns the convoy with the notes as they now stand. See [`flotilla_resources::convoy::engine::note`].
+pub async fn note_convoy<P: flotilla_resources::StatusPatch<flotilla_resources::ConvoyStatus> + ?Sized>(
+    path: &flotilla_resources::convoy::engine::EngineConvoyPath,
+    convoys: &crate::TypedResolver<flotilla_resources::Convoy>,
+    name: &str,
+    patch: &P,
+) -> Result<flotilla_resources::ResourceObject<flotilla_resources::Convoy>, String> {
+    let convoy = convoys.get(name).await.map_err(|error| error.to_string())?;
+    flotilla_resources::convoy::engine::note(path, &convoy, patch)
+}
+
 #[cfg(test)]
 mod live_query_tests {
     use super::*;

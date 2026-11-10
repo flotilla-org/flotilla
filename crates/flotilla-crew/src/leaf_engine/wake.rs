@@ -307,7 +307,8 @@ impl ReconcilerWake {
         let mut next = status.clone();
         patch.apply(&mut next);
         if next != *status {
-            flotilla_store::apply_status_patch(
+            flotilla_store::note_convoy(
+                &self.subscriptions.inner.convoy_engine,
                 &self.subscriptions.inner.backend.clone().using::<Convoy>(namespace),
                 &convoy.metadata.name,
                 &patch,

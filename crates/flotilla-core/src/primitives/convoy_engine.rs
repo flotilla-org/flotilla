@@ -16,16 +16,18 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use flotilla_protocol::Subject;
 use flotilla_resources::{
+    address::subject_address,
     convoy::engine::{Actor, EngineConvoys, OldPromises, VerdictScope},
     promises::{PromiseKind as OldKind, PromiseOperation, PromiseSource as OldSource},
-    Convoy as OldConvoy, Forge, ForgeSpec, ResourceObject,
+    Convoy as OldConvoy, Forge, ForgeSpec, ResourceObject, SubjectDiscoverySource,
 };
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::convoy::{
-        AbandonCause, AddSeat, Authority, Convoy, ConvoyEdge, ConvoyLabel, ConvoyState, Declare, Deliver, Keep, Progress, Promise,
-        PromiseId, Reassign, Reject, Retract, SeatName, Submit,
+        AbandonCause, AddSeat, Authority, Convoy, ConvoyEdge, ConvoyLabel, ConvoyState, Declare, Deliver, FailSeat, Keep, Link, LinkSource,
+        Progress, Promise, PromiseId, Reassign, Reject, Retract, SeatName, Submit, Unlink,
     },
     Ref, Resource,
 };
@@ -445,8 +447,73 @@ impl EngineConvoys for ConvoyEngine {
         .await
     }
 
+    async fn fail_seat(
+        &self,
+        convoy: &ResourceObject<OldConvoy>,
+        vessel: &str,
+        role: &str,
+        principal: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        let (name, seat, by, reason) =
+            (map::engine_name(convoy)?, crews(convoy).seat(vessel, role), operator(principal), reason.to_owned());
+        self.edit(convoy, move |current, world| {
+            if current.spec().seat(&seat).is_some_and(|(_, seat)| seat.failed.is_some()) {
+                return Ok((Vec::new(), ()));
+            }
+            let authority = input(&name, "fail-seat");
+            world.authority.put(&Ref::new(authority.as_str()), true);
+            Ok((vec![FailSeat { seat, reason, by, authority: Ref::new(authority) }.into()], ()))
+        })
+        .await
+    }
+
+    async fn link(
+        &self,
+        convoy: &ResourceObject<OldConvoy>,
+        subject: &Subject,
+        source: SubjectDiscoverySource,
+        principal: &str,
+    ) -> Result<(), String> {
+        let source = match source {
+            SubjectDiscoverySource::Claim => LinkSource::Claim,
+            SubjectDiscoverySource::Operator => LinkSource::Operator,
+            SubjectDiscoverySource::Relay => LinkSource::Relay,
+            SubjectDiscoverySource::Branch => return Err("the engine records no branch-found link yet".into()),
+        };
+        let address = subject_address(subject, &self.forges(&convoy.metadata.namespace).await?)?;
+        let (name, by) = (map::engine_name(convoy)?, operator(principal));
+        self.edit(convoy, move |current, world| {
+            if current.spec().linked().contains(&&address) {
+                return Ok((Vec::new(), ()));
+            }
+            let authority = input(&name, "link");
+            world.authority.put(&Ref::new(authority.as_str()), true);
+            Ok((vec![Link { subject: address, source, by, authority: Ref::new(authority) }.into()], ()))
+        })
+        .await
+    }
+
+    async fn unlink(&self, convoy: &ResourceObject<OldConvoy>, subject: &Subject, principal: &str) -> Result<(), String> {
+        let address = subject_address(subject, &self.forges(&convoy.metadata.namespace).await?)?;
+        let (name, by) = (map::engine_name(convoy)?, operator(principal));
+        self.edit(convoy, move |current, world| {
+            if !current.spec().linked().contains(&&address) {
+                return Ok((Vec::new(), ()));
+            }
+            let authority = input(&name, "unlink");
+            world.authority.put(&Ref::new(authority.as_str()), true);
+            Ok((vec![Unlink { subject: address, by, authority: Ref::new(authority) }.into()], ()))
+        })
+        .await
+    }
+
     fn changes(&self) -> tokio::sync::broadcast::Receiver<String> {
         self.changes.subscribe()
+    }
+
+    fn memory(&self) -> &flotilla_resources::convoy_records::ConvoyMemory {
+        self.convoys.memory()
     }
 
     fn promises(&self, convoy: &ResourceObject<OldConvoy>, home: Option<&str>) -> Result<Option<OldPromises>, String> {
