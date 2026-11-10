@@ -663,21 +663,6 @@ impl StartupRestoration {
         let Some(state) = self.state.as_ref() else {
             return futures::future::pending::<Result<(), ResourceError>>().await;
         };
-        // Warm all board sources independently of readiness reconciliation and
-        // interactive request cancellation. Reads schedule coalesced refreshes.
-        let board_daemon = Arc::clone(daemon);
-        controller_tasks.push(AbortOnDropHandle::new(spawn_periodic_task(
-            options.controller_resync_interval,
-            PeriodicTaskStart::Immediate,
-            move || {
-                let daemon = Arc::clone(&board_daemon);
-                async move {
-                    if let Err(error) = daemon.refresh_dispatch_boards_internal().await {
-                        tracing::debug!(%error, "dispatch board observation unavailable");
-                    }
-                }
-            },
-        )));
         let audit_daemon = Arc::clone(daemon);
         // The old store's audit sweep compacts old Messages; on the engine path there are none.
         if daemon.message_primitives().is_none() {
@@ -701,11 +686,7 @@ impl StartupRestoration {
                 },
             )));
         }
-        controller_tasks.push(AbortOnDropHandle::new(spawn_dispatch_reconciler_task(
-            Arc::clone(daemon),
-            options.namespace.clone(),
-            options.controller_resync_interval,
-        )));
+        controller_tasks.push(AbortOnDropHandle::new(spawn_dispatch_reconciler_task(Arc::clone(daemon), options.namespace.clone())));
         controller_tasks.push(AbortOnDropHandle::new(spawn_convoy_ensure_reconciler_task(
             Arc::clone(state),
             options.namespace.clone(),

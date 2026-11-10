@@ -1290,7 +1290,8 @@ impl InProcessDaemon {
         let provisioning_namespace = Arc::new(std::sync::RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()));
         // One per host: every provider this daemon builds shares its forge read cache.
         let forge_reads =
-            flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), DEFAULT_PROVISIONING_NAMESPACE.into());
+            flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), DEFAULT_PROVISIONING_NAMESPACE.into())
+                .with_clock(Arc::clone(&clock));
         let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(ProviderChangeRequestQueryPort {
             forge_reads: forge_reads.clone(),
             config: Arc::clone(&config),
@@ -1306,6 +1307,11 @@ impl InProcessDaemon {
             observation_source.clone(),
             flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
+        // A board change marks the source's other forge reads out of date, so a pass it wakes reads current facts.
+        let dispatch_board_cache = dispatch_board::DispatchBoardCache::new({
+            let forge_reads = forge_reads.clone();
+            move |source: &flotilla_protocol::IssueSource| forge_reads.source_changed(source)
+        });
         let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(ProviderIssueQueryPort {
             forge_reads,
             host_providers: Mutex::new(HashMap::new()),
@@ -1384,7 +1390,7 @@ impl InProcessDaemon {
                 .build(),
         );
         let daemon = Arc::new_cyclic(|self_weak| Self {
-            dispatch_board_cache: dispatch_board::DispatchBoardCache::default(),
+            dispatch_board_cache,
             repos: Arc::clone(&repos),
             repo_order: RwLock::new(order),
             event_source,
@@ -4445,6 +4451,13 @@ impl InProcessDaemon {
         self.read_projections().list_hosts(&self.local_host_counts().await).await
     }
 
+    /// Marked changed when a dispatch board probe sees its issues change.
+    pub fn dispatch_board_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.dispatch_board_cache.changes()
+    }
+
+    /// Reads every Project's boards: enrols each source in the board probe and, once all are
+    /// observed, retires sources no Project binds.
     pub async fn refresh_dispatch_boards_internal(&self) -> Result<(), String> {
         self.dispatch_board_repositories_internal(None).await.map(|_| ())
     }

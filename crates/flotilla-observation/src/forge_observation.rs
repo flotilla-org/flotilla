@@ -51,6 +51,7 @@ type ReadLock = Arc<Mutex<Option<LastRead>>>;
 
 /// This host's latest completed read of one request.
 struct LastRead {
+    started_at: DateTime<Utc>,
     attempted_at: DateTime<Utc>,
     /// The last successful result, kept through later failures.
     value: Option<serde_json::Value>,
@@ -258,11 +259,25 @@ pub struct ForgeReads {
     pub namespace: String,
     pub allow_stale: bool,
     reads: Arc<Mutex<BTreeMap<String, ReadLock>>>,
+    /// When each source last changed: reads started before it are out of date.
+    changed: Arc<std::sync::Mutex<BTreeMap<IssueSource, DateTime<Utc>>>>,
     clock: Arc<dyn Clock>,
 }
 impl ForgeReads {
     pub fn new(backend: ResourceBackend, namespace: String) -> Self {
-        Self { backend, namespace, allow_stale: false, reads: Default::default(), clock: Arc::new(SystemClock) }
+        Self {
+            backend,
+            namespace,
+            allow_stale: false,
+            reads: Default::default(),
+            changed: Default::default(),
+            clock: Arc::new(SystemClock),
+        }
+    }
+    /// The source changed: the next read of each request re-observes it, even within freshness.
+    pub fn source_changed(&self, source: &IssueSource) {
+        let now = self.clock.now();
+        self.changed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(canonical_source(source), now);
     }
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
@@ -298,8 +313,9 @@ impl ForgeReads {
         let lock = self.lock(&source, &request).await;
         let mut last = lock.lock().await;
         let now = self.clock.now();
+        let changed = self.changed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&source).copied();
         let fresh = last.as_ref().is_some_and(|last| {
-            now.signed_duration_since(last.attempted_at) < READ_FRESHNESS
+            (now.signed_duration_since(last.attempted_at) < READ_FRESHNESS && changed.is_none_or(|changed| last.started_at >= changed))
                 || last.error.as_ref().and_then(ObservationError::retry_at).is_some_and(|at| at > now)
         });
         if !fresh {
@@ -310,8 +326,8 @@ impl ForgeReads {
             let previous = last.take().and_then(|last| last.value);
             let attempted_at = self.clock.now();
             *last = Some(match result {
-                Ok(value) => LastRead { attempted_at, value: Some(value), error: None },
-                Err(error) => LastRead { attempted_at, value: previous, error: Some(error) },
+                Ok(value) => LastRead { started_at: now, attempted_at, value: Some(value), error: None },
+                Err(error) => LastRead { started_at: now, attempted_at, value: previous, error: Some(error) },
             });
         }
         let last = last.as_ref().expect("a read completed under this lock");
@@ -513,6 +529,20 @@ mod tests {
             assert_eq!(forge.board(&reads).await.unwrap(), if stale { 2 } else { 1 });
             assert_eq!(forge.calls(), 1 + usize::from(stale));
         });
+    }
+
+    #[tokio::test]
+    async fn a_source_change_makes_the_next_read_call_the_forge() {
+        let (reads, clock) = clocked_reads("host");
+        let forge = CountingForge::new(Ok(1));
+        assert_eq!(forge.board(&reads).await.unwrap(), 1);
+        forge.respond(Ok(2));
+        clock.advance(Duration::seconds(1));
+        reads.source_changed(&source());
+        assert_eq!(forge.board(&reads).await.unwrap(), 2);
+        forge.respond(Ok(3));
+        assert_eq!(forge.board(&reads).await.unwrap(), 2);
+        assert_eq!(forge.calls(), 2);
     }
 
     #[hegel::test]

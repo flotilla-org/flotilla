@@ -61,20 +61,24 @@ pub(super) mod tests {
         let slow_reads = reads.clone();
         let slow_source = source.clone();
         let (entered, started) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(std::sync::Mutex::new(Some(entered)));
         cache
-            .read(&source, move || async move {
-                // Model request/resource-store setup before the load timer.
-                // Equal layered deadlines cannot tolerate this small overhead.
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let result = slow_reads
-                    .read(&slow_source, ForgeReadRequest::Board, || async {
-                        entered.send(()).unwrap();
-                        std::future::pending::<Result<DispatchBoardRepository, String>>().await
-                    })
-                    .await;
-                let mut board = result?;
-                board.refresh_error = slow_reads.last_error(&slow_source, &ForgeReadRequest::Board).await;
-                Ok(board)
+            .read(&source, move || {
+                let (slow_reads, slow_source, entered) = (slow_reads.clone(), slow_source.clone(), entered.clone());
+                async move {
+                    // Model request/resource-store setup before the load timer.
+                    // Equal layered deadlines cannot tolerate this small overhead.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let result = slow_reads
+                        .read(&slow_source, ForgeReadRequest::Board, || async {
+                            entered.lock().unwrap().take().expect("one slow read").send(()).unwrap();
+                            std::future::pending::<Result<DispatchBoardRepository, String>>().await
+                        })
+                        .await;
+                    let mut board = result?;
+                    board.refresh_error = slow_reads.last_error(&slow_source, &ForgeReadRequest::Board).await;
+                    Ok(board)
+                }
             })
             .await
             .expect_err("cold cache");
@@ -91,13 +95,16 @@ pub(super) mod tests {
         assert_eq!(cached.issues, snapshot.issues);
         assert_eq!(cached.refresh_error.as_deref(), Some("forge observation timed out"));
         clock.advance(chrono::Duration::seconds(60));
-        tokio::time::advance(REFRESH_INTERVAL).await;
         let recovered = snapshot.clone();
         let refresh_source = source.clone();
         cache
-            .read(&source, move || async move { reads.read(&refresh_source, ForgeReadRequest::Board, || async { Ok(recovered) }).await })
+            .read(&source, move || {
+                let (reads, refresh_source, recovered) = (reads.clone(), refresh_source.clone(), recovered.clone());
+                async move { reads.read(&refresh_source, ForgeReadRequest::Board, || async { Ok(recovered) }).await }
+            })
             .await
             .unwrap();
+        tokio::time::advance(REFRESH_INTERVAL).await;
         for _ in 0..1000 {
             tokio::task::yield_now().await;
         }

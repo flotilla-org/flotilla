@@ -820,15 +820,103 @@ pub(super) fn spawn_environment_orphan_sweep_task(state: Arc<ControllerRuntimeSt
     })
 }
 
-pub(super) fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
+/// Failed dispatch passes and subscriptions back off from one second to a minute; a pass gives up
+/// after this many failures until the next change.
+const DISPATCH_RETRY_LIMIT: u32 = 10;
+const DISPATCH_RETRY: RetryBackoff = RetryBackoff { initial: Duration::from_secs(1), maximum: Duration::from_secs(60) };
+
+/// Dispatch passes wake on board probe changes, on Project, Repository, WorkflowTemplate and Convoy
+/// changes, and when a queue goes stale. Project and Repository changes also read every Project's
+/// boards, which enrols their sources in the probe and retires removed ones.
+pub(super) fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: String) -> JoinHandle<()> {
     let issues = Arc::new(DaemonDispatchIssueSource::new(Arc::clone(&daemon))) as Arc<dyn DispatchIssueSource>;
-    let reconciler = Arc::new(DispatchReconciler::new(daemon.resource_backend(), namespace, issues));
-    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
-        let reconciler = Arc::clone(&reconciler);
-        async move {
-            if let Err(error) = reconciler.reconcile_once().await {
-                warn!(%error, "dispatch reconciliation pass failed");
+    let backend = daemon.resource_backend();
+    let reconciler = DispatchReconciler::new(backend.clone(), namespace.clone(), issues);
+    tokio::spawn(async move {
+        let mut boards = daemon.dispatch_board_changes();
+        let mut enrol = true;
+        let mut pass_failures = 0_u32;
+        let mut watch_failures = 0_u32;
+        loop {
+            // Subscribe before the pass so a change during it wakes the next one. Each event says
+            // whether it changes the board sources.
+            let mut watches = SelectAll::new();
+            let mut subscribed = true;
+            for (kind, sources) in [("Project", true), ("Repository", true), ("WorkflowTemplate", false), ("Convoy", false)] {
+                match watch_resource_kind_including_replicas(&backend, &namespace, kind).await {
+                    Ok(watch) => watches.push(
+                        watch
+                            .stream
+                            .map(move |event| event.map(|_| sources))
+                            .chain(futures::stream::once(async move { Err(ResourceError::other(format!("the {kind} watch ended"))) }))
+                            .boxed(),
+                    ),
+                    Err(error) => {
+                        warn!(%kind, %error, %namespace, "could not watch a dispatch input; resubscribing");
+                        subscribed = false;
+                        break;
+                    }
+                }
             }
+            if !subscribed {
+                watch_failures = watch_failures.saturating_add(1);
+                tokio::time::sleep(DISPATCH_RETRY.delay(watch_failures)).await;
+                enrol = true;
+                continue;
+            }
+            let mut watches = watches.ready_chunks(64);
+            loop {
+                // Until every board has been read once, the probe's first observations wake this
+                // pass to finish enrolling and retiring.
+                if enrol {
+                    match daemon.refresh_dispatch_boards_internal().await {
+                        Ok(()) => enrol = false,
+                        Err(error) => debug!(%error, "dispatch board observation unavailable"),
+                    }
+                }
+                let (failed, due) = match reconciler.reconcile_once().await {
+                    Ok(pass) => (pass.project_errors > 0, pass.next_due),
+                    Err(error) => {
+                        warn!(%error, "dispatch reconciliation pass failed");
+                        (true, None)
+                    }
+                };
+                pass_failures = if failed { pass_failures.saturating_add(1) } else { 0 };
+                if pass_failures == DISPATCH_RETRY_LIMIT {
+                    error!(%namespace, failures = pass_failures, "dispatch passes failed repeatedly; waiting for the next change");
+                }
+                let retry = (failed && pass_failures < DISPATCH_RETRY_LIMIT).then(|| DISPATCH_RETRY.delay(pass_failures));
+                let due = due.map(|due| due.signed_duration_since(Utc::now()).to_std().unwrap_or_default());
+                let wake = retry.into_iter().chain(due).min();
+                tokio::select! {
+                    events = watches.next() => match events {
+                        Some(events) => {
+                            if let Some(error) = events.iter().find_map(|event| event.as_ref().err()) {
+                                warn!(%error, %namespace, "dispatch input watch failed; resubscribing");
+                                break;
+                            }
+                            enrol |= events.into_iter().any(|event| matches!(event, Ok(true)));
+                            watch_failures = 0;
+                        }
+                        None => break,
+                    },
+                    changed = boards.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = tokio::time::sleep(wake.unwrap_or_default()), if wake.is_some() => continue,
+                }
+                // A change revives a pass that gave up.
+                if pass_failures >= DISPATCH_RETRY_LIMIT {
+                    pass_failures = 0;
+                }
+            }
+            // Re-subscribe after a failed or ended watch, then pass again to recover any events
+            // missed during the gap.
+            enrol = true;
+            watch_failures = watch_failures.saturating_add(1);
+            tokio::time::sleep(DISPATCH_RETRY.delay(watch_failures)).await;
         }
     })
 }

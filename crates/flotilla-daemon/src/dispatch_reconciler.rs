@@ -182,6 +182,8 @@ pub(crate) struct ReconcilePass {
     pub blocked: usize,
     pub dispatches_observed: usize,
     pub project_errors: usize,
+    /// When a queue goes stale and needs attention, if no change comes first.
+    pub next_due: Option<DateTime<Utc>>,
 }
 
 pub(crate) struct DispatchReconciler {
@@ -284,6 +286,7 @@ impl DispatchReconciler {
                     total.queued += outcome.queued;
                     total.blocked += outcome.blocked;
                     total.dispatches_observed += outcome.dispatches_observed;
+                    total.next_due = total.next_due.into_iter().chain(outcome.next_due).min();
                 }
                 Err(error) => {
                     warn!(project = %project.metadata.name, %error, "dispatch reconciliation failed for project; continuing pass");
@@ -447,7 +450,8 @@ impl DispatchReconciler {
             .map_err(|error| error.to_string())?;
         }
 
-        Ok(ReconcilePass { queued: queue.len(), blocked, dispatches_observed, ..ReconcilePass::default() })
+        let next_due = dispatch_queue_stale_since(&queue, policy).filter(|stale_since| *stale_since > now);
+        Ok(ReconcilePass { queued: queue.len(), blocked, dispatches_observed, next_due, ..ReconcilePass::default() })
     }
 
     async fn cached_facts(&self, reference: &IssueRef, reads: &mut PassIssueReads) -> Result<DispatchIssueFacts, String> {
@@ -571,6 +575,12 @@ impl DispatchReconciler {
     }
 }
 
+fn dispatch_queue_stale_since(queue: &[DispatchQueueEntry], policy: &DispatchPolicy) -> Option<DateTime<Utc>> {
+    let oldest = queue.iter().map(|entry| entry.ready_observed_at).min()?;
+    let threshold = i64::try_from(policy.stale_after_seconds).unwrap_or(i64::MAX);
+    Some(oldest.checked_add_signed(Duration::seconds(threshold)).unwrap_or(DateTime::<Utc>::MAX_UTC))
+}
+
 fn dispatch_queue_attention(
     queue: &[DispatchQueueEntry],
     policy: &DispatchPolicy,
@@ -578,8 +588,7 @@ fn dispatch_queue_attention(
     now: DateTime<Utc>,
 ) -> Option<DispatchQueueAttention> {
     let oldest = queue.iter().map(|entry| entry.ready_observed_at).min()?;
-    let threshold = i64::try_from(policy.stale_after_seconds).unwrap_or(i64::MAX);
-    let stale_since = oldest.checked_add_signed(Duration::seconds(threshold)).unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let stale_since = dispatch_queue_stale_since(queue, policy)?;
     (now >= stale_since).then(|| {
         let observed_at = previous
             .filter(|attention| {
@@ -979,8 +988,10 @@ mod tests {
         let mut boards = issues.boards(&backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project")).await.expect("board");
         boards[0].issues.push(tracking);
         *issues.board_override.lock().expect("board") = Some(boards.clone());
-        reconciler.reconcile_once().await.expect("first pass");
+        let pass = reconciler.reconcile_once().await.expect("first pass");
         let first = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        // Without a change, the pass is due again when the queue goes stale.
+        assert_eq!(pass.next_due, Some(first.dispatch_queue[0].ready_observed_at + Duration::seconds(60)));
         let score = first.dispatch_queue[0].score.as_ref().expect("score");
         assert_eq!(f64::from(score.attributes.weight), 2.0);
         assert_eq!(score.attributes.priority, flotilla_protocol::Priority::High);
@@ -989,7 +1000,8 @@ mod tests {
         boards[0].issues.last_mut().expect("tracking").mission_fields.weight = Some(7.5.try_into().expect("value"));
         *issues.board_override.lock().expect("board") = Some(boards);
         clock.advance(Duration::seconds(60));
-        reconciler.reconcile_once().await.expect("re-rank pass");
+        let pass = reconciler.reconcile_once().await.expect("re-rank pass");
+        assert_eq!(pass.next_due, None, "attention raised");
         let second = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
         assert_eq!(second.dispatch_queue[0].ready_observed_at, first.dispatch_queue[0].ready_observed_at);
         let score = second.dispatch_queue[0].score.as_ref().expect("score");
@@ -1455,5 +1467,142 @@ mod tests {
             );
             assert!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.is_empty());
         });
+    }
+
+    /// A forge whose issue "1" carries the ready label once `ready` is set; its board and ready
+    /// query both say so.
+    #[derive(Default)]
+    struct LabelForge {
+        ready: std::sync::atomic::AtomicBool,
+    }
+
+    impl LabelForge {
+        fn issue(&self, reference: IssueRef) -> Issue {
+            let labels = if self.ready.load(std::sync::atomic::Ordering::SeqCst) { vec![READY_ISSUE_LABEL.to_string()] } else { vec![] };
+            Issue::builder()
+                .reference(reference)
+                .title("Widget".into())
+                .labels(labels)
+                .state(IssueState::Open)
+                .as_of(Utc::now())
+                .provider_name("test".into())
+                .provider_display_name("Test".into())
+                .build()
+        }
+    }
+
+    #[async_trait]
+    impl flotilla_issue_tracker::IssueProvider for LabelForge {
+        fn supports(&self, _: &IssueSource) -> bool {
+            true
+        }
+        fn board_includes_mission_fields(&self) -> bool {
+            true
+        }
+        async fn query(
+            &self,
+            source: &IssueSource,
+            _: &IssueQuery,
+            _: u32,
+            _: usize,
+        ) -> Result<flotilla_protocol::issue_query::IssueResultPage, String> {
+            let issue = self.issue(IssueRef { source: source.clone(), id: "1".into() });
+            let items = if issue.labels.is_empty() { vec![] } else { vec![issue] };
+            Ok(flotilla_protocol::issue_query::IssueResultPage { total: Some(items.len() as u32), items, has_more: false })
+        }
+        async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String> {
+            Ok(self.issue(reference.clone()))
+        }
+        async fn dispatch_facts(&self, _: &IssueRef) -> Result<DispatchIssueFacts, String> {
+            Ok(DispatchIssueFacts::default())
+        }
+        async fn list_changed_since(&self, _: &IssueSource, _: &str, _: usize) -> Result<flotilla_protocol::IssueChangeset, String> {
+            Ok(flotilla_protocol::IssueChangeset { updated: vec![], closed: vec![], has_more: false })
+        }
+        async fn open_in_browser(&self, _: &IssueRef) -> Result<(), String> {
+            unreachable!("no browser")
+        }
+        async fn dispatch_board(&self, source: &IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
+            let issue = self.issue(IssueRef { source: source.clone(), id: "1".into() });
+            Ok(flotilla_protocol::DispatchBoardRepository {
+                source: source.clone(),
+                observed_at: Utc::now(),
+                age_seconds: 0,
+                refresh_error: None,
+                issues: vec![flotilla_protocol::DispatchBoardIssue::builder()
+                    .id("1".into())
+                    .title(issue.title)
+                    .state(IssueState::Open)
+                    .url("https://github.com/acme/widgets/issues/1".into())
+                    .updated_at(String::new())
+                    .labels(issue.labels)
+                    .blocked_by(vec![])
+                    .pull_requests(vec![])
+                    .build()],
+                pull_requests: vec![],
+            })
+        }
+    }
+
+    // The ready query is cached for a minute, and is read after the board. A board change marks
+    // it out of date, so the pass the change wakes decides on the new label rather than the old one.
+    #[tokio::test(start_paused = true)]
+    async fn a_board_change_makes_the_pass_read_the_new_ready_label() {
+        let temp = tempfile::tempdir().expect("config");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"dispatch-wake-test\"\n").expect("daemon config");
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let clock = Arc::new(VirtualClock::new(Utc::now()));
+        let forge = Arc::new(LabelForge::default());
+        let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
+            Vec::new(),
+            Arc::new(flotilla_config::ConfigStore::with_base(temp.path())),
+            flotilla_discovery_testkit::fake_discovery_with_provider_set(
+                flotilla_discovery_testkit::FakeDiscoveryProviders::default().with_issue_tracker(forge.clone()),
+            ),
+            flotilla_protocol::HostName::new("test-host"),
+            backend.clone(),
+            clock.clone(),
+            Arc::new(crate::peer::HostPeerOverlay::default()),
+        )
+        .await;
+        backend
+            .using::<Project>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name("widgets".to_string()).build(),
+                &ProjectSpec::builder()
+                    .display_name("Widgets".to_string())
+                    .issue_source_bindings(vec![flotilla_resources::IssueSourceBindingSpec::builder()
+                        .source(source())
+                        .alias("widgets".to_string())
+                        .build()])
+                    .dispatch_policy(DispatchPolicy::builder().stale_after_seconds(3600).build())
+                    .build(),
+            )
+            .await
+            .expect("project");
+        let reconciler = DispatchReconciler::new(
+            backend.clone(),
+            NAMESPACE,
+            Arc::new(DaemonDispatchIssueSource::new(Arc::clone(&daemon))) as Arc<dyn DispatchIssueSource>,
+        );
+        let mut changes = daemon.dispatch_board_changes();
+        let queue =
+            || async { backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue };
+
+        // The first pass enrols the source; its first observation is a change.
+        reconciler.reconcile_once().await.expect("cold pass");
+        changes.changed().await.expect("first board observation");
+        clock.advance(Duration::seconds(10));
+        reconciler.reconcile_once().await.expect("unready pass");
+        assert!(queue().await.is_empty());
+
+        // The label lands. The board's next refresh, a minute on, sees it while the ready query
+        // read ten seconds after the board is still within its minute.
+        forge.ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        clock.advance(Duration::seconds(50));
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        changes.changed().await.expect("board change");
+        reconciler.reconcile_once().await.expect("woken pass");
+        assert_eq!(queue().await.iter().map(|entry| entry.issue.id.as_str()).collect::<Vec<_>>(), vec!["1"]);
     }
 }
