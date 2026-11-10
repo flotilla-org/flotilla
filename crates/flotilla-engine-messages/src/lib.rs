@@ -1320,22 +1320,29 @@ impl MessagePrimitives {
         Ok(views)
     }
 
-    /// Whether a message to `receiver`, an old crew address, is admitted at
-    /// this home and not yet delivered: Pending in the receiver's inbox for
-    /// less than one delivery hold. A turn still undelivered after that no
-    /// longer holds its recipient; the stall judge reports a quiet crew.
-    pub async fn awaits_delivery(&self, namespace: &str, receiver: &str) -> Result<bool, String> {
+    /// Until when messages to `receiver`, an old crew address, hold its delivery: those admitted
+    /// at this home and still Pending in the receiver's inbox each hold for one delivery hold
+    /// from admission, and the latest of those ends is returned; None when none holds now. A
+    /// turn still undelivered after its hold no longer holds its recipient; the stall judge
+    /// reports a quiet crew.
+    pub async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
         // Nothing is admitted until the fleet is designated.
-        let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(false) };
+        let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(None) };
         let records = self.records(namespace).await.map_err(|error| error.to_string())?;
         let inbox = Conversion { roles: &roles, forges: &records.forges, records: &*records }.inbox(receiver)?;
         let hold = flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.num_microseconds().expect("a bounded hold");
         let now = self.world.now();
-        Ok(self.messages()?.iter().any(|(_, message)| {
-            message.spec().inbox == inbox
-                && matches!(message.state(), flotilla_state_machines::machines::message::MessageState::Pending)
-                && now.0.saturating_sub(message.since().0) < hold
-        }))
+        Ok(self
+            .messages()?
+            .iter()
+            .filter(|(_, message)| {
+                message.spec().inbox == inbox
+                    && matches!(message.state(), flotilla_state_machines::machines::message::MessageState::Pending)
+            })
+            .map(|(_, message)| message.since().0.saturating_add(hold))
+            .filter(|end| *end > now.0)
+            .max()
+            .and_then(|end| flotilla_schema::Timestamp(end).to_datetime()))
     }
 
     /// Every message this home holds, its own and those it follows, as the generic resource
@@ -1479,8 +1486,8 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String> {
         MessagePrimitives::end_stalls(self, namespace, seats, stalled, reason).await
     }
-    async fn awaits_delivery(&self, namespace: &str, receiver: &str) -> Result<bool, String> {
-        MessagePrimitives::awaits_delivery(self, namespace, receiver).await
+    async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+        MessagePrimitives::delivery_held_until(self, namespace, receiver).await
     }
     async fn delivery_wait(&self, namespace: &str) -> Result<Option<String>, String> {
         MessagePrimitives::delivery_wait(self, namespace).await

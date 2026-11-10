@@ -1407,3 +1407,53 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
         assert!(promises.iter().all(|p| p.state == PromiseState::Kept));
     });
 }
+
+// Behaviour: a repository whose change request landed on a target other than the one it
+// declared is a target mismatch; one that landed on its declared target, or has no landing
+// evidence, is not.
+#[test]
+fn a_landing_on_another_target_is_a_target_mismatch() {
+    let mut spec = valid_convoy_spec();
+    spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
+        .url("https://github.com/example/repo-a".to_string())
+        .repo_ref(RepositoryKey("repo-a".to_string()))
+        .source_ref("main".to_string())
+        .target_ref("main".to_string())
+        .workspace_slug("repo-a".to_string())
+        .subpaths(Vec::new())
+        .build()];
+    let convoy = convoy_object("convoy-a", spec, None);
+    for (observed, mismatched) in [(Some("release"), true), (Some("main"), false), (None, false)] {
+        let checkouts = engine_checkouts("host-a", "convoy-a");
+        put_inspected(
+            &checkouts,
+            "convoy-a",
+            "checkout-a",
+            (&RepositoryKey("repo-a".to_string()), "feature/lifecycle", "/tmp/checkout-a"),
+            Inspection {
+                landed: Some(true),
+                landed_evidence: Some(Landed {
+                    change_request: 42,
+                    merged_at: None,
+                    target_ref: observed.map(str::to_owned),
+                    head_in_merged_head: true,
+                }),
+                ..Inspection::default()
+            },
+        );
+        let mismatches = flotilla_resources::convoy::reconcile::target_mismatches(&convoy, &held_checkouts(&checkouts));
+        if mismatched {
+            assert_eq!(mismatches.len(), 1, "{observed:?}");
+            assert_eq!(
+                (
+                    mismatches[0].change_request_id.as_str(),
+                    mismatches[0].declared_target_ref.as_str(),
+                    mismatches[0].observed_target_ref.as_str()
+                ),
+                ("42", "main", "release")
+            );
+        } else {
+            assert!(mismatches.is_empty(), "{observed:?}: {mismatches:?}");
+        }
+    }
+}

@@ -21,15 +21,6 @@ use flotilla_store::{
     DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, TypedResolver,
 };
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
-/// How soon a landing convoy held on an undelivered turn is rechecked (#3894): the engine delivery
-/// adapter's pace, since no Message watch wakes this controller when the turn is delivered. The
-/// hold itself lasts at most one delivery hold (`DELIVERY_HOLD_FOR`), after which an untyped turn
-/// no longer holds its crew and may be lost to teardown; the stall judge reports it.
-const TURN_HOLD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// How soon a convoy waiting on capacity checks its hosts again: no Host watch wakes it.
-const CAPACITY_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// The principal this controller acts as on the engine.
 const CONVOY_CONTROLLER: &str = "convoy-controller";
 
@@ -54,7 +45,7 @@ pub struct ConvoyReconciler {
     lifecycle_reads: Arc<dyn lifecycle_reads::LifecycleReads>,
 }
 
-/// What one pass did to the launch, and when it must look again without a change.
+/// What one pass did to the launch, and the deadline at which it must look again without a change.
 #[derive(Debug, Clone, Default)]
 pub struct ConvoyPass {
     requeue_after: Option<std::time::Duration>,
@@ -157,9 +148,41 @@ impl ConvoyReconciler {
     }
 
     /// What wakes a convoy besides its engine records: its sessions (a turn's delivery holds its
-    /// landing) and the evidence its promises are observed from.
-    pub fn secondary_watches(backend: &flotilla_store::ResourceBackend, namespace: &str) -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
+    /// landing), the evidence its promises are observed from, and, for a convoy its home notes as
+    /// waiting, what it waits on: capacity on a host (Host, Vessel, Environment and Convoy
+    /// changes) or a crew turn's delivery (Message changes).
+    pub fn secondary_watches(
+        backend: &flotilla_store::ResourceBackend,
+        namespace: &str,
+        engine: EngineConvoyPath,
+    ) -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
+        let capacity = flotilla_resources::convoy_records::ConvoyNotes::waits_for_capacity;
         vec![
+            Box::new(NoteWake {
+                changes: WakeOn::Replicas(backend.including_replicas::<Host>(namespace)),
+                engine: Arc::clone(&engine),
+                waiting: capacity,
+            }),
+            Box::new(NoteWake {
+                changes: WakeOn::Replicas(backend.including_replicas::<Vessel>(namespace)),
+                engine: Arc::clone(&engine),
+                waiting: capacity,
+            }),
+            Box::new(NoteWake {
+                changes: WakeOn::Engine(backend.clone().using::<Environment>(namespace)),
+                engine: Arc::clone(&engine),
+                waiting: capacity,
+            }),
+            Box::new(NoteWake {
+                changes: WakeOn::Replicas(backend.including_replicas::<Convoy>(namespace)),
+                engine: Arc::clone(&engine),
+                waiting: capacity,
+            }),
+            Box::new(NoteWake {
+                changes: WakeOn::Replicas(backend.including_replicas::<Message>(namespace)),
+                engine,
+                waiting: flotilla_resources::convoy_records::ConvoyNotes::holds_delivery,
+            }),
             Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(EvidenceWake {
                 evidence: backend.including_replicas::<ChangeRequest>(namespace),
@@ -172,9 +195,15 @@ impl ConvoyReconciler {
         ]
     }
 
-    /// A live crew session has an engine turn not yet delivered to it (#3894).
-    async fn turn_awaits(&self, obj: &ResourceObject<Convoy>, vessel: &str, role: &str) -> Result<bool, ResourceError> {
-        let (Some(messages), Some(sessions)) = (self.messages.get(), &self.terminal_sessions) else { return Ok(false) };
+    /// Until when a live crew session's engine turn, not yet delivered to it, holds the convoy's
+    /// delivery (#3894).
+    async fn turn_held_until(
+        &self,
+        obj: &ResourceObject<Convoy>,
+        vessel: &str,
+        role: &str,
+    ) -> Result<Option<DateTime<Utc>>, ResourceError> {
+        let (Some(messages), Some(sessions)) = (self.messages.get(), &self.terminal_sessions) else { return Ok(None) };
         let sessions = sessions
             .list_matching_labels(&BTreeMap::from([
                 (CONVOY_LABEL.to_string(), obj.metadata.name.clone()),
@@ -186,29 +215,28 @@ impl ConvoyReconciler {
         let live =
             sessions.iter().any(|session| session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running));
         if !live {
-            return Ok(false);
+            return Ok(None);
         }
         let namespace = &obj.metadata.namespace;
         let receiver =
             crate::leaf_engine::crew_role_address(obj.spec.project_ref.as_deref().unwrap_or(namespace), &obj.metadata.name, vessel, role);
-        messages.awaits_delivery(namespace, &receiver).await.map_err(ResourceError::other)
+        messages.delivery_held_until(namespace, &receiver).await.map_err(ResourceError::other)
     }
 
-    /// Some crew of `obj` has a turn not yet delivered to its live session (#3894): delivering the
-    /// convoy now would let teardown drop the turn and its receipt.
-    async fn any_turn_awaits(&self, obj: &ResourceObject<Convoy>) -> Result<bool, ResourceError> {
+    /// Until when some crew of `obj` has a turn not yet delivered to its live session (#3894):
+    /// delivering the convoy before then would let teardown drop the turn and its receipt.
+    async fn delivery_held_until(&self, obj: &ResourceObject<Convoy>) -> Result<Option<DateTime<Utc>>, ResourceError> {
         let seats = obj
             .status
             .iter()
             .flat_map(|status| status.crew_work.iter())
             .flat_map(|(vessel, roles)| roles.keys().map(move |role| (vessel.clone(), role.clone())))
             .collect::<Vec<_>>();
+        let mut until = None;
         for (vessel, role) in seats {
-            if self.turn_awaits(obj, &vessel, &role).await? {
-                return Ok(true);
-            }
+            until = until.max(self.turn_held_until(obj, &vessel, &role).await?);
         }
-        Ok(false)
+        Ok(until)
     }
 
     /// What `host` holds against its vessel cap, or None without the convoy and vessel reads to
@@ -225,6 +253,12 @@ impl ConvoyReconciler {
     /// Why `obj` waits for capacity on a host its placement chose, if it does: the host is not
     /// ready, is asleep, or has no free vessel slot.
     pub async fn capacity_wait(&self, obj: &ResourceObject<Convoy>) -> Result<Option<String>, ResourceError> {
+        Ok(self.capacity(obj).await?.map(|wait| wait.reason))
+    }
+
+    /// The capacity `obj` waits for, if it does. Host, vessel, environment and convoy changes wake
+    /// it; a sleeping host also by the time it sleeps until.
+    async fn capacity(&self, obj: &ResourceObject<Convoy>) -> Result<Option<CapacityWait>, ResourceError> {
         let Some(hosts) = &self.hosts else { return Ok(None) };
         let available_hosts = hosts.list().await?;
         let mut decisions = obj.status.as_ref().and_then(|status| status.placement_decision.as_ref()).into_iter().collect::<Vec<_>>();
@@ -242,10 +276,10 @@ impl ConvoyReconciler {
             let canonical = match canonical_host_id(available_hosts.items.iter().map(|host| &host.object), &selected.host) {
                 Ok(canonical) => canonical,
                 Err(error) => {
-                    return Ok(Some(format!(
+                    return Ok(Some(CapacityWait::reason(format!(
                         "capacity for fulfilment `{}` on host `{}` is unavailable: {error}",
                         selected.kind, selected.host
-                    )));
+                    ))));
                 }
             };
             let host = canonical.as_ref().and_then(|id| {
@@ -262,7 +296,8 @@ impl ConvoyReconciler {
                 status.apply_heartbeat_readiness(self.clock.now());
                 status
             });
-            let sleeping = status.as_ref().and_then(|status| status.sleeping_until).is_some_and(|until| until > self.clock.now());
+            let sleeping_until = status.as_ref().and_then(|status| status.sleeping_until).filter(|until| *until > self.clock.now());
+            let sleeping = sleeping_until.is_some();
             let slots =
                 status.as_ref().and_then(|status| status.fulfilment_facts.get(&selected.kind)).and_then(|facts| facts.free_vessel_slots);
             // A capped host admits convoys in admission order while its live vessels leave room
@@ -273,22 +308,25 @@ impl ConvoyReconciler {
                     Ok(None) => slots == Some(0),
                     // An unreadable count waits rather than failing the pass.
                     Err(error) => {
-                        return Ok(Some(format!(
+                        return Ok(Some(CapacityWait::reason(format!(
                             "capacity for fulfilment `{}` on host `{}` is unavailable: cannot count its vessels: {error}",
                             selected.kind, selected.host
-                        )));
+                        ))));
                     }
                 },
                 _ => slots == Some(0),
             };
             if status.as_ref().is_none_or(|status| !status.ready) || sleeping || full {
-                return Ok(Some(format!(
-                    "capacity for fulfilment `{}` on host `{}` is unavailable{}{}",
-                    selected.kind,
-                    selected.host,
-                    if sleeping { " (sleeping)" } else { "" },
-                    if full { " (no free vessel slots)" } else { "" }
-                )));
+                return Ok(Some(CapacityWait {
+                    reason: format!(
+                        "capacity for fulfilment `{}` on host `{}` is unavailable{}{}",
+                        selected.kind,
+                        selected.host,
+                        if sleeping { " (sleeping)" } else { "" },
+                        if full { " (no free vessel slots)" } else { "" }
+                    ),
+                    until: sleeping_until,
+                }));
             }
         }
         Ok(None)
@@ -308,7 +346,7 @@ impl ConvoyReconciler {
                     maker: Some(LeafMaker::Controller {
                         resource_kind: "Convoy".to_string(),
                         name: None,
-                        retry: ControllerRetry::retryable(None, now, RetryBackoff { initial: CAPACITY_RETRY, maximum: CAPACITY_RETRY }),
+                        retry: ControllerRetry::terminal(None, now, "a host with room for the convoy's vessels"),
                         ceiling: RetryCeiling::default(),
                     }),
                     evidence: evidence.clone(),
@@ -347,6 +385,29 @@ impl ConvoyReconciler {
         Ok(flotilla_resources::checkout_records::latest_launches(held))
     }
 
+    /// Notes and traces each repository of `obj` whose change request landed on a target other
+    /// than the one it declared, as its checkout's landing evidence shows. Nothing decides on it:
+    /// it explains the convoy until its notes are dropped, and the trace keeps it.
+    fn note_target_mismatches(
+        &self,
+        engine: &dyn EngineConvoys,
+        obj: &ResourceObject<Convoy>,
+        checkouts: &BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>,
+    ) {
+        let mismatches = target_mismatches(obj, checkouts);
+        for mismatch in &mismatches {
+            tracing::warn!(
+                convoy = %obj.metadata.name,
+                repository = %mismatch.repo_ref.0,
+                change_request = %mismatch.change_request_id,
+                declared = %mismatch.declared_target_ref,
+                observed = %mismatch.observed_target_ref,
+                "a delivered convoy's change request landed on a target other than the one its repository declared"
+            );
+        }
+        engine.memory().update(&obj.metadata.name, |notes| notes.target_mismatches = mismatches);
+    }
+
     /// An ended launch's teardown: once the checkouts held for it are released, its prepared
     /// snapshots are collected and its home's notes on it dropped.
     async fn tear_down(&self, engine: &dyn EngineConvoys, obj: &ResourceObject<Convoy>) -> Result<(), ResourceError> {
@@ -364,6 +425,98 @@ impl ConvoyReconciler {
         }
         engine.memory().forget(&obj.metadata.name);
         Ok(())
+    }
+}
+
+/// The capacity a convoy waits for: why, and when a sleeping host it waits on wakes.
+struct CapacityWait {
+    reason: String,
+    until: Option<DateTime<Utc>>,
+}
+
+impl CapacityWait {
+    fn reason(reason: String) -> Self {
+        Self { reason, until: None }
+    }
+}
+
+/// Wakes the convoys whose home notes `waiting` selects when a `W` changes: a convoy waiting on
+/// capacity when a host, vessel, environment or convoy changes; one holding delivery on a crew
+/// turn when a message changes. A change wakes only the convoys noted as waiting, and each reads
+/// again whether it still waits.
+pub struct NoteWake<W: Resource> {
+    pub changes: WakeOn<W>,
+    pub engine: EngineConvoyPath,
+    pub waiting: fn(&flotilla_resources::convoy_records::ConvoyNotes) -> bool,
+}
+
+/// Where a wake hears a kind's changes: the replicas of a kind that replicates, or the engine of a
+/// kind it alone serves, such as Environment, which streams every home's changes.
+pub enum WakeOn<W: Resource> {
+    Replicas(ReplicaReadResolver<W>),
+    Engine(TypedResolver<W>),
+}
+
+impl<W: Resource> std::clone::Clone for WakeOn<W> {
+    fn clone(&self) -> Self {
+        match self {
+            WakeOn::Replicas(resolver) => WakeOn::Replicas(resolver.clone()),
+            WakeOn::Engine(resolver) => WakeOn::Engine(resolver.clone()),
+        }
+    }
+}
+
+impl<W: Resource> WakeOn<W> {
+    /// The kind's changes, each read as nothing more than that one happened.
+    async fn watch(&self) -> Result<futures::stream::BoxStream<'static, Result<(), ResourceError>>, ResourceError> {
+        use futures::StreamExt;
+        Ok(match self {
+            WakeOn::Replicas(resolver) => resolver.watch().await?.map(|event| event.map(drop)).boxed(),
+            WakeOn::Engine(resolver) => resolver.watch(WatchStart::Now).await?.map(|event| event.map(drop)).boxed(),
+        })
+    }
+}
+
+impl<W: Resource> std::clone::Clone for NoteWake<W> {
+    fn clone(&self) -> Self {
+        Self { changes: self.changes.clone(), engine: Arc::clone(&self.engine), waiting: self.waiting }
+    }
+}
+
+impl<W: Resource> SecondaryWatch for NoteWake<W> {
+    type Primary = Convoy;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: flotilla_store::ResourceBackend,
+        _namespace: String,
+        sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            // Without the engine no convoy is noted as waiting.
+            let Some(engine) = self.engine.get().cloned() else { return std::future::pending().await };
+            let mut watch = self.changes.watch().await?;
+            loop {
+                match futures::StreamExt::next(&mut watch).await {
+                    Some(Ok(_)) => {
+                        for name in engine.memory().waiting(self.waiting) {
+                            if sender.send(name).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, kind = W::API_PATHS.kind, "a convoy note wake's watch failed");
+                        return Err(error);
+                    }
+                    None => return Ok(()),
+                }
+            }
+        })
     }
 }
 
@@ -550,10 +703,10 @@ impl Reconciler for ConvoyReconciler {
             None => BTreeMap::new(),
         };
         // A convoy waits for capacity until its first vessel is placed.
-        let capacity_wait = if vessels.is_empty() { self.capacity_wait(obj).await? } else { None };
-        self.note_capacity(obj, capacity_wait.as_ref(), now).map_err(ResourceError::other)?;
-        if capacity_wait.is_some() {
-            return Ok(ConvoyPass { requeue_after: Some(CAPACITY_RETRY) });
+        let capacity = if vessels.is_empty() { self.capacity(obj).await? } else { None };
+        self.note_capacity(obj, capacity.as_ref().map(|wait| &wait.reason), now).map_err(ResourceError::other)?;
+        if let Some(wait) = capacity {
+            return Ok(ConvoyPass { requeue_after: wait.until.and_then(|until| until.signed_duration_since(now).to_std().ok()) });
         }
 
         let checkouts = self.held_checkouts(obj).await?;
@@ -636,10 +789,16 @@ impl Reconciler for ConvoyReconciler {
             )
         });
         if settlement.as_ref().is_some_and(|settlement| settlement.disposition.is_some()) {
-            if self.any_turn_awaits(obj).await? {
-                pass.requeue_after = Some(TURN_HOLD_RETRY);
-            } else if let Err(error) = engine.deliver(obj).await {
-                tracing::info!(convoy = %obj.metadata.name, %error, "the engine refused delivery; landing holds");
+            let held_until = self.delivery_held_until(obj).await?;
+            engine.memory().update(&obj.metadata.name, |notes| notes.delivery_held_until = held_until);
+            if let Some(until) = held_until {
+                // A Message change wakes it sooner; the hold's end is its one deadline.
+                pass.requeue_after = Some(until.signed_duration_since(now).to_std().unwrap_or_default());
+            } else {
+                match engine.deliver(obj).await {
+                    Ok(()) => self.note_target_mismatches(engine.as_ref(), obj, &checkouts),
+                    Err(error) => tracing::info!(convoy = %obj.metadata.name, %error, "the engine refused delivery; landing holds"),
+                }
             }
         }
         let attention = settlement.as_ref().and_then(|settlement| {

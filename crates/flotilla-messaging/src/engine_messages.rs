@@ -50,9 +50,9 @@ pub trait EngineMessages: Send + Sync {
     /// review); a seat that shares `stalled`'s record subject keeps its
     /// records. Returns the records withdrawn.
     async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String>;
-    /// Whether a message to `receiver` (a crew role address) is admitted
-    /// at this home and not yet delivered (#3894).
-    async fn awaits_delivery(&self, namespace: &str, receiver: &str) -> Result<bool, String>;
+    /// Until when messages to `receiver` (a crew role address), admitted at this home and not
+    /// yet delivered, hold its delivery; None when none does (#3894).
+    async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String>;
     /// Where charter notifications are admitted on this path.
     fn charter_notices(self: std::sync::Arc<Self>, namespace: &str) -> Box<dyn crate::CharterNotices>;
 }

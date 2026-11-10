@@ -200,6 +200,32 @@ async fn an_observation_is_the_engines_edge() {
     assert!(outcome.patch.is_none() && outcome.actuations.is_empty(), "no status write: {:?}", outcome.patch);
 }
 
+// Behaviour: an observer edge is written only when the observation changes what the engine
+// holds. Each recorded edge is applied as the engine applies it; once the launch's promise
+// stands where the evidence puts it, further passes over the same evidence write nothing.
+#[tokio::test]
+async fn an_unchanged_observation_writes_no_edge() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut convoy = ledger_convoy(&backend).await;
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine));
+    let mut written = Vec::new();
+    for _ in 0..4 {
+        reconciler.prepare(&convoy).await.expect("prepare");
+        let calls = std::mem::take(&mut *engine.promises.lock().expect("promises"));
+        for (vessel, role, operation, _) in calls {
+            promises::apply(convoy.status.as_mut().expect("status"), &vessel, &role, &operation);
+            written.push(operation);
+        }
+    }
+    assert!(
+        matches!(written.as_slice(), [PromiseOperation::Submit { .. }, PromiseOperation::Verdict { verdict, .. }] if verdict.accepted),
+        "{written:?}"
+    );
+    let held = &convoy.status.as_ref().expect("status").promises["work"]["coder"][0];
+    assert_eq!(held.state, PromiseState::Kept);
+}
+
 // Behaviour: a convoy held at another home is that home's to judge: this home asks its engine
 // nothing and notes nothing.
 #[tokio::test]
@@ -238,8 +264,9 @@ async fn a_failed_work_ends_the_launch_and_an_ended_launch_is_forgotten() {
 }
 
 // Behaviour: a convoy whose placement chose a full host notes a capacity stall in its home's
-// memory and looks again on its own schedule (no Host watch wakes it); once the host has room
-// the stall is cleared. Nothing is written to the convoy.
+// memory and sets no timer: a change wakes it (a_change_wakes_only_the_convoys_noted_as_waiting).
+// A sleeping host's wake is its one deadline. Once the host has room the stall is cleared.
+// Nothing is written to the convoy.
 #[tokio::test]
 async fn a_capacity_wait_is_a_note() {
     use flotilla_protocol::{CanonicalHostId, FulfilmentAllocation, FulfilmentAllocationCandidate, PlacementDecision, PlacementTargetHost};
@@ -293,18 +320,97 @@ async fn a_capacity_wait_is_a_note() {
     let prepared = reconciler.prepare(&convoy).await.expect("prepare full");
     let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
     assert!(outcome.patch.is_none());
-    assert_eq!(outcome.requeue_after, Some(std::time::Duration::from_secs(30)));
+    assert_eq!(outcome.requeue_after, None, "no timer: a change wakes it");
     let stall = engine.memory.get("c").stall.expect("a capacity stall is noted");
     assert_eq!(stall.cause, Some(StallCause::Capacity));
     assert!(stall.evidence.contains("no free vessel slots"), "{}", stall.evidence);
     assert!(engine.promises.lock().expect("promises").is_empty(), "a waiting convoy observes nothing yet");
 
-    // The view shows the note; the host frees a slot.
+    // The host sleeps for an hour: its wake is the deadline.
+    let asleep = HostStatus { sleeping_until: Some(chrono::Utc::now() + chrono::Duration::hours(1)), ..slots(1) };
+    let host = hosts.update_status("feta", &host.metadata.resource_version, &asleep).await.expect("asleep");
+    let prepared = reconciler.prepare(&convoy).await.expect("prepare asleep");
+    let requeue = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now()).requeue_after.expect("the host's wake");
+    assert!(requeue > std::time::Duration::from_secs(59 * 60) && requeue <= std::time::Duration::from_secs(3600), "{requeue:?}");
+
+    // The view shows the note; the host wakes with a free slot.
     engine.memory.get("c").write_into(convoy.status.as_mut().expect("status"));
     hosts.update_status("feta", &host.metadata.resource_version, &slots(1)).await.expect("free");
     let prepared = reconciler.prepare(&convoy).await.expect("prepare free");
     assert_eq!(reconciler.reconcile(&convoy, &prepared, chrono::Utc::now()).requeue_after, None);
     assert_eq!(engine.memory.get("c").stall, None, "the capacity stall is cleared");
+}
+
+// Behaviour: a change of what convoys wait on wakes the convoys their home notes as waiting on
+// it, and no other: a capacity wait on a Host change, a held delivery on a Message change (here
+// any watched kind stands in; secondary_watches names which kinds wake which wait). No timer is
+// involved.
+#[tokio::test]
+async fn a_change_wakes_only_the_convoys_noted_as_waiting() {
+    use flotilla_crew::convoy::{NoteWake, WakeOn};
+    use flotilla_resources::{
+        convoy_records::ConvoyNotes, Host, HostSpec, HostStatus, StallCause, StallEvidenceSource, StallRung, StalledCondition,
+    };
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let stall = StalledCondition {
+        leaves: Vec::new(),
+        maker: None,
+        evidence: "no free vessel slots".into(),
+        source: StallEvidenceSource::LeafEngine,
+        cause: Some(StallCause::Capacity),
+        began_at: chrono::Utc::now(),
+        rung: StallRung::Operator,
+        supervisor: None,
+        supervision_message: None,
+        supervision_index: None,
+        supervision_exhausted: false,
+        reason: None,
+        proposed_disposition: None,
+        nudge_history: Vec::new(),
+    };
+    engine.memory.update("waits-for-capacity", |notes| notes.stall = Some(stall));
+    engine.memory.update("holds-delivery", |notes| notes.delivery_held_until = Some(chrono::Utc::now()));
+    engine.memory.update("neither", |notes| notes.branch_subject_scan_error = Some("noted".into()));
+    let path: EngineConvoyPath = Arc::new(OnceLock::new());
+    let shared: Arc<dyn EngineConvoys> = engine;
+    assert!(path.set(shared).is_ok());
+
+    let hosts = backend.clone().using::<Host>(NAMESPACE);
+    let mut host = hosts
+        .create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec { display_name: "feta".into(), ..HostSpec::default() })
+        .await
+        .expect("host");
+    for (waiting, woken) in [
+        (ConvoyNotes::waits_for_capacity as fn(&ConvoyNotes) -> bool, "waits-for-capacity"),
+        (ConvoyNotes::holds_delivery, "holds-delivery"),
+    ] {
+        let (sender, mut queue) = WorkQueueSender::channel();
+        let wake: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(NoteWake {
+            changes: WakeOn::Replicas(backend.including_replicas::<Host>(NAMESPACE)),
+            engine: Arc::clone(&path),
+            waiting,
+        });
+        let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
+        // The wake opens its watch when it starts: change the host until it hears.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let status = HostStatus { heartbeat_at: Some(chrono::Utc::now()), ..Default::default() };
+                host = hosts.update_status("feta", &host.metadata.resource_version, &status).await.expect("host change");
+                if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                    return name;
+                }
+            }
+        })
+        .await
+        .expect("woken");
+        assert_eq!(first, woken);
+        while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+            assert_eq!(name, woken, "only the convoys noted as waiting on it are woken");
+        }
+        watch.abort();
+    }
 }
 
 // Behaviour (#3732 review): each engine edit's convoy name wakes the convoy reconciler through
@@ -428,11 +534,11 @@ async fn evidence_changes_wake_the_open_convoys() {
     watch.abort();
 }
 
-/// The engine Message path's one answer the hold reads: whether the crew has
-/// an undelivered turn. The convoy reconciler asks it nothing else.
+/// The engine Message path's one answer the hold reads: until when the crew's
+/// undelivered turn holds delivery. The convoy reconciler asks it nothing else.
 struct Turns {
     backend: ResourceBackend,
-    awaiting: bool,
+    held_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[async_trait]
@@ -478,9 +584,9 @@ impl flotilla_messaging::EngineMessages for Turns {
     async fn end_stalls(&self, _: &str, _: &[String], _: Option<&str>, _: &str) -> Result<Vec<String>, String> {
         unreachable!("the convoy reconciler ends no stalls")
     }
-    async fn awaits_delivery(&self, namespace: &str, receiver: &str) -> Result<bool, String> {
+    async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
         assert_eq!((namespace, receiver), (NAMESPACE, "flotilla/c/work/coder"));
-        Ok(self.awaiting)
+        Ok(self.held_until)
     }
     async fn delivery_wait(&self, _: &str) -> Result<Option<String>, String> {
         Ok(None)
@@ -491,9 +597,9 @@ impl flotilla_messaging::EngineMessages for Turns {
 }
 
 // Behaviour (#3894): a landing convoy is delivered only once no turn to a live crew session is
-// undelivered; while one is, delivery holds and rechecks soon, since no Message watch wakes the
-// controller when the turn is delivered. The engine's reading of the session's launch decides
-// whether it is live.
+// undelivered; while one is, delivery holds, noted in its home's memory so a Message change wakes
+// it, with the hold's end as its one deadline. The engine's reading of the session's launch
+// decides whether it is live.
 #[tokio::test]
 async fn an_undelivered_turn_holds_delivery() {
     use flotilla_provisioning_testkit::{EngineFixture, TerminalsFixture};
@@ -524,7 +630,8 @@ async fn an_undelivered_turn_holds_delivery() {
         backend.serve_engine_in(NAMESPACE);
         let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
         let messages: flotilla_crew::ports::MessagePath = Arc::new(OnceLock::new());
-        let turns: Arc<dyn flotilla_messaging::EngineMessages> = Arc::new(Turns { backend: backend.clone(), awaiting });
+        let held_until = awaiting.then(|| chrono::Utc::now() + chrono::Duration::minutes(5));
+        let turns: Arc<dyn flotilla_messaging::EngineMessages> = Arc::new(Turns { backend: backend.clone(), held_until });
         assert!(messages.set(turns).is_ok());
         let engine = Arc::new(Recording { holds: true, ..Default::default() });
         let reconciler = reconciler(&backend, Arc::clone(&engine))
@@ -535,8 +642,14 @@ async fn an_undelivered_turn_holds_delivery() {
         let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
         let delivered = *engine.deliveries.lock().expect("deliveries") == 1;
         assert_eq!(delivered, !(awaiting && live), "awaiting {awaiting}, live {live}");
+        let noted = engine.memory.get("c").delivery_held_until;
         if awaiting && live {
-            assert_eq!(outcome.requeue_after, Some(std::time::Duration::from_secs(1)), "held delivery rechecks soon");
+            let requeue = outcome.requeue_after.expect("the hold's end");
+            assert!(requeue > std::time::Duration::from_secs(4 * 60) && requeue <= std::time::Duration::from_secs(5 * 60), "{requeue:?}");
+            assert_eq!(noted, held_until, "the hold is noted for a Message change to wake");
+        } else {
+            assert_eq!(outcome.requeue_after, None);
+            assert_eq!(noted, None);
         }
     }
 }

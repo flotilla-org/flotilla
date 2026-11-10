@@ -120,9 +120,25 @@ pub struct ConvoyNotes {
     pub provisioning_retry: BTreeMap<String, ControllerRetry>,
     /// By work, then role.
     pub crew: BTreeMap<String, BTreeMap<String, CrewNotes>>,
+    /// Until when a crew turn not yet delivered holds the convoy's delivery (#3894); a Message
+    /// change or this deadline wakes it.
+    pub delivery_held_until: Option<DateTime<Utc>>,
+    /// Where a repository landed on a target other than the one it declared, as observed when
+    /// the convoy was delivered.
+    pub target_mismatches: Vec<crate::TargetMismatch>,
 }
 
 impl ConvoyNotes {
+    /// The launch waits for capacity on a host its placement chose.
+    pub fn waits_for_capacity(&self) -> bool {
+        self.stall.as_ref().is_some_and(|stall| stall.cause == Some(crate::StallCause::Capacity))
+    }
+
+    /// The launch's delivery is held on a crew turn not yet delivered.
+    pub fn holds_delivery(&self) -> bool {
+        self.delivery_held_until.is_some()
+    }
+
     /// Applies `patch` as the old status patch changed the stored status, keeping only what the
     /// notes hold (#3108 C3'). The patch runs on `view`, the launch as its readers see it, with
     /// these notes in place of the view's, and the notes are read back from the result. The rest
@@ -142,6 +158,7 @@ impl ConvoyNotes {
         status.stalled.clone_from(&self.stall);
         status.branch_subject_scan_at = self.branch_subject_scan_at;
         status.branch_subject_scan_error.clone_from(&self.branch_subject_scan_error);
+        status.target_mismatches.clone_from(&self.target_mismatches);
         for (work, state) in &mut status.work {
             state.provisioning_retry = self.provisioning_retry.get(work).cloned();
         }
@@ -164,6 +181,7 @@ impl ConvoyNotes {
         self.stall.clone_from(&status.stalled);
         self.branch_subject_scan_at = status.branch_subject_scan_at;
         self.branch_subject_scan_error.clone_from(&status.branch_subject_scan_error);
+        self.target_mismatches.clone_from(&status.target_mismatches);
         self.provisioning_retry =
             status.work.iter().filter_map(|(work, state)| Some((work.clone(), state.provisioning_retry.clone()?))).collect();
         self.crew = status
@@ -488,8 +506,13 @@ impl ConvoyMemory {
     /// How many launches wait for capacity on a host their placement chose.
     pub fn capacity_waits(&self) -> u64 {
         let held = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
-        held.values().filter(|notes| notes.stall.as_ref().is_some_and(|stall| stall.cause == Some(crate::StallCause::Capacity))).count()
-            as u64
+        held.values().filter(|notes| notes.waits_for_capacity()).count() as u64
+    }
+
+    /// The launches whose notes `waiting` selects: those a change of what they wait on wakes.
+    pub fn waiting(&self, waiting: fn(&ConvoyNotes) -> bool) -> Vec<String> {
+        let held = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+        held.iter().filter(|(_, notes)| waiting(notes)).map(|(name, _)| name.clone()).collect()
     }
 
     /// Drops the notes on launch `name`, once it has ended and its home no longer judges it.

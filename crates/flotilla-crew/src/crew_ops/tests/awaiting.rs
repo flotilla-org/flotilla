@@ -101,8 +101,8 @@ impl EngineMessages for RecordingMessages {
         self.ended.lock().expect("ended").push((seats.to_vec(), stalled.map(str::to_owned)));
         Ok(Vec::new())
     }
-    async fn awaits_delivery(&self, _namespace: &str, _receiver: &str) -> Result<bool, String> {
-        Ok(false)
+    async fn delivery_held_until(&self, _namespace: &str, _receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+        Ok(None)
     }
     async fn delivery_wait(&self, _namespace: &str) -> Result<Option<String>, String> {
         Ok(None)

@@ -105,6 +105,31 @@ pub enum UnmetSettlementExpectation {
     },
 }
 
+/// Each repository of `convoy` whose change request landed on a target other than the one it
+/// declared, as the landing evidence of its checkout in `checkouts` shows.
+pub fn target_mismatches(convoy: &ResourceObject<Convoy>, checkouts: &BTreeMap<String, CheckoutRecord>) -> Vec<super::TargetMismatch> {
+    convoy
+        .spec
+        .repositories
+        .iter()
+        .filter_map(|repository| {
+            let evidence = checkouts
+                .values()
+                .find(|checkout| checkout.spec.repo_ref() == &repository.repo_ref)?
+                .inspection()?
+                .landed_evidence
+                .as_ref()?;
+            let observed_target_ref = evidence.target_ref.as_ref()?;
+            (observed_target_ref != &repository.target_ref).then(|| super::TargetMismatch {
+                repo_ref: repository.repo_ref.clone(),
+                change_request_id: evidence.change_request.to_string(),
+                declared_target_ref: repository.target_ref.clone(),
+                observed_target_ref: observed_target_ref.clone(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct SettlementEvaluation {
     /// ADR 0047: remove default one roll after introduction.

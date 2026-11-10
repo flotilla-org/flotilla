@@ -114,7 +114,7 @@ async fn deleting_mis_homed_convoy_finalizes_it_at_its_home() {
     let parent_controller = tokio::spawn(
         ControllerLoop {
             primary: convoys.clone(),
-            secondaries: ConvoyReconciler::secondary_watches(&parent_backend, namespace),
+            secondaries: ConvoyReconciler::secondary_watches(&parent_backend, namespace, Default::default()),
             reconciler: ConvoyReconciler::new().with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
             backend: parent_backend.clone(),
         }
@@ -987,7 +987,7 @@ async fn forced_convoy_teardown_from_another_host_finalizes_at_its_home() {
     let convoy_backend = mesh.hosts[0].resource_backend();
     let convoy_controller = ControllerLoop {
         primary: convoy_backend.using::<Convoy>(namespace),
-        secondaries: ConvoyReconciler::secondary_watches(&convoy_backend, namespace),
+        secondaries: ConvoyReconciler::secondary_watches(&convoy_backend, namespace, Default::default()),
         reconciler: ConvoyReconciler::new().with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
         backend: convoy_backend,
     };
