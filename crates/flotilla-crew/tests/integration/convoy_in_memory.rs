@@ -385,7 +385,7 @@ async fn controller_loop_finalizer_deletes_vessels_and_waits_for_its_checkouts()
         )
         .await
         .expect("task workspace create should succeed");
-    checkouts.open_convoy("convoy-delete");
+    crate::common::admit_on_engine(&backend, "flotilla", &checkouts, "convoy-delete").await;
     let launch = checkouts.put_ready(
         "checkout-convoy-delete",
         &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
@@ -397,7 +397,7 @@ async fn controller_loop_finalizer_deletes_vessels_and_waits_for_its_checkouts()
             target_path: "/checkouts/convoy-delete".to_string(),
             url: "https://github.com/flotilla-org/flotilla".to_string(),
         }),
-        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("convoy-delete".to_string())),
+        Some(&checkouts.holder("convoy-delete")),
     );
     workspaces
         .create(

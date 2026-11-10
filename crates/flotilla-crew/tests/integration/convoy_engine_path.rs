@@ -71,6 +71,9 @@ impl EngineConvoys for Recording {
     fn delivered(&self, _: &ResourceObject<Convoy>) -> Option<String> {
         self.delivered.clone()
     }
+    fn launch(&self, _: &ResourceObject<Convoy>) -> Result<Option<String>, String> {
+        Ok(self.holds.then(|| "launch#1".to_owned()))
+    }
     async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
         Ok(())
     }
@@ -174,7 +177,7 @@ async fn an_engine_held_convoy_observes_through_the_engine() {
     );
     assert_eq!(*engine.views.lock().expect("views"), 1, "one keyed read of the engine's promises per pass");
     // The stored status still holds bootstrap's seeds: the hand-over is retried.
-    assert_eq!(outcome.patch, Some(ConvoyStatusPatch::HandPromisesToEngine));
+    assert_eq!(outcome.patch, Some(ConvoyStatusPatch::HandPromisesToEngine { launch: "launch#1".into() }));
 }
 
 // Behaviour: a convoy the engine does not hold stays on the old path: the observation is the old
@@ -220,6 +223,7 @@ async fn a_work_failing_after_the_engine_delivered_does_not_fail_the_convoy() {
     status.phase = ConvoyPhase::Landing;
     status.observed_workflow_ref = Some("w".into());
     status.promises.clear();
+    status.engine_launch = Some("launch#1".into());
     status.work.insert(
         "work".into(),
         WorkState::builder().phase(WorkPhase::Failed).message("request checkout: convoy c has ended".into()).build(),
@@ -438,6 +442,7 @@ async fn an_undelivered_turn_holds_the_engines_derived_done() {
         let mut convoy = ledger_convoy(&backend).await;
         // Handed over: the engine holds the kept promises; the stored status holds none.
         let status = convoy.status.as_mut().expect("status");
+        status.engine_launch = Some("launch#1".into());
         let mut held = std::mem::take(&mut status.promises);
         for promise in held.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("promises") {
             promise.state = PromiseState::Kept;

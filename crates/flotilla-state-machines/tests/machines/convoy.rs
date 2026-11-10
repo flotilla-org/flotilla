@@ -55,6 +55,7 @@ fn lifetime(owner: &str) -> Duty {
 /// A convoy whose seat `coder` owns the given promises, under `lead`.
 fn request(promises: &[(u32, PromiseSource)]) -> ConvoyRequest {
     ConvoyRequest {
+        launch_of: "c".into(),
         workflow_ref: "w".into(),
         admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project(),
@@ -93,7 +94,8 @@ fn apply(
     home: &mut Home<Convoy>,
     edge: impl Into<flotilla_state_machines::machines::convoy::ConvoyEdge>,
 ) -> Result<(), WriteError<Convoy>> {
-    home.apply("c", edge, &world(), at()).map(drop)
+    let launch = home.newest_launch("c", None).expect("admitted").name().to_owned();
+    home.apply(&launch, edge, &world(), at()).map(drop)
 }
 
 fn refused(refusal: ConvoyRefusal) -> Result<(), WriteError<Convoy>> {
@@ -101,7 +103,7 @@ fn refused(refusal: ConvoyRefusal) -> Result<(), WriteError<Convoy>> {
 }
 
 fn progress(home: &Home<Convoy>, id: u32) -> Progress {
-    home.get("c").expect("exists").spec().promise(PromiseId(id)).expect("promise").1.progress.value
+    home.newest_launch("c", None).expect("exists").spec().promise(PromiseId(id)).expect("promise").1.progress.value
 }
 
 fn submit(id: u32, by: &str, durable: &str) -> Submit {
@@ -209,7 +211,7 @@ fn admission_reads_the_project_by_address() {
     let unknown = MemoryConvoyWorld::default();
     let refusal = home.create("c", request(&[(0, PromiseSource::Template)]), &unknown, Timestamp(0)).err();
     assert_eq!(refusal, Some(WriteError::Refused(ConvoyRefusal::UnknownProject)));
-    assert!(home.get("c").is_none());
+    assert!(home.newest_launch("c", None).is_none());
     let mut known = MemoryConvoyWorld::default();
     let version = known.projects.put(&Ref::new(project().as_str()), ());
     let created = home.create("c", request(&[(0, PromiseSource::Template)]), &known, Timestamp(0)).expect("admitted");
@@ -268,7 +270,7 @@ fn declare_adds_a_crew_promise_once() {
     };
     assert_eq!(apply(&mut home, declare(1, "nobody")), refused(ConvoyRefusal::UnknownSeat));
     apply(&mut home, declare(1, "coder")).expect("declared");
-    let promise = home.get("c").expect("exists").spec().promise(PromiseId(1)).expect("row").1.clone();
+    let promise = home.newest_launch("c", None).expect("exists").spec().promise(PromiseId(1)).expect("row").1.clone();
     assert_eq!((promise.source, promise.progress.value, promise.progress.since), (PromiseSource::Crew, Progress::Pending, at()));
     assert_eq!(apply(&mut home, declare(1, "coder")), refused(ConvoyRefusal::PromiseExists));
     apply(&mut home, retract(1, "coder", Authority::Owner)).expect("the owner retracts before submitting");
@@ -286,8 +288,9 @@ fn the_owner_submits_durable_references() {
     assert_eq!(apply(&mut home, submit(0, "coder", "absent")), refused(ConvoyRefusal::NotDurable));
     assert_eq!(apply(&mut home, submit(9, "coder", YES)), refused(ConvoyRefusal::UnknownPromise));
     apply(&mut home, submit(0, "coder", YES)).expect("submitted");
-    home.apply("c", submit(0, "coder", YES), &world(), Timestamp(9)).expect("submitted again");
-    let promise = home.get("c").expect("exists").spec().promise(PromiseId(0)).expect("row").1.clone();
+    let launch = home.newest_launch("c", None).expect("admitted").name().to_owned();
+    home.apply(&launch, submit(0, "coder", YES), &world(), Timestamp(9)).expect("submitted again");
+    let promise = home.newest_launch("c", None).expect("exists").spec().promise(PromiseId(0)).expect("row").1.clone();
     assert_eq!(promise.submissions.len(), 2);
     assert_eq!(promise.submissions.get(flotilla_schema::Position(1)).expect("second").version, 3, "stamped with the write's version");
     assert_eq!((promise.progress.value, promise.progress.since), (Progress::Submitted, at()));
@@ -301,7 +304,7 @@ fn reject_returns_a_submission() {
     apply(&mut home, submit(0, "coder", YES)).expect("submitted");
     apply(&mut home, Reject { promise: PromiseId(0) }).expect("rejected");
     assert_eq!(progress(&home, 0), Progress::Pending);
-    assert_eq!(home.get("c").expect("exists").spec().promise(PromiseId(0)).expect("row").1.submissions.len(), 1);
+    assert_eq!(home.newest_launch("c", None).expect("exists").spec().promise(PromiseId(0)).expect("row").1.submissions.len(), 1);
 }
 
 // Observed keeping names the current submission of a Submitted promise; a
@@ -351,11 +354,11 @@ fn reassign_moves_an_open_promise_to_a_seat() {
     assert_eq!(apply(&mut home, reassign("lead", "x", Authority::Dispatcher)), refused(ConvoyRefusal::Unauthorised));
     assert_eq!(apply(&mut home, reassign("nobody", "coder", Authority::Owner)), refused(ConvoyRefusal::UnknownSeat));
     apply(&mut home, reassign("lead", "coder", Authority::Owner)).expect("handed off");
-    let promise = home.get("c").expect("exists").spec().promise(PromiseId(0)).expect("row").1.clone();
+    let promise = home.newest_launch("c", None).expect("exists").spec().promise(PromiseId(0)).expect("row").1.clone();
     assert_eq!((promise.owner, promise.progress.value, promise.submissions.len()), (seat("lead"), Progress::Submitted, 1));
-    let version = home.get("c").expect("exists").version();
+    let version = home.newest_launch("c", None).expect("exists").version();
     apply(&mut home, reassign("lead", "lead", Authority::Owner)).expect("to the current owner");
-    assert_eq!(home.get("c").expect("exists").version(), Version(version.0 + 1), "an accepted edge that writes nothing");
+    assert_eq!(home.newest_launch("c", None).expect("exists").version(), Version(version.0 + 1), "an accepted edge that writes nothing");
 }
 
 // Fan-out adds a seat under an existing one; a name is never reused; a
@@ -378,7 +381,7 @@ fn seats_are_added_and_resupervised() {
         |name: &str| Resupervise { seat: seat(name), supervised_by: address("operator"), by: seat("lead"), authority: Ref::new(YES) };
     assert_eq!(apply(&mut home, change("nobody")), refused(ConvoyRefusal::UnknownSeat));
     apply(&mut home, change("reviewer")).expect("re-pointed");
-    let spec = home.get("c").expect("exists").spec().clone();
+    let spec = home.newest_launch("c", None).expect("exists").spec().clone();
     let reviewer = spec.seat(&seat("reviewer")).expect("row").1;
     assert_eq!((reviewer.parent.clone(), reviewer.supervised_by.clone()), (Some(seat("lead")), address("operator")));
     assert_eq!(spec.seats.len(), 3);
@@ -401,7 +404,7 @@ fn deliver_waits_for_promises_then_duties() {
     apply(&mut home, retire(0, YES)).expect("retired");
     assert_eq!(apply(&mut home, retire(0, YES)), refused(ConvoyRefusal::UnknownDuty), "already retired");
     apply(&mut home, merged()).expect("delivered");
-    let state = home.get("c").expect("exists").state().clone();
+    let state = home.newest_launch("c", None).expect("exists").state().clone();
     let delivered = ConvoyState::Delivered { quota: quota(&[("standard", 1)]), retired: [DutyId(0)].into(), disposition: "merged".into() };
     assert_eq!(state, delivered);
     assert_eq!(apply(&mut home, submit(0, "coder", YES)), refused(ConvoyRefusal::NotOpen));
@@ -420,7 +423,7 @@ fn abandon_is_an_authorised_decision() {
     assert_eq!(apply(&mut home, abandon("vessel failed", NO)), refused(ConvoyRefusal::Unauthorised));
     assert_eq!(apply(&mut home, abandon("", YES)), refused(ConvoyRefusal::Unauthorised));
     apply(&mut home, abandon("vessel failed", YES)).expect("abandoned");
-    let state = home.get("c").expect("exists").state().clone();
+    let state = home.newest_launch("c", None).expect("exists").state().clone();
     assert_eq!((state.cause(), state.reason()), (Some(AbandonCause::Failed), Some("vessel failed")));
 }
 
@@ -440,7 +443,7 @@ fn a_seat_fails_once_with_a_reason() {
     assert_eq!(apply(&mut home, fail("nobody", "crashed", YES)), refused(ConvoyRefusal::UnknownSeat));
     apply(&mut home, fail("coder", "crashed", YES)).expect("failed");
     assert_eq!(apply(&mut home, fail("coder", "again", YES)), refused(ConvoyRefusal::SeatFailed));
-    let convoy = home.get("c").expect("exists");
+    let convoy = home.newest_launch("c", None).expect("exists");
     let (_, coder) = convoy.spec().seat(&seat("coder")).expect("seat");
     assert_eq!(coder.failed.as_deref(), Some("crashed"));
     assert_eq!(convoy.state(), &ConvoyState::Open { quota: quota(&[("standard", 1)]), retired: BTreeSet::new() });
@@ -462,9 +465,9 @@ fn subjects_link_unlink_and_relink() {
     assert_eq!(apply(&mut home, link(LinkSource::Relay, YES)), refused(ConvoyRefusal::SubjectLinked));
     assert_eq!(apply(&mut home, unlink(NO)), refused(ConvoyRefusal::Unauthorised));
     apply(&mut home, unlink(YES)).expect("unlinked");
-    assert!(home.get("c").expect("exists").spec().linked().is_empty());
+    assert!(home.newest_launch("c", None).expect("exists").spec().linked().is_empty());
     apply(&mut home, link(LinkSource::Operator, YES)).expect("relinked");
-    let spec = home.get("c").expect("exists").spec().clone();
+    let spec = home.newest_launch("c", None).expect("exists").spec().clone();
     assert_eq!(spec.linked(), BTreeSet::from([&change]));
     let rows: Vec<_> = spec.subjects.iter().map(|row| (row.record.source, row.record.unlinked)).collect();
     assert_eq!(rows, [(LinkSource::Claim, true), (LinkSource::Operator, false)]);
@@ -480,7 +483,7 @@ fn readmission_only_raises_the_quota() {
     assert_eq!(apply(&mut home, readmit(&[("standard", 0)], YES)), refused(ConvoyRefusal::QuotaNotIncrease));
     assert_eq!(apply(&mut home, readmit(&[("standard", 2), ("large", 1)], YES)), refused(ConvoyRefusal::QuotaNotIncrease));
     apply(&mut home, readmit(&[("standard", 2)], YES)).expect("readmitted");
-    assert_eq!(home.get("c").expect("exists").state().quota(), &quota(&[("standard", 2)]));
+    assert_eq!(home.newest_launch("c", None).expect("exists").state().quota(), &quota(&[("standard", 2)]));
 }
 
 #[test]
@@ -491,5 +494,5 @@ fn admission_starts_fresh_seat_lifetimes() {
         seat.replacements = u32::MAX;
     }
     let home = convoy(req);
-    assert!(home.get("c").unwrap().spec().seats.iter().all(|r| !r.record.retired && r.record.replacements == 0));
+    assert!(home.newest_launch("c", None).unwrap().spec().seats.iter().all(|r| !r.record.retired && r.record.replacements == 0));
 }

@@ -136,8 +136,8 @@ impl CheckoutRecord {
             (crate::AUTHORITY_LABEL.to_string(), authority.as_label_value().to_string()),
             (crate::REPO_KEY_LABEL.to_string(), self.spec.repo_ref().to_string()),
         ]);
-        if let Some(CheckoutHolder::Convoy(convoy)) = &self.holder {
-            labels.insert(crate::CONVOY_LABEL.to_string(), convoy.clone());
+        if let Some(CheckoutHolder::Convoy(launch)) = &self.holder {
+            labels.insert(crate::CONVOY_LABEL.to_string(), launched(launch).to_owned());
         }
         crate::ResourceObject {
             metadata: crate::ObjectMeta {

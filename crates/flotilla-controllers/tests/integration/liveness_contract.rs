@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use flotilla_crew::convoy::ConvoyReconciler;
-use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecords as _, Inspection};
+use flotilla_resources::checkout_records::{CheckoutRecords as _, Inspection};
 use flotilla_resources::Actuation;
 use flotilla_resources::ChangeRequest;
 use flotilla_resources::ChangeRequestReviewObservation;
@@ -122,7 +122,7 @@ impl WorldBuilder for ConvoyWorldBuilder {
                 target_path: "/work/checkout-a".to_string(),
                 url: "https://github.com/example/repo-a".to_string(),
             }),
-            Some(&CheckoutHolder::Convoy("convoy-a".to_string())),
+            Some(&checkouts.holder("convoy-a")),
         );
         checkouts
             .checkouts

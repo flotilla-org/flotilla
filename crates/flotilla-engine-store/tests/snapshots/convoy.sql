@@ -116,6 +116,8 @@ FROM "awaiting_reply";
 CREATE TABLE "convoy" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "workflow_ref" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "admission" BLOB NOT NULL REFERENCES "objects" ("hash"),
   "project" INTEGER NOT NULL REFERENCES "strings" ("id"),
@@ -229,6 +231,7 @@ CREATE TABLE "convoy_retired" (
   PRIMARY KEY ("convoy", "value"),
   FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
+CREATE INDEX "convoy_by_launch" ON "convoy" ("project", "launch_of", "launch");
 CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN ('op');
 CREATE UNIQUE INDEX "convoy_promises_by_label" ON "convoy_promises" ("convoy", "label");
 CREATE INDEX "convoy_promises_submissions_by_address" ON "convoy_promises_submissions" ("address");
@@ -273,6 +276,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "convoy_view" AS SELECT
   "convoy"."id",
   "convoy"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy"."launch_of") AS "launch_of",
+  "convoy"."launch",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy"."workflow_ref") AS "workflow_ref",
   "convoy"."admission",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy"."project") AS "project",

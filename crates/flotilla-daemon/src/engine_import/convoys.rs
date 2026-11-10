@@ -1,4 +1,5 @@
-//! The Convoy importer: each convoy homed here, a standing convoy's generations folded into one,
+//! The Convoy importer: each convoy homed here as a launch of its engine name, a standing role's
+//! generations as its successive launches,
 //! with an open stall as the record awaiting its supervision message.
 
 use std::collections::BTreeMap;
@@ -43,7 +44,8 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
                 match write_into(target, convoy) {
                     Ok(written) => {
                         *report.imported.entry((KIND, "open")).or_default() += 1;
-                        written_convoys.push(((convoy.home.clone(), written.name().to_owned()), written.version().0));
+                        written_convoys
+                            .push(((convoy.home.clone(), convoy.record.clone()), (written.name().to_owned(), written.version().0)));
                     }
                     Err(reason) => report.refused.push(ImportRefusal { kind: KIND, record: convoy.resource.name().to_owned(), reason }),
                 }
@@ -56,9 +58,6 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
             }
             for refusal in &mapped.refused {
                 report.refused.push(ImportRefusal { kind: KIND, record: refused_name(refusal), reason: refusal.to_string() });
-            }
-            if mapped.folded_generations > 0 {
-                report.notes.push(format!("{} standing convoy generations folded into their stable convoys", mapped.folded_generations));
             }
         }
     }

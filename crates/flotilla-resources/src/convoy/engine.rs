@@ -115,6 +115,11 @@ pub trait EngineConvoys: Send + Sync {
     /// the convoy ended) changes it. `None` while it is open, or not held here.
     fn delivered(&self, convoy: &ResourceObject<Convoy>) -> Option<String>;
 
+    /// The launch `convoy` was admitted or imported as (`<launch_of>#<n>`), found by the old record
+    /// its admission names, for a hand-over to the old status that has not landed yet: an imported
+    /// convoy's, or one whose admission patch failed. `Ok(None)` when no launch here was.
+    fn launch(&self, convoy: &ResourceObject<Convoy>) -> Result<Option<String>, String>;
+
     /// An operator's abandonment, with a reason.
     async fn abandon(&self, convoy: &ResourceObject<Convoy>, principal: &str, reason: &str) -> Result<(), String>;
 
@@ -182,6 +187,14 @@ fn with_promises(convoy: &ResourceObject<Convoy>, promises: OldPromises) -> Reso
     let mut viewed = convoy.clone();
     viewed.status.get_or_insert_with(Default::default).promises = promises;
     viewed
+}
+
+/// The holder of `convoy`'s checkouts: the engine launch its generation became at admission
+/// (`host:<home>/convoy:<launch_of>%23<n>` once stored), never a predecessor's or successor's.
+/// `None` until the engine admits it, when nothing is held for it.
+pub fn checkout_holder(convoy: &ResourceObject<Convoy>) -> Option<crate::checkout_records::CheckoutHolder> {
+    let launch = convoy.status.as_ref()?.engine_launch.clone()?;
+    Some(crate::checkout_records::CheckoutHolder::Convoy(launch))
 }
 
 /// Stable engine identity of a standing role; independent of its old generation record.
@@ -266,6 +279,9 @@ mod tests {
         }
         fn delivered(&self, _: &ResourceObject<Convoy>) -> Option<String> {
             None
+        }
+        fn launch(&self, _: &ResourceObject<Convoy>) -> Result<Option<String>, String> {
+            Ok(None)
         }
         async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
             Ok(())

@@ -23,7 +23,7 @@ use flotilla_protocol::{
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
 };
 use flotilla_resources::checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id};
-use flotilla_resources::checkout_records::{latest_launches, CheckoutHolder, CheckoutRecord};
+use flotilla_resources::checkout_records::{latest_launches, CheckoutRecord};
 use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords};
 use flotilla_resources::{
     address::{
@@ -1573,9 +1573,9 @@ impl CrewService {
         *self.checkout_inspector.write().expect("checkout inspector lock") = Some(inspector);
     }
 
-    /// The checkouts held for `convoy`'s engine Convoy, at any home, each its latest launch.
+    /// The checkouts held for `convoy`'s engine launch, at any home, each its latest launch.
     pub async fn held_checkouts(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<Vec<CheckoutRecord>, String> {
-        let holder = CheckoutHolder::Convoy(flotilla_resources::convoy::engine::engine_name(convoy)?);
+        let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(convoy) else { return Ok(Vec::new()) };
         let reads = Arc::clone(&self.lifecycle_reads);
         let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
             .await

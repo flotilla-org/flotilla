@@ -28,7 +28,7 @@ use flotilla_store::{
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_provisioning_testkit::{CheckoutFixture, Ending};
-use flotilla_resources::checkout_records::{latest_launches, CheckoutHolder, CheckoutRecord, CheckoutRecords as _, Inspection, Landed};
+use flotilla_resources::checkout_records::{latest_launches, CheckoutRecord, CheckoutRecords as _, Inspection, Landed};
 use flotilla_store_testkit::fixtures as common;
 
 use crate::common::cr_name;
@@ -634,7 +634,7 @@ fn put_inspected(
             host_ref: checkouts.home.clone(),
             is_main: false,
         }),
-        Some(&CheckoutHolder::Convoy(convoy.to_string())),
+        Some(&checkouts.holder(convoy)),
     );
     checkouts.checkouts.inspected(&launch, inspection).expect("inspection written");
     launch
@@ -680,6 +680,7 @@ async fn reconcile_with_observed_change_request(
     let vessels = backend.clone().using::<Vessel>("flotilla");
     let checkouts = engine_checkouts("host-a", "convoy-a");
     let mut status = bootstrapped_convoy_status();
+    status.engine_launch = Some(checkouts.launch("convoy-a"));
     status.phase = phase;
     status.branch_subject_scan_at = Some(timestamp(40));
     for work in status.work.values_mut() {
@@ -782,7 +783,12 @@ async fn reconcile_with_observed_digest(
         .bundle_url("s3://reviews/digest-anchor/1/".to_string())
         .claimed_head_digest("claimed-digest".to_string())
         .build();
-    let mut status = ConvoyStatus { phase, observed_workflow_ref: Some("reviewless".to_string()), ..Default::default() };
+    let mut status = ConvoyStatus {
+        phase,
+        observed_workflow_ref: Some("reviewless".to_string()),
+        engine_launch: Some(checkouts.launch("digest-anchor")),
+        ..Default::default()
+    };
     if existing_attention {
         status.attention = Some(
             flotilla_resources::ConvoyAttention::builder()
@@ -857,6 +863,8 @@ async fn convoy_finalizer_waits_for_remote_checkout_authority() {
     // The checkout is held for the convoy at its own home, feta; its removal there was refused
     // (preserved dirty work), so it stays realised.
     let remote_checkouts = engine_checkouts("feta", "convoy-a");
+    let mut convoy = convoy;
+    convoy.status = Some(ConvoyStatus { engine_launch: Some(remote_checkouts.launch("convoy-a")), ..Default::default() });
     let launch = remote_checkouts.put_ready(
         "checkout-convoy-a-feta",
         &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
@@ -867,7 +875,7 @@ async fn convoy_finalizer_waits_for_remote_checkout_authority() {
             target_path: "/checkouts/a".to_string(),
             clone_ref: "clone-a".to_string(),
         }),
-        Some(&CheckoutHolder::Convoy("convoy-a".to_string())),
+        Some(&remote_checkouts.holder("convoy-a")),
     );
     let reconciler =
         ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla")).with_lifecycle_reads(remote_checkouts.reads.clone());
@@ -1950,6 +1958,7 @@ async fn reconcile_terminal_bound_change_request(
     let repo_ref = RepositoryKey("repo-a".to_string());
 
     let mut status = bootstrapped_convoy_status();
+    status.engine_launch = Some(checkouts.launch("convoy-a"));
     status.phase = ConvoyPhase::Landing;
     for work in status.work.values_mut() {
         work.phase = WorkPhase::Complete;
@@ -2164,6 +2173,7 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
     let convoys = authority.clone().using::<Convoy>("flotilla");
     let remote_checkouts = engine_checkouts("feta", "cross-host");
     let mut status = bootstrapped_convoy_status();
+    status.engine_launch = Some(remote_checkouts.launch("cross-host"));
     status.phase = ConvoyPhase::Landing;
     for work in status.work.values_mut() {
         work.phase = WorkPhase::Complete;

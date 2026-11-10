@@ -648,7 +648,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
     use flotilla_resources::checkout_records::CheckoutRecords as _;
     let engine = flotilla_daemon_testkit::engine::runtime_checkouts(&feta);
     let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
-    engine.open_convoy(&engine_convoy);
+    engine.admit_for(&home, "flotilla", &engine_convoy, &convoy.metadata.name).await;
     let launch = engine.put_ready(
         "crew-checkout",
         &CheckoutSpec::Observed(ObservedCheckoutSpec {
@@ -658,7 +658,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
             host_ref: "feta".into(),
             is_main: false,
         }),
-        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(engine_convoy)),
+        Some(&engine.holder(&engine_convoy)),
     );
     engine
         .checkouts

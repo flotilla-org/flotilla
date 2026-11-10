@@ -180,8 +180,10 @@ impl ConvoyHolderInputs {
 #[async_trait]
 impl HolderInputs for ConvoyHolderInputs {
     async fn inputs(&self, holder: Option<&CheckoutHolder>, spec: &CheckoutSpec) -> Result<CheckoutInputs, String> {
-        let Some(CheckoutHolder::Convoy(name)) = holder else { return Ok(CheckoutInputs::default()) };
-        let owner = Some(name.clone());
+        let Some(CheckoutHolder::Convoy(launch)) = holder else { return Ok(CheckoutInputs::default()) };
+        // The holder is a launch (`<launch_of>#<n>`); a finite convoy's launch_of is its record's name.
+        let name = flotilla_resources::checkout_records::launched(launch);
+        let owner = Some(name.to_owned());
         let convoy = match self.backend.including_replicas::<Convoy>(&self.namespace).get(name).await {
             Ok(convoy) => convoy.object,
             // A holder with no record supplies nothing but its name.

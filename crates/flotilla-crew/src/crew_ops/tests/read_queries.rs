@@ -2,7 +2,7 @@ use super::*;
 use chrono::Utc;
 use flotilla_protocol::CrewCommandContext;
 use flotilla_provisioning_testkit::CheckoutFixture;
-use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecord, CheckoutRecords as _, Inspection, Landed};
+use flotilla_resources::checkout_records::{CheckoutRecord, CheckoutRecords as _, Inspection, Landed};
 use flotilla_resources::{ChangeRequest, ChangeRequestSpec, Message, MessageRelation, MessageSpec, Vessel, VesselSpec};
 use flotilla_store::StoreExt;
 
@@ -312,7 +312,7 @@ async fn active_delete_fixture() -> (Arc<CrewService>, ResourceBackend, Arc<Chec
     status.phase = ConvoyPhase::Active;
     convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("active");
     // The adopted checkout is held for the convoy, realised and never inspected.
-    engine.open_convoy("crew");
+    engine.admit_for(&backend, "flotilla", "crew", "crew").await;
     let launch = engine.put_ready(
         "checkout",
         &flotilla_resources::CheckoutSpec::Observed(
@@ -324,7 +324,7 @@ async fn active_delete_fixture() -> (Arc<CrewService>, ResourceBackend, Arc<Chec
                 .is_main(false)
                 .build(),
         ),
-        Some(&CheckoutHolder::Convoy("crew".into())),
+        Some(&engine.holder("crew")),
     );
     (crew, backend, engine, launch, _config)
 }

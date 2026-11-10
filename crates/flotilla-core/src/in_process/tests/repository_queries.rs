@@ -204,7 +204,6 @@ async fn cli_lists_include_active_provider_sessions() {
 // through an observed shadow of its name.
 #[tokio::test]
 async fn cli_checkout_rows_follow_engine_checkouts() {
-    use flotilla_resources::checkout_records::CheckoutHolder;
     use flotilla_resources::{CheckoutWorktreeSpec, RepositorySpec};
 
     let temp = tempfile::tempdir().expect("config");
@@ -242,7 +241,7 @@ async fn cli_checkout_rows_follow_engine_checkouts() {
             )
             .await
             .expect("convoy");
-        engine.open_convoy(&convoy_name);
+        super::support::admit_on_engine(&backend, &engine, &convoy_name).await;
         last_convoy = Some(convoy_name.clone());
         daemon
             .observed_resource_backend()
@@ -269,7 +268,7 @@ async fn cli_checkout_rows_follow_engine_checkouts() {
                 target_path: "/work".into(),
                 clone_ref: "source".into(),
             }),
-            Some(&CheckoutHolder::Convoy(convoy_name.clone())),
+            Some(&engine.holder(&convoy_name)),
         );
         let rows = daemon.list_cli_items_internal(CliListKind::Checkout).await.expect("progress");
         assert_eq!(rows.items.iter().find(|row| row.reference == name).expect("row").status, "pending");

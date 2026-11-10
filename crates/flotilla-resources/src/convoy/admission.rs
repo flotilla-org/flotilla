@@ -51,6 +51,11 @@ pub struct AdmissionDocument {
     pub subjects: Vec<DeclaredSubject>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
+    /// The old Convoy record this launch was admitted or imported from (a standing role's
+    /// generation, or a finite convoy's one record): its checkouts are held for this launch. Goes
+    /// with the old kind (#3108); then a decoder that drops it, one roll on (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_from: Option<String>,
 }
 
 /// An admission document that could not be encoded, or a convoy whose document does not decode.
@@ -147,6 +152,7 @@ mod tests {
                 change_request: None,
             }],
             instruction: Some("land it".into()),
+            admitted_from: None,
         }
     }
 
@@ -158,6 +164,8 @@ mod tests {
         let bytes = document.encode().expect("canonical");
         assert_eq!(document.encode().expect("canonical again"), bytes);
         assert_eq!(AdmissionDocument::decode("c", &bytes).expect("decodes"), document);
+        let admitted = AdmissionDocument { admitted_from: Some("c-2".into()), ..document };
+        assert_eq!(AdmissionDocument::decode("c", &admitted.encode().expect("canonical")).expect("decodes"), admitted);
     }
 
     // Behaviour (ADR 0047): bytes the first generation wrote still decode to the same document

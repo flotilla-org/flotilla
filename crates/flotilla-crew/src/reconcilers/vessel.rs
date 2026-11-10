@@ -1,6 +1,6 @@
 use flotilla_resources::account_access::AccountRecords;
 use flotilla_resources::checkout_path::checkout_path_component;
-use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecords, HOLDER_NOT_OPEN};
+use flotilla_resources::checkout_records::{CheckoutRecords, HOLDER_NOT_OPEN};
 use flotilla_resources::environment_records::{EnvironmentRecord, EnvironmentRecords};
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::Actuation;
@@ -947,11 +947,12 @@ impl VesselReconciler {
                     }),
                 }
             };
-            // Held for the convoy's engine Convoy: the Checkout controller releases it once that
-            // convoy has ended. The convoy supplies its inputs (branch policy, credentials) too.
-            let holder = match flotilla_resources::convoy::engine::engine_name(&convoy) {
-                Ok(name) => CheckoutHolder::Convoy(name),
-                Err(message) => return Ok(VesselPrepared::failed(message)),
+            // Held for the engine launch the convoy's generation became: the Checkout controller
+            // releases it once that launch has ended. The convoy supplies its inputs (branch policy,
+            // credentials) too. Until the engine admits it, its checkouts wait.
+            let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(&convoy) else {
+                waiting_for_checkouts.push(format!("{checkout_name} (convoy {} {HOLDER_NOT_OPEN})", convoy.metadata.name));
+                continue;
             };
             match self.checkouts()?.request(&checkout_name, &spec, Some(&holder)) {
                 Ok(_) => waiting_for_checkouts.push(checkout_name),

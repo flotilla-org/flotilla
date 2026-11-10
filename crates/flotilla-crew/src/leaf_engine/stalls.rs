@@ -988,12 +988,15 @@ impl ReconcilerWake {
                 .collect::<HashSet<_>>();
             let mut progress = BTreeMap::new();
             if selected_checkouts.is_none() {
-                let holder =
-                    flotilla_resources::checkout_records::CheckoutHolder::Convoy(flotilla_resources::convoy::engine::engine_name(convoy)?);
-                let reads = Arc::clone(&self.subscriptions.inner.lifecycle_reads);
-                let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
-                    .await
-                    .map_err(|error| format!("held checkouts: {error}"))??;
+                let held = match flotilla_resources::convoy::engine::checkout_holder(convoy) {
+                    Some(holder) => {
+                        let reads = Arc::clone(&self.subscriptions.inner.lifecycle_reads);
+                        tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
+                            .await
+                            .map_err(|error| format!("held checkouts: {error}"))??
+                    }
+                    None => Vec::new(),
+                };
                 *selected_checkouts = Some(flotilla_resources::checkout_records::latest_launches(held));
             }
             for checkout in selected_checkouts.iter().flat_map(BTreeMap::values) {

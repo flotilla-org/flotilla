@@ -6,7 +6,7 @@ Kind tables only; the shared tables are in `message.sql`.
 |---|---|--:|---|---|---|
 | `awaiting_reply` | root | 12 | – | – | `open_by_sender` (sender), `open_by_subject` (subject), `by_message` (message), `deadline` (deadline) |
 | `agent_session` | root | 9 | – | – | – |
-| `convoy` | root | 12 | – | `convoy_subjects` (records), `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_quota` (state data), `convoy_retired` (state data) | `open_by_project` (project) |
+| `convoy` | root | 14 | – | `convoy_subjects` (records), `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_quota` (state data), `convoy_retired` (state data) | `open_by_project` (project), `by_launch` (project, launch_of, launch) |
 | `convoy_subjects` | records | 6 | – | – | – |
 | `convoy_duties` | child | 6 | 1: `scope` 1 | `convoy_duties_scope_promises` (child) | – |
 | `convoy_duties_scope_promises` | child | 3 | – | – | – |
@@ -37,6 +37,7 @@ Interned column domains:
 | `awaiting_reply` | `recipient` | `ad` |
 | `awaiting_reply` | `subject` | `ad` |
 | `awaiting_reply` | `kind` | `ak` |
+| `convoy` | `launch_of` | `ln` |
 | `convoy` | `workflow_ref` | `wf` |
 | `convoy` | `project` | `ad` |
 | `convoy_subjects` | `subject` | `ad` |

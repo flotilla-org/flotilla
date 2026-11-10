@@ -21,6 +21,7 @@ fn address(text: &str) -> Address {
 
 fn request() -> ConvoyRequest {
     ConvoyRequest {
+        launch_of: "c".into(),
         workflow_ref: "w".into(),
         admission: flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new()))
             .expect("freeze"),
@@ -65,11 +66,11 @@ fn a_convoy_survives_a_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     {
         let convoys = Convoys::open("home-a", &service(&dir)).expect("open");
-        let refused = convoys.admit("c", request(), Timestamp(1)).expect_err("the project must exist");
+        let refused = convoys.admit(request(), Timestamp(1)).expect_err("the project must exist");
         assert_eq!(refused.refusal(), Some(&ConvoyRefusal::UnknownProject));
         convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
-        assert!(convoys.admit("c", request(), Timestamp(1)).expect("admitted"));
-        assert!(!convoys.admit("c", request(), Timestamp(1)).expect("existing"), "a second admission is the first");
+        assert!(convoys.admit(request(), Timestamp(1)).expect("admitted"));
+        assert!(!convoys.admit(request(), Timestamp(1)).expect("existing"), "a second admission is the first");
         convoys.world(|world| world.durable.put(&Ref::new(address("change").as_str()), true));
         let submit = Submit {
             promise: PromiseId(0),
@@ -100,11 +101,11 @@ fn a_label_is_unique_within_its_convoy() {
     let mut second = twice.promises[&PromiseId(0)].clone();
     second.kind = "decision-ledger".into();
     twice.promises.insert(PromiseId(1), second);
-    let error = convoys.admit("c", twice, Timestamp(1)).expect_err("a taken label");
+    let error = convoys.admit(twice, Timestamp(1)).expect_err("a taken label");
     assert_eq!(error.refusal(), None, "the store refuses it, not the machine: {error:?}");
     assert!(convoys.get("c").is_none(), "nothing was admitted");
-    assert!(convoys.admit("c", request(), Timestamp(1)).expect("admitted"));
-    assert!(convoys.admit("d", request(), Timestamp(1)).expect("the same label in another convoy"));
+    assert!(convoys.admit(request(), Timestamp(1)).expect("admitted"));
+    assert!(convoys.admit(ConvoyRequest { launch_of: "d".into(), ..request() }, Timestamp(1)).expect("the same label in another convoy"));
 }
 
 // Behaviour (#3721 review): a restored home still holds labels unique, and a store refusal of an
@@ -115,7 +116,7 @@ fn a_taken_label_is_refused_after_a_restart_and_changes_nothing() {
     {
         let convoys = Convoys::open("home-a", &service(&dir)).expect("open");
         convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
-        assert!(convoys.admit("c", request(), Timestamp(1)).expect("admitted"));
+        assert!(convoys.admit(request(), Timestamp(1)).expect("admitted"));
     }
     let convoys = Convoys::open("home-a", &service(&dir)).expect("reopen");
     let declare = Declare {
@@ -136,25 +137,24 @@ fn a_taken_label_is_refused_after_a_restart_and_changes_nothing() {
     assert_eq!(convoys.apply("c", free, Timestamp(3)).expect("a free label"), Version(4), "the refusal took no sequence");
 }
 
-// Owner ruling #3825: replacing an ended standing generation reuses its name,
-// retains all log history, and never changes an active or refused generation.
+// Behaviour (owner's ruling, #3108): each standing generation is its own convoy, the next launch
+// of the role's name. A generation is admitted only once the newest has ended; the ended one
+// stays as it ended, under its own name; a refused admission takes no launch; and a reopened home
+// reads the newest launch as the role's convoy.
 #[hegel::test]
-fn ended_standing_generations_are_replaced_atomically(tc: hegel::TestCase) {
-    use flotilla_schema::{Cause, Kind};
-    use flotilla_state_machines::{
-        machines::convoy::{Abandon, AbandonCause, Authority, Convoy, ConvoyLabel, Deliver, Keep},
-        Resource,
-    };
+fn each_standing_generation_is_its_own_launch(tc: hegel::TestCase) {
+    use flotilla_state_machines::machines::convoy::{Abandon, AbandonCause, Authority, ConvoyLabel, Deliver, Keep};
+    let standing = |request: ConvoyRequest| ConvoyRequest { launch_of: "standing".into(), ..request };
     // Sequences cover both terminal labels, duplicate admission and optional
-    // restart before replacement, across one to three generations.
+    // restart before the next generation, across one to three generations.
     let steps = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
     let dir = tempfile::tempdir().expect("tempdir");
     let service = service(&dir);
     let mut convoys = Convoys::open("home-a", &service).expect("open");
     convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
-    assert!(convoys.admit_standing("standing", request(), Timestamp(1)).expect("initial generation"));
+    assert!(convoys.admit_standing(standing(request()), Timestamp(1)).expect("initial generation"));
     for _ in 0..steps {
-        assert!(!convoys.admit_standing("standing", request(), Timestamp(2)).expect("duplicate active admission"));
+        assert!(!convoys.admit_standing(standing(request()), Timestamp(2)).expect("duplicate active admission"));
         if tc.draw(hegel::generators::booleans()) {
             convoys
                 .apply(
@@ -177,7 +177,7 @@ fn ended_standing_generations_are_replaced_atomically(tc: hegel::TestCase) {
                     Abandon {
                         by: SeatName::new("operator", ""),
                         cause: AbandonCause::Operator,
-                        reason: "replace generation".into(),
+                        reason: "next generation".into(),
                         authority: Ref::new("operator"),
                     },
                     Timestamp(4),
@@ -189,85 +189,23 @@ fn ended_standing_generations_are_replaced_atomically(tc: hegel::TestCase) {
             convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
         }
         let ended = convoys.get("standing").expect("ended generation");
-        let (ended_version, ended_state) = (ended.version(), ended.state().clone());
-        let mut invalid = request();
+        let mut invalid = standing(request());
         invalid.project = address("missing");
-        assert!(convoys.admit_standing("standing", invalid, Timestamp(5)).is_err(), "gate refusal");
-        let mut conflicting = request();
+        assert!(convoys.admit_standing(invalid, Timestamp(5)).is_err(), "gate refusal");
+        let mut conflicting = standing(request());
         conflicting.promises.insert(PromiseId(1), conflicting.promises[&PromiseId(0)].clone());
-        assert!(convoys.admit_standing("standing", conflicting, Timestamp(5)).is_err(), "store refusal rolls retirement back");
-        let reopened = Convoys::open("home-a", &service).expect("reopen after refusals");
-        let retained = reopened.get("standing").expect("retained ended generation");
-        assert_eq!((retained.version(), retained.state()), (ended_version, &ended_state));
-        assert!(convoys.admit_standing("standing", request(), Timestamp(6)).expect("new generation"));
+        assert!(convoys.admit_standing(conflicting, Timestamp(5)).is_err(), "store refusal");
+        assert_eq!(convoys.get("standing").as_ref(), Some(&ended), "a refused admission takes no launch");
+        assert!(convoys.admit_standing(standing(request()), Timestamp(6)).expect("new generation"));
         let next = convoys.get("standing").expect("fresh generation");
         assert_eq!(next.label(), ConvoyLabel::Open);
-        assert!(next.version() > ended_version);
+        assert!(next.spec().launch > ended.spec().launch);
+        assert_eq!(next.name(), format!("standing#{}", next.spec().launch));
         assert_eq!(next.spec().promise(PromiseId(0)).expect("fresh promise").1.progress.value, Progress::Pending);
-        service
-            .with_store(|store| {
-                let mut read = store.read()?;
-                let id = read.resolve(<Resource<Convoy> as Kind>::CODE, "standing", "home-a")?.expect("identity");
-                let events = read.changes(id, 0, 64)?;
-                assert!(events.iter().any(|event| event.home_seq == ended_version.0), "ended history retained");
-                assert!(events.iter().any(|event| event.cause == Cause::Delete), "retirement logged");
-                Ok(())
-            })
-            .expect("read retained history");
         convoys = Convoys::open("home-a", &service).expect("restart fresh generation");
-        assert_eq!(convoys.get("standing").expect("restored").label(), ConvoyLabel::Open);
+        assert_eq!(convoys.get("standing").as_ref(), Some(&next), "the newest launch is the role's convoy");
+        let retained = convoys.launch(ended.name()).expect("the ended generation is kept");
+        assert_eq!((retained.version(), retained.state()), (ended.version(), ended.state()));
         convoys.world(|world| world.projects.put(&Ref::new(address("fleet").as_str()), ()));
-    }
-}
-
-// A missing stored body or identity must return an error without evicting the
-// resident ended generation or poisoning its writer locks.
-#[test]
-fn a_missing_resident_generation_returns_an_error() {
-    use flotilla_schema::{Kind, NewChange};
-    use flotilla_state_machines::{
-        machines::convoy::{Abandon, AbandonCause, Convoy},
-        Resource, WriteError,
-    };
-    for expunge in [false, true] {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let service = service(&dir);
-        let convoys = Convoys::open("home-a", &service).expect("open");
-        convoys.world(|world| {
-            world.projects.put(&Ref::new(address("fleet").as_str()), ());
-            world.authority.put(&Ref::new("operator"), true);
-        });
-        convoys.admit_standing("standing", request(), Timestamp(1)).expect("admit");
-        convoys
-            .apply(
-                "standing",
-                Abandon {
-                    by: SeatName::new("operator", ""),
-                    cause: AbandonCause::Operator,
-                    reason: "ended".into(),
-                    authority: Ref::new("operator"),
-                },
-                Timestamp(2),
-            )
-            .expect("end");
-        let version = convoys.get("standing").expect("resident").version();
-        service
-            .with_store(|store| {
-                let mut read = store.read()?;
-                let id = read.resolve(<Resource<Convoy> as Kind>::CODE, "standing", "home-a")?.expect("identity");
-                let stamp = read.load::<Resource<Convoy>>(id)?.expect("stored").stamp();
-                drop(read);
-                let mut write = store.write()?;
-                let origin = NewChange::new("test", Timestamp(3));
-                write.delete::<Resource<Convoy>>(stamp, &origin)?;
-                if expunge {
-                    write.expunge::<Resource<Convoy>>(id, &origin)?;
-                }
-                write.commit()
-            })
-            .expect("inject missing backing");
-        let error = convoys.admit_standing("standing", request(), Timestamp(4)).expect_err("missing backing");
-        assert!(matches!(error, WriteError::Log(_)), "{error:?}");
-        assert_eq!(convoys.get("standing").expect("resident retained").version(), version);
     }
 }

@@ -1342,7 +1342,10 @@ async fn convoy_explain_reports_observed_digest_anchor_and_mismatch() {
         .bundle_url("s3://reviews/digest-anchor/1/".to_string())
         .claimed_head_digest("claimed-digest".to_string())
         .build();
-    let mut status = flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
+    // The engine holds the convoy, and the adopted checkout for it; its inspection reads the
+    // remote ref.
+    let launch = engine.open_convoy("digest-anchor");
+    let mut status = flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landing, engine_launch: Some(launch), ..Default::default() };
     status.crew_work.insert(
         "work".to_string(),
         BTreeMap::from([(
@@ -1352,8 +1355,6 @@ async fn convoy_explain_reports_observed_digest_anchor_and_mismatch() {
     );
     convoys.update_status("digest-anchor", &convoy.metadata.resource_version, &status).await.expect("publish claim");
 
-    // The engine holds the adopted checkout for the convoy; its inspection reads the remote ref.
-    engine.open_convoy("digest-anchor");
     let launch = engine.put_ready(
         "digest-checkout",
         &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
@@ -1363,7 +1364,7 @@ async fn convoy_explain_reports_observed_digest_anchor_and_mismatch() {
             host_ref: "home".to_string(),
             is_main: false,
         }),
-        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("digest-anchor".to_string())),
+        Some(&engine.holder("digest-anchor")),
     );
     let inspect = |digest: &str| {
         use flotilla_resources::checkout_records::CheckoutRecords as _;

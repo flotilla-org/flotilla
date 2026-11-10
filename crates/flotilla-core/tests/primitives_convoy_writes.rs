@@ -449,7 +449,7 @@ fn a_partial_edit_reports_what_applied() {
         convoy_map::request(&tokio_block(old_convoy(&fixture.backend, "c", bootstrapped(vec![("work", vec![crew("coder", true)])]))))
             .expect("request");
     fixture.convoys.world(|world| world.projects.put(&Ref::new(request.project.as_str()), ()));
-    assert!(fixture.convoys.admit("c", request, flotilla_schema::Timestamp(1)).expect("admitted"));
+    assert!(fixture.convoys.admit(request, flotilla_schema::Timestamp(1)).expect("admitted"));
     let owner = SeatName::new("coder", "");
     let target: flotilla_schema::Address = "project:fleet/convoy:c".parse().expect("target");
     let error = fixture
@@ -517,7 +517,12 @@ async fn standing_admission_uses_the_ensure_role_identity() {
         .unwrap();
     assert_eq!(fixture.convoys.get(name).unwrap().spec().duties, duties);
     assert!(fixture.engine.holds(&old));
-    assert_eq!(fixture.convoys.get(name).unwrap().name(), name);
+    let first = fixture.convoys.get(name).unwrap();
+    assert_eq!(first.name(), format!("{name}#{}", first.spec().launch), "a launch of the role's name");
+    // Admission names the launch on the generation's record: what its checkouts are held for.
+    let stored = fixture.backend.clone().using::<Convoy>(NAMESPACE);
+    let named = |record: ResourceObject<Convoy>| record.status.expect("status").engine_launch;
+    assert_eq!(named(stored.get("old-generation-id").await.expect("old")).as_deref(), Some(first.name()));
     assert!(fixture.engine.promises(&old, None).unwrap().is_some());
     // A nonterminal old-store generation must not mask an ended engine record:
     // the next Ensure generation reaches admission under the same stable name.
@@ -529,7 +534,11 @@ async fn standing_admission_uses_the_ensure_role_identity() {
     next.metadata.annotations = old.metadata.annotations.clone();
     assert!(!fixture.engine.holds(&next));
     assert_eq!(fixture.engine.admit(&next).await.expect("next generation"), Admission::Held);
-    let version = fixture.convoys.get(name).expect("fresh engine generation").version();
+    let second = fixture.convoys.get(name).expect("fresh engine generation");
+    assert_ne!(second.name(), first.name(), "the next generation is a launch of its own");
+    assert_eq!(named(stored.get("next-generation-id").await.expect("next")).as_deref(), Some(second.name()));
+    assert_eq!(fixture.engine.launch(&old).expect("read").as_deref(), Some(first.name()), "an earlier generation keeps its launch");
+    let version = second.version();
     assert!(fixture.engine.holds(&next));
     assert_eq!(fixture.engine.admit(&next).await.expect("duplicate generation"), Admission::Held);
     assert_eq!(fixture.convoys.get(name).expect("same generation").version(), version);

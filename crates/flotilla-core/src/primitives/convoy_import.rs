@@ -21,6 +21,8 @@
 //! | `completion_refusal`, `legacy_checks` | dropped |
 //! | Landing | Open |
 //! | a standing convoy | a convoy-lifetime duty per agent seat |
+//! | a standing role's generation | its own convoy, the next launch of the role's name |
+//! | a convoy's name | a launch `<engine name>#<n>`, n the home sequence its create takes |
 //! | a finite, unfinished convoy with no promise | refused: [`ConvoyImportRefusal::NoObligations`] |
 //!
 //! A convoy that has ended (Landed, Failed, Abandoned) or not yet bootstrapped
@@ -85,9 +87,6 @@ impl std::fmt::Display for ConvoyImportRefusal {
 /// The old claim fields the engine has no column for, kept as history.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimHistory {
-    // ADR 0047 N→N+1: remove this default one roll after seat growth lands.
-    #[serde(default)]
-    pub previous_generations: Vec<String>,
     pub crews: Vec<CrewClaim>,
     /// The old `landing_entry`, as the old status encodes it (JSON text).
     pub landing_entry: Option<String>,
@@ -116,6 +115,8 @@ pub struct ImportedStall {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportedConvoy {
     pub home: String,
+    /// The old record it was imported from: what its checkouts were held for.
+    pub record: String,
     pub resource: Resource<Convoy>,
     pub history: ClaimHistory,
     pub stall: Option<ImportedStall>,
@@ -304,10 +305,23 @@ pub fn import_convoy(
     let used: BTreeSet<&str> = promises.iter().map(|row| row.record.kind.as_str()).collect();
     let kinds = Catalog::resolve(&stock(), &[]).and_then(|catalog| catalog.freeze(used)).map_err(|error| refuse(error.to_string()))?;
     let (workflow_ref, admission) = map::admission(convoy).map_err(refuse)?;
-    let spec =
-        ConvoySpec { workflow_ref, admission, project, priority: Priority(0), kinds, subjects: Records::new(), duties, seats, promises };
+    // A launch of its engine name, numbered when it is written.
+    let launch_of = map::engine_name(convoy).map_err(refuse)?;
+    let spec = ConvoySpec {
+        launch_of: launch_of.clone(),
+        launch: 0,
+        workflow_ref,
+        admission,
+        project,
+        priority: Priority(0),
+        kinds,
+        subjects: Records::new(),
+        duties,
+        seats,
+        promises,
+    };
     let state = StoredState::<Convoy>::new(ConvoyState::Open { quota: BTreeMap::new(), retired: BTreeSet::new() }, since);
-    let resource = Resource::stored(map::engine_name(convoy).map_err(refuse)?, spec, state, Version(1));
+    let resource = Resource::stored(launch_of, spec, state, Version(1));
     check(&resource).map_err(refuse)?;
 
     // History the old status cannot encode refuses the import: it is never
@@ -331,7 +345,7 @@ pub fn import_convoy(
         }
     }
     let landing_entry = status.landing_entry.as_ref().map(|entry| encode("the landing entry", serde_json::to_string(entry))).transpose()?;
-    let history = ClaimHistory { previous_generations: Vec::new(), crews: claims, landing_entry };
+    let history = ClaimHistory { crews: claims, landing_entry };
 
     let (stall, unrecorded_stall) = match status.stalled.as_ref() {
         None => (None, None),
@@ -363,7 +377,14 @@ pub fn import_convoy(
             }
         }
     };
-    Ok(ImportOutcome::Imported(Box::new(ImportedConvoy { home: home.to_owned(), resource, history, stall, unrecorded_stall })))
+    Ok(ImportOutcome::Imported(Box::new(ImportedConvoy {
+        home: home.to_owned(),
+        record: convoy.metadata.name.clone(),
+        resource,
+        history,
+        stall,
+        unrecorded_stall,
+    })))
 }
 
 /// A promise as [`check`] compares it: id, label, owner, progress and
@@ -378,9 +399,9 @@ type PromiseShape = (PromiseId, String, SeatName, Progress, Vec<(Address, String
 /// compared.
 pub fn check(resource: &Resource<Convoy>) -> Result<(), String> {
     let spec = resource.spec();
-    let name = resource.name();
     let mut world = MemoryConvoyWorld::default().with_project(&spec.project);
     let request = ConvoyRequest {
+        launch_of: spec.launch_of.clone(),
         workflow_ref: spec.workflow_ref.clone(),
         admission: spec.admission.clone(),
         project: spec.project.clone(),
@@ -408,7 +429,14 @@ pub fn check(resource: &Resource<Convoy>) -> Result<(), String> {
         kinds: spec.kinds.clone(),
     };
     let mut home = Home::<Convoy>::new("import").map_err(|error| format!("{error:?}"))?;
-    home.create(name, request, &world, Timestamp(0)).map_err(|error| format!("the machine refuses admission: {error:?}"))?;
+    // The fresh home numbers its own launch; the replay follows the name it gives.
+    let created = home
+        .create(resource.name(), request, &world, Timestamp(0))
+        .map_err(|error| format!("the machine refuses admission: {error:?}"))?
+        .resource
+        .name()
+        .to_owned();
+    let name = created.as_str();
     let refused = |step: &str| {
         let step = step.to_owned();
         move |error| format!("the machine refuses {step}: {error:?}")
@@ -490,17 +518,21 @@ pub fn stall_record(convoy: &ImportedConvoy) -> Result<Option<Resource<AwaitingR
 /// path, with its open stall record if it has one: one transaction and one
 /// `import` change (#4024). The old claim history is not carried: no reader
 /// of the engine's log asks for it. The cut-over's importer writes each convoy
-/// so; the rehearsal does the same into a scratch store.
-pub fn write(store: &mut flotilla_schema_sqlite::Store, convoy: &ImportedConvoy) -> Result<(), String> {
+/// so; the rehearsal does the same into a scratch store. The convoy is a launch, numbered by the
+/// home sequence its create takes, as any launch is; returns it as written.
+pub fn write(store: &mut flotilla_schema_sqlite::Store, convoy: &ImportedConvoy) -> Result<Resource<Convoy>, String> {
     let stall = stall_record(convoy)?;
     let mut write = store.write().map_err(|error| error.to_string())?;
     let change =
         write.open_change(&flotilla_schema::NewChange::new("import", convoy.resource.since())).map_err(|error| error.to_string())?;
-    write.insert(convoy.resource.name(), &convoy.resource, change).map_err(|error| error.to_string())?;
+    let next = write.last_sequence(&convoy.home).map_err(|error| error.to_string())? + 1;
+    let resource = convoy.resource.clone().numbered(next);
+    write.insert(resource.name(), &resource, change).map_err(|error| error.to_string())?;
     if let Some(stall) = &stall {
         write.insert(stall.name(), stall, change).map_err(|error| format!("stall `{}`: {error}", stall.name()))?;
     }
-    write.commit().map_err(|error| error.to_string())
+    write.commit().map_err(|error| error.to_string())?;
+    Ok(resource)
 }
 
 /// A spec's content with each record row's version left out: the store
@@ -528,13 +560,16 @@ fn stamped(spec: &ConvoySpec, version: u64) -> ConvoySpec {
 pub fn write_into(target: &mut impl flotilla_engine_store::ImportTarget, convoy: &ImportedConvoy) -> Result<Resource<Convoy>, String> {
     let stall = stall_record(convoy)?;
     let change = flotilla_schema::NewChange::new(flotilla_engine_store::IMPORT_WRITER, convoy.resource.since());
-    let written = target.write_with(&convoy.home, convoy.resource.name(), &change, convoy.resource.version().0, |version| {
-        Resource::stored(
+    // A launch, numbered by the home sequence its create takes, as any launch is.
+    let (_, written) = target.write_named_with(&convoy.home, &change, convoy.resource.version().0, |version| {
+        let resource = Resource::stored(
             convoy.resource.name(),
             stamped(convoy.resource.spec(), version),
             convoy.resource.stored_state().clone(),
             Version(version),
         )
+        .numbered(version);
+        (resource.name().to_owned(), resource)
     })?;
     if let Some(stall) = &stall {
         target.write(&convoy.home, stall.name(), &change, stall).map_err(|error| format!("stall `{}`: {error}", stall.name()))?;
@@ -575,16 +610,19 @@ pub fn rehearse(imported: &[ImportedConvoy]) -> Vec<RehearsalRefusal> {
                 }
             }
         };
-        if let Err(error) = write(store, convoy) {
-            refusals.push(refuse(convoy, format!("the store refuses its creation: {error}")));
-            continue;
-        }
+        let written = match write(store, convoy) {
+            Ok(written) => written,
+            Err(error) => {
+                refusals.push(refuse(convoy, format!("the store refuses its creation: {error}")));
+                continue;
+            }
+        };
         let read = store.read().and_then(|mut read| {
-            let id = read.resolve(Resource::<Convoy>::CODE, convoy.resource.name(), &convoy.home)?;
+            let id = read.resolve(Resource::<Convoy>::CODE, written.name(), &convoy.home)?;
             id.map(|id| read.load::<Resource<Convoy>>(id)).transpose().map(Option::flatten)
         });
         match read {
-            Ok(Some(loaded)) if content(loaded.value.spec()) == content(convoy.resource.spec()) => {
+            Ok(Some(loaded)) if content(loaded.value.spec()) == content(written.spec()) => {
                 if let Err(reason) = check(&loaded.value) {
                     refusals.push(refuse(convoy, reason));
                 }
@@ -618,7 +656,6 @@ pub struct RehearsalReport {
     pub stays_old: Vec<(String, String)>,
     pub refused: Vec<ConvoyImportRefusal>,
     pub rehearsal: Vec<RehearsalRefusal>,
-    pub folded_generations: usize,
 }
 
 /// Imports and rehearses every old convoy of one home.
@@ -633,9 +670,9 @@ pub fn rehearse_all<'a>(
     report
 }
 
-/// Maps every old convoy of `convoys`, homed at `home`, onto the engine: each finite convoy alone,
-/// and each standing convoy's generations folded into one stable identity. Nothing is written,
-/// so the report's `rehearsal` is empty.
+/// Maps every old convoy of `convoys`, homed at `home`, onto the engine, each alone: a standing
+/// role's generations are launches of its name, imported in generation order so the newest
+/// generation is the newest launch. Nothing is written, so the report's `rehearsal` is empty.
 pub fn import_all<'a>(
     convoys: impl IntoIterator<Item = &'a ResourceObject<OldConvoy>>,
     home: &str,
@@ -644,7 +681,7 @@ pub fn import_all<'a>(
 ) -> RehearsalReport {
     let mut report = RehearsalReport::default();
     let mut standing: BTreeMap<String, Vec<&ResourceObject<OldConvoy>>> = BTreeMap::new();
-    let mut finite = Vec::new();
+    let mut ordered = Vec::new();
     for convoy in convoys {
         if is_ensured(convoy) {
             match map::engine_name(convoy) {
@@ -652,14 +689,7 @@ pub fn import_all<'a>(
                 Err(reason) => report.refused.push(ConvoyImportRefusal::Unmappable { convoy: convoy.metadata.name.clone(), reason }),
             }
         } else {
-            finite.push(convoy);
-        }
-    }
-    for convoy in finite {
-        match import_convoy(convoy, home, forges, world) {
-            Ok(ImportOutcome::Imported(imported)) => report.imported.push(*imported),
-            Ok(ImportOutcome::StaysOld(reason)) => report.stays_old.push((convoy.metadata.name.clone(), reason)),
-            Err(refusal) => report.refused.push(refusal),
+            ordered.push(convoy);
         }
     }
     for (_, mut generations) in standing {
@@ -677,29 +707,26 @@ pub fn import_all<'a>(
             });
             continue;
         }
-        let Some(current) = generations.pop() else { continue };
-        // No status means a fresh, not-ended generation. import_convoy leaves an
-        // unbootstrapped latest generation on the old path for admission at bootstrap.
+        // No status means a fresh, not-ended generation.
         let ended = |c: &ResourceObject<OldConvoy>| {
             c.status.as_ref().is_some_and(|s| matches!(s.phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Abandoned))
         };
-        if ended(current) && generations.iter().any(|c| !ended(c)) {
+        // At most one generation is live, and it is the newest: an earlier live one would be a
+        // second open convoy of the role, and the newest launch would not be the current one.
+        let live = generations.iter().filter(|c| !ended(c)).count();
+        if live > 1 || (live == 1 && generations.last().is_some_and(|c| ended(c))) {
             report.refused.push(ConvoyImportRefusal::Unmappable {
-                convoy: current.metadata.name.clone(),
-                reason: "ended latest generation has an earlier live generation".into(),
+                convoy: generations.last().unwrap().metadata.name.clone(),
+                reason: "an earlier standing generation is still live".into(),
             });
             continue;
         }
-        match import_convoy(current, home, forges, world) {
-            Ok(ImportOutcome::Imported(mut imported)) => {
-                // Old generations remain in the old archive. Only their identities go
-                // into the creation's history, never into the live convoy's seats.
-                // Each generation is its own convoy, so its promise ids are its own.
-                imported.history.previous_generations = generations.iter().map(|c| c.metadata.name.clone()).collect();
-                report.folded_generations += generations.len();
-                report.imported.push(*imported);
-            }
-            Ok(ImportOutcome::StaysOld(reason)) => report.stays_old.push((current.metadata.name.clone(), reason)),
+        ordered.extend(generations);
+    }
+    for convoy in ordered {
+        match import_convoy(convoy, home, forges, world) {
+            Ok(ImportOutcome::Imported(imported)) => report.imported.push(*imported),
+            Ok(ImportOutcome::StaysOld(reason)) => report.stays_old.push((convoy.metadata.name.clone(), reason)),
             Err(refusal) => report.refused.push(refusal),
         }
     }

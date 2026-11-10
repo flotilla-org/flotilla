@@ -184,9 +184,10 @@ struct Carried {
     messages: BTreeMap<(String, String), (flotilla_state_machines::machines::message::MessageRef, flotilla_address::Address)>,
     /// The last admission sequence the imported messages took, by home.
     admitted: BTreeMap<String, u64>,
-    /// Each imported engine Convoy's version as written, by home and engine name: the checkouts
-    /// held for it are created under it.
-    convoys: BTreeMap<(String, String), u64>,
+    /// The launch each imported old Convoy became, and its version as written, by home and old
+    /// record name: the checkouts held for the old record are held for that launch, created under
+    /// that version.
+    convoys: BTreeMap<(String, String), (String, u64)>,
     /// The launch each imported TerminalSession became, by home and old name: a message delivered
     /// to the session names that launch's consumer.
     launches: BTreeMap<(String, String), String>,

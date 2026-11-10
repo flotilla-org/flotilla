@@ -160,9 +160,7 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
     // The adopted checkout is the engine's, held for the convoy; it is seen, and landing never
     // removes it (#3108).
     let convoy = convoys.get(&adopted_record).await.expect("landed convoy");
-    let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy(
-        flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine name"),
-    );
+    let holder = flotilla_resources::convoy::engine::checkout_holder(&convoy).expect("held for its launch");
     let held = daemon.lifecycle_reads().checkouts().expect("checkouts").held(&holder).expect("held checkouts");
     assert_eq!(held.len(), 1, "{held:?}");
     assert!(

@@ -169,14 +169,14 @@ pub trait HolderInputs: Send + Sync + 'static {
     async fn inputs(&self, holder: Option<&CheckoutHolder>, spec: &CheckoutSpec) -> Result<CheckoutInputs, String>;
 }
 
-/// A holder that supplies nothing but its name as the owner: tests, and holders whose records
+/// A holder that supplies nothing but its convoy's name as the owner: tests, and holders whose records
 /// carry no inputs yet.
 pub struct NamedHolderInputs;
 
 #[async_trait]
 impl HolderInputs for NamedHolderInputs {
     async fn inputs(&self, holder: Option<&CheckoutHolder>, _: &CheckoutSpec) -> Result<CheckoutInputs, String> {
-        let owner = holder.map(|CheckoutHolder::Convoy(name)| name.clone());
+        let owner = holder.map(|CheckoutHolder::Convoy(launch)| launched(launch).to_owned());
         Ok(CheckoutInputs { owner, ..CheckoutInputs::default() })
     }
 }

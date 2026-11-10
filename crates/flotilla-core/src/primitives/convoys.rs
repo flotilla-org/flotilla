@@ -9,12 +9,14 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use flotilla_address::Address;
 use flotilla_engine_store::StoreLog;
-use flotilla_schema::{NewChange, Timestamp};
+use flotilla_resources::convoy::admission::AdmissionDocument;
+use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
-    machines::convoy::{Convoy, ConvoyEdge, ConvoyLabel, ConvoyRefusal, ConvoyRequest, MemoryConvoyWorld},
-    Edge as _, Home, LogError, Resource, Version, WriteError,
+    machines::convoy::{Convoy, ConvoyEdge, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoySpec, MemoryConvoyWorld},
+    Edge as _, Home, Resource, Version, WriteError,
 };
 
 /// This home's Convoy records and the world their gates read.
@@ -77,21 +79,45 @@ impl Convoys {
         &self.home_name
     }
 
-    /// Another home's Convoy as this home's decided store replicates it: one
-    /// keyed read by kind, name and home. Absence means no such replica.
-    pub fn replica(&self, name: &str, home: &str) -> Result<Option<Resource<Convoy>>, String> {
+    /// Another home's newest launch of `of` in `project` as this home's decided store replicates
+    /// it: one read of the `by_launch` index at that home. Absence means no such replica.
+    pub fn replica(&self, of: &str, project: &Address, home: &str) -> Result<Option<Resource<Convoy>>, String> {
         self.service
             .with_store(|store| {
                 let mut read = store.read()?;
-                let Some(id) = read.resolve(<Resource<Convoy> as flotilla_schema::Kind>::CODE, name, home)? else { return Ok(None) };
+                let query = ConvoySpec::by_launch(project, &of.to_owned());
+                let Some((id, _)) = read.integer_index_keys_before(&query, home, i64::MAX, 1)?.first().copied() else {
+                    return Ok(None);
+                };
                 Ok(read.load::<Resource<Convoy>>(id)?.map(|loaded| loaded.value))
             })
             .map_err(|error| error.to_string())
     }
 
-    /// One keyed read; absence means no Convoy of that name is homed here.
-    pub fn get(&self, name: &str) -> Option<Resource<Convoy>> {
+    /// The newest launch of `of` homed here: one keyed read. Absence means none is.
+    pub fn get(&self, of: &str) -> Option<Resource<Convoy>> {
+        locked(&self.home).newest_launch(of, None).cloned()
+    }
+
+    /// The launch named `name` (`<of>#<n>`) homed here, whether or not it is the newest.
+    pub fn launch(&self, name: &str) -> Option<Resource<Convoy>> {
         locked(&self.home).get(name).cloned()
+    }
+
+    /// The launch of `of` homed here that was admitted or imported from the old record `record`,
+    /// searched newest first: a standing role's generation is among its newest launches.
+    pub fn admitted_from(&self, of: &str, record: &str) -> Result<Option<String>, String> {
+        let home = locked(&self.home);
+        let mut before = None;
+        while let Some(launch) = home.newest_launch(of, before) {
+            let document =
+                AdmissionDocument::decode(launch.name(), launch.spec().admission.value().bytes()).map_err(|error| error.to_string())?;
+            if document.admitted_from.as_deref() == Some(record) {
+                return Ok(Some(launch.name().to_owned()));
+            }
+            before = Some(launch.spec().launch);
+        }
+        Ok(None)
     }
 
     /// Edit the world the gates read; the next admission or edge reads the
@@ -104,83 +130,41 @@ impl Convoys {
         edit(&mut locked(&self.world))
     }
 
-    /// Admits `name`, unless a Convoy of that name is already homed here
+    /// Admits the first launch of `request.launch_of`, unless one is already homed here
     /// (`Ok(false)`). A refusal is the machine's, as `Err`.
-    pub fn admit(&self, name: &str, request: ConvoyRequest, now: Timestamp) -> Result<bool, WriteError<Convoy>> {
-        self.admit_generation(name, request, now, false)
+    pub fn admit(&self, request: ConvoyRequest, now: Timestamp) -> Result<bool, WriteError<Convoy>> {
+        self.admit_launch(request, now, |_| false)
     }
 
-    /// Admit a standing generation, retiring an ended generation's live rows.
-    /// Delete and create share a transaction; the per-home log retains both.
-    pub fn admit_standing(&self, name: &str, request: ConvoyRequest, now: Timestamp) -> Result<bool, WriteError<Convoy>> {
-        self.admit_generation(name, request, now, true)
+    /// Admits a standing role's next generation: a new launch of `request.launch_of`, unless its
+    /// newest launch is still Open (`Ok(false)`). An ended generation stays as it ended.
+    pub fn admit_standing(&self, request: ConvoyRequest, now: Timestamp) -> Result<bool, WriteError<Convoy>> {
+        self.admit_launch(request, now, |newest| newest.label() != ConvoyLabel::Open)
     }
 
-    fn admit_generation(
+    fn admit_launch(
         &self,
-        name: &str,
         request: ConvoyRequest,
         now: Timestamp,
-        replace_ended: bool,
+        follows: impl FnOnce(&Resource<Convoy>) -> bool,
     ) -> Result<bool, WriteError<Convoy>> {
         let mut home = locked(&self.home);
         let world = locked(&self.world);
-        let Some(previous) = home.get(name) else {
-            home.create(name, request, &*world, now)?;
-            return Ok(true);
-        };
-        if !replace_ended || previous.label() == ConvoyLabel::Open {
+        if home.newest_launch(&request.launch_of, None).is_some_and(|newest| !follows(newest)) {
             return Ok(false);
         }
-        // Validate admission before retiring anything. A gate or store refusal
-        // leaves the ended generation intact in memory and on disk.
-        let mut fresh = Home::<Convoy>::new(&self.home_name)
-            .map_err(|errors| WriteError::Log(LogError::new(format!("Convoy definition: {errors:?}"))))?;
-        let created = fresh.create(name, request, &*world, now)?;
-        let resource = created.resource.clone();
-        // One change retires the ended generation and admits the next. Which of its admission's
-        // reads name records, and so are the change's items, is the open question on #4024.
-        let change = NewChange::new(&self.home_name, now);
-        let version = self
-            .service
-            .with_store(|store| {
-                let loaded = {
-                    let mut read = store.read()?;
-                    let Some(id) = read.resolve(<Resource<Convoy> as flotilla_schema::Kind>::CODE, name, &self.home_name)? else {
-                        return Ok(None);
-                    };
-                    let Some(loaded) = read.load::<Resource<Convoy>>(id)? else {
-                        return Ok(None);
-                    };
-                    loaded
-                };
-                let mut write = store.write()?;
-                let change = write.open_change(&change)?;
-                write.delete::<Resource<Convoy>>(loaded.stamp(), change)?;
-                let stamp = write.insert(name, &resource, change)?;
-                write.commit()?;
-                Ok(Some(stamp.version))
-            })
-            .map_err(|error| WriteError::Log(LogError::new(error)))?
-            .ok_or_else(|| WriteError::Log(LogError::new(format!("resident Convoy `{name}` is missing from the store"))))?;
-        home.evict(name);
-        // Restore only refuses an existing name. The writer lock is still held
-        // and that name was just evicted, so it cannot fail after this commit.
-        home.restore(Resource::stored(name, resource.spec().clone(), resource.stored_state().clone(), Version(version))).map_err(
-            |error| {
-                tracing::error!(convoy = name, ?error, "committed standing generation could not be restored to its resident home");
-                error
-            },
-        )?;
+        let of = request.launch_of.clone();
+        home.create(of, request, &*world, now)?;
         Ok(true)
     }
 
-    /// Applies `edge` to `name` through the store's log.
-    pub fn apply(&self, name: &str, edge: impl Into<ConvoyEdge>, now: Timestamp) -> Result<Version, WriteError<Convoy>> {
+    /// Applies `edge` to the newest launch of `of` through the store's log.
+    pub fn apply(&self, of: &str, edge: impl Into<ConvoyEdge>, now: Timestamp) -> Result<Version, WriteError<Convoy>> {
         let mut home = locked(&self.home);
         let world = locked(&self.world);
-        home.apply(name, edge, &*world, now)?;
-        Ok(home.get(name).map(Resource::version).expect("an applied edge leaves its resource"))
+        let name = newest_name(&home, of).ok_or_else(|| WriteError::Unknown(of.to_owned()))?;
+        home.apply(&name, edge, &*world, now)?;
+        Ok(home.get(&name).map(Resource::version).expect("an applied edge leaves its resource"))
     }
 
     /// Works out edges from `name`'s current record and the world, then
@@ -202,13 +186,14 @@ impl Convoys {
     ) -> Result<(usize, T), EditError> {
         let mut home = locked(&self.home);
         let mut world = locked(&self.world);
-        let current = home.get(name).ok_or_else(|| EditError::Unknown(name.to_owned()))?;
+        let launch = newest_name(&home, name).ok_or_else(|| EditError::Unknown(name.to_owned()))?;
+        let current = home.get(&launch).expect("the newest launch is held");
         let planned = plan(current, &mut world);
         let result = planned.map_err(EditError::Plan).and_then(|(edges, output)| {
             let mut applied = 0;
             for edge in edges {
                 let kind = format!("{:?}", edge.kind());
-                home.apply(name, edge, &*world, now).map_err(|error| match error {
+                home.apply(&launch, edge, &*world, now).map_err(|error| match error {
                     WriteError::Refused(refusal) => EditError::Refused { edge: kind, refusal, applied },
                     other => EditError::Write { error: format!("{other:?}"), applied },
                 })?;
@@ -220,6 +205,11 @@ impl Convoys {
         world.authority = Default::default();
         result
     }
+}
+
+/// The name of the newest launch of `of` held at `home`.
+fn newest_name(home: &Home<Convoy, StoreLog>, of: &str) -> Option<String> {
+    home.newest_launch(of, None).map(|launch| launch.name().to_owned())
 }
 
 /// Why [`Convoys::edit`] wrote nothing more.

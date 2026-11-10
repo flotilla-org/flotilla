@@ -299,9 +299,19 @@ pub fn create_ready_checkout(
     };
     assert_eq!(spec.target_path(), Some(fixture.path.as_str()), "a checkout is realised at its target path");
     checkouts.ensure_convoy(convoy);
-    let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy.to_owned());
-    let launch = checkouts.put_ready(&fixture.name, &spec, Some(&holder));
+    let launch = checkouts.put_ready(&fixture.name, &spec, Some(&checkouts.holder(convoy)));
     checkouts.record(&launch)
+}
+
+/// Admits a launch of engine Convoy `convoy` here unless one is held, and names it on the old
+/// record `convoy` as engine admission does. Returns the launch.
+pub async fn admit_on_engine(
+    backend: &ResourceBackend,
+    namespace: &str,
+    checkouts: &flotilla_provisioning_testkit::CheckoutFixture,
+    convoy: &str,
+) -> String {
+    checkouts.admit_for(backend, namespace, convoy, convoy).await
 }
 
 #[derive(bon::Builder)]

@@ -472,7 +472,7 @@ async fn observed_commit_resets_budget_but_refresh_does_not() {
     // The engine holds the actor's checkout for the convoy, its HEAD inspected.
     let engine = flotilla_provisioning_testkit::CheckoutFixture::default();
     let wake = ReconcilerWake::new(wake.subscriptions.with_lifecycle_reads(engine.reads_with_agent_sessions(agents())));
-    engine.open_convoy("stalled-work");
+    engine.admit_for(&backend, "flotilla", "stalled-work", "stalled-work").await;
     let launch = engine.put_ready(
         "actor-checkout",
         &CheckoutSpec::Observed(
@@ -484,7 +484,7 @@ async fn observed_commit_resets_budget_but_refresh_does_not() {
                 .is_main(false)
                 .build(),
         ),
-        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("stalled-work".into())),
+        Some(&engine.holder("stalled-work")),
     );
     let inspection =
         |head: &str| flotilla_resources::checkout_records::Inspection { head_revision: Some(head.into()), ..Default::default() };
@@ -1235,7 +1235,7 @@ async fn clone_controller_rows_judge_transient_terminal_and_exhausted_failures()
         path: "/tmp/clone".into(),
     };
     let clone = flotilla_resources::clone_records::clone_name(&repository, "delivery-env").expect("clone name");
-    engine.open_convoy("delivery");
+    engine.admit_for(&backend, "flotilla", "delivery", "delivery").await;
     engine.put_ready(
         "delivery-checkout",
         &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
@@ -1247,7 +1247,7 @@ async fn clone_controller_rows_judge_transient_terminal_and_exhausted_failures()
             // Named by its clone, the checkout reads the clone's latest launch.
             clone_ref: clone.clone(),
         }),
-        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("delivery".into())),
+        Some(&engine.holder("delivery")),
     );
     let first = clones.request(&repository, &clone_spec, false);
     let judge_clone = || async {

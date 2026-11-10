@@ -530,6 +530,16 @@ pub(in crate::in_process) fn test_engine(daemon: &InProcessDaemon) -> TestEngine
     engine
 }
 
+/// Admits a launch of engine Convoy `convoy` on `engine` and names it on the old record `convoy`
+/// in `backend`, as engine admission does: what the convoy's checkouts are held for.
+pub(in crate::in_process) async fn admit_on_engine(
+    backend: &flotilla_store::ResourceBackend,
+    engine: &flotilla_provisioning_testkit::CheckoutFixture,
+    convoy: &str,
+) -> String {
+    engine.admit_for(backend, "flotilla", convoy, convoy).await
+}
+
 /// [`TestEngine`], not installed: each fixture's `reads` serve all three.
 pub(in crate::in_process) fn engine_fixture() -> TestEngine {
     TestEngine::default()

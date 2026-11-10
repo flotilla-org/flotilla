@@ -190,19 +190,25 @@ impl EngineConvoys for ConvoyEngine {
             // Old admission read the project; the engine's gate reads that record.
             convoys.world(|world| world.projects.put(&Ref::new(project.as_str()), ()));
             if standing {
-                convoys.admit_standing(&name, request, now)
+                convoys.admit_standing(request, now)
             } else {
-                convoys.admit(&name, request, now)
+                convoys.admit(request, now)
             }
         })
         .await
         .map_err(|error| error.to_string())?;
         match admitted {
             Ok(_) => {
-                // The engine holds the promises now: drop bootstrap's seeds from the old status.
+                // The engine holds the promises now: drop bootstrap's seeds from the old status, and
+                // name the launch this generation became, which its checkouts are held for.
+                let launch = self
+                    .convoys
+                    .admitted_from(&name, &convoy.metadata.name)?
+                    .ok_or_else(|| format!("convoy `{}`: no launch admitted from it", convoy.metadata.name))?;
                 let convoys = self.backend.clone().using::<OldConvoy>(&convoy.metadata.namespace);
                 if let Err(error) =
-                    flotilla_store::apply_status_patch(&convoys, &convoy.metadata.name, &ConvoyStatusPatch::HandPromisesToEngine).await
+                    flotilla_store::apply_status_patch(&convoys, &convoy.metadata.name, &ConvoyStatusPatch::HandPromisesToEngine { launch })
+                        .await
                 {
                     tracing::warn!(convoy = %convoy.metadata.name, %error, "dropping the seeded promises from the old status failed");
                 }
@@ -437,6 +443,10 @@ impl EngineConvoys for ConvoyEngine {
         }
     }
 
+    fn launch(&self, convoy: &ResourceObject<OldConvoy>) -> Result<Option<String>, String> {
+        self.convoys.admitted_from(&map::engine_name(convoy)?, &convoy.metadata.name)
+    }
+
     async fn abandon(&self, convoy: &ResourceObject<OldConvoy>, principal: &str, reason: &str) -> Result<(), String> {
         let (name, by, reason) = (map::engine_name(convoy)?, operator(principal), reason.to_owned());
         self.edit(convoy, move |current, world| {
@@ -468,7 +478,7 @@ impl EngineConvoys for ConvoyEngine {
             None => self.convoys.get(&map::engine_name(convoy)?),
             Some(home) => self
                 .convoys
-                .replica(&map::engine_name(convoy)?, home)
+                .replica(&map::engine_name(convoy)?, &map::project(convoy)?, home)
                 .map_err(|error| format!("convoy `{}` at {home}: the engine replica did not read: {error}", convoy.metadata.name))?,
         };
         Ok(engine.map(|engine| map::old_promises(&engine, &crews(convoy))))

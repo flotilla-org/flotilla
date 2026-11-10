@@ -198,10 +198,6 @@ fn repository() -> RepositorySpec {
     RepositorySpec::remote("https://forge.example/o/widgets").expect("repository")
 }
 
-fn convoy(name: &str) -> CheckoutHolder {
-    CheckoutHolder::Convoy(name.into())
-}
-
 impl World {
     /// A decided store with its Checkout controller started over `provider`, this host's direct
     /// environment realised and a clone of the repository realised in it.
@@ -305,7 +301,7 @@ impl World {
     /// A worktree of the realised clone held for convoy `holder`, made and realised.
     async fn ready_worktree(&self, holder: &str, branch: &str) -> String {
         let clone = self.clone(true);
-        let launch = self.checkouts.request(branch, &self.worktree(&clone, branch), Some(&convoy(holder)));
+        let launch = self.checkouts.request(branch, &self.worktree(&clone, branch), Some(&self.checkouts.holder(holder)));
         self.until("ready", |world| world.ready(&launch)).await;
         launch
     }
@@ -322,7 +318,7 @@ async fn a_worktree_waits_for_its_clone_then_is_made_once() {
     let world = World::start(RecordingProvider::default());
     world.checkouts.open_convoy("c1");
     let clone = world.clone(false);
-    let launch = world.checkouts.request("feature", &world.worktree(&clone, "feature"), Some(&convoy("c1")));
+    let launch = world.checkouts.request("feature", &world.worktree(&clone, "feature"), Some(&world.checkouts.holder("c1")));
     assert_eq!(world.reading(&launch), Some(LifecycleReading::InProgress));
     assert!(world.provider.asked().worktrees.is_empty(), "untried while its clone is not realised");
     world.clones.ready(&clone, Some("main"));
@@ -340,12 +336,13 @@ async fn a_worktree_waits_for_its_clone_then_is_made_once() {
 async fn a_checkout_is_requested_only_under_an_open_convoy() {
     let world = World::start(RecordingProvider::default());
     let clone = world.clone(true);
-    let refused = world.checkouts.checkouts.request("feature", &world.worktree(&clone, "feature"), Some(&convoy("c1")));
+    let refused = world.checkouts.checkouts.request("feature", &world.worktree(&clone, "feature"), Some(&world.checkouts.holder("c1")));
     assert!(refused.is_err_and(|error| error.contains(&format!("convoy c1 {}", flotilla_resources::checkout_records::HOLDER_NOT_OPEN))));
     world.checkouts.open_convoy("c1");
     world.checkouts.abandon_convoy("c1", "deleted");
-    let refused = world.checkouts.checkouts.request("feature", &world.worktree(&clone, "feature"), Some(&convoy("c1")));
-    assert!(refused.is_err_and(|error| error.contains("convoy c1 has ended")));
+    let refused = world.checkouts.checkouts.request("feature", &world.worktree(&clone, "feature"), Some(&world.checkouts.holder("c1")));
+    let ended = format!("convoy {} has ended", world.checkouts.launch("c1"));
+    assert!(refused.is_err_and(|error| error.contains(&ended)), "{ended}");
 }
 
 // Behaviour: a convoy abandoned as deleted releases its checkout; a clean and pushed worktree is
@@ -433,7 +430,7 @@ async fn an_adopted_checkout_is_seen_and_never_removed() {
         host_ref: HOME.into(),
         is_main: false,
     });
-    let launch = world.checkouts.request("found", &spec, Some(&convoy("c1")));
+    let launch = world.checkouts.request("found", &spec, Some(&world.checkouts.holder("c1")));
     world.until("ready", |world| world.ready(&launch)).await;
     world.checkouts.abandon_convoy("c1", "deleted");
     world.until("released", |world| world.released(&launch)).await;
@@ -460,10 +457,10 @@ async fn a_local_clone_records_its_degradation_and_a_sibling_shares_its_branch()
             url: URL.into(),
         })
     };
-    let first = world.checkouts.request("first", &local("/work/c/first"), Some(&convoy("c1")));
+    let first = world.checkouts.request("first", &local("/work/c/first"), Some(&world.checkouts.holder("c1")));
     world.until("first ready", |world| world.ready(&first)).await;
     assert_eq!(world.checkouts.record(&first).degraded.as_deref(), Some("objects not shared"));
-    let second = world.checkouts.request("second", &local("/work/c/second"), Some(&convoy("c1")));
+    let second = world.checkouts.request("second", &local("/work/c/second"), Some(&world.checkouts.holder("c1")));
     world.until("second ready", |world| world.ready(&second)).await;
     let intents: Vec<String> = world.provider.asked().local_clones.iter().map(|(_, _, intent)| intent.clone()).collect();
     assert_eq!(intents, ["NewBranch", "ShareConvoyBranch"]);
@@ -515,7 +512,7 @@ fn ended_across_a_snapshot(write: impl FnOnce(&CheckoutFixture)) -> bool {
         host_ref: "alpha".into(),
         is_main: false,
     });
-    let request = request_of("found", &spec, Some(&convoy_holder()), "alpha").expect("request");
+    let request = request_of("found", &spec, Some(&CheckoutHolder::Convoy(convoy.name.clone())), "alpha").expect("request");
     alpha.inputs.stage("found", vec![ChangeItem::new(convoy.clone(), Some(read_at.to_string()))]);
     let found = alpha.lifecycles.request("found", request, Timestamp::from_datetime(&chrono::Utc::now())).expect("requested");
 
@@ -525,10 +522,6 @@ fn ended_across_a_snapshot(write: impl FnOnce(&CheckoutFixture)) -> bool {
     let held = read.resolve(convoy.kind, &convoy.name, &convoy.home).expect("resolve").expect("the convoy is held at alpha");
     assert!(read.changes(held, 0, 16).expect("entries").is_empty(), "alpha holds the convoy from a snapshot alone");
     convoy_holding(&mut read, found.name(), "alpha").expect("judged").ended
-}
-
-fn convoy_holder() -> CheckoutHolder {
-    convoy("c1")
 }
 
 // Behaviour: where the Convoy's entries after the version read were lost to a snapshot, its end
@@ -561,7 +554,7 @@ async fn a_branch_another_live_checkout_holds_is_refused() {
     let second_spec = |name: &str| {
         CheckoutSpec::Worktree(CheckoutWorktreeSpec { target_path: format!("/work/c/{name}"), ..world_worktree(&clone, "feature") })
     };
-    let second = world.checkouts.request("second", &second_spec("second"), Some(&convoy("c2")));
+    let second = world.checkouts.request("second", &second_spec("second"), Some(&world.checkouts.holder("c2")));
     world.until("refused", |world| world.reading(&second).is_some_and(|reading| matches!(reading, LifecycleReading::GaveUp { .. }))).await;
     assert!(
         gave_up_with(&world, &second, "checkout branch feature conflicts with Checkout feature; choose a fresh branch name"),
@@ -572,7 +565,7 @@ async fn a_branch_another_live_checkout_holds_is_refused() {
 
     world.checkouts.abandon_convoy("c1", "deleted");
     world.until("the first released", |world| world.released(&first)).await;
-    let third = world.checkouts.request("third", &second_spec("third"), Some(&convoy("c2")));
+    let third = world.checkouts.request("third", &second_spec("third"), Some(&world.checkouts.holder("c2")));
     world.until("third ready", |world| world.ready(&third)).await;
 }
 
@@ -601,9 +594,9 @@ async fn a_new_branch_is_validated_with_the_forge_before_it_is_made() {
     let world = World::validated(RecordingProvider::default(), validation);
     world.checkouts.open_convoy("c1");
     let clone = world.clone(true);
-    let taken = world.checkouts.request("taken", &world.worktree(&clone, "taken"), Some(&convoy("c1")));
+    let taken = world.checkouts.request("taken", &world.worktree(&clone, "taken"), Some(&world.checkouts.holder("c1")));
     world.until("refused", |world| gave_up_with(world, &taken, "conflicts with Open change request #7")).await;
-    let unknown = world.checkouts.request("unknown", &world.worktree(&clone, "unknown"), Some(&convoy("c1")));
+    let unknown = world.checkouts.request("unknown", &world.worktree(&clone, "unknown"), Some(&world.checkouts.holder("c1")));
     world.until("tried", |world| world.validation.asked.lock().expect("asked").len() == 2).await;
     world.until("retrying", |world| matches!(world.reading(&unknown), Some(LifecycleReading::Retrying { .. }))).await;
     assert!(world.provider.asked().worktrees.is_empty(), "neither was made");
@@ -647,7 +640,7 @@ async fn a_gate_inspection_is_recorded_on_the_checkouts_latest_launch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_checkout_change_wakes_the_vessels_of_its_convoy_only() {
     use flotilla_provisioning::engine::checkouts::CheckoutVesselWake;
-    use flotilla_resources::{Convoy, ConvoySpec, InputMeta, Vessel, VesselSpec};
+    use flotilla_resources::{Convoy, ConvoySpec, ConvoyStatus, InputMeta, Vessel, VesselSpec};
     use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
 
     let directory = tempfile::tempdir().expect("directory");
@@ -657,12 +650,11 @@ async fn a_checkout_change_wakes_the_vessels_of_its_convoy_only() {
     let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     for (convoy, vessel) in [("held", "held-implement"), ("other", "other-implement")] {
         let meta = |name: &str| InputMeta::builder().name(name.to_owned()).build();
-        backend
-            .clone()
-            .using::<Convoy>("flotilla")
-            .create(&meta(convoy), &ConvoySpec::builder().workflow_ref("wf".into()).build())
-            .await
-            .expect("convoy");
+        let convoys = backend.clone().using::<Convoy>("flotilla");
+        let created = convoys.create(&meta(convoy), &ConvoySpec::builder().workflow_ref("wf".into()).build()).await.expect("convoy");
+        // Each generation names the launch its checkouts are held for.
+        let status = ConvoyStatus { engine_launch: Some(checkouts.open_convoy(convoy)), ..ConvoyStatus::default() };
+        convoys.update_status(convoy, &created.metadata.resource_version, &status).await.expect("launch named");
         let spec = VesselSpec {
             convoy_ref: convoy.into(),
             vessel_name: "implement".into(),
@@ -676,8 +668,7 @@ async fn a_checkout_change_wakes_the_vessels_of_its_convoy_only() {
     // The wake follows the log from its start: let it start before the checkout changes.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    checkouts.open_convoy("held");
-    checkouts.request("feature", &CheckoutSpec::Worktree(world_worktree("clone-widgets#1", "feature")), Some(&convoy("held")));
+    checkouts.request("feature", &CheckoutSpec::Worktree(world_worktree("clone-widgets#1", "feature")), Some(&checkouts.holder("held")));
     let first = tokio::time::timeout(Duration::from_secs(5), woken.recv()).await.expect("a vessel is woken");
     assert_eq!(first.as_deref(), Some("held-implement"));
     assert!(tokio::time::timeout(Duration::from_millis(200), woken.recv()).await.is_err(), "the other convoy's vessel is not woken");

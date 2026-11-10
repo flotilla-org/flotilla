@@ -233,8 +233,9 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     }
 
     let teardown_checkout_path = if matches!(completion_action, CompletionAction::Delete) {
-        // The convoy's checkout, held for its engine Convoy.
-        let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy("convoy-a".to_string());
+        // The convoy's checkout, held for the launch its record names.
+        let convoy = convoys.get("convoy-a").await.expect("convoy");
+        let holder = flotilla_resources::convoy::engine::checkout_holder(&convoy).expect("held for its launch");
         let checkout = daemon
             .lifecycle_reads()
             .checkouts()

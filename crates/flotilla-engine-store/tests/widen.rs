@@ -230,6 +230,7 @@ fn a_table_missing_a_defaulted_column_and_a_code_is_widened() {
         replacements: 0,
     };
     let request = ConvoyRequest {
+        launch_of: "c".into(),
         workflow_ref: "w".into(),
         admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project.clone(),

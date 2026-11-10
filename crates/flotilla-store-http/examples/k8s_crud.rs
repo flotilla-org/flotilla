@@ -150,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 workflow_snapshot: None,
                 work: Default::default(),
                 crew_work: Default::default(),
+                engine_launch: None,
                 message: None,
                 started_at: None,
                 finished_at: None,

@@ -498,7 +498,7 @@ pub async fn forced_convoy_delete_retains_force_intent_until_checkout_finalizes(
     let convoy = backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await.expect("standing convoy");
     let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
     engine(&daemon).checkouts.open_convoy(&engine_convoy);
-    let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy(engine_convoy);
+    let holder = engine(&daemon).checkouts.holder(&engine_convoy);
     engine(&daemon).checkouts.put_ready(
         "checkout-at-risk",
         &ResourceCheckoutSpec::Worktree(

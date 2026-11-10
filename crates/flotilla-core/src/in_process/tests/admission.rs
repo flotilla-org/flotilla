@@ -33,7 +33,7 @@ use flotilla_admission::repository_inspection::RepositoryInspector;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::ChangeRequest;
 use flotilla_provider_runtime::available_space::AvailableSpaceProbe;
-use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecords as _, Inspection};
+use flotilla_resources::checkout_records::{CheckoutRecords as _, Inspection};
 use flotilla_store_testkit::cr_name;
 
 #[tokio::test]
@@ -414,14 +414,13 @@ async fn prepared_placement_snapshot_rejects_a_different_replica_spec() {
     assert!(driver.using::<FulfilmentKind>("flotilla").list().await.expect("driver local placement log").items.is_empty());
 }
 
-/// Convoy `name` in `backend`, and open on the engine `engine` holds checkouts for.
+/// Convoy `name` in `backend`, and open on the engine `engine` holds checkouts for, as the launch
+/// its record names.
 async fn archive_convoy(backend: &ResourceBackend, engine: &flotilla_provisioning_testkit::CheckoutFixture, name: &str) {
-    backend
-        .using::<ResourceConvoy>("flotilla")
-        .create(&test_meta(name), &ConvoySpec::builder().workflow_ref("work".into()).build())
-        .await
-        .expect("convoy");
-    engine.open_convoy(name);
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let convoy = convoys.create(&test_meta(name), &ConvoySpec::builder().workflow_ref("work".into()).build()).await.expect("convoy");
+    let status = flotilla_resources::ConvoyStatus { engine_launch: Some(engine.open_convoy(name)), ..Default::default() };
+    convoys.update_status(name, &convoy.metadata.resource_version, &status).await.expect("launch named");
 }
 
 #[tokio::test]
@@ -468,7 +467,7 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
                 host_ref: "archive-test".to_string(),
                 is_main: false,
             }),
-            Some(&CheckoutHolder::Convoy("archive-convoy".into())),
+            Some(&engine.holder("archive-convoy")),
         );
         engine.checkouts.inspected(&launch, Inspection { pushed: Some(pushed), ..Default::default() }).expect("inspection");
         if stale {
@@ -528,7 +527,7 @@ async fn abandon_archive_names_replica_checkouts_left_to_their_own_host() {
             host_ref: "feta".into(),
             is_main: false,
         }),
-        Some(&CheckoutHolder::Convoy("archive-convoy".into())),
+        Some(&feta_checkouts.holder("archive-convoy")),
     );
 
     let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.unwrap();
@@ -589,7 +588,7 @@ async fn abandon_archive_pushes_only_checkout_with_commits_beyond_base() {
                 host_ref: "archive-test".into(),
                 is_main: false,
             }),
-            Some(&CheckoutHolder::Convoy("archive-convoy".into())),
+            Some(&engine.holder("archive-convoy")),
         );
     }
     let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.unwrap();
@@ -635,7 +634,7 @@ async fn abandon_archive_of_a_checkout_in_an_unreachable_environment_names_it_an
                 .clone_ref("clone".to_string())
                 .build(),
         ),
-        Some(&CheckoutHolder::Convoy("archive-convoy".into())),
+        Some(&engine.holder("archive-convoy")),
     );
 
     let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.unwrap();
@@ -696,11 +695,14 @@ async fn host_direct_checkout_on_the_daemon_host_is_archived_and_passes_delete_i
         .update_status(
             "governor",
             &convoy.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus { phase: flotilla_resources::ConvoyPhase::Active, ..Default::default() },
+            &flotilla_resources::ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                engine_launch: Some(engine.open_convoy("governor")),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
-    engine.open_convoy("governor");
     engine.put_ready(
         "governor-checkout",
         &ResourceCheckoutSpec::Worktree(
@@ -713,7 +715,7 @@ async fn host_direct_checkout_on_the_daemon_host_is_archived_and_passes_delete_i
                 .clone_ref("clone".to_string())
                 .build(),
         ),
-        Some(&CheckoutHolder::Convoy("governor".into())),
+        Some(&engine.holder("governor")),
     );
 
     let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "governor").await.unwrap();

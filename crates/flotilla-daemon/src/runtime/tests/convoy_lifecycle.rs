@@ -674,8 +674,15 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
         )
         .await
         .expect("create authority convoy");
+    // The engine holds the adopted checkout for the convoy at checkout host B; the convoy
+    // authority A reads B's records as B's log reaches it (one store here).
+    let at_checkout_host = flotilla_provisioning_testkit::CheckoutFixture::at("checkout-root");
+    let at_authority = flotilla_provisioning_testkit::CheckoutFixture::over("authority-root", Arc::clone(&at_checkout_host.store));
+    authority_daemon.install_lifecycle_reads(at_authority.reads.clone()).expect("authority engine reads");
+    let launch = at_checkout_host.open_convoy("cross-host");
     let mut landing_status = ConvoyStatus {
         phase: ConvoyPhase::Landing,
+        engine_launch: Some(launch),
         workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
             cascade: None,
             stall_nudges: Default::default(),
@@ -713,12 +720,6 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
         .expect("replicate Landing convoy to checkout host");
 
     let git_repo = TestGitRepo::init(temp.path().join("checkout")).with_initial_commit();
-    // The engine holds the adopted checkout for the convoy at checkout host B; the convoy
-    // authority A reads B's records as B's log reaches it (one store here).
-    let at_checkout_host = flotilla_provisioning_testkit::CheckoutFixture::at("checkout-root");
-    let at_authority = flotilla_provisioning_testkit::CheckoutFixture::over("authority-root", Arc::clone(&at_checkout_host.store));
-    authority_daemon.install_lifecycle_reads(at_authority.reads.clone()).expect("authority engine reads");
-    at_checkout_host.open_convoy("cross-host");
     let spec = CheckoutSpec::Observed(ResourceObservedCheckoutSpec {
         r#ref: "feature/cross-host".to_string(),
         path: git_repo.path().display().to_string(),
@@ -726,11 +727,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
         host_ref: "checkout-host".to_string(),
         is_main: false,
     });
-    let launch = at_checkout_host.put_ready(
-        "checkout-b",
-        &spec,
-        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("cross-host".to_string())),
-    );
+    let launch = at_checkout_host.put_ready("checkout-b", &spec, Some(&at_checkout_host.holder("cross-host")));
 
     // #3710: the PR observation is replicated before checkout inspection; gh
     // supplies only merge time/base metadata, never the landing state or SHA.

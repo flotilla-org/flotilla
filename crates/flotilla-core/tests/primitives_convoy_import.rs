@@ -293,7 +293,7 @@ fn an_open_stall_becomes_the_seats_stall_record() {
     // The import writes the record beside the convoy, Open, and the rehearsal reads it back.
     assert_eq!(rehearse(std::slice::from_ref(&convoy)), Vec::new());
     // Numeric engine IDs are internal to the promise table. A carried stall
-    // names a seat and a message, so folding must not rewrite either reference.
+    // names a seat and a message, so a standing generation's import rewrites neither.
     let mut standing = old.clone();
     standing.spec.role = "coder".into();
     standing.spec.generation = 2;
@@ -348,9 +348,9 @@ fn the_import_is_one_change_at_the_convoys_time() {
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     let mut store =
         flotilla_schema_sqlite::Store::open(connection, HOME, flotilla_engine_store::registry().expect("registry")).expect("store");
-    flotilla_core::primitives::convoy_import::write(&mut store, &convoy).expect("written");
+    let written = flotilla_core::primitives::convoy_import::write(&mut store, &convoy).expect("written");
     let mut read = store.read().expect("read");
-    let id = read.resolve(Resource::<Engine>::CODE, "c", HOME).expect("resolve").expect("created");
+    let id = read.resolve(Resource::<Engine>::CODE, written.name(), HOME).expect("resolve").expect("created");
     let events = read.changes(id, 0, 10).expect("log");
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0].cause, Cause::Create));
@@ -432,10 +432,12 @@ fn several_convoys_rehearse_at_one_home() {
     assert_eq!(rehearse(&convoys), Vec::new());
 }
 
-// Seat growth folds old per-generation records into one stable engine identity.
+// Behaviour: each standing generation is its own convoy, a launch of the role's engine name. The
+// live generation imports with its own promise ids and is numbered by the home sequence its
+// create takes; an ended one stays on the old store, as any ended convoy does.
 #[test]
-fn standing_generations_fold_into_one_stable_convoy() {
-    use flotilla_core::primitives::convoy_import::rehearse_all;
+fn a_standing_generation_imports_as_a_launch_of_its_role() {
+    use flotilla_core::primitives::convoy_import::{rehearse_all, write};
     let mut old = convoy("governor-1", ConvoyPhase::Landed, vec![agent("governor", true)]);
     let mut live = convoy("governor-2", ConvoyPhase::Active, vec![agent("governor", true)]);
     for (generation, record) in [(1, &mut old), (2, &mut live)] {
@@ -446,14 +448,24 @@ fn standing_generations_fold_into_one_stable_convoy() {
     let report = rehearse_all([&live, &old], HOME, &[], &World { standing_ruled: true });
     assert!(report.refused.is_empty(), "{:?}", report.refused);
     assert!(report.rehearsal.is_empty(), "{:?}", report.rehearsal);
-    assert_eq!(report.imported.len(), 1);
-    assert_eq!(report.folded_generations, 1);
-    let imported = &report.imported[0];
-    assert_eq!(imported.resource.name(), "project:fleet/convoy:governor");
-    assert_eq!(imported.history.previous_generations, vec!["governor-1"]);
+    assert_eq!(report.stays_old.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["governor-1"]);
+    let [imported] = &report.imported[..] else { panic!("one generation imports: {:?}", report.imported) };
+    assert_eq!(imported.resource.spec().launch_of, "project:fleet/convoy:governor");
     assert_eq!(imported.resource.spec().seats.len(), 1);
-    // Each generation is its own convoy: the live one's promise ids are its own.
     assert_eq!(imported.resource.spec().promises.iter().next().unwrap().record.id.0, 0);
+    // The launch names the generation it was imported from: the record whose checkouts it holds.
+    assert_eq!(imported.record, "governor-2");
+    let document = AdmissionDocument::decode("governor", imported.resource.spec().admission.value().bytes()).expect("admission document");
+    assert_eq!(document.admitted_from.as_deref(), Some("governor-2"));
+
+    let connection = rusqlite::Connection::open_in_memory().expect("connection");
+    let mut store =
+        flotilla_schema_sqlite::Store::open(connection, HOME, flotilla_engine_store::registry().expect("registry")).expect("store");
+    let written = write(&mut store, imported).expect("written");
+    // The import's change takes sequence 1 and the create 2, the launch's number.
+    assert_eq!(written.name(), "project:fleet/convoy:governor#2");
+    assert_eq!(written.spec().launch, 2);
+
     live.spec.generation = 1;
     let duplicate = rehearse_all([&live, &old], HOME, &[], &World { standing_ruled: true });
     assert!(duplicate.imported.is_empty());
@@ -461,7 +473,7 @@ fn standing_generations_fold_into_one_stable_convoy() {
 }
 
 #[test]
-fn standing_fold_refuses_an_earlier_live_generation() {
+fn a_standing_import_refuses_an_earlier_live_generation() {
     let mut old = convoy("governor-1", ConvoyPhase::Active, vec![agent("governor", true)]);
     let mut live = convoy("governor-2", ConvoyPhase::Active, vec![agent("governor", true)]);
     for (generation, record) in [(1, &mut old), (2, &mut live)] {
@@ -477,5 +489,10 @@ fn standing_fold_refuses_an_earlier_live_generation() {
     live.status.as_mut().unwrap().phase = ConvoyPhase::Landed;
     let report = rehearse_all([&old, &live], HOME, &[], &World { standing_ruled: true });
     assert!(report.imported.is_empty());
-    assert!(matches!(&report.refused[..], [ConvoyImportRefusal::Unmappable { reason, .. }] if reason.contains("earlier live generation")));
+    assert!(matches!(&report.refused[..], [ConvoyImportRefusal::Unmappable { reason, .. }] if reason.contains("still live")));
+    // Two live generations: the earlier would be a second open convoy of the role.
+    live.status.as_mut().unwrap().phase = ConvoyPhase::Active;
+    let report = rehearse_all([&old, &live], HOME, &[], &World { standing_ruled: true });
+    assert!(report.imported.is_empty());
+    assert!(matches!(&report.refused[..], [ConvoyImportRefusal::Unmappable { reason, .. }] if reason.contains("still live")));
 }

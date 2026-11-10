@@ -91,7 +91,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
         .expect("clone request");
     // The convoy's checkout, held for its engine Convoy, made from the clone.
     let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
-    engine.checkouts.open_convoy(&engine_convoy);
+    engine.checkouts.admit_for(&backend, NAMESPACE, &engine_convoy, &convoy.metadata.name).await;
     engine.checkouts.request(
         "clone-failure-checkout",
         &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
@@ -102,7 +102,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
             target_path: temp.path().join("checkout").display().to_string(),
             clone_ref: launch.clone(),
         }),
-        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(engine_convoy)),
+        Some(&engine.checkouts.holder(&engine_convoy)),
     );
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {

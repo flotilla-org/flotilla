@@ -63,7 +63,7 @@ impl Aggregator {
     }
     /// The checkouts the engine holds for `convoy`, at every home, by checkout name (#3108).
     pub(super) fn held_checkouts(&self, convoy: &ResourceObject<Convoy>) -> HeldCheckouts {
-        let holder = CheckoutHolder::Convoy(flotilla_resources::convoy::engine::engine_name(convoy)?);
+        let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(convoy) else { return Ok(BTreeMap::new()) };
         Ok(latest_launches(self.lifecycle_reads.checkouts()?.held(&holder)?))
     }
 }

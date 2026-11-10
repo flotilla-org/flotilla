@@ -157,7 +157,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkWorkFailed { .. } => PatchKind::ConvoyMarkWorkFailed,
         ConvoyStatusPatch::MarkWorkCancelled { .. } => PatchKind::ConvoyMarkWorkCancelled,
         ConvoyStatusPatch::MarkConvoyAbandoned { .. } => PatchKind::ConvoyMarkConvoyAbandoned,
-        ConvoyStatusPatch::Promise { .. } | ConvoyStatusPatch::ObservePromise { .. } | ConvoyStatusPatch::HandPromisesToEngine => {
+        ConvoyStatusPatch::Promise { .. } | ConvoyStatusPatch::ObservePromise { .. } | ConvoyStatusPatch::HandPromisesToEngine { .. } => {
             PatchKind::ConvoyPromise
         }
         ConvoyStatusPatch::MarkCrewCompleted { .. } => PatchKind::ConvoyMarkCrewCompleted,
@@ -283,6 +283,7 @@ fn active_convoy_status() -> ConvoyStatus {
             "implement".to_string(),
             BTreeMap::from([("coder".to_string(), crew_state(CrewWorkPhase::Working, Some(ts(10)), None))]),
         )]),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(10)),
         finished_at: None,

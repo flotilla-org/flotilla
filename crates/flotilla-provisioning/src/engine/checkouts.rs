@@ -545,8 +545,7 @@ impl flotilla_store::controller::SecondaryWatch for CheckoutRepositoryWake {
     }
 }
 
-/// The old convoys whose engine Convoy is among `holders`, by name: a finite convoy's own name,
-/// a standing convoy's generations by their shared engine name.
+/// The old convoys whose engine launch is among `holders`: each generation by the launch it became.
 async fn holder_convoys(
     backend: &flotilla_store::ResourceBackend,
     namespace: &str,
@@ -559,8 +558,8 @@ async fn holder_convoys(
         .items
         .into_iter()
         .filter(|convoy| {
-            holders.contains(&convoy.object.metadata.name)
-                || flotilla_resources::convoy::engine::engine_name(&convoy.object).is_ok_and(|name| holders.contains(&name))
+            flotilla_resources::convoy::engine::checkout_holder(&convoy.object)
+                .is_some_and(|CheckoutHolder::Convoy(launch)| holders.contains(&launch))
         })
         .map(|convoy| convoy.object.metadata.name)
         .collect())
@@ -577,8 +576,8 @@ async fn changed_holders(watch: &mut super::watch::EngineWatch) -> Result<std::c
 }
 
 /// Wakes the vessels of the convoy a checkout is held for when it changes: a vessel waits for its
-/// convoy's checkouts to be ready, and reads their paths (#3108). The holder is the engine Convoy,
-/// which a standing convoy's generations share; each generation's vessels are woken.
+/// convoy's checkouts to be ready, and reads their paths (#3108). The holder is the engine launch,
+/// one per generation; that generation's vessels are woken.
 #[derive(Clone)]
 pub struct CheckoutVesselWake {
     service: Arc<flotilla_schema_sqlite::stream::Service>,

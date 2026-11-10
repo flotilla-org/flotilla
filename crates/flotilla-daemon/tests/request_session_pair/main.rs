@@ -2660,7 +2660,7 @@ async fn active_convoy_delete_names_the_host_owning_an_unreachable_checkout_envi
     let owning_daemon = flotilla_provisioning_testkit::other_home_for(&decided, &owner_home);
     let checkouts = flotilla_provisioning_testkit::CheckoutFixture::over(owning_daemon.home(), owning_daemon.service().store());
     let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
-    checkouts.open_convoy(&engine_convoy);
+    checkouts.admit_for(&home, namespace, &engine_convoy, convoy_name).await;
     checkouts.put_ready(
         "checkout-remote",
         &CheckoutSpec::Worktree(
@@ -2672,7 +2672,7 @@ async fn active_convoy_delete_names_the_host_owning_an_unreachable_checkout_envi
                 .clone_ref("clone".into())
                 .build(),
         ),
-        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(engine_convoy)),
+        Some(&checkouts.holder(&engine_convoy)),
     );
     owning_daemon.replicate_to(&decided);
     apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, topology.follower_host.clone()).await;

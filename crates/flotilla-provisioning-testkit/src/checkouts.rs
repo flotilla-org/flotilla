@@ -124,9 +124,9 @@ impl CheckoutFixture {
         )
     }
 
-    /// Admits engine Convoy `name` here, open, its one obligation the lead's lifetime duty: what a
-    /// checkout held for it is requested under.
-    pub fn open_convoy(&self, name: &str) {
+    /// Admits a launch of engine Convoy `name` here, open, its one obligation the lead's lifetime
+    /// duty: what a checkout held for it is requested under. Returns the launch's name.
+    pub fn open_convoy(&self, name: &str) -> String {
         let seat = Seat {
             role: "lead".into(),
             seat: String::new(),
@@ -137,6 +137,7 @@ impl CheckoutFixture {
             replacements: 0,
         };
         let request = ConvoyRequest {
+            launch_of: name.into(),
             workflow_ref: "w".into(),
             admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
             project: Address::project(PROJECT).expect("project"),
@@ -147,26 +148,52 @@ impl CheckoutFixture {
             priority: Priority(1),
             kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
         };
-        self.convoys.lock().expect("convoys").create(name, request, &convoy_world(), Self::now()).expect("convoy admitted");
+        let mut convoys = self.convoys.lock().expect("convoys");
+        convoys.create(name, request, &convoy_world(), Self::now()).expect("convoy admitted");
+        convoys.newest_launch(name, None).expect("convoy admitted").name().to_owned()
     }
 
-    /// Admits engine Convoy `name` here unless it is held already, as admission does once for a
-    /// convoy whose vessels follow.
-    pub fn ensure_convoy(&self, name: &str) {
-        if self.convoys.lock().expect("convoys").get(name).is_none() {
-            self.open_convoy(name);
-        }
+    /// Admits a launch of engine Convoy `of` here unless one is held, and names it on old convoy
+    /// `record` in `backend` as engine admission does: what that convoy's checkouts are held for.
+    /// Returns the launch.
+    pub async fn admit_for(&self, backend: &flotilla_store::ResourceBackend, namespace: &str, of: &str, record: &str) -> String {
+        let launch = self.ensure_convoy(of);
+        let convoys = backend.clone().using::<flotilla_resources::Convoy>(namespace);
+        let current = convoys.get(record).await.expect("convoy");
+        let status = flotilla_resources::ConvoyStatus { engine_launch: Some(launch.clone()), ..current.status.clone().unwrap_or_default() };
+        convoys.update_status(record, &current.metadata.resource_version, &status).await.expect("launch named");
+        launch
     }
 
-    /// Readmits engine Convoy `name` with one more standard vessel: a write that ends nothing.
+    /// The newest launch of engine Convoy `name` here; `name` itself, which names no launch, when
+    /// none is held.
+    pub fn launch(&self, name: &str) -> String {
+        self.convoys.lock().expect("convoys").newest_launch(name, None).map_or_else(|| name.to_owned(), |launch| launch.name().to_owned())
+    }
+
+    /// The holder of checkouts held for engine Convoy `name`'s newest launch here.
+    pub fn holder(&self, name: &str) -> CheckoutHolder {
+        CheckoutHolder::Convoy(self.launch(name))
+    }
+
+    /// Admits engine Convoy `name` here unless a launch is held already, as admission does once
+    /// for a convoy whose vessels follow. Returns the launch's name.
+    pub fn ensure_convoy(&self, name: &str) -> String {
+        let held = self.convoys.lock().expect("convoys").newest_launch(name, None).map(|launch| launch.name().to_owned());
+        held.unwrap_or_else(|| self.open_convoy(name))
+    }
+
+    /// Readmits the newest launch of engine Convoy `name` with one more standard vessel: a write that ends nothing.
     pub fn readmit_convoy(&self, name: &str) {
         let readmit =
             Readmit { quota: [(VesselClass::new("standard"), 2)].into_iter().collect(), by: lead(), authority: Ref::new(AUTHORITY) };
-        self.convoys.lock().expect("convoys").apply(name, readmit, &convoy_world(), Self::now()).expect("convoy readmitted");
+        let launch = self.launch(name);
+        self.convoys.lock().expect("convoys").apply(&launch, readmit, &convoy_world(), Self::now()).expect("convoy readmitted");
     }
 
-    /// The engine Convoy `name`'s version here, and its identity.
+    /// The newest launch of engine Convoy `name`: its version here, and its identity.
     pub fn convoy_version(&self, name: &str) -> (Identity, u64) {
+        let name = &self.launch(name);
         let mut store = self.store.lock().expect("store");
         let mut read = store.read().expect("read");
         let code = <Resource<Convoy> as Kind>::CODE;
@@ -175,18 +202,20 @@ impl CheckoutFixture {
         (Identity { kind: code, name: loaded.name, home: loaded.home }, loaded.version)
     }
 
-    /// Ends engine Convoy `name` as delivered: its lead's duty retired, nothing holds it open.
+    /// Ends the newest launch of engine Convoy `name` as delivered: its lead's duty retired, nothing holds it open.
     pub fn deliver_convoy(&self, name: &str) {
+        let name = &self.launch(name);
         let mut convoys = self.convoys.lock().expect("convoys");
         let retire = RetireDuty { duty: DUTY, by: lead(), authority: Ref::new(AUTHORITY) };
         convoys.apply(name, retire, &convoy_world(), Self::now()).expect("duty retired");
         convoys.apply(name, Deliver { disposition: "merged".into() }, &convoy_world(), Self::now()).expect("convoy delivered");
     }
 
-    /// Ends engine Convoy `name` as abandoned by the operator, for `reason`.
+    /// Ends the newest launch of engine Convoy `name` as abandoned by the operator, for `reason`.
     pub fn abandon_convoy(&self, name: &str, reason: &str) {
         let abandon = Abandon { by: lead(), cause: AbandonCause::Operator, reason: reason.into(), authority: Ref::new(AUTHORITY) };
-        self.convoys.lock().expect("convoys").apply(name, abandon, &convoy_world(), Self::now()).expect("convoy abandoned");
+        let launch = self.launch(name);
+        self.convoys.lock().expect("convoys").apply(&launch, abandon, &convoy_world(), Self::now()).expect("convoy abandoned");
     }
 
     fn now() -> Timestamp {

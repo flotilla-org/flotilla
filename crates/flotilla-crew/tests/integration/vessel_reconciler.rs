@@ -8,9 +8,9 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use common::{
-    create_convoy_with_single_task, create_docker_kind, create_host_direct_kind, create_kind, create_ready_checkout, create_ready_clone,
-    create_ready_docker_environment, create_ready_host_direct_environment, create_workspace, meta, vessel_meta, work_state,
-    DockerKindFixture, ReadyCheckoutFixture,
+    admit_on_engine, create_convoy_with_single_task, create_docker_kind, create_host_direct_kind, create_kind, create_ready_checkout,
+    create_ready_clone, create_ready_docker_environment, create_ready_host_direct_environment, create_workspace, meta, vessel_meta,
+    work_state, DockerKindFixture, ReadyCheckoutFixture,
 };
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
@@ -111,7 +111,7 @@ async fn landed_convoy_does_not_recreate_a_missing_checkout() {
     convoys.update_status("convoy-landed", &convoy.metadata.resource_version, &status).await.expect("mark landed");
     create_host_direct_kind(&backend, NAMESPACE, "policy-landed", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/tmp/convoy-landed");
-    lease_engine.checkouts.ensure_convoy("convoy-landed");
+    admit_on_engine(&backend, NAMESPACE, &lease_engine.checkouts, "convoy-landed").await;
     let vessel =
         create_workspace(&backend, NAMESPACE, "convoy-landed-implement", "convoy-landed", "implement", "policy-landed", REPO_URL).await;
 
@@ -349,14 +349,14 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
     let review =
         create_workspace(&backend, NAMESPACE, "workspace-shared-review", "convoy-shared", "review", "policy-shared", REPO_URL).await;
 
-    lease_engine.checkouts.ensure_convoy("convoy-shared");
+    let shared = admit_on_engine(&backend, NAMESPACE, &lease_engine.checkouts, "convoy-shared").await;
 
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let implement_deps = reconciler.prepare(&implement).await.expect("implement dependencies");
     reconciler.reconcile(&implement, &implement_deps, Utc::now());
     let requested = requested_checkouts(lease_engine);
     let checkout = requested.get("checkout-convoy-shared").expect("first vessel should request the shared checkout");
-    assert_eq!(checkout.holder, Some(CheckoutHolder::Convoy("convoy-shared".into())), "held for the convoy, not the vessel");
+    assert_eq!(checkout.holder, Some(CheckoutHolder::Convoy(shared)), "held for the convoy's launch, not the vessel");
     assert_eq!(requested.len(), 1);
     let launch = checkout.name.clone();
     lease_engine.checkouts.ready(&launch, None);
@@ -396,7 +396,7 @@ async fn stuck_provisioning_vessel_surfaces_the_statusless_checkout_it_is_retryi
     create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone");
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     let vessel = create_workspace(&backend, NAMESPACE, "workspace-stuck", "convoy-stuck", "implement", "policy-stuck", REPO_URL).await;
-    lease_engine.checkouts.ensure_convoy("convoy-stuck");
+    admit_on_engine(&backend, NAMESPACE, &lease_engine.checkouts, "convoy-stuck").await;
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&vessel).await.expect("initial dependencies");
     reconciler.reconcile(&vessel, &deps, Utc::now());
@@ -448,8 +448,8 @@ async fn unrelated_convoys_with_the_same_branch_use_distinct_worktree_paths() {
     let first = create_workspace(&backend, NAMESPACE, "workspace-one", "convoy-one", "implement", "policy-shared-branch", REPO_URL).await;
     let second = create_workspace(&backend, NAMESPACE, "workspace-two", "convoy-two", "implement", "policy-shared-branch", REPO_URL).await;
 
-    lease_engine.checkouts.ensure_convoy("convoy-one");
-    lease_engine.checkouts.ensure_convoy("convoy-two");
+    admit_on_engine(&backend, NAMESPACE, &lease_engine.checkouts, "convoy-one").await;
+    admit_on_engine(&backend, NAMESPACE, &lease_engine.checkouts, "convoy-two").await;
     let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     reconciler.prepare(&first).await.expect("first dependencies");
     reconciler.prepare(&second).await.expect("second dependencies");
@@ -623,7 +623,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         )
         .await
         .expect("vessel should create");
-    lease_engine.checkouts.ensure_convoy("convoy-multi");
+    admit_on_engine(&backend, NAMESPACE, &lease_engine.checkouts, "convoy-multi").await;
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
 
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
@@ -1049,7 +1049,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .await
         .expect("vessel should create");
 
-    lease_engine.checkouts.ensure_convoy("convoy-scoped");
+    admit_on_engine(&backend, NAMESPACE, &lease_engine.checkouts, "convoy-scoped").await;
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     reconciler.reconcile(&vessel, &deps, Utc::now());
@@ -1288,7 +1288,7 @@ async fn a_cloud_vessel_clones_below_the_workspace_root_and_crews_run_at_the_rec
             reconciler.reconcile(vessel, &deps, Utc::now())
         }
     };
-    lease_engine.checkouts.ensure_convoy("convoy-cloud");
+    admit_on_engine(&backend, NAMESPACE, &lease_engine.checkouts, "convoy-cloud").await;
     let outcome = reconcile(&vessel).await;
     let requested = requested_checkouts(lease_engine);
     let (name, checkout) = requested
@@ -1424,7 +1424,7 @@ async fn reuses_existing_clone_by_deterministic_name() {
         create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone");
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-b", "convoy-b", "implement", "policy-a", REPO_URL).await;
 
-    lease_engine.checkouts.ensure_convoy("convoy-b");
+    admit_on_engine(&backend, NAMESPACE, &lease_engine.checkouts, "convoy-b").await;
     let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
@@ -1462,7 +1462,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
 
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     lease_engine.lease("workspace-c", "convoy-c", HOST_REF);
-    lease_engine.checkouts.ensure_convoy("convoy-c");
+    admit_on_engine(&backend, NAMESPACE, &lease_engine.checkouts, "convoy-c").await;
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
     let requested = requested_checkouts(lease_engine);

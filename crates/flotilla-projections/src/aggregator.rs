@@ -59,7 +59,7 @@ use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer,
 mod convoy_inputs;
 use convoy_inputs::ConvoyInputs;
 mod readiness;
-use flotilla_resources::checkout_records::{latest_launches, CheckoutHolder};
+use flotilla_resources::checkout_records::latest_launches;
 use readiness::{apply_readiness_event, next_checkout_change, readiness_resources, HeldCheckouts};
 
 type RepositorySourceKey = (String, String, Option<flotilla_protocol::NodeId>);
@@ -6697,6 +6697,8 @@ mod tests {
                     vessels: vec![definition],
                 }),
                 work,
+                // Admitted on the engine: its checkouts are held for this launch.
+                engine_launch: Some("convoy-a#1".to_string()),
                 ..Default::default()
             }),
         }

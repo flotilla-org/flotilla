@@ -32,42 +32,49 @@ fn retired_seats_keep_their_names_and_replicas_follow_seat_edges() {
         retired: false,
         replacements: 0,
     };
-    home.create(
-        name,
-        ConvoyRequest {
-            workflow_ref: "w".into(),
-            admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
-            project,
-            priority: Priority(0),
-            kinds: Frozen::new(PromiseKinds::default()).unwrap(),
-            seats: vec![seat(&a, None), seat(&b, Some(a.clone())), seat(&child, Some(b.clone()))],
-            promises: BTreeMap::from([(
-                PromiseId(9),
-                AdmittedPromise {
-                    label: "old".into(),
-                    kind: "opaque".into(),
-                    target: address.clone(),
-                    source: PromiseSource::Crew,
-                    owner: b.clone(),
-                },
-            )]),
-            duties: BTreeMap::from([
-                (DutyId(0), Duty { owner: a.clone(), scope: DutyScope::Lifetime, terms: Terms::default() }),
-                (
-                    DutyId(1),
-                    Duty {
+    // The create names the launch: `<name>#<n>`.
+    let launched = home
+        .create(
+            name,
+            ConvoyRequest {
+                launch_of: name.into(),
+                workflow_ref: "w".into(),
+                admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
+                project,
+                priority: Priority(0),
+                kinds: Frozen::new(PromiseKinds::default()).unwrap(),
+                seats: vec![seat(&a, None), seat(&b, Some(a.clone())), seat(&child, Some(b.clone()))],
+                promises: BTreeMap::from([(
+                    PromiseId(9),
+                    AdmittedPromise {
+                        label: "old".into(),
+                        kind: "opaque".into(),
+                        target: address.clone(),
+                        source: PromiseSource::Crew,
                         owner: b.clone(),
-                        scope: DutyScope::WhileOpen { promises: BTreeSet::from([PromiseId(9)]) },
-                        terms: Terms::default(),
                     },
-                ),
-            ]),
-            quota: BTreeMap::new(),
-        },
-        &world,
-        Timestamp(0),
-    )
-    .unwrap();
+                )]),
+                duties: BTreeMap::from([
+                    (DutyId(0), Duty { owner: a.clone(), scope: DutyScope::Lifetime, terms: Terms::default() }),
+                    (
+                        DutyId(1),
+                        Duty {
+                            owner: b.clone(),
+                            scope: DutyScope::WhileOpen { promises: BTreeSet::from([PromiseId(9)]) },
+                            terms: Terms::default(),
+                        },
+                    ),
+                ]),
+                quota: BTreeMap::new(),
+            },
+            &world,
+            Timestamp(0),
+        )
+        .unwrap()
+        .resource
+        .name()
+        .to_owned();
+    let name = launched.as_str();
     home.apply(name, ReplaceSeat(a.clone()), &world, Timestamp(1)).unwrap();
     home.apply(
         name,

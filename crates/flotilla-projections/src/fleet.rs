@@ -9,7 +9,7 @@ use flotilla_protocol::{
     NodeId, PeerConnectionState,
 };
 use flotilla_resources::canonical_placement_host_ref_from_sources;
-use flotilla_resources::checkout_records::{latest_launches, CheckoutHolder};
+use flotilla_resources::checkout_records::latest_launches;
 use flotilla_resources::LifecycleAuthority;
 use flotilla_resources::{
     crew_attention, Host as ResourceHost, HostStatus as ResourceHostStatus, ReadResourceObject, ResourceProvenance,
@@ -242,8 +242,8 @@ impl FleetService {
                 if !crewed.contains(&convoy.metadata.name) {
                     continue;
                 }
-                let held =
-                    latest_launches(checkouts.held(&CheckoutHolder::Convoy(flotilla_resources::convoy::engine::engine_name(&convoy)?))?);
+                let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(&convoy) else { continue };
+                let held = latest_launches(checkouts.held(&holder)?);
                 let authority = if held.values().any(|checkout| matches!(checkout.spec, flotilla_resources::CheckoutSpec::Observed(_))) {
                     Some(LifecycleAuthority::Adopted)
                 } else {

@@ -358,6 +358,7 @@ pub fn request(convoy: &ResourceObject<OldConvoy>) -> Result<ConvoyRequest, Stri
     let kinds = Catalog::resolve(&stock(), &[]).and_then(|catalog| catalog.freeze(used)).map_err(|error| error.to_string())?;
     let (workflow_ref, admission) = admission(convoy)?;
     Ok(ConvoyRequest {
+        launch_of: engine_name(convoy)?,
         workflow_ref,
         admission,
         project: project(convoy)?,
@@ -393,6 +394,7 @@ pub fn admission(convoy: &ResourceObject<OldConvoy>) -> Result<(String, Frozen<A
         adopted_checkout_refs: spec.adopted_checkout_refs.clone(),
         subjects: spec.declared_subjects()?,
         instruction: spec.instruction.clone(),
+        admitted_from: Some(name.clone()),
     };
     let bytes = document.encode().map_err(|error| format!("convoy {name}: {error}"))?;
     let admission = Frozen::new(AdmissionBytes::new(bytes)).map_err(|error| format!("convoy {name}: admission document: {error}"))?;

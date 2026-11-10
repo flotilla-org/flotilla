@@ -534,7 +534,7 @@ fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel
             .await
             .unwrap();
         if checkout_present {
-            engine.open_convoy("merged");
+            engine.admit_for(&backend, "flotilla", "merged", "merged").await;
             engine.put_ready(
                 "checkout",
                 &CheckoutSpec::Observed(
@@ -546,7 +546,7 @@ fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel
                         .is_main(false)
                         .build(),
                 ),
-                Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("merged".into())),
+                Some(&engine.holder("merged")),
             );
         }
 
@@ -609,7 +609,7 @@ fn landing_digest_evidence_obligations_follow_observations(tc: hegel::TestCase) 
             },
         )
         .await;
-        engine.open_convoy("digest");
+        engine.admit_for(&backend, "flotilla", "digest", "digest").await;
         let launch = engine.put_ready(
             "digest-checkout",
             &CheckoutSpec::Observed(
@@ -621,7 +621,7 @@ fn landing_digest_evidence_obligations_follow_observations(tc: hegel::TestCase) 
                     .is_main(false)
                     .build(),
             ),
-            Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("digest".into())),
+            Some(&engine.holder("digest")),
         );
         let convoys = backend.using::<Convoy>("flotilla");
         for step in steps {
@@ -687,7 +687,7 @@ fn landing_digest_evidence_obligations_follow_observations(tc: hegel::TestCase) 
                     .is_main(false)
                     .build(),
             ),
-            Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("digest".into())),
+            Some(&engine.holder("digest")),
         );
         let objects = HashMap::from([("digest".into(), convoys.get("digest").await.unwrap())]);
         wake.sync_rows("flotilla", &objects).await.unwrap();

@@ -200,7 +200,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     // observed store, and removes an adopted projection whose launch has ended.
     let engine = flotilla_daemon_testkit::engine::runtime_checkouts(&daemon);
     engine.open_convoy("ship-it");
-    let ship_it = flotilla_resources::checkout_records::CheckoutHolder::Convoy("ship-it".to_string());
+    let ship_it = engine.holder("ship-it");
     let host_ref = daemon.local_host_id().expect("local host id").to_string();
     let adopted = |branch: &str, path: &str| {
         CheckoutSpec::Observed(

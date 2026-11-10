@@ -57,7 +57,7 @@ use crate::{
     },
     host_registry::HostCounts,
 };
-use flotilla_resources::checkout_records::{latest_launches, CheckoutHolder};
+use flotilla_resources::checkout_records::latest_launches;
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
     explain_unmet_expectation, resolve_convoy_candidate_indices, ConvoyAddressIdentity, LeafFiringRecord, LeafSubscriptionRow, LeafWatcher,
@@ -1316,11 +1316,10 @@ impl ReadProjections<'_> {
         let change_request_stale_after = self.leaf_subscriptions.change_request_stale_after();
 
         // The convoy's checkouts as the engine holds them, across homes (#3108).
-        let selected_checkouts = self
-            .lifecycles
-            .checkouts()?
-            .held(&CheckoutHolder::Convoy(flotilla_resources::convoy::engine::engine_name(&convoy)?))
-            .map(latest_launches)?;
+        let selected_checkouts = match flotilla_resources::convoy::engine::checkout_holder(&convoy) {
+            Some(holder) => self.lifecycles.checkouts()?.held(&holder).map(latest_launches)?,
+            None => BTreeMap::new(),
+        };
         let vessel_sources = self
             .backend
             .query_declared::<Vessel>(

@@ -70,7 +70,7 @@ async fn branch_discovery_ignores_preexisting_terminal_request() {
 // operator's unlink wins over rediscovery.
 #[tokio::test]
 async fn inspected_change_request_is_discovered_and_unlink_wins() {
-    use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecords as _, Inspection};
+    use flotilla_resources::checkout_records::{CheckoutRecords as _, Inspection};
     let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
     let engine = &fixture.engine.checkouts;
     let backend = fixture.daemon.resource_backend();
@@ -94,7 +94,7 @@ async fn inspected_change_request_is_discovered_and_unlink_wins() {
         )
         .await
         .expect("convoy");
-    engine.open_convoy("switch-work");
+    super::support::admit_on_engine(&backend, engine, "switch-work").await;
     let launch = engine.put_ready(
         "switch-checkout",
         &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
@@ -104,7 +104,7 @@ async fn inspected_change_request_is_discovered_and_unlink_wins() {
             host_ref: "test-host".into(),
             is_main: false,
         }),
-        Some(&CheckoutHolder::Convoy("switch-work".into())),
+        Some(&engine.holder("switch-work")),
     );
     engine.checkouts.inspected(&launch, Inspection { change_request: Some(8), ..Default::default() }).expect("inspection");
     // The forge observation of #8 finds it open.

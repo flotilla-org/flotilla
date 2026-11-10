@@ -294,7 +294,7 @@ async fn resume_reads_environment_lifecycle_without_a_copy() {
 #[tokio::test]
 async fn teardown_reads_checkout_endings_from_the_engine() {
     use flotilla_provisioning_testkit::{CheckoutFixture, Ending};
-    use flotilla_resources::{checkout_records::CheckoutHolder, CheckoutSpec, CheckoutWorktreeSpec, RepositoryKey};
+    use flotilla_resources::{CheckoutSpec, CheckoutWorktreeSpec, RepositoryKey};
 
     for ending in [Ending::Released, Ending::Lost("/work"), Ending::GaveUp("failure")] {
         let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
@@ -312,7 +312,7 @@ async fn teardown_reads_checkout_endings_from_the_engine() {
                 target_path: "/work".into(),
                 clone_ref: "source".into(),
             }),
-            Some(&CheckoutHolder::Convoy("crew".into())),
+            Some(&engine.holder("crew")),
         );
         assert!(crew.verify_convoy_teardown_gate_for_checkouts(&convoy, &[engine.record(&launch)], false).await.is_err());
         let gave_up = matches!(ending, Ending::GaveUp(_));

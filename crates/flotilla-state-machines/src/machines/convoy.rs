@@ -342,12 +342,29 @@ impl<'de> Deserialize<'de> for AdmissionBytes {
 }
 
 /// What admission fixes, and the records edges change. It declares the
-/// stored Convoy (kind code `cv`), indexed for a project's open convoys.
-/// Subjects, seats and promises are records in the order they arrived, so a
-/// row's position is fixed for the convoy's life.
+/// stored Convoy (kind code `cv`), indexed for a project's open convoys and
+/// for a name's launches. Subjects, seats and promises are records in the
+/// order they arrived, so a row's position is fixed for the convoy's life.
+///
+/// Each convoy is a launch named `<launch_of>#<n>` ([`Machine::launch`]): a
+/// finite convoy is the one launch of its name, and each generation of a
+/// standing role is the next launch of the role's name, so a generation is a
+/// convoy of its own and the newest launch is the current one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
-#[store(kind = "Convoy", code = "cv", state = ConvoyState, index(name = "open_by_project", eq(project), when(state in [Open])))]
+#[store(
+    kind = "Convoy",
+    code = "cv",
+    state = ConvoyState,
+    index(name = "open_by_project", eq(project), when(state in [Open])),
+    // A name's launches in launch order: the newest is the last.
+    index(name = "by_launch", eq(project, launch_of), order(launch))
+)]
 pub struct ConvoySpec {
+    /// The name this is a launch of, interned (domain `ln`).
+    #[store(intern = "ln")]
+    pub launch_of: String,
+    /// The home sequence the launch's create took; 0 until its log numbers it.
+    pub launch: u64,
     /// The workflow template admission resolved.
     #[store(intern = "wf")]
     pub workflow_ref: String,
@@ -480,6 +497,8 @@ pub struct AdmittedPromise {
 /// as lists of pairs, since a frozen document's map keys are text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyRequest {
+    /// The name the convoy is a launch of; its log numbers the launch.
+    pub launch_of: String,
     /// The workflow template the caller resolved.
     pub workflow_ref: String,
     /// The caller's admission document, stored as given.
@@ -990,6 +1009,14 @@ impl Machine for Convoy {
     type Refusal = ConvoyRefusal;
     type World = dyn ConvoyWorld;
 
+    fn launch(spec: &ConvoySpec) -> Option<(&str, u64)> {
+        Some((&spec.launch_of, spec.launch))
+    }
+
+    fn numbered(spec: ConvoySpec, launch: u64) -> ConvoySpec {
+        ConvoySpec { launch, ..spec }
+    }
+
     fn definition() -> MachineDef<Self> {
         use ConvoyLabel::*;
         MachineDef::new(Open)
@@ -1185,6 +1212,8 @@ impl Machine for Convoy {
         }
         let now = admission.now();
         let mut spec = ConvoySpec {
+            launch_of: request.launch_of,
+            launch: 0,
             workflow_ref: request.workflow_ref,
             admission: request.admission,
             project: request.project,

@@ -708,6 +708,7 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
         .collect();
     seats.sort_by_key(|seat| seat.parent.is_some());
     ConvoyRequest {
+        launch_of: "c".into(),
         workflow_ref: "w".into(),
         admission: flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new()))
             .expect("freeze"),

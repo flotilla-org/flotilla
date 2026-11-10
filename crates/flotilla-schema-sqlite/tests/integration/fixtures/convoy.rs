@@ -104,6 +104,8 @@ pub fn spec(tc: &TestCase, pick: Pick) -> ConvoySpec {
         }
     }
     ConvoySpec {
+        launch_of: name(tc),
+        launch: version(tc),
         workflow_ref: name(tc),
         admission: Frozen::new(AdmissionBytes::new(name(tc).into_bytes())).expect("freeze"),
         project: address(tc),
@@ -175,6 +177,8 @@ pub fn sample() -> Resource<Convoy> {
     };
     promises.append(0, promise).expect("room");
     let spec = ConvoySpec {
+        launch_of: "c".into(),
+        launch: 1,
         workflow_ref: "w".into(),
         admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: "project:p".parse().expect("address"),

@@ -1082,6 +1082,10 @@ pub struct ConvoyStatus {
     /// ADR 0061. Remove decoder default one roll after introduction (ADR 0047).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub promises: BTreeMap<String, BTreeMap<String, Vec<promises::Promise>>>,
+    /// The engine Convoy launch (`<launch_of>#<n>`) this generation became at admission: what its
+    /// checkouts are held for. `None` until the engine admits it. Goes with this kind (#3108).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_launch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1823,8 +1827,11 @@ pub enum ConvoyStatusPatch {
     },
     /// The engine admitted the convoy and now holds its promises (#3587
     /// layer 8): the declarations bootstrap seeded are dropped, so no reader
-    /// or recheck sees a stale copy. Written once, at engine admission.
-    HandPromisesToEngine,
+    /// or recheck sees a stale copy. Written once, at engine admission, with
+    /// the launch admission made of this generation.
+    HandPromisesToEngine {
+        launch: String,
+    },
     HoldTurnDelivery {
         source: String,
         hold: ConvoyAttention,
@@ -2096,7 +2103,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
         Some(match self {
             Self::Promise { .. } => "Promise",
             Self::ObservePromise { .. } => "ObservePromise",
-            Self::HandPromisesToEngine => "HandPromisesToEngine",
+            Self::HandPromisesToEngine { .. } => "HandPromisesToEngine",
             Self::HoldTurnDelivery { .. } => "HoldTurnDelivery",
             Self::RestoreTurnActivation { .. } => "RestoreTurnActivation",
             Self::ObserveEnvironment { .. } => "ObserveEnvironment",
@@ -2218,7 +2225,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::ObservePromise { vessel, role, operation } => {
                 promises::apply(status, vessel, role, operation);
             }
-            Self::HandPromisesToEngine => status.promises.clear(),
+            Self::HandPromisesToEngine { launch } => {
+                status.promises.clear();
+                status.engine_launch = Some(launch.clone());
+            }
             Self::DiscoverSubjects { subjects, source, at } => {
                 for (subject, relationship) in subjects {
                     status.discover_subject(subject.clone(), *relationship, *source, *at);

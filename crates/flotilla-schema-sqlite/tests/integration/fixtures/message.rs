@@ -41,6 +41,7 @@ pub fn body(tc: &TestCase, pick: Pick) -> Frozen<MessageBody> {
     let body = match pick.variant(tc, 2, |index| index) {
         0 => MessageBody::Text(text(tc)),
         _ => MessageBody::Request(RequestBody::Convoy(Box::new(ConvoyRequest {
+            launch_of: name(tc),
             workflow_ref: name(tc),
             admission: Frozen::new(AdmissionBytes::new(name(tc).into_bytes())).expect("freeze"),
             project: address(tc),

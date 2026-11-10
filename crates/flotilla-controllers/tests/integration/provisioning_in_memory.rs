@@ -18,7 +18,7 @@ use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_protocol::LifecycleReading;
 use flotilla_provisioning::{engine::checkouts::CheckoutVesselWake, reconcilers::CloneRuntime};
 use flotilla_provisioning_testkit::clones::{MadeCheckouts, RunningClones};
-use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecords as _};
+use flotilla_resources::checkout_records::CheckoutRecords as _;
 use flotilla_resources::clone_records::CloneRecords;
 use flotilla_resources::terminal_records::{TerminalLaunchFacts, TerminalRecords as _};
 use flotilla_resources::{
@@ -90,7 +90,7 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
         .expect("destination should start without the convoy repository");
     create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "kind-a", repository_url).await;
 
-    engine.checkouts.ensure_convoy("convoy-a");
+    common::admit_on_engine(&backend, NAMESPACE, &engine.checkouts, "convoy-a").await;
     let harness = full_controller_harness(backend.clone(), &engine);
 
     let workspaces = backend.clone().using::<Vessel>(NAMESPACE);
@@ -166,7 +166,7 @@ async fn a_project_gaining_a_member_leaves_a_running_convoys_checkouts_unchanged
         .expect("project create");
     create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "kind-a", repository_url).await;
 
-    engine.checkouts.ensure_convoy("convoy-a");
+    common::admit_on_engine(&backend, NAMESPACE, &engine.checkouts, "convoy-a").await;
     let harness = full_controller_harness(backend.clone(), &engine);
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     harness
@@ -304,7 +304,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
     )
     .await;
 
-    engine.checkouts.ensure_convoy("convoy-multi");
+    common::admit_on_engine(&backend, NAMESPACE, &engine.checkouts, "convoy-multi").await;
     let harness = full_controller_harness(backend.clone(), &engine);
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     harness
@@ -408,7 +408,7 @@ async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
             target_path: "/Users/alice/dev/flotilla.fix-clone-failed-latch".to_string(),
             clone_ref: launch.clone(),
         }),
-        Some(&CheckoutHolder::Convoy("convoy-new-demand".to_string())),
+        Some(&engine.checkouts.holder("convoy-new-demand")),
     );
 
     harness
@@ -449,7 +449,7 @@ async fn vessel_controller_finalizer_preserves_the_convoys_checkout() {
             target_path: "/Users/alice/dev/flotilla-repos/workspace-delete".to_string(),
             clone_ref: "clone-a".to_string(),
         }),
-        Some(&CheckoutHolder::Convoy("convoy-delete".to_string())),
+        Some(&engine.holder("convoy-delete")),
     );
     let workspaces = backend.clone().using::<Vessel>(NAMESPACE);
     let mut harness = ControllerLoopHarness::new(backend.clone());

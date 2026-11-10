@@ -13,7 +13,7 @@ use flotilla_resources::checkout_integration::remote_ref_for_branch;
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, leaf_for, record_name, subject_address},
-    checkout_records::{latest_launches, CheckoutChange, CheckoutHolder, CheckoutRecord},
+    checkout_records::{latest_launches, CheckoutChange, CheckoutRecord},
     clone_records::{launched, CloneChange, CloneRecord},
     instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest, CheckoutSpec,
     ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyPhase, CrewWorkPhase, Forge, InstantiatedExit, LeafMaker, ResourceError,
@@ -575,13 +575,15 @@ impl ReconcilerWake {
                     episode_key: EpisodeKeyFields::default(),
                 });
             }
-            let checkouts = {
-                let holder = CheckoutHolder::Convoy(flotilla_resources::convoy::engine::engine_name(convoy)?);
-                let reads = Arc::clone(&self.subscriptions.inner.lifecycle_reads);
-                let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
-                    .await
-                    .map_err(|error| format!("held checkouts: {error}"))??;
-                latest_launches(held)
+            let checkouts = match flotilla_resources::convoy::engine::checkout_holder(convoy) {
+                Some(holder) => {
+                    let reads = Arc::clone(&self.subscriptions.inner.lifecycle_reads);
+                    let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
+                        .await
+                        .map_err(|error| format!("held checkouts: {error}"))??;
+                    latest_launches(held)
+                }
+                None => BTreeMap::new(),
             };
             inputs.extend(checkouts.keys().map(|name| checkout_dependency(name)));
             // A worktree's clone stands as a controller row while the engine's reading of it is a

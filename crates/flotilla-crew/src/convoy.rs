@@ -76,9 +76,10 @@ pub struct ConvoyPrepared {
     engine_refusal: Option<String>,
     /// The convoy with the engine's promises, when the engine holds it.
     viewed: Option<ResourceObject<Convoy>>,
-    /// The engine holds the convoy, yet the stored status still has the
-    /// promises bootstrap seeded: admission's hand-over did not land.
-    stale_seeds: bool,
+    /// The engine holds the convoy as this launch, yet the stored status still
+    /// has the promises bootstrap seeded or names no launch: admission's
+    /// hand-over did not land.
+    unhanded: Option<String>,
     /// A crew's derived Done waits on its undelivered turn (#3894).
     turn_hold: bool,
 }
@@ -430,14 +431,12 @@ impl SecondaryWatch for EngineConvoyWake {
 }
 
 impl ConvoyReconciler {
-    /// The checkouts held for `obj`'s engine Convoy, at any home, each its latest launch.
+    /// The checkouts held for `obj`'s engine launch, at any home, each its latest launch.
     async fn held_checkouts(
         &self,
         obj: &ResourceObject<Convoy>,
     ) -> Result<BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>, ResourceError> {
-        let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy(
-            flotilla_resources::convoy::engine::engine_name(obj).map_err(ResourceError::other)?,
-        );
+        let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(obj) else { return Ok(BTreeMap::new()) };
         let reads = Arc::clone(&self.lifecycle_reads);
         let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
             .await
@@ -505,7 +504,13 @@ impl Reconciler for ConvoyReconciler {
             Some(_) => Some(viewed(&self.engine, obj).map_err(ResourceError::other)?.into_owned()),
             None => None,
         };
-        let stale_seeds = engine.is_some() && obj.status.as_ref().is_some_and(|status| !status.promises.is_empty());
+        // The hand-over has not landed while bootstrap's seeds stay, or the launch is unnamed.
+        let unhanded = match (engine, obj.status.as_ref()) {
+            (Some(engine), Some(status)) if !status.promises.is_empty() || status.engine_launch.is_none() => {
+                engine.launch(obj).map_err(ResourceError::other)?
+            }
+            _ => None,
+        };
         let obj = viewed.as_ref().unwrap_or(obj);
         let capacity_wait = if obj.status.as_ref().is_none_or(|status| {
             status.provisioning.is_none_or(|state| state == flotilla_resources::convoy::ConvoyProvisioningState::NotStarted)
@@ -784,7 +789,7 @@ impl Reconciler for ConvoyReconciler {
             capacity_wait,
             engine_refusal,
             viewed: viewed.clone(),
-            stale_seeds,
+            unhanded,
             turn_hold,
         })
     }
@@ -877,10 +882,10 @@ impl Reconciler for ConvoyReconciler {
                 requeue_after: None,
             };
         }
-        if prepared.stale_seeds {
+        if let Some(launch) = &prepared.unhanded {
             // Retry the hand-over: the engine holds the promises, not the old status.
             return ControllerReconcileOutcome {
-                patch: Some(ConvoyStatusPatch::HandPromisesToEngine),
+                patch: Some(ConvoyStatusPatch::HandPromisesToEngine { launch: launch.clone() }),
                 actuations: Vec::new(),
                 requeue_after: None,
             };
@@ -960,27 +965,24 @@ impl Reconciler for ConvoyReconciler {
         if let Some(vessels) = &self.vessels {
             delete_lifecycle_owned_matching(vessels, &selector).await?;
         }
-        // A finite convoy's checkouts are held for it alone: the Checkout controller releases them
-        // once its engine Convoy has ended, and the convoy waits for that. A standing convoy's
-        // generations share their holder, which outlives this generation.
-        if !is_ensured(obj) {
-            let remaining = self
-                .held_checkouts(obj)
-                .await?
-                .into_values()
-                .filter(|checkout| !checkout.ended() && !matches!(checkout.spec, CheckoutSpec::Observed(_)))
-                .map(|checkout| FinalizerWaitReason::CheckoutAuthority {
-                    message: match &checkout.reading {
-                        flotilla_protocol::LifecycleReading::Retrying { cause, .. }
-                        | flotilla_protocol::LifecycleReading::Exhausted { cause } => Some(cause.clone()),
-                        _ => None,
-                    },
-                    checkout: checkout.checkout_name().to_owned(),
-                })
-                .collect::<Vec<_>>();
-            if !remaining.is_empty() {
-                return Err(ResourceError::FinalizerWait { reasons: remaining });
-            }
+        // A convoy's checkouts are held for its own launch, a standing role's generation included:
+        // the Checkout controller releases them once that launch has ended, and the convoy waits.
+        let remaining = self
+            .held_checkouts(obj)
+            .await?
+            .into_values()
+            .filter(|checkout| !checkout.ended() && !matches!(checkout.spec, CheckoutSpec::Observed(_)))
+            .map(|checkout| FinalizerWaitReason::CheckoutAuthority {
+                message: match &checkout.reading {
+                    flotilla_protocol::LifecycleReading::Retrying { cause, .. }
+                    | flotilla_protocol::LifecycleReading::Exhausted { cause } => Some(cause.clone()),
+                    _ => None,
+                },
+                checkout: checkout.checkout_name().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        if !remaining.is_empty() {
+            return Err(ResourceError::FinalizerWait { reasons: remaining });
         }
         if let Some(collector) = &self.prepared_snapshot_gc {
             collector.collect(Some(&obj.metadata.name)).await?;

@@ -81,6 +81,7 @@ fn promise() -> AdmittedPromise {
 /// A convoy whose seat `coder` owns promise 0 and a lifetime duty.
 fn convoy_request() -> ConvoyRequest {
     ConvoyRequest {
+        launch_of: "c".into(),
         workflow_ref: "w".into(),
         admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project(),
@@ -166,7 +167,7 @@ fn resources_survive_the_codec() {
     round_trip(&sessions, "s");
 
     let mut convoys = Home::<Convoy>::new("home").expect("valid");
-    convoys.create("c", convoy_request(), &convoy_world(), Timestamp(2)).expect("created");
+    let c = convoys.create("c", convoy_request(), &convoy_world(), Timestamp(2)).expect("created").resource.name().to_owned();
     let submit = Submit {
         promise: PromiseId(0),
         by: SeatName::new("coder", ""),
@@ -174,11 +175,11 @@ fn resources_survive_the_codec() {
         revision: "abc".into(),
         durable: Ref::new("yes"),
     };
-    convoys.apply("c", submit, &convoy_world(), Timestamp(3)).expect("submitted");
+    convoys.apply(&c, submit, &convoy_world(), Timestamp(3)).expect("submitted");
     let keep =
         Keep::Verdict { promise: PromiseId(0), by: SeatName::new("operator", ""), authority: Authority::Operator, reason: "r".into() };
-    convoys.apply("c", keep, &convoy_world(), Timestamp(4)).expect("kept");
-    let convoy = round_trip(&convoys, "c");
+    convoys.apply(&c, keep, &convoy_world(), Timestamp(4)).expect("kept");
+    let convoy = round_trip(&convoys, &c);
     assert_eq!((convoy.version(), convoy.since()), (Version(3), Timestamp(2)), "a records edge keeps since");
     assert_eq!(convoy.spec().promises.get(flotilla_schema::Position(0)).expect("row").record.submissions.len(), 1);
 
@@ -304,12 +305,12 @@ fn a_resources_edge_moves_since_only_with_the_label() {
     let mut request = convoy_request();
     request.promises.clear();
     let world = convoy_world();
-    home.create("c", request, &world, Timestamp(1)).expect("created");
-    let created = home.get("c").expect("exists").stored_state().clone();
+    let c = home.create("c", request, &world, Timestamp(1)).expect("created").resource.name().to_owned();
+    let created = home.get(&c).expect("exists").stored_state().clone();
 
     let retire = RetireDuty { duty: DutyId(0), by: SeatName::new("coder", ""), authority: Ref::new("yes") };
-    let event = home.apply("c", retire, &world, Timestamp(5)).expect("retired");
-    let resource = home.get("c").expect("exists");
+    let event = home.apply(&c, retire, &world, Timestamp(5)).expect("retired");
+    let resource = home.get(&c).expect("exists");
     let edge = resource.stored_edge(&created, &event).expect("edge");
     assert_eq!(resource.since(), Timestamp(1), "a data-only edge keeps since");
     let kept = resource.stored_state().clone();
@@ -328,8 +329,8 @@ fn a_resources_edge_moves_since_only_with_the_label() {
     );
     assert_eq!(parts.event.arguments::<ConvoyEdge>().expect("arguments"), event.arguments.edge);
 
-    let event = home.apply("c", Deliver { disposition: "merged".into() }, &world, Timestamp(8)).expect("delivered");
-    let resource = home.get("c").expect("exists");
+    let event = home.apply(&c, Deliver { disposition: "merged".into() }, &world, Timestamp(8)).expect("delivered");
+    let resource = home.get(&c).expect("exists");
     let edge = resource.stored_edge(&kept, &event).expect("edge");
     assert_eq!(resource.stored_state(), &State::new(resource.state().clone(), Timestamp(8)), "a label change moves since");
     let parts = edge.into_parts();
@@ -439,6 +440,8 @@ fn convoy_and_awaiting_reply_round_trip() {
     subjects.append(1, SubjectLink { subject: project(), source: LinkSource::Claim, unlinked: true }).expect("room");
     subjects.append(2, SubjectLink { subject: project(), source: LinkSource::Relay, unlinked: false }).expect("room");
     let spec = ConvoySpec {
+        launch_of: "c".into(),
+        launch: 1,
         workflow_ref: "w".into(),
         admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project(),

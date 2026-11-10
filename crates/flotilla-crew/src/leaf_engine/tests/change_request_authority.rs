@@ -62,7 +62,7 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
     // The remote host's checkout, which the engine holds for the convoy at that host, inspected
     // there: not landed, its branch associated with change request 1364 (#3108).
     let remote_checkouts = flotilla_provisioning_testkit::CheckoutFixture::at("remote-root");
-    remote_checkouts.open_convoy("cross-host");
+    remote_checkouts.admit_for(&authority, "flotilla", "cross-host", "cross-host").await;
     let launch = remote_checkouts.put_ready(
         "remote-checkout",
         &CheckoutSpec::Observed(ObservedCheckoutSpec {
@@ -72,7 +72,7 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
             host_ref: "remote".to_string(),
             is_main: false,
         }),
-        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("cross-host".to_string())),
+        Some(&remote_checkouts.holder("cross-host")),
     );
     let inspection =
         flotilla_resources::checkout_records::Inspection { landed: Some(false), change_request: Some(1364), ..Default::default() };

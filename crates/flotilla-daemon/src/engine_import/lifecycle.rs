@@ -76,18 +76,17 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
             engine_name(&convoy.object).ok().map(|name| ((convoy.home.clone(), convoy.object.metadata.name.clone()), name))
         })
         .collect();
-    // Each checkout is created under the engine Convoy its convoy imported as, at the convoy's
-    // home. One whose convoy was not imported (ended, or staying on the old store) is not: nothing
-    // would release it.
+    // Each checkout is held for the launch its convoy's record imported as, at the convoy's home,
+    // created under that launch's version. One whose convoy was not imported (ended, or staying on
+    // the old store) is not: nothing would release it.
     let convoy_code = <Resource<EngineConvoy> as Kind>::CODE;
     for record in
         source.owned::<Checkout>("checkouts", namespace, "Checkout", target, report).into_iter().map(|record| (record.object, record.home))
     {
         let convoy_home = record.0.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).unwrap_or(&record.1).clone();
         let holder = |old: &str| {
-            let name = aliases.get(&(convoy_home.clone(), old.to_owned()))?;
-            let version = carried.convoys.get(&(convoy_home.clone(), name.clone()))?;
-            Some((Identity { kind: convoy_code, name: name.clone(), home: convoy_home.clone() }, *version))
+            let (launch, version) = carried.convoys.get(&(convoy_home.clone(), old.to_owned()))?;
+            Some((Identity { kind: convoy_code, name: launch.clone(), home: convoy_home.clone() }, *version))
         };
         if record.0.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| holder(convoy).is_none()) {
             *report.dropped.entry(("Checkout", "held for a convoy that was not imported")).or_default() += 1;
