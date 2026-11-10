@@ -17,6 +17,54 @@ use crate::{
 
 type ChildKey = (String, String);
 
+/// The first retry delay of a child whose collection failed, doubling to [`RETRY_CAP`].
+const RETRY_BASE: Duration = Duration::from_secs(1);
+const RETRY_CAP: Duration = Duration::from_secs(60);
+/// Failed collections of one child before it is left until its owner or it changes again.
+const RETRY_LIMIT: u32 = 10;
+
+/// Children whose collection failed, each with its failures so far and when it is next tried.
+#[derive(Default)]
+struct Retries {
+    due: HashMap<(ChildKey, OwnerReference), (u32, tokio::time::Instant)>,
+}
+
+impl Retries {
+    /// Counts a failed collection of `child` for `owner`, and schedules it again unless it has
+    /// failed [`RETRY_LIMIT`] times.
+    fn failed(&mut self, child: ChildKey, owner: OwnerReference, error: &ResourceError) {
+        let key = (child, owner);
+        let failures = self.due.get(&key).map_or(0, |(failures, _)| *failures) + 1;
+        if failures >= RETRY_LIMIT {
+            self.due.remove(&key);
+            tracing::error!(kind = %key.0 .0, name = %key.0 .1, owner = %key.1.name, %error, failures, "owner garbage collection of a child failed; left until it changes");
+            return;
+        }
+        tracing::warn!(kind = %key.0 .0, name = %key.0 .1, owner = %key.1.name, %error, failures, "owner garbage collection of a child failed; retrying");
+        let delay = RETRY_BASE.saturating_mul(1 << failures.min(6)).min(RETRY_CAP);
+        self.due.insert(key, (failures, tokio::time::Instant::now() + delay));
+    }
+
+    /// A child seen changing starts its count again.
+    fn changed(&mut self, child: &ChildKey) {
+        self.due.retain(|(held, _), _| held != child);
+    }
+
+    fn next(&self) -> Option<tokio::time::Instant> {
+        self.due.values().map(|(_, at)| *at).min()
+    }
+
+    /// The children due to be tried again; each stays held until it succeeds or runs out.
+    fn ready(&self) -> Vec<(ChildKey, OwnerReference)> {
+        let now = tokio::time::Instant::now();
+        self.due.iter().filter(|(_, (_, at))| *at <= now).map(|(key, _)| key.clone()).collect()
+    }
+
+    fn succeeded(&mut self, child: ChildKey, owner: OwnerReference) {
+        self.due.remove(&(child, owner));
+    }
+}
+
 #[derive(Default)]
 struct ControlledChildren {
     by_owner: HashMap<OwnerReference, HashSet<ChildKey>>,
@@ -86,12 +134,15 @@ impl OwnerGarbageCollector {
         Self { backend, namespace: namespace.into() }
     }
 
-    /// Relist recovery for restart, expired watches, and failed deletion attempts.
+    /// Relist recovery, run at start once every watch is established.
     pub async fn sweep(&self) -> Result<(), ResourceError> {
         collect_owned_resources(&self.backend, &self.namespace, None).await
     }
 
-    pub async fn run(&self, backstop_interval: Duration) -> Result<(), ResourceError> {
+    /// Collects children as their owners are deleted. A failed collection is retried with
+    /// backoff up to [`RETRY_LIMIT`] times; a closed or failed watch ends the run, for the
+    /// supervisor to restart it with a fresh startup sweep.
+    pub async fn run(&self) -> Result<(), ResourceError> {
         let mut watches = SelectAll::new();
         let mut children = ControlledChildren::default();
         // Establish every watch before recovery, so deletes during the sweep
@@ -114,13 +165,20 @@ impl OwnerGarbageCollector {
                     .boxed(),
             );
         }
-        // The interval's immediate first tick performs startup recovery after
-        // all watches are established. Delaying that tick would skip recovery.
-        let mut backstop = tokio::time::interval(backstop_interval);
-        backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Startup recovery, after every watch is established.
+        self.sweep().await?;
+        let mut retries = Retries::default();
         loop {
+            let next = retries.next();
             tokio::select! {
-                _ = backstop.tick() => self.sweep().await?,
+                () = async { match next { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
+                    for ((kind, name), owner) in retries.ready() {
+                        match collect_indexed_child(&self.backend, &self.namespace, &kind, &name, &owner).await {
+                            Ok(()) => retries.succeeded((kind, name), owner),
+                            Err(error) => retries.failed((kind, name), owner, &error),
+                        }
+                    }
+                }
                 event = watches.next() => {
                     let event = event.ok_or_else(|| ResourceError::other("owner garbage collector watches closed"))??;
                     let object = &event["object"];
@@ -131,8 +189,11 @@ impl OwnerGarbageCollector {
                         Some("ADDED" | "MODIFIED") => {
                             let kind = field(&object["kind"])?;
                             let name = field(&object["metadata"]["name"])?;
+                            retries.changed(&(kind.clone(), name.clone()));
                             for owner in children.record(object)? {
-                                collect_indexed_child(&self.backend, &self.namespace, &kind, &name, &owner).await?;
+                                if let Err(error) = collect_indexed_child(&self.backend, &self.namespace, &kind, &name, &owner).await {
+                                    retries.failed((kind.clone(), name.clone()), owner, &error);
+                                }
                             }
                         }
                         Some("DELETED") => {
@@ -144,7 +205,10 @@ impl OwnerGarbageCollector {
                             let owner = OwnerReference { api_version: field(&object["apiVersion"])?, kind, name, controller: true };
                             if let Some(affected) = children.by_owner.get(&owner) {
                                 for (kind, name) in affected.clone() {
-                                    collect_indexed_child(&self.backend, &self.namespace, &kind, &name, &owner).await?;
+                                    retries.changed(&(kind.clone(), name.clone()));
+                                    if let Err(error) = collect_indexed_child(&self.backend, &self.namespace, &kind, &name, &owner).await {
+                                        retries.failed((kind, name), owner.clone(), &error);
+                                    }
                                 }
                             }
                         }
@@ -203,7 +267,7 @@ mod tests {
         hosts.create(&orphan, &HostSpec::default()).await.expect("create startup orphan");
         let mut watch = hosts.watch(WatchStart::Now).await.expect("watch marker");
         let collector = OwnerGarbageCollector::new(backend, "gc-leaf-list-test");
-        let task = tokio::spawn(async move { collector.run(Duration::from_secs(3600)).await });
+        let task = tokio::spawn(async move { collector.run().await });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if matches!(watch.next().await.expect("watch open").expect("watch event"), WatchEvent::Deleted(object) if object.metadata.name == "startup-orphan") {
@@ -211,6 +275,17 @@ mod tests {
                 }
             }
         }).await.expect("startup sweep");
+        // The startup sweep deletes that orphan part-way through its lists. A marker made now is
+        // collected from its watch event, which the collector reads only once the sweep is done.
+        orphan.name = "after-sweep-orphan".to_string();
+        hosts.create(&orphan, &HostSpec::default()).await.expect("create sweep marker");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(watch.next().await.expect("watch open").expect("watch event"), WatchEvent::Deleted(object) if object.metadata.name == "after-sweep-orphan") {
+                    break;
+                }
+            }
+        }).await.expect("startup sweep finished");
         let before = GC_FULL_KIND_LISTS.load(Ordering::Relaxed);
         hosts.delete("leaf").await.expect("delete leaf");
         orphan.name = "after-leaf-orphan".to_string();

@@ -103,13 +103,8 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         )
         .with_provisioning_lifecycles(Some(provisioning)),
     );
-    let controller_handles = spawn_controller_loops(
-        Arc::clone(&state),
-        NAMESPACE,
-        Duration::from_secs(3600),
-        ControllerSupervision::default(),
-        RuntimeHealth::default(),
-    );
+    let controller_handles =
+        spawn_controller_loops(Arc::clone(&state), NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
     // Startup realises the host's environment before work arrives. Nothing holds a host-direct
     // environment, so its realisation wakes no vessel: one placed before it waits for the resync.
     let host_environment = profile.host_direct_environment_name();

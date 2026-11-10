@@ -42,7 +42,7 @@ pub async fn start(backend: &ResourceBackend) -> tokio::task::JoinHandle<Result<
     let mut watch = backend.using::<Host>(NS).watch(WatchStart::Now).await.expect("watch startup");
     create(backend, meta("startup-orphan", Some("missing"))).await;
     let collector = OwnerGarbageCollector::new(backend.clone(), NS);
-    let mut task = tokio::spawn(async move { collector.run(Duration::from_secs(3600)).await });
+    let mut task = tokio::spawn(async move { collector.run().await });
     // Startup recovery deletes this marker only after all watches are established.
     tokio::select! {
         _ = deleted(&mut watch, "startup-orphan") => {},

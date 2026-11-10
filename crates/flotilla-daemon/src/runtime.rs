@@ -733,15 +733,9 @@ impl StartupRestoration {
         controller_tasks.push(AbortOnDropHandle::new(spawn_environment_orphan_sweep_task(Arc::clone(state))));
         controller_tasks.push(AbortOnDropHandle::new(remotes::spawn_remote_probe_task(Arc::clone(state), remotes::REMOTE_PROBE_INTERVAL)));
         controller_tasks.extend(
-            spawn_controller_loops(
-                Arc::clone(state),
-                &options.namespace,
-                options.controller_resync_interval,
-                options.controller_supervision.clone(),
-                runtime_health.clone(),
-            )
-            .into_iter()
-            .map(AbortOnDropHandle::new),
+            spawn_controller_loops(Arc::clone(state), &options.namespace, options.controller_supervision.clone(), runtime_health.clone())
+                .into_iter()
+                .map(AbortOnDropHandle::new),
         );
         // The guards abort all owned controllers when shutdown cancels restoration.
         futures::future::pending::<Result<(), ResourceError>>().await
@@ -785,7 +779,6 @@ impl Drop for DaemonRuntime {
 fn spawn_controller_loops(
     state: Arc<ControllerRuntimeState>,
     namespace: &str,
-    controller_resync_interval: Duration,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
 ) -> Vec<JoinHandle<()>> {
@@ -843,7 +836,7 @@ fn spawn_controller_loops(
     let gc = tokio::spawn(async move {
         supervise_controller("owner_gc", gc_supervision, gc_health, move || {
             let collector = flotilla_store::OwnerGarbageCollector::new(gc_backend.clone(), gc_namespace.clone());
-            async move { collector.run(controller_resync_interval).await }
+            async move { collector.run().await }
         })
         .await;
     });
@@ -1047,7 +1040,7 @@ fn spawn_controller_loops(
             namespace_string.clone(),
             supervision.clone(),
             runtime_health.clone(),
-            move |_backend, namespace| account_access::run_provision_controller(Arc::clone(&state), namespace, controller_resync_interval),
+            move |_backend, namespace| account_access::run_provision_controller(Arc::clone(&state), namespace),
         )
     });
     // #3964: each access's delivery status, removed with its place or convoy.

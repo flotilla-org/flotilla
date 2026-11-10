@@ -38,13 +38,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     .with_provisioning_lifecycles(Some(provisioning));
     state.local_core_count = || Ok(std::num::NonZeroUsize::new(32).expect("32 cores"));
     let state = Arc::new(state);
-    let controller_handles = spawn_controller_loops(
-        Arc::clone(&state),
-        NAMESPACE,
-        Duration::from_millis(20),
-        ControllerSupervision::default(),
-        RuntimeHealth::default(),
-    );
+    let controller_handles =
+        spawn_controller_loops(Arc::clone(&state), NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
 
     backend
         .clone()
@@ -408,13 +403,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         )
         .with_provisioning_lifecycles(Some(provisioning)),
     );
-    let controller_handles = spawn_controller_loops(
-        Arc::clone(&state),
-        NAMESPACE,
-        Duration::from_millis(20),
-        ControllerSupervision::default(),
-        RuntimeHealth::default(),
-    );
+    let controller_handles =
+        spawn_controller_loops(Arc::clone(&state), NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
     wait_until(|| {
         let terminals = terminals.clone();
         let name = coder.metadata.name.clone();

@@ -32,13 +32,8 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         )
         .with_provisioning_lifecycles(Some(provisioning)),
     );
-    let controller_handles = spawn_controller_loops(
-        Arc::clone(&state),
-        NAMESPACE,
-        Duration::from_millis(25),
-        ControllerSupervision::default(),
-        RuntimeHealth::default(),
-    );
+    let controller_handles =
+        spawn_controller_loops(Arc::clone(&state), NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
 
     backend
         .clone()
