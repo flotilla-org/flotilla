@@ -586,10 +586,11 @@ fn smoke_plan() -> LoadPlan {
         drain: Duration::from_secs(180),
         ramp_per_second: 20.0,
         dispatch_concurrency: 6,
-        // The first `running` dispatches cover every mix, and the window's
-        // replacements are coders. A turn takes its 1.5s delay plus the 1s
-        // delivery confirmation, so a window opened after warm-up holds
-        // receipted turns.
+        // The first `running` dispatches cover every mix, and the first
+        // replacement (dispatch 10, slot 2 of 4) is a coder-reviewer, whose
+        // handoff turns flow through the window wherever it opens. A turn takes
+        // its 1.5s delay plus the 1s delivery confirmation.
+        mix: vec![(CrewMix::Coder, 1), (CrewMix::LongRunner, 1), (CrewMix::CoderReviewer, 1), (CrewMix::CoderSupervisor, 1)],
         window: Duration::from_secs(6),
         max_ramp: Duration::from_secs(60),
         convoy_deadline: Duration::from_secs(120),
