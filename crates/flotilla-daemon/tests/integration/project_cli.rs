@@ -733,7 +733,8 @@ async fn ops_entries_materialization_scenario() {
     .expect("write scoped workflow");
     std::fs::write(
         tmp.path().join("all-code.entry"),
-        "---\nkind: workflow_template\nname: all-code\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo check\n",
+        // A crew owes a promise to be admitted on the engine, so the tool crew keeps a decision ledger.
+        "---\nkind: workflow_template\nname: all-code\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo check\n        promises:\n          - kind: decision-ledger\n            owner: verify\n",
     )
     .expect("write default-scoped workflow");
     std::fs::write(
@@ -1450,7 +1451,8 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
                 .action(CommandAction::ConvoyCreate {
                     name: "identity-migrated".into(),
                     workflow_ref: "scratch".into(),
-                    inputs: Vec::new(),
+                    // Admission freezes the workflow, so its declared input is given up front.
+                    inputs: vec![("topic".into(), "identity-migrated".into())],
                     repository_url: None,
                     r#ref: None,
                     project_ref: Some("github-com-flotilla-org-andamento".into()),
@@ -2271,7 +2273,8 @@ async fn convoy_create_carries_project_ref() {
                 .action(CommandAction::ConvoyCreate {
                     name: "linked".into(),
                     workflow_ref: "scratch".into(),
-                    inputs: vec![],
+                    // Admission freezes the workflow, so its declared input is given up front.
+                    inputs: vec![("topic".into(), "linked".into())],
                     repository_url: None,
                     r#ref: None,
                     project_ref: Some("my-project".into()),
