@@ -1618,7 +1618,7 @@ impl CrewService {
         if convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Abandoned) {
             return Ok(());
         }
-        let expected = flotilla_resources::expected_checkout_refs(convoy)?;
+        let expected = flotilla_resources::expected_checkout_refs(convoy, checkout_list.iter().map(CheckoutRecord::checkout_name));
         if expected.is_empty() {
             return Ok(());
         }
