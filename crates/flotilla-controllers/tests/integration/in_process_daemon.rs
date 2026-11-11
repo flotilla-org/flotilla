@@ -2673,7 +2673,6 @@ async fn exercise_existing_pr_admission(continuing: bool) {
             &replacement,
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeMap::new(),
             &[],
             Duration::from_secs(30),
             Duration::from_secs(30),

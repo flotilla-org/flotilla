@@ -1618,7 +1618,7 @@ impl CrewService {
         if convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Abandoned) {
             return Ok(());
         }
-        let expected = flotilla_resources::expected_checkout_refs(convoy)?;
+        let expected = flotilla_resources::expected_checkout_refs(convoy, checkout_list.iter().map(CheckoutRecord::checkout_name));
         if expected.is_empty() {
             return Ok(());
         }
@@ -3619,11 +3619,11 @@ impl CrewService {
         }
     }
 
-    /// An operator's delete of convoy `name`. A convoy ends on the engine and is never deleted
-    /// (#3108): once its teardown gate passes (force skips it), a live convoy is abandoned and an
-    /// ended one has nothing left to end. Its vessels, checkouts and sessions are released by
-    /// their controllers once it has ended.
-    pub async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+    /// A delete of convoy `name`. A convoy ends on the engine and is never deleted (#3108): once
+    /// its teardown gate passes (force skips it), a live convoy is abandoned by `principal`
+    /// ("operator" when the delete carries none) and an ended one has nothing left to end. Its
+    /// vessels, checkouts and sessions are released by their controllers once it has ended.
+    pub async fn reap(&self, namespace: &str, name: &str, force: bool, principal: Option<&PrincipalRef>) -> Result<(), String> {
         self.teardown(namespace, name, force).await?;
         self.cascade_convoy_children(namespace, name).await?;
         let convoy = self.resource_backend.clone().using::<ResourceConvoy>(namespace).get(name).await.map_err(|error| error.to_string())?;
@@ -3632,7 +3632,8 @@ impl CrewService {
         }
         let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
             .ok_or_else(|| format!("convoy `{name}` is not held at this home"))?;
-        engine.abandon(&convoy, "operator", "deleted by an operator").await
+        let principal = principal.map_or("operator", |principal| principal.name.as_str());
+        engine.abandon(&convoy, principal, "deleted").await
     }
 }
 

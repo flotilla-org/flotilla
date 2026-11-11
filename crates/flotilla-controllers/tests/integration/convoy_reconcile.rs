@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 use common::{bootstrapped_convoy_status, convoy_meta, convoy_object, task_provisioning_convoy_spec, timestamp, valid_convoy_spec};
 use flotilla_resources::{
-    evaluate_landing_settlement, external_patches, implement_review_workflow_spec, select_convoy_children, BoundChangeRequest,
+    evaluate_landing_settlement, external_patches, implement_review_workflow_spec, BoundChangeRequest,
     ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, CheckoutSpec, Convoy, ConvoyPhase, ConvoyStatus,
     ConvoyStatusPatch, CrewWorkPhase, InputMeta, Observation, ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks,
     ObservedMergeability, OwnerReference, RepositoryKey, ReviewRefPair, SettlementClaimEvidence, StatusPatch, UnmetSettlementExpectation,
@@ -167,7 +167,6 @@ async fn landing_judgement(
     checkouts: &CheckoutFixture,
     now: chrono::DateTime<chrono::Utc>,
 ) -> LandingSettlement {
-    let vessels = select_convoy_children(convoy, &backend.including_replicas::<Vessel>("flotilla").list().await.expect("vessels").items);
     let change_requests = backend
         .using::<ChangeRequest>("flotilla")
         .list()
@@ -179,7 +178,6 @@ async fn landing_judgement(
         .collect();
     evaluate_landing_settlement_with_disposition(
         convoy,
-        &vessels,
         &held_checkouts(checkouts),
         &change_requests,
         &[],
@@ -326,7 +324,6 @@ fn landing_convoy_with_no_declared_exit_never_settles() {
         &convoy,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &BTreeMap::new(),
         &[],
         Duration::from_secs(180),
         Duration::from_secs(30),
@@ -357,7 +354,6 @@ fn missing_change_request_is_reported_once_across_terminal_exit_entries() {
 
     let evaluation = evaluate_landing_settlement(
         &convoy,
-        &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
         &[],
@@ -430,7 +426,6 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
         evaluate_landing_settlement(
             &convoy,
             &BTreeMap::new(),
-            &BTreeMap::new(),
             records,
             &[],
             Duration::from_secs(180),
@@ -444,7 +439,6 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
     // The satisfied exit must drive delivery.
     let settlement = evaluate_landing_settlement_with_disposition(
         &convoy,
-        &BTreeMap::new(),
         &BTreeMap::new(),
         &records,
         &[],
@@ -462,7 +456,6 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
     }
     let unmatched = evaluate_landing_settlement(
         &closed_only,
-        &BTreeMap::new(),
         &BTreeMap::new(),
         &records,
         &[],
@@ -550,7 +543,6 @@ fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
         evaluate_landing_settlement(
             &convoy,
             &BTreeMap::new(),
-            &BTreeMap::new(),
             records,
             &[],
             Duration::from_secs(180),
@@ -597,7 +589,6 @@ fn landing_waits_for_a_branch_scan_before_treating_an_empty_subject_set_as_no_pr
     let evaluate = |convoy: &flotilla_resources::ResourceObject<Convoy>| {
         evaluate_landing_settlement(
             convoy,
-            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &[],
@@ -995,7 +986,6 @@ async fn reconcile_terminal_bound_change_request(
     let change_request_objects = change_requests.list().await.expect("change requests").items;
     let evaluation = evaluate_landing_settlement(
         &current,
-        &BTreeMap::new(),
         &held_checkouts(&checkouts),
         &change_request_objects.into_iter().map(|record| (record.metadata.name.clone(), record)).collect(),
         &[],
@@ -1214,7 +1204,6 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
                 changes.list().await.expect("changes").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
             let evaluation = evaluate_landing_settlement(
                 &current,
-                &BTreeMap::new(),
                 &checkout_objects,
                 &change_objects,
                 &[],
@@ -1388,7 +1377,6 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
                 let current = convoys.get("three-pr").await.unwrap();
                 let evidence = evaluate_landing_settlement(
                     &current,
-                    &BTreeMap::new(),
                     &BTreeMap::new(),
                     &requests.list().await.unwrap().items.into_iter().map(|cr| (cr.metadata.name.clone(), cr)).collect(),
                     &[],

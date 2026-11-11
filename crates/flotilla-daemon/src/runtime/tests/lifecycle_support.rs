@@ -4,6 +4,8 @@ use super::*;
 pub(super) enum CompletionAction {
     Retain,
     Delete,
+    /// An operator deletes the convoy while its work is still running.
+    DeleteLive,
 }
 
 pub(super) struct NoPrProcessRunner;
@@ -220,6 +222,57 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    if matches!(completion_action, CompletionAction::DeleteLive) {
+        // A delete ends the convoy, never deletes it (#3108); what it held is released.
+        let holder = flotilla_resources::convoy::engine::checkout_holder(&convoys.get(&convoy_name).await.expect("convoy"))
+            .expect("held for its launch");
+        let reads = daemon.lifecycle_reads();
+        assert!(
+            reads.checkouts().and_then(|checkouts| checkouts.held(&holder)).expect("held checkouts").iter().any(|checkout| !checkout.ended()),
+            "the running convoy holds a live checkout"
+        );
+        let delete_id = daemon
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyDelete { namespace: Some(NAMESPACE.to_string()), name: "convoy-a".to_string(), force: true })
+                    .build(),
+            )
+            .await
+            .expect("convoy delete command should start");
+        assert_eq!(wait_for_command_result(&mut rx, delete_id).await, CommandValue::Ok);
+        wait_until(|| {
+            let convoys = convoys.clone();
+            let convoy_name = convoy_name.clone();
+            let terminals = backend.using::<TerminalSession>(NAMESPACE);
+            let vessel_released =
+                reads.vessels().and_then(|vessels| vessels.get(&launch, None)).is_ok_and(|record| record.is_some_and(|record| record.ended()));
+            let checkouts_released = reads
+                .checkouts()
+                .and_then(|checkouts| checkouts.held(&holder))
+                .is_ok_and(|held| !held.is_empty() && held.iter().all(|checkout| checkout.ended()));
+            async move {
+                let abandoned = convoys
+                    .get(&convoy_name)
+                    .await
+                    .ok()
+                    .and_then(|convoy| convoy.status)
+                    .is_some_and(|status| status.phase == ConvoyPhase::Abandoned);
+                let sessions_stopped = terminals.list().await.is_ok_and(|list| {
+                    list.items.iter().all(|session| {
+                        session.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::TerminalSessionPhase::Stopped)
+                    })
+                });
+                abandoned && vessel_released && checkouts_released && sessions_stopped
+            }
+        })
+        .await;
+        for handle in controller_handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+        return;
+    }
+
     let teardown_checkout_path = if matches!(completion_action, CompletionAction::Delete) {
         // The convoy's checkout, held for the launch its record names.
         let convoy = convoys.get(&convoy_name).await.expect("convoy");
@@ -254,7 +307,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
                     work: "implement".to_string(),
                     message: Some(match completion_action {
                         CompletionAction::Delete => "https://github.com/flotilla-org/flotilla/pull/884".to_string(),
-                        CompletionAction::Retain => "done".to_string(),
+                        CompletionAction::Retain | CompletionAction::DeleteLive => "done".to_string(),
                     }),
                 })
                 .build(),

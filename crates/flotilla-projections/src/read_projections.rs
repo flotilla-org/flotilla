@@ -1363,7 +1363,7 @@ impl ReadProjections<'_> {
             .map_err(|error| error.to_string())?
             .items;
         let selected_vessels = flotilla_resources::select_convoy_children(&convoy, &vessel_sources);
-        let expected = expected_checkout_refs(&convoy).map_err(|error| format!("derive expected checkouts: {error}"))?;
+        let expected = expected_checkout_refs(&convoy, selected_checkouts.keys().map(String::as_str));
         let checkouts = expected
             .iter()
             .map(|checkout_name| {
@@ -1504,7 +1504,6 @@ impl ReadProjections<'_> {
 
         let evaluation = evaluate_landing_settlement(
             &convoy,
-            &selected_vessels,
             &selected_checkouts,
             &change_request_objects,
             &forges,

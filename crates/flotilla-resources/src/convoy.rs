@@ -431,27 +431,13 @@ impl<'de> Deserialize<'de> for ConvoySpec {
     }
 }
 
-/// Checkout object names durably recorded as provisioned for this convoy.
-///
-/// Placements are copied onto work state before vessels can disappear, so the
-/// expected set remains available while federated checkout observations lag.
-/// Adopted refs are also declarations on the convoy itself and therefore count
-/// as expected even before a placement has repeated them.
-pub fn expected_checkout_refs(convoy: &crate::ResourceObject<Convoy>) -> Result<BTreeSet<String>, String> {
+/// The checkout names the convoy expects: those its launch holds on the engine (`held`, every
+/// checkout made for it, ended or not) and its adopted refs, which are declarations on the convoy
+/// itself and count before anything holds them.
+pub fn expected_checkout_refs<'a>(convoy: &crate::ResourceObject<Convoy>, held: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
     let mut expected = convoy.spec.adopted_checkout_refs.values().cloned().collect::<BTreeSet<_>>();
-    let Some(status) = &convoy.status else {
-        return Ok(expected);
-    };
-    for (work_name, work) in &status.work {
-        let Some(checkout_refs) = work.placement.as_ref().and_then(|placement| placement.fields.get("checkout_refs")) else {
-            continue;
-        };
-        let checkout_refs = serde_json::from_value::<BTreeMap<RepositoryKey, String>>(checkout_refs.clone()).map_err(|error| {
-            format!("convoy {}/{} has invalid checkout_refs in work {work_name}: {error}", convoy.metadata.namespace, convoy.metadata.name)
-        })?;
-        expected.extend(checkout_refs.into_values());
-    }
-    Ok(expected)
+    expected.extend(held.into_iter().map(str::to_owned));
+    expected
 }
 
 /// Change requests already known through the convoy's expected checkouts: each checkout's
@@ -464,7 +450,7 @@ pub fn observed_change_request_subjects(
     forges: &[crate::ForgeSpec],
     state_of: &dyn Fn(&Subject) -> Option<crate::ObservedChangeRequestState>,
 ) -> Result<Vec<Subject>, String> {
-    let expected = expected_checkout_refs(convoy)?;
+    let expected = expected_checkout_refs(convoy, checkouts.keys().map(String::as_str));
     let adopted = convoy
         .spec
         .declared_subjects()?
@@ -519,11 +505,6 @@ pub fn convoy_sanctions_checkout_reclaim(convoy: &crate::ResourceObject<Convoy>)
     convoy.metadata.deletion_timestamp.is_some()
         || convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landed | ConvoyPhase::Abandoned))
 }
-
-/// Explicit operator force on a convoy deletion. Checkout authorities use
-/// this durable metadata after replication, including while finalizers run.
-pub const FORCE_TEARDOWN_ANNOTATION: &str = "flotilla.work/force-teardown";
-pub const CONVOY_TEARDOWN_FINALIZER: &str = "flotilla.work/convoy-teardown";
 
 /// The address of a convoy's explicitly bound change request, resolving its
 /// repository's remote through `forges`.
@@ -829,9 +810,9 @@ pub fn instantiate_turn_delivery(
 /// Instantiate the convoy's pinned exit declaration over every bound subject.
 ///
 /// A table entry is an implicit universal over its subject role. With no bound
-/// subjects, a declared table collapses to the same claim exit as `exit: claim`.
-/// An absent declaration stays absent, leaving the convoy standing until an
-/// operator explicitly reaps it.
+/// subjects its entries have no leaves; settlement collapses such a table to the
+/// claim exit when the convoy expects no checkout either. An absent declaration
+/// stays absent, leaving the convoy standing until an operator explicitly reaps it.
 pub fn instantiate_exit(convoy: &crate::ResourceObject<Convoy>, forges: &[crate::ForgeSpec]) -> Result<InstantiatedExit, String> {
     let Some(declaration) =
         convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).and_then(|snapshot| snapshot.exit.clone())
@@ -843,9 +824,6 @@ pub fn instantiate_exit(convoy: &crate::ResourceObject<Convoy>, forges: &[crate:
     }
 
     let subjects = bound_change_request_addresses(convoy, forges)?;
-    if subjects.is_empty() && expected_checkout_refs(convoy)?.is_empty() {
-        return Ok(InstantiatedExit::Claim);
-    }
     let ExitDeclaration::Table(entries) = declaration else {
         unreachable!("claim declaration returned above");
     };

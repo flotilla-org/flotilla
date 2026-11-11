@@ -8,7 +8,7 @@ use flotilla_protocol::{CommandAction, HostName, NodeId};
 use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
     CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure, Host as ResourceHost, InputMeta, Project,
-    ProjectSpec, Repository, RepositoryKey, RepositorySpec, ResourceError, ResourceObject, WorkflowTemplate,
+    ProjectSpec, Repository, RepositoryKey, RepositorySpec, ResourceObject, WorkflowTemplate,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;

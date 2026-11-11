@@ -779,7 +779,6 @@ impl Reconciler for ConvoyReconciler {
         let settlement = is_landing.then(|| {
             evaluate_landing_settlement_with_disposition(
                 obj,
-                &vessels,
                 &checkouts,
                 &change_requests,
                 &forges,

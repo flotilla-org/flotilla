@@ -767,7 +767,6 @@ impl ReconcilerWake {
                 // selections above without cloning their resource bodies again.
                 let settlement = flotilla_resources::evaluate_landing_settlement(
                     convoy,
-                    &convoy_vessels,
                     &checkouts,
                     &observed_change_requests,
                     &forges,
