@@ -35,11 +35,38 @@ pub fn validate_message_address(address: &str) -> Result<(), ResourceError> {
     Ok(())
 }
 
+/// The role address of `role` in `vessel` of launch `convoy` in `project`: the old 4-part spelling
+/// `project/convoy/vessel/role`. A standing launch's name holds its address (`project:P/convoy:R#n`),
+/// so the convoy segment escapes `%` and `/`; [`parse_crew_role_address`] reads it back.
+/// Old 4-part spelling; goes when crew compares engine addresses (#3108 gate task).
+pub fn crew_role_address(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
+    format!("{project}/{}/{vessel}/{role}", convoy_segment(convoy))
+}
+
+/// The project, launch, vessel and role a 4-part role address names, its convoy segment unescaped;
+/// `None` for any other address. Old 4-part spelling; goes when crew compares engine addresses (#3108 gate task).
+pub fn parse_crew_role_address(address: &str) -> Option<(&str, String, &str, &str)> {
+    match address.split('/').collect::<Vec<_>>().as_slice() {
+        [project, convoy, vessel, role] => Some((*project, convoy_of_segment(convoy), *vessel, *role)),
+        _ => None,
+    }
+}
+
+/// Launch `convoy` as one address segment: `%` and `/` escaped.
+pub fn convoy_segment(convoy: &str) -> String {
+    convoy.replace('%', "%25").replace('/', "%2F")
+}
+
+/// The launch an address segment written by [`convoy_segment`] names.
+pub fn convoy_of_segment(segment: &str) -> String {
+    segment.replace("%2F", "/").replace("%25", "%")
+}
+
 pub fn qualify_message_address(address: &str, context: &MessageAddressContext) -> Result<String, ResourceError> {
     let parts: Vec<_> = address.split('/').collect();
     let qualified = match parts.as_slice() {
         [role] if !address.starts_with("principal:") && !address.starts_with("system:") => {
-            format!("{}/{}/{}/{role}", context.project, context.convoy, context.vessel)
+            crew_role_address(&context.project, &context.convoy, &context.vessel, role)
         }
         // Two segments already name a project holder. Convoy-relative targets
         // in another vessel use convoy/vessel/role to avoid this ambiguity.
@@ -54,11 +81,9 @@ pub fn qualify_message_address(address: &str, context: &MessageAddressContext) -
 /// already carries its convoy context. Bare sender roles require accept_in_context.
 pub fn qualify_message_spec(mut spec: MessageSpec) -> Result<MessageSpec, ResourceError> {
     validate_message_address(&spec.sender)?;
-    if let [project, convoy, vessel, _] = spec.sender.split('/').collect::<Vec<_>>().as_slice() {
-        spec.receiver = qualify_message_address(
-            &spec.receiver,
-            &MessageAddressContext { project: (*project).into(), convoy: (*convoy).into(), vessel: (*vessel).into() },
-        )?;
+    if let Some((project, convoy, vessel, _)) = parse_crew_role_address(&spec.sender) {
+        spec.receiver =
+            qualify_message_address(&spec.receiver, &MessageAddressContext { project: project.into(), convoy, vessel: vessel.into() })?;
     }
     validate_message_address(&spec.receiver)?;
     Ok(spec)

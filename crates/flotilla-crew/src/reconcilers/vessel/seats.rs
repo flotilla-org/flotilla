@@ -207,7 +207,12 @@ impl VesselPlanning {
                                     Some(&seating.terminal_cwd),
                                 );
                                 if let Some(project) = convoy.spec.project_ref.as_deref() {
-                                    let address = format!("{project}/{}/{}/{}", convoy.metadata.name, obj.spec.vessel_name, process.role);
+                                    let address = flotilla_resources::crew_role_address(
+                                        project,
+                                        &convoy.metadata.name,
+                                        &obj.spec.vessel_name,
+                                        &process.role,
+                                    );
                                     let book = flotilla_messaging::crew_address_book(&self.backend, &self.namespace, &address).await?;
                                     brief.content.push('\n');
                                     brief.content.push_str(&book.render());

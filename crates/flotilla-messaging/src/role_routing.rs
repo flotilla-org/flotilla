@@ -189,10 +189,9 @@ async fn topic_candidates_from_declarations(
 }
 
 fn terminal_has_address(terminal: &crate::ResourceObject<TerminalSession>, project: &str, address: &str) -> bool {
-    let parts: Vec<_> = address.split('/').collect();
-    matches!(parts.as_slice(), [p, convoy, vessel, role]
-        if *p == project
-        && terminal.metadata.labels.get(CONVOY_LABEL).is_some_and(|value| value == convoy)
+    matches!(flotilla_resources::parse_crew_role_address(address), Some((p, convoy, vessel, role))
+        if p == project
+        && terminal.metadata.labels.get(CONVOY_LABEL).is_some_and(|value| *value == convoy)
         && terminal.metadata.labels.get(VESSEL_LABEL).is_some_and(|value| value == vessel)
         && terminal.metadata.labels.get(ROLE_LABEL).is_some_and(|value| value == role))
 }
@@ -238,7 +237,7 @@ pub async fn crew_address_book(backend: &ResourceBackend, namespace: &str, own_a
         if let Some(status) = &convoy.status {
             for (vessel, crew) in &status.crew_work {
                 for role in crew.keys() {
-                    let address = format!("{candidate_project}/{}/{vessel}/{role}", convoy.metadata.name);
+                    let address = flotilla_resources::crew_role_address(candidate_project, &convoy.metadata.name, vessel, role);
                     if address != own_address {
                         let holder = receivers.resolve(&address)?;
                         contacts.push(RoleContact {
@@ -465,7 +464,7 @@ async fn reconcile_charter_notifications_from_receivers(
         } else {
             let Some(project) = convoy.and_then(|convoy| convoy.spec.project_ref.as_ref()) else { continue };
             let (Some(vessel), Some(role)) = (labels.get(VESSEL_LABEL), labels.get(ROLE_LABEL)) else { continue };
-            (project.clone(), role.clone(), format!("{project}/{}/{vessel}/{role}", context.convoy))
+            (project.clone(), role.clone(), flotilla_resources::crew_role_address(project, &context.convoy, vessel, role))
         };
         let Some(project) = projects.iter().find(|project| project.metadata.name == project_name) else { continue };
         let Some(revision) = flotilla_resources::role_cascade::project_charter_revision(project) else { continue };

@@ -459,12 +459,11 @@ async fn publish_card_revision(
     };
     let convoy = backend.including_replicas::<Convoy>(namespace).get(&context.convoy).await.map_err(|error| error.to_string())?.object;
     let vessel = backend.including_replicas::<Vessel>(namespace).get(&context.vessel_ref).await.map_err(|error| error.to_string())?.object;
-    let receiver = format!(
-        "{}/{}/{}/{}",
+    let receiver = flotilla_resources::crew_role_address(
         convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-        context.convoy,
-        vessel.spec.vessel_name,
-        session.spec.role
+        &context.convoy,
+        &vessel.spec.vessel_name,
+        &session.spec.role,
     );
     let sender = "system:capabilities";
     let name = message_record_name(&receiver, sender, &format!("{}:capabilities@{revision}", session.metadata.name));

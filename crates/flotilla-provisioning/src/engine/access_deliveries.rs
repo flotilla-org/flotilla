@@ -17,7 +17,7 @@ impl PlainKind for AccessDeliverySpec {
     const WRITER: &'static str = "access-delivery-records";
 
     fn object(name: String, home: String, version: u64, record: &Self) -> Held {
-        let labels = convoy_of_access(&record.access).map(|convoy| (CONVOY_LABEL.to_owned(), convoy.to_owned())).into_iter().collect();
+        let labels = convoy_of_access(&record.access).map(|convoy| (CONVOY_LABEL.to_owned(), convoy)).into_iter().collect();
         Ok(EngineObject {
             spec: serde_json::to_value(record).map_err(|error| format!("{} {name} at {home}: {error}", <Self as Kind>::KIND))?,
             status: None,

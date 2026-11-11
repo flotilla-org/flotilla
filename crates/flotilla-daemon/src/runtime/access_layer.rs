@@ -526,7 +526,7 @@ fn record_vessel<'a>(vessels: &'a [ResourceObject<Vessel>], record: &ResourceObj
 /// Whether an access key `{project}/{convoy}/{vessel}/{role}` names this convoy's vessel,
 /// whatever the project and role hold.
 fn access_names_vessel(access: &str, convoy: &str, vessel_name: &str) -> bool {
-    access.contains(&format!("/{convoy}/{vessel_name}/"))
+    access.contains(&format!("/{}/{vessel_name}/", flotilla_resources::convoy_segment(convoy)))
 }
 
 #[cfg(test)]

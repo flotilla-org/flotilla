@@ -79,7 +79,7 @@ impl CharterBriefRenderer for LiveCharterBriefRenderer {
         let empty_scopes = Default::default();
         let scopes = requirement.map(|requirement| &requirement.credential_scopes).unwrap_or(&empty_scopes);
         append_convoy_work_context(&mut brief.content, convoy, &repositories, scopes, Some(&input.holder.spec.cwd));
-        let address = format!("{}/{}/{}/{}", input.project.metadata.name, convoy.metadata.name, vessel, input.role);
+        let address = flotilla_resources::crew_role_address(&input.project.metadata.name, &convoy.metadata.name, vessel, &input.role);
         let book = flotilla_messaging::crew_address_book(&self.backend, &context.namespace, &address).await?;
         brief.content.push('\n');
         brief.content.push_str(&book.render());

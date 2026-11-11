@@ -5154,10 +5154,8 @@ impl InProcessDaemon {
             }
             _ => None,
         });
-        let convoy = referenced.or_else(|| match original.object.spec.receiver.split('/').collect::<Vec<_>>().as_slice() {
-            [_, convoy, _, _] => Some((*convoy).to_owned()),
-            _ => None,
-        });
+        let convoy = referenced
+            .or_else(|| flotilla_resources::parse_crew_role_address(&original.object.spec.receiver).map(|(_, convoy, _, _)| convoy));
         if let Some(convoy) = convoy {
             if let Ok(convoy) = self.resource_backend.including_replicas::<ResourceConvoy>(namespace).get(&convoy).await {
                 return Ok(match convoy.provenance {

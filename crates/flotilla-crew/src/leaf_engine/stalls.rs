@@ -160,9 +160,7 @@ impl ReconcilerWake {
     }
 }
 
-pub(crate) fn crew_role_address(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
-    format!("{project}/{convoy}/{vessel}/{role}")
-}
+pub(crate) use flotilla_resources::crew_role_address;
 
 fn convoy_stall_subject(project: &str, convoy: &str) -> String {
     let project = flotilla_address::Address::project(project).expect("a stored convoy has a project");
@@ -1031,7 +1029,7 @@ impl ReconcilerWake {
             }
             obligation.progress.extend(progress);
             let receiver_address =
-                format!("{}/{}/{}/{}", convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy.metadata.name, vessel, role);
+                crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), &convoy.metadata.name, vessel, role);
             let current_message = messages
                 .iter()
                 .filter(|message| {

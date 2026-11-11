@@ -236,17 +236,18 @@ impl MessageReceiverSnapshot {
             validate_message_address(address)?;
             let parts: Vec<_> = address.split('/').collect();
             match parts.as_slice() {
-                [_, convoy, vessel, role] => {
+                [_, segment, vessel, role] => {
+                    let convoy = flotilla_resources::convoy_of_segment(segment);
                     adopted_queries.push(crate::StoreQuery::labels(
                         &BTreeMap::from([
-                            (CONVOY_LABEL.into(), (*convoy).into()),
+                            (CONVOY_LABEL.into(), convoy.clone()),
                             (VESSEL_LABEL.into(), (*vessel).into()),
                             (ROLE_LABEL.into(), (*role).into()),
                         ]),
                         false,
                         true,
                     ));
-                    convoy_names.insert((*convoy).to_string());
+                    convoy_names.insert(convoy);
                 }
                 [project, role] => {
                     ensure_queries.push(crate::StoreQuery {
@@ -391,7 +392,7 @@ impl MessageReceiverSnapshot {
     pub fn may_address_convoy(&self, address: &str, project: &str, convoy: &str) -> bool {
         let parts = address.split('/').collect::<Vec<_>>();
         match parts.as_slice() {
-            [p, c, _, _] => *p == project && *c == convoy,
+            [p, c, _, _] => *p == project && flotilla_resources::convoy_of_segment(c) == convoy,
             [p, role] if *p == project => {
                 self.ensures.items.iter().any(|source| {
                     let declaration = &source.object;
@@ -437,8 +438,12 @@ impl MessageReceiverSnapshot {
         use crate::{TerminalSessionSource, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
         let parts: Vec<_> = address.split('/').collect();
         let convoys = &self.convoys.items;
+        let launch = match parts.as_slice() {
+            [_, segment, _, _] => Some(flotilla_resources::convoy_of_segment(segment)),
+            _ => None,
+        };
         let (project, convoy, vessel, role) = match parts.as_slice() {
-            [project, convoy, vessel, role] => (*project, Some(*convoy), Some(*vessel), *role),
+            [project, _, vessel, role] => (*project, launch.as_deref(), Some(*vessel), *role),
             [project, role] => (*project, None, None, *role),
             // Principal and system addresses never guess an agent terminal.
             _ => return Ok(None),

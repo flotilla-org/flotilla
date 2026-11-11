@@ -2314,19 +2314,18 @@ pub async fn message_views(
             let terminal = holder.object;
             let convoy = terminal.metadata.labels.get(flotilla_resources::CONVOY_LABEL)?;
             let vessel = terminal.metadata.labels.get(flotilla_resources::VESSEL_LABEL)?;
-            Some(format!("{}/{convoy}/{vessel}/{}", message.spec.receiver.split('/').next()?, terminal.spec.role))
+            Some(flotilla_resources::crew_role_address(message.spec.receiver.split('/').next()?, convoy, vessel, &terminal.spec.role))
         });
         if let Some(convoy) = convoy {
-            let direct = message.spec.receiver.split('/').collect::<Vec<_>>();
-            let is_direct = matches!(direct.as_slice(), [_, name, _, _] if *name == convoy.metadata.name);
+            let names_convoy = |address: &str| {
+                flotilla_resources::parse_crew_role_address(address).is_some_and(|(_, name, _, _)| name == convoy.metadata.name)
+            };
+            let is_direct = names_convoy(&message.spec.receiver);
             // An unresolvable receiver has no holder to confirm the convoy, so
             // keep it on the evidence `may_address_convoy` already required: a
             // four-part address naming this convoy, or a role declaration or
             // terminal claim pointing at it. Hiding it would hide the ambiguity.
-            if !is_direct
-                && receiver_error.is_none()
-                && !current_receiver.as_deref().is_some_and(|receiver| receiver.split('/').nth(1) == Some(convoy.metadata.name.as_str()))
-            {
+            if !is_direct && receiver_error.is_none() && !current_receiver.as_deref().is_some_and(names_convoy) {
                 continue;
             }
         }

@@ -839,7 +839,7 @@ impl CrewService {
             .await
             .map_err(|error| error.to_string())?;
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
-        let address = format!("{project}/{}/{}/{}", context.convoy, context.vessel, context.caller_role);
+        let address = crew_role_address(project, &context.convoy, &context.vessel, &context.caller_role);
         flotilla_messaging::crew_address_book(&self.resource_backend, &context.namespace, &address).await.map_err(|error| error.to_string())
     }
 
@@ -1910,28 +1910,28 @@ impl CrewService {
             },
         )
         .map_err(|error| error.to_string())?;
-        let parts = receiver.split('/').collect::<Vec<_>>();
-        let [target_project, target_convoy, target_vessel, target_role] = parts.as_slice() else {
+        let Some((target_project, target_convoy, target_vessel, target_role)) = flotilla_resources::parse_crew_role_address(&receiver)
+        else {
             return Err("crew handoff target requires a convoy crew address".into());
         };
-        if *target_project != project || *target_convoy != context.convoy {
+        if target_project != project || target_convoy != context.convoy {
             return Err("crew handoff target must belong to the caller's convoy".into());
         }
-        if *target_vessel != context.vessel {
+        if target_vessel != context.vessel {
             let status = convoy.status.as_ref().ok_or("convoy has no status")?;
             let process = status
                 .workflow_snapshot
                 .as_ref()
-                .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == *target_vessel))
-                .and_then(|vessel| vessel.crew.iter().find(|crew| crew.role == *target_role))
+                .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == target_vessel))
+                .and_then(|vessel| vessel.crew.iter().find(|crew| crew.role == target_role))
                 .ok_or_else(|| format!("no such crew target `{receiver}`"))?;
             if !matches!(process.source, CrewSource::Agent { .. }) {
                 return Err(format!("crew target `{receiver}` is a tool process and cannot receive a handoff"));
             }
             if status
                 .crew_work
-                .get(*target_vessel)
-                .and_then(|crew| crew.get(*target_role))
+                .get(target_vessel)
+                .and_then(|crew| crew.get(target_role))
                 .is_some_and(|state| state.phase == CrewWorkPhase::Failed)
             {
                 return Err(format!("crew target `{receiver}` has failed work and cannot receive a handoff"));
@@ -1949,8 +1949,8 @@ impl CrewService {
                     .namespace(context.namespace.clone())
                     .convoy(context.convoy.clone())
                     .source("handoff".into())
-                    .vessel((*target_vessel).into())
-                    .role((*target_role).into())
+                    .vessel((target_vessel).into())
+                    .role((target_role).into())
                     .brief(message.into())
                     .subject_revision(uuid::Uuid::new_v4().to_string())
                     .sender(crew_role_address(project, &context.convoy, &context.vessel, &context.caller_role))
@@ -1961,7 +1961,7 @@ impl CrewService {
             .await?;
             return Ok(());
         }
-        let target = *target_role;
+        let target = target_role;
         let (task_index, task) = convoy
             .status
             .as_ref()
@@ -2151,7 +2151,7 @@ impl CrewService {
                             Some(&anchor.spec.cwd),
                         )?;
                         if let Some(project) = convoy.spec.project_ref.as_deref() {
-                            let address = format!("{project}/{}/{}/{target}", context.convoy, context.vessel);
+                            let address = crew_role_address(project, &context.convoy, &context.vessel, target);
                             let book = flotilla_messaging::crew_address_book(&self.resource_backend, &context.namespace, &address)
                                 .await
                                 .map_err(|error| error.to_string())?;

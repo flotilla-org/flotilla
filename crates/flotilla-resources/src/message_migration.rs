@@ -26,7 +26,7 @@ fn legacy_actor_address(actor: &str) -> String {
     if let Some((crew, convoy)) = actor.split_once(" in ") {
         if let Some((role, vessel)) = crew.split_once('@') {
             return if let Some((convoy, project)) = convoy.split_once('@') {
-                format!("{project}/{convoy}/{vessel}/{role}")
+                crate::crew_role_address(project, convoy, vessel, role)
             } else {
                 format!("{convoy}/{vessel}/{role}")
             };
@@ -40,18 +40,18 @@ fn legacy_actor_address(actor: &str) -> String {
 
 pub fn legacy_message_spec(receiver: &str, message: &TerminalCrewMessage) -> MessageSpec {
     let (mut sender, relation) = legacy_message_sender(&message.sender);
-    if let [project, convoy, vessel, _] = receiver.split('/').collect::<Vec<_>>().as_slice() {
+    if let Some((project, convoy, vessel, _)) = crate::parse_crew_role_address(receiver) {
         // Old bosun/handoff headers sometimes omit convoy context but retain
         // role@vessel. Governor role@project is a declared project role instead.
         match &message.sender {
             CrewMessageSender::Bosun { name } | CrewMessageSender::Handoff { from: name } if !name.contains(" in ") => {
                 if let Some((role, sender_vessel)) = name.split_once('@') {
-                    sender = format!("{project}/{convoy}/{sender_vessel}/{role}");
+                    sender = crate::crew_role_address(project, &convoy, sender_vessel, role);
                 }
             }
             _ => {}
         }
-        let context = crate::MessageAddressContext { project: (*project).into(), convoy: (*convoy).into(), vessel: (*vessel).into() };
+        let context = crate::MessageAddressContext { project: project.into(), convoy, vessel: vessel.into() };
         if let Ok(qualified) = crate::qualify_message_address(&sender, &context) {
             sender = qualified;
         }
