@@ -13,7 +13,7 @@ use flotilla_resources::{
     convoy::engine::{set_notes, EngineConvoyPath, EngineConvoys, VerdictScope},
     lifecycle_reads::LifecycleReads,
     terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource},
-    Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ResourceObject, SystemClock,
+    Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, ResourceObject, SystemClock,
 };
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::ResourceBackend;
@@ -40,6 +40,7 @@ impl EngineHome {
         backend.install_engine_records(Arc::new(flotilla_store::TerminalViews::new(namespace, engine.reads())));
         let convoys = EngineConvoysHome::over(&service, namespace, backend, Arc::new(SystemClock), engine.reads());
         let agents = Arc::new(AgentSessionsFixture::new(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH));
+        crate::serve_agents(Arc::clone(&agents));
         Self { engine, convoys, agents, namespace: namespace.to_owned(), host: home.to_owned(), service, _dir: dir }
     }
 
@@ -50,7 +51,20 @@ impl EngineHome {
 
     /// The readings a crew service takes: this home's records, with its AgentSessions.
     pub fn reads(&self) -> Arc<dyn LifecycleReads> {
-        let agents: Arc<dyn AgentSessionReads> = self.agents.clone();
+        self.reads_with(self.agents.clone())
+    }
+
+    /// The readings a daemon restarted at `watched_from` serves: this home's records and
+    /// AgentSessions, with none of their progress seen. [`crate::agents`] observes on the
+    /// restarted daemon's from then on.
+    pub fn restarted_reads(&self, watched_from: chrono::DateTime<chrono::Utc>) -> Arc<dyn LifecycleReads> {
+        let agents = Arc::new(crate::agents().restarted(watched_from));
+        crate::serve_agents(Arc::clone(&agents));
+        self.reads_with(agents)
+    }
+
+    fn reads_with(&self, agents: Arc<AgentSessionsFixture>) -> Arc<dyn LifecycleReads> {
+        let agents: Arc<dyn AgentSessionReads> = agents;
         let engine = &self.engine;
         Arc::new(
             LifecycleReadPort::new(StoreReads::new(self.service.store()), self.host.clone())
@@ -66,6 +80,19 @@ impl EngineHome {
     /// Admits convoy `name` with `spec` and `status` as the next launch of `name`; returns the launch.
     pub async fn admit(&self, name: &str, spec: ConvoySpec, status: ConvoyStatus) -> String {
         self.convoys.launch(flotilla_engine_convoys_testkit::convoy(&self.namespace, name, spec, status)).await
+    }
+
+    /// Reserves the next launch of `name`, as admission does before it writes anything keyed by
+    /// the launch; returns the launch, which [`Self::admit_reserved`] admits.
+    pub async fn reserve(&self, name: &str) -> String {
+        self.engine().reserve(name).await.expect("reserve a launch")
+    }
+
+    /// Admits launch `launch`, which [`Self::reserve`] reserved, with `spec` and `status`.
+    pub async fn admit_reserved(&self, launch: &str, spec: ConvoySpec, status: ConvoyStatus) {
+        let convoy = flotilla_engine_convoys_testkit::convoy(&self.namespace, launch, spec, status.clone());
+        self.engine().admit_reserved(&convoy).await.expect("admit the launch");
+        set_notes(&self.path(), launch, &status).expect("note the launch's status");
     }
 
     /// Launch `launch` as its view reads, through `backend`.
@@ -101,6 +128,49 @@ impl EngineHome {
         let facts = TerminalLaunchFacts { agent, ..Default::default() };
         self.engine.terminals.ready(&launch, &format!("{}-runtime", request.session), &facts);
         launch
+    }
+
+    /// Brings `role`'s seat in work `work` of launch `launch`, whose Vessel is `vessel`, to the
+    /// phase its view reads as `phase`, by the facts that make it so: Pending starts nothing;
+    /// Working starts its agent session `session`; Interrupted loses that session; Done keeps the
+    /// seat's promises; Failed is a supervisor's ruling; HandedBack hands its work to a seat
+    /// `successor`. Returns the session's launch, once one started.
+    pub async fn seat(
+        &self,
+        backend: &ResourceBackend,
+        launch: &str,
+        (vessel, work): (&str, &str),
+        (role, session): (&str, &str),
+        phase: CrewWorkPhase,
+    ) -> Option<String> {
+        if phase == CrewWorkPhase::Pending {
+            return None;
+        }
+        let convoy = self.view(backend, launch).await;
+        let snapshot = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).expect("a launch's workflow");
+        let eager =
+            snapshot.vessels.iter().any(|requirement| requirement.name == work && requirement.eagerly_started_roles().contains(role));
+        if !eager {
+            // A latent role works once its task is delivered.
+            self.note(backend, launch, |status| {
+                status.crew_work.get_mut(work).and_then(|roles| roles.get_mut(role)).expect("the seat").task_assigned = true;
+            })
+            .await;
+        }
+        let started = self.session(vessel, role, session, "env");
+        let convoy = self.view(backend, launch).await;
+        let engine = self.engine();
+        match phase {
+            CrewWorkPhase::Working => {}
+            CrewWorkPhase::Interrupted => self.engine.terminals.lost(&started, "pool lost the session"),
+            CrewWorkPhase::Done => self.keep(backend, launch, work, role).await,
+            CrewWorkPhase::Failed => engine.fail_seat(&convoy, work, role, "supervisor", "failed").await.expect("fail the seat"),
+            CrewWorkPhase::HandedBack => engine.reassign(&convoy, work, role, "successor").await.expect("hand the work back"),
+            other => panic!("no facts make a {other:?} seat"),
+        }
+        let read = self.view(backend, launch).await.status.expect("status").crew_work[work][role].phase;
+        assert_eq!(read, phase, "the seat's facts read as its phase");
+        Some(started)
     }
 
     /// An operator keeps every open promise of `role` in `work` of launch `launch` by verdict.

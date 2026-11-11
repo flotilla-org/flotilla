@@ -67,6 +67,13 @@ pub(crate) fn restarted_agent_reads(
     reads_with_agent_sessions(fixture)
 }
 
+/// Makes `fixture` the AgentSessions [`agents`] observes on this test thread, as readings built
+/// over it serve them.
+#[cfg(test)]
+pub(crate) fn serve_agents(fixture: std::sync::Arc<flotilla_provisioning_testkit::AgentSessionsFixture>) {
+    AGENTS.with(|agents| *agents.borrow_mut() = Some(fixture));
+}
+
 /// The AgentSessions the readings this test thread last built serve.
 #[cfg(test)]
 pub(crate) fn agents() -> std::sync::Arc<flotilla_provisioning_testkit::AgentSessionsFixture> {
