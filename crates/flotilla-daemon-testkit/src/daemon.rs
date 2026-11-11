@@ -25,6 +25,11 @@
 //! recorded, and the scenario fails at its next step with where each access came
 //! from. `OldStoreMode::Recording` serves the accesses and only records them, so
 //! one run lists what a scenario still reads and writes there.
+//!
+//! `.import(..)` puts an old store and its daemon's host id in the state
+//! directory, so the first start imports it into the engine store as a host of
+//! the frozen fleet does at the cut-over; the daemon then reads what it
+//! imported and is not seeded with the dummy catalog.
 
 use std::{
     sync::{
@@ -104,6 +109,13 @@ pub struct ForgeTransport {
     pub commands: Arc<dyn CommandRunner>,
 }
 
+/// An old store a daemon's first start imports: the store's file, and the host id of the daemon
+/// that wrote it, so its own Host imports as this daemon's.
+pub struct OldStoreImport {
+    pub store: std::path::PathBuf,
+    pub host_id: Option<String>,
+}
+
 pub struct TestDaemon {
     daemon: Arc<InProcessDaemon>,
     fleet: Arc<DummyFleet>,
@@ -146,13 +158,19 @@ impl TestDaemon {
         /// recording.
         #[builder(default)]
         old_store: OldStoreMode,
+        /// An old store the first start imports; the daemon is then not seeded.
+        import: Option<OldStoreImport>,
     ) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_dir = dir.path().join("config");
         std::fs::create_dir_all(&config_dir).expect("config dir");
         std::fs::write(config_dir.join("daemon.toml"), daemon_toml(settings, agent, environment, change_request)).expect("daemon.toml");
-        let config = Arc::new(ConfigStore::with_base(config_dir));
+        let config = Arc::new(ConfigStore::with_base(config_dir.clone()));
         let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
+        let seeded = import.is_none();
+        if let Some(import) = &import {
+            place_import(import, config.state_dir().as_path(), daemon_config.machine_id.as_deref().expect("a machine id"));
+        }
         let mode = old_store;
         let old_store = (mode != OldStoreMode::Available).then(|| Arc::new(OldStoreAccesses::default()));
         let store: Arc<dyn flotilla_store::Store> = match (&old_store, mode) {
@@ -179,8 +197,27 @@ impl TestDaemon {
         let (daemon, runtime) = untouched(composition.refused(), compose(&composition, config, discovery, &relay)).await;
         let operator = Operator::connect(&daemon).await;
         let started = Self { daemon, fleet, runtime: Some(runtime), relay, operator, composition, dispatched: AtomicU64::new(0), dir };
-        started.seed().await;
+        if seeded {
+            started.seed().await;
+        }
         started
+    }
+}
+
+/// Puts `import`'s old store, with its write-ahead log, where the first start reads it in
+/// `state_dir`, and its daemon's host id where the daemon resolves its own for `machine_id`.
+fn place_import(import: &OldStoreImport, state_dir: &std::path::Path, machine_id: &str) {
+    for suffix in ["", "-wal"] {
+        let from = std::path::PathBuf::from(format!("{}{suffix}", import.store.display()));
+        if suffix.is_empty() || from.exists() {
+            let to = state_dir.join(format!("{}{suffix}", flotilla_daemon::engine_import::OLD_STORE));
+            std::fs::copy(&from, &to).unwrap_or_else(|error| panic!("copy {}: {error}", from.display()));
+        }
+    }
+    if let Some(host_id) = &import.host_id {
+        let identity = state_dir.join(machine_id);
+        std::fs::create_dir_all(&identity).expect("identity dir");
+        std::fs::write(identity.join("host-id"), format!("{host_id}\n")).expect("host-id");
     }
 }
 
@@ -529,6 +566,36 @@ impl TestDaemon {
         })
     }
 
+    /// The report of the import the first start made, when it made one.
+    pub fn import_report(&self) -> Option<serde_json::Value> {
+        let state_dir = self.dir.path().join("config");
+        let report = std::fs::read_dir(&state_dir)
+            .expect("state dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("import-")))
+            .max()?;
+        Some(serde_json::from_slice(&std::fs::read(&report).expect("import report")).expect("import report json"))
+    }
+
+    /// Each engine kind's root table, as the tables API lists them.
+    pub async fn engine_tables(&self) -> std::collections::BTreeMap<String, String> {
+        let (status, body) = local_get_as(&self.daemon, "/tables", "application/json").await;
+        assert_eq!(status, 200, "GET /tables: {}", String::from_utf8_lossy(&body));
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|error| panic!("GET /tables: {error}"));
+        let mut kinds = std::collections::BTreeMap::new();
+        for entry in listed["kinds"].as_array().expect("the listed kinds") {
+            // An engine kind's tables end with its log; the old store's kinds, derived tables
+            // and query families have none.
+            let tables = entry["tables"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str);
+            let engine = tables.into_iter().any(|table| table.ends_with(".log"));
+            if let (true, Some(kind), Some(root)) = (engine, entry["kind"].as_str(), entry["root"].as_str()) {
+                kinds.insert(kind.to_owned(), root.to_owned());
+            }
+        }
+        kinds
+    }
+
     /// Fails with every access, when the old store is unavailable and
     /// something reached it.
     pub fn assert_old_store_untouched(&self) {
@@ -544,6 +611,15 @@ impl TestDaemon {
         if let Some(accesses) = &self.composition.old_store {
             accesses.stage(stage);
         }
+    }
+
+    /// The kinds the old store was accessed for so far, when its accesses are recorded.
+    pub fn old_store_kinds(&self) -> std::collections::BTreeSet<&'static str> {
+        self.composition
+            .old_store
+            .as_ref()
+            .map(|accesses| accesses.accesses().iter().map(|access| access.kind).collect())
+            .unwrap_or_default()
     }
 
     /// The old store's accesses so far, when they are recorded.
@@ -794,10 +870,15 @@ async fn untouched<T>(old_store: Option<&OldStoreAccesses>, step: impl std::futu
 /// One GET over a connection the daemon serves as its main socket serves the
 /// operator's process: the status and the de-chunked body.
 async fn local_get(daemon: &Arc<InProcessDaemon>, target: &str) -> (u16, Vec<u8>) {
+    local_get_as(daemon, target, "application/x-ndjson").await
+}
+
+/// [`local_get`], accepting `accept`.
+async fn local_get_as(daemon: &Arc<InProcessDaemon>, target: &str, accept: &str) -> (u16, Vec<u8>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut client, server) = tokio::net::UnixStream::pair().expect("socket pair");
     let serving = tokio::spawn(flotilla_daemon::server::serve_local_http(server, Arc::clone(daemon)));
-    let request = format!("GET {target} HTTP/1.1\r\nHost: flotilla.local\r\nAccept: application/x-ndjson\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {target} HTTP/1.1\r\nHost: flotilla.local\r\nAccept: {accept}\r\nConnection: close\r\n\r\n");
     client.write_all(request.as_bytes()).await.expect("send request");
     let mut response = Vec::new();
     tokio::time::timeout(WAIT, client.read_to_end(&mut response)).await.expect("response in time").expect("read response");

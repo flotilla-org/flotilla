@@ -710,12 +710,8 @@ fn the_import_maps_live_cloud_sandboxes_and_drops_deleted_gone_ones() {
             import_environments(&[(obj.clone(), HOME.to_owned())], &Default::default(), &mut target, &mut report);
             assert_eq!(report.refused, vec![], "{phase:?}");
             let gone = deleted && phase == EnvironmentPhase::Lost;
-            let counted = |counts: &BTreeMap<(&'static str, &'static str), usize>| counts.values().sum::<usize>();
-            assert_eq!(
-                (counted(&report.imported), counted(&report.dropped)),
-                if gone { (0, 1) } else { (1, 0) },
-                "{phase:?} deleted {deleted}"
-            );
+            let rows = report.rows.get("Environment").copied().unwrap_or_default();
+            assert_eq!((rows.imported, rows.dropped), if gone { (0, 1) } else { (1, 0) }, "{phase:?} deleted {deleted}");
             if !gone {
                 assert_eq!(report.imported.get(&("Environment", label)), Some(&1), "{phase:?}");
             }

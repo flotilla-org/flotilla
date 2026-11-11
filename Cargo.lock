@@ -2601,6 +2601,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bon",
+ "chrono",
  "flotilla-agent",
  "flotilla-client",
  "flotilla-config",
@@ -2621,8 +2622,10 @@ dependencies = [
  "flotilla-schema-sqlite",
  "flotilla-store",
  "flotilla-store-memory",
+ "flotilla-store-sqlite",
  "flotilla-transport",
  "futures",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

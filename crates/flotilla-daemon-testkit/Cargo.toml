@@ -24,6 +24,7 @@ flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 flotilla-replication = { path = "../flotilla-replication" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-transport = { path = "../flotilla-transport" }
 tokio = { workspace = true }
@@ -34,6 +35,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 toml = "0.8"
+chrono = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled"] }
 uuid = { workspace = true, features = ["v4"] }
 
 flotilla-daemon = { path = "../flotilla-daemon" }

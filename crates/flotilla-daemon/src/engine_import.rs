@@ -113,6 +113,20 @@ impl Source {
         ))
     }
 
+    /// The host id of the daemon that wrote this store, read from its records: the one Host
+    /// homed at `home` that describes a daemon, if exactly one does.
+    pub fn own_daemon_host(&self, home: &str) -> Option<String> {
+        let mut daemons = self
+            .rows
+            .iter()
+            .filter(|row| row.plural == "hosts" && row.home == home)
+            .filter_map(|row| decode::<flotilla_resources::Host>(&row.document).ok())
+            .filter(|host| host.spec.connection.is_daemon())
+            .map(|host| host.metadata.name);
+        let own = daemons.next();
+        own.filter(|_| daemons.next().is_none())
+    }
+
     fn namespaces(&self, plurals: &[&str]) -> BTreeSet<&str> {
         self.rows.iter().filter(|row| plurals.contains(&row.plural.as_str())).map(|row| row.namespace.as_str()).collect()
     }
@@ -424,16 +438,19 @@ pub struct Report {
     /// Every old row, by its old kind.
     pub rows: BTreeMap<String, Rows>,
     pub refusals: Vec<Refusal>,
+    /// The home sequence of the import's last write: every log entry after it is the daemon's own.
+    pub last_sequence: u64,
 }
 
 impl Report {
-    pub fn new(summary: &Summary) -> Self {
+    pub fn new(summary: &Summary, last_sequence: u64) -> Self {
         Self {
             build: flotilla_daemon_api::build_info::build_id().to_owned(),
             source: OLD_STORE.to_owned(),
             outcome: if summary.refused() { Outcome::Refused } else { Outcome::Imported },
             kinds: summary.kinds.clone(),
             rows: summary.rows.clone(),
+            last_sequence,
             refusals: summary.refusals.clone(),
         }
     }
@@ -494,11 +511,13 @@ pub fn first_start(state_dir: &Path, home: &str, own_host: Option<&str>) -> Resu
     tracing::info!(source = %old.display(), target = %importing.display(), home, "engine import: first start with [primitives]");
     let source = Source::read(&old, home)?.with_own_host(own_host.map(str::to_owned));
     let registry = crate::runtime::decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
-    let summary = {
+    let (summary, last_sequence) = {
         let mut target = Import::create(&importing, home, registry)?;
-        import(&source, &mut target)
+        let summary = import(&source, &mut target);
+        let last = target.store().read().and_then(|mut read| read.last_sequence(home)).map_err(|error| error.to_string())?;
+        (summary, last)
     };
-    let report = write_report(state_dir, &Report::new(&summary))?;
+    let report = write_report(state_dir, &Report::new(&summary, last_sequence))?;
     log_summary(&summary, &report);
     if summary.refused() {
         return Err(format!(

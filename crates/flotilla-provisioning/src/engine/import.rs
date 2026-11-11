@@ -215,6 +215,21 @@ impl ImportReport {
     }
 }
 
+/// Writes `value`, a record kept beside the launch `name` (its facts, a checkout's integration),
+/// and counts it among the records written.
+fn write_beside<K: Kind + PartialEq + Clone>(
+    target: &mut impl ImportTarget,
+    home: &str,
+    name: &str,
+    change: &NewChange,
+    value: &K,
+    report: &mut ImportReport,
+) -> Result<(), String> {
+    target.write(home, name, change, value)?;
+    *report.imported.entry((K::KIND, "beside")).or_default() += 1;
+    Ok(())
+}
+
 /// A stored state's label, as the report counts it.
 pub fn label(state: &LifecycleState) -> &'static str {
     match state {
@@ -439,7 +454,7 @@ pub fn import_environments(
             // A realised launch keeps the facts its provider reported, written beside it.
             if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
                 let facts = launch_facts(environment.status.as_ref()).map_err(refuse)?;
-                target.write(home, imported.resource.name(), &change, &facts).map_err(refuse)?;
+                write_beside(target, home, imported.resource.name(), &change, &facts, report).map_err(refuse)?;
             }
             Ok(imported)
         });
@@ -565,7 +580,7 @@ pub fn import_clones(
             write_imported(target, &mut imported, &change).map_err(refuse)?;
             if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
                 let facts = CloneFacts { default_branch: clone.status.as_ref().and_then(|status| status.default_branch.clone()) };
-                target.write(home, imported.resource.name(), &change, &facts).map_err(refuse)?;
+                write_beside(target, home, imported.resource.name(), &change, &facts, report).map_err(refuse)?;
             }
             launches.insert((home.clone(), clone.metadata.name.clone()), imported.resource.name().to_owned());
             Ok(imported)
@@ -631,11 +646,11 @@ pub fn import_checkouts(
             let status = checkout.status.as_ref();
             if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
                 let facts = CheckoutFacts { degraded: status.and_then(|status| status.degraded.clone()) };
-                target.write(home, imported.resource.name(), &change, &facts).map_err(refuse)?;
+                write_beside(target, home, imported.resource.name(), &change, &facts, report).map_err(refuse)?;
             }
             if let Some(status) = status.filter(|status| status.integration != Default::default()) {
                 let integration = checkouts::stored_integration(Inspection::of_status(&status.integration), None);
-                target.write(home, imported.resource.name(), &change, &integration).map_err(refuse)?;
+                write_beside(target, home, imported.resource.name(), &change, &integration, report).map_err(refuse)?;
             }
             Ok(imported)
         });
@@ -718,7 +733,7 @@ pub fn import_terminal_sessions(
             let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
             write_imported(target, &mut imported, &change).map_err(refuse)?;
             if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
-                target.write(home, imported.resource.name(), &change, &terminal_launch_facts(session)).map_err(refuse)?;
+                write_beside(target, home, imported.resource.name(), &change, &terminal_launch_facts(session), report).map_err(refuse)?;
             }
             Ok(imported)
         });

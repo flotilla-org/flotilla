@@ -2,235 +2,21 @@ use std::path::Path;
 
 use chrono::Utc;
 use flotilla_core::primitives::demand_import::retired;
+use flotilla_daemon_testkit::import_fixture::{artifact, clone, demand, designation, document, forge, message, own, populated, NS, THERE};
 use flotilla_engine_store::ImportTarget;
-use flotilla_protocol::NodeId;
 use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
 use flotilla_resources::{
-    AccessDelivery, Artifact, ChangeRequestReviewObservation, ChangeRequestStatus, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
-    CredentialSpec, FleetDesignation, Forge, FulfilmentKind, InputMeta, IssueStatus, Message, Observation, ObservedChangeRequestState,
-    ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, Project, Repository, RepositorySpec, Resource,
-    TerminalSession, Vessel,
+    Artifact, ChangeRequestReviewObservation, ChangeRequestStatus, FulfilmentKind, IssueStatus, Message, Observation,
+    ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, TerminalSession,
 };
 use flotilla_schema::{Kind, Timestamp};
-use flotilla_store::{replica::StoredReplicaEventKind, ResourceKind};
 use flotilla_store_sqlite::SqliteBackend;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::*;
 
-const NS: &str = "flotilla";
 const HERE: &str = "host-a";
-const THERE: &str = "host-b";
-
-fn document(kind: &str, name: &str, spec: Value, status: Value) -> Value {
-    json!({
-        "apiVersion": "flotilla.work/v1", "kind": kind,
-        "metadata": {"name": name, "namespace": NS, "resourceVersion": "1", "creationTimestamp": "2026-10-19T00:00:00Z"},
-        "spec": spec,
-        "status": status,
-    })
-}
-
-fn designation() -> Value {
-    document("FleetDesignation", "fleet", json!({"fleet": "lab", "project": "project-map"}), Value::Null)
-}
-
-fn message(name: &str) -> Value {
-    document(
-        "Message",
-        name,
-        json!({"sender": "system:turn-rules", "receiver": "flotilla/demo/work/coder", "relation": "system", "body": "hello"}),
-        json!({"phase": "accepted", "since": "2026-10-19T00:00:00Z", "reason": "waiting", "acceptedSequence": 1}),
-    )
-}
-
-fn artifact(name: &str) -> Value {
-    document(
-        "Artifact",
-        name,
-        json!({"convoy": "demo", "producer": "coder", "kind": "brief", "subject": "demo", "summary": {"charter_commit": "abc"},
-            "digest": "ef37", "size": 1, "media_type": "text/markdown", "expires_at": "2026-11-19T00:00:00Z"}),
-        Value::Null,
-    )
-}
-
-/// An access delivery as r974's access layer wrote it: the digest-named record, two needs, and for
-/// a failed delivery a permanent retry.
-fn access_delivery(name: &str, failed: bool) -> Value {
-    let retry = if failed {
-        json!({"need": "account", "attempts": 3, "error": "permanent, not retried: authority refused", "next_at": i64::MAX})
-    } else {
-        Value::Null
-    };
-    document(
-        "AccessDelivery",
-        name,
-        json!({"access": "flotilla/demo/implement/coder", "place": "env-a", "harness": "claude-code", "home": "/home/crew/.claude",
-            "needs": {
-                "home": {"mechanism": "agent-push", "digest": "ab12", "at": 1_790_000_000_000_000_i64},
-                "skills": {"mechanism": "host-path-read-only-live", "digest": "cd34", "at": 1_790_000_001_000_000_i64},
-            },
-            "retry": retry}),
-        Value::Null,
-    )
-}
-
-fn clone(name: &str) -> Value {
-    document(
-        "Clone",
-        name,
-        json!({"repo_ref": "github.com/org/repo", "url": "https://github.com/org/repo", "env_ref": "env-a", "path": format!("/c/{name}")}),
-        json!({"phase": "Ready"}),
-    )
-}
-
-fn forge() -> Value {
-    document(
-        "Forge",
-        "lab",
-        json!({"forge_id": "lab", "git_ssh_host": "forge.example.invalid", "hosts": ["forge.example.invalid"],
-            "https_url": "https://forge.example.invalid", "kind": "forgejo"}),
-        Value::Null,
-    )
-}
-
-/// A record of this store, created (at the time of the write) as the daemon creates it.
-async fn own<R: Resource>(backend: &SqliteBackend, document: Value) -> Value {
-    let kind = ResourceKind::of::<R>();
-    let meta = InputMeta::builder().name(document["metadata"]["name"].as_str().expect("name").to_owned()).build();
-    let created = backend.create_raw(kind, NS, &meta, &document["spec"]).await.expect("create");
-    let created = if document["status"].is_null() {
-        created
-    } else {
-        let version = created.metadata.resource_version.clone();
-        backend.update_status_raw(kind, NS, &meta.name, &version, &document["status"]).await.expect("status")
-    };
-    kind.encode_object(&created).expect("encode")
-}
-
-/// A record of a retired kind, stored as the previous generation stored it.
-fn own_retired(dir: &Path, document: Value) {
-    let connection = rusqlite::Connection::open(dir.join(OLD_STORE)).expect("old store");
-    connection
-        .execute(
-            "INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json) VALUES ('flotilla.work', 'v1', ?1, ?2, ?3, 1, ?4)",
-            rusqlite::params![document["kind"].as_str().expect("kind"), NS, document["metadata"]["name"].as_str().expect("name"), document.to_string()],
-        )
-        .expect("retired row");
-}
-
-/// A copy of `origin`'s record, as replication stores it.
-async fn replica<R: Resource>(backend: &SqliteBackend, origin: &str, document: Value) {
-    let kind = ResourceKind::of::<R>();
-    let object = kind.decode_object(document).expect("decode");
-    backend.apply_replica_raw(kind, &NodeId::new(origin), NS, StoredReplicaEventKind::Added, &object, Utc::now()).await.expect("replica");
-}
-
-/// An old store holding a record of each importer's kinds homed here, and copies of records
-/// homed at another host; open, as the daemon holds it while it imports.
-async fn populated(dir: &Path) -> SqliteBackend {
-    let backend = SqliteBackend::open(dir.join(OLD_STORE)).expect("old store");
-    own::<FleetDesignation>(&backend, designation()).await;
-    own::<Message>(&backend, message("waiting")).await;
-    own::<Artifact>(&backend, artifact("ours")).await;
-    own::<CloneResource>(&backend, clone("clone-a")).await;
-    own::<AccessDelivery>(&backend, access_delivery("access-delivered", false)).await;
-    own::<AccessDelivery>(&backend, access_delivery("access-failed", true)).await;
-    own::<Checkout>(
-        &backend,
-        document(
-            "Checkout",
-            "observed-a",
-            json!({"kind": "observed", "ref": "main", "path": "/repo", "repo_ref": "repo", "host_ref": "feta", "is_main": true}),
-            json!({"phase": "Ready"}),
-        ),
-    )
-    .await;
-    own::<Vessel>(
-        &backend,
-        document(
-            "Vessel",
-            "convoy-b-implement",
-            json!({"convoy_ref": "convoy-b", "vessel_name": "implement", "fulfilment_kind_ref": "p"}),
-            json!({"phase": "Ready", "environment_ref": "env-b",
-                "placement_decision": {"policy_name": "p", "target_host": {"ref": "feta", "display_name": "feta"}}}),
-        ),
-    )
-    .await;
-    own::<ConvoyEnsure>(
-        &backend,
-        document(
-            "ConvoyEnsure",
-            "standing-governor",
-            json!({"project_ref": "flotilla", "role": "governor", "repositories": []}),
-            json!({"convoy_ref": "governor-9"}),
-        ),
-    )
-    .await;
-    own::<Convoy>(&backend, document("Convoy", "governor-1", json!({"workflow_ref": "w", "inputs": {}}), Value::Null)).await;
-    own_retired(
-        dir,
-        demand(
-            "reclaim-refusal-governor-1",
-            ("Convoy", "governor-1"),
-            &[(retired::RECLAIM_REFUSAL_REASON_ANNOTATION, "checkout is dirty")],
-            "raised",
-        ),
-    );
-    let repository = json!({"forge": {"repository": "org/repo", "service_url": "https://github.com"},
-        "identity": {"canonical_remote": "https://github.com/org/repo", "kind": "remote"}, "remotes": ["https://github.com/org/repo"]});
-    let key = serde_json::from_value::<RepositorySpec>(repository.clone()).expect("repository").key().0;
-    own::<Repository>(&backend, document("Repository", &key, repository, Value::Null)).await;
-    own::<Project>(
-        &backend,
-        document(
-            "Project",
-            "flotilla",
-            json!({"default_workflow_ref": "single-agent-contained", "display_name": "flotilla", "issue_source_bindings": [],
-                "repositories": [{"repo": key}]}),
-            Value::Null,
-        ),
-    )
-    .await;
-    own::<CredentialSpec>(
-        &backend,
-        document(
-            "CredentialSpec",
-            "claude",
-            json!({"consumer": {"account_email": "user@example.invalid", "adapter": "claude-oauth"}, "lifecycle": "static",
-                "placement": {"binaries": ["claude"]}, "source": {"kind": "file", "path": "/credentials/claude"}}),
-            Value::Null,
-        ),
-    )
-    .await;
-    own::<FulfilmentKind>(
-        &backend,
-        document(
-            "FulfilmentKind",
-            "docker",
-            json!({"grants": [{"kind": "platform", "value": "linux"}], "host_ref": "feta", "image": {"image_baseline_ref": "fleet-crew"},
-                "pool": "cleat", "realisation": "docker_per_vessel"}),
-            Value::Null,
-        ),
-    )
-    .await;
-    own::<TerminalSession>(
-        &backend,
-        document(
-            "TerminalSession",
-            "tool-a",
-            json!({"env_ref": "env", "role": "tool", "source": {"kind": "tool", "command": "true"}, "cwd": "/repo", "pool": "cleat"}),
-            json!({"phase": "Running", "session_id": "s1"}),
-        ),
-    )
-    .await;
-    replica::<Artifact>(&backend, THERE, artifact("theirs")).await;
-    replica::<AccessDelivery>(&backend, THERE, access_delivery("access-theirs", false)).await;
-    replica::<CloneResource>(&backend, THERE, clone("clone-b")).await;
-    replica::<Forge>(&backend, THERE, forge()).await;
-    backend
-}
 
 fn digest(path: &Path) -> Vec<u8> {
     Sha256::digest(std::fs::read(path).expect("read")).to_vec()
@@ -1027,17 +813,6 @@ fn hosts_importing_together_write_each_observation_once_at_its_observer() {
 
 type MessageResource = flotilla_state_machines::Resource<flotilla_state_machines::machines::message::Message>;
 
-fn demand(name: &str, target: (&str, &str), annotations: &[(&str, &str)], state: &str) -> Value {
-    let target = flotilla_protocol::ResourceRef::new("flotilla.work/v1", target.0, NS, target.1);
-    let principal = flotilla_protocol::PrincipalRef::implicit_for_namespace(NS);
-    let spec =
-        json!({"originating_work_ref": target, "kind": "human_gate", "addressee": {"kind": "principal", "principal_ref": principal}});
-    let mut record =
-        document("Demand", name, spec, json!({"state": state, "raised": {"as_of": "2026-10-20T00:00:00Z", "authority": "writer"}}));
-    record["metadata"]["annotations"] = annotations.iter().map(|(key, value)| ((*key).to_owned(), json!(value))).collect();
-    record
-}
-
 fn attention_records() -> Vec<Value> {
     let convoy = |name: &str, project: Option<&str>, phase: &str| {
         let spec = flotilla_resources::ConvoySpec::builder().workflow_ref("w".into()).maybe_project_ref(project.map(str::to_owned)).build();
@@ -1273,66 +1048,4 @@ async fn placement_rows_import_as_kinds_and_none_stay_on_the_old_store() {
     for name in ["host-direct-feta", "docker-crew-image-feta", "placement-snapshot-0123456789ab"] {
         assert!(holds::<flotilla_provisioning::stored::placement::FulfilmentKindDefinition>(&mut store, name, HERE), "{name}");
     }
-}
-
-/// The own host of a real old store: the one Host homed there that describes a daemon.
-fn own_daemon_host(source: &Source, home: &str) -> Option<String> {
-    let mut daemons = source
-        .rows
-        .iter()
-        .filter(|row| row.plural == "hosts" && row.home == home)
-        .filter_map(|row| decode::<flotilla_resources::Host>(&row.document).ok())
-        .filter(|host| host.spec.connection.is_daemon())
-        .map(|host| host.metadata.name);
-    let own = daemons.next();
-    own.filter(|_| daemons.next().is_none())
-}
-
-// Rehearsal (#3108): the first start's import over a real old store copied into
-// `FLOTILLA_IMPORT_REHEARSAL_DIR`, which it writes its report and engine store beside. Prints
-// counts by kind and refusal reasons only; the report beside the copy names the records.
-#[test]
-#[ignore = "needs a real old store copy in FLOTILLA_IMPORT_REHEARSAL_DIR"]
-fn first_start_imports_a_real_old_store() {
-    let dir = std::path::PathBuf::from(std::env::var_os("FLOTILLA_IMPORT_REHEARSAL_DIR").expect("FLOTILLA_IMPORT_REHEARSAL_DIR"));
-    let home = "rehearsal-home";
-    // An engine store an earlier rehearsal put in place is replaced: the copy's old store is the source.
-    for file in [ENGINE_STORE, "decided.sqlite-wal", "decided.sqlite-shm"] {
-        let _ = std::fs::remove_file(dir.join(file));
-    }
-    let source = Source::read(&dir.join(OLD_STORE), home).expect("read old store");
-    let own_host = own_daemon_host(&source, home);
-    println!(
-        "rows: {}, homed here: {}, own daemon Host found: {}",
-        source.rows.len(),
-        source.rows.iter().filter(|row| row.home == home).count(),
-        own_host.is_some()
-    );
-    let result = first_start(&dir, home, own_host.as_deref());
-    let report = std::fs::read_dir(&dir)
-        .expect("dir")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("import-")))
-        .max()
-        .expect("report");
-    let report: Value = serde_json::from_slice(&std::fs::read(&report).expect("report")).expect("json");
-    println!("outcome: {}", report["outcome"]);
-    for (kind, counts) in report["kinds"].as_object().expect("kinds") {
-        println!("{kind}: {counts}");
-    }
-    let mut reasons = BTreeMap::<(String, String), usize>::new();
-    for refusal in report["refusals"].as_array().expect("refusals") {
-        *reasons
-            .entry((refusal["kind"].as_str().unwrap_or_default().to_owned(), refusal["reason"].as_str().unwrap_or_default().to_owned()))
-            .or_default() += 1;
-    }
-    for ((kind, reason), count) in reasons {
-        println!("refused {count} {kind}: {reason}");
-    }
-    for (kind, rows) in report["rows"].as_object().expect("rows") {
-        println!("rows {kind}: {rows}");
-    }
-    println!("first_start: {}", if result.is_ok() { "ok" } else { "error" });
-    every_row_accounted(&report);
 }
