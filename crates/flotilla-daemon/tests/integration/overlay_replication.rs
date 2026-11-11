@@ -135,16 +135,19 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
         )
         .await
         .expect("publish feta heartbeat");
-    feta.resource_backend()
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("feta-convoy".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).role("feta-convoy".to_string()).build(),
-        )
-        .await
-        .expect("create feta convoy");
-    // The crew's session is feta's engine launch, held for feta's launch of the convoy's work.
-    let vessel = crate::engine(&feta).vessels.request("feta-convoy", "work", &feta_host_id);
+    // The convoy is feta's engine launch; the crew's session is feta's launch too, held for feta's
+    // launch of the convoy's work.
+    let convoy = crate::admit_convoy(
+        &feta,
+        flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "feta-convoy",
+            ConvoySpec::builder().workflow_ref("workflow".to_string()).role("feta-convoy".to_string()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        ),
+    )
+    .await;
+    let vessel = crate::engine(&feta).vessels.request(&convoy, "work", &feta_host_id);
     crate::engine(&feta).terminals.request(&TerminalLaunchRequest {
         session: "feta-session".to_string(),
         environment: "feta-environment".to_string(),
@@ -174,7 +177,7 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
     let row = list.rows.iter().find(|row| row.session.as_deref() == Some("feta-session")).expect("feta crew row");
     assert_eq!(row.host, HostName::new("feta"));
     assert_eq!(row.crew, "work/coder");
-    assert_eq!(row.convoy, "feta-convoy");
+    assert_eq!(row.convoy, convoy);
     assert!(matches!(row.staleness, FleetStaleness::Fresh { .. }));
     let health = kiwi.fleet_health_internal().await.expect("fleet health");
     let feta_health = health.hosts.iter().find(|row| row.host == HostName::new("feta")).expect("feta health");
@@ -184,13 +187,14 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
     // #742: the aliases formerly indexed from snapshot rows remain attachable.
     std::fs::write(kiwi.config_store().base_path().join("hosts.toml"), "[hosts.feta]\nhostname = 'feta.example'\n")
         .expect("attach hop config");
-    for reference in ["feta-session", "feta-convoy/work/coder", "work/coder", "work", "coder", "feta-environment"] {
+    let crew_path = format!("{convoy}/work/coder");
+    for reference in ["feta-session", crew_path.as_str(), "work/coder", "work", "coder", "feta-environment"] {
         let resolved =
             kiwi.resolve_attach_command_on_host_internal(reference, Some(&HostName::new("feta"))).await.expect("remote crew alias");
         let binding = resolved.binding.expect("crew binding");
         assert_eq!(binding.host, HostName::new("feta"));
         assert_eq!(binding.session.as_deref(), Some("feta-session"));
-        assert_eq!(binding.convoy.as_deref(), Some("feta-convoy"));
+        assert_eq!(binding.convoy.as_deref(), Some(convoy.as_str()));
         assert_eq!(binding.vessel.as_deref(), Some("work"));
         assert_eq!(binding.role.as_deref(), Some("coder"));
     }
@@ -1632,15 +1636,15 @@ async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
     );
     let mut spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).role("coder".to_string()).build();
     spec.project_ref = Some("flotilla".to_string());
-    kiwi.resource_backend()
-        .using::<Convoy>("flotilla")
-        .create(&InputMeta::builder().name("convoy-homed-on-kiwi".to_string()).build(), &spec)
-        .await
-        .expect("create convoy on kiwi");
+    let convoy = crate::admit_convoy(
+        &kiwi,
+        flotilla_engine_convoys_testkit::convoy("flotilla", "convoy-homed-on-kiwi", spec, flotilla_engine_convoys_testkit::single_agent("coder")),
+    )
+    .await;
     // The crew runs on feta: its session is feta's engine launch, held for feta's launch of work
     // `work` in the convoy homed at kiwi.
     let vessel = crate::engine(&feta).vessels.request_for(&flotilla_resources::vessel_records::VesselLaunchRequest {
-        convoy: "convoy-homed-on-kiwi".to_string(),
+        convoy: convoy.clone(),
         convoy_home: kiwi.node_id().as_str().to_string(),
         work: "work".to_string(),
         host: feta_host_id.clone(),
@@ -1674,14 +1678,14 @@ async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
     .expect("replication");
 
     let feta_name = HostName::new("feta");
-    for reference in ["coder@flotilla", "convoy-homed-on-kiwi"] {
+    for reference in ["coder@flotilla", convoy.as_str()] {
         // From the Convoy's home, with and without an explicit session host.
         for host in [None, Some(&feta_name)] {
             let resolved =
                 kiwi.resolve_attach_command_on_host_internal(reference, host).await.unwrap_or_else(|e| panic!("{reference}: {e}"));
             let binding = resolved.binding.expect("binding");
             assert_eq!(binding.host, feta_name, "{reference}");
-            assert_eq!(binding.convoy.as_deref(), Some("convoy-homed-on-kiwi"));
+            assert_eq!(binding.convoy.as_deref(), Some(convoy.as_str()));
         }
         // From the session's own host the session is local.
         let resolved = feta.resolve_attach_command_internal(reference).await.unwrap_or_else(|e| panic!("{reference}: {e}"));

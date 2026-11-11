@@ -16,4 +16,4 @@ mod test_daemon;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;
 
-use flotilla_daemon_testkit::engine::{engine, engine_environments};
+use flotilla_daemon_testkit::engine::{admit_convoy, engine, engine_environments};

@@ -14,7 +14,7 @@ use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_daemon_testkit::engine::session_request;
+use flotilla_daemon_testkit::engine::{admit_convoy, session_request};
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::fake_discovery_with_provider_set;
 use flotilla_discovery_testkit::FakeDiscoveryProviders;
@@ -76,6 +76,11 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         instruction: None,
         promises: Vec::new(),
     }
+}
+
+/// Convoy `name` as admission hands it to the engine: `spec`, with one agent seat to owe.
+fn engine_convoy(name: &str, spec: ConvoySpec) -> flotilla_resources::ResourceObject<Convoy> {
+    flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, flotilla_engine_convoys_testkit::single_agent("coder"))
 }
 
 fn convoy_rows(result_set: &ResultSet) -> &[ConvoyRow] {
@@ -538,18 +543,17 @@ async fn aggregator_emits_result_set_events() {
     };
     assert!(convoy_rows(&bootstrap).is_empty());
 
-    // Create a Convoy resource — the Aggregator should pick it up via the watch
+    // Admit a convoy on the engine — the Aggregator should pick it up via the watch
     // stream and emit a delta for the convoys query.
-    let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
     let mut spec = convoy_spec("my-workflow");
     spec.project_ref = Some("my-project".to_string());
-    convoys.create(&convoy_meta("test-convoy-1"), &spec).await.expect("create convoy");
+    let launch = admit_convoy(&daemon, engine_convoy("test-convoy-1", spec)).await;
     let DaemonEvent::ResultDelta(_) = next_convoys_event(&mut rx, "the convoy's delta").await else { panic!("a delta follows") };
 
     let found = convoys_result_set(&daemon).await;
     let rows = convoy_rows(&found);
     assert_eq!(rows.len(), 1, "expected exactly one convoy in the result set");
-    assert_eq!(rows[0].name, "test-convoy-1");
+    assert_eq!(rows[0].name, launch);
     assert_eq!(rows[0].project_ref.as_deref(), Some("my-project"));
 }
 
@@ -605,16 +609,16 @@ async fn an_attention_raised_on_the_engine_marks_its_convoys_row() {
         .expect("designation");
     let mut spec = convoy_spec("w");
     spec.project_ref = Some("flotilla".to_string());
-    backend.using::<Convoy>("flotilla").create(&convoy_meta("demo"), &spec).await.expect("create convoy");
+    let demo = admit_convoy(&daemon, engine_convoy("demo", spec)).await;
     let _ = next_convoys_event(&mut rx, "the convoy's row").await;
 
-    let attention = Attention::new(Fact::ReclaimRefused { convoy: "demo".into() }, "reclaim refused: backing alive", chrono::Utc::now());
+    let attention = Attention::new(Fact::ReclaimRefused { convoy: demo.clone() }, "reclaim refused: backing alive", chrono::Utc::now());
     daemon.attentions().raise("flotilla", &attention).await.expect("raise on the engine");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let set = convoys_result_set(&daemon).await;
             if convoy_rows(&set).iter().any(|row| {
-                row.name == "demo"
+                row.name == demo
                     && row.surface_state.needs_attention()
                     && row.message.as_deref().is_some_and(|message| message.contains("reclaim refused: backing alive"))
             }) {
@@ -683,10 +687,31 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .create(&InputMeta::builder().name(environment_name.clone()).build(), &environment_spec)
         .await
         .expect("create attach environment");
+    // The convoy is the engine's launch, its work `coder` running.
+    let convoy_a = admit_convoy(
+        &daemon,
+        flotilla_engine_convoys_testkit::convoy("flotilla", "convoy-a", convoy_spec("scratch"), ConvoyStatus {
+            phase: ResourceConvoyPhase::Active,
+            workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: None,
+                turn_delivery: Default::default(),
+                vessels: vec![VesselRequirement::builder()
+                    .name("coder".to_string())
+                    .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                    .build()],
+            }),
+            work: BTreeMap::from([("coder".to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+            ..Default::default()
+        }),
+    )
+    .await;
     // The sessions are the engine's launches, written at the daemon's home before its runtime
-    // starts; the convoy-bound one is held for the daemon's launch of work `coder` of `convoy-a`.
+    // starts; the convoy-bound one is held for the daemon's launch of work `coder` of the convoy.
     let vessel = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store().expect("decided store")).request(
-        "convoy-a",
+        &convoy_a,
         "coder",
         &host_id.to_string(),
     );
@@ -704,28 +729,6 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         ..session_request("terminal-convoy-coder", &tool(&environment_name, "coder", "fake-terminals"))
     });
     terminals.ready(&convoy_launch, "cleat-convoy-coder", &Default::default());
-    let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys.create(&convoy_meta("convoy-a"), &convoy_spec("scratch")).await.expect("create convoy for bound terminal session");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ResourceConvoyPhase::Active,
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder().name("coder".to_string()).crew(Vec::new()).build()],
-                }),
-                work: BTreeMap::from([("coder".to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark convoy vessel running");
     let unresolvable = terminals.request(&session_request("terminal-unresolvable", &tool("missing-environment", "observer", "fake")));
     terminals.ready(&unresolvable, "cleat-unresolvable", &Default::default());
     let options = RuntimeOptions {
@@ -795,7 +798,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     // capability event has already advanced every query family.
     let materialized_convoy = |rows: &[ConvoyRow]| {
         rows.iter()
-            .find(|row| row.name == "convoy-a")
+            .find(|row| row.name == convoy_a)
             .filter(|row| {
                 row.vessels.iter().any(|vessel| vessel.name == "coder" && vessel.materialize.as_deref() == Some("terminal-convoy-coder"))
             })
@@ -935,20 +938,19 @@ async fn subscribe_queries_replays_result_set_after_seq() {
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
 
-    let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
     let DaemonEvent::ResultSet(_) = next_convoys_event(&mut rx, "the bootstrap result set").await else {
         panic!("the convoys query starts with a result set")
     };
 
-    // Step 1: Create convoy A and wait for its change.
-    convoys.create(&convoy_meta("convoy-a"), &convoy_spec("wf-a")).await.expect("create convoy-a");
+    // Step 1: Admit convoy A and wait for its change.
+    admit_convoy(&daemon, engine_convoy("convoy-a", convoy_spec("wf-a"))).await;
     let DaemonEvent::ResultDelta(after_a) = next_convoys_event(&mut rx, "convoy-a's delta").await else { panic!("a delta follows") };
 
     let cursor_seq = after_a.seq;
     assert!(cursor_seq > 0, "result set seq must be positive");
 
-    // Step 2: Create convoy B and wait for the ResultDelta.
-    convoys.create(&convoy_meta("convoy-b"), &convoy_spec("wf-b")).await.expect("create convoy-b");
+    // Step 2: Admit convoy B and wait for the ResultDelta.
+    let convoy_b = admit_convoy(&daemon, engine_convoy("convoy-b", convoy_spec("wf-b"))).await;
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -977,13 +979,12 @@ async fn subscribe_queries_replays_result_set_after_seq() {
             _ => None,
         })
         .expect("expected a ResultSet for the convoys query in subscribe replay");
-    assert!(convoy_rows(result_set).iter().any(|row| row.name == "convoy-b"), "replayed result set must contain convoy-b");
+    assert!(convoy_rows(result_set).iter().any(|row| row.name == convoy_b), "replayed result set must contain convoy-b");
 }
 
-// The inspector replaces the Git subprocess boundary. Publishing a rival convoy
+// The inspector replaces the Git subprocess boundary. Admitting a rival convoy
 // during inspection models an identity becoming occupied after the first check.
 struct ConflictCheckoutInspector {
-    backend: ResourceBackend,
     daemon: std::sync::Weak<InProcessDaemon>,
 }
 
@@ -996,14 +997,9 @@ impl flotilla_admission::repository_inspection::RepositoryInspector for Conflict
     ) -> Result<flotilla_admission::repository_inspection::RepositoryInspection, String> {
         use flotilla_admission::repository_inspection::LocalCheckoutInspection;
         use flotilla_admission::repository_inspection::RepositoryInspection;
-        self.backend
-            .using::<Convoy>("flotilla")
-            .create(
-                &InputMeta::builder().name("rival".to_string()).build(),
-                &ConvoySpec::builder().role("cleanup".to_string()).workflow_ref("cleanup-workflow".to_string()).build(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        let daemon = self.daemon.upgrade().expect("daemon remains alive");
+        let rival = ConvoySpec::builder().role("cleanup".to_string()).workflow_ref("cleanup-workflow".to_string()).build();
+        admit_convoy(&daemon, engine_convoy("rival", rival)).await;
         Ok(RepositoryInspection {
             spec: RepositorySpec::remote("https://github.com/widgets/api.git")?,
             checkout: LocalCheckoutInspection::builder()
@@ -1118,7 +1114,7 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
             .await
             .expect("workflow");
         daemon
-            .set_repository_inspector(Arc::new(ConflictCheckoutInspector { backend: backend.clone(), daemon: Arc::downgrade(&daemon) }))
+            .set_repository_inspector(Arc::new(ConflictCheckoutInspector { daemon: Arc::downgrade(&daemon) }))
             .await;
         let result = cleanup_command_result(
             &daemon,
