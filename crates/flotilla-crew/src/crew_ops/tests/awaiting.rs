@@ -126,18 +126,18 @@ fn wired(messages: &Arc<RecordingMessages>) -> MessagePath {
 async fn a_failed_first_record_write_is_written_by_the_repeat() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let messages = RecordingMessages::new(backend, 1);
-    let (crew, _backend, probe, _config) = fixture_with_message_path(flotilla_resources::CrewWorkPhase::Done, wired(&messages)).await;
+    let (crew, _backend, probe, held) = fixture_with_message_path(flotilla_resources::CrewWorkPhase::Done, wired(&messages)).await;
     probe.fail.store(false, Ordering::SeqCst);
     let request = CrewTurnIntent::builder()
         .namespace("flotilla".into())
-        .convoy("crew".into())
+        .convoy(held.launch.clone())
         .source("ask".into())
         .vessel("work".into())
         .role("coder".into())
-        .receiver("flotilla/crew/work/coder".into())
+        .receiver(held.receiver("work", "coder"))
         .brief("a question".into())
         .subject_revision("revision".into())
-        .sender("flotilla/crew/work/reviewer".into())
+        .sender(held.receiver("work", "reviewer"))
         .expectation(MessageExpectation::Reply)
         .build();
     let refused = crew.deliver_turn(&request).await.expect_err("the record failed");
@@ -158,10 +158,9 @@ async fn a_failed_first_record_write_is_written_by_the_repeat() {
 async fn the_stall_reconciler_ends_records_of_subjects_not_stalled() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let messages = RecordingMessages::new(backend, 0);
-    let (crew, _backend, _probe, _config) = fixture_with_message_path(flotilla_resources::CrewWorkPhase::Working, wired(&messages)).await;
+    let (crew, _backend, _probe, held) = fixture_with_message_path(flotilla_resources::CrewWorkPhase::Working, wired(&messages)).await;
     crew.reconcile_crew_stalls_once("flotilla").await.expect("one pass");
-    assert_eq!(
-        messages.ended.lock().expect("ended").as_slice(),
-        &[(vec!["flotilla/crew/work/coder".to_owned(), "project:flotilla/convoy:crew".to_owned()], None)]
-    );
+    let project = flotilla_address::Address::project("flotilla").expect("project address");
+    let convoy = flotilla_resources::convoy::engine::launch_address(&project, &held.launch).expect("launch address");
+    assert_eq!(messages.ended.lock().expect("ended").as_slice(), &[(vec![held.receiver("work", "coder"), convoy.to_string()], None)]);
 }
