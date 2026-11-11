@@ -2428,6 +2428,7 @@ dependencies = [
  "flotilla-provisioning-testkit",
  "flotilla-replay-testkit",
  "flotilla-resources",
+ "flotilla-schema-sqlite",
  "flotilla-store",
  "flotilla-store-http",
  "flotilla-store-memory",

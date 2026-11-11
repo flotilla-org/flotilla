@@ -2,18 +2,18 @@ use crate::crew_ops::MessageAttribution;
 use flotilla_resources::ResumeIntent;
 use std::sync::atomic::Ordering;
 
-use flotilla_resources::{Convoy as ResourceConvoy, CrewWorkPhase};
+use flotilla_resources::CrewWorkPhase;
 
 use super::{fixture, old_store_fixture};
 use crate::crew_ops::ConvoyResumeOutcome;
 
 #[tokio::test]
 async fn resume_restores_work_until_credentials_are_staged() {
-    let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;
+    let (crew, backend, probe, held) = fixture(CrewWorkPhase::Done).await;
     let error = crew
         .convoy_resume_with_sender_internal(
             "flotilla",
-            "crew",
+            &held.launch,
             "continue",
             (None, None),
             MessageAttribution::operator(None),
@@ -22,12 +22,15 @@ async fn resume_restores_work_until_credentials_are_staged() {
         .await
         .expect_err("credential failure");
     assert_eq!(error, "staging unavailable");
-    let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
-    assert_eq!(convoy.status.expect("status").crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
+    // The failed resume is undone: the coder stays Done and its home no longer notes the resume.
+    let convoy = held.convoy(&backend).await;
+    let coder = convoy.status.expect("status").crew_work["work"]["coder"].clone();
+    assert_eq!(coder.phase, CrewWorkPhase::Done);
+    assert_eq!(coder.resume_brief_id, None);
     assert_eq!(
         crew.convoy_resume_with_sender_internal(
             "flotilla",
-            "crew",
+            &held.launch,
             "continue",
             (None, None),
             MessageAttribution::operator(None),
@@ -47,10 +50,10 @@ async fn resume_restores_work_until_credentials_are_staged() {
 #[tokio::test]
 async fn convoy_resume_body_is_author_text() {
     for phase in [CrewWorkPhase::Working, CrewWorkPhase::Done] {
-        let (crew, backend, probe, _config) = fixture(phase).await;
+        let (crew, backend, probe, held) = fixture(phase).await;
         probe.fail.store(false, Ordering::SeqCst);
         let prompt = "Continue the fix.\n\nKeep this paragraph.";
-        crew.resume("flotilla", "crew", prompt, None, None).await.expect("resume");
+        crew.resume("flotilla", &held.launch, prompt, None, None).await.expect("resume");
         let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].spec.body, prompt);
@@ -67,23 +70,24 @@ fn queued_resume_replaces_and_withdraws_without_staging(tc: hegel::TestCase) {
     let operations: Vec<u8> = (0..steps).map(|_| tc.draw(gs::integers::<u8>().min_value(0).max_value(3))).collect();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let (crew, backend, probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
+        let (crew, backend, probe, held) = old_store_fixture(CrewWorkPhase::Working).await;
+        let launch = held.launch.as_str();
         let mut expected = None;
         for operation in operations {
             match operation {
                 0 | 1 => {
                     let prompt = if operation == 0 { "first" } else { "second" };
                     assert_eq!(
-                        crew.resume("flotilla", "crew", prompt, None, None).await.expect("queue"),
+                        crew.resume("flotilla", launch, prompt, None, None).await.expect("queue"),
                         ConvoyResumeOutcome::Queued { displaced: expected.clone() }
                     );
                     expected = Some(prompt.to_string());
                 }
                 2 => {
-                    assert_eq!(crew.withdraw_pending_brief("flotilla", "crew").await.expect("withdraw"), expected.take());
+                    assert_eq!(crew.withdraw_pending_brief("flotilla", launch).await.expect("withdraw"), expected.take());
                 }
                 _ => {
-                    crew.resume("flotilla", "crew", "", None, None).await.expect_err("empty prompt refused");
+                    crew.resume("flotilla", launch, "", None, None).await.expect_err("empty prompt refused");
                 }
             }
             let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;

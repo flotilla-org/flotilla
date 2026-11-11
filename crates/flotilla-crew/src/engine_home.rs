@@ -1,0 +1,141 @@
+//! The engine at a crew test's home (#3108): one decided store whose launches, vessels, terminal
+//! sessions and environments a test drives, served on its resource backend as Convoy, Vessel and
+//! TerminalSession the way the composition root serves them, and the readings a crew service and
+//! its leaf subscriptions take over the same store.
+
+use std::sync::Arc;
+
+use flotilla_engine_convoys_testkit::EngineConvoysHome;
+use flotilla_provisioning::engine::reads::{LifecycleReadPort, StoreReads};
+use flotilla_provisioning_testkit::{AgentSessionsFixture, EngineFixture, TerminalsFixture};
+use flotilla_resources::{
+    agent_activity::AgentSessionReads,
+    convoy::engine::{set_notes, EngineConvoyPath, EngineConvoys, VerdictScope},
+    lifecycle_reads::LifecycleReads,
+    terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource},
+    Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ResourceObject, SystemClock,
+};
+use flotilla_schema_sqlite::stream::Service;
+use flotilla_store::ResourceBackend;
+
+/// One home's engine, as a crew test's daemon would hold it.
+pub(crate) struct EngineHome {
+    pub engine: EngineFixture,
+    pub convoys: EngineConvoysHome,
+    pub agents: Arc<AgentSessionsFixture>,
+    namespace: String,
+    host: String,
+    service: Arc<Service>,
+    _dir: tempfile::TempDir,
+}
+
+impl EngineHome {
+    /// Opens a decided store at `home` and serves its records on `backend` in `namespace`.
+    pub fn install(backend: &ResourceBackend, namespace: &str, home: &str) -> Self {
+        let dir = tempfile::tempdir().expect("decided store directory");
+        let registry = flotilla_provisioning::stored::decided_registry().expect("decided store kinds");
+        let service = Arc::new(Service::open(&dir.path().join("decided.sqlite"), home, registry).expect("decided store"));
+        let engine = EngineFixture::over_service(&service);
+        backend.install_engine_records(Arc::new(flotilla_store::VesselViews::new(backend.clone(), namespace, engine.reads())));
+        backend.install_engine_records(Arc::new(flotilla_store::TerminalViews::new(namespace, engine.reads())));
+        let convoys = EngineConvoysHome::over(&service, namespace, backend, Arc::new(SystemClock), engine.reads());
+        let agents = Arc::new(AgentSessionsFixture::new(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH));
+        Self { engine, convoys, agents, namespace: namespace.to_owned(), host: home.to_owned(), service, _dir: dir }
+    }
+
+    /// The Convoy path, as the crew and its leaf subscriptions take it.
+    pub fn path(&self) -> EngineConvoyPath {
+        self.convoys.path()
+    }
+
+    /// The readings a crew service takes: this home's records, with its AgentSessions.
+    pub fn reads(&self) -> Arc<dyn LifecycleReads> {
+        let agents: Arc<dyn AgentSessionReads> = self.agents.clone();
+        let engine = &self.engine;
+        Arc::new(
+            LifecycleReadPort::new(StoreReads::new(self.service.store()), self.host.clone())
+                .with_environments(Arc::clone(&engine.environments.environments) as _)
+                .with_clones(Arc::clone(&engine.clones.clones) as _)
+                .with_checkouts(Arc::clone(&engine.checkouts.checkouts) as _)
+                .with_terminals(Arc::clone(&engine.terminals.terminals) as _)
+                .with_vessels(Arc::clone(&engine.vessels.vessels) as _)
+                .with_agent_sessions(agents),
+        )
+    }
+
+    /// Admits convoy `name` with `spec` and `status` as the next launch of `name`; returns the launch.
+    pub async fn admit(&self, name: &str, spec: ConvoySpec, status: ConvoyStatus) -> String {
+        self.convoys.launch(flotilla_engine_convoys_testkit::convoy(&self.namespace, name, spec, status)).await
+    }
+
+    /// Launch `launch` as its view reads, through `backend`.
+    pub async fn view(&self, backend: &ResourceBackend, launch: &str) -> ResourceObject<Convoy> {
+        backend.using::<Convoy>(&self.namespace).get(launch).await.expect("convoy view")
+    }
+
+    /// Work `work` of launch `launch`'s vessel, requested at this home and realised in
+    /// `environment`; returns the vessel's launch.
+    pub fn vessel(&self, launch: &str, work: &str, environment: &str) -> String {
+        let vessel = self.engine.vessels.request(launch, work, &self.host);
+        self.engine.vessels.ready(&vessel, environment);
+        vessel
+    }
+
+    /// `role`'s agent session `session` in `vessel`, realised in `environment`; returns its launch.
+    pub fn session(&self, vessel: &str, role: &str, session: &str, environment: &str) -> String {
+        self.launch_session(&TerminalLaunchRequest { session: session.to_owned(), ..TerminalsFixture::agent(vessel, role, environment) })
+    }
+
+    /// The session `request` asks for, realised; returns its launch, which is its crew's id. An
+    /// agent's launch resolves to its adapter's harness (`claude` when it names none).
+    pub fn launch_session(&self, request: &TerminalLaunchRequest) -> String {
+        let launch = self.engine.terminals.request(request);
+        let agent = match &request.source {
+            TerminalLaunchSource::Agent { adapter, model, .. } => Some(AgentLaunch {
+                adapter: adapter.clone().unwrap_or_else(|| "claude".to_owned()),
+                model: model.clone(),
+                stance: "trusted-implicit".to_owned(),
+            }),
+            TerminalLaunchSource::Tool { .. } => None,
+        };
+        let facts = TerminalLaunchFacts { agent, ..Default::default() };
+        self.engine.terminals.ready(&launch, &format!("{}-runtime", request.session), &facts);
+        launch
+    }
+
+    /// An operator keeps every open promise of `role` in `work` of launch `launch` by verdict.
+    pub async fn keep(&self, backend: &ResourceBackend, launch: &str, work: &str, role: &str) {
+        let convoy = self.view(backend, launch).await;
+        let scope = VerdictScope { vessel: work.to_owned(), role: Some(role.to_owned()) };
+        self.engine().keep_by_verdict(&convoy, &scope, "operator", "done").await.expect("keep by verdict");
+    }
+
+    /// Ends launch `launch` as `phase` says: Landed is its delivery, Failed and Abandoned an
+    /// operator's ending.
+    pub async fn end(&self, backend: &ResourceBackend, launch: &str, phase: ConvoyPhase) {
+        let convoy = self.view(backend, launch).await;
+        let engine = self.engine();
+        match phase {
+            ConvoyPhase::Landed => engine.deliver(&convoy).await,
+            ConvoyPhase::Failed => engine.fail(&convoy, "operator", "failed").await,
+            ConvoyPhase::Abandoned => engine.abandon(&convoy, "operator", "abandoned").await,
+            other => panic!("{other:?} is no ending"),
+        }
+        .expect("end the launch");
+    }
+
+    /// Changes this home's notes on launch `launch` as `change` changes its view's status; returns
+    /// the view with them. Only what the home notes is kept: the rest of a view is derived.
+    pub async fn note(&self, backend: &ResourceBackend, launch: &str, change: impl FnOnce(&mut ConvoyStatus)) -> ResourceObject<Convoy> {
+        let convoy = self.view(backend, launch).await;
+        let mut status = convoy.status.unwrap_or_default();
+        change(&mut status);
+        set_notes(&self.path(), launch, &status).expect("note the launch");
+        self.view(backend, launch).await
+    }
+
+    /// The Convoy path's engine.
+    pub fn engine(&self) -> Arc<dyn EngineConvoys> {
+        self.path().get().cloned().expect("the Convoy path is installed")
+    }
+}

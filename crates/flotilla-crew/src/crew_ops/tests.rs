@@ -9,11 +9,13 @@ use flotilla_config::ConfigStore;
 use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
 use flotilla_protocol::{EnvironmentId, HostName};
 use flotilla_provider_runtime::ObservationError;
+use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource};
 use flotilla_resources::{
-    ChangeRequestStatus, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewWorkPhase, CrewWorkState, InputMeta, Selector,
-    SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionSource,
-    TerminalSessionSpec, WorkState, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    ChangeRequestStatus, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewWorkPhase, InputMeta, Selector, SystemClock,
+    TerminalBrief, WorkflowSnapshot,
 };
+
+use crate::engine_home::EngineHome;
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_testkit::ReadCountsBackendExt;
@@ -57,6 +59,8 @@ impl CheckoutVcsResolver for NoCheckoutVcs {
 // Stand-in for credential controller I/O. Assert staging precedes terminal delivery.
 struct StagingProbe {
     backend: ResourceBackend,
+    /// The fixture's convoy launch.
+    launch: std::sync::OnceLock<String>,
     fail: AtomicBool,
     calls: AtomicUsize,
 }
@@ -65,8 +69,11 @@ struct StagingProbe {
 impl WorkCredentialReconciler for StagingProbe {
     async fn reconcile(&self, namespace: &str, environment: &str) -> Result<(), String> {
         assert_eq!(environment, "resume-env");
-        let convoy = self.backend.using::<ResourceConvoy>(namespace).get("crew").await.expect("convoy");
-        assert_eq!(convoy.status.expect("status").crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+        let launch = self.launch.get().expect("the fixture's launch");
+        let convoy = self.backend.using::<ResourceConvoy>(namespace).get(launch).await.expect("convoy");
+        // The coder's work is reopened first: its home notes the resume it is staging for.
+        let coder = &convoy.status.expect("status").crew_work["work"]["coder"];
+        assert!(coder.task_assigned && coder.resume_brief_id.is_some(), "staging follows the noted reopen: {coder:?}");
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.fail.swap(false, Ordering::SeqCst) {
             Err("staging unavailable".into())
@@ -76,11 +83,21 @@ impl WorkCredentialReconciler for StagingProbe {
     }
 }
 
-/// What a fixture's crew service needs kept alive: its config directory and the engine's
-/// Message path at its home.
+/// What a fixture's crew service needs kept alive, and the engine records it drives: its config
+/// directory, the engine's Message path at its home, and the engine at its home holding convoy
+/// `crew`'s launch, the launch's vessel for `work` and the `coder`'s agent session in it.
 struct Held {
     _config: tempfile::TempDir,
     messages: Option<EngineMessagesHome>,
+    engine: EngineHome,
+    /// Convoy `crew`'s launch.
+    launch: String,
+    /// The launch's vessel for `work`, realised in `resume-env`.
+    vessel: String,
+    /// The coder's agent session `session`'s launch.
+    session: String,
+    /// The launches and crew ids of the convoys admitted before it.
+    prelude: Vec<(String, String)>,
 }
 
 impl Held {
@@ -88,25 +105,92 @@ impl Held {
     fn messages(&self) -> &EngineMessagesHome {
         self.messages.as_ref().expect("a fixture on the engine's Message path")
     }
+
+    /// The fixture convoy's view.
+    async fn convoy(&self, backend: &ResourceBackend) -> flotilla_resources::ResourceObject<ResourceConvoy> {
+        self.engine.view(backend, &self.launch).await
+    }
+
+    /// The address of the fixture convoy's `role` in `work`.
+    fn receiver(&self, work: &str, role: &str) -> String {
+        flotilla_resources::crew_role_address("flotilla", &self.launch, work, role)
+    }
+
+    /// Admits convoy `name` for `role` with one vessel `work` crewed by agent `member`, the vessel
+    /// realised in `resume-env` and `member` working in its session `session`; returns the launch
+    /// and the session's launch (its crew id).
+    async fn admit_crewed(&self, name: &str, role: &str, work: &str, member: &str, session: &str) -> (String, String) {
+        admit_crewed(&self.engine, &Crewed { name, role, work, member, session }).await
+    }
+
+    /// `member`'s session `session` in the fixture's `work` vessel, running; returns the session's
+    /// launch (its crew id). A member that is not the vessel's first agent works once its task is
+    /// delivered ([`Self::assign`]).
+    fn crew_session(&self, member: &str, session: &str) -> String {
+        self.engine.session(&self.vessel, member, session, "resume-env")
+    }
+
+    /// `member` of `work` has its task, as a delivered turn notes it: it is wanted running.
+    async fn assign(&self, backend: &ResourceBackend, work: &str, member: &str) {
+        self.engine
+            .note(backend, &self.launch, |status| {
+                status.crew_work.get_mut(work).and_then(|crew| crew.get_mut(member)).expect("a declared member").task_assigned = true;
+            })
+            .await;
+    }
+
+    /// The coder declared itself stalled for `scope`, as its stall verb notes it; `change` then
+    /// changes the noted stall.
+    async fn stall(
+        &self,
+        backend: &ResourceBackend,
+        change: impl FnOnce(&mut flotilla_resources::StalledCondition),
+    ) -> flotilla_resources::ResourceObject<ResourceConvoy> {
+        let launch = self.launch.clone();
+        self.engine
+            .note(backend, &self.launch, |status| {
+                flotilla_resources::StatusPatch::apply(
+                    &flotilla_resources::external_patches::mark_crew_stalled(
+                        launch,
+                        "work".into(),
+                        "coder".into(),
+                        chrono::Utc::now(),
+                        flotilla_protocol::StallReason::Scope,
+                        None,
+                        "blocked".into(),
+                    ),
+                    status,
+                );
+                change(status.stalled.as_mut().expect("the coder's stall"));
+            })
+            .await
+    }
+}
+
+/// Another convoy at the fixture's home: `name` for `role`, with one vessel `work` crewed by
+/// agent `member` working in its session `session`.
+struct Crewed<'a> {
+    name: &'a str,
+    role: &'a str,
+    work: &'a str,
+    member: &'a str,
+    session: &'a str,
+}
+
+/// Admits `crewed` at `engine`, its vessel realised in `resume-env` and its member's session
+/// running there; returns the launch and the session's launch (its crew id).
+async fn admit_crewed(engine: &EngineHome, crewed: &Crewed<'_>) -> (String, String) {
+    let mut status = flotilla_engine_convoys_testkit::single_agent(crewed.member);
+    status.workflow_snapshot.as_mut().expect("workflow").vessels[0].name = crewed.work.into();
+    let launch =
+        engine.admit(crewed.name, ConvoySpec::builder().workflow_ref("workflow".into()).role(crewed.role.into()).build(), status).await;
+    let vessel = engine.vessel(&launch, crewed.work, "resume-env");
+    let session = engine.session(&vessel, crewed.member, crewed.session, "resume-env");
+    (launch, session)
 }
 
 async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
     fixture_with_message_path(phase, Default::default()).await
-}
-
-/// The engine's launch of `work` in convoy `crew`, realised in `environment`, read as a vessel
-/// through `backend`; `crew` reads the engine, as a daemon's readings serve it.
-fn launch_vessel(
-    crew: &mut Arc<CrewService>,
-    backend: &ResourceBackend,
-    environment: &str,
-) -> (flotilla_provisioning_testkit::EngineFixture, String) {
-    let engine = flotilla_provisioning_testkit::EngineFixture::default();
-    let launch = engine.vessels.request("crew", "work", "host");
-    engine.vessels.ready(&launch, environment);
-    backend.install_engine_records(Arc::new(flotilla_store::VesselViews::new(backend.clone(), "flotilla", engine.reads())));
-    Arc::get_mut(crew).expect("unique service").lifecycle_reads = engine.reads();
-    (engine, launch)
 }
 
 /// [`fixture`], with the `[primitives]` Message path the crew service and its
@@ -122,27 +206,79 @@ async fn fixture_with_message_path(
     if message_path.get().is_none() {
         let _ = message_path.set(messages.messages());
     }
-    build_fixture(phase, backend, message_path, Some(messages)).await
+    build_fixture(phase, backend, message_path, Some(messages), crew_spec(), &[], |_, _| {}).await
+}
+
+/// [`fixture`], its convoy admitted with `spec`.
+async fn spec_fixture(phase: CrewWorkPhase, spec: ConvoySpec) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
+    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
+    let messages = EngineMessagesHome::open("host", "flotilla", &backend);
+    designate_fleet(&backend, "flotilla").await;
+    let message_path = crate::ports::MessagePath::default();
+    let _ = message_path.set(messages.messages());
+    build_fixture(phase, backend, message_path, Some(messages), spec, &[], |_, _| {}).await
+}
+
+/// The fixture convoy's spec: workflow `workflow`, for role `crew`.
+fn crew_spec() -> ConvoySpec {
+    ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build()
+}
+
+/// [`fixture`] admitted with the workflow `shape` makes of the fixture's: a convoy's workflow is
+/// frozen when it is admitted.
+async fn shaped_fixture(
+    phase: CrewWorkPhase,
+    shape: impl FnOnce(&mut WorkflowSnapshot),
+) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
+    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
+    let messages = EngineMessagesHome::open("host", "flotilla", &backend);
+    designate_fleet(&backend, "flotilla").await;
+    let message_path = crate::ports::MessagePath::default();
+    let _ = message_path.set(messages.messages());
+    build_fixture(phase, backend, message_path, Some(messages), crew_spec(), &[], |snapshot, _| shape(snapshot)).await
 }
 
 /// [`fixture`] on the old Message store, for crew behaviour that compares old receiver and
 /// sender spellings. Goes when crew compares engine addresses (#3108 gate task).
 async fn old_store_fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
-    backend.install_attentions(Arc::new(flotilla_store_testkit::NoAttentions));
-    build_fixture(phase, backend, Default::default(), None).await
+    old_store_shaped_fixture(phase, |_| {}).await
 }
 
+/// [`old_store_fixture`] admitted with the workflow `shape` makes of the fixture's.
+async fn old_store_shaped_fixture(
+    phase: CrewWorkPhase,
+    shape: impl FnOnce(&mut WorkflowSnapshot),
+) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
+    old_store_prelude_fixture(phase, &[], |snapshot, _| shape(snapshot)).await
+}
+
+/// [`old_store_fixture`] at a home that admitted `prelude` first, its workflow shaped by `shape`
+/// from the prelude's launches and crew ids.
+async fn old_store_prelude_fixture(
+    phase: CrewWorkPhase,
+    prelude: &[Crewed<'_>],
+    shape: impl FnOnce(&mut WorkflowSnapshot, &[(String, String)]),
+) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
+    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
+    backend.install_attentions(Arc::new(flotilla_store_testkit::NoAttentions));
+    build_fixture(phase, backend, Default::default(), None, crew_spec(), prelude, shape).await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn build_fixture(
     phase: CrewWorkPhase,
     backend: ResourceBackend,
     message_path: crate::ports::MessagePath,
     messages: Option<EngineMessagesHome>,
+    spec: ConvoySpec,
+    prelude: &[Crewed<'_>],
+    shape: impl FnOnce(&mut WorkflowSnapshot, &[(String, String)]),
 ) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
     let config_dir = tempfile::tempdir().expect("config directory");
     let config = Arc::new(ConfigStore::with_base(config_dir.path()));
     let environment = EnvironmentId::new("local");
     let namespace = Arc::new(std::sync::RwLock::new("flotilla".into()));
+    let engine = EngineHome::install(&backend, "flotilla", "host");
     let refresher = ChangeRequestRefresher::new(
         "host".into(),
         backend.clone(),
@@ -151,16 +287,22 @@ async fn build_fixture(
         ChangeRequestRefreshCadence::default(),
     );
     let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::new(RecordingEventSink::default()), refresher)
-        .with_lifecycle_reads(crate::no_held_checkouts())
-        .with_message_path(message_path.clone());
-    let probe = Arc::new(StagingProbe { backend: backend.clone(), fail: AtomicBool::new(true), calls: AtomicUsize::new(0) });
+        .with_lifecycle_reads(engine.reads())
+        .with_message_path(message_path.clone())
+        .with_convoy_engine(engine.path());
+    let probe = Arc::new(StagingProbe {
+        backend: backend.clone(),
+        launch: std::sync::OnceLock::new(),
+        fail: AtomicBool::new(true),
+        calls: AtomicUsize::new(0),
+    });
     let reconciler: Arc<dyn WorkCredentialReconciler> = probe.clone();
     let crew = Arc::new(
         CrewService::builder()
             .resource_backend(backend.clone())
             .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())))
             .leaf_subscriptions(subscriptions)
-            .lifecycle_reads(crate::no_held_checkouts())
+            .lifecycle_reads(engine.reads())
             .work_credential_reconciler(RwLock::new(Some(reconciler)))
             .clock(Arc::new(SystemClock))
             .provisioning_namespace(namespace)
@@ -171,81 +313,67 @@ async fn build_fixture(
             .local_environment_id(environment)
             .capability_cards(crate::crew_capabilities::CapabilityCardTracker::with_message_path(message_path.clone()))
             .message_path(message_path)
+            .convoy_engine(engine.path())
             .build(),
     );
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name("crew".into()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build(),
-        )
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            "crew",
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    vessels: vec![flotilla_resources::VesselRequirement::builder()
-                        .name("work".into())
-                        .crew(vec![flotilla_resources::CrewSpec::builder()
-                            .role("coder".into())
-                            .source(CrewSource::Agent {
-                                selector: Selector { capability: "code".into(), adapter: None, model: None },
-                                prompt: None,
-                                brief_template: None,
-                            })
-                            .build()])
-                        .build()],
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                }),
-                work: BTreeMap::from([("work".into(), WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build())]),
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(phase).build())]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("status");
-    backend
-        .using::<ResourceTerminalSession>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("session".into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "crew".into()),
-                    (VESSEL_LABEL.into(), "work".into()),
-                    (ROLE_LABEL.into(), "coder".into()),
-                ]))
-                .build(),
-            &TerminalSessionSpec {
-                env_ref: "resume-env".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Agent {
+    // A Done coder has kept what it owed: it owes a decision ledger to have something to keep.
+    let promises = match phase {
+        CrewWorkPhase::Done => vec![flotilla_resources::TemplatePromise::decision_ledger("coder")],
+        _ => Vec::new(),
+    };
+    let mut snapshot = WorkflowSnapshot {
+        cascade: None,
+        vessels: vec![flotilla_resources::VesselRequirement::builder()
+            .name("work".into())
+            .crew(vec![flotilla_resources::CrewSpec::builder()
+                .role("coder".into())
+                .promises(promises)
+                .source(CrewSource::Agent {
                     selector: Selector { capability: "code".into(), adapter: None, model: None },
-                    brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: "original".into(), copies: vec![] },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "crew".into(),
-                        vessel_ref: "vessel".into(),
-                    }),
-                },
-                cwd: "/repo".into(),
-                env: Default::default(),
-                pool: "passthrough".into(),
-            },
-        )
-        .await
-        .expect("session");
-    (crew, backend, probe, Held { _config: config_dir, messages })
+                    prompt: None,
+                    brief_template: None,
+                })
+                .build()])
+            .build()],
+        exit: None,
+        turn_delivery: Default::default(),
+        stall_nudges: Default::default(),
+        supervision: None,
+    };
+    let mut admitted = Vec::new();
+    for crewed in prelude {
+        admitted.push(admit_crewed(&engine, crewed).await);
+    }
+    shape(&mut snapshot, &admitted);
+    let launch = engine.admit("crew", spec, ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() }).await;
+    probe.launch.set(launch.clone()).expect("one launch");
+    // The coder works in its vessel's agent session: the first agent of a vessel starts with it.
+    let vessel = engine.vessel(&launch, "work", "resume-env");
+    let session = engine.launch_session(&TerminalLaunchRequest {
+        session: "session".into(),
+        environment: "resume-env".into(),
+        vessel: Some(vessel.clone()),
+        role: "coder".into(),
+        pool: "passthrough".into(),
+        cwd: "/repo".into(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Agent {
+            capability: "code".into(),
+            adapter: None,
+            model: None,
+            brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: "original".into(), copies: vec![] },
+        },
+    });
+    match phase {
+        CrewWorkPhase::Working => {}
+        CrewWorkPhase::Done => engine.keep(&backend, &launch, "work", "coder").await,
+        // The session the coder works in was lost.
+        CrewWorkPhase::Interrupted => engine.engine.terminals.lost(&session, "pool lost the session"),
+        other => panic!("no fixture for a {other:?} coder"),
+    }
+    let held = Held { _config: config_dir, messages, engine, launch, vessel, session, prelude: admitted };
+    assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["work"]["coder"].phase, phase);
+    (crew, backend, probe, held)
 }
 
 // Resume must restore work on credential failure and stage credentials before retry delivery (#2221).
@@ -283,50 +411,28 @@ mod supervision;
 
 mod read_queries;
 
-// Retained terminal history must not be decoded during legacy adoption.
-#[tokio::test]
-async fn legacy_adoption_reads_only_live_convoys() {
-    use flotilla_store_testkit::{measure_reads, ReadOperation};
-    let (crew, backend, _, _temp) = fixture(CrewWorkPhase::Working).await;
-
-    flotilla_store_testkit::fixtures::seed_convoy_history()
-        .backend(&backend)
-        .namespace("flotilla")
-        .landed(300)
-        .active(10)
-        .call()
-        .await
-        .expect("convoy history");
-
-    let (result, reads) = measure_reads(crew.adopt_legacy_convoy_queues_once("flotilla", None)).await;
-    result.expect("adopt");
-    reads.of(&backend).assert_no_lists("legacy adoption");
-    // Two queries each read the 10 Active rows plus the fixture's live "crew" convoy.
-    assert_eq!(reads.of(&backend).objects("Convoy", ReadOperation::Query), 22);
-}
-
 // Resume uses the Environment its vessel's launch realised in, by its ending and cause: requested
 // and realised environments may resume.
 #[tokio::test]
 async fn resume_reads_environment_lifecycle_without_a_copy() {
     use flotilla_provisioning_testkit::Ending;
     use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec};
-    let (mut crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    let (crew, _backend, _, held) = fixture(CrewWorkPhase::Working).await;
     let env = EnvironmentSpec {
         host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
         ..Default::default()
     };
-    let (engine, _) = launch_vessel(&mut crew, &backend, "env");
-    let lifecycle = &engine.environments;
-    lifecycle.request("env", &env, None);
-    crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect("requested may resume");
-    lifecycle.finish("env", Ending::Ready("/work"));
-    crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect("ready may resume");
-    lifecycle.finish("env", Ending::Lost("/work"));
-    let error = crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect_err("lost cannot resume");
+    let lifecycle = &held.engine.engine.environments;
+    let launch = held.launch.as_str();
+    lifecycle.request("resume-env", &env, None);
+    crew.ensure_vessel_backing_available("flotilla", launch, "work").await.expect("requested may resume");
+    lifecycle.finish("resume-env", Ending::Ready("/work"));
+    crew.ensure_vessel_backing_available("flotilla", launch, "work").await.expect("ready may resume");
+    lifecycle.finish("resume-env", Ending::Lost("/work"));
+    let error = crew.ensure_vessel_backing_available("flotilla", launch, "work").await.expect_err("lost cannot resume");
     assert!(error.contains("lost, recoverable") && !error.contains("stale"));
     lifecycle.poison();
-    assert!(crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect_err("checked read").contains("poisoned"));
+    assert!(crew.ensure_vessel_backing_available("flotilla", launch, "work").await.expect_err("checked read").contains("poisoned"));
 }
 
 // Teardown reads Checkout endings from the engine's records of the convoy's checkouts: a live or
@@ -337,9 +443,9 @@ async fn teardown_reads_checkout_endings_from_the_engine() {
     use flotilla_resources::{CheckoutSpec, CheckoutWorktreeSpec, RepositoryKey};
 
     for ending in [Ending::Released, Ending::Lost("/work"), Ending::GaveUp("failure")] {
-        let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+        let (crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
         let engine = CheckoutFixture::default();
-        let mut convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
+        let mut convoy = held.convoy(&backend).await;
         convoy.spec.adopted_checkout_refs.insert(RepositoryKey("github.com/org/repo".into()), "checkout".into());
         engine.open_convoy("crew");
         let launch = engine.request(
