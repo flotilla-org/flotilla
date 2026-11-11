@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_crew::leaf_engine::CrewTurnIntent;
@@ -20,9 +19,9 @@ use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
-    ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, EnvironmentSpec,
+    ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, EnvironmentSpec,
     ExitDeclaration, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Message,
-    MessageExpectation, Resource, Selector, TerminalSession, Vessel, VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
+    MessageExpectation, Selector, TerminalSession, Vessel, VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use flotilla_store::ResourceBackend;
 use futures::StreamExt;
@@ -30,11 +29,6 @@ use tokio_util::task::AbortOnDropHandle;
 
 fn meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
-}
-
-async fn replicate<T: Resource>(source: &ResourceBackend, destination: &ResourceBackend, source_root: &NodeId) {
-    let objects = source.clone().using::<T>("flotilla").list().await.expect("source list");
-    destination.replica_writer::<T>(source_root.clone(), "flotilla").replace(&objects, Utc::now()).await.expect("replicate resources");
 }
 
 #[derive(Clone, Copy)]
@@ -97,19 +91,14 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .await
         .expect("cross-host Message mutation router");
 
-    let convoys = home.clone().using::<Convoy>("flotilla");
-    let created = convoys
-        .create(
-            &meta("nudge-convoy"),
-            &ConvoySpec::builder().workflow_ref("wf".to_string()).placement_policy("placement-policy".to_string()).build(),
-        )
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &ConvoyStatus {
+    // The convoy is the home's engine launch, its coder working.
+    let convoy = crate::admit_convoy(
+        &home_daemon,
+        flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "nudge-convoy",
+            ConvoySpec::builder().workflow_ref("wf".to_string()).placement_policy("placement-policy".to_string()).build(),
+            ConvoyStatus {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(WorkflowSnapshot {
                     cascade: None,
@@ -130,16 +119,11 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
                         .build()],
                 }),
                 work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
                 ..Default::default()
             },
-        )
-        .await
-        .expect("working crew");
-    replicate::<Convoy>(&home, &placement, home_daemon.node_id()).await;
+        ),
+    )
+    .await;
     home.using::<FulfilmentKind>("flotilla")
         .create(
             &meta("placement-policy"),
@@ -172,7 +156,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     );
     // The placement launches the work of the convoy homed at home; its vessel reads as the launch.
     let held = crate::engine(&placement_daemon).vessels.request_for(&flotilla_resources::vessel_records::VesselLaunchRequest {
-        convoy: "nudge-convoy".to_string(),
+        convoy: convoy.clone(),
         convoy_home: home_daemon.node_id().as_str().to_string(),
         work: "work".to_string(),
         host: "placement-host".to_string(),
@@ -202,10 +186,6 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     let launch = requested().expect("crew terminal requested").name;
     let agent = AgentLaunch { adapter: "codex".into(), model: None, stance: "work".into() };
     terminals.ready(&launch, "receiver-session", &TerminalLaunchFacts { agent: Some(agent), ..Default::default() });
-    let convoy = convoys.get("nudge-convoy").await.expect("working convoy");
-    let mut status = convoy.status.expect("working status");
-    status.crew_work.get_mut("work").expect("work crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Stalled;
-    convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("stall crew");
     // The session's launch and its holder vessel reach the convoy's home as the placement's log does.
     crate::engine(&home_daemon);
     flotilla_provisioning_testkit::other_home::replicate_home(
@@ -263,7 +243,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
 
     let request = CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
-        .convoy("nudge-convoy".to_string())
+        .convoy(convoy.clone())
         .source("stall-nudge-1".to_string())
         .vessel("work".to_string())
         .role("coder".to_string())
@@ -278,7 +258,11 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     home_daemon.deliver_standing_turn(&request).await.expect("nudge accepted at convoy home");
     // A replicated dependency wakes the standing-turn task while its other
     // stream is closed; resubscription must happen before the periodic resync.
-    replicate::<Convoy>(&home, &placement, home_daemon.node_id()).await;
+    flotilla_provisioning_testkit::other_home::replicate_home(
+        &home_daemon.decided_store().expect("home decided store"),
+        home_daemon.node_id().as_str(),
+        &placement_daemon.decided_store().expect("placement decided store"),
+    );
     if closed_watch.is_some() {
         tokio::time::timeout(Duration::from_secs(5), async {
             while subscriptions.load(Ordering::SeqCst) < 2 || before_retry.lock().expect("retry capture").is_none() {
@@ -292,7 +276,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     assert_eq!(records.len(), 1);
     let nudge = &records[0];
     assert_eq!(nudge.spec.sender, "system:nudge");
-    assert_eq!(nudge.spec.receiver, "flotilla/nudge-convoy/work/coder");
+    assert_eq!(nudge.spec.receiver, format!("flotilla/{convoy}/work/coder"));
     assert!(nudge.spec.body.contains("Please continue"));
     assert!(matches!(nudge.spec.expectation, MessageExpectation::Outcome { .. }));
     assert!(home.using::<Message>("flotilla").list().await.expect("sender-local inbox").items.is_empty());

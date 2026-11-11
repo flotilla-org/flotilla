@@ -23,7 +23,8 @@ fn of_convoy<'a>(convoy: &'a str, state: &'a str) -> impl Fn(&Row) -> bool + 'a 
     move |row| {
         let holder = text(row, "holder");
         let vessel = holder.rsplit([':', '/']).next().unwrap_or(holder);
-        vessel.starts_with(&format!("{convoy}-")) && text(row, "state") == state
+        // A vessel is a launch of `<convoy launch_of>-<work>`.
+        vessel.starts_with(&format!("{}-", flotilla_resources::convoy::launch_of(convoy))) && text(row, "state") == state
     }
 }
 
