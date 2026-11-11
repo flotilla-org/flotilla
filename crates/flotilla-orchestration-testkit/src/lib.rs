@@ -191,9 +191,9 @@ async fn seed_convoy_routing_row(
 /// Installs the engine `daemon` reads its environments, clones and checkouts from, on its decided
 /// store, as the runtime's composition does; a scenario daemon is not composed by the runtime.
 fn install_engine(daemon: &InProcessDaemon) {
+    // Attentions are Messages on the engine, and convoys its launches, as the daemon composes them.
+    daemon.open_message_primitives().expect("the engine Message and Convoy paths");
     daemon.install_lifecycle_reads(engine(daemon).reads()).expect("install the engine's readings");
-    // Attentions are Messages on the engine, as the daemon composes them.
-    daemon.open_message_primitives().expect("the engine Message path");
 }
 
 /// The standing role's holds open in `flotilla`.

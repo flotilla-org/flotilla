@@ -179,13 +179,15 @@ impl flotilla_projections::ports::AgentSessions for InProcessDaemon {
 
 pub use agent_sessions::DecidedAgentSessions;
 
-/// Provisioning readings whose AgentSessions are the daemon's own.
-pub(super) struct WithAgentSessions {
+/// Provisioning readings whose AgentSessions, and Convoys once the engine's Convoy path is
+/// installed, are the daemon's own.
+pub(super) struct DecidedReads {
     pub(super) reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     pub(super) agent_sessions: DecidedAgentSessions,
+    pub(super) convoys: Arc<std::sync::OnceLock<Arc<crate::primitives::convoy_records::EngineConvoyRecords>>>,
 }
 
-impl flotilla_resources::lifecycle_reads::LifecycleReads for WithAgentSessions {
+impl flotilla_resources::lifecycle_reads::LifecycleReads for DecidedReads {
     fn is_disabled(&self) -> bool {
         self.reads.is_disabled()
     }
@@ -224,7 +226,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for WithAgentSessions {
     }
 
     fn convoys(&self) -> Result<&dyn flotilla_resources::convoy_records::ConvoyRecords, String> {
-        self.reads.convoys()
+        match self.convoys.get() {
+            Some(convoys) => Ok(&**convoys),
+            None => self.reads.convoys(),
+        }
     }
 }
 

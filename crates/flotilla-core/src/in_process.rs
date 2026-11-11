@@ -118,7 +118,7 @@ use crate::host_identity::resolve_or_create_remote_environment_id;
 use crate::host_identity::resolve_or_create_remote_host_id;
 use crate::model::repo_name;
 use crate::model::RepoModel;
-use crate::primitives::{convoy_engine::ConvoyEngine, convoys::Convoys};
+use crate::primitives::{convoy_engine::ConvoyEngine, convoy_records::EngineConvoyRecords, convoys::Convoys};
 use crate::repo_state::RepoRootState;
 use crate::repo_state::RepoState;
 use crate::repository_inspection::GitRepositoryInspector;
@@ -786,6 +786,8 @@ pub struct InProcessDaemon {
     convoy_engine_path: flotilla_resources::convoy::engine::EngineConvoyPath,
     /// The engine Convoys behind that path, for readers of its records and its home's memory.
     engine_convoys: std::sync::OnceLock<Arc<Convoys>>,
+    /// The engine's convoys as their readers read them, once the Convoy path is installed.
+    convoy_records: Arc<std::sync::OnceLock<Arc<EngineConvoyRecords>>>,
     /// Which seats a vessel serves, the engine's answer behind `[primitives]` (#3629 layer 8).
     vessel_seats_path: flotilla_resources::vessel_seats::VesselSeatsPath,
     message_receivers: projection_ports::MessageReceivers,
@@ -1452,6 +1454,7 @@ impl InProcessDaemon {
             crew_message_path,
             convoy_engine_path,
             engine_convoys: std::sync::OnceLock::new(),
+            convoy_records: Arc::default(),
             vessel_seats_path,
             brief_artifact_writer: Arc::clone(&brief_artifact_writer),
             session_id: uuid::Uuid::new_v4(),
@@ -2325,12 +2328,14 @@ impl InProcessDaemon {
 
     /// Installs the engine's provisioning readings during composition (#3629 layer 4). Their
     /// AgentSessions are this daemon's own, read from its decided store with what it has seen
-    /// of its crews' progress (#3108).
+    /// of its crews' progress (#3108), and so are its Convoys once the engine's Convoy path is
+    /// installed.
     pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_projections::ports::LifecycleReads>) -> Result<(), String> {
         let reads: Arc<dyn flotilla_projections::ports::LifecycleReads> = match self.decided_store() {
-            Ok(service) => Arc::new(projection_ports::WithAgentSessions {
+            Ok(service) => Arc::new(projection_ports::DecidedReads {
                 reads,
                 agent_sessions: DecidedAgentSessions::new(service, Arc::clone(&self.clock), Arc::clone(&self.crew_progress)),
+                convoys: Arc::clone(&self.convoy_records),
             }),
             Err(_) => reads,
         };
@@ -2430,6 +2435,13 @@ impl InProcessDaemon {
     pub fn install_message_primitives(&self, primitives: Arc<flotilla_engine_messages::MessagePrimitives>) -> Result<(), String> {
         let records = Arc::new(Convoys::open(primitives.home(), primitives.service())?);
         self.engine_convoys.set(Arc::clone(&records)).map_err(|_| "the Convoy path is already installed".to_owned())?;
+        // Every convoy reader reads the engine's launches, with this home's notes on them; its
+        // readers hear their changes from the store's log, on the runtime composing this daemon.
+        let reads = Arc::new(EngineConvoyRecords::new(primitives.home(), Arc::clone(primitives.service()), Arc::clone(records.memory())));
+        if tokio::runtime::Handle::try_current().is_ok() {
+            drop(reads.follow()?);
+        }
+        self.convoy_records.set(reads).map_err(|_| "the Convoy path is already installed".to_owned())?;
         let convoys: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> =
             Arc::new(ConvoyEngine::new(records, self.resource_backend(), self.clock_for_scenarios()));
         self.message_path.set(Arc::clone(&primitives)).map_err(|_| "the Message path is already installed".to_owned())?;
