@@ -157,8 +157,10 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     // engine launch, its work crewed by an agent seat for `coder`.
     let convoy =
         |project: &str, role: &str| ConvoySpec::builder().workflow_ref("w".into()).project_ref(project.into()).role(role.into()).build();
-    let subject_x = super::admit_convoy(a, super::engine_convoy("subject-x", convoy(NS, "subject-x"), Default::default())).await;
-    let crew = super::admit_convoy(b, super::engine_convoy("crew-b", convoy(NS, "crew-b"), Default::default())).await;
+    let held =
+        |name: &str| flotilla_engine_convoys_testkit::convoy(NS, name, convoy(NS, name), flotilla_engine_convoys_testkit::single_agent("coder"));
+    let subject_x = flotilla_daemon_testkit::engine::admit_convoy(a, held("subject-x")).await;
+    let crew = flotilla_daemon_testkit::engine::admit_convoy(b, held("crew-b")).await;
     // The crew's session is B's engine launch, held for its vessel's launch at B.
     let vessel = flotilla_daemon_testkit::engine::engine(b).vessels.request(&crew, "work", &home_b);
     let terminals = &flotilla_daemon_testkit::engine::engine(b).terminals;

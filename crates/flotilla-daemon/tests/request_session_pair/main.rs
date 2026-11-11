@@ -78,7 +78,7 @@ use flotilla_resources::{
     CrewWorkPhase, CrewWorkState, FulfilmentKind, FulfilmentKindSpec, Host, HostSpec, HostStatus, InputMeta, Message, RepositoryKey,
     Resource, ResourceError, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession,
     TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot,
-    WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
+    WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, ROLE_LABEL,
 };
 use flotilla_store::off_frame;
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, old_store_resource_kinds, ResourceBackend};
@@ -343,17 +343,6 @@ async fn admit(daemon: &InProcessDaemon, record_name: &str, role: &str) -> Strin
 /// The phase `daemon` reads of convoy launch `name`.
 async fn convoy_phase(daemon: &InProcessDaemon, name: &str) -> Option<ResourceConvoyPhase> {
     daemon.resource_backend().using::<Convoy>("flotilla").get(name).await.ok().and_then(|convoy| convoy.status).map(|status| status.phase)
-}
-
-fn convoy_meta(record_name: &str, role: &str) -> InputMeta {
-    InputMeta::builder()
-        .name(record_name.to_string())
-        .labels(BTreeMap::from([
-            (PROJECT_LABEL.to_string(), "flotilla".to_string()),
-            (ROLE_LABEL.to_string(), role.to_string()),
-            (GENERATION_LABEL.to_string(), "1".to_string()),
-        ]))
-        .build()
 }
 
 async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
