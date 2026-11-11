@@ -3,16 +3,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use flotilla_protocol::CrewCommandContext;
-use flotilla_resources::{
-    CrewWorkPhase, InputMeta, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-};
+use flotilla_provisioning_testkit::TerminalsFixture;
+use flotilla_resources::terminal_records::TerminalLaunchRequest;
+use flotilla_resources::{CrewWorkPhase, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase};
 use tokio::sync::RwLock;
 
-use super::fixture;
+use super::{fixture, shaped_fixture};
 
 #[tokio::test]
 async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
-    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Message, MessageReference, Vessel, VesselSpec};
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Message, MessageReference};
 
     use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
     // In-memory port stands in for credential mint/delivery I/O.
@@ -28,23 +28,12 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
             Ok(self.1.read().await.clone())
         }
     }
-    let (mut crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("vessel".into()).build(),
-            &VesselSpec {
-                convoy_ref: "crew".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("vessel");
-    let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
-    Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = environments.reads.clone();
-    environments.request(
+    // The vessel's grants come from its convoy's frozen requirement.
+    let (crew, backend, _, held) = shaped_fixture(CrewWorkPhase::Working, |snapshot| {
+        snapshot.vessels[0].credential_refs = BTreeSet::from(["github".into()]);
+    })
+    .await;
+    held.engine.engine.environments.request(
         "resume-env",
         &EnvironmentSpec {
             host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
@@ -63,31 +52,26 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     *crew.capability_source.write().await = Some(source.clone());
     let context = CrewCommandContext::builder()
         .namespace("flotilla".into())
-        .convoy("crew".into())
-        .vessel_ref("vessel".into())
+        .convoy(held.launch.clone())
+        .vessel_ref(held.vessel.clone())
         .role("coder".into())
         .build();
-    // The vessel's grants come from its convoy's frozen requirement.
-    let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
-    let convoy = convoys.get("crew").await.expect("convoy");
-    let mut convoy_status = convoy.status.clone().expect("convoy status");
-    convoy_status.workflow_snapshot.as_mut().expect("snapshot").vessels[0].credential_refs = BTreeSet::from(["github".into()]);
-    convoys.update_status("crew", &convoy.metadata.resource_version, &convoy_status).await.expect("vessel grant references");
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let healthy = sessions.get("session").await.expect("healthy session");
-    let mut status = healthy.status.clone().unwrap_or_default();
-    status.phase = ResourceTerminalSessionPhase::Running;
-    sessions.update_status("session", &healthy.metadata.resource_version, &status).await.expect("running healthy session");
+    assert_eq!(healthy.status.as_ref().map(|status| status.phase), Some(ResourceTerminalSessionPhase::Running));
     // A running session whose grants can't be read sorts before the healthy session and must
     // not starve it of observations. Its different role cannot receive this card.
-    let mut broken_spec = healthy.spec.clone();
-    broken_spec.role = "broken".into();
-    let flotilla_resources::TerminalSessionSource::Agent { context: broken_context, .. } = &mut broken_spec.source else {
-        panic!("agent session")
-    };
-    broken_context.vessel_ref = "missing-vessel".into();
-    let broken = sessions.create(&InputMeta::builder().name("000-malformed".into()).build(), &broken_spec).await.expect("broken session");
-    sessions.update_status("000-malformed", &broken.metadata.resource_version, &status).await.expect("running broken session");
+    let broken = held.engine.launch_session(&TerminalLaunchRequest {
+        session: "000-malformed".into(),
+        vessel: Some("missing-vessel".into()),
+        role: "broken".into(),
+        ..TerminalsFixture::agent(&held.vessel, "broken", "resume-env")
+    });
+    assert_eq!(
+        sessions.get("000-malformed").await.expect("broken session").status.map(|status| status.phase),
+        Some(ResourceTerminalSessionPhase::Running),
+        "launch {broken} runs"
+    );
     let first = crew.query_capabilities(&context).await.expect("first live card");
     assert!(first.contains("You can push `.github/workflows`"));
     crate::crew_capabilities::observe_launch_card(&backend, "flotilla", "session", &first, &crew.capability_cards)
@@ -110,7 +94,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
             "flotilla",
             source.as_ref(),
             &crew.capability_cards,
-            environments.reads.clone(),
+            held.engine.reads(),
             &flotilla_store::OldStoreAccounts::new(backend.clone()),
         )
         .await
@@ -165,7 +149,11 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     let (id, _) = primitives.locate(&latest.metadata.name).expect("locate").expect("the latest card");
     let stored = primitives.messages().expect("messages").into_iter().find(|(_, message)| message.name() == id).expect("stored card").1;
     let subject = stored.spec().subject().expect("a subject");
-    assert_eq!(subject.address.to_string(), "project:flotilla/convoy:crew/role:coder");
+    let project = flotilla_address::Address::project("flotilla").expect("project address");
+    let seat = flotilla_resources::convoy::engine::launch_address(&project, &held.launch)
+        .and_then(|convoy| convoy.child(flotilla_address::Kind::Role, "coder").map_err(|error| error.to_string()))
+        .expect("seat address");
+    assert_eq!(subject.address, seat);
     // The crew reads it in the old shape, naming the session.
     let latest = primitives.view("flotilla", &latest.metadata.name).await.expect("view").expect("the latest card").object;
     let Some(MessageReference::ControlRecord { revision: latest_revision, .. }) = &latest.spec.subject else { panic!("revision subject") };
@@ -190,21 +178,8 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
 #[tokio::test]
 async fn an_unseen_session_gets_a_full_card_once_then_delivered_deltas() {
     use crate::crew_capabilities::{card_delta, observe_card, CapabilityCardTracker};
-    use flotilla_resources::{Message, Vessel, VesselSpec};
+    use flotilla_resources::Message;
     let (crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("vessel".into()).build(),
-            &VesselSpec {
-                convoy_ref: "crew".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("vessel");
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let session = sessions.get("session").await.expect("session");
     let unseen = "## Your capabilities\n### Credentials\n- unseen\n";
@@ -242,7 +217,7 @@ async fn an_unseen_session_gets_a_full_card_once_then_delivered_deltas() {
 async fn failing_source_never_publishes_an_empty_card() {
     use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker};
     use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
-    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Message, Vessel, VesselSpec};
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Message};
     // Credential/endpoint delivery is the runtime I/O boundary; resources use the real memory backend.
     struct Delivery(RwLock<BTreeMap<String, String>>, std::sync::atomic::AtomicBool);
     #[async_trait]
@@ -257,22 +232,8 @@ async fn failing_source_never_publishes_an_empty_card() {
             Ok(self.0.read().await.clone())
         }
     }
-    let (crew, backend, _, _held) = fixture(CrewWorkPhase::Working).await;
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("vessel".into()).build(),
-            &VesselSpec {
-                convoy_ref: "crew".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("vessel");
-    let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
-    environments.request(
+    let (crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
+    held.engine.engine.environments.request(
         "resume-env",
         &EnvironmentSpec {
             host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
@@ -280,39 +241,17 @@ async fn failing_source_never_publishes_an_empty_card() {
         },
         None,
     );
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.get("session").await.expect("session");
-    sessions
-        .update_status(
-            "session",
-            &session.metadata.resource_version,
-            &flotilla_resources::TerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() },
-        )
-        .await
-        .expect("running");
+    let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
+    assert_eq!(session.status.map(|status| status.phase), Some(ResourceTerminalSessionPhase::Running));
     let source = Delivery(RwLock::new(BTreeMap::new()), std::sync::atomic::AtomicBool::new(false));
     let tracker = CapabilityCardTracker::with_message_path(crew.message_path.clone());
-    refresh_cards(
-        &backend,
-        "flotilla",
-        &source,
-        &tracker,
-        environments.reads.clone(),
-        &flotilla_store::OldStoreAccounts::new(backend.clone()),
-    )
-    .await
-    .expect("initial baseline");
+    refresh_cards(&backend, "flotilla", &source, &tracker, held.engine.reads(), &flotilla_store::OldStoreAccounts::new(backend.clone()))
+        .await
+        .expect("initial baseline");
     source.1.store(true, std::sync::atomic::Ordering::SeqCst);
-    refresh_cards(
-        &backend,
-        "flotilla",
-        &source,
-        &tracker,
-        environments.reads.clone(),
-        &flotilla_store::OldStoreAccounts::new(backend.clone()),
-    )
-    .await
-    .expect_err("reconstruction gap");
+    refresh_cards(&backend, "flotilla", &source, &tracker, held.engine.reads(), &flotilla_store::OldStoreAccounts::new(backend.clone()))
+        .await
+        .expect_err("reconstruction gap");
     let messages = backend.using::<Message>("flotilla").list().await.expect("messages").items;
     assert!(messages.is_empty());
 }
@@ -323,7 +262,7 @@ async fn image_capabilities_follow_engine_without_a_copy() {
     use flotilla_provisioning::engine::image_build::ImageBuildBinding;
     use flotilla_provisioning_testkit::{image_build, store_object, Ending, LifecycleFixture};
     use flotilla_resources::{DockerEnvironmentSpec, EnvironmentSpec, ImageBuildPhase};
-    let (_, backend, _, _held) = fixture(CrewWorkPhase::Working).await;
+    let (_, backend, _, held) = fixture(CrewWorkPhase::Working).await;
     let build = image_build(ImageBuildPhase::Built);
     store_object(&backend, build.clone()).await;
     let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
@@ -350,8 +289,9 @@ async fn image_capabilities_follow_engine_without_a_copy() {
     spec.source = flotilla_resources::TerminalSessionSource::Tool { command: "true".into() };
     let endpoints = BTreeMap::new();
     let accounts = flotilla_store::OldStoreAccounts::new(backend.clone());
-    let card =
-        || crate::crew_capabilities::session_card(&backend, "flotilla", "crew", &spec, &[], &endpoints, fixture.reads.clone(), &accounts);
+    let card = || {
+        crate::crew_capabilities::session_card(&backend, "flotilla", &held.launch, &spec, &[], &endpoints, fixture.reads.clone(), &accounts)
+    };
     assert!(card().await.expect("unheld").contains("tool:verified"));
     fixture.request(&build);
     assert!(!card().await.expect("requested").contains("tool:verified"));
