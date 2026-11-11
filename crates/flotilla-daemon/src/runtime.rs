@@ -36,8 +36,7 @@ use flotilla_protocol::CanonicalHostId;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
-    host_direct_environment_name, Checkout, Convoy, Forge, Host, Repository, Resource, ResourceError, TerminalSession, Vessel,
-    WorkflowTemplate,
+    host_direct_environment_name, Convoy, Forge, Host, Repository, Resource, ResourceError, TerminalSession, Vessel, WorkflowTemplate,
 };
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tokio::{sync::watch, task::JoinHandle};
@@ -234,11 +233,8 @@ impl DaemonRuntime {
         }
         let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::clone(&daemon.discovery_runtime().env)));
         let health = DaemonHealthIdentity {
-            generation: retry_phase("read_observed_generation", || async {
-                daemon.observed_resource_backend().using::<Checkout>(&options.namespace).list().await
-            })
-            .await?
-            .generation,
+            // Each daemon start is a new generation.
+            generation: Some(uuid::Uuid::new_v4().to_string()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at: Utc::now(),
         };

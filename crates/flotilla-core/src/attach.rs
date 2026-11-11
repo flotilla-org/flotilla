@@ -102,7 +102,6 @@ impl AttachReadContext {
 
 pub(super) struct AttachResolver<'a> {
     pub(super) resource_backend: &'a ResourceBackend,
-    pub(super) observed_resource_backend: &'a ResourceBackend,
     pub(super) discovered_checkouts: &'a flotilla_resources::discovered_checkouts::DiscoveredCheckouts,
     pub(super) aggregator_projection_state: &'a AggregatorProjectionState,
     pub(super) config: &'a ConfigStore,
@@ -512,14 +511,8 @@ impl<'a> AttachResolver<'a> {
             .await
             .map_err(|error| error.to_string())?
             .items;
-        let observed_sessions = self
-            .observed_resource_backend
-            .query_declared::<ResourceTerminalSession>(&namespace, &query)
-            .await
-            .map_err(|error| error.to_string())?
-            .items;
         let convoys = convoy_sources.clone();
-        let sessions = durable_sessions.iter().chain(&observed_sessions).cloned().collect();
+        let sessions = durable_sessions.clone();
         let convoy_addresses = convoy_sources
             .into_iter()
             .map(|source| {
@@ -534,33 +527,7 @@ impl<'a> AttachResolver<'a> {
                 ResourceProvenance::Local => {
                     sessions_by_name.insert(session.object.metadata.name.clone(), session.object);
                 }
-                ResourceProvenance::Replica { .. } => replicated_sessions.push((session, AttachSessionSource::Durable)),
-            }
-        }
-        let mut replica_keys = replicated_sessions
-            .iter()
-            .map(|(session, _)| {
-                (
-                    session.object.metadata.namespace.clone(),
-                    session.object.metadata.name.clone(),
-                    replica_origin(&session.provenance).cloned(),
-                )
-            })
-            .collect::<HashSet<_>>();
-        for session in observed_sessions {
-            match session.provenance {
-                ResourceProvenance::Local => {
-                    sessions_by_name.entry(session.object.metadata.name.clone()).or_insert(session.object);
-                }
-                ResourceProvenance::Replica { .. } => {
-                    if replica_keys.insert((
-                        session.object.metadata.namespace.clone(),
-                        session.object.metadata.name.clone(),
-                        replica_origin(&session.provenance).cloned(),
-                    )) {
-                        replicated_sessions.push((session, AttachSessionSource::Observed));
-                    }
-                }
+                ResourceProvenance::Replica { .. } => replicated_sessions.push(session),
             }
         }
         let mut candidates = Vec::new();
@@ -573,7 +540,7 @@ impl<'a> AttachResolver<'a> {
                 target: AttachTarget::Local(Box::new(session)),
             });
         }
-        for (replicated, source) in replicated_sessions {
+        for replicated in replicated_sessions {
             let session = replicated.object;
             let ResourceProvenance::Replica { origin_root, .. } = replicated.provenance else {
                 unreachable!("local durable sessions were partitioned above");
@@ -586,12 +553,6 @@ impl<'a> AttachResolver<'a> {
             let role = session.metadata.labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
             let crew = session.metadata.labels.get(VESSEL_LABEL).map_or_else(|| role.clone(), |vessel| format!("{vessel}/{role}"));
             let independent = !session.metadata.labels.contains_key(CONVOY_LABEL);
-            if independent
-                && matches!(source, AttachSessionSource::Observed)
-                && session.status.as_ref().is_none_or(|status| status.phase != flotilla_resources::TerminalSessionPhase::Running)
-            {
-                continue;
-            }
             let row = FleetListRow::builder()
                 .convoy(convoy_address.cloned().unwrap_or_else(|| convoy.clone()).replace("@", " @ "))
                 .maybe_convoy_ref((!independent).then_some(convoy))
@@ -1087,11 +1048,6 @@ fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>,
         (Some(convoy), None, None) => format!("{convoy} ({session_name})"),
         _ => session_name.to_string(),
     }
-}
-
-enum AttachSessionSource {
-    Durable,
-    Observed,
 }
 
 type ConvoyAddresses = HashMap<(String, String, Option<flotilla_protocol::NodeId>), String>;
@@ -2354,7 +2310,7 @@ mod tests {
     #[tokio::test]
     async fn attach_reads_ignore_unrelated_convoys_and_messages() {
         use flotilla_store_testkit::{assert_flat_reads, ReadBudget, ReadOperation, ReadSnapshot};
-        async fn attach_reads(reference: &str, unrelated: usize) -> (ReadSnapshot, ReadSnapshot) {
+        async fn attach_reads(reference: &str, unrelated: usize) -> ReadSnapshot {
             let (daemon, backend, _temp) = attach_fixture().await;
             create_identity_convoy(&backend, "convoy-main", "coder", Some("flotilla")).await;
             let convoys = backend.using::<ResourceConvoy>("flotilla");
@@ -2397,9 +2353,7 @@ mod tests {
             // the same data but retain separate, uncounted backend handles.
             let request_backend = backend.clone().with_read_counts();
             let mut resolver = daemon.attach_resolver();
-            let request_observations = resolver.observed_resource_backend.clone().with_read_counts();
             resolver.resource_backend = &request_backend;
-            resolver.observed_resource_backend = &request_observations;
             // A read through the daemon handle must not leak into the
             // request observer, even when it reads the same resource kind.
             backend.using::<ResourceConvoy>("flotilla").get("convoy-main").await.expect("daemon read");
@@ -2428,10 +2382,7 @@ mod tests {
                     .calls("Host", ReadOperation::List, 2),
                 reference,
             );
-            let observed = request_observations.read_snapshot();
-            assert_eq!(observed.calls_by_kind().get("TerminalSession"), Some(&1));
-            assert_eq!(observed.objects_by_kind().get("TerminalSession"), Some(&0));
-            (reads, observed)
+            reads
         }
         for reference in ["coder", "coder@flotilla", "convoy-main", "terminal-main", "terminal-ma"] {
             assert_flat_reads([0, 40], |unrelated| attach_reads(reference, unrelated)).await;

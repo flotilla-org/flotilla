@@ -4958,7 +4958,6 @@ impl InProcessDaemon {
     fn attach_resolver(&self) -> AttachResolver<'_> {
         AttachResolver {
             resource_backend: &self.resource_backend,
-            observed_resource_backend: &self.observed_resource_backend,
             discovered_checkouts: &self.discovered_checkouts,
             aggregator_projection_state: &self.aggregator_projection_state,
             config: &self.config,
