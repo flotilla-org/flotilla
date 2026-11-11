@@ -556,11 +556,13 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
     .expect("start other host query projection");
     let repository_key = RepositoryKey("repo_flotilla".into());
     let home = feta.resource_backend();
-    let convoy = home
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("crew-convoy".to_string()).build(),
-            &ConvoySpec::builder()
+    // The convoy is feta's engine launch, active before any PR exists.
+    let convoy = crate::admit_convoy(
+        &feta,
+        flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "crew-convoy",
+            ConvoySpec::builder()
                 .workflow_ref("workflow".to_string())
                 .r#ref("fix/crew-branch".to_string())
                 .repositories(vec![ConvoyRepositorySpec {
@@ -573,21 +575,14 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
                 }])
                 .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "crew-checkout".to_string())]))
                 .build(),
-        )
-        .await
-        .expect("admit convoy before PR exists");
-    home.using::<Convoy>("flotilla")
-        .update_status(
-            "crew-convoy",
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
+            ConvoyStatus {
                 phase: flotilla_resources::ConvoyPhase::Active,
                 observed_workflow_ref: Some("workflow".into()),
-                ..Default::default()
+                ..flotilla_engine_convoys_testkit::single_agent("coder")
             },
-        )
-        .await
-        .expect("convoy is active before PR exists");
+        ),
+    )
+    .await;
     let _feta_runtime = DaemonRuntime::start_with_options(
         Arc::clone(&feta),
         feta.config_store(),
@@ -641,8 +636,6 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
         .expect("change request is open");
     use flotilla_resources::checkout_records::CheckoutRecords as _;
     let engine = flotilla_daemon_testkit::engine::runtime_checkouts(&feta);
-    let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
-    engine.admit_for(&home, "flotilla", &engine_convoy, &convoy.metadata.name).await;
     let launch = engine.put_ready(
         "crew-checkout",
         &CheckoutSpec::Observed(ObservedCheckoutSpec {
@@ -652,7 +645,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
             host_ref: "feta".into(),
             is_main: false,
         }),
-        Some(&engine.holder(&engine_convoy)),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy.clone())),
     );
     engine
         .checkouts
@@ -660,7 +653,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
         .expect("crew opens PR without changing convoy phase");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get("crew-convoy").await.is_ok() {
+            if kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get(&convoy).await.is_ok() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -668,12 +661,12 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
     })
     .await
     .expect("other host receives convoy replica");
-    kiwi.discover_convoy_branch_subjects("flotilla", "crew-convoy", "fix/crew-branch")
+    kiwi.discover_convoy_branch_subjects("flotilla", &convoy, "fix/crew-branch")
         .await
         .expect("replica host skips home-only discovery");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let replica = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get("crew-convoy").await;
+            let replica = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get(&convoy).await;
             if replica.ok().and_then(|record| record.object.status).is_some_and(|status| {
                 status.subjects.iter().any(|entry| {
                     entry.subject.kind == SubjectKind::ChangeRequest
@@ -696,7 +689,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
                 .as_convoys()
                 .expect("convoy rows")
                 .iter()
-                .any(|row| row.resource.name == "crew-convoy" && row.subjects.iter().any(|entry| entry.subject.id == "2301"))
+                .any(|row| row.resource.name == convoy && row.subjects.iter().any(|entry| entry.subject.id == "2301"))
             {
                 break;
             }
@@ -1766,8 +1759,10 @@ mod governor_relay {
     async fn governor_snapshot(daemon: &InProcessDaemon) -> (ResourceObject<Convoy>, WorkflowTemplateSpec) {
         let backend = daemon.resource_backend();
         let convoys = backend.using::<Convoy>("flotilla").list().await.expect("list admitted convoys");
-        assert_eq!(convoys.items.len(), 1);
-        let convoy = convoys.items.into_iter().next().expect("admitted governor");
+        // An ended launch stays on the engine, so the governor is the one live launch.
+        let mut live = convoys.items.into_iter().filter(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()));
+        let convoy = live.next().expect("admitted governor");
+        assert!(live.next().is_none(), "one live governor");
         let snapshot = backend
             .definitions::<WorkflowTemplate>("flotilla")
             .get(&convoy.metadata.annotations[WORKFLOW_SNAPSHOT_ANNOTATION])
@@ -1858,6 +1853,10 @@ mod governor_relay {
         let feta = &roots[0].0;
         let kiwi = &roots[1].0;
         let udder = &roots[2].0;
+        // Each root reads its convoys from the engine, as its runtime installs the readings.
+        for (root, ()) in &roots {
+            crate::engine(root);
+        }
         udder
             .resource_backend()
             .definitions::<Project>("flotilla")
@@ -1929,7 +1928,14 @@ mod governor_relay {
             await_template(root, "governor", &workflow).await;
         }
         assert_eq!(governor_snapshot(udder).await.1, first_snapshot, "relay must not rewrite an admitted snapshot");
-        udder.resource_backend().using::<Convoy>("flotilla").delete(&first_convoy.metadata.name).await.expect("retire first admission");
+        // A convoy ends on the engine and is never deleted: the first admission is retired by abandoning it.
+        udder
+            .convoy_engine_path()
+            .get()
+            .expect("udder's Convoy path")
+            .abandon(&first_convoy, "operator", "retire first admission")
+            .await
+            .expect("retire first admission");
         let result = admit_governor(udder).await;
         assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "re-admission failed: {result:?}");
         expected_snapshot = workflow.clone();
