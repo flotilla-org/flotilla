@@ -29,8 +29,6 @@ mod vessel_views;
 pub use lifecycle_views::LifecycleViews;
 pub use terminal_views::TerminalViews;
 pub use vessel_views::VesselViews;
-mod image_build;
-pub use image_build::*;
 pub mod message_query;
 pub use message_query::*;
 mod off_frame;

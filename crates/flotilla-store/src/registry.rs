@@ -121,7 +121,7 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
         &["credentialspec", "credential_spec", "credential_specs", "credential-spec", "credential-specs"],
     ),
     kind::<CrewDefaults>(RegisteredResource::CrewDefaults, &["crew-defaults"]),
-    kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
+    engine_kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
     kind::<ImageLayer>(RegisteredResource::ImageLayer, &["image-layer"]),
     kind::<AccountBinding>(RegisteredResource::AccountBinding, &["account-binding"]),
     kind::<AccountProvision>(RegisteredResource::AccountProvision, &["account-provision"]),

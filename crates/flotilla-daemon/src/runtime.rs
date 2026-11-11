@@ -33,7 +33,6 @@ use flotilla_crew::reconcilers::vessel::{ConvoyVesselWake, CrewSeats, VesselPlan
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
-use flotilla_provisioning::engine::{image_build::ImageBuildBinding, Engine};
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
@@ -64,7 +63,7 @@ use self::tasks::{
     spawn_environment_orphan_sweep_task, spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task,
     spawn_local_fulfilment_probe_task, spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task,
     spawn_provisioned_environment_reconciliation_task, spawn_sleep_inhibitor_task, spawn_ssh_fulfilment_probe_task,
-    spawn_startup_restoration, spawn_vessel_requests, supervise_controller, CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart,
+    spawn_startup_restoration, spawn_vessel_requests, CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart,
     MANIFEST_RECONCILE_INTERVAL,
 };
 use self::terminal::TerminalControllerRuntime;
@@ -478,10 +477,10 @@ impl DaemonRuntime {
             .await;
         if options.start_controllers {
             // ADR 0062: composed images are built by this host's build
-            // service (the Docker provider's owned BuildKit builder) when the
-            // ImageBuild reconciler finds builds for it; the reconciler
-            // enforces Host.spec.image_build_capacity, including single-host
-            // local mode's undeclared default. This host also publishes its
+            // service (the Docker provider's owned BuildKit builder) when a
+            // home demands a build of it; the ImageBuild controller enforces
+            // Host.spec.image_build_capacity, including single-host local
+            // mode's undeclared default. This host also publishes its
             // cache inventory for placement cost.
             let image_build_service = local_registry
                 .environment_providers
@@ -888,67 +887,7 @@ fn spawn_controller_loops(
             }
         }));
     }
-    // Every host collects retired ImageBuild records; hosts with a build
-    // service also execute the builds placed on them.
-    if let Some(credentials) = state.credential_store.clone() {
-        let blobs: Arc<dyn crate::blob_store::BlobStore> = match state.blob_store.clone() {
-            Some(blobs) => blobs,
-            None => Arc::new(crate::blob_store::LocalBlobStore::new(state.config.state_dir().as_path())),
-        };
-        let materials: Arc<dyn flotilla_provisioning::reconcilers::ImageBuildMaterials> =
-            Arc::new(crate::image_build::DaemonImageBuildMaterials {
-                credentials,
-                blobs,
-                backend: backend.clone(),
-                namespace: namespace_string.clone(),
-                host: state.local_host_ref.clone(),
-                secrets: image_builder_directory(state.config.state_dir().as_path()).join("secrets"),
-            });
-        let service = state.image_build_service.clone();
-        let host = state.local_host_ref.clone();
-        let probe_wrapper: Arc<str> = flotilla_agent::process::with_preludes("exec \"$@\"").into();
-        let image_build_reads = state.daemon.lifecycle_reads();
-        let image_build_lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.image_builds));
-        controllers.push(controller!(flotilla_resources::ImageBuild, {
-            move |backend: ResourceBackend, namespace_string: String| {
-                (
-                    vec![],
-                    Engine::<_, ImageBuildBinding>::new(
-                        flotilla_provisioning::reconcilers::ImageBuildReconciler::new(
-                            service.clone(),
-                            Arc::clone(&materials),
-                            &backend,
-                            &namespace_string,
-                            &host,
-                            &probe_wrapper,
-                        )
-                        .with_lifecycle_reads(Arc::clone(&image_build_reads)),
-                        image_build_lifecycles.clone(),
-                    ),
-                )
-            }
-        }));
-    } else {
-        warn!("no credential store; image builds placed on this host will not run");
-    }
-    // Builders mirror replicated per-identity ImageBuild demand into their own
-    // store, and withdraw copies whose demand was deleted.
-    {
-        let projection_backend = backend.clone();
-        let projection_namespace = namespace_string.clone();
-        let projection_host = state.local_host_ref.clone();
-        let projection_supervision = supervision.clone();
-        let projection_health = runtime_health.clone();
-        controllers.push(tokio::spawn(async move {
-            supervise_controller("image_build_placement", projection_supervision, projection_health, move || {
-                let backend = projection_backend.clone();
-                let namespace = projection_namespace.clone();
-                let host = projection_host.clone();
-                async move { crate::image_build::run_build_projection(&backend, &namespace, &host).await }
-            })
-            .await;
-        }));
-    }
+    controllers.extend(spawn_image_build_controller(&state));
     // Message delivery is the engine path's adapter (#3317, #3108); the runtime opens that path at
     // startup, before any controller runs.
     match state.daemon.message_primitives() {
@@ -1122,6 +1061,66 @@ fn spawn_clone_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHan
         Err(error) => {
             error!(%error, "the Clone controller could not start; clones will not launch");
             None
+        }
+    }
+}
+
+/// The ImageBuild controller and launcher (#3108, ADR 0062): on a host with a build service and a
+/// credential store, the launcher launches each build any home demands of this host, and the
+/// controller is the single writer of those launches, building each through the build service.
+/// Elsewhere nothing builds here.
+fn spawn_image_build_controller(state: &Arc<ControllerRuntimeState>) -> Vec<JoinHandle<()>> {
+    use flotilla_provisioning::engine::{
+        controller::Controller, image_build_actuator::ImageBuildActuator, image_builds::ImageBuildLauncher,
+    };
+    let Some(engine) = state.provisioning.as_ref() else { return Vec::new() };
+    let (Some(build_service), Some(credentials)) = (state.image_build_service.clone(), state.credential_store.clone()) else {
+        if state.image_build_service.is_some() {
+            warn!("no credential store; image builds demanded of this host will not run");
+        }
+        return Vec::new();
+    };
+    let service = match state.daemon.decided_store() {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "the ImageBuild controller has no decided store; image builds will not run");
+            return Vec::new();
+        }
+    };
+    let blobs: Arc<dyn crate::blob_store::BlobStore> = match state.blob_store.clone() {
+        Some(blobs) => blobs,
+        None => Arc::new(crate::blob_store::LocalBlobStore::new(state.config.state_dir().as_path())),
+    };
+    let materials = Arc::new(crate::image_build::DaemonImageBuildMaterials {
+        credentials,
+        blobs,
+        backend: state.daemon.resource_backend(),
+        namespace: state.namespace.clone(),
+        host: state.local_host_ref.clone(),
+        secrets: image_builder_directory(state.config.state_dir().as_path()).join("secrets"),
+    });
+    let probe_wrapper: Arc<str> = flotilla_agent::process::with_preludes("exec \"$@\"").into();
+    let host = state.local_host_ref.clone();
+    let actuator = ImageBuildActuator::new(build_service, materials, Arc::clone(&service), host.clone(), probe_wrapper);
+    let launcher = match ImageBuildLauncher::start(Arc::clone(&engine.image_builds), Arc::clone(&service), &host) {
+        Ok(launcher) => launcher,
+        Err(error) => {
+            error!(%error, "the image build launcher could not start; image builds will not run");
+            return Vec::new();
+        }
+    };
+    match Controller::start(Arc::clone(&engine.image_builds), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
+        Ok(controller) => vec![
+            tokio::spawn(launcher.run()),
+            tokio::spawn(async move {
+                // No probe observes a build's backing: the image stays in its cache.
+                let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
+                controller.run(backings).await
+            }),
+        ],
+        Err(error) => {
+            error!(%error, "the ImageBuild controller could not start; image builds will not run");
+            Vec::new()
         }
     }
 }
@@ -1302,6 +1301,7 @@ async fn open_provisioning_lifecycles(
         checkouts::EngineCheckouts,
         clones::EngineClones,
         environments::EngineEnvironments,
+        image_builds::EngineImageBuilds,
         launch_log::{LaunchLog, StagedFacts},
         reads::{LifecycleReadPort, StoreReads},
         terminals::EngineTerminals,
@@ -1336,11 +1336,14 @@ async fn open_provisioning_lifecycles(
         let terminal_facts = StagedFacts::default();
         let terminal_sessions: Arc<dyn flotilla_provisioning::engine::Lifecycles<_>> =
             Arc::new(LifecycleHome::new(&home, open_home_with(&log(), LaunchLog::new(log(), terminal_facts.clone()))?));
-        let terminal_records = Arc::new(EngineTerminals::over(Arc::clone(&terminal_sessions), service));
+        let terminal_records = Arc::new(EngineTerminals::over(Arc::clone(&terminal_sessions), Arc::clone(&service)));
+        let image_builds: Arc<dyn flotilla_provisioning::engine::Lifecycles<_>> = Arc::new(LifecycleHome::new(&home, open_home(log())?));
+        let image_build_records = Arc::new(EngineImageBuilds::over(Arc::clone(&image_builds), service));
         Ok::<_, String>(ProvisioningLifecycles {
             environments: Arc::new(LifecycleHome::new(&home, open_home_with(&log(), LaunchLog::new(log(), environment_facts.clone()))?)),
             environment_facts,
-            image_builds: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            image_builds,
+            image_build_records,
             clones: Arc::new(LifecycleHome::new(&home, open_home_with(&log(), LaunchLog::new(log(), clone_facts.clone()))?)),
             clone_facts,
             checkouts,
@@ -1372,6 +1375,9 @@ async fn open_provisioning_lifecycles(
         LifecycleReadPort::new(StoreReads::new(store), home)
             .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>)
             .with_clones(clones as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
+            .with_image_builds(
+                Arc::clone(&lifecycles.image_build_records) as Arc<dyn flotilla_resources::image_build_records::ImageBuildRecords>
+            )
             .with_checkouts(Arc::clone(&lifecycles.checkout_records) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
             .with_terminals(terminals as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>)
             .with_vessels(vessels as Arc<dyn flotilla_resources::vessel_records::VesselRecords>),

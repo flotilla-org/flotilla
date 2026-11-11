@@ -207,6 +207,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for WithAgentSessions {
         self.reads.clones()
     }
 
+    fn image_builds(&self) -> Result<&dyn flotilla_resources::image_build_records::ImageBuildRecords, String> {
+        self.reads.image_builds()
+    }
+
     fn checkouts(&self) -> Result<&dyn flotilla_resources::checkout_records::CheckoutRecords, String> {
         self.reads.checkouts()
     }

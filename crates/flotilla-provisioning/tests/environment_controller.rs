@@ -8,7 +8,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_engine_store::{open_home, open_home_with, StoreLog};
+use flotilla_engine_store::{
+    open_home, open_home_with,
+    plain::{PendingChange, PlainLog},
+    StoreLog,
+};
 use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_protocol::{ConfiguredResourceLimits, LifecycleReading};
 use flotilla_provisioning::{
@@ -16,6 +20,7 @@ use flotilla_provisioning::{
         controller::{Backing, BackingEvent, Controller},
         environment_actuator::{EnvironmentActuator, LaunchEnvironment},
         environments::EngineEnvironments,
+        image_builds::launch_of,
         launch_log::{LaunchLog, StagedFacts},
         reads::StoreReads,
         LifecycleHome, Lifecycles, Step,
@@ -26,7 +31,7 @@ use flotilla_provisioning::{
         decided_registry,
         environment::EnvironmentKind,
         host::{HostObservation, Provider, Readiness},
-        image_build::{Architecture, Delivery, ImageBuildKind, ImageBuildRequest, Reservation},
+        image_build::{Architecture, Delivery, ImageBuildDemand, ImageBuildKind, Reservation},
         terminal_session::{Launch, TerminalSessionKind, TerminalSessionRequest},
         Holder,
     },
@@ -290,11 +295,13 @@ impl World {
         self.vessels.request(name, lease, now()).expect("lease").name().to_owned()
     }
 
-    fn build(&self, name: &str) {
-        self.build_to(name, Delivery::Local);
+    /// Demands build `name` here and launches it here, as admission and its builder do; the
+    /// launch's name.
+    fn build(&self, name: &str) -> String {
+        self.build_to(name, Delivery::Local)
     }
 
-    fn build_to(&self, name: &str, delivery: Delivery) {
+    fn build_to(&self, name: &str, delivery: Delivery) -> String {
         let layer = ImageLayerSpec::builder()
             .name("base".into())
             .version("1.0.0".into())
@@ -304,14 +311,16 @@ impl World {
             .fragment("RUN true".into())
             .probe("true".into())
             .build();
-        let request = ImageBuildRequest {
+        let demand = ImageBuildDemand {
             composition: "sha256:feed".into(),
             architecture: Architecture::Amd64,
             layers: Frozen::new(vec![layer]).expect("freeze"),
+            builder: Ref::new("builder", HOME),
             delivery,
             reservation: Reservation { cpu: 2, disk_bytes: 1 << 30 },
         };
-        self.builds.request(name, request, now()).expect("build");
+        PlainLog::new(self.service.store()).create(name, &demand, &PendingChange::new(NewChange::new("admission", now()))).expect("demand");
+        self.builds.request(name, launch_of(name, &demand), now()).expect("build").name().to_owned()
     }
 
     fn checkout(&self, name: &str, environment: &str) {
@@ -454,7 +463,7 @@ async fn a_vessel_s_environment_launches_with_its_derived_env_and_its_facts() {
 async fn a_built_environment_waits_for_its_build(#[case] delivery: Delivery, #[case] pull: DockerImagePullPolicy) {
     let world = World::start(None);
     let v1 = world.vessel("v1");
-    world.build_to("b1", delivery);
+    let b1 = world.build_to("b1", delivery);
     world.environments.request("env-v1", &docker("", Some("b1")), Some(&v1)).expect("request");
     // Another environment realised after it: the controller has passed it.
     let v2 = world.vessel("v2");
@@ -463,7 +472,7 @@ async fn a_built_environment_waits_for_its_build(#[case] delivery: Delivery, #[c
     assert!(world.provider.provisioned("env-v1").is_empty(), "nothing is launched while the build runs");
     assert_eq!(world.reading("env-v1"), Some(LifecycleReading::InProgress), "no attempt is spent waiting");
 
-    world.builds.step("b1", &Step::Realised { identity: "sha256:built".into() }, now()).expect("built");
+    world.builds.step(&b1, &Step::Realised { identity: "sha256:built".into() }, now()).expect("built");
     world.until("env-v1 ready", |world| world.ready("env-v1")).await;
     let launched = world.provider.provisioned("env-v1");
     let docker = launched[0].docker.as_ref().expect("docker");
@@ -632,12 +641,12 @@ async fn a_lost_environment_is_not_launched_again() {
 async fn a_build_that_gave_up_gives_its_environment_up() {
     let world = World::start(None);
     let v1 = world.vessel("v1");
-    world.build("b1");
+    let b1 = world.build("b1");
     world.environments.request("env-v1", &docker("", Some("b1")), Some(&v1)).expect("request");
     world
         .builds
         .step(
-            "b1",
+            &b1,
             &Step::Attempted(flotilla_state_machines::Outcome::Failed {
                 cause: flotilla_state_machines::Cause::new(flotilla_state_machines::CauseCategory::Refused, "probe `harness-codex` failed"),
                 retryable: false,
@@ -693,10 +702,10 @@ async fn a_cloud_sandbox_is_realised_and_destroyed_under_its_backing() {
 async fn a_built_cloud_sandbox_launches_on_the_registry_digest(#[case] delivery: Delivery) {
     let world = World::start(None);
     let v1 = world.vessel("v1");
-    world.build_to("b1", delivery.clone());
+    let b1 = world.build_to("b1", delivery.clone());
     world.environments.request("cloud", &cloud("", Some("b1")), Some(&v1)).expect("request");
     let digest = "registry.test/crew@sha256:built";
-    world.builds.step("b1", &Step::Realised { identity: digest.into() }, now()).expect("built");
+    world.builds.step(&b1, &Step::Realised { identity: digest.into() }, now()).expect("built");
     match delivery {
         Delivery::Registry { .. } => {
             world.until("cloud ready", |world| world.ready("cloud")).await;

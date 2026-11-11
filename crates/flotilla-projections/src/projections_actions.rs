@@ -68,7 +68,7 @@ use flotilla_issue_tracker::IssueProvider;
 /// requiring the host port to expose its state.
 #[async_trait]
 pub trait ProjectionsActionPort: Send + Sync {
-    async fn image_build_report(&self, namespace: &str, name: &str) -> Result<flotilla_protocol::image_check::ImageBuildReport, String>;
+    async fn image_build_report(&self, name: &str) -> Result<flotilla_protocol::image_check::ImageBuildReport, String>;
     async fn crew_capability_card(&self, context: &flotilla_protocol::CrewCommandContext) -> Result<String, String>;
     async fn message_contacts_internal(
         &self,
@@ -237,13 +237,10 @@ impl ProjectionsActions<'_> {
                 Ok(v) => Ok(CommandValue::FulfilmentList(Box::new(v))),
                 Err(message) => Ok(CommandValue::Error { message }),
             },
-            CommandAction::QueryImageBuild { name } => {
-                let namespace = self.port.provisioning_namespace().await;
-                match self.port.image_build_report(&namespace, name).await {
-                    Ok(report) => Ok(CommandValue::ImageBuild(Box::new(report))),
-                    Err(message) => Ok(CommandValue::Error { message }),
-                }
-            }
+            CommandAction::QueryImageBuild { name } => match self.port.image_build_report(name).await {
+                Ok(report) => Ok(CommandValue::ImageBuild(Box::new(report))),
+                Err(message) => Ok(CommandValue::Error { message }),
+            },
             CommandAction::QueryFleetList { project, crew_id, convoy } => {
                 match self.port.scoped_fleet_list(project.as_deref(), crew_id.as_deref(), convoy.as_deref()).await {
                     Ok(v) => Ok(CommandValue::FleetList(Box::new(v))),

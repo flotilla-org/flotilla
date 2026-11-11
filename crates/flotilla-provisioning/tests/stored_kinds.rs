@@ -50,6 +50,7 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Environment"), Some(KindCode::new("ev")));
     assert_eq!(held("EnvironmentLaunchFacts"), Some(KindCode::new("el")));
     assert_eq!(held("ImageBuild"), Some(KindCode::new("ib")));
+    assert_eq!(held("ImageBuildDemand"), Some(KindCode::new("iq")));
     assert_eq!(held("Clone"), Some(KindCode::new("cl")));
     assert_eq!(held("CloneFacts"), Some(KindCode::new("cf")));
     assert_eq!(held("Checkout"), Some(KindCode::new("ck")));
@@ -71,7 +72,7 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Host"), Some(KindCode::new("ho")));
     assert_eq!(held("HostObservation"), Some(KindCode::new("ob")));
     assert_eq!(held("AccessDelivery"), Some(KindCode::new("ad")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 30);
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 31);
     // The definition kinds (#3824 layer 2b), in the decided store with their writers (2b-ii).
     for (kind, code) in [
         ("Forge", "fo"),
@@ -205,6 +206,8 @@ fn each_kind_survives_the_codec() {
     for delivery in [Delivery::Registry { repository: "registry/flotilla".into() }, Delivery::Local] {
         for state in states() {
             let spec = ImageBuildRequest {
+                launch_of: "image-feed-arm64".into(),
+                launch: 0,
                 composition: "sha256:feed".into(),
                 architecture: Architecture::Arm64,
                 layers: layers.clone(),
@@ -354,6 +357,8 @@ fn environment_request() -> EnvironmentRequest {
 
 fn image_build_request() -> ImageBuildRequest {
     ImageBuildRequest {
+        launch_of: "image-feed-arm64".into(),
+        launch: 0,
         composition: "sha256:feed".into(),
         architecture: Architecture::Amd64,
         layers: Frozen::new(vec![layer()]).expect("freeze"),
@@ -402,11 +407,11 @@ fn policies_give_up_as_the_old_retries_did() {
 
     let world = MemoryLifecycleWorld::default();
     let mut home = Home::<Lifecycle<ImageBuildKind>>::new("home").expect("declaration");
-    home.create("b", image_build_request(), &world, Timestamp::from_micros(0)).expect("created");
+    let b = home.create("b", image_build_request(), &world, Timestamp::from_micros(0)).expect("created").resource.name().to_owned();
     let recipe = Cause::new(CauseCategory::Refused, "probe failed");
-    home.apply("b", Attempted { outcome: Outcome::Failed { cause: recipe.clone(), retryable: false } }, &world, Timestamp::from_micros(1))
+    home.apply(&b, Attempted { outcome: Outcome::Failed { cause: recipe.clone(), retryable: false } }, &world, Timestamp::from_micros(1))
         .expect("attempt");
-    home.apply("b", GiveUp { cause: recipe }, &world, Timestamp::from_micros(1)).expect("a recipe failure gives up at once");
+    home.apply(&b, GiveUp { cause: recipe }, &world, Timestamp::from_micros(1)).expect("a recipe failure gives up at once");
 
     let mut clones = Home::<Lifecycle<CloneKind>>::new("home").expect("declaration");
     let c = clones.create("r", clone(), &world, Timestamp::from_micros(0)).expect("created").resource.name().to_owned();

@@ -14,9 +14,11 @@
 //! | | Lost | Gone(Lost) |
 //! | | Failed | GaveUp |
 //! | Cloud sandbox Environment, deleted | Lost (its sandbox gone) | not stored: dropped |
-//! | ImageBuild | Queued, Building, Failed with a retry to come | Requested (its failed attempts tallied) |
+//! | ImageBuild, as admission wrote it | any | an ImageBuildDemand at its home, naming its builder |
+//! | ImageBuild at its builder (as launch `#1`) | Queued, Building, Failed with a retry to come | Requested (its failed attempts tallied) |
 //! | | Built | Realised (its digest) |
 //! | | Failed, settled | GaveUp |
+//! | ImageBuild, retired per-stage | any | not stored: dropped |
 //! | Clone (as launch `#1`) | Pending, Cloning, Failed from before the terminal policy | Requested |
 //! | | Ready | Realised (its path), with the default branch it found |
 //! | | Failed, terminal | GaveUp |
@@ -48,7 +50,7 @@ use flotilla_resources::{
     EnvironmentStatus, ImageBuild as OldImageBuild, ImageBuildFailureClass, ImageBuildPhase, ResourceObject,
     TerminalSession as OldTerminalSession, TerminalSessionPhase, Vessel as OldVessel, VesselPhase, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
-use flotilla_schema::{Kind, NewChange, State, Timestamp};
+use flotilla_schema::{Kind, NewChange, Ref, State, Timestamp};
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
@@ -64,11 +66,12 @@ use flotilla_resources::{
     vessel_resource_name, CONVOY_LABEL,
 };
 
-use super::{checkouts, clones, environments, image_build::ImageBuildBinding, terminals, vessel::PINNED_CLASS, Binding};
+use super::{checkouts, clones, environments, image_builds, terminals, vessel::PINNED_CLASS, Binding};
 use crate::stored::{
     checkout::{CheckoutFacts, CheckoutKind},
     clone::{CloneFacts, CloneKind},
     environment::EnvironmentKind,
+    image_build::{ImageBuildDemand, ImageBuildKind},
     launch_facts::EnvironmentLaunchFacts,
     terminal_facts::{AgentLaunch, TerminalEndpoint, TerminalLaunchFacts},
     terminal_session::TerminalSessionKind,
@@ -434,6 +437,7 @@ pub fn rehearse_vessels(records: &[(ResourceObject<OldVessel>, String)], report:
 pub fn import_environments(
     records: &[(ResourceObject<OldEnvironment>, String)],
     vessels: &VesselLaunches,
+    builder_home: &dyn Fn(&str) -> Result<String, String>,
     target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) {
@@ -448,7 +452,7 @@ pub fn import_environments(
     }
     for (environment, home) in &kept {
         let refuse = |reason: String| ImportRefusal { kind: EnvironmentKind::NAME, record: environment.metadata.name.clone(), reason };
-        let result = import_environment(environment, home, vessels).and_then(|imported| {
+        let result = import_environment(environment, home, vessels, builder_home).and_then(|imported| {
             let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
             target.write(home, imported.resource.name(), &change, &imported.resource).map_err(refuse)?;
             // A realised launch keeps the facts its provider reported, written beside it.
@@ -463,11 +467,13 @@ pub fn import_environments(
 }
 
 /// Maps old Environment `obj`, homed at `home`, onto its engine resource: the request the
-/// environment port makes, held for the launch the vessel its label names imported as.
+/// environment port makes, held for the launch the vessel its label names imported as, its image
+/// built at the home `builder_home` gives for its build.
 pub fn import_environment(
     obj: &ResourceObject<OldEnvironment>,
     home: &str,
     vessels: &VesselLaunches,
+    builder_home: &dyn Fn(&str) -> Result<String, String>,
 ) -> Result<ImportedResource<EnvironmentKind>, ImportRefusal> {
     let refuse = |reason: String| ImportRefusal { kind: EnvironmentKind::NAME, record: obj.metadata.name.clone(), reason };
     // An empty label names no vessel.
@@ -477,7 +483,7 @@ pub fn import_environment(
         .get(flotilla_resources::VESSEL_REF_LABEL)
         .filter(|vessel| !vessel.is_empty())
         .map(|vessel| held_for_launch(vessel, home, vessels));
-    let request = environments::request_of(&obj.spec, vessel.as_deref(), home).map_err(refuse)?;
+    let request = environments::request_of(&obj.spec, vessel.as_deref(), builder_home).map_err(refuse)?;
     let state = environment_state(obj).map_err(refuse)?;
     let since = Timestamp::from_datetime(&obj.metadata.creation_timestamp);
     Ok(ImportedResource {
@@ -525,38 +531,98 @@ fn environment_state(obj: &ResourceObject<OldEnvironment>) -> Result<LifecycleSt
     }
 }
 
-impl Imported for ImageBuildBinding {
-    fn imported_state(obj: &ResourceObject<OldImageBuild>) -> Result<LifecycleState, String> {
-        let status = obj.status.clone().unwrap_or_default();
-        let cause = || {
-            let failure = status.failure.as_ref();
-            let category = match failure.map(|failure| failure.class) {
-                Some(ImageBuildFailureClass::Recipe) => CauseCategory::Refused,
-                _ => CauseCategory::Transient,
+/// The stored state old ImageBuild `obj`'s status maps to.
+pub fn image_build_state(obj: &ResourceObject<OldImageBuild>) -> Result<LifecycleState, String> {
+    let status = obj.status.clone().unwrap_or_default();
+    let cause = || {
+        let failure = status.failure.as_ref();
+        let category = match failure.map(|failure| failure.class) {
+            Some(ImageBuildFailureClass::Recipe) => CauseCategory::Misconfigured,
+            _ => CauseCategory::Transient,
+        };
+        Cause::new(category, failure.map_or("the build failed", |failure| failure.reason.as_str()))
+    };
+    // The failed attempts so far: every started attempt but one in flight.
+    let tally = |failed: u32| match failed {
+        0 => LifecycleState::requested(),
+        failures => LifecycleState::Requested {
+            failures,
+            last_failure: Some(Failure {
+                // A failure with no finish time reads as long past (the epoch): its backoff has
+                // run out and the next pass retries at once, the safe direction.
+                at: status.finished_at.as_ref().map_or(Timestamp(0), Timestamp::from_datetime),
+                cause: cause(),
+                retryable: true,
+            }),
+        },
+    };
+    Ok(match status.phase {
+        ImageBuildPhase::Queued => tally(status.attempt),
+        ImageBuildPhase::Building => tally(status.attempt.saturating_sub(1)),
+        ImageBuildPhase::Built => realised(status.digest.clone(), "digest")?,
+        ImageBuildPhase::Failed if status.will_retry() => tally(status.attempt),
+        ImageBuildPhase::Failed => LifecycleState::GaveUp { cause: cause() },
+    })
+}
+
+/// Imports old ImageBuild `records` into `target`. A record its admission wrote is that home's
+/// demand, naming its builder's Host record at the home `builder_home` gives for the builder
+/// host. A record its builder executes (a copy it projected from a demand, or a demand of its
+/// own) is the build's first launch there (`<name>#<n>`), in the state its status maps to. A
+/// retired per-stage record is dropped.
+pub fn import_image_builds(
+    records: &[(ResourceObject<OldImageBuild>, String)],
+    builder_home: &dyn Fn(&str) -> Result<String, String>,
+    target: &mut impl ImportTarget,
+    report: &mut ImportReport,
+) {
+    for (build, home) in records {
+        if !target.imports(home) {
+            continue;
+        }
+        let name = &build.metadata.name;
+        let Some(spec) = build.spec.current() else {
+            *report.dropped.entry((ImageBuildKind::NAME, "a retired per-stage build")).or_default() += 1;
+            continue;
+        };
+        let refuse = |reason: String| ImportRefusal { kind: ImageBuildKind::NAME, record: name.clone(), reason };
+        let change = created(build);
+        let projected = build.metadata.annotations.contains_key(ACTUATOR_SOURCE_ROOT_ANNOTATION);
+        let builder = match builder_home(&spec.host_ref) {
+            Ok(builder) => builder,
+            Err(reason) => {
+                report.refused.push(refuse(reason));
+                continue;
+            }
+        };
+        if !projected {
+            let written = image_builds::demand_of(spec, Ref::new(spec.host_ref.clone(), builder.clone()))
+                .and_then(|demand| target.write(home, name, &change, &demand));
+            match written {
+                Ok(()) => *report.imported.entry((ImageBuildDemand::KIND, "demanded")).or_default() += 1,
+                Err(reason) => {
+                    report.refused.push(refuse(reason));
+                    continue;
+                }
+            }
+        }
+        if !projected && builder != *home {
+            continue;
+        }
+        let result = image_build_state(build).map_err(refuse).and_then(|state| {
+            let request = image_builds::demand_of(spec, Ref::new(spec.host_ref.clone(), builder.clone()))
+                .map(|demand| image_builds::launch_of(name, &demand))
+                .map_err(refuse)?;
+            let since = Timestamp::from_datetime(&build.metadata.creation_timestamp);
+            let mut imported = ImportedResource::<ImageBuildKind> {
+                record: name.clone(),
+                home: home.clone(),
+                resource: Resource::stored(name.clone(), request, State::new(state, since), Version(1)),
             };
-            Cause::new(category, failure.map_or("the build failed", |failure| failure.reason.as_str()))
-        };
-        // The failed attempts so far: every started attempt but one in flight.
-        let tally = |failed: u32| match failed {
-            0 => LifecycleState::requested(),
-            failures => LifecycleState::Requested {
-                failures,
-                last_failure: Some(Failure {
-                    // A failure with no finish time reads as long past (the epoch): its backoff has
-                    // run out and the next pass retries at once, the safe direction.
-                    at: status.finished_at.as_ref().map_or(Timestamp(0), Timestamp::from_datetime),
-                    cause: cause(),
-                    retryable: true,
-                }),
-            },
-        };
-        Ok(match status.phase {
-            ImageBuildPhase::Queued => tally(status.attempt),
-            ImageBuildPhase::Building => tally(status.attempt.saturating_sub(1)),
-            ImageBuildPhase::Built => realised(status.digest.clone(), "digest")?,
-            ImageBuildPhase::Failed if status.will_retry() => tally(status.attempt),
-            ImageBuildPhase::Failed => LifecycleState::GaveUp { cause: cause() },
-        })
+            write_imported(target, &mut imported, &change).map_err(refuse)?;
+            Ok(imported)
+        });
+        report.record(&result);
     }
 }
 

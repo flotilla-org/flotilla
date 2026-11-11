@@ -317,23 +317,22 @@ async fn failing_source_never_publishes_an_empty_card() {
     assert!(messages.is_empty());
 }
 
-// Capability cards verify tools only after the engine realises the referenced image.
+// Capability cards verify tools only once the engine has built the referenced image.
 #[tokio::test]
-async fn image_capabilities_follow_engine_without_a_copy() {
-    use flotilla_provisioning::engine::image_build::ImageBuildBinding;
-    use flotilla_provisioning_testkit::{image_build, store_object, Ending, LifecycleFixture};
-    use flotilla_resources::{DockerEnvironmentSpec, EnvironmentSpec, ImageBuildPhase};
+async fn image_capabilities_follow_engine_builds() {
+    use flotilla_provisioning_testkit::{image_build_spec, Ending, EngineFixture};
+    use flotilla_resources::{DockerEnvironmentSpec, EnvironmentSpec};
     let (_, backend, _, _held) = fixture(CrewWorkPhase::Working).await;
-    let build = image_build(ImageBuildPhase::Built);
-    store_object(&backend, build.clone()).await;
-    let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
-    fixture.environments.request(
+    let engine = EngineFixture::default();
+    engine.image_builds.host("builder", "amd64");
+    let build = engine.image_builds.demand(&image_build_spec());
+    engine.environments.request(
         "resume-env",
         &EnvironmentSpec {
             docker: Some(DockerEnvironmentSpec {
                 host_ref: "builder".into(),
                 image: "composed".into(),
-                image_build_ref: Some(build.metadata.name.clone()),
+                image_build_ref: Some(build.clone()),
                 declared_agent_adapters: Default::default(),
                 required_agent_adapters: Default::default(),
                 pull_policy: Default::default(),
@@ -346,19 +345,19 @@ async fn image_capabilities_follow_engine_without_a_copy() {
     );
     let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
     // A command-source card exercises the same image reader without unrelated vessel-placement setup.
-    let mut spec = session.spec;
-    spec.source = flotilla_resources::TerminalSessionSource::Tool { command: "true".into() };
+    let mut session_spec = session.spec;
+    session_spec.source = flotilla_resources::TerminalSessionSource::Tool { command: "true".into() };
     let endpoints = BTreeMap::new();
     let accounts = flotilla_store::OldStoreAccounts::new(backend.clone());
     let card =
-        || crate::crew_capabilities::session_card(&backend, "flotilla", "crew", &spec, &[], &endpoints, fixture.reads.clone(), &accounts);
-    assert!(card().await.expect("unheld").contains("tool:verified"));
-    fixture.request(&build);
-    assert!(!card().await.expect("requested").contains("tool:verified"));
-    fixture.finish(&build, Ending::Ready("engine digest"));
-    assert!(card().await.expect("ready").contains("tool:verified"));
-    fixture.finish(&build, Ending::Lost("engine digest"));
+        || crate::crew_capabilities::session_card(&backend, "flotilla", "crew", &session_spec, &[], &endpoints, engine.reads(), &accounts);
+    assert!(!card().await.expect("not launched").contains("tool:verified"));
+    engine.image_builds.launch(&build);
+    assert!(!card().await.expect("launched").contains("tool:verified"));
+    engine.image_builds.finish(&build, Ending::Ready("engine digest"));
+    assert!(card().await.expect("built").contains("tool:verified"));
+    engine.image_builds.finish(&build, Ending::Lost("engine digest"));
     assert!(!card().await.expect("lost").contains("tool:verified"));
-    fixture.poison();
+    engine.image_builds.poison();
     assert!(card().await.expect_err("checked read").contains("poisoned"));
 }

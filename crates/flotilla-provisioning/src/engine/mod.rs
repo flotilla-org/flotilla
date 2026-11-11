@@ -43,7 +43,8 @@ pub mod environments;
 pub mod forge_observation_import;
 pub mod host_import;
 pub mod hosts;
-pub mod image_build;
+pub mod image_build_actuator;
+pub mod image_builds;
 pub mod import;
 pub mod kinds;
 pub mod launch_log;
@@ -100,6 +101,8 @@ pub struct ProvisioningLifecycles {
     /// The facts the Environment controller stages for each launch's Realise edge.
     pub environment_facts: launch_log::StagedFacts,
     pub image_builds: Arc<dyn Lifecycles<ImageBuildKind>>,
+    /// The image build port every image build reader, demander and retrier goes through.
+    pub image_build_records: Arc<image_builds::EngineImageBuilds>,
     pub clones: Arc<dyn Lifecycles<CloneKind>>,
     /// The facts the Clone controller stages for each launch's Realise edge.
     pub clone_facts: launch_log::StagedFacts<CloneFacts>,

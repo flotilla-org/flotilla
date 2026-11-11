@@ -12,7 +12,6 @@ pub trait ChangeCursor<C>: Send {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProvisioningKind {
     Environment,
-    ImageBuild,
     Clone,
     Checkout,
     /// A terminal session's current launch, read by its record name.
@@ -58,6 +57,12 @@ pub trait LifecycleReads: Send + Sync {
     /// Unavailable where no engine is installed.
     fn checkouts(&self) -> Result<&dyn crate::checkout_records::CheckoutRecords, String> {
         Err("checkout records are not served without the engine".into())
+    }
+
+    /// The engine's image builds (#3108): every image build reader, demander and retrier goes
+    /// through them. Unavailable where no engine is installed.
+    fn image_builds(&self) -> Result<&dyn crate::image_build_records::ImageBuildRecords, String> {
+        Err("image builds are not served without the engine".into())
     }
 
     /// The AgentSessions the decided store holds (#3108): every reader of what a crew's agent is
@@ -138,6 +143,10 @@ impl LifecycleReads for LateLifecycleReads {
 
     fn clones(&self) -> Result<&dyn crate::clone_records::CloneRecords, String> {
         self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.clones()
+    }
+
+    fn image_builds(&self) -> Result<&dyn crate::image_build_records::ImageBuildRecords, String> {
+        self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.image_builds()
     }
 
     fn checkouts(&self) -> Result<&dyn crate::checkout_records::CheckoutRecords, String> {

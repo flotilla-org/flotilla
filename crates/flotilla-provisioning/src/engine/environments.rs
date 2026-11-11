@@ -50,12 +50,16 @@ impl RecipeOf {
     }
 }
 
-/// The request `spec` makes at `home`, held for `vessel`. Env entries derived at launch are left
-/// out: they are composed again at each launch, never stored (look-over ruling 5).
-pub fn request_of(spec: &EnvironmentSpec, vessel: Option<&str>, home: &str) -> Result<EnvironmentRequest, String> {
+/// The request `spec` makes, held for `vessel`. Env entries derived at launch are left out: they
+/// are composed again at each launch, never stored (look-over ruling 5). A built image names its
+/// build at the builder's home, `builder_home` of the build's name, where its launches are.
+pub fn request_of(
+    spec: &EnvironmentSpec,
+    vessel: Option<&str>,
+    builder_home: impl Fn(&str) -> Result<String, String>,
+) -> Result<EnvironmentRequest, String> {
     let provider = spec.resolved_provider_address(None)?.ok_or("an environment names no provider or host")?;
-    // The build is homed at its builder; the environment names it as replicated here.
-    let built = |name: &Option<String>| name.as_ref().map(|name| Ref::new(name.clone(), home));
+    let built = |name: &Option<String>| name.as_ref().map(|name| builder_home(name).map(|home| Ref::new(name.clone(), home))).transpose();
     // A composed image names its build, whose realised digest is read at creation.
     let image = |image_build: &Option<_>, reference: &str| match image_build {
         Some(_) => DockerImage::Built,
@@ -66,7 +70,7 @@ pub fn request_of(spec: &EnvironmentSpec, vessel: Option<&str>, home: &str) -> R
     };
     let (recipe, image_build) = match (&spec.docker, &spec.host_direct, &spec.cloud_sandbox) {
         (Some(docker), None, None) => {
-            let image_build = built(&docker.image_build_ref);
+            let image_build = built(&docker.image_build_ref)?;
             let recipe = DockerRecipe {
                 image: image(&image_build, &docker.image),
                 declared_adapters: docker.declared_agent_adapters.clone(),
@@ -84,7 +88,7 @@ pub fn request_of(spec: &EnvironmentSpec, vessel: Option<&str>, home: &str) -> R
             (Recipe::of(&recipe)?, None)
         }
         (None, None, Some(cloud)) => {
-            let image_build = built(&cloud.image_build_ref);
+            let image_build = built(&cloud.image_build_ref)?;
             let recipe = CloudSandboxRecipe {
                 image: image(&image_build, &cloud.image),
                 size: cloud.size.clone(),
@@ -364,7 +368,14 @@ impl EnvironmentRecords for EngineEnvironments {
         if self.lifecycles.get(name).is_some() {
             return Ok(false);
         }
-        let request = request_of(spec, vessel, self.home())?;
+        let homes = (self.homes)();
+        let builder_home = |build: &str| {
+            self.reads
+                .read(|read| Ok(super::image_builds::builder_home(read, &homes, build)?))
+                .map_err(|error| format!("find the builder of {build}: {error}"))?
+                .ok_or_else(|| format!("image build {build} is demanded at no home this one follows"))
+        };
+        let request = request_of(spec, vessel, builder_home)?;
         let at = Timestamp::from_datetime(&chrono::Utc::now());
         self.lifecycles.request(name, request, at).map(|_| true).map_err(|error| format!("request environment {name}: {error}"))
     }

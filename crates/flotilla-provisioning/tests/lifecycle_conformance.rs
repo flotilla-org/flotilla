@@ -94,6 +94,8 @@ impl Sample for ImageBuildKind {
             .probe("true".into())
             .build();
         ImageBuildRequest {
+            launch_of: "image-feed-arm64".into(),
+            launch: 0,
             composition: "sha256:feed".into(),
             architecture: Architecture::Amd64,
             layers: Frozen::new(vec![layer]).expect("freeze"),

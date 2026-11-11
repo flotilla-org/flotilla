@@ -70,6 +70,7 @@ mod forge;
 mod fulfilment_kind;
 #[doc(hidden)]
 pub mod host;
+pub mod image_build_records;
 mod issue;
 pub mod labels;
 mod leaf;

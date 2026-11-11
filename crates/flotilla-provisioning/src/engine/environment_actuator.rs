@@ -34,7 +34,7 @@ use super::{
     controller::{Actuator, Backing, Holding, ProviderFailure, Usability},
     environments::{launch_facts, spec_of},
     launch_log::StagedFacts,
-    reads::{keyed, StoreReads},
+    reads::{latest, StoreReads},
 };
 use crate::{
     reconcilers::environment::{EnvironmentProvisioning, EnvironmentRuntime},
@@ -73,6 +73,18 @@ pub struct EnvironmentActuator<R> {
     home: String,
     staged: StagedFacts,
     launch: Arc<dyn LaunchEnvironment>,
+}
+
+/// The lifecycle state of the newest launch of `name` at `home`.
+pub(crate) fn latest_state_of<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<LifecycleState>, StoreError>
+where
+    K: crate::stored::Launches,
+    Resource<Lifecycle<K>>: Kind,
+{
+    let Some((id, _)) = read.integer_index_keys_before(&K::by_launch(name), home, i64::MAX, 1)?.first().copied() else {
+        return Ok(None);
+    };
+    Ok(read.load::<Resource<Lifecycle<K>>>(id)?.map(|loaded| loaded.value.state().clone()))
 }
 
 impl<R> EnvironmentActuator<R> {
@@ -124,12 +136,12 @@ where
 }
 
 impl<R> EnvironmentActuator<R> {
-    /// The image the provider runs for a built environment: its build's digest, and how the
-    /// provider gets it. The controller tries only once the build has finished.
+    /// The image the provider runs for a built environment: its build's newest launch's digest,
+    /// and how the provider gets it. The controller tries only once that launch has finished.
     fn built(&self, build: &Ref<Resource<Lifecycle<ImageBuildKind>>>) -> Result<(String, Delivery), ProviderFailure> {
         let view = self
             .reads
-            .read(|read| keyed::<ImageBuildKind>(read, &build.name, &build.home))
+            .read(|read| latest::<ImageBuildKind>(read, &build.name, &build.home))
             .map_err(|error| failed(format!("read ImageBuild {}: {error}", build.name), true))?
             .ok_or_else(|| failed(format!("ImageBuild {} awaiting replicated build status", build.name), true))?;
         match view.state {
@@ -300,7 +312,8 @@ where
         }
         if let Some(build) = &request.image_build {
             // A build still being made holds the launch; a finished one, built or not, lets it run.
-            let building = state_of::<ImageBuildKind>(read, &build.name, &build.home)?
+            // The build's newest launch is read: an operator's retry launches it again.
+            let building = latest_state_of::<ImageBuildKind>(read, &build.name, &build.home)?
                 .is_none_or(|state| matches!(state, LifecycleState::Requested { .. }));
             facts.push(Usability {
                 fact: Identity { kind: IMAGE_BUILD, name: build.name.clone(), home: build.home.clone() },

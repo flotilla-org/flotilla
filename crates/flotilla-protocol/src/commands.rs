@@ -1140,10 +1140,14 @@ pub enum CommandAction {
     ProjectRefresh {
         name: String,
     },
-    /// Resolve a branch's composed image and get-or-create its ImageBuild
+    /// Resolve a branch's composed image and demand its image build
     /// (`flotilla image check`).
     ImageCheck {
         request: crate::image_check::ImageCheckRequest,
+    },
+    /// Launch a given-up image build again, at its builder (`flotilla image retry`).
+    ImageBuildRetry {
+        name: String,
     },
 
     TrackRepoPath {
@@ -1442,6 +1446,7 @@ impl Command {
             CommandAction::QueryFulfilmentList {} => "query fulfilment list",
             CommandAction::QueryImageBuild { .. } => "query image build",
             CommandAction::ImageCheck { .. } => "Checking composed image...",
+            CommandAction::ImageBuildRetry { .. } => "Retrying image build...",
             CommandAction::QueryFleetList { .. } => "query fleet list",
             CommandAction::QueryCrewStalls { .. } => "query crew stalls",
             CommandAction::QueryCrewCapabilities { .. } => "query crew capabilities",
@@ -1625,6 +1630,10 @@ pub enum CommandValue {
     FulfilmentList(Box<FulfilmentListResponse>),
     ImageCheck(Box<crate::image_check::ImageCheckReport>),
     ImageBuild(Box<crate::image_check::ImageBuildReport>),
+    /// The launch an image build retry made.
+    ImageBuildRetried {
+        launch: String,
+    },
     FleetList(Box<FleetListResponse>),
     CrewStalls(Box<CrewStallsResponse>),
     CrewCapabilities {

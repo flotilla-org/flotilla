@@ -31,10 +31,11 @@ use flotilla_state_machines::{
     Cause, CauseCategory, Home, Log, Outcome,
 };
 
-/// The engine's environments, clones, checkouts, terminal sessions and vessels homed at one home
-/// on one store, each fixture's `reads` serving all five, as a daemon's lifecycle reads do.
+/// The engine's environments, image builds, clones, checkouts, terminal sessions and vessels homed
+/// at one home on one store, each fixture's `reads` serving them all, as a daemon's lifecycle reads do.
 pub struct EngineFixture {
     pub environments: EnvironmentFixture,
+    pub image_builds: image_build::ImageBuildFixture,
     pub clones: CloneFixture,
     pub checkouts: CheckoutFixture,
     pub terminals: TerminalsFixture,
@@ -73,9 +74,11 @@ impl EngineFixture {
         let mut environments = EnvironmentFixture::over(home, Arc::clone(&store));
         let mut clones = CloneFixture::over(home, Arc::clone(&store));
         let mut checkouts = CheckoutFixture::over(home, Arc::clone(&store));
+        let mut image_builds = image_build::ImageBuildFixture::over(home, Arc::clone(&store));
         let reads: Arc<dyn LifecycleReads> = Arc::new(
             LifecycleReadPort::new(StoreReads::new(store), home.to_owned())
                 .with_environments(Arc::clone(&environments.environments) as Arc<dyn EnvironmentRecords>)
+                .with_image_builds(Arc::clone(&image_builds.builds) as Arc<dyn flotilla_resources::image_build_records::ImageBuildRecords>)
                 .with_clones(Arc::clone(&clones.clones) as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
                 .with_checkouts(Arc::clone(&checkouts.checkouts) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
                 .with_terminals(Arc::clone(&terminals.terminals) as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>)
@@ -84,12 +87,13 @@ impl EngineFixture {
         environments.reads = reads.clone();
         clones.reads = reads.clone();
         checkouts.reads = reads.clone();
+        image_builds.reads = reads.clone();
         terminals.reads = reads.clone();
         vessels.reads = reads;
-        Self { environments, clones, checkouts, terminals, vessels }
+        Self { environments, image_builds, clones, checkouts, terminals, vessels }
     }
 
-    /// The readings serving all five.
+    /// The readings serving them all.
     pub fn reads(&self) -> Arc<dyn LifecycleReads> {
         self.checkouts.reads.clone()
     }
@@ -260,12 +264,9 @@ pub async fn store_object<T: flotilla_resources::Resource>(
     }
 }
 
-/// Contradictory actuator evidence for image reader contracts; the engine supplies phase/digest/cause.
-pub fn image_build(phase: flotilla_resources::ImageBuildPhase) -> ResourceObject<flotilla_resources::ImageBuild> {
-    use flotilla_resources::{
-        ImageBuildFailure, ImageBuildFailureClass, ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageBuildStatus,
-        ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier,
-    };
+/// A one-layer image build on host `builder`, whose layer provides `tool:verified`.
+pub fn image_build_spec() -> flotilla_resources::ImageBuildSpec {
+    use flotilla_resources::{ImageBuildReservation, ImageBuildSpec, ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier};
     let layers = vec![ImageLayerSpec::builder()
         .name("base".into())
         .version("1".into())
@@ -276,26 +277,12 @@ pub fn image_build(phase: flotilla_resources::ImageBuildPhase) -> ResourceObject
         .probe("true".into())
         .provides(std::collections::BTreeSet::from(["tool:verified".into()]))
         .build()];
-    let identity = flotilla_resources::image_identity(&layers);
-    let name = flotilla_resources::image_build_name(&identity, "amd64", &ImageDelivery::Local, "builder");
-    object(
-        &name,
-        ImageBuildResourceSpec::Current(Box::new(
-            ImageBuildSpec::builder()
-                .identity(identity)
-                .architecture("amd64".into())
-                .layers(layers)
-                .host_ref("builder".into())
-                .delivery(ImageDelivery::Local)
-                .reservation(ImageBuildReservation { cpu: 1, disk_bytes: 1 })
-                .build(),
-        )),
-        ImageBuildStatus {
-            phase,
-            attempt: 99,
-            digest: Some("stale digest".into()),
-            failure: Some(ImageBuildFailure { class: ImageBuildFailureClass::Recipe, reason: "stale reason".into() }),
-            ..Default::default()
-        },
-    )
+    ImageBuildSpec::builder()
+        .identity(flotilla_resources::image_identity(&layers))
+        .architecture("amd64".into())
+        .layers(layers)
+        .host_ref("builder".into())
+        .delivery(ImageDelivery::Local)
+        .reservation(ImageBuildReservation { cpu: 1, disk_bytes: 1 })
+        .build()
 }

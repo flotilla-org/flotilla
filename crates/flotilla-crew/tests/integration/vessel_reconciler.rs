@@ -2403,8 +2403,11 @@ fn create_ready_adopted_checkout(engine: &EngineFixture, name: &str, path: &str)
 async fn composed_placement_names_its_image_build_then_reads_its_digest() {
     let lease_engine = &EngineFixture::default();
     use flotilla_resources::PlacementImageSource;
-    let identity = format!("sha256:{}", "c".repeat(64));
-    let image_build_ref = format!("image-{}-amd64", "c".repeat(40));
+    let spec = flotilla_provisioning_testkit::image_build_spec();
+    let identity = spec.identity.clone();
+    // Admission demands the build before the vessel names it.
+    lease_engine.image_builds.host("builder", "amd64");
+    let image_build_ref = lease_engine.image_builds.demand(&spec);
     let digest = format!("registry.test/crew@sha256:{}", "d".repeat(64));
     let built = PlacementImageSource::Built { identity, image_build_ref: image_build_ref.clone() };
     let kind = FulfilmentKindSpec::builder()
@@ -2427,6 +2430,8 @@ async fn composed_placement_names_its_image_build_then_reads_its_digest() {
     assert_eq!(reading(lease_engine, &vessel.metadata.name), LifecycleReading::InProgress);
 
     let lease_engine = &EngineFixture::default();
+    lease_engine.image_builds.host("builder", "amd64");
+    lease_engine.image_builds.demand(&spec);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-composed", "implement", REPO_URL, GIT_REF).await;
     create_kind(&backend, NAMESPACE, "kind-composed", kind).await;

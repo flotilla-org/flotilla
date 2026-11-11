@@ -5704,6 +5704,7 @@ impl InProcessDaemon {
             CommandAction::ProjectRegister { .. } => return boxed_action!(admission.execute_action_project_register(id, &command)),
             CommandAction::ProjectRefresh { .. } => return boxed_action!(admission.execute_action_project_refresh(id, &command)),
             CommandAction::ImageCheck { .. } => return boxed_action!(admission.execute_action_image_check(id, &command)),
+            CommandAction::ImageBuildRetry { .. } => return boxed_action!(admission.execute_action_image_build_retry(id, &command)),
             CommandAction::TrackRepoPath { .. } => return boxed_action!(executor.execute_action_track_repo_path(id, &command)),
             CommandAction::UntrackRepo { .. } => return boxed_action!(typed executor.execute_action_untrack_repo(id, &command)),
             CommandAction::OpenChangeRequest { .. }
@@ -6075,8 +6076,8 @@ impl crew_actions::CrewActionPort for InProcessDaemon {
 
 #[async_trait]
 impl projections_actions::ProjectionsActionPort for InProcessDaemon {
-    async fn image_build_report(&self, namespace: &str, name: &str) -> Result<flotilla_protocol::image_check::ImageBuildReport, String> {
-        image_check::image_build_report(&self.resource_backend, namespace, name, self.lifecycle_reads()).await
+    async fn image_build_report(&self, name: &str) -> Result<flotilla_protocol::image_check::ImageBuildReport, String> {
+        image_check::image_build_report(self.lifecycle_reads(), name).await
     }
     async fn crew_capability_card(&self, context: &flotilla_protocol::CrewCommandContext) -> Result<String, String> {
         self.crew.query_capabilities(context).await
@@ -6323,6 +6324,10 @@ impl ProjectOperations for InProcessDaemon {
         let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
         let host = self.environment_manager.local_host_id().as_str().to_string();
         image_check::check_image(&self.resource_backend, &namespace, &host, self, request, self.lifecycle_reads()).await
+    }
+    async fn image_build_retry(&self, name: &str) -> Result<String, String> {
+        let (reads, owned) = (self.lifecycle_reads(), name.to_owned());
+        tokio::task::spawn_blocking(move || reads.image_builds()?.retry(&owned)).await.map_err(|error| format!("retry {name}: {error}"))?
     }
     async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
         InProcessDaemon::project_register(self, target).await

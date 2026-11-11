@@ -60,6 +60,9 @@ impl crate::project_ops::ProjectOperations for TestProjectOperations {
     ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
         panic!("no image checks")
     }
+    async fn image_build_retry(&self, _: &str) -> Result<String, String> {
+        panic!("no image build retries")
+    }
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(remote)
     }

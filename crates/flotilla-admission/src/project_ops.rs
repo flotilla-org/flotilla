@@ -278,6 +278,8 @@ pub trait ProjectOperations: Send + Sync {
         &self,
         request: &flotilla_protocol::image_check::ImageCheckRequest,
     ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String>;
+    /// Launches given-up image build `name` again here, its builder, returning the launch.
+    async fn image_build_retry(&self, name: &str) -> Result<String, String>;
     async fn project_register(&self, target: &str) -> Result<(String, usize), String>;
     async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String>;
     fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool;

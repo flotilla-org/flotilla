@@ -910,10 +910,10 @@ impl ConvoyAdmission {
                 serde_json::to_string(adopted).map_err(|error| error.to_string())?,
             );
         }
-        let created = crate::image_build::create_planned_builds(&self.backend, namespace, image_builds).await?;
+        let created = crate::image_build::demand_planned_builds(Arc::clone(&self.lifecycle_reads), image_builds).await?;
         let result = self.create_convoy_with_annotations(namespace, name, spec, placement_decision, annotations).await;
         if result.is_err() {
-            crate::image_build::remove_created_builds(&self.backend, namespace, &created).await;
+            crate::image_build::withdraw_demanded_builds(Arc::clone(&self.lifecycle_reads), &created).await;
         }
         result
     }
@@ -1480,12 +1480,12 @@ impl ConvoyAdmission {
             flotilla_resources::convoy::ENSURE_ADMISSION_ANNOTATION.to_string(),
             serde_json::to_string(&ensure.spec).map_err(|error| error.to_string())?,
         );
-        let created = crate::image_build::create_planned_builds(&self.backend, namespace, &admission.image_builds).await?;
+        let created = crate::image_build::demand_planned_builds(Arc::clone(&self.lifecycle_reads), &admission.image_builds).await?;
         let result = self
             .create_convoy_with_annotations(namespace, &admission.name, &admission.spec, admission.placement_decision, annotations)
             .await;
         if result.is_err() {
-            crate::image_build::remove_created_builds(&self.backend, namespace, &created).await;
+            crate::image_build::withdraw_demanded_builds(Arc::clone(&self.lifecycle_reads), &created).await;
         }
         result?;
         self.accounts.open(namespace, bindings).await?;
@@ -1998,7 +1998,7 @@ impl AdmissionReadContext<'_> {
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<AdmissionReadContext<'a>, String> {
-        use flotilla_resources::{CrewDefaults, FleetDesignation, ImageBuild, ImageLayer, FLEET_DESIGNATION_NAME};
+        use flotilla_resources::{CrewDefaults, FleetDesignation, ImageLayer, FLEET_DESIGNATION_NAME};
         use flotilla_store::StoreQuery;
         let backend = &owner.backend;
         let project_ref = required_admission_value(&intent.project_ref, "project")?;
@@ -2111,13 +2111,9 @@ impl AdmissionReadContext<'_> {
             .query_declared::<CredentialSpec>(namespace, &StoreQuery::names(credential_names, true))
             .await
             .map_err(|error| error.to_string())?;
-        // Composed images resolve against every layer definition, and their
-        // placement cost reads the per-identity builds.
+        // Composed images resolve against every layer definition; their placement cost reads
+        // the per-identity builds from the engine.
         let image_layers = flotilla_store::read_definition_catalog::<ImageLayer>(backend, namespace).await?;
-        let builds = backend
-            .query_declared::<ImageBuild>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
-            .await
-            .map_err(|error| error.to_string())?;
         let mut snapshot = flotilla_store::RequestSnapshot::new(backend, namespace)?;
         snapshot.insert_definitions::<Project>(projects)?;
         snapshot.insert_definitions::<FleetDesignation>(fleet)?;
@@ -2136,7 +2132,6 @@ impl AdmissionReadContext<'_> {
             .map(|host| host.object.metadata.name.clone())
             .collect();
         let occupancy = host_occupancies(backend, namespace, &capped).await?;
-        snapshot.insert::<ImageBuild>(builds)?;
         snapshot.insert::<ResourceHost>(hosts)?;
         let mut reads = owner.reads(snapshot.finish());
         reads.occupancy = occupancy;
@@ -3965,8 +3960,8 @@ struct ConvoySnapshotBundle<'a> {
     pub placement: Option<&'a FulfilmentKindSpec>,
     pub placement_decision: Option<PlacementDecision>,
     pub vessel_placements: Option<&'a BTreeMap<String, (FulfilmentKindSpec, PlacementDecision)>>,
-    /// Composed images' builds, created only with the convoy (refusals before
-    /// this point never leave builds behind).
+    /// Composed images' builds, demanded only with the convoy (refusals before
+    /// this point never leave demands behind).
     pub image_builds: &'a [crate::image_build::PlannedImageBuild],
     /// The checkout the convoy adopts, recorded on it (#3108).
     pub adopted_checkout: Option<&'a flotilla_resources::ObservedCheckoutSpec>,
@@ -4806,7 +4801,7 @@ async fn image_placement_cost(
     lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
 ) -> Result<flotilla_resources::ImageAcquisitionCost, String> {
     use flotilla_resources::{
-        FleetDesignation, FulfilmentRealisation, ImageAcquisitionCost, ImageBuildPhase, PlacementImageSource, FLEET_DESIGNATION_NAME,
+        FleetDesignation, FulfilmentRealisation, ImageAcquisitionCost, PlacementImageSource, FLEET_DESIGNATION_NAME,
         IMAGE_DIGESTS_CAPABILITY,
     };
     let image = match realisation {
@@ -4830,20 +4825,11 @@ async fn image_placement_cost(
             let digest = match (&architecture, host) {
                 (Some(architecture), Some(host)) => {
                     let name = crate::image_build::expected_build_name(identity, architecture, image_cache.as_ref(), &host.metadata.name);
-                    match flotilla_store::read_image_build(backend, namespace, &name, Arc::clone(&lifecycle_reads)).await {
-                        Ok(reading) => match reading.lifecycle {
-                            Some(flotilla_protocol::LifecycleReading::Ready { identity }) => Some(identity),
-                            Some(_) => None,
-                            None => reading
-                                .build
-                                .object
-                                .status
-                                .filter(|status| status.phase == ImageBuildPhase::Built)
-                                .and_then(|status| status.digest),
-                        },
-                        Err(ResourceError::NotFound { .. }) => None,
-                        Err(error) => return Err(error.to_string()),
-                    }
+                    let reads = Arc::clone(&lifecycle_reads);
+                    tokio::task::spawn_blocking(move || reads.image_builds()?.get(&name))
+                        .await
+                        .map_err(|error| format!("read image build: {error}"))??
+                        .and_then(|build| build.digest().map(str::to_owned))
                 }
                 _ => None,
             };
@@ -5820,13 +5806,12 @@ mod tests {
     }
 
     // ADR 0062: a composed placement costs Held when the host inventory holds
-    // the identity's Built digest, RegistryPull when the build was pushed,
-    // and Build while the build is absent or unfinished.
+    // the identity's built digest, RegistryPull when the build was pushed,
+    // and Build while the build is absent, unfinished or lost.
     #[tokio::test]
     async fn composed_image_cost_follows_the_identity_build() {
-        use flotilla_resources::{
-            ImageAcquisitionCost, ImageBuild, ImageBuildStatus, ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier,
-        };
+        use flotilla_provisioning_testkit::{image_build::ImageBuildFixture, Ending};
+        use flotilla_resources::{ImageAcquisitionCost, ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier};
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let hosts = backend.using::<ResourceHost>("test");
         let host =
@@ -5855,21 +5840,25 @@ mod tests {
             .probe("true".into())
             .build()];
         let identity = flotilla_resources::image_identity(&layers);
-        let name = flotilla_resources::image_build_name(&identity, "amd64", &ImageDelivery::Local, "host");
         let realisation = flotilla_resources::FulfilmentRealisation::DockerPerVessel { image: None };
-        let cost = || {
-            image_placement_cost(
-                &backend,
-                "test",
-                Some(&host),
-                Some("cache"),
-                &realisation,
-                Some(BTreeSet::from([identity.as_str()])),
-                Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
-            )
+        let fixture = ImageBuildFixture::at("home");
+        fixture.host("host", "amd64");
+        let cost = |host: ResourceObject<ResourceHost>| {
+            let (backend, realisation, reads, identity) = (&backend, &realisation, fixture.reads.clone(), identity.clone());
+            async move {
+                image_placement_cost(
+                    backend,
+                    "test",
+                    Some(&host),
+                    Some("cache"),
+                    realisation,
+                    Some(BTreeSet::from([identity.as_str()])),
+                    reads,
+                )
+                .await
+            }
         };
-        assert_eq!(cost().await.expect("cost"), ImageAcquisitionCost::Build, "no build yet");
-        let builds = backend.using::<ImageBuild>("test");
+        assert_eq!(cost(host.clone()).await.expect("cost"), ImageAcquisitionCost::Build, "no build yet");
         let spec = flotilla_resources::ImageBuildSpec::builder()
             .identity(identity.clone())
             .architecture("amd64".into())
@@ -5878,57 +5867,19 @@ mod tests {
             .delivery(ImageDelivery::Local)
             .reservation(flotilla_resources::ImageBuildReservation { cpu: 1, disk_bytes: 1 })
             .build();
-        let created = builds.create(&InputMeta::builder().name(name.clone()).build(), &spec.into()).await.expect("build");
-        assert_eq!(cost().await.expect("cost"), ImageAcquisitionCost::Build, "queued build");
-        let built = |digest: &str| ImageBuildStatus {
-            phase: flotilla_resources::ImageBuildPhase::Built,
-            digest: Some(digest.to_string()),
-            ..Default::default()
-        };
+        let name = fixture.put(&spec);
+        assert_eq!(cost(host.clone()).await.expect("cost"), ImageAcquisitionCost::Build, "unfinished build");
         let manifest = format!("sha256:{}", "2".repeat(64));
-        builds
-            .update_status(&name, &created.metadata.resource_version, &built(&format!("registry.test/crew@{manifest}")))
-            .await
-            .expect("pushed");
-        assert_eq!(cost().await.expect("cost"), ImageAcquisitionCost::RegistryPull);
+        fixture.finish(&name, Ending::Ready(&format!("registry.test/crew@{manifest}")));
+        assert_eq!(cost(host.clone()).await.expect("cost"), ImageAcquisitionCost::RegistryPull);
         status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), serde_json::json!({"cache": [local_id, manifest]}));
         hosts.update_status("host", &host.metadata.resource_version, &status).await.expect("pulled inventory");
         let host = hosts.get("host").await.expect("host");
-        let held = image_placement_cost(
-            &backend,
-            "test",
-            Some(&host),
-            Some("cache"),
-            &realisation,
-            Some(BTreeSet::from([identity.as_str()])),
-            Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
-        );
-        assert_eq!(held.await.expect("cost"), ImageAcquisitionCost::Held);
-
-        // A held engine judgement replaces the contradictory Built digest in placement costs.
-        use flotilla_provisioning::engine::image_build::ImageBuildBinding;
-        use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
-        let build = builds.get(&name).await.expect("build");
-        let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
-        fixture.request(&build);
-        let cost = || {
-            image_placement_cost(
-                &backend,
-                "test",
-                Some(&host),
-                Some("cache"),
-                &realisation,
-                Some(BTreeSet::from([identity.as_str()])),
-                fixture.reads.clone(),
-            )
-        };
-        assert_eq!(cost().await.expect("requested"), ImageAcquisitionCost::Build);
-        fixture.finish(&build, Ending::Ready(&manifest));
-        assert_eq!(cost().await.expect("ready"), ImageAcquisitionCost::Held);
-        fixture.finish(&build, Ending::Lost(&manifest));
-        assert_eq!(cost().await.expect("lost"), ImageAcquisitionCost::Build);
+        assert_eq!(cost(host.clone()).await.expect("cost"), ImageAcquisitionCost::Held);
+        fixture.finish(&name, Ending::Lost(&manifest));
+        assert_eq!(cost(host.clone()).await.expect("lost"), ImageAcquisitionCost::Build);
         fixture.poison();
-        assert!(cost().await.expect_err("checked read").contains("poisoned"));
+        assert!(cost(host).await.expect_err("checked read").contains("poisoned"));
     }
 
     #[test]
