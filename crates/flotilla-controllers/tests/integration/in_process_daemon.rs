@@ -8957,39 +8957,21 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
             )
             .build()],
     };
-    let initial_status = flotilla_resources::ConvoyStatus {
-        phase: ConvoyPhase::Active,
-        workflow_snapshot: Some(snapshot),
-        crew_work: BTreeMap::from([(
-            "work".to_string(),
-            BTreeMap::from([
-                (
-                    "coder".to_string(),
-                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                ),
-                (
-                    "reviewer".to_string(),
-                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Pending).build(),
-                ),
-            ]),
-        )]),
-        ..Default::default()
-    };
+    // The coder, the first agent, starts eagerly and works; the reviewer waits for its task.
     let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("handoff-convoy".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
-        )
-        .await
-        .expect("create convoy");
-    convoys.update_status("handoff-convoy", &created.metadata.resource_version, &initial_status).await.expect("set crew status");
-    // The work's launch, homed at the authority.
-    let vessel_ref = authority_engine.vessels.request("handoff-convoy", "work", "feta");
+    let convoy = launch_convoy(
+        &authority,
+        "handoff-convoy",
+        flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        flotilla_resources::ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() },
+    )
+    .await;
+    // The work's launch, homed at the authority and realised.
+    let vessel_ref = work_underway(&authority_engine, &convoy, "work");
     let session_name = |role: &str, index| {
         flotilla_resources::TerminalSessionIdentity::builder()
             .vessel_ref(vessel_ref.clone())
-            .convoy("handoff-convoy".to_string())
+            .convoy(convoy.clone())
             .vessel("work".to_string())
             .role(role.to_string())
             .vessel_index(0)
@@ -9037,19 +9019,21 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     let context = flotilla_protocol::CrewCommandContext {
         crew_id: None,
         namespace: Some("flotilla".to_string()),
-        convoy: Some("handoff-convoy".to_string()),
+        convoy: Some(convoy.clone()),
         vessel_ref: Some(vessel_ref.clone()),
         role: Some("coder".to_string()),
     };
 
     // Only a remote anchor: the target cannot be created here.
     start_session("coder", 0);
+    let initial_status = convoys.get(&convoy).await.expect("convoy before refusal").status;
+    assert_eq!(initial_status.as_ref().expect("status").crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
     let error = authority
         .crew_handoff_internal(&context, "reviewer", "Review again")
         .await
         .expect_err("remote anchor cannot create a local target");
     assert!(error.contains(terminal_host.node_id().as_str()), "refusal must name the anchor origin: {error}");
-    assert_eq!(convoys.get("handoff-convoy").await.expect("convoy after refusal").status, Some(initial_status.clone()));
+    assert_eq!(convoys.get(&convoy).await.expect("convoy after refusal").status, initial_status);
 
     start_session("reviewer", 1);
     struct FailedHandoffPublisher;
@@ -9061,25 +9045,25 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     }
     let failed: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> = Arc::new(FailedHandoffPublisher);
     authority.set_resource_intent_publisher(Arc::downgrade(&failed));
-    let before = convoys.get("handoff-convoy").await.expect("before failed handoff").status;
+    let before = convoys.get(&convoy).await.expect("before failed handoff").status;
     let error = authority.crew_handoff_internal(&context, "reviewer", "Review this").await.expect_err("publication fails");
     assert!(error.contains("remote handoff publication unavailable"));
-    assert_eq!(convoys.get("handoff-convoy").await.expect("after failed handoff").status, before);
+    assert_eq!(convoys.get(&convoy).await.expect("after failed handoff").status, before);
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     authority.crew_handoff_internal(&context, "reviewer", "Review this").await.expect("queue remote handoff");
-    let convoy = convoys.get("handoff-convoy").await.expect("convoy after handoff");
-    assert!(convoy.status.expect("convoy status").turn_deliveries.values().all(|delivery| delivery.pending_supervisor_turn.is_none()));
-    terminal_host
-        .resource_backend()
-        .replica_writer::<ResourceConvoy>(authority.node_id().clone(), "flotilla")
-        .replace(&convoys.list().await.expect("convoy snapshot"), chrono::Utc::now())
-        .await
-        .expect("replicate handoff");
+    let handed = convoys.get(&convoy).await.expect("convoy after handoff");
+    assert!(handed.status.expect("convoy status").turn_deliveries.values().all(|delivery| delivery.pending_supervisor_turn.is_none()));
+    // The authority's log, with the handoff, reaches the session's home.
+    flotilla_provisioning_testkit::replicate_home(
+        &authority_store,
+        authority_store.home(),
+        &terminal_host.decided_store().expect("terminal host store"),
+    );
     terminal_host.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver handoff at session origin");
     let inbox = terminal_host.resource_backend().using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
     assert_eq!(inbox.items.len(), 1);
     assert!(inbox.items[0].spec.body.contains("Review this"));
-    assert_eq!(inbox.items[0].spec.sender, "flotilla/handoff-convoy/work/coder");
+    assert_eq!(inbox.items[0].spec.sender, format!("flotilla/{convoy}/work/coder"));
 }
 
 #[tokio::test]
