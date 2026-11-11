@@ -37,11 +37,6 @@ fn in_phase(name: &str, phase: ConvoyPhase) -> impl Fn(&ResourceObject<Convoy>) 
 fn stalled(name: &str) -> impl Fn(&ResourceObject<Convoy>) -> bool + '_ {
     convoy(name, |status| {
         status.stalled.is_some()
-            && status
-                .crew_work
-                .get("implement")
-                .and_then(|roles| roles.get("coder"))
-                .is_some_and(|work| work.phase == CrewWorkPhase::Stalled)
     })
 }
 
