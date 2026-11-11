@@ -928,6 +928,8 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
     let base = Utc::now() - chrono::Duration::seconds(2);
     let records = backend.using::<ChangeRequest>("flotilla");
     let name = cr_name("github.com", "flotilla-org/flotilla", 2596);
+    // The home's Host is the forge's only observer, so the record is its own: a foreign
+    // authority would be taken over, and its observation dropped, once a row demands it.
     records
         .create(
             &InputMeta::builder().name(name.clone()).build(),
@@ -935,7 +937,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                 .service("github.com".into())
                 .scope("flotilla-org/flotilla".into())
                 .number(2596)
-                .observing_authority("authority".into())
+                .observing_authority("test-host".into())
                 .build(),
         )
         .await
@@ -954,7 +956,9 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
             "{phase:?}"
         );
     }
-    let launch = produced_pr_launch(&backend, &home, "single-agent", "coder", CrewWorkPhase::Interrupted).await;
+    // An unclaimed crew still at work. (A crew reads Interrupted only once its vessel is lost,
+    // which interrupts the launch too, and an Interrupted launch arms no rows.)
+    let launch = produced_pr_launch(&backend, &home, "single-agent", "coder", CrewWorkPhase::Working).await;
     let launch = launch.as_str();
     if stalled {
         use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, Submission};
@@ -1014,6 +1018,15 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
         mergeable: Default::default(),
         review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
     };
+    // Arm this launch's rows before the PR is observed: the sync retires the earlier launches'
+    // rows, and the record they alone demanded is collected and recreated unobserved. Disarm
+    // their watches so the merged observation fires only through the deterministic evaluation
+    // below.
+    let objects = HashMap::from([(launch.to_owned(), convoys.get(launch).await.expect("convoy"))]);
+    wake.sync_rows("flotilla", &objects).await.expect("active subscriptions");
+    for task in table.inner.tasks.lock().await.drain().map(|(_, task)| task) {
+        task.abort();
+    }
     let record = records.get(&name).await.expect("record");
     let record = records.update_status(&name, &record.metadata.resource_version, &observed).await.expect("merged observation");
     if stalled {
@@ -1357,13 +1370,11 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
         );
         inactive.push((phase, launch));
     }
-    let mut launch = String::new();
-    for phase in [CrewWorkPhase::Interrupted, CrewWorkPhase::Working] {
-        launch = produced_pr_launch(&backend, &home, workflow, role, phase).await;
-        let updated = convoys.get(&launch).await.expect("active crew");
-        wake.sync_rows("flotilla", &HashMap::from([(launch.clone(), updated)])).await.expect("active subscriptions");
-        assert!(table.rows().await.iter().any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { rule, .. } if rule.to.role == role && flotilla_resources::legacy_field_path(&rule.on.path) == ".checks")), "{phase:?}");
-    }
+    // A working crew. (An Interrupted crew's launch is Interrupted too, and arms no rows.)
+    let launch = produced_pr_launch(&backend, &home, workflow, role, CrewWorkPhase::Working).await;
+    let updated = convoys.get(&launch).await.expect("active crew");
+    wake.sync_rows("flotilla", &HashMap::from([(launch.clone(), updated)])).await.expect("active subscriptions");
+    assert!(table.rows().await.iter().any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { rule, .. } if rule.to.role == role && flotilla_resources::legacy_field_path(&rule.on.path) == ".checks")));
     let launch = launch.as_str();
     let objects = HashMap::from([(launch.to_owned(), convoys.get(launch).await.expect("convoy"))]);
     // Drive each evaluation deterministically, using the same evaluator and
@@ -1727,7 +1738,6 @@ fn engine_table(
 
 #[cfg(any())]
 mod change_request_authority;
-#[cfg(any())]
 mod settlement;
 #[cfg(any())]
 mod stalls_supervision;
