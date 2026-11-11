@@ -53,9 +53,23 @@ impl EngineConvoysHome {
     /// [`Self::over`] a new decided store at `home`, which lives as long as the value.
     pub fn open(home: &str, namespace: &str, backend: &ResourceBackend, clock: Arc<dyn Clock>, reads: Arc<dyn LifecycleReads>) -> Self {
         let dir = tempfile::tempdir().expect("decided store directory");
+        let opened = Self::open_in(dir.path(), home, namespace, backend, clock, reads);
+        Self { _dir: Some(dir), ..opened }
+    }
+
+    /// [`Self::over`] a new decided store at `home` in `dir`, which the caller keeps: the
+    /// [`path`](Self::path) keeps the store open after this value is dropped.
+    pub fn open_in(
+        dir: &std::path::Path,
+        home: &str,
+        namespace: &str,
+        backend: &ResourceBackend,
+        clock: Arc<dyn Clock>,
+        reads: Arc<dyn LifecycleReads>,
+    ) -> Self {
         let registry = flotilla_engine_store::registry().expect("engine kind registry");
-        let service = Arc::new(Service::open(&dir.path().join("decided.sqlite"), home, registry).expect("decided store"));
-        Self { _dir: Some(dir), ..Self::over(&service, namespace, backend, clock, reads) }
+        let service = Arc::new(Service::open(&dir.join("decided.sqlite"), home, registry).expect("decided store"));
+        Self::over(&service, namespace, backend, clock, reads)
     }
 
     /// The path, as the crew and admission take it.

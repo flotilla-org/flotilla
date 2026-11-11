@@ -1461,6 +1461,8 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
         .await;
         let name = format!("terminal-{harness_name}");
         let vessel = install_engine(&daemon).vessels.request(&convoy_name, "work", daemon.local_host_id().expect("local host").as_str());
+        // The crew's vessel stands ready, so its convoy is active.
+        install_engine(&daemon).vessels.ready(&vessel, "contained-vessel");
         let spec = TerminalSessionSpec {
             env_ref: "contained-vessel".into(),
             role: "coder".into(),
@@ -5164,40 +5166,30 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
         )
         .await
         .expect("credential declaration");
-    let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name("live-credential-work".into()).build(),
-            &ConvoySpec::builder().workflow_ref("test".into()).build(),
-        )
-        .await
-        .expect("live convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".into())
-                        .credential_refs(std::collections::BTreeSet::from(["work-token".into()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                ..ConvoyStatus::default()
-            },
-        )
-        .await
-        .expect("live credential requirement");
+    let status = ConvoyStatus {
+        workflow_snapshot: Some(WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: vec![VesselRequirement::builder()
+                .name("work".into())
+                .credential_refs(std::collections::BTreeSet::from(["work-token".into()]))
+                .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                .build()],
+        }),
+        ..ConvoyStatus::default()
+    };
+    let spec = ConvoySpec::builder().workflow_ref("test".into()).build();
+    let convoy = flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy("flotilla", "live-credential-work", spec, status),
+    )
+    .await;
     // Written on its decided store before the runtime starts, as the runtime's engine finds it.
     let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store().expect("decided store"));
-    let vessel = vessels.request("live-credential-work", "work", daemon.local_host_id().expect("local host").as_str());
+    let vessel = vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
     vessels.ready(&vessel, &env_ref);
     // The live crew's launch, running before this start as the last run's controller left it.
     let spec = TerminalSessionSpec {
@@ -5216,7 +5208,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
             },
             context: Box::new(TerminalCrewContext {
                 namespace: "flotilla".into(),
-                convoy: "live-credential-work".into(),
+                convoy: convoy.clone(),
                 vessel_ref: vessel,
             }),
         },
@@ -6097,7 +6089,10 @@ async fn caller_can_stall_and_promise(daemon: &InProcessDaemon, caller: flotilla
         let event = super::environment_connection::command_completion(&mut events, id).await.unwrap();
         assert!(matches!(&event, DaemonEvent::CommandFinished { result: CommandValue::Ok, .. }), "{event:?}");
         let status = convoys.get(&own).await.unwrap().status.unwrap();
-        assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Stalled);
+        // The crew's stall is the home's stall judgement, made by the coder; the seat reads
+        // Stalled once its supervision opens a stall record about it.
+        let maker = status.stalled.as_ref().and_then(|stall| stall.maker.clone());
+        assert_eq!(maker, Some(flotilla_resources::LeafMaker::Actor { vessel: "work".into(), role: "coder".into() }));
         if !stalling {
             assert!(flotilla_resources::promises::owned(&status, "work", "coder").iter().any(|promise| promise.id == "follow-up"));
         }

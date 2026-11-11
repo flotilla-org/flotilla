@@ -377,17 +377,11 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
     };
     // The adapter's screen reading is the agent's activity, recorded on the AgentSession the
     // session's launch names; the pool's screen motion is not.
-    let service = Arc::new(
-        flotilla_schema_sqlite::stream::Service::open(
-            &temp.path().join("decided.sqlite"),
-            "home",
-            flotilla_engine_store::registry().unwrap(),
-        )
-        .unwrap(),
-    );
+    // The primitives share the daemon's decided store and home, where its Convoy path is.
+    let service = daemon.decided_store().unwrap();
     let primitives = Arc::new(
         flotilla_engine_messages::MessagePrimitives::open(
-            "home",
+            daemon.node_id().as_str(),
             Arc::clone(&service),
             daemon.resource_backend(),
             Arc::new(flotilla_resources::SystemClock),

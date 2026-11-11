@@ -114,10 +114,9 @@ impl std::ops::Deref for Environments {
     }
 }
 
-/// Admits `convoy` at `daemon`'s engine as the next launch of what it is a launch of, the way
+/// Admits `convoy` on `daemon`'s Convoy path, which its decided store brings, as the next launch of what it is a launch of, the way
 /// admission does, and returns the launch.
 pub async fn admit_convoy(daemon: &InProcessDaemon, convoy: ResourceObject<Convoy>) -> String {
-    engine(daemon);
     flotilla_engine_convoys_testkit::launch(&daemon.convoy_engine_path(), convoy).await
 }
 

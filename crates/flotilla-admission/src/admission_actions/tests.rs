@@ -35,7 +35,12 @@ async fn direct_admission_contract_success_and_duplicate() {
     let workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder()
             .name("work".into())
-            .crew(vec![CrewSpec::builder().role("coder".into()).source(CrewSource::Tool { command: "true".into() }).build()])
+            .crew(vec![CrewSpec::builder()
+                .role("coder".into())
+                // A convoy owes something: the engine admits none that owes nothing.
+                .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("coder")])
+                .source(CrewSource::Tool { command: "true".into() })
+                .build()])
             .build()])
         .build();
     backend.using::<WorkflowTemplate>("flotilla").create(&InputMeta::builder().name("work".into()).build(), &workflow).await.unwrap();

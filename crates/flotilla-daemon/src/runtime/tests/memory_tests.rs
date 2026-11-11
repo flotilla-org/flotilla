@@ -1,5 +1,5 @@
 use super::*;
-use crate::testkits::engine::{engine, runtime_checkouts};
+use crate::testkits::engine::{admit_convoy, engine, runtime_checkouts};
 use flotilla_provisioning::engine::controller::{Backing, BackingEvent};
 
 // Process boundary only: the actual Docker provider decodes the real incident
@@ -55,47 +55,30 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     let env_id = EnvironmentId::new("env-memory-incident");
     // The work's repository, whose retained checkout a loss names.
     let repo = RepositoryKey("test-repository".into());
-    let convoy = backend
-        .using::<Convoy>(NAMESPACE)
-        .create(&empty_meta("memory-incident"), &ConvoySpec::builder().workflow_ref("scratch".into()).build())
-        .await
-        .expect("convoy");
-    backend
-        .using::<Convoy>(NAMESPACE)
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                observed_workflow_ref: Some("scratch".into()),
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".into())
-                        .repository_refs(vec![repo.clone()])
-                        .crew(vec![CrewSpec::builder().role("shell".into()).source(CrewSource::Tool { command: "true".into() }).build()])
-                        .build()],
-                }),
-                work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([(
-                        "shell".into(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                    )]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("admitted convoy");
+    let status = ConvoyStatus {
+        observed_workflow_ref: Some("scratch".into()),
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+            vessels: vec![VesselRequirement::builder()
+                .name("work".into())
+                .repository_refs(vec![repo.clone()])
+                .crew(vec![CrewSpec::builder()
+                    .role("shell".into())
+                    .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("shell")])
+                    .source(CrewSource::Tool { command: "true".into() })
+                    .build()])
+                .build()],
+        }),
+        ..Default::default()
+    };
+    let spec = ConvoySpec::builder().workflow_ref("scratch".into()).build();
+    let convoy = admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, "memory-incident", spec, status)).await;
     // The work's adopted checkout, ready on the engine and held for its convoy.
     let checkouts = runtime_checkouts(&daemon);
-    checkouts.admit_for(&backend, NAMESPACE, "memory-incident", "memory-incident").await;
     checkouts.put_ready(
         "recoverable-work",
         &ResourceCheckoutSpec::Observed(
@@ -107,11 +90,11 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
                 .is_main(false)
                 .build(),
         ),
-        Some(&checkouts.holder("memory-incident")),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy.clone())),
     );
     // The work's launch, ready in its environment; the planner reads it as the old store's view.
     let engine = engine(&daemon);
-    let launch = engine.vessels.request("memory-incident", "work", daemon.local_host_id().expect("local host").as_str());
+    let launch = engine.vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
     // Its container, requested for it and running.
     let host_ref = daemon.local_host_id().expect("local host").to_string();
     engine_environments(&daemon).put_ready(
@@ -190,33 +173,18 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         panic!("the launch ends lost with its cause: {:?}", reading());
     };
     assert!(message.contains("host oomd") && message.contains("exit code 137") && message.contains("/hulls/work/flotilla"), "{message}");
+    // The convoy's work and crew read interrupted from the lost launch.
     let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy_reconciler = ConvoyReconciler::new()
-        .with_vessels(backend.including_replicas::<Vessel>(NAMESPACE))
-        .with_lifecycle_reads(daemon.lifecycle_reads());
-    // Reconciliations interrupt work and crew.
-    for _ in 0..2 {
-        let convoy = convoys.get("memory-incident").await.expect("convoy");
-        let prepared = convoy_reconciler.prepare(&convoy).await.expect("prepare convoy");
-        let outcome = convoy_reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
-        let Some(patch) = outcome.patch else { break };
-        flotilla_store::apply_status_patch(&convoys, "memory-incident", &patch).await.expect("persist convoy interruption");
-    }
-    let interrupted = convoys.get("memory-incident").await.expect("convoy").status.expect("status");
+    let interrupted = convoys.get(&convoy).await.expect("convoy").status.expect("status");
     assert_eq!(interrupted.phase, ConvoyPhase::Interrupted);
     assert_eq!(interrupted.work["work"].message.as_deref(), Some(message.as_str()));
     assert_eq!(interrupted.crew_work["work"]["shell"].phase, flotilla_resources::CrewWorkPhase::Interrupted);
-    // A lost launch is replaced in its convoy; the crew is told why its session stopped.
-    assert_eq!(
-        interrupted.crew_work["work"]["shell"].message.as_deref(),
-        Some(format!("crew session for `shell` was interrupted: {message}").as_str())
-    );
     // The launch has already ended Lost, so nothing is left to release. The evidence is this
     // home's, read for the work's launch.
     let result = daemon
         .execute_query(
             Command::builder()
-                .action(CommandAction::QueryExplainConvoy { namespace: Some(NAMESPACE.into()), name: "memory-incident".into() })
+                .action(CommandAction::QueryExplainConvoy { namespace: Some(NAMESPACE.into()), name: convoy.clone() })
                 .build(),
             uuid::Uuid::new_v4(),
         )

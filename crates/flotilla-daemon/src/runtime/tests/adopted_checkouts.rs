@@ -101,10 +101,11 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         )
         .await
         .expect("duplicate convoy create command should start");
-    assert_eq!(
-        wait_for_command_result(&mut rx, duplicate_id).await,
-        CommandValue::Error { message: "live convoy convoy-adopted generation 1 already exists".to_string() }
-    );
+    // The live launch's generation is its home sequence (decision 147), whatever number that is.
+    let CommandValue::Error { message } = wait_for_command_result(&mut rx, duplicate_id).await else {
+        panic!("a duplicate is refused")
+    };
+    assert!(message.starts_with("live convoy convoy-adopted generation ") && message.ends_with(" already exists"), "{message}");
     assert_eq!(checkout_count().await, checkout_count_before, "a rejected duplicate must not persist an orphan adopted checkout");
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);

@@ -490,7 +490,7 @@ async fn convoy_explain_finds_a_convoy_by_its_record_name_or_role() {
     let verbs = rows(&router, "/tables/verbs/rows").await;
     let explain = verbs.iter().find(|verb| verb["name"] == "convoy.explain").expect("listed");
     assert_eq!((&explain["effect"], &explain["picks"], &explain["broken"]), (&json!("read"), &json!("each"), &Value::Null));
-    let record = format!("convoy:{launch}");
+    let record = format!("convoy:{}", flotilla_address::encode(&launch));
     let subjects = [record.as_str(), "project:flotilla/convoy:fix-3774", "project:other/convoy:fix-3774"];
     let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.explain", json!({"invocation": "r", "subjects": subjects})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
