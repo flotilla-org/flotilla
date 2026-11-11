@@ -6,9 +6,8 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
 use flotilla_resources::{
     address::leaf_record_name, evaluate_leaf, expected_change_request_leaves, external_patches, Artifact, ArtifactLeafSubject,
-    ChangeRequest, Convoy, ConvoyAttention, ConvoyPhase, HoldAct, Issue, ObservedChecks, ResourceError, ResourceObject, StatusPatch,
-    TerminalSession, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    ChangeRequest, Convoy, ConvoyAttention, HoldAct, Issue, ObservedChecks, ResourceError, ResourceObject, StatusPatch, TerminalSession,
+    TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe, launch_underway};
@@ -263,9 +262,6 @@ impl LeafSubscriptionTable {
         // A stale firing after settlement has no work left to deliver.
         if status.phase.is_terminal() {
             return Ok(());
-        }
-        if status.phase == ConvoyPhase::Pending {
-            return Err(DeliveryError::from("wrong convoy kind or phase for turn delivery".to_string()));
         }
         if !status.crew_work.get(&rule.to.vessel).is_some_and(|crew| crew.contains_key(&rule.to.role)) {
             return Err(DeliveryError::from("turn-delivery target crew is absent".to_string()));
