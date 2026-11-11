@@ -453,6 +453,11 @@ pub trait ConvoyRecords: Send + Sync {
     fn changes(&self) -> tokio::sync::broadcast::Receiver<ConvoyChange> {
         tokio::sync::broadcast::channel(1).1
     }
+    /// Tells [`ConvoyRecords::changes`] of every change committed before this call, before it
+    /// returns, so a reader that drains its changes after it reads what the store holds.
+    fn catch_up(&self) -> Result<(), String> {
+        Ok(())
+    }
     /// What this home observes of its own launches.
     fn memory(&self) -> &ConvoyMemory;
 }

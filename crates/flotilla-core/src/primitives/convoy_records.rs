@@ -7,10 +7,17 @@
 //! each seat's stall from the open stall records about it. This home's launches and other
 //! homes' replicas read the same way.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use chrono::{DateTime, Utc};
 use flotilla_address::{Address, Kind as AddressKind};
+use flotilla_engine_store::follow::{Followed, Follower};
 use flotilla_protocol::Relationship;
 use flotilla_resources::{
     address::subject_for,
@@ -19,7 +26,10 @@ use flotilla_resources::{
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
 use flotilla_schema::{Kind, Timestamp};
-use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
+use flotilla_schema_sqlite::{
+    stream::{CommitListener, Committed, Service},
+    Read, StoreError,
+};
 use flotilla_state_machines::{
     machines::{
         awaiting_reply::{AwaitingReply, AwaitingReplySpec},
@@ -43,51 +53,62 @@ pub struct EngineConvoyRecords {
     service: Arc<Service>,
     memory: Arc<ConvoyMemory>,
     changes: tokio::sync::broadcast::Sender<ConvoyChange>,
+    following: std::sync::OnceLock<Following>,
+}
+
+/// The cursors over the store's log the changes are read with, once [`EngineConvoyRecords::follow`]
+/// has started them, and whether a commit of the followed kinds has landed since the last pass.
+struct Following {
+    follower: std::sync::Mutex<Follower>,
+    dirty: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+    // The store holds the listener weakly: it lapses with these records.
+    _listener: Arc<CommitListener>,
 }
 
 impl EngineConvoyRecords {
     /// The port at `home` over `service`, with the home's notes in `memory`, which its writers share.
     pub fn new(home: &str, service: Arc<Service>, memory: Arc<ConvoyMemory>) -> Self {
-        Self { home: home.to_owned(), service, memory, changes: tokio::sync::broadcast::channel(CHANGES).0 }
+        Self {
+            home: home.to_owned(),
+            service,
+            memory,
+            changes: tokio::sync::broadcast::channel(CHANGES).0,
+            following: std::sync::OnceLock::new(),
+        }
     }
 
     /// Follows the convoys' records and the stall records about their seats in the store's log,
-    /// at every home, telling [`ConvoyRecords::changes`] of each. It runs at the store's commits.
-    pub fn follow(&self) -> Result<tokio::task::JoinHandle<()>, String> {
-        use flotilla_engine_store::follow::Followed;
-        let convoy = <Resource<Convoy> as Kind>::CODE;
-        let awaiting = <Resource<AwaitingReply> as Kind>::CODE;
-        let mut watch = flotilla_provisioning::engine::watch::EngineWatch::start(Arc::clone(&self.service), [convoy, awaiting])
-            .map_err(|error| error.to_string())?;
-        let changes = self.changes.clone();
+    /// at every home, telling [`ConvoyRecords::changes`] of each. It runs at the store's commits,
+    /// and a reader brings it up to the last one at once with [`ConvoyRecords::catch_up`].
+    pub fn follow(self: &Arc<Self>) -> Result<tokio::task::JoinHandle<()>, String> {
+        let kinds = BTreeSet::from([<Resource<Convoy> as Kind>::CODE, <Resource<AwaitingReply> as Kind>::CODE]);
+        let (dirty, wake) = (Arc::new(AtomicBool::new(false)), Arc::new(tokio::sync::Notify::new()));
+        let listener: Arc<CommitListener> = {
+            let (dirty, wake, kinds) = (Arc::clone(&dirty), Arc::clone(&wake), kinds.clone());
+            Arc::new(move |committed: &Committed<'_>| {
+                if committed.touches(&kinds) {
+                    dirty.store(true, Ordering::SeqCst);
+                    wake.notify_one();
+                }
+            })
+        };
+        // The listener first, so a commit between it and the cursors' start is read by the first pass.
+        self.service.on_commit(Arc::downgrade(&listener));
+        let mut follower = Follower::new(kinds);
+        let homes = self.service.homes();
+        self.service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(|error| error.to_string())?;
+        let following = Following { follower: std::sync::Mutex::new(follower), dirty, wake: Arc::clone(&wake), _listener: listener };
+        self.following.set(following).map_err(|_| "the convoys' changes are already followed".to_string())?;
+        let records = Arc::clone(self);
         Ok(tokio::spawn(async move {
             loop {
-                let followed = watch
-                    .next(move |read, followed| {
-                        let mut out = Vec::new();
-                        for followed in followed {
-                            match followed {
-                                Followed::Changed(identity) if identity.kind == convoy => {
-                                    out.push(ConvoyChange::Changed { name: identity.name, home: identity.home })
-                                }
-                                // A stall record names the seat it is about, under its launch.
-                                Followed::Changed(identity) => {
-                                    let Some(id) = read.resolve(awaiting, &identity.name, &identity.home)? else { continue };
-                                    let Some(loaded) = read.load::<Resource<AwaitingReply>>(id)? else { continue };
-                                    if let Some(launch) = stall_launch(loaded.value.spec()) {
-                                        out.push(ConvoyChange::Changed { name: launch.to_owned(), home: identity.home });
-                                    }
-                                }
-                                Followed::Rescan(_) => out.push(ConvoyChange::Rescanned),
-                            }
-                        }
-                        Ok(out)
-                    })
-                    .await;
-                match followed {
-                    // No follower is no reason to stop: one may subscribe later.
-                    Ok(followed) => followed.into_iter().for_each(|change| drop(changes.send(change))),
-                    Err(error) => tracing::warn!(%error, "the convoys' changes could not be read from the log; retrying"),
+                wake.notified().await;
+                let caught = Arc::clone(&records);
+                match tokio::task::spawn_blocking(move || caught.catch_up()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::warn!(%error, "the convoys' changes could not be read from the log; retrying"),
+                    Err(error) => tracing::warn!(%error, "the convoys' log pass did not finish; retrying"),
                 }
             }
         }))
@@ -159,9 +180,58 @@ impl ConvoyRecords for EngineConvoyRecords {
         self.changes.subscribe()
     }
 
+    /// One pass over the log, when a commit of the followed kinds has landed since the last: under
+    /// the follower's lock, so the changes are told in the log's order whoever passes.
+    fn catch_up(&self) -> Result<(), String> {
+        let Some(following) = self.following.get() else { return Ok(()) };
+        let mut follower = following.follower.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !following.dirty.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let homes = self.service.homes();
+        let changes = self.service.with_store(|store| {
+            let mut read = store.read()?;
+            let followed = follower.pass(&mut read, &homes)?;
+            changes_of(&mut read, followed)
+        });
+        match changes {
+            // No follower is no reason to stop: one may subscribe later.
+            Ok(changes) => Ok(changes.into_iter().for_each(|change| drop(self.changes.send(change)))),
+            Err(error) => {
+                // The commit is given back, so the next pass reads it.
+                following.dirty.store(true, Ordering::SeqCst);
+                following.wake.notify_one();
+                Err(format!("engine convoys' changes: {error}"))
+            }
+        }
+    }
+
     fn memory(&self) -> &ConvoyMemory {
         &self.memory
     }
+}
+
+/// The launches what one pass followed changed: a stall record names the seat it is about, under
+/// its launch.
+fn changes_of(read: &mut Read<'_>, followed: Vec<Followed>) -> Result<Vec<ConvoyChange>, StoreError> {
+    let (convoy, awaiting) = (<Resource<Convoy> as Kind>::CODE, <Resource<AwaitingReply> as Kind>::CODE);
+    let mut out = Vec::new();
+    for followed in followed {
+        match followed {
+            Followed::Changed(identity) if identity.kind == convoy => {
+                out.push(ConvoyChange::Changed { name: identity.name, home: identity.home })
+            }
+            Followed::Changed(identity) => {
+                let Some(id) = read.resolve(awaiting, &identity.name, &identity.home)? else { continue };
+                let Some(loaded) = read.load::<Resource<AwaitingReply>>(id)? else { continue };
+                if let Some(launch) = stall_launch(loaded.value.spec()) {
+                    out.push(ConvoyChange::Changed { name: launch.to_owned(), home: identity.home });
+                }
+            }
+            Followed::Rescan(_) => out.push(ConvoyChange::Rescanned),
+        }
+    }
+    Ok(out)
 }
 
 /// The seat address a stall about role `role` of launch `launch` in `project` names.
