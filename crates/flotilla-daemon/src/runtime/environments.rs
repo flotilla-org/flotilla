@@ -16,6 +16,7 @@ use flotilla_resources::lifecycle_reads::ProvisioningKind;
 use flotilla_resources::{
     Checkout, Environment, EnvironmentPhase, EnvironmentStatusPatch, ResourceError, ResourceObject, Vessel, VesselStatusPatch,
 };
+use futures::FutureExt;
 use tracing::{info, warn};
 
 use super::docker::{probe_provisioned_environment, verify_declared_agent_adapters};
@@ -100,15 +101,22 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     let (cloud, candidates): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|environment| environment.spec.cloud_sandbox.is_some());
     let mut cloud_jobs = Vec::new();
     for environment in cloud {
-        if !environment.spec.provider_address.as_ref().is_some_and(|address| state.environment_providers.get(address).is_ok())
-            || !environment_readiness(&state.daemon, &environment).await?.is_ready()
-        {
+        if !environment.spec.provider_address.as_ref().is_some_and(|address| state.environment_providers.get(address).is_ok()) {
             continue;
         }
         let state = Arc::clone(state);
         let namespace = namespace.to_owned();
-        cloud_jobs
-            .push((environment.metadata.name.clone(), async move { reconcile_cloud_environment(&state, &namespace, &environment).await }));
+        if environment_readiness(&state.daemon, &environment).await?.is_ready() {
+            cloud_jobs.push((
+                environment.metadata.name.clone(),
+                async move { reconcile_cloud_environment(&state, &namespace, &environment).await }.boxed(),
+            ));
+        } else if environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Lost && !status.backing_gone) {
+            cloud_jobs.push((
+                environment.metadata.name.clone(),
+                async move { confirm_lost_cloud_backing(&state, &namespace, &environment).await }.boxed(),
+            ));
+        }
     }
     // Start cloud work before any Docker inventory/SSH awaits. Dropping this
     // JoinSet aborts its coordinator, which in turn aborts its active jobs.
@@ -469,6 +477,29 @@ async fn reconcile_cloud_environment(
     }
 }
 
+/// A lost cloud sandbox, asked again on a later pass: only a second, independent
+/// report that it is gone or absent records the backing gone, so one transient
+/// or partial inventory never discards work (#4304). This also covers a sandbox
+/// a previous generation recorded only as `Lost`. A stopped sandbox keeps its
+/// disk, and an unknown one may return, so either stays held as it is.
+async fn confirm_lost_cloud_backing(
+    state: &Arc<ControllerRuntimeState>,
+    namespace: &str,
+    environment: &ResourceObject<Environment>,
+) -> Result<(), String> {
+    use flotilla_environment::environment::ObservationState;
+    let provider = state.provider_for_environment(&environment.metadata.name).await?;
+    let id = EnvironmentId::new(&environment.metadata.name);
+    let cause = match provider.inspect(&id).await? {
+        None => "cloud sandbox missing from authoritative provider inventory".to_string(),
+        Some(handle) => match handle.observe().await.state {
+            ObservationState::Gone { cause } => format!("cloud sandbox gone: {cause:?}"),
+            ObservationState::Running | ObservationState::Stopped { .. } | ObservationState::Unknown { .. } => return Ok(()),
+        },
+    };
+    mark_unavailable_environment(state, namespace, &id, BackingDisposition::Gone, &cause).await
+}
+
 async fn record_cloud_health(
     state: &ControllerRuntimeState,
     namespace: &str,
@@ -545,6 +576,8 @@ pub(super) fn changed_runtime_observation(
 
 pub(super) enum BackingDisposition {
     Lost,
+    /// Lost, and the provider confirmed the backing and its storage gone.
+    Gone,
     Failed,
 }
 
@@ -583,16 +616,19 @@ pub(super) async fn mark_unavailable_environment(
     retained_paths.dedup();
     let message = match disposition {
         BackingDisposition::Lost => format!("lost, recoverable: {message}; rehydration is not available yet (#2872)"),
+        BackingDisposition::Gone => format!("lost, unrecoverable: {message}"),
         BackingDisposition::Failed => message.to_string(),
     };
-    let message = if retained_paths.is_empty() {
-        message.clone()
-    } else {
-        format!("{message}; recover work from retained checkout(s): {}", retained_paths.join(", "))
+    let message = match (retained_paths.is_empty(), &disposition) {
+        (true, _) => message.clone(),
+        // The checkouts lived inside the backing: name the work that went with it.
+        (false, BackingDisposition::Gone) => format!("{message}; work in checkout(s) is gone with it: {}", retained_paths.join(", ")),
+        (false, _) => format!("{message}; recover work from retained checkout(s): {}", retained_paths.join(", ")),
     };
     let environments = state.daemon.resource_backend().using::<Environment>(namespace);
     let mut patch = Some(match disposition {
         BackingDisposition::Lost => EnvironmentStatusPatch::MarkLost { message: message.clone() },
+        BackingDisposition::Gone => EnvironmentStatusPatch::MarkBackingGone { message: message.clone() },
         BackingDisposition::Failed => EnvironmentStatusPatch::MarkFailed { message: message.clone() },
     });
     // Behind `[primitives]` the engine decides first (#3629 layer 3): the old status is written

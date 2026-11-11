@@ -217,6 +217,9 @@ pub enum CheckoutArchiveStatus {
     Failed,
     /// The checkout lives on another host, whose teardown archives it there.
     ArchivingOnHost,
+    /// The checkout lived inside an environment whose backing its provider
+    /// confirmed gone: any unpushed work in it is unrecoverable.
+    Lost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

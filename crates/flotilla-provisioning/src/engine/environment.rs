@@ -92,7 +92,7 @@ impl Binding for EnvironmentBinding {
             EnvironmentStatusPatch::MarkFailed { message } => {
                 vec![Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::External, message), retryable: false })]
             }
-            EnvironmentStatusPatch::MarkLost { .. } => {
+            EnvironmentStatusPatch::MarkLost { .. } | EnvironmentStatusPatch::MarkBackingGone { .. } => {
                 vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }]
             }
             EnvironmentStatusPatch::WaitForImageBuild { .. }
@@ -108,6 +108,8 @@ impl Binding for EnvironmentBinding {
             (EnvironmentStatusPatch::MarkFailed { message }, Some(LifecycleState::Realised { .. })) => vec![Step::Vanished {
                 cause: flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: message.clone() },
             }],
+            // Confirming an already-vanished backing gone refines its status only (#4304).
+            (EnvironmentStatusPatch::MarkBackingGone { .. }, Some(LifecycleState::Gone { .. })) => vec![],
             _ => Self::steps(obj, patch),
         }
     }
