@@ -2322,8 +2322,10 @@ impl InProcessDaemon {
             };
             fleet.report_change_stream(&node, update);
         }))?;
-        *slot = Some(service);
-        Ok(())
+        *slot = Some(Arc::clone(&service));
+        drop(slot);
+        // Convoys are launches on this store, so the store brings this home's Convoy path.
+        self.install_convoy_path(self.node_id().as_str(), &service).map(drop)
     }
 
     /// Installs the engine's provisioning readings during composition (#3629 layer 4). Their
