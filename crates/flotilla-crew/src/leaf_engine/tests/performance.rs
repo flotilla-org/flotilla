@@ -159,8 +159,14 @@ async fn stale_episode_reads_one_schedule_and_does_not_rewrite_lag() {
     );
     let convoys = backend.using::<Convoy>("flotilla");
     let mut notes = home.engine().memory().subscribe();
+    // Each judgement waits for the views to hear the launch as it now reads, or it skips it.
+    let current = || async {
+        let convoy = convoys.get(&lag).await.unwrap();
+        caught_up(&wake, &convoy).await;
+        HashMap::from([(lag.clone(), convoy)])
+    };
     for age in [0, 19, 21, 22, 23, 24] {
-        let objects = HashMap::from([(lag.clone(), convoys.get(&lag).await.unwrap())]);
+        let objects = current().await;
         wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
         assert_eq!(wake.subscriptions.inner.change_requests.grace_schedule_reads(), 1);
         let current = convoys.get(&lag).await.unwrap();
@@ -193,11 +199,11 @@ async fn stale_episode_reads_one_schedule_and_does_not_rewrite_lag() {
         )
         .await
         .unwrap();
-    let objects = HashMap::from([(lag.clone(), convoys.get(&lag).await.unwrap())]);
+    let objects = current().await;
     wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(24)).await.unwrap();
     assert!(convoys.get(&lag).await.unwrap().status.unwrap().stalled.is_none());
     wake.subscriptions.inner.rows.lock().await.get_mut(&id).unwrap().freshness_demand = Some(start + chrono::Duration::seconds(25));
-    let objects = HashMap::from([(lag.clone(), convoys.get(&lag).await.unwrap())]);
+    let objects = current().await;
     wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(25)).await.unwrap();
     assert_eq!(wake.subscriptions.inner.change_requests.grace_schedule_reads(), 2);
 }

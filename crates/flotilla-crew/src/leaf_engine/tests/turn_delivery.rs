@@ -246,7 +246,7 @@ async fn silent_turn_survives_stale_and_unobservable_evidence() {
         let wake = &case.wake;
         let start = Utc::now();
         observe_actor_source(&case, wake, TerminalAttentionState::Working, source, start).await;
-        wake.judge_stalls_at("flotilla", &case.objects().await, start + chrono::Duration::seconds(120)).await.expect("stale observation");
+        case.judge(wake, start + chrono::Duration::seconds(120)).await;
         observe_actor_source(&case, wake, TerminalAttentionState::Unobservable, source, start + chrono::Duration::seconds(121)).await;
         observe_actor(&case, wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(900)).await;
         let status = case.status().await;

@@ -344,20 +344,14 @@ impl Case {
     /// Waits until `wake`'s views have heard the work's launch as it now reads: a judge skips a
     /// launch whose view lags, until the watch catches up.
     async fn caught_up(&self, wake: &ReconcilerWake) {
-        let current = self.convoy().await.metadata.resource_version;
-        let cell = wake.views("flotilla").await.expect("views");
-        let views = cell.get().expect("initialized views");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let heard = views.convoys.shared_named(&self.work).await.expect("view");
-                if heard.iter().any(|read| read.object.metadata.resource_version == current) {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the views hear the launch");
+        caught_up(wake, &self.convoy().await).await;
+    }
+
+    /// `wake` judges the work's launch at `now`, once its views have heard the launch as it reads.
+    async fn judge(&self, wake: &ReconcilerWake, now: DateTime<Utc>) {
+        let convoy = self.convoy().await;
+        caught_up(wake, &convoy).await;
+        wake.judge_stalls_at("flotilla", &HashMap::from([(self.work.clone(), convoy)]), now).await.expect("judge scenario");
     }
 
     /// The launch of the governor the case was given as `name`.
@@ -519,7 +513,7 @@ async fn observe_actor_source(
 ) {
     observe_session(&case.home, "resumed-coder", Some(TerminalAttention { state, as_of: now, source }));
     observe_agent(&case.home, "resumed-coder", state, source, now);
-    wake.judge_stalls_at("flotilla", &case.objects().await, now).await.expect("judge scenario");
+    case.judge(wake, now).await;
 }
 
 /// This home observes `attention` of session `session`'s running launch.
@@ -1378,6 +1372,29 @@ async fn submit_ledger(home: &EngineHome, backend: &ResourceBackend, launch: &st
 
 /// Whether this home's notes changed since `notes` last looked: a write the old store counted
 /// as a status update.
+/// Waits until `wake`'s views have heard `convoy` at its version, on their change events: a judge
+/// skips a launch whose view lags, until the watch catches up.
+async fn caught_up(wake: &ReconcilerWake, convoy: &ResourceObject<Convoy>) {
+    let (name, current) = (&convoy.metadata.name, &convoy.metadata.resource_version);
+    let cell = wake.views("flotilla").await.expect("views");
+    let views = cell.get().expect("initialized views");
+    let mut changes = views.convoys.subscribe_local_keys();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let heard = views.convoys.shared_named(name).await.expect("view");
+            if heard.iter().any(|read| read.object.metadata.resource_version == *current) {
+                return;
+            }
+            match changes.recv().await {
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => panic!("the convoy view stopped"),
+            }
+        }
+    })
+    .await
+    .expect("the views hear the launch");
+}
+
 fn notes_changed(notes: &mut broadcast::Receiver<String>) -> bool {
     let mut changed = false;
     loop {
