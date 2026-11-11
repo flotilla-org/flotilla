@@ -214,8 +214,10 @@ impl LeafSubscriptionTable {
         failures: BTreeMap<String, DeliveryError>,
     ) -> Result<(), ResourceError> {
         let patch = FailTurnDeliveries { failures, now: Utc::now(), changed: Default::default() };
+        // Read here, not in the note, so a missing convoy stays NotFound and its batch is pruned.
+        let current = convoys.get(convoy).await?;
         let written =
-            flotilla_store::note_convoy(&self.inner.convoy_engine, convoys, convoy, &patch).await.map_err(ResourceError::other)?;
+            flotilla_resources::convoy::engine::note(&self.inner.convoy_engine, &current, &patch).map_err(ResourceError::other)?;
         let status = written.status.unwrap_or_default();
         for source in patch.changed.lock().expect("changed turn-delivery failures").iter() {
             let (Some(error), Some(failure)) =
