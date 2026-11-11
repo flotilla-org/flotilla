@@ -26,7 +26,7 @@ use crate::{
         NudgeObligation, StalledCondition, TurnDeliveryStatus, WorkCompletionAuthority, WorkPhase, WorkState,
     },
     labels::{PROJECT_LABEL, ROLE_LABEL},
-    ControllerRetry, Convoy, ObjectMeta, ResourceObject,
+    Convoy, ObjectMeta, ResourceObject,
 };
 
 /// How a launch ended.
@@ -116,8 +116,6 @@ pub struct ConvoyNotes {
     /// When the home last scanned the convoy's branches for subjects, which paces the next scan.
     pub branch_subject_scan_at: Option<DateTime<Utc>>,
     pub branch_subject_scan_error: Option<String>,
-    /// A work's provisioning retry, by work.
-    pub provisioning_retry: BTreeMap<String, ControllerRetry>,
     /// By work, then role.
     pub crew: BTreeMap<String, BTreeMap<String, CrewNotes>>,
     /// Until when a crew turn not yet delivered holds the convoy's delivery (#3894); a Message
@@ -159,9 +157,6 @@ impl ConvoyNotes {
         status.branch_subject_scan_at = self.branch_subject_scan_at;
         status.branch_subject_scan_error.clone_from(&self.branch_subject_scan_error);
         status.target_mismatches.clone_from(&self.target_mismatches);
-        for (work, state) in &mut status.work {
-            state.provisioning_retry = self.provisioning_retry.get(work).cloned();
-        }
         for (work, roles) in &mut status.crew_work {
             for (role, state) in roles {
                 let noted = self.crew.get(work).and_then(|roles| roles.get(role)).cloned().unwrap_or_default();
@@ -182,8 +177,6 @@ impl ConvoyNotes {
         self.branch_subject_scan_at = status.branch_subject_scan_at;
         self.branch_subject_scan_error.clone_from(&status.branch_subject_scan_error);
         self.target_mismatches.clone_from(&status.target_mismatches);
-        self.provisioning_retry =
-            status.work.iter().filter_map(|(work, state)| Some((work.clone(), state.provisioning_retry.clone()?))).collect();
         self.crew = status
             .crew_work
             .iter()
@@ -292,7 +285,6 @@ impl ConvoyRecord {
             .map(|(name, phase)| {
                 let facts = joins.works.get(name);
                 let state = WorkState {
-                    provisioning_retry: notes.provisioning_retry.get(name).cloned(),
                     phase: *phase,
                     completion_authority: if *phase == WorkPhase::Complete {
                         WorkCompletionAuthority::Promises
