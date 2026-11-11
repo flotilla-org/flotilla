@@ -9110,33 +9110,32 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("split-convoy".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
-        )
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status(
-            "split-convoy",
-            &created.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([(
-                        "coder".to_string(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Stalled).build(),
-                    )]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark stalled crew work");
+    let convoy = launch_convoy(
+        &authority,
+        "split-convoy",
+        flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        Default::default(),
+    )
+    .await;
     // The crew's launch, homed at the authority, reaches the terminal host as its home replicates.
-    let vessel_ref = authority_engine.vessels.request("split-convoy", "work", "feta");
+    let vessel_ref = work_underway(&authority_engine, &convoy, "work");
+    // The coder declared itself stalled: the authority's note (#3108).
+    flotilla_store::note_convoy(
+        &authority.convoy_engine_path(),
+        &convoys,
+        &convoy,
+        &flotilla_resources::external_patches::mark_crew_stalled(
+            convoy.clone(),
+            "work".to_string(),
+            "coder".to_string(),
+            chrono::Utc::now(),
+            flotilla_resources::StallReason::Scope,
+            None,
+            "needs direction".to_string(),
+        ),
+    )
+    .await
+    .expect("mark stalled crew work");
     let authority_store = authority.decided_store().expect("authority store");
     flotilla_provisioning_testkit::replicate_home(
         &authority_store,
@@ -9173,19 +9172,15 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     );
 
     let outcome = authority
-        .convoy_resume_internal("flotilla", "split-convoy", "Continue", Some("work"), Some("coder"), ResumeIntent::Reminder)
+        .convoy_resume_internal("flotilla", &convoy, "Continue", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("resume remote crew session");
     assert!(matches!(outcome, flotilla_crew::crew_ops::ConvoyResumeOutcome::Queued { .. }));
-    let convoy = convoys.get("split-convoy").await.expect("convoy after resume");
+    let convoy = convoys.get(&convoy).await.expect("convoy after resume");
     assert!(convoy.status.expect("convoy status").turn_deliveries.values().all(|delivery| delivery.pending_supervisor_turn.is_none()));
     assert!(authority.resource_backend().using::<TerminalSession>("flotilla").list().await.expect("local sessions").items.is_empty());
-    terminal_host
-        .resource_backend()
-        .replica_writer::<ResourceConvoy>(authority.node_id().clone(), "flotilla")
-        .replace(&convoys.list().await.expect("convoy snapshot"), chrono::Utc::now())
-        .await
-        .expect("replicate pending turn");
+    // The authority's log, with its pending turn, reaches the terminal host.
+    flotilla_provisioning_testkit::replicate_home(&authority_store, authority_store.home(), &terminal_store);
     terminal_host.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver at session origin");
     let inbox = terminal_host.resource_backend().using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
     assert_eq!(inbox.items.len(), 1);
