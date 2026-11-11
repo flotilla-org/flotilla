@@ -1273,7 +1273,7 @@ async fn resource_list_and_get_queries_return_wire_json() {
 }
 
 #[tokio::test]
-async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown() {
+async fn convoy_explain_settles_with_an_ended_held_checkout_before_vessel_teardown() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon = InProcessDaemon::new(
         vec![],
@@ -1283,66 +1283,62 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    // The engine's readings, which a running daemon always has.
-    let engine = install_engine(&daemon);
+    // The engine's readings, which a running daemon always has, homed with its convoys.
+    let engine = install_decided_engine(&daemon);
     let backend = daemon.resource_backend();
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let change_requests = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
     let repo_ref = flotilla_resources::RepositoryKey("repo-a".to_string());
     let workflow = implement_review_workflow_spec();
-    let mut status = flotilla_resources::ConvoyStatus {
-        phase: ConvoyPhase::Landing,
-        workflow_snapshot: Some(WorkflowSnapshot {
-            cascade: None,
-            stall_nudges: Default::default(),
-            supervision: None,
-            exit: workflow.exit,
-            turn_delivery: workflow.turn_delivery,
-            vessels: workflow.vessels,
-        }),
-        observed_workflow_ref: Some("implement-review@1".to_string()),
-        ..Default::default()
-    };
-    status.work.insert(
-        "work".to_string(),
-        WorkState {
-            phase: WorkPhase::Complete,
-            placement: Some(flotilla_resources::PlacementStatus {
-                fields: BTreeMap::from([(
-                    "checkout_refs".to_string(),
-                    serde_json::json!(BTreeMap::from([(repo_ref.clone(), "checkout-dead".to_string())])),
-                )]),
+    let launch = launch_convoy(
+        &daemon,
+        "terminal-checkout",
+        flotilla_resources::ConvoySpec::builder()
+            .workflow_ref("implement-review".to_string())
+            .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
+                .url("https://github.com/owner/repo".to_string())
+                .repo_ref(repo_ref.clone())
+                .source_ref("feature".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("repo".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .change_request(
+                flotilla_resources::BoundChangeRequest::builder()
+                    .id("42".to_string())
+                    .repository_ref(repo_ref.clone())
+                    .title("terminal".to_string())
+                    .build(),
+            )
+            .build(),
+        flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Landing,
+            workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: workflow.exit,
+                turn_delivery: workflow.turn_delivery,
+                vessels: workflow.vessels,
             }),
-            ..WorkState::builder().phase(WorkPhase::Complete).build()
+            observed_workflow_ref: Some("implement-review@1".to_string()),
+            ..Default::default()
         },
+    )
+    .await;
+    // The work's live launch, and the checkout the launch held, since lost.
+    let vessel = engine.vessels.request(&launch, "work", "host");
+    let checkout = engine.checkouts.request(
+        "checkout-dead",
+        &flotilla_resources::CheckoutSpec::Observed(flotilla_resources::ObservedCheckoutSpec {
+            r#ref: "feature".to_string(),
+            path: "/tmp/checkout-dead".to_string(),
+            repo_ref: repo_ref.clone(),
+            host_ref: engine.checkouts.home.clone(),
+            is_main: false,
+        }),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(launch.clone())),
     );
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name("terminal-checkout".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder()
-                .workflow_ref("implement-review".to_string())
-                .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
-                    .url("https://github.com/owner/repo".to_string())
-                    .repo_ref(repo_ref.clone())
-                    .source_ref("feature".to_string())
-                    .target_ref("main".to_string())
-                    .workspace_slug("repo".to_string())
-                    .subpaths(Vec::new())
-                    .build()])
-                .change_request(
-                    flotilla_resources::BoundChangeRequest::builder()
-                        .id("42".to_string())
-                        .repository_ref(repo_ref.clone())
-                        .title("terminal".to_string())
-                        .build(),
-                )
-                .build(),
-        )
-        .await
-        .expect("create convoy");
-    convoys.update_status("terminal-checkout", &convoy.metadata.resource_version, &status).await.expect("publish landing status");
-    // The work's live launch.
-    let vessel = engine.vessels.request("terminal-checkout", "work", "host");
+    engine.checkouts.finish(&checkout, flotilla_provisioning_testkit::Ending::Lost("gone"));
     let observed_at = chrono::Utc::now();
     let record_name = cr_name("github.com", "owner/repo", 42);
     let record = change_requests
@@ -1385,24 +1381,23 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
                     node_id: None,
                     provisioning_target: None,
                     context_repo: None,
-                    action: CommandAction::QueryExplainConvoy {
-                        namespace: Some("flotilla".to_string()),
-                        name: "terminal-checkout".to_string(),
-                    },
+                    action: CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: launch.clone() },
                 },
                 uuid::Uuid::new_v4(),
             )
             .await
             .expect("explain convoy")
     };
+    // A held checkout stays readable after it ends, so it is never missing: the merged change
+    // request settles the launch while its vessel is still live.
     let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
-    assert!(!explanation.settlement.satisfied, "a live vessel must retain its missing-checkout expectation");
-    assert!(explanation.settlement.unmet.iter().any(|unmet| unmet.reason == "missing_record" && unmet.subject == "checkout/checkout-dead"));
+    assert!(explanation.settlement.satisfied, "an ended held checkout must not hold settlement: {:?}", explanation.settlement.unmet);
+    assert!(explanation.settlement.unmet.is_empty());
 
-    // Its home releases it: the launch is torn down.
+    // Its home releases the vessel; teardown changes nothing about the settlement.
     engine.vessels.step(&vessel, flotilla_resources::vessel_records::VesselStep::Released);
     let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
-    assert!(explanation.settlement.satisfied, "terminal world evidence should discharge the torn-down vessel's checkout");
+    assert!(explanation.settlement.satisfied, "terminal world evidence settles the torn-down launch");
     assert!(explanation.settlement.unmet.is_empty());
 }
 
