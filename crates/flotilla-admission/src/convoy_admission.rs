@@ -3836,21 +3836,14 @@ fn brief_convoy_query(
     Ok((convoy_query, visible))
 }
 
-fn convoy_identity_query(project: Option<&str>, role: &str) -> flotilla_store::StoreQuery {
-    let mut query = flotilla_store::StoreQuery {
-        fields: BTreeMap::from([("spec.role".into(), role.into())]),
+/// The convoys of `role` in `project`. A convoy that names no project is a launch in its
+/// namespace's project, as the engine holds every launch under one (#3108).
+fn convoy_identity_query(namespace: &str, project: Option<&str>, role: &str) -> flotilla_store::StoreQuery {
+    flotilla_store::StoreQuery {
+        fields: BTreeMap::from([("spec.role".into(), role.into()), ("spec.project_ref".into(), project.unwrap_or(namespace).into())]),
         include_replicas: true,
         ..Default::default()
-    };
-    match project {
-        Some(project) => {
-            query.fields.insert("spec.project_ref".into(), project.into());
-        }
-        None => {
-            query.missing_fields.insert("spec.project_ref".into());
-        }
     }
-    query
 }
 
 async fn convoy_admission_inventory(
@@ -3861,7 +3854,7 @@ async fn convoy_admission_inventory(
     extra: Option<StoreQuery>,
 ) -> Result<Vec<ReadResourceObject<ResourceConvoy>>, String> {
     use flotilla_store::StoreQuery;
-    let mut selections = vec![convoy_identity_query(spec.project_ref.as_deref(), &spec.role)];
+    let mut selections = vec![convoy_identity_query(namespace, spec.project_ref.as_deref(), &spec.role)];
     selections.extend(extra);
     if let Some(ensure) = ensure {
         selections.push(StoreQuery {
@@ -3907,7 +3900,7 @@ async fn convoy_admission_inventory(
 /// Refuses a convoy of `role` in `project` while one is live, at any home.
 pub async fn refuse_live_convoy_in(backend: &ResourceBackend, namespace: &str, project: Option<&str>, role: &str) -> Result<(), String> {
     let generations = backend
-        .query_declared::<ResourceConvoy>(namespace, &convoy_identity_query(project, role))
+        .query_declared::<ResourceConvoy>(namespace, &convoy_identity_query(namespace, project, role))
         .await
         .map_err(|error| error.to_string())?;
     refuse_live_convoy(&generations.items, project, role)
@@ -3916,9 +3909,11 @@ pub async fn refuse_live_convoy_in(backend: &ResourceBackend, namespace: &str, p
 /// The identity guard and continuation guard share a single selected inventory
 /// taken under the admission lock. Neither performs reads in a candidate loop.
 fn refuse_live_convoy(generations: &[ReadResourceObject<ResourceConvoy>], project: Option<&str>, role: &str) -> Result<(), String> {
-    for source in
-        generations.iter().filter(|source| source.object.spec.project_ref.as_deref() == project && source.object.spec.role == role)
-    {
+    // A convoy that names no project is held in its namespace's.
+    let in_project = |convoy: &ResourceObject<ResourceConvoy>| {
+        convoy.spec.project_ref.as_deref() == Some(project.unwrap_or(&convoy.metadata.namespace))
+    };
+    for source in generations.iter().filter(|source| in_project(&source.object) && source.object.spec.role == role) {
         let convoy = &source.object;
         if convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()) {
             let provenance = match &source.provenance {
@@ -4906,8 +4901,15 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
     let admission_free_space_path = Arc::new(std::sync::RwLock::new(temp.path().to_path_buf()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let host_name = HostName::new("host");
+    // The engine's Convoy path, over a decided store in the fixture's directory, which the path
+    // keeps open.
+    let reads = Arc::clone(crate::test_support::no_held_checkouts());
+    let convoys =
+        flotilla_engine_convoys_testkit::EngineConvoysHome::open_in(temp.path(), "host", "flotilla", &resource_backend, Arc::clone(&clock), reads)
+            .path();
     let admission = ConvoyAdmission::builder()
         .backend(resource_backend.clone())
+        .convoys(convoys)
         .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(resource_backend.clone())))
         .observed_backend(observed_resource_backend.clone())
         .config(Arc::clone(&config))
@@ -5193,15 +5195,17 @@ mod tests {
                 .await
                 .unwrap();
             for index in 0..n {
-                fixture
-                    .backend
-                    .using::<ResourceConvoy>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(format!("unrelated-{index}")).build(),
-                        &ConvoySpec::builder().workflow_ref("scratch".into()).build(),
-                    )
-                    .await
-                    .unwrap();
+                // An unrelated launch on the engine, as admission admits one.
+                flotilla_engine_convoys_testkit::launch(
+                    &fixture.owner.convoys,
+                    flotilla_engine_convoys_testkit::convoy(
+                        "flotilla",
+                        &format!("unrelated-{index}"),
+                        ConvoySpec::builder().workflow_ref("scratch".into()).build(),
+                        flotilla_engine_convoys_testkit::single_agent("coder"),
+                    ),
+                )
+                .await;
                 fixture
                     .backend
                     .using::<Message>("flotilla")
@@ -5254,15 +5258,17 @@ mod tests {
                 .await
                 .unwrap();
             for index in 0..n {
-                fixture
-                    .backend
-                    .using::<ResourceConvoy>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(format!("unrelated-{index}")).build(),
-                        &ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).build(),
-                    )
-                    .await
-                    .unwrap();
+                // An unrelated launch on the engine, as admission admits one.
+                flotilla_engine_convoys_testkit::launch(
+                    &fixture.owner.convoys,
+                    flotilla_engine_convoys_testkit::convoy(
+                        "flotilla",
+                        &format!("unrelated-{index}"),
+                        ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).build(),
+                        flotilla_engine_convoys_testkit::single_agent("coder"),
+                    ),
+                )
+                .await;
                 fixture
                     .backend
                     .using::<Message>("flotilla")
@@ -5340,7 +5346,8 @@ mod tests {
             for (kind, count) in &reads {
                 assert!(*count <= 1, "{kind}: {count} reads");
             }
-            assert_eq!(decoded.get("Convoy"), Some(&0));
+            // The engine serves convoys through its views: no stored Convoy is decoded.
+            assert_eq!(decoded.get("Convoy").copied().unwrap_or(0), 0);
             outcomes.push((reads, decoded));
         }
         assert_eq!(outcomes[0], outcomes[1]);
@@ -5632,15 +5639,17 @@ mod tests {
                 .await
                 .unwrap();
             for index in 0..n {
-                fixture
-                    .backend
-                    .using::<ResourceConvoy>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(format!("unrelated-{index}")).build(),
-                        &ConvoySpec::builder().workflow_ref("unrelated".into()).build(),
-                    )
-                    .await
-                    .unwrap();
+                // An unrelated launch on the engine, as admission admits one.
+                flotilla_engine_convoys_testkit::launch(
+                    &fixture.owner.convoys,
+                    flotilla_engine_convoys_testkit::convoy(
+                        "flotilla",
+                        &format!("unrelated-{index}"),
+                        ConvoySpec::builder().workflow_ref("unrelated".into()).build(),
+                        flotilla_engine_convoys_testkit::single_agent("coder"),
+                    ),
+                )
+                .await;
                 fixture
                     .backend
                     .using::<Message>("flotilla")
