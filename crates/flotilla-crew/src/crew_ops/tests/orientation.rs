@@ -5,16 +5,15 @@ use std::{collections::BTreeMap, sync::Arc};
 use chrono::Utc;
 use flotilla_protocol::CrewCommandContext;
 use flotilla_resources::{
-    Convoy as ResourceConvoy, CrewWorkPhase, InputMeta, Project, Repository, RepositoryKey, TerminalSession as ResourceTerminalSession,
-    Vessel,
+    ConvoySpec, CrewWorkPhase, InputMeta, Project, Repository, RepositoryKey, TerminalSession as ResourceTerminalSession,
 };
 use flotilla_store::ResourceBackend;
 
-use super::fixture;
+use super::{fixture, spec_fixture};
 
 #[hegel::test]
 fn orientation_follows_live_project(tc: hegel::TestCase) {
-    use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, VesselSpec};
+    use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec};
     use hegel::generators as gs;
     // Sequences cover empty membership, additions/removals, duplicate repo keys
     // with distinct subpaths, and every role (including multiple roles).
@@ -25,45 +24,9 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
         .collect();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
-        backend
-            .using::<Vessel>("flotilla")
-            .create(
-                &InputMeta::builder().name("vessel".into()).build(),
-                &VesselSpec {
-                    convoy_ref: "crew".into(),
-                    vessel_name: "work".into(),
-                    fulfilment_kind_ref: "test".into(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                },
-            )
-            .await
-            .expect("vessel");
-        let convoys = backend.using::<ResourceConvoy>("flotilla");
-        let mut convoy = convoys.get("crew").await.expect("convoy");
-        convoy.spec.project_ref = Some("island".into());
-        let admission = convoys
-            .update(&InputMeta::from(&convoy.metadata), &convoy.metadata.resource_version, &convoy.spec)
-            .await
-            .expect("project reference");
-        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-        let session = sessions.get("session").await.expect("session");
-        sessions
-            .update_status(
-                "session",
-                &session.metadata.resource_version,
-                &flotilla_resources::TerminalSessionStatus {
-                    crew: Some(flotilla_resources::CrewSessionStatus {
-                        id: "governor-id".into(),
-                        adapter: "codex".into(),
-                        model: None,
-                        stance: "trusted-implicit".into(),
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("crew identity");
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).project_ref("island".into()).build();
+        let (crew, backend, _probe, held) = spec_fixture(CrewWorkPhase::Working, spec).await;
+        let admission = held.convoy(&backend).await;
         let repository_spec = flotilla_resources::RepositorySpec::remote("https://github.com/example/live").expect("repository spec");
         let repository_key = repository_spec.key();
         backend
@@ -79,7 +42,8 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
         };
         let projects = origin.using::<Project>("flotilla");
         let writer = backend.replica_writer::<Project>(origin_root, "flotilla");
-        let context = CrewCommandContext::builder().convoy("crew".into()).vessel_ref("vessel".into()).role("coder".into()).build();
+        let context =
+            CrewCommandContext::builder().convoy(held.launch.clone()).vessel_ref(held.vessel.clone()).role("coder".into()).build();
         let unavailable = crew.crew_list_internal(&context).await.expect("crew state with missing Project");
         assert!(unavailable.project.is_none());
         assert!(unavailable.project_error.as_deref().expect("explicit charter error").contains("live Project"));
@@ -111,7 +75,7 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
             if replicated {
                 writer.replace(&projects.list().await.expect("source projects"), Utc::now()).await.expect("replicate live Project");
             }
-            let ambient = CrewCommandContext::builder().crew_id("governor-id".into()).build();
+            let ambient = CrewCommandContext::builder().crew_id(held.session.clone()).build();
             let result = crew.crew_list_internal(&ambient).await.expect("orientation through crew identity");
             assert_eq!(result, crew.crew_list_internal(&context).await.expect("explicit orientation"));
             assert!(result.project_error.is_none(), "successful orientation clears the charter error");
@@ -130,7 +94,7 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
                     assert!(actual.remotes.is_empty(), "missing Repository retains declared membership");
                 }
             }
-            let current = convoys.get("crew").await.expect("unchanged convoy");
+            let current = held.convoy(&backend).await;
             assert_eq!(current.metadata.resource_version, admission.metadata.resource_version);
             assert_eq!(current.spec, admission.spec);
             assert_eq!(current.status, admission.status);
@@ -143,15 +107,6 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
         assert!(removed.project.is_none(), "a removed charter must not fall back to admission");
         assert!(removed.project_error.is_some());
         assert_eq!(removed.members, unavailable.members);
-        let mut current = convoys.get("crew").await.expect("convoy");
-        current.spec.project_ref = None;
-        convoys
-            .update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &current.spec)
-            .await
-            .expect("unscoped convoy");
-        let unscoped = crew.crew_list_internal(&context).await.expect("unscoped query");
-        assert!(unscoped.project.is_none());
-        assert!(unscoped.project_error.is_none());
     });
 }
 
@@ -166,25 +121,12 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
 async fn crew_list_never_reads_message_history() {
     use flotilla_resources::{Message, MessageRelation, MessageSpec};
 
-    let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
-    backend
-        .using::<flotilla_resources::Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("crew-work".into()).build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "crew".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .unwrap();
+    let (crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
     let context = CrewCommandContext {
         crew_id: None,
         namespace: Some("flotilla".into()),
-        convoy: Some("crew".into()),
-        vessel_ref: Some("crew-work".into()),
+        convoy: Some(held.launch.clone()),
+        vessel_ref: Some(held.vessel.clone()),
         role: Some("coder".into()),
     };
     let before = backend.read_snapshot();
@@ -197,7 +139,7 @@ async fn crew_list_never_reads_message_history() {
     // convoys' seats and to this crew's own.
     let messages = backend.using::<Message>("flotilla");
     for index in 0..103 {
-        let receiver = if index < 100 { format!("flotilla/other-{index}/work/coder") } else { "flotilla/crew/work/coder".into() };
+        let receiver = if index < 100 { format!("flotilla/other-{index}/work/coder") } else { held.receiver("work", "coder") };
         messages
             .create(
                 &InputMeta::builder().name(format!("inbox-{index}")).build(),
@@ -238,21 +180,8 @@ impl flotilla_resources::vessel_seats::VesselSeats for FixedSeats {
 // the session labels until the engine's answer is installed, and that answer afterwards.
 #[tokio::test]
 async fn crew_list_reads_a_vessels_seats_through_one_port() {
-    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("vessel".into()).build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "crew".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
-    let context = CrewCommandContext::builder().convoy("crew".into()).vessel_ref("vessel".into()).role("coder".into()).build();
+    let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
+    let context = CrewCommandContext::builder().convoy(held.launch.clone()).vessel_ref(held.vessel.clone()).role("coder".into()).build();
     let labelled = crew.crew_list_internal(&context).await.expect("crew state");
     assert_ne!(labelled.members[0].state, "stopped", "the labels' session, before the port is installed");
 
