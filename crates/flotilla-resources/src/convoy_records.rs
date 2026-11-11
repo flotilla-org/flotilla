@@ -101,6 +101,9 @@ pub struct CrewNotes {
     pub pending_follow_up: Option<flotilla_protocol::ResourceRef>,
     pub resumed_at: Option<DateTime<Utc>>,
     pub resume_brief_id: Option<String>,
+    /// What the crew said when it declared its stall. The stall note's evidence also gathers the
+    /// judge's delivery diagnostics, so the report is kept apart from it.
+    pub stall_report: Option<String>,
 }
 
 /// What the convoy's home observes of one launch, in memory (owner's ruling: local observations
@@ -166,6 +169,9 @@ impl ConvoyNotes {
                 state.pending_follow_up = noted.pending_follow_up;
                 state.resumed_at = noted.resumed_at;
                 state.resume_brief_id = noted.resume_brief_id;
+                if state.phase == CrewWorkPhase::Stalled {
+                    state.message = noted.stall_report.or(state.message.take());
+                }
             }
         }
     }
@@ -179,6 +185,8 @@ impl ConvoyNotes {
         self.branch_subject_scan_at = status.branch_subject_scan_at;
         self.branch_subject_scan_error.clone_from(&status.branch_subject_scan_error);
         self.target_mismatches.clone_from(&status.target_mismatches);
+        let declared =
+            status.stalled.as_ref().filter(|stall| stall.source == crate::StallEvidenceSource::Crew).and_then(StalledCondition::seat);
         self.crew = status
             .crew_work
             .iter()
@@ -191,6 +199,10 @@ impl ConvoyNotes {
                             pending_follow_up: state.pending_follow_up.clone(),
                             resumed_at: state.resumed_at,
                             resume_brief_id: state.resume_brief_id.clone(),
+                            stall_report: state
+                                .message
+                                .clone()
+                                .filter(|_| state.phase == CrewWorkPhase::Stalled && declared == Some((work.as_str(), role.as_str()))),
                         };
                         (role.clone(), noted)
                     })
@@ -251,7 +263,13 @@ impl ConvoyRecord {
         })
     }
 
-    fn crew_readings(&self, working: &BTreeSet<(String, String)>) -> BTreeMap<String, BTreeMap<String, CrewReading>> {
+    /// Each seat's reading. A seat is stalled while a stall is raised about it: replicated as its
+    /// open stall AwaitingReply, or the home's open stall note, whichever rung it is at.
+    fn crew_readings(
+        &self,
+        working: &BTreeSet<(String, String)>,
+        notes: Option<&ConvoyNotes>,
+    ) -> BTreeMap<String, BTreeMap<String, CrewReading>> {
         let mut readings: BTreeMap<String, BTreeMap<String, CrewReading>> = BTreeMap::new();
         for (work, roles) in &self.promises {
             for (role, owned) in roles {
@@ -267,6 +285,9 @@ impl ConvoyRecord {
                 reading.handed_back = seat.handed_back;
                 reading.stalled = seat.stalled;
             }
+        }
+        if let Some((work, role)) = notes.and_then(|notes| notes.stall.as_ref()).and_then(StalledCondition::seat) {
+            readings.entry(work.to_owned()).or_default().entry(role.to_owned()).or_default().stalled = true;
         }
         for (work, role) in working {
             readings.entry(work.clone()).or_default().entry(role.clone()).or_default().working = true;
@@ -292,7 +313,7 @@ impl ConvoyRecord {
     /// The launch as an old Convoy object in `namespace`, its phases derived from `joins`.
     pub fn read_view(&self, namespace: &str, joins: ConvoyJoins<'_>) -> ResourceObject<Convoy> {
         let snapshot = &self.admission.workflow_snapshot;
-        let readings = self.crew_readings(joins.working);
+        let readings = self.crew_readings(joins.working, joins.notes);
         let vessels: BTreeMap<String, VesselReading> = joins.works.iter().map(|(work, facts)| (work.clone(), facts.reading)).collect();
         let derived = view::derive(&ConvoyFacts { ended: self.end(), snapshot, vessels: &vessels, crew: &readings });
         let notes = joins.notes.cloned().unwrap_or_default();
@@ -343,7 +364,7 @@ impl ConvoyRecord {
                             .maybe_resume_brief_id(noted.resume_brief_id)
                             .maybe_finished_at(claimed_at)
                             .maybe_decision_ledger_ref(decision_ledger_ref.flatten())
-                            .maybe_message(failed)
+                            .maybe_message(failed.or(noted.stall_report.filter(|_| *phase == CrewWorkPhase::Stalled)))
                             .build();
                         (role.clone(), state)
                     })

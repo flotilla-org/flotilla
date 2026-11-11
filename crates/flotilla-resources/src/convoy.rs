@@ -1335,6 +1335,16 @@ pub struct StalledCondition {
     pub nudge_history: Vec<StallNudge>,
 }
 
+impl StalledCondition {
+    /// The seat `(work, role)` the stall is about: its first leaf's crew phase.
+    pub fn seat(&self) -> Option<(&str, &str)> {
+        let leaf = self.leaves.first()?;
+        let LeafAddress::Work { work, .. } = &leaf.address else { return None };
+        let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
+        Some((work, role))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleMutation {
     pub action: String,
@@ -2809,6 +2819,12 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at = None;
                     state.decision_ledger_digest = None;
                     state.message = Some(prompt.clone());
+                }
+                // The new turn resumes the crew, which ends the stall it declared.
+                if status.stalled.as_ref().is_some_and(|stall| {
+                    stall.source == StallEvidenceSource::Crew && stall.seat() == Some((vessel.as_str(), role.as_str()))
+                }) {
+                    status.stalled = None;
                 }
                 status.phase = ConvoyPhase::Active;
                 status.finished_at = None;

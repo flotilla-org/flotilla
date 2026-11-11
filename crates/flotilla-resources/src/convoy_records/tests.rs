@@ -206,6 +206,43 @@ fn a_launch_reads_its_verdicts_and_how_it_ended() {
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
 }
 
+// Behaviour (#3108 Q1): a crew's declared stall is the home's open stall note, at the operator
+// rung with no AwaitingReply about the seat. The seat reads Stalled with the crew's own report,
+// which the judge's diagnostics on the note's evidence do not change; once the note is cleared
+// the seat works again.
+#[test]
+fn a_stall_note_stalls_its_seat_at_any_rung() {
+    let record = record(PromiseState::Open);
+    let live = BTreeSet::from([seat("work", "coder")]);
+    let working = record.working(&live, None);
+    let view = |notes: &ConvoyNotes| {
+        record.read_view("flotilla", ConvoyJoins { works: &ready(), working: &working, notes: Some(notes) }).status.expect("status")
+    };
+    let mut notes = ConvoyNotes::default();
+    let declare = crate::external_patches::mark_crew_stalled(
+        "fix-it#7".into(),
+        "work".into(),
+        "coder".into(),
+        at(150),
+        crate::StallReason::Other,
+        None,
+        "needs decision".into(),
+    );
+    notes.apply(&view(&notes), &declare);
+    notes.stall.as_mut().expect("the stall note").evidence.push_str("; supervisor delivery failed: gone");
+
+    let status = view(&notes);
+    let coder = &status.crew_work["work"]["coder"];
+    assert_eq!(notes.stall.as_ref().map(|stall| stall.rung), Some(crate::StallRung::Operator));
+    assert_eq!((coder.phase, coder.message.as_deref()), (CrewWorkPhase::Stalled, Some("needs decision")));
+    assert_eq!(status.work["work"].phase, WorkPhase::Stalled);
+
+    notes.apply(&status, &crate::ConvoyStatusPatch::SetStalled { condition: None });
+    let status = view(&notes);
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working, "the cleared note stalls nothing");
+    assert_eq!(status.crew_work["work"]["coder"].message, None);
+}
+
 fn submitted(reference: &str, kept_at: Option<DateTime<Utc>>) -> Submission {
     Submission {
         reference: reference.into(),
