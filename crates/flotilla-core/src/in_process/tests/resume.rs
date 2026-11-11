@@ -26,16 +26,16 @@ use flotilla_crew::crew_ops::{ConvoyResumeOutcome, CrewSupervisionRequest};
 async fn working_resume_uses_message_delivery_instead_of_pending_brief_release() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let current = convoys.get("resume-staging").await.expect("convoy");
+    let current = convoys.get(&probe.convoy).await.expect("convoy");
     let mut status = current.status.expect("status");
     status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
     convoys.update_status(&current.metadata.name, &current.metadata.resource_version, &status).await.expect("working crew");
     daemon
-        .convoy_resume_internal("flotilla", "resume-staging", "operator guidance", Some("work"), Some("coder"), ResumeIntent::Reminder)
+        .convoy_resume_internal("flotilla", &probe.convoy, "operator guidance", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("queue intent");
     daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("migration scan");
-    assert!(convoys.get("resume-staging").await.expect("convoy").status.expect("status").pending_brief().is_none());
+    assert!(convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").pending_brief().is_none());
     let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].spec.body, "operator guidance");
@@ -48,11 +48,10 @@ async fn working_resume_uses_message_delivery_instead_of_pending_brief_release()
 async fn resume_stages_credentials_before_message_and_retries_failure() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let resume =
-        || daemon.convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"), ResumeIntent::Reopen);
+    let resume = || daemon.convoy_resume_internal("flotilla", &probe.convoy, "continue", Some("work"), Some("coder"), ResumeIntent::Reopen);
     assert!(resume().await.expect_err("staging should fail").contains("credential staging failed"));
     assert_eq!(
-        convoys.get("resume-staging").await.expect("convoy").status.expect("status").crew_work["work"]["coder"].phase,
+        convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").crew_work["work"]["coder"].phase,
         CrewWorkPhase::Done
     );
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -135,7 +134,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         .await
         .expect("project");
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let source = convoys.get("resume-staging").await.expect("source convoy");
+    let source = convoys.get(&probe.convoy).await.expect("source convoy");
     let mut spec = source.spec.clone();
     spec.project_ref = Some("project".to_string());
     spec.role = "graphql-budget".to_string();
@@ -146,7 +145,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     status.workflow_snapshot.as_mut().expect("workflow").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
     status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Running;
     status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
-    convoys.update_status("resume-staging", &source.metadata.resource_version, &status).await.expect("activate source");
+    convoys.update_status(&probe.convoy, &source.metadata.resource_version, &status).await.expect("activate source");
     let governor = convoys
         .create(
             &test_meta("governor"),
@@ -199,7 +198,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
     let mut task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     let patch = convoy_external_patches::mark_crew_stalled(
-        "resume-staging".to_string(),
+        probe.convoy.clone(),
         "work".to_string(),
         "coder".to_string(),
         chrono::Utc::now(),
@@ -207,10 +206,10 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         Some(flotilla_resources::StallProposedDisposition::ReduceScope),
         "repository permission missing".to_string(),
     );
-    apply_resource_status_patch(&convoys, "resume-staging", &patch).await.expect("declare stall");
+    apply_resource_status_patch(&convoys, &probe.convoy, &patch).await.expect("declare stall");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let status = convoys.get("resume-staging").await.expect("source").status.expect("status");
+            let status = convoys.get(&probe.convoy).await.expect("source").status.expect("status");
             if status.stalled.as_ref().is_some_and(|stalled| stalled.rung == flotilla_resources::StallRung::Governor) {
                 break;
             }
@@ -219,7 +218,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     })
     .await
     .expect("governor rung");
-    let stalled = convoys.get("resume-staging").await.expect("source").status.expect("status");
+    let stalled = convoys.get(&probe.convoy).await.expect("source").status.expect("status");
     let condition = stalled.stalled.expect("stall condition");
     assert_eq!(condition.reason, Some(flotilla_resources::StallReason::Access));
     assert_eq!(condition.proposed_disposition, Some(flotilla_resources::StallProposedDisposition::ReduceScope));
@@ -303,7 +302,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         .supervise(
             CrewSupervisionRequest::builder()
                 .namespace("flotilla")
-                .convoy_name("resume-staging")
+                .convoy_name(&probe.convoy)
                 .vessel("work")
                 .role("coder")
                 .operation(flotilla_protocol::CrewSupervisionAction::Resume)
@@ -314,7 +313,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         )
         .await
         .expect("governor resume");
-    let resumed = convoys.get("resume-staging").await.expect("source").status.expect("status");
+    let resumed = convoys.get(&probe.convoy).await.expect("source").status.expect("status");
     assert_eq!(resumed.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     assert!(resumed.stalled.is_none());
     let guidance = backend
@@ -340,7 +339,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     };
     hook(&governor_launch, Activity::Idle, "Stop");
     let patch = convoy_external_patches::mark_crew_stalled(
-        "resume-staging".to_string(),
+        probe.convoy.clone(),
         "work".to_string(),
         "coder".to_string(),
         clock.now(),
@@ -348,12 +347,12 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         None,
         "repository permission still missing".to_string(),
     );
-    apply_resource_status_patch(&convoys, "resume-staging", &patch).await.expect("stall again");
+    apply_resource_status_patch(&convoys, &probe.convoy, &patch).await.expect("stall again");
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             // Skip through the idle governor's attention debounce at ten times real speed.
             clock.skip(chrono::Duration::milliseconds(500));
-            let status = convoys.get("resume-staging").await.expect("source").status.expect("status");
+            let status = convoys.get(&probe.convoy).await.expect("source").status.expect("status");
             if status
                 .stalled
                 .as_ref()
@@ -368,7 +367,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     .expect("idle governor escalates to operator");
     apply_resource_status_patch(
         &convoys,
-        "resume-staging",
+        &probe.convoy,
         &convoy_external_patches::resume_crew_work(
             "work".to_string(),
             "coder".to_string(),
@@ -390,7 +389,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     hook(&source_launch, Activity::NeedsInput, "PermissionRequest");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let status = convoys.get("resume-staging").await.expect("source").status.expect("status");
+            let status = convoys.get(&probe.convoy).await.expect("source").status.expect("status");
             if status
                 .stalled
                 .as_ref()
@@ -407,7 +406,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     hook(&source_launch, Activity::Working, "PostToolUse");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if convoys.get("resume-staging").await.expect("source").status.expect("status").stalled.is_none() {
+            if convoys.get(&probe.convoy).await.expect("source").status.expect("status").stalled.is_none() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -424,11 +423,11 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
 async fn claimed_resume_delivers_information_without_reopening() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let claimed = convoys.get("resume-staging").await.unwrap().status.unwrap();
+    let claimed = convoys.get(&probe.convoy).await.unwrap().status.unwrap();
     let outcome =
-        daemon.convoy_resume_internal("flotilla", "resume-staging", "please complete", None, None, ResumeIntent::Reminder).await.unwrap();
+        daemon.convoy_resume_internal("flotilla", &probe.convoy, "please complete", None, None, ResumeIntent::Reminder).await.unwrap();
     assert_eq!(outcome, ConvoyResumeOutcome::Informational);
-    assert_eq!(convoys.get("resume-staging").await.unwrap().status.unwrap(), claimed);
+    assert_eq!(convoys.get(&probe.convoy).await.unwrap().status.unwrap(), claimed);
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
     let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap().items;
     assert_eq!(messages.len(), 1);
@@ -439,8 +438,8 @@ async fn claimed_resume_delivers_information_without_reopening() {
     let launch = terminals.record("resume-staging-session").name;
     terminals.ready(&launch, "resume-staging-pool-session", &Default::default());
     terminals.failed(&launch, "pool lost the session");
-    daemon.convoy_resume_internal("flotilla", "resume-staging", "duplicate reminder", None, None, ResumeIntent::Reminder).await.unwrap();
-    assert_eq!(convoys.get("resume-staging").await.unwrap().status.unwrap(), claimed);
+    daemon.convoy_resume_internal("flotilla", &probe.convoy, "duplicate reminder", None, None, ResumeIntent::Reminder).await.unwrap();
+    assert_eq!(convoys.get(&probe.convoy).await.unwrap().status.unwrap(), claimed);
 }
 
 // #3145: the command reports information-only delivery without a lifecycle
@@ -459,7 +458,7 @@ async fn claimed_resume_command_reports_outcome_and_audits_explicit_reopen() {
                 Command::builder()
                     .action(CommandAction::ConvoyResume {
                         namespace: Some("flotilla".into()),
-                        name: "resume-staging".into(),
+                        name: probe.convoy.clone(),
                         prompt: "please complete".into(),
                         vessel: None,
                         role: None,
@@ -481,7 +480,7 @@ async fn claimed_resume_command_reports_outcome_and_audits_explicit_reopen() {
         })
         .await
         .unwrap();
-        let status = backend.using::<ResourceConvoy>("flotilla").get("resume-staging").await.unwrap().status.unwrap();
+        let status = backend.using::<ResourceConvoy>("flotilla").get(&probe.convoy).await.unwrap().status.unwrap();
         if reopen {
             assert!(matches!(result, CommandValue::ConvoyBriefQueued { .. }), "{result:?}");
             assert_eq!(status.phase, flotilla_resources::ConvoyPhase::Active);

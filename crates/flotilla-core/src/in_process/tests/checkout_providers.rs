@@ -120,7 +120,8 @@ async fn checkout_vcs_discovery_names_the_repository_a_clone_is_for() {
     )
     .await;
     let repository = RepositorySpec::remote("https://forge.example/team/repo").expect("repository");
-    let clones = super::test_engine(&daemon).clones;
+    let fixture = super::test_engine(&daemon);
+    let clones = &fixture.clones;
     clones.put_named(
         "clone",
         &flotilla_resources::CloneSpec {

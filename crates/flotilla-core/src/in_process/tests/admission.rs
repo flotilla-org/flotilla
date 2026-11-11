@@ -442,7 +442,8 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
     .await;
     // The engine holds the convoy's checkouts here, as its inspections last found them; one
     // whose inspections are failing has no fresh pushed judgement (#3108).
-    let engine = super::test_engine(&daemon).checkouts;
+    let fixture = super::test_engine(&daemon);
+    let engine = &fixture.checkouts;
     archive_convoy(&backend, &engine, "archive-convoy").await;
     let repository = RepositorySpec::remote("https://github.com/acme/archive").expect("repository spec").key();
     for (name, pushed, stale) in
@@ -554,7 +555,8 @@ async fn abandon_archive_pushes_only_checkout_with_commits_beyond_base() {
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    let engine = super::test_engine(&daemon).checkouts;
+    let fixture = super::test_engine(&daemon);
+    let engine = &fixture.checkouts;
     archive_convoy(&backend, &engine, "archive-convoy").await;
     let repository = RepositorySpec::remote("https://github.com/acme/archive").unwrap().key();
     for (name, advanced) in [("at-base", false), ("advanced", true)] {
@@ -611,7 +613,8 @@ async fn abandon_archive_of_a_checkout_in_an_unreachable_environment_names_it_an
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    let engine = super::test_engine(&daemon).checkouts;
+    let fixture = super::test_engine(&daemon);
+    let engine = &fixture.checkouts;
     archive_convoy(&backend, &engine, "archive-convoy").await;
     engine.put_ready(
         "remote-work",
@@ -674,7 +677,8 @@ async fn host_direct_checkout_on_the_daemon_host_is_archived_and_passes_delete_i
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    let engine = super::test_engine(&daemon).checkouts;
+    let fixture = super::test_engine(&daemon);
+    let engine = &fixture.checkouts;
     let env_ref = flotilla_resources::host_direct_environment_name(daemon.local_host_id().unwrap().as_str());
     assert_ne!(env_ref, daemon.local_environment_id.as_str());
     let repository = RepositorySpec::remote("https://github.com/acme/archive").unwrap();

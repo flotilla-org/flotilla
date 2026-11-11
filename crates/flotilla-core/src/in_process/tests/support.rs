@@ -19,11 +19,11 @@ use flotilla_discovery_api::UnmetRequirement;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
     terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords},
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, CrewWorkPhase, CrewWorkState,
-    EnvironmentSpec as ResourceEnvironmentSpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec,
-    FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostDirectEnvironmentSpec, HostSpec, HostStatus, InputMeta, ResourceObject,
-    TerminalAttention, TerminalSession as ResourceTerminalSession, VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
-    GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, CrewWorkPhase, EnvironmentSpec as ResourceEnvironmentSpec,
+    FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost,
+    HostDirectEnvironmentSpec, HostSpec, HostStatus, InputMeta, ResourceObject, TerminalAttention,
+    TerminalSession as ResourceTerminalSession, VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL,
+    PROJECT_LABEL, ROLE_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
@@ -74,6 +74,8 @@ impl WorkCredentialReconciler for RecordingWorkCredentials {
 
 pub(super) struct SessionStagingProbe {
     pub(super) backend: ResourceBackend,
+    /// The launch of `resume-staging` the session works for.
+    pub(super) convoy: String,
     pub(super) session: String,
     pub(super) environment: String,
     pub(super) fail_next: std::sync::atomic::AtomicBool,
@@ -122,42 +124,31 @@ pub(super) async fn resume_staging_fixture_with_clock(
     )
     .await;
     let engine = test_engine(&daemon);
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let convoy = convoys
-        .create(
-            &test_meta("resume-staging"),
-            &ConvoySpec::builder().workflow_ref("implement-review".to_string()).role("resume-staging".to_string()).build(),
-        )
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Landing,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![claim_crew("coder")]).build()],
-                }),
-                work: BTreeMap::from([(
-                    "work".to_string(),
-                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
-                )]),
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("convoy status");
-    let vessel = ensure_vessel(&engine, "resume-staging", "work");
+    // Its coder owes a decision ledger, kept by an operator's verdict: the convoy is Landing,
+    // its work Complete and its crew Done.
+    let mut coder = claim_crew("coder");
+    coder.promises = vec![flotilla_resources::TemplatePromise::decision_ledger("coder")];
+    let launch = admit(
+        &daemon,
+        "resume-staging",
+        ConvoySpec::builder().workflow_ref("implement-review".to_string()).role("resume-staging".to_string()).build(),
+        ConvoyStatus {
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: None,
+                turn_delivery: Default::default(),
+                vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![coder]).build()],
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+    let convoy = backend.clone().using::<ResourceConvoy>("flotilla").get(&launch).await.expect("convoy");
+    let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: Some("coder".to_string()) };
+    convoy_engine(&daemon).keep_by_verdict(&convoy, &scope, "operator", "work done").await.expect("work complete");
+    let vessel = ensure_vessel(&engine, &launch, "work");
     engine.terminals.request(&TerminalLaunchRequest {
         session: "resume-staging-session".to_string(),
         environment: "resume-env".to_string(),
@@ -180,6 +171,7 @@ pub(super) async fn resume_staging_fixture_with_clock(
     });
     let probe = Arc::new(SessionStagingProbe {
         backend: backend.clone(),
+        convoy: launch,
         session: "resume-staging-session".to_string(),
         environment: "resume-env".to_string(),
         fail_next: std::sync::atomic::AtomicBool::new(true),
@@ -192,12 +184,16 @@ pub(super) async fn resume_staging_fixture_with_clock(
 
 /// The launch serving `work` of convoy `convoy`: what a crew's sessions are held for, whose
 /// convoy and work their readers see. A live launch is reused.
-pub(in crate::in_process) fn ensure_vessel(engine: &TestEngine, convoy: &str, work: &str) -> String {
+pub(in crate::in_process) fn ensure_vessel(engine: &flotilla_provisioning_testkit::EngineFixture, convoy: &str, work: &str) -> String {
     engine.vessels.request(convoy, work, "local")
 }
 
 /// Records `attention` as what this home observes of launch `launch`, as its hooks or screen reads do.
-pub(in crate::in_process) fn observe_attention(engine: &TestEngine, launch: &str, attention: TerminalAttention) {
+pub(in crate::in_process) fn observe_attention(
+    engine: &flotilla_provisioning_testkit::EngineFixture,
+    launch: &str,
+    attention: TerminalAttention,
+) {
     engine.terminals.terminals.observations().update(launch, |observation| observation.attention = Some(attention));
 }
 
@@ -354,7 +350,9 @@ impl CommandRunner for BatchedObservationRunner {
     }
 }
 
-pub(in crate::in_process) async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {
+/// Old Convoy `record` in a plain store, generation 1 of standing `role` in `project`: what a
+/// store without the engine's Convoy path holds.
+pub(in crate::in_process) async fn create_identity_record(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {
     let labels = BTreeMap::from([
         (PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string()),
         (ROLE_LABEL.to_string(), role.to_string()),
@@ -368,6 +366,33 @@ pub(in crate::in_process) async fn create_identity_convoy(backend: &ResourceBack
         .create(&InputMeta::builder().name(record.to_string()).labels(labels).build(), &spec)
         .await
         .expect("convoy");
+}
+
+/// Admits a launch of `record`, generation 1 of standing `role` in `project`, on `daemon`'s
+/// engine, its work crewed by an agent for `role`. Returns the launch's name.
+pub(in crate::in_process) async fn create_identity_convoy(
+    daemon: &InProcessDaemon,
+    record: &str,
+    role: &str,
+    project: Option<&str>,
+) -> String {
+    let mut spec = ConvoySpec::builder().workflow_ref("review".to_string()).role(role.to_string()).generation(1).build();
+    spec.project_ref = project.map(str::to_string);
+    identity_launch(daemon, record, spec).await
+}
+
+/// Admits a launch of `record` with identity `spec` on `daemon`'s engine, labelled as admission
+/// labels a standing role's generation; see [`create_identity_convoy`].
+pub(in crate::in_process) async fn identity_launch(daemon: &InProcessDaemon, record: &str, spec: ConvoySpec) -> String {
+    let labels = BTreeMap::from([
+        (PROJECT_LABEL.to_string(), spec.project_ref.clone().unwrap_or_default()),
+        (ROLE_LABEL.to_string(), spec.role.clone()),
+        (GENERATION_LABEL.to_string(), spec.generation.to_string()),
+    ]);
+    let status = flotilla_engine_convoys_testkit::single_agent(&spec.role);
+    let mut convoy = flotilla_engine_convoys_testkit::convoy("flotilla", record, spec, status);
+    convoy.metadata.labels = labels;
+    admit_convoy(daemon, convoy).await
 }
 
 pub(in crate::in_process) fn test_meta(name: &str) -> InputMeta {
@@ -503,31 +528,57 @@ pub(super) fn trusted_codex_workflow() -> WorkflowTemplateSpec {
     flotilla_resources::single_agent_workflow_spec()
 }
 
-/// The engine's environments for `daemon`'s tests, installed with its clones and checkouts (none
-/// held) as its lifecycle reads, as the daemon's runtime installs them.
-/// The engine's environments, clones and checkouts on one store, as a daemon's runtime has them.
-pub(in crate::in_process) use flotilla_provisioning_testkit::EngineFixture as TestEngine;
+/// The engine a test daemon reads: its environments, clones, checkouts, vessels and terminal
+/// sessions on the daemon's decided store, as the daemon's runtime has them.
+pub(in crate::in_process) type TestEngine = Arc<flotilla_provisioning_testkit::EngineFixture>;
 
-/// [`TestEngine`], installed as `daemon`'s lifecycle reads.
+/// The engines installed into test daemons, by the decided store they are on.
+static TEST_ENGINES: std::sync::LazyLock<std::sync::Mutex<Vec<(std::sync::Weak<flotilla_schema_sqlite::stream::Service>, TestEngine)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// [`TestEngine`] over `daemon`'s decided store, installed as its lifecycle reads on first use
+/// and the same engine after, as a composed daemon has one. Its readers and watchers follow the
+/// store when a runtime is running, as the runtime's do.
 pub(in crate::in_process) fn test_engine(daemon: &InProcessDaemon) -> TestEngine {
-    let engine = engine_fixture();
-    daemon.install_lifecycle_reads(engine.checkouts.reads.clone()).expect("engine reads");
+    let service = daemon.decided_store().expect("decided store");
+    let mut engines = TEST_ENGINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    engines.retain(|(store, _)| store.strong_count() > 0);
+    if let Some((_, engine)) = engines.iter().find(|(store, _)| store.as_ptr() == Arc::as_ptr(&service)) {
+        return Arc::clone(engine);
+    }
+    let engine = Arc::new(flotilla_provisioning_testkit::EngineFixture::over_service(&service));
+    if tokio::runtime::Handle::try_current().is_ok() {
+        drop(engine.terminals.terminals.follow(Arc::clone(&service)).expect("follow the terminal sessions"));
+        drop(engine.vessels.vessels.follow(Arc::clone(&service)).expect("follow the vessels"));
+        drop(engine.environments.environments.follow(Arc::clone(&service)).expect("follow the environments"));
+        drop(engine.checkouts.checkouts.follow(Arc::clone(&service)).expect("follow the checkouts"));
+    }
+    daemon.install_lifecycle_reads(engine.reads()).expect("engine reads");
+    engines.push((Arc::downgrade(&service), Arc::clone(&engine)));
     engine
 }
 
-/// Admits a launch of engine Convoy `convoy` on `engine` and names it on the old record `convoy`
-/// in `backend`, as engine admission does: what the convoy's checkouts are held for.
-pub(in crate::in_process) async fn admit_on_engine(
-    backend: &flotilla_store::ResourceBackend,
-    engine: &flotilla_provisioning_testkit::CheckoutFixture,
-    convoy: &str,
-) -> String {
-    engine.admit_for(backend, "flotilla", convoy, convoy).await
+/// Admits `convoy` on `daemon`'s engine Convoy path as the next launch of what it is a launch of,
+/// as admission does, with its status's workflow snapshot frozen. Returns the launch's name.
+pub(in crate::in_process) async fn admit_convoy(daemon: &InProcessDaemon, convoy: ResourceObject<ResourceConvoy>) -> String {
+    test_engine(daemon);
+    flotilla_engine_convoys_testkit::launch(&daemon.convoy_engine_path(), convoy).await
 }
 
-/// [`TestEngine`], not installed: each fixture's `reads` serve all three.
-pub(in crate::in_process) fn engine_fixture() -> TestEngine {
-    TestEngine::default()
+/// `daemon`'s engine Convoy writer, for the edges a test drives: verdicts, links, failure.
+pub(in crate::in_process) fn convoy_engine(daemon: &InProcessDaemon) -> Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> {
+    test_engine(daemon);
+    Arc::clone(daemon.convoy_engine_path().get().expect("the Convoy path is installed"))
+}
+
+/// Admits `convoy` with `spec` and `status` in namespace `flotilla` on `daemon`; see [`admit_convoy`].
+pub(in crate::in_process) async fn admit(daemon: &InProcessDaemon, convoy: &str, spec: ConvoySpec, status: ConvoyStatus) -> String {
+    admit_convoy(daemon, flotilla_engine_convoys_testkit::convoy("flotilla", convoy, spec, status)).await
+}
+
+/// An engine not installed into any daemon: each fixture's `reads` serve all of them.
+pub(in crate::in_process) fn engine_fixture() -> flotilla_provisioning_testkit::EngineFixture {
+    flotilla_provisioning_testkit::EngineFixture::default()
 }
 
 /// `name`, a ready host-direct environment of `host_ref` on the engine.
@@ -547,7 +598,7 @@ pub(in crate::in_process) fn create_test_environment(
 /// Session `name`, a tool running in environment `env_ref` for convoy `convoy`'s `work` vessel
 /// as `role`, under pool session `session-<name>`. Its launch.
 pub(in crate::in_process) async fn create_running_session(
-    engine: &TestEngine,
+    engine: &flotilla_provisioning_testkit::EngineFixture,
     env_ref: &str,
     name: &str,
     convoy: &str,
@@ -727,7 +778,13 @@ pub(super) fn claim_crew(role: &str) -> flotilla_resources::CrewSpec {
 
 /// Session `name`, a tool running for convoy `convoy`'s `work` vessel as `role`, whose home
 /// observes `attention`. Its launch.
-pub(super) async fn stall_test_session(engine: &TestEngine, convoy: &str, name: &str, role: &str, attention: TerminalAttention) -> String {
+pub(super) async fn stall_test_session(
+    engine: &flotilla_provisioning_testkit::EngineFixture,
+    convoy: &str,
+    name: &str,
+    role: &str,
+    attention: TerminalAttention,
+) -> String {
     let vessel_ref = ensure_vessel(engine, convoy, "work");
     let launch = engine.terminals.request(&TerminalLaunchRequest {
         session: name.into(),

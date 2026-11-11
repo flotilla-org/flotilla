@@ -556,12 +556,12 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
         let (daemon, backend, probe) = resume_staging_fixture().await;
         probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
         let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-        let convoy = convoys.get("resume-staging").await.expect("convoy");
+        let convoy = convoys.get(&probe.convoy).await.expect("convoy");
         let mut status = convoy.status.expect("status");
         status.phase = ConvoyPhase::Active;
         status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Interrupted;
         status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = phase;
-        convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("unfinished work");
+        convoys.update_status(&probe.convoy, &convoy.metadata.resource_version, &status).await.expect("unfinished work");
         let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
         let session = sessions.get("resume-staging-session").await.expect("session");
         let original_cwd = session.spec.cwd.clone();
@@ -572,7 +572,7 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
         daemon
             .convoy_resume_internal(
                 "flotilla",
-                "resume-staging",
+                &probe.convoy,
                 "Recover the unfinished review",
                 Some("work"),
                 Some("coder"),
@@ -592,7 +592,7 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
             .items
             .iter()
             .any(|message| message.spec.body.contains("Recover the unfinished review")));
-        let status = convoys.get("resume-staging").await.expect("convoy").status.expect("status");
+        let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
         assert!(status.pending_brief().is_none(), "an exited process cannot consume a pending brief");
         assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     }

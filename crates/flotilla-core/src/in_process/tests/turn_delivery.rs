@@ -31,7 +31,7 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
     terminals.exited(&exited.name, "exit 0");
     let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
-        .convoy("resume-staging".to_string())
+        .convoy(probe.convoy.clone())
         .source("review".to_string())
         .vessel("work".to_string())
         .role("coder".to_string())
@@ -59,7 +59,7 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
-        .convoy("resume-staging".to_string())
+        .convoy(probe.convoy.clone())
         .source("review".to_string())
         .vessel("work".to_string())
         .role("coder".to_string())
@@ -233,7 +233,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             resume_staging_fixture_with_clock(ResourceBackend::new(InMemoryBackend::default()), clock.clone()).await;
         probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
         let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-        let convoy = convoys.get("resume-staging").await.expect("convoy");
+        let convoy = convoys.get(&probe.convoy).await.expect("convoy");
         let mut status = convoy.status.expect("status");
         status.phase = flotilla_resources::ConvoyPhase::Active;
         status.workflow_snapshot.as_mut().expect("workflow").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
@@ -243,7 +243,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             "work/coder".to_string(),
             flotilla_resources::StallNudgePolicy { max_per_episode: limit, max_refusals: None, idle_grace_seconds: Some(0) },
         );
-        convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("active convoy");
+        convoys.update_status(&probe.convoy, &convoy.metadata.resource_version, &status).await.expect("active convoy");
         let launch = probe.engine.terminals.record("resume-staging-session").name;
         probe.engine.terminals.ready(&launch, "resume-staging-pool-session", &Default::default());
         let idle = |as_of| TerminalAttention { state: TerminalAttentionState::Idle, as_of, source: TerminalAttentionSource::Hook };
@@ -255,7 +255,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         hook(Activity::Idle, "Stop", clock.now());
         let expected_rung = if limit == 0 { StallRung::Operator } else { StallRung::Nudge };
         daemon.reconcile_crew_stalls_once("flotilla").await.expect("first stall judgement");
-        let first = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
+        let first = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").stalled.expect("stalled");
         assert_eq!(first.rung, expected_rung);
         assert_eq!(first.nudge_history.len(), limit.min(1) as usize);
         if limit == 0 {
@@ -295,20 +295,20 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
                 hook(Activity::Idle, "Stop", clock.now());
                 observe_attention(&probe.engine, &launch, idle(idle_again));
                 daemon.reconcile_crew_stalls_once("flotilla").await.expect("next idle episode judgement");
-                let stalled = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
+                let stalled = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").stalled.expect("stalled");
                 assert_eq!(stalled.nudge_history.len(), 2);
                 assert_eq!(stalled.rung, desired_rung);
             }
-            let stalled = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
+            let stalled = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").stalled.expect("stalled");
             assert_eq!(stalled.nudge_history.len(), 2);
         }
-        let convoy = convoys.get("resume-staging").await.expect("convoy");
+        let convoy = convoys.get(&probe.convoy).await.expect("convoy");
         let mut status = convoy.status.expect("status");
         status.phase = flotilla_resources::ConvoyPhase::Landed;
         status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Done;
-        convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("complete");
+        convoys.update_status(&probe.convoy, &convoy.metadata.resource_version, &status).await.expect("complete");
         daemon.reconcile_crew_stalls_once("flotilla").await.expect("clear stall");
-        assert!(convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.is_none());
+        assert!(convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").stalled.is_none());
     }
 }
 
@@ -322,7 +322,7 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".into())
-        .convoy("resume-staging".into())
+        .convoy(probe.convoy.clone())
         .source("legacy".into())
         .vessel("work".into())
         .role("coder".into())
