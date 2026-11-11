@@ -11,7 +11,7 @@ use flotilla_protocol::{CommandValue, NodeId, ResourceCursor, ResourceReadEnvelo
 use flotilla_resources::{Convoy, ConvoySpec, InputMeta, PartitionDigest, ResourceObject, ResourceProvenance};
 use flotilla_store::ResourceBackend;
 
-use super::test_ports::{host, stores, HealthReport, InMemoryPeers, NoRoutedPeer, RecordingHealth};
+use super::test_ports::{host, store, HealthReport, InMemoryPeers, NoRoutedPeer, RecordingHealth};
 use super::*;
 use crate::ports::{PeerSources, RoutedDigestRequest, RoutedPeer, RoutedWatch, RoutedWatchItem, RoutedWatchRequest};
 
@@ -60,25 +60,24 @@ async fn await_replicas(backend: &ResourceBackend, expected: &[(&str, &NodeId)])
 #[tokio::test]
 async fn direct_peer_store_replicates_snapshot_and_live_log() {
     let authority_id = NodeId::new("authority");
-    let authority = stores(&authority_id);
-    author(&authority.durable, "snapshotted").await;
+    let authority = store(&authority_id);
+    author(&authority, "snapshotted").await;
     let health = Arc::new(RecordingHealth::default());
     let holder = host("holder", Arc::clone(&health));
 
     let task = tokio::spawn({
         let holder = holder.clone();
-        let remote = authority.durable.clone();
+        let remote = authority.clone();
         let peer = authority_id.clone();
-        async move { replicate_kind_direct::<Convoy>(remote, &holder, &peer, ReplicationStore::Durable).await }
+        async move { replicate_kind_direct::<Convoy>(remote, &holder, &peer).await }
     });
-    await_replicas(&holder.stores().durable, &[("snapshotted", &authority_id)]).await;
-    author(&authority.durable, "live").await;
-    await_replicas(&holder.stores().durable, &[("live", &authority_id), ("snapshotted", &authority_id)]).await;
-    authority.durable.using::<Convoy>(REPLICATION_NAMESPACE).delete("snapshotted").await.expect("delete");
-    await_replicas(&holder.stores().durable, &[("live", &authority_id)]).await;
+    await_replicas(holder.store(), &[("snapshotted", &authority_id)]).await;
+    author(&authority, "live").await;
+    await_replicas(holder.store(), &[("live", &authority_id), ("snapshotted", &authority_id)]).await;
+    authority.using::<Convoy>(REPLICATION_NAMESPACE).delete("snapshotted").await.expect("delete");
+    await_replicas(holder.store(), &[("live", &authority_id)]).await;
 
     assert!(health.reports().contains(&HealthReport::Healthy(authority_id.clone(), "Convoy".into())));
-    assert!(replica_origins(&holder.stores().observed).await.is_empty(), "durable replication must not write the observed store");
     // Load metrics (#3206): one snapshot, then the live create and delete as events.
     let metrics = holder.metrics().snapshot();
     assert_eq!((metrics.snapshots, metrics.lag_resets), (1, 0));
@@ -91,8 +90,8 @@ async fn direct_peer_store_replicates_snapshot_and_live_log() {
 #[tokio::test]
 async fn supervisors_replicate_a_connected_direct_peer_until_disconnect() {
     let authority_id = NodeId::new("authority");
-    let authority = stores(&authority_id);
-    author(&authority.durable, "first").await;
+    let authority = store(&authority_id);
+    author(&authority, "first").await;
     let peers = Arc::new(InMemoryPeers::default());
     let socket = PathBuf::from("/peers/authority.sock");
     peers.serve(socket.clone(), authority.clone());
@@ -105,20 +104,15 @@ async fn supervisors_replicate_a_connected_direct_peer_until_disconnect() {
     );
 
     supervisors.peer_connected(authority_id.clone(), 1, Some(socket.clone())).await;
-    await_replicas(&holder.stores().durable, &[("first", &authority_id)]).await;
+    await_replicas(holder.store(), &[("first", &authority_id)]).await;
     assert_eq!(health.reports().first(), Some(&HealthReport::Begin(authority_id.clone())));
-    assert!(peers
-        .connections
-        .lock()
-        .expect("connections")
-        .iter()
-        .all(|(path, store)| path == &socket && *store == ReplicationStore::Durable));
+    assert!(peers.connections.lock().expect("connections").iter().all(|path| path == &socket));
 
     supervisors.peer_disconnected(&authority_id, 1);
     tokio::task::yield_now().await;
-    author(&authority.durable, "after-disconnect").await;
+    author(&authority, "after-disconnect").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(replica_origins(&holder.stores().durable).await, vec![("first".to_string(), authority_id)]);
+    assert_eq!(replica_origins(holder.store()).await, vec![("first".to_string(), authority_id)]);
 }
 
 /// A routed peer that replays scripted watch items and records requests.
@@ -185,8 +179,8 @@ fn bookmark() -> ResourceReadRecord {
 #[tokio::test]
 async fn routed_watch_snapshot_replaces_replicas_at_the_bookmark() {
     let peer_id = NodeId::new("peer");
-    let peer_store = stores(&peer_id);
-    let object = author(&peer_store.durable, "routed").await;
+    let peer_store = store(&peer_id);
+    let object = author(&peer_store, "routed").await;
     let routed = Arc::new(ScriptedRoutedPeer::default());
     routed.items.lock().expect("items").extend([
         envelope(&object.metadata.resource_version, vec![record(ResourceRecordType::Current, &object), bookmark()]),
@@ -195,9 +189,9 @@ async fn routed_watch_snapshot_replaces_replicas_at_the_bookmark() {
     let health = Arc::new(RecordingHealth::default());
     let holder = host("holder", Arc::clone(&health));
 
-    replicate_kind_over_routed_watch::<Convoy>(&routed, &holder, &peer_id, ReplicationStore::Durable, None).await.expect("routed watch");
+    replicate_kind_over_routed_watch::<Convoy>(&routed, &holder, &peer_id, None).await.expect("routed watch");
 
-    assert_eq!(replica_origins(&holder.stores().durable).await, vec![("routed".to_string(), peer_id.clone())]);
+    assert_eq!(replica_origins(holder.store()).await, vec![("routed".to_string(), peer_id.clone())]);
     assert_eq!(
         routed.requests.lock().expect("requests").as_slice(),
         [RoutedWatchRequest { namespace: REPLICATION_NAMESPACE.into(), kind: "convoys".into(), replica_sources: false, cursor: None }]
@@ -214,10 +208,10 @@ async fn routed_relay_skips_local_and_peer_origins() {
     let peer_id = NodeId::new("peer");
     let holder = host("holder", Arc::new(RecordingHealth::default()));
     let third = NodeId::new("third");
-    let scratch = stores(&peer_id);
+    let scratch = store(&peer_id);
     let mut records = Vec::new();
     for (name, origin) in [("from-holder", holder.node_id()), ("from-peer", &peer_id), ("from-third", &third)] {
-        let mut object = author(&scratch.durable, name).await;
+        let mut object = author(&scratch, name).await;
         object.metadata.annotations.insert("flotilla.work/origin-root".into(), origin.to_string());
         object.metadata.annotations.insert("flotilla.work/last-synced-at".into(), "2026-10-01T00:00:00Z".into());
         records.push(record(ResourceRecordType::Added, &object));
@@ -225,9 +219,9 @@ async fn routed_relay_skips_local_and_peer_origins() {
     let routed = Arc::new(ScriptedRoutedPeer::default());
     routed.items.lock().expect("items").extend([envelope("3", records), RoutedWatchItem::Finished(Box::new(CommandValue::Ok))]);
 
-    replicate_relay_over_routed_watch::<Convoy>(&routed, &holder, &peer_id, ReplicationStore::Durable).await.expect("relay");
+    replicate_relay_over_routed_watch::<Convoy>(&routed, &holder, &peer_id).await.expect("relay");
 
-    assert_eq!(replica_origins(&holder.stores().durable).await, vec![("from-third".to_string(), third)]);
+    assert_eq!(replica_origins(holder.store()).await, vec![("from-third".to_string(), third)]);
     assert!(routed.requests.lock().expect("requests")[0].replica_sources);
 }
 
@@ -237,9 +231,8 @@ async fn routed_watch_lag_is_a_sequence_gap() {
     let routed = Arc::new(ScriptedRoutedPeer::default());
     routed.items.lock().expect("items").push_back(RoutedWatchItem::Lagged(4));
     let holder = host("holder", Arc::new(RecordingHealth::default()));
-    let error = run_routed_watch::<Convoy>(&routed, &holder, &NodeId::new("peer"), ReplicationStore::Durable, None, None)
-        .await
-        .expect_err("lag cannot continue the log");
+    let error =
+        run_routed_watch::<Convoy>(&routed, &holder, &NodeId::new("peer"), None, None).await.expect_err("lag cannot continue the log");
     assert!(error.contains("sequence gap"), "{error}");
     assert_eq!(holder.metrics().snapshot().lag_resets, 1);
 }
@@ -276,8 +269,8 @@ async fn direct_watch_terminates_on_apply_error() {
 async fn routed_relay_recreation_survives_every_snapshot_event_order() {
     let peer = NodeId::new("relay");
     let origin = NodeId::new("origin");
-    let scratch = stores(&origin);
-    let mut old = author(&scratch.durable, "record").await;
+    let scratch = store(&origin);
+    let mut old = author(&scratch, "record").await;
     old.metadata.annotations.insert("flotilla.work/origin-root".into(), origin.to_string());
     old.metadata.annotations.insert("flotilla.work/last-synced-at".into(), "2026-10-01T00:00:01Z".into());
     let mut deleted = old.clone();
@@ -302,8 +295,8 @@ async fn routed_relay_recreation_survives_every_snapshot_event_order() {
                 }
                 items.push_back(RoutedWatchItem::Finished(Box::new(CommandValue::Ok)));
             }
-            replicate_relay_over_routed_watch::<Convoy>(&routed, &holder, &peer, ReplicationStore::Durable).await.expect("relay snapshot");
-            let backend = holder.stores().durable.clone();
+            replicate_relay_over_routed_watch::<Convoy>(&routed, &holder, &peer).await.expect("relay snapshot");
+            let backend = holder.store().clone();
             let live = backend.including_replicas::<Convoy>(REPLICATION_NAMESPACE).get("record").await.expect("recreated record");
             assert_eq!(live.object.spec.workflow_ref, "recreated", "arrival order {order:?}");
             assert_eq!(live.object.metadata.resource_version, "3");

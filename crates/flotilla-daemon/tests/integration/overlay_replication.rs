@@ -13,7 +13,7 @@ use flotilla_resources::{
     terminal_records::{TerminalLaunchRequest, TerminalLaunchSource},
     Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, Host,
     HostSpec, HostStatus, InputMeta, IntegrationCondition, ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey, ResourceProvenance,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselSpec,
+    TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
 };
 use flotilla_store::{watch_resource_kind_replica_sources, ResourceBackend};
 use futures::StreamExt;
@@ -848,8 +848,8 @@ async fn a_peer_relays_another_origins_home_bound_runtime_resource() {
     drop(feta_gouda);
 }
 
-// #742: another host's adopted checkouts reach checkout queries by following its log, and
-// independent attach targets through resource replication, including updates and removals.
+// #742: another host's adopted checkouts and independent attach targets reach it by following
+// its log, including updates and removals.
 #[tokio::test]
 async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hosts() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -864,7 +864,6 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
     .await
     .expect("start query projection");
     let checkouts = flotilla_daemon_testkit::engine::runtime_checkouts(&feta);
-    let sessions = feta.observed_resource_backend().using::<TerminalSession>("flotilla");
     let adopted = |branch: &str| {
         CheckoutSpec::Observed(ObservedCheckoutSpec {
             repo_ref: RepositoryKey("widgets".into()),
@@ -882,31 +881,18 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
         .create(&InputMeta::builder().name("checkout".to_string()).build(), &spec)
         .await
         .expect("create local checkout");
-    let session = sessions
-        .create(
-            &InputMeta::builder().name("terminal-independent".to_string()).build(),
-            &TerminalSessionSpec::builder()
-                .env_ref("feta-env".to_string())
-                .role("shell".to_string())
-                .source(TerminalSessionSource::Tool { command: "sh".into() })
-                .cwd("/srv/widgets".to_string())
-                .pool("passthrough".to_string())
-                .build(),
-        )
-        .await
-        .expect("create independent");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("terminal-independent".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("running independent");
+    let independent = flotilla_daemon_testkit::engine::run_session(
+        &feta,
+        "terminal-independent",
+        &TerminalSessionSpec::builder()
+            .env_ref(feta.local_environment_id().to_string())
+            .role("shell".to_string())
+            .source(TerminalSessionSource::Tool { command: "sh".into() })
+            .cwd("/srv/widgets".to_string())
+            .pool("passthrough".to_string())
+            .build(),
+        &Default::default(),
+    );
     let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect daemons");
     let state = kiwi.aggregator_projection_state().await;
     for branch in ["main", "feature", "main"] {
@@ -930,31 +916,18 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.path == "/srv/widgets" && row.resource.host.as_ref() == Some(&row.host)));
     }
-    tokio::time::timeout(Duration::from_secs(5), async {
+    std::fs::write(kiwi.config_store().base_path().join("hosts.toml"), "[hosts.feta]\nhostname = 'feta.example'\n")
+        .expect("attach hop config");
+    let resolved = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if kiwi
-                .observed_resource_backend()
-                .including_replicas::<TerminalSession>("flotilla")
-                .list()
-                .await
-                .expect("session replicas")
-                .items
-                .iter()
-                .any(|source| source.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running))
-            {
-                break;
+            if let Ok(resolved) = kiwi.resolve_attach_command_on_host_internal("terminal-independent", Some(&HostName::new("feta"))).await {
+                break resolved;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("independent replication");
-    std::fs::write(kiwi.config_store().base_path().join("hosts.toml"), "[hosts.feta]\nhostname = 'feta.example'\n")
-        .expect("attach hop config");
-    let resolved = kiwi
-        .resolve_attach_command_on_host_internal("terminal-independent", Some(&HostName::new("feta")))
-        .await
-        .expect("remote independent attach");
+    .expect("remote independent attach");
     assert_eq!(resolved.binding.as_ref().map(|binding| &binding.host), Some(&HostName::new("feta")));
     let checkout_attach =
         kiwi.resolve_transient_attach_command_internal("/srv/widgets", Some(&HostName::new("feta"))).await.expect("remote checkout attach");
@@ -968,14 +941,14 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
     assert!(serde_json::to_string(&checkout_attach.plan).expect("attach plan").contains("/srv/widgets"));
     assert!(kiwi.resource_backend().including_replicas::<Checkout>("flotilla").list().await.expect("durable checkouts").items.is_empty());
     checkouts.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
-    sessions.delete("terminal-independent").await.expect("delete independent");
+    flotilla_daemon_testkit::engine::engine(&feta).terminals.release(&independent);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let set = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout query");
             let rows = set.rows.as_checkouts().expect("checkout rows");
-            let remote_sessions =
-                kiwi.observed_resource_backend().including_replicas::<TerminalSession>("flotilla").list().await.expect("sessions");
-            if rows.len() == 1 && rows[0].host == HostName::new("kiwi") && remote_sessions.items.is_empty() {
+            let detached =
+                kiwi.resolve_attach_command_on_host_internal("terminal-independent", Some(&HostName::new("feta"))).await.is_err();
+            if rows.len() == 1 && rows[0].host == HostName::new("kiwi") && detached {
                 break;
             }
             tokio::task::yield_now().await;
@@ -983,7 +956,6 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
     })
     .await
     .expect("remote observations removed");
-    assert!(kiwi.resolve_attach_command_on_host_internal("terminal-independent", Some(&HostName::new("feta"))).await.is_err());
     drop(topology);
 }
 
