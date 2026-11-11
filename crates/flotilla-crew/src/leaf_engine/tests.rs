@@ -172,52 +172,6 @@ impl observation::ChangeRequestObservationSource for CountingChangeRequests {
     }
 }
 
-fn overload_row(connection_id: uuid::Uuid) -> LeafSubscriptionRow {
-    LeafSubscriptionRow {
-        id: uuid::Uuid::new_v4(),
-        namespace: "flotilla".into(),
-        leaves: vec![leaf(LeafAddress::Convoy { name: "busy".into() }, ".status.phase", "Failed")],
-        watcher: LeafWatcher::WaitCaller { connection_id },
-        maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
-        freshness_demand: None,
-        created_at: Utc::now(),
-        episode_key: EpisodeKeyFields::default(),
-    }
-}
-
-async fn overload_demand(table: &LeafSubscriptionTable, id: uuid::Uuid) {
-    table
-        .inner
-        .change_requests
-        .demand(
-            id,
-            ChangeRequestKey::new(
-                "flotilla",
-                flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 1, &[]).expect("address"),
-            )
-            .expect("key"),
-            None,
-        )
-        .await
-        .expect("refresher demand");
-    assert_eq!(table.inner.change_requests.active_demands().await, 1);
-}
-
-async fn overload_convoy(backend: &ResourceBackend) {
-    let convoys = backend.using::<Convoy>("flotilla");
-    let mut object = convoys.get("busy").await.expect("convoy");
-    for index in 0..300 {
-        object = convoys
-            .update(
-                &InputMeta::from(&object.metadata),
-                &object.metadata.resource_version,
-                &ConvoySpec::builder().workflow_ref(format!("load-{index}")).build(),
-            )
-            .await
-            .expect("overload write");
-    }
-}
-
 fn convoy_spec() -> ConvoySpec {
     ConvoySpec::builder().workflow_ref("workflow".to_string()).build()
 }
@@ -1726,16 +1680,13 @@ fn engine_table(
 }
 
 mod change_request_authority;
-#[cfg(any())]
 mod settlement;
 #[cfg(any())]
 mod stalls_supervision;
-#[cfg(any())]
 mod subscriptions;
 mod turn_delivery;
 
 #[cfg(any())]
 mod landing_stalls;
 
-#[cfg(any())]
 mod performance;

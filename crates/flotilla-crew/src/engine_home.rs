@@ -204,6 +204,11 @@ impl EngineHome {
         self.view(backend, launch).await
     }
 
+    /// This home's decided store, which another home's log is replicated into, or this one's from.
+    pub fn service(&self) -> &Arc<Service> {
+        &self.service
+    }
+
     /// The Convoy path's engine.
     pub fn engine(&self) -> Arc<dyn EngineConvoys> {
         self.path().get().cloned().expect("the Convoy path is installed")
