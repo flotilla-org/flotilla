@@ -5101,10 +5101,6 @@ impl InProcessDaemon {
             _ => None,
         };
         let Some((namespace, kind, name)) = target else { return Ok(None) };
-        // A kind the generic verbs refuse has no object to read: the refusal is local.
-        if flotilla_store::generic_verb_refusal(&self.resource_backend, kind).is_some() {
-            return Ok(None);
-        }
         let object = match get_resource_kind_including_replicas(&self.resource_backend, namespace, kind, name).await {
             Ok(object) => object,
             Err(ResourceError::NotFound { .. }) => {

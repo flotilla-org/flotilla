@@ -942,14 +942,6 @@ pub fn canonical_resource_kind(kind: &str) -> Result<&'static str, ResourceError
     Ok(lookup_resource_kind(kind)?.kind)
 }
 
-/// The refusal of a generic resource verb for `requested_kind` (a kind, plural or alias): the
-/// engine serves it through a port of its own.
-pub fn generic_verb_refusal(backend: &ResourceBackend, requested_kind: &str) -> Option<ResourceError> {
-    let kind = lookup_resource_kind(requested_kind).ok()?.kind;
-    let instead = backend.generic_verb_refusal(kind)?;
-    Some(ResourceError::invalid(format!("{kind} is served by the engine, not the resource commands; {instead}")))
-}
-
 fn lookup_resource_kind(kind: &str) -> Result<&'static RegisteredResourceKind, ResourceError> {
     let normalized = kind.trim();
     REGISTERED_RESOURCE_KINDS

@@ -99,11 +99,6 @@ pub struct ExecutorActions<'a> {
     pub events: flotilla_daemon_api::action_events::ActionEvents<'a>,
 }
 
-/// The generic resource verbs refuse a kind the engine serves through a port of its own.
-fn engine_refusal(backend: &ResourceBackend, kind: &str) -> Option<CommandValue> {
-    flotilla_store::generic_verb_refusal(backend, kind).map(|error| CommandValue::Error { message: error.to_string() })
-}
-
 impl ExecutorActions<'_> {
     async fn provisioning_namespace(&self) -> String {
         flotilla_daemon_api::action_namespace::provisioning_namespace(self.namespace)
@@ -114,10 +109,6 @@ impl ExecutorActions<'_> {
             // Artifact reservations and Message admission can race status writers.
             // Both mutations are replay-safe; retain a bounded conflict budget.
             let kind = document.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
-            if let Some(refused) = engine_refusal(self.resource_backend, kind) {
-                self.events.finish(id, empty_identity, refused);
-                return Ok(id);
-            }
             let applied = retry_resource_apply(kind, || self.port.apply_intent_document(namespace, document.clone())).await;
             let result = match applied {
                 Ok(applied) => CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
@@ -193,10 +184,6 @@ impl ExecutorActions<'_> {
     pub async fn execute_action_resource_status_patch(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceStatusPatch { namespace, kind, name, status, expected_resource_version } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
-            if let Some(refused) = engine_refusal(self.resource_backend, kind) {
-                self.events.finish(id, empty_identity, refused);
-                return Ok(id);
-            }
             let patched = match expected_resource_version {
                 Some(expected) => {
                     flotilla_store::patch_resource_status_if_version(self.resource_backend, namespace, kind, name, status.clone(), expected)
@@ -223,10 +210,6 @@ impl ExecutorActions<'_> {
     pub async fn execute_action_resource_delete(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceDelete { namespace, kind, name, replica_origin } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
-            if let Some(refused) = engine_refusal(self.resource_backend, kind) {
-                self.events.finish(id, empty_identity, refused);
-                return Ok(id);
-            }
             let result = if let Some(origin_root) = replica_origin {
                 let deleted = if self.port.peer_connection_status(origin_root).await == PeerConnectionState::Connected {
                     Err(ResourceError::invalid(format!(

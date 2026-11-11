@@ -37,9 +37,6 @@ struct EngineSlots {
     /// The engine keeps no namespaces: its records read in whichever namespace is asked, and carry
     /// this daemon's one, as a scan for the namespaces holding a kind it serves answers.
     namespace: Option<String>,
-    /// Kinds the engine serves through ports of their own, which the generic resource verbs
-    /// refuse: what to use instead.
-    refused: std::collections::BTreeMap<&'static str, String>,
     /// Each kind's shared listing while any watcher holds it.
     feeds: std::collections::BTreeMap<&'static str, std::sync::Weak<crate::engine_feed::EngineFeed>>,
 }
@@ -87,16 +84,6 @@ impl ResourceBackend {
     pub fn engine_namespace(&self, kind: &str) -> Option<String> {
         let engines = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         engines.ports.contains_key(kind).then(|| engines.namespace.clone()).flatten()
-    }
-    /// Refuses the generic resource verbs (get, list, apply, status patch, delete) for `kind`,
-    /// which the engine serves through a port of its own; `instead` names the commands that read
-    /// or change it. Watch and digest still serve the old store, for replication.
-    pub fn refuse_generic_verbs(&self, kind: &'static str, instead: impl Into<String>) {
-        self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner).refused.insert(kind, instead.into());
-    }
-    /// Why the generic resource verbs refuse `kind`, by its kind name, when they do.
-    pub fn generic_verb_refusal(&self, kind: &str) -> Option<String> {
-        self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).refused.get(kind).cloned()
     }
     /// Whether an engine port serves `kind`: its records reach other homes by log following,
     /// never through the old store's replication.
