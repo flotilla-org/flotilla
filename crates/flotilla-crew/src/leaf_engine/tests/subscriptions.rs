@@ -22,19 +22,35 @@ fn reconciler_row_identity_ignores_regenerated_freshness_instant() {
     ));
 }
 
+/// A launch at work, `name`'s first: its vessel ready, its coder owing a ledger.
+async fn active_launch(backend: &ResourceBackend, home: &EngineHome, name: &str) -> String {
+    launch_at(backend, home, name, ledger_owed(), ConvoyPhase::Active).await
+}
+
+/// Yields until `ready` holds, for at most two seconds of real time. Engine reads run on blocking
+/// threads, which neither a yield nor paused time waits for. A wait polled by hand is polled in
+/// `ready` until it parks on its changes: one left inside a read holds the engine's Convoy views.
+async fn until(what: &str, mut ready: impl AsyncFnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !ready().await {
+        assert!(std::time::Instant::now() < deadline, "{what} within two seconds");
+        tokio::task::yield_now().await;
+    }
+}
+
 // A live wait must survive queue overflow and evaluate the current state
 // after relisting, with its original subscription identity intact.
 #[tokio::test]
 async fn leaf_wait_recovers_after_watch_overflow() {
     use futures::FutureExt;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let table = supervision_wake(&backend).subscriptions;
-    create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    let (backend, home) = engine_backend();
+    let table = supervision_wake(&backend, &home).subscriptions;
+    let busy = active_launch(&backend, &home, "busy").await;
     let id = uuid::Uuid::new_v4();
     let row = LeafSubscriptionRow {
         id,
         namespace: "flotilla".into(),
-        leaves: vec![leaf(LeafAddress::Convoy { name: "busy".into() }, ".status.phase", "Failed")],
+        leaves: vec![leaf(LeafAddress::Convoy { name: busy.clone() }, ".status.phase", "Failed")],
         watcher: LeafWatcher::WaitCaller { connection_id: uuid::Uuid::new_v4() },
         maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
         freshness_demand: None,
@@ -45,17 +61,14 @@ async fn leaf_wait_recovers_after_watch_overflow() {
     let mut watching = Box::pin(table.watch_row(row));
     // Poll through watch registration and snapshot loading, then deliberately
     // stop polling while writes outrun the bounded ring.
-    assert!(watching.as_mut().now_or_never().is_none());
-    let convoys = backend.using::<Convoy>("flotilla");
-    let mut object = convoys.get("busy").await.expect("convoy");
-    for index in 0..600 {
-        let spec = ConvoySpec::builder().workflow_ref(format!("workflow-{index}")).build();
-        object = convoys.update(&InputMeta::from(&object.metadata), &object.metadata.resource_version, &spec).await.expect("update");
-    }
-    convoys
-        .update_status("busy", &object.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() })
-        .await
-        .expect("fail convoy");
+    until("the wait loads", async || {
+        assert!(watching.as_mut().now_or_never().is_none());
+        table.inner.evaluations.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    tokio::task::unconstrained(overload_store(&backend)).await;
+    tokio::task::unconstrained(overload_store(&backend)).await;
+    home.end(&backend, &busy, ConvoyPhase::Failed).await;
     tokio::time::timeout(Duration::from_secs(2), watching).await.expect("wait recovers").expect("watch succeeds");
     assert!(!table.rows().await.iter().any(|row| row.id == id), "recovered wait fires and releases its row");
     assert!(table.inner.last_firings.lock().await.is_empty(), "one-shot wait releases firing state");
@@ -66,10 +79,10 @@ async fn leaf_wait_recovers_after_watch_overflow() {
 #[tokio::test(start_paused = true)]
 async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
     use futures::FutureExt;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let table = supervision_wake(&backend).subscriptions;
-    create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
-    let row = overload_row(uuid::Uuid::new_v4());
+    let (backend, home) = engine_backend();
+    let table = supervision_wake(&backend, &home).subscriptions;
+    let busy = active_launch(&backend, &home, "busy").await;
+    let row = overload_row(uuid::Uuid::new_v4(), &busy);
     let id = row.id;
     table.inner.last_firings.lock().await.insert(
         (id, row.leaves[0].clone()),
@@ -90,7 +103,7 @@ async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
         let watching_live = routing.watch_losses == routing.resyncs;
         drop(routing);
         if watching_live {
-            overload_convoy(&backend).await;
+            overload_store(&backend).await;
         }
         for _ in 0..2 {
             assert!(watching.as_mut().now_or_never().is_none());
@@ -108,12 +121,7 @@ async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
     assert_eq!(table.inner.last_firings.lock().await.len(), 1, "backoff retains firing history");
     assert!(table.inner.unable_since.lock().await.contains_key(&id), "backoff retains episode accounting");
     assert!(table.inner.stale_attention_reported.lock().await.contains(&id));
-    let convoys = backend.using::<Convoy>("flotilla");
-    let object = convoys.get("busy").await.expect("convoy");
-    convoys
-        .update_status("busy", &object.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() })
-        .await
-        .expect("fail convoy");
+    home.end(&backend, &busy, ConvoyPhase::Failed).await;
     tokio::time::timeout(Duration::from_secs(2), watching).await.expect("bounded recovery latency").expect("watch succeeds");
     assert!(table.rows().await.is_empty());
     assert_eq!(table.inner.change_requests.active_demands().await, 0, "completion releases demand");
@@ -127,27 +135,35 @@ async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
 #[tokio::test(start_paused = true)]
 async fn leaf_overload_backoff_is_cancelled_by_disconnect() {
     use futures::FutureExt;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let table = supervision_wake(&backend).subscriptions;
-    create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    let (backend, home) = engine_backend();
+    let table = supervision_wake(&backend, &home).subscriptions;
+    let busy = active_launch(&backend, &home, "busy").await;
     let connection_id = uuid::Uuid::new_v4();
-    let row = overload_row(connection_id);
+    let row = overload_row(connection_id, &busy);
     let id = row.id;
     overload_demand(&table, id).await;
     table.inner.rows.lock().await.insert(id, row.clone());
     let watching_table = table.clone();
     let mut watching = Box::pin(async move { watching_table.watch_row(row).await });
-    assert!(watching.as_mut().now_or_never().is_none());
+    until("the wait loads", async || {
+        assert!(watching.as_mut().now_or_never().is_none());
+        table.inner.evaluations.load(Ordering::SeqCst) >= 1
+    })
+    .await;
     // Disable cooperative yielding so the burst deterministically overruns the ring.
-    tokio::task::unconstrained(overload_convoy(&backend)).await;
+    tokio::task::unconstrained(overload_store(&backend)).await;
     for _ in 0..20 {
         tokio::task::yield_now().await;
     }
     assert_eq!(table.inner.routing.lock().await.watch_losses, 1);
     assert_eq!(table.inner.routing.lock().await.resyncs, 1, "first expiry resyncs without advancing time");
-    assert!(watching.as_mut().now_or_never().is_none());
+    until("the resync reloads the wait", async || {
+        assert!(watching.as_mut().now_or_never().is_none());
+        table.inner.evaluations.load(Ordering::SeqCst) >= 2
+    })
+    .await;
     // Disable cooperative yielding so the burst deterministically overruns the ring.
-    tokio::task::unconstrained(overload_convoy(&backend)).await;
+    tokio::task::unconstrained(overload_store(&backend)).await;
     for _ in 0..20 {
         tokio::task::yield_now().await;
     }
@@ -163,9 +179,13 @@ async fn leaf_overload_backoff_is_cancelled_by_disconnect() {
         tokio::task::yield_now().await;
     }
     assert_eq!(table.inner.routing.lock().await.resyncs, 2, "second expiry resyncs at 25ms");
-    assert!(watching.as_mut().now_or_never().is_none());
+    until("the second resync reloads the wait", async || {
+        assert!(watching.as_mut().now_or_never().is_none());
+        table.inner.evaluations.load(Ordering::SeqCst) >= 3
+    })
+    .await;
     // Disable cooperative yielding so the burst deterministically overruns the ring.
-    tokio::task::unconstrained(overload_convoy(&backend)).await;
+    tokio::task::unconstrained(overload_store(&backend)).await;
     for _ in 0..20 {
         tokio::task::yield_now().await;
     }
@@ -205,42 +225,50 @@ fn leaf_recovery_budget_resets_after_healthy_watch(tc: hegel::TestCase) {
     assert!(recovery.expired(Duration::from_secs(5)).is_zero());
 }
 
+/// Starts the coder's session, which needs input, as its hook reports. A seat with no live session
+/// reads Pending, launching, and a declared stall does not make it Stalled, so this is how the
+/// coder is unable.
+fn coder_needs_input(case: &Case) {
+    resume_coder(case);
+    let now = Utc::now();
+    let attention = TerminalAttention { state: TerminalAttentionState::NeedsInput, as_of: now, source: TerminalAttentionSource::Hook };
+    observe_session(&case.home, "resumed-coder", Some(attention));
+    observe_agent(&case.home, "resumed-coder", TerminalAttentionState::NeedsInput, TerminalAttentionSource::Hook, now);
+}
+
 #[tokio::test]
 async fn missing_resumed_session_does_not_suppress_supervision_forever() {
-    let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    flotilla_store::apply_status_patch(
-        &convoys,
-        "stalled-work",
-        &flotilla_resources::external_patches::resume_crew_work(
+    let case = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+    case.note(|status| {
+        flotilla_resources::external_patches::resume_crew_work(
             "work".into(),
             "coder".into(),
             Utc::now() - chrono::Duration::minutes(3),
             "Continue with the operator's guidance".into(),
             Some("lost-resume-brief".into()),
             ResumeIntent::Reopen,
-        ),
-    )
-    .await
-    .expect("resume declared stall");
-    let row_id = *wake.subscriptions.inner.rows.lock().await.keys().next().expect("actor row");
-    wake.subscriptions
-        .inner
-        .unable_since
-        .lock()
-        .await
-        .insert(row_id, (UnableEvidenceKey::Absent, Utc::now() - chrono::Duration::minutes(3)));
-    let source = convoys.get("stalled-work").await.expect("resumed convoy");
-    let governor = convoys.get("governor").await.expect("governor");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source), ("governor".into(), governor)]))
-        .await
-        .expect("judge missing session");
-    let status = convoys.get("stalled-work").await.expect("source").status.expect("status");
-    let requests = delivery.requests.lock().expect("supervisor requests");
-    assert!(!requests.is_empty(), "missing session should be supervised: {:?}", status.stalled);
-    assert_eq!(requests[0].convoy, "governor");
+        )
+        .apply(status)
+    })
+    .await;
+    // The resumed session is missing: the coder works in a session started since.
+    coder_needs_input(&case);
+    let governor = case.governor("governor");
+    let mut objects = case.objects().await;
+    objects.insert(governor.clone(), case.home.view(&case.backend, &governor).await);
+    case.caught_up(&case.wake).await;
+    case.wake.judge_stalls("flotilla", &objects).await.expect("judge missing session");
+    let status = case.status().await;
+    let requests = case.delivery.requests.lock().expect("supervisor requests");
+    assert!(
+        !requests.is_empty(),
+        "missing session should be supervised: {:?}, its coder {:?}",
+        status.stalled,
+        status.crew_work.get("work").and_then(|crew| crew.get("coder"))
+    );
+    assert_eq!(requests[0].convoy, governor);
     // Escalations retain the fully-qualified source crew, including its convoy.
-    assert_eq!(requests[0].sender, "wheelhouse/stalled-work/work/coder");
+    assert_eq!(requests[0].sender, format!("wheelhouse/{}/work/coder", case.work));
     assert_eq!(requests[0].expectation, flotilla_resources::MessageExpectation::Reply);
 }
 
@@ -249,29 +277,29 @@ async fn missing_resumed_session_does_not_suppress_supervision_forever() {
 #[tokio::test]
 async fn operator_only_supervision_is_consumed_once() {
     for policy in [Vec::new(), vec![SupervisionTarget::Operator]] {
-        let (backend, wake, delivery) = project_supervision_case(&[]).await;
-        let convoys = backend.using::<Convoy>("flotilla");
-        let source = convoys.get("stalled-work").await.expect("source");
-        let mut status = source.status.expect("status");
-        status.workflow_snapshot.as_mut().expect("snapshot").supervision = Some(policy);
-        convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("operator policy");
-        let mut previous_version = None;
-        for _ in 0..3 {
+        // The policy is the work's workflow's, frozen at admission.
+        let mut workflow = supervised_workflow();
+        workflow.supervision = Some(policy.clone());
+        let case = supervised_case(workflow, &[]).await;
+        coder_needs_input(&case);
+        let convoys = case.backend.using::<Convoy>("flotilla");
+        let mut notes = case.home.engine().memory().subscribe();
+        for tick in 0..3 {
             let objects =
                 convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
-            wake.sync_rows("flotilla", &objects).await.expect("rows");
-            wake.judge_stalls("flotilla", &objects).await.expect("judge operator policy");
-            let source = convoys.get("stalled-work").await.expect("source");
-            let stalled = source.status.expect("status").stalled.expect("stall");
-            assert!(stalled.supervision_exhausted);
+            case.wake.sync_rows("flotilla", &objects).await.expect("rows");
+            case.wake.judge_stalls("flotilla", &objects).await.expect("judge operator policy");
+            let stalled = case.status().await.stalled.expect("stall");
+            assert!(stalled.supervision_exhausted, "policy {policy:?} at tick {tick}: {stalled:?}");
             assert!(stalled.supervision_index.is_some());
             assert!(stalled.supervisor.is_none());
             assert_eq!(stalled.rung, StallRung::Operator);
-            if let Some(version) = previous_version {
-                assert_eq!(source.metadata.resource_version, version);
+            // The first tick consumes the ladder; later ones write nothing.
+            let changed = notes_changed(&mut notes);
+            if tick > 0 {
+                assert!(!changed, "tick {tick} rewrote the consumed condition");
             }
-            previous_version = Some(source.metadata.resource_version);
-            assert!(delivery.requests.lock().expect("deliveries").is_empty());
+            assert!(case.delivery.requests.lock().expect("deliveries").is_empty());
         }
     }
 }
@@ -288,7 +316,7 @@ async fn sqlite_leaf_subscription_contract() {
 
 #[tokio::test]
 async fn diagnostics_retain_the_last_firing_for_an_armed_reconciler_row() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let (backend, home) = engine_backend();
     let (event_tx, _) = broadcast::channel(4);
     let refresher = ChangeRequestRefresher::new(
         "fleet".to_string(),
@@ -297,7 +325,7 @@ async fn diagnostics_retain_the_last_firing_for_an_armed_reconciler_row() {
         Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) }),
         flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    let table = served_table(backend, broadcast_test_sink(event_tx), refresher);
+    let table = engine_table(backend, &home, broadcast_test_sink(event_tx), refresher);
     let id = uuid::Uuid::new_v4();
     let fired_leaf = leaf(LeafAddress::Convoy { name: "held".to_string() }, ".status.phase", "Landed");
     table.inner.rows.lock().await.insert(
@@ -349,7 +377,7 @@ fn unchanged_subscription_decisions_log_once() {
 
 #[tokio::test]
 async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let (backend, home) = engine_backend();
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
     let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
@@ -359,7 +387,7 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
         stale_after: Duration::from_secs(60),
     };
     let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
-    let table = served_table(backend.clone(), broadcast_test_sink(event_tx), refresher);
+    let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
     let repo_ref = RepositoryKey("repo".to_string());
     let spec = ConvoySpec::builder()
         .workflow_ref("workflow".to_string())
@@ -373,40 +401,14 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
             .build()])
         .change_request(BoundChangeRequest::builder().id("1391".to_string()).repository_ref(repo_ref).title("custom".to_string()).build())
         .build();
-    let mut meta = InputMeta::builder().name("custom".to_string()).finalizers(vec!["flotilla.work/convoy-teardown".to_string()]).build();
-    meta.set_lifecycle_authority(LifecycleAuthority::Managed);
+    let exit = ExitDeclaration::Table(indexmap::IndexMap::from([(
+        "shipped".to_string(),
+        flotilla_resources::parse_leaf_template("$cr.state == merged").expect("custom leaf template"),
+    )]));
     let convoys = backend.clone().using::<Convoy>("flotilla");
-    let created = convoys.create(&meta, &spec).await.expect("create custom-exit convoy");
-    let status = ConvoyStatus {
-        phase: ConvoyPhase::Landing,
-        observed_workflow_ref: Some("workflow".to_string()),
-        workflow_snapshot: Some(WorkflowSnapshot {
-            cascade: None,
-            stall_nudges: Default::default(),
-            supervision: None,
-            exit: Some(ExitDeclaration::Table(indexmap::IndexMap::from([(
-                "shipped".to_string(),
-                flotilla_resources::parse_leaf_template("$cr.state == merged").expect("custom leaf template"),
-            )]))),
-            turn_delivery: Default::default(),
-            vessels: Vec::new(),
-        }),
-        work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
-        ..Default::default()
-    };
-    convoys.update_status("custom", &created.metadata.resource_version, &status).await.expect("mark custom convoy Landing");
+    let custom = landing_launch(&backend, &home, "custom", spec, exit).await;
 
-    let controller = tokio::spawn(
-        ControllerLoop {
-            primary: convoys.clone(),
-            secondaries: vec![table.reconciler_wake_watch()],
-            reconciler: ConvoyReconciler::new()
-                .with_lifecycle_reads(agent_reads())
-                .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
+    let controller = convoy_controller(&backend, &home, &table, Some(cadence.stale_after));
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if !table.rows().await.is_empty() {
@@ -421,7 +423,7 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
     source.merged.store(true, Ordering::SeqCst);
     let settled = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let convoy = convoys.get("custom").await.expect("convoy");
+            let convoy = convoys.get(&custom).await.expect("convoy");
             let status = convoy.status.expect("status");
             if status.phase == ConvoyPhase::Landed {
                 break status;
@@ -458,31 +460,30 @@ async fn routing_count_contract(backend: ResourceBackend, changes: &[usize]) {
     routing_contract(backend, changes, false).await;
 }
 
-// #3141 / #3120: a warm leaf wake must evaluate from resident subjects.
-// Today each affected row reloads its addressed objects; keep the zero budget
-// running in CI as an expected failure until the resident redesign lands.
+// #3141 / #3120: a warm leaf wake must evaluate from resident subjects. Each
+// affected row still reloads its addressed launches, but from the engine's held
+// Convoy views (#3108), so the durable store is not read.
 #[tokio::test]
-#[should_panic(expected = "zero durable-store read budget exceeded")]
-async fn leaf_wake_zero_reads_pending_3120() {
+async fn leaf_wake_zero_reads() {
     routing_contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")), &[0, 1, 63], true).await;
 }
 
-// #3141 / #3120: attaching a wait to an already warm leaf engine should
-// use resident subjects; today even an already watched address is re-read.
+// #3141 / #3120: attaching a wait to an already warm leaf engine should use
+// resident subjects. The re-read of an already watched launch is served by the
+// engine's held Convoy views (#3108), not the durable store.
 #[tokio::test]
-#[should_panic(expected = "zero durable-store read budget exceeded")]
-async fn leaf_warm_subscription_zero_reads_pending_3120() {
+async fn leaf_warm_subscription_zero_reads() {
     use flotilla_store_testkit::{ReadCountsBackendExt, ZeroReadGuard};
     use futures::FutureExt;
     let writer = ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"));
-    create_convoy(&writer, "watched", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    let home = EngineHome::install(&writer, "flotilla", "test-host");
+    let watched = active_launch(&writer, &home, "watched").await;
     let counted = writer.with_read_counts();
-    let table = supervision_wake(&counted).subscriptions;
+    let table = supervision_wake(&counted, &home).subscriptions;
     let mut watches = Vec::new();
     for index in 0..2 {
         let guard = ZeroReadGuard::after_warm_up(&counted);
-        let mut row = overload_row(uuid::Uuid::new_v4());
-        row.leaves = vec![leaf(LeafAddress::Convoy { name: "watched".into() }, ".status.phase", "Failed")];
+        let row = overload_row(uuid::Uuid::new_v4(), &watched);
         table.inner.rows.lock().await.insert(row.id, row.clone());
         let mut watching = Box::pin(table.watch_row(row));
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -504,9 +505,15 @@ async fn leaf_warm_subscription_zero_reads_pending_3120() {
 async fn routing_contract(backend: ResourceBackend, changes: &[usize], zero_reads: bool) {
     use flotilla_store_testkit::{ReadCountsBackendExt, ZeroReadGuard};
     use futures::FutureExt;
+    let home = EngineHome::install(&backend, "flotilla", "test-host");
     let counted = backend.clone().with_read_counts();
-    for index in 0..64 {
-        create_convoy(&backend, &format!("object-{index}"), ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    // Only the objects the waits address or the changes touch are launched: the others would
+    // never change.
+    let mut objects = BTreeMap::new();
+    for index in [0, 1, 2].iter().chain(changes) {
+        if !objects.contains_key(index) {
+            objects.insert(*index, active_launch(&backend, &home, &format!("object-{index}")).await);
+        }
     }
     let (events, mut fires) = broadcast::channel(16);
     let refresher = ChangeRequestRefresher::new(
@@ -516,21 +523,18 @@ async fn routing_contract(backend: ResourceBackend, changes: &[usize], zero_read
         Arc::new(UnavailableChangeRequests),
         Default::default(),
     );
-    let table = served_table(counted.clone(), broadcast_test_sink(events), refresher);
+    let table = engine_table(counted.clone(), &home, broadcast_test_sink(events), refresher);
     let mut watchers = Vec::new();
     let mut ids = Vec::new();
     for index in [0, 1, 2, 0] {
-        let mut row = overload_row(uuid::Uuid::new_v4());
-        row.leaves = vec![leaf(LeafAddress::Convoy { name: format!("object-{index}") }, ".status.phase", "Failed")];
+        let mut row = overload_row(uuid::Uuid::new_v4(), &objects[&index]);
         // Multiple conditions on one object share a single store dependency.
         let mut another = row.leaves[0].clone();
         another.literal = "Landed".into();
         row.leaves.push(another);
         ids.push(row.id);
         table.inner.rows.lock().await.insert(row.id, row.clone());
-        let mut watching = Box::pin(table.watch_row(row));
-        assert!(watching.as_mut().now_or_never().is_none());
-        watchers.push(watching);
+        watchers.push(Box::pin(table.watch_row(row)));
     }
     tokio::time::timeout(Duration::from_secs(2), async {
         while table.inner.evaluations.load(Ordering::SeqCst) < 4 {
@@ -549,17 +553,7 @@ async fn routing_contract(backend: ResourceBackend, changes: &[usize], zero_read
         let previous_events = table.inner.routing.lock().await.events_processed;
         let before_evaluations = table.inner.evaluations.load(Ordering::SeqCst);
         let before_reads = table.inner.store_reads.load(Ordering::SeqCst);
-        let convoys = backend.using::<Convoy>("flotilla");
-        let name = format!("object-{index}");
-        let object = convoys.get(&name).await.expect("convoy");
-        convoys
-            .update(
-                &InputMeta::from(&object.metadata),
-                &object.metadata.resource_version,
-                &ConvoySpec::builder().workflow_ref(format!("changed-{step}")).build(),
-            )
-            .await
-            .expect("event");
+        touch(&backend, &home, &objects[index]).await;
         router_processed(&table, previous_events).await;
         let touched = if *index == 0 { 2 } else { usize::from(*index < 3) };
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -582,28 +576,13 @@ async fn routing_contract(backend: ResourceBackend, changes: &[usize], zero_read
             guard.assert_zero("leaf wake and subscription delivery");
         }
     }
-    // A matching name in another namespace is not an addressed object.
-    let other = backend.using::<Convoy>("other");
-    other
-        .create(&InputMeta::builder().name("object-0".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-        .await
-        .expect("other namespace");
-    tokio::task::yield_now().await;
-    let before = table.inner.evaluations.load(Ordering::SeqCst);
-    for watching in &mut watchers {
-        assert!(watching.as_mut().now_or_never().is_none());
-    }
-    assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), before);
-    // Exactly one wait fires per addressed object, retaining subscription identity.
+    // Exactly one wait fires per addressed object, retaining subscription identity. The second
+    // wait on object-0 fires from the failure the first one heard.
     for (position, watching) in watchers.iter_mut().enumerate() {
         let index = [0, 1, 2, 0][position];
-        let convoys = backend.using::<Convoy>("flotilla");
-        let name = format!("object-{index}");
-        let object = convoys.get(&name).await.expect("convoy");
-        convoys
-            .update_status(&name, &object.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() })
-            .await
-            .expect("fail");
+        if position < 3 {
+            home.end(&backend, &objects[&index], ConvoyPhase::Failed).await;
+        }
         tokio::time::timeout(Duration::from_secs(2), watching).await.expect("fires").expect("watch");
         let DaemonEvent::LeafFired(fire) = fires.try_recv().expect("one fire") else { panic!("leaf fire") };
         assert_eq!(fire.subscription_id, ids[position]);
@@ -628,33 +607,31 @@ async fn router_processed(table: &LeafSubscriptionTable, previous: usize) {
 #[tokio::test]
 async fn leaf_routing_missing_work_and_restart() {
     use futures::FutureExt;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let table = supervision_wake(&backend).subscriptions;
-    let mut row = overload_row(uuid::Uuid::new_v4());
-    row.leaves = vec![leaf(LeafAddress::Work { convoy: "missing".into(), work: "work".into() }, ".status.phase", "Complete")];
+    let (backend, home) = engine_backend();
+    let table = supervision_wake(&backend, &home).subscriptions;
+    // The launch is reserved, so its name is known, but not yet admitted.
+    let missing = home.reserve("missing").await;
+    let mut row = overload_row(uuid::Uuid::new_v4(), &missing);
+    row.leaves = vec![leaf(LeafAddress::Work { convoy: missing.clone(), work: "work".into() }, ".status.phase", "Complete")];
     table.inner.rows.lock().await.insert(row.id, row.clone());
     let mut watching = Box::pin(table.watch_row(row.clone()));
-    assert!(watching.as_mut().now_or_never().is_none(), "absent convoy is Unknown");
-    create_convoy(&backend, "missing", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    until("the absent convoy loads", async || {
+        assert!(watching.as_mut().now_or_never().is_none(), "absent convoy is Unknown");
+        table.inner.evaluations.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    home.admit_reserved(&missing, convoy_spec(), ledger_owed()).await;
     router_processed(&table, 0).await;
-    assert!(watching.as_mut().now_or_never().is_none(), "absent work is Unknown");
-    let convoys = backend.using::<Convoy>("flotilla");
-    let object = convoys.get("missing").await.expect("convoy");
-    convoys
-        .update_status(
-            "missing",
-            &object.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Complete).build())]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("complete work");
+    until("the admitted convoy loads", async || {
+        assert!(watching.as_mut().now_or_never().is_none(), "work not yet complete");
+        table.inner.evaluations.load(Ordering::SeqCst) >= 2
+    })
+    .await;
+    // The work completes as its coder's promises are kept.
+    home.keep(&backend, &missing, "work", "coder").await;
     tokio::time::timeout(Duration::from_secs(2), watching).await.expect("parent convoy event arrives").expect("Work leaf fires");
     assert!(table.rows().await.is_empty());
-    let restarted = supervision_wake(&backend).subscriptions;
+    let restarted = supervision_wake(&backend, &home).subscriptions;
     row.id = uuid::Uuid::new_v4();
     restarted.inner.rows.lock().await.insert(row.id, row.clone());
     restarted.watch_row(row).await.expect("restart fires from current level");
@@ -668,27 +645,30 @@ async fn leaf_routing_missing_work_and_restart() {
 #[tokio::test]
 async fn leaf_resync_evaluates_each_row_once_then_routes_again() {
     use futures::FutureExt;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    for name in ["busy", "object-0", "object-1"] {
-        create_convoy(&backend, name, ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
-    }
-    let table = supervision_wake(&backend).subscriptions;
+    let (backend, home) = engine_backend();
+    let busy = active_launch(&backend, &home, "busy").await;
+    let objects = [active_launch(&backend, &home, "object-0").await, active_launch(&backend, &home, "object-1").await];
+    let table = supervision_wake(&backend, &home).subscriptions;
     let mut watchers = Vec::new();
     let mut connections = Vec::new();
-    for index in 0..2 {
+    for object in &objects {
         let connection = uuid::Uuid::new_v4();
         connections.push(connection);
-        let mut row = overload_row(connection);
-        row.leaves = vec![leaf(LeafAddress::Convoy { name: format!("object-{index}") }, ".status.phase", "Failed")];
+        let row = overload_row(connection, object);
         table.inner.rows.lock().await.insert(row.id, row.clone());
-        let mut watching = Box::pin(table.watch_row(row));
-        assert!(watching.as_mut().now_or_never().is_none());
-        watchers.push(watching);
+        watchers.push(Box::pin(table.watch_row(row)));
     }
+    until("both waits load", async || {
+        for watching in &mut watchers {
+            assert!(watching.as_mut().now_or_never().is_none());
+        }
+        table.inner.evaluations.load(Ordering::SeqCst) >= 2
+    })
+    .await;
     assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 2);
     // No task can consume the store's bounded watch ring during this burst.
-    tokio::task::unconstrained(overload_convoy(&backend)).await;
-    tokio::task::unconstrained(overload_convoy(&backend)).await;
+    tokio::task::unconstrained(overload_store(&backend)).await;
+    tokio::task::unconstrained(overload_store(&backend)).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         while table.inner.routing.lock().await.resyncs == 0 {
             tokio::task::yield_now().await;
@@ -696,22 +676,17 @@ async fn leaf_resync_evaluates_each_row_once_then_routes_again() {
     })
     .await
     .expect("shared router recovers");
-    for watching in &mut watchers {
-        assert!(watching.as_mut().now_or_never().is_none());
-    }
+    until("the resync reloads both waits", async || {
+        for watching in &mut watchers {
+            assert!(watching.as_mut().now_or_never().is_none());
+        }
+        table.inner.evaluations.load(Ordering::SeqCst) >= 4
+    })
+    .await;
     assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 4, "one resync evaluation per row");
     assert_eq!(table.inner.store_reads.load(Ordering::SeqCst), 4, "one addressed read per evaluation");
     let previous = table.inner.routing.lock().await.events_processed;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let object = convoys.get("busy").await.expect("busy");
-    convoys
-        .update(
-            &InputMeta::from(&object.metadata),
-            &object.metadata.resource_version,
-            &ConvoySpec::builder().workflow_ref("after-resync".into()).build(),
-        )
-        .await
-        .expect("unrelated event");
+    touch(&backend, &home, &busy).await;
     router_processed(&table, previous).await;
     for watching in &mut watchers {
         assert!(watching.as_mut().now_or_never().is_none());
@@ -732,31 +707,30 @@ async fn leaf_resync_evaluates_each_row_once_then_routes_again() {
 #[tokio::test]
 async fn slow_leaf_watch_open_does_not_block_other_namespaces() {
     use futures::FutureExt;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
-    let table = supervision_wake(&backend).subscriptions;
+    let (backend, home) = engine_backend();
+    let busy = active_launch(&backend, &home, "busy").await;
+    let table = supervision_wake(&backend, &home).subscriptions;
     let connection = uuid::Uuid::new_v4();
-    let row = overload_row(connection);
+    let row = overload_row(connection, &busy);
     table.inner.rows.lock().await.insert(row.id, row.clone());
     let mut watching = Box::pin(table.watch_row(row));
-    assert!(watching.as_mut().now_or_never().is_none());
-    let mut slow_row = overload_row(uuid::Uuid::new_v4());
+    until("the wait loads", async || {
+        assert!(watching.as_mut().now_or_never().is_none());
+        table.inner.evaluations.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    let mut slow_row = overload_row(uuid::Uuid::new_v4(), &busy);
     slow_row.namespace = "slow-store".into();
     let previous = table.inner.routing.lock().await.events_processed;
     let mut opening = Box::pin(table.register_routing_with(&slow_row, std::future::pending()));
     assert!(opening.as_mut().now_or_never().is_none());
-    let convoys = backend.using::<Convoy>("flotilla");
-    let object = convoys.get("busy").await.expect("convoy");
-    convoys
-        .update(
-            &InputMeta::from(&object.metadata),
-            &object.metadata.resource_version,
-            &ConvoySpec::builder().workflow_ref("while-other-store-stalls".into()).build(),
-        )
-        .await
-        .expect("update");
+    touch(&backend, &home, &busy).await;
     router_processed(&table, previous).await;
-    assert!(watching.as_mut().now_or_never().is_none());
+    until("the touched wait reloads", async || {
+        assert!(watching.as_mut().now_or_never().is_none());
+        table.inner.evaluations.load(Ordering::SeqCst) >= 2
+    })
+    .await;
     assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 2);
     tokio::time::timeout(Duration::from_secs(2), table.unsubscribe_connection(connection)).await.expect("independent cancellation");
     watching.await.expect("watcher exits");
@@ -769,9 +743,10 @@ async fn slow_leaf_watch_open_does_not_block_other_namespaces() {
 #[tokio::test]
 async fn racing_leaf_openers_share_router_and_remove_only_their_addresses() {
     use futures::FutureExt;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let table = supervision_wake(&backend).subscriptions;
-    let row = overload_row(uuid::Uuid::new_v4());
+    let (backend, home) = engine_backend();
+    let table = supervision_wake(&backend, &home).subscriptions;
+    let busy = home.reserve("busy").await;
+    let row = overload_row(uuid::Uuid::new_v4(), &busy);
     let mut sibling = row.clone();
     sibling.id = uuid::Uuid::new_v4();
     let permit = tokio::sync::Notify::new();
@@ -784,7 +759,7 @@ async fn racing_leaf_openers_share_router_and_remove_only_their_addresses() {
     let (_, mut sibling_changes) = table.register_routing(&sibling).await.expect("live router");
     permit.notify_one();
     let (_, mut changes) = opening.await.expect("join winning router");
-    create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    home.admit_reserved(&busy, convoy_spec(), ledger_owed()).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         changes.changed().await.expect("first row receives event");
         sibling_changes.changed().await.expect("sibling receives event");
@@ -808,10 +783,10 @@ async fn racing_leaf_openers_share_router_and_remove_only_their_addresses() {
 #[tokio::test(start_paused = true)]
 async fn leaf_targeted_reads_retry_without_losing_wait_identity() {
     use futures::FutureExt;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() }).await;
-    let table = supervision_wake(&backend).subscriptions;
-    let row = overload_row(uuid::Uuid::new_v4());
+    let (backend, home) = engine_backend();
+    let busy = launch_at(&backend, &home, "busy", ledger_owed(), ConvoyPhase::Failed).await;
+    let table = supervision_wake(&backend, &home).subscriptions;
+    let row = overload_row(uuid::Uuid::new_v4(), &busy);
     let id = row.id;
     overload_demand(&table, id).await;
     table.inner.rows.lock().await.insert(id, row.clone());
@@ -855,10 +830,10 @@ async fn leaf_targeted_reads_retry_without_losing_wait_identity() {
 // demand immediately; no read retries occur after cancellation.
 #[tokio::test(start_paused = true)]
 async fn leaf_read_backoff_is_cancelled_by_disconnect() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let table = supervision_wake(&backend).subscriptions;
+    let (backend, home) = engine_backend();
+    let table = supervision_wake(&backend, &home).subscriptions;
     let connection = uuid::Uuid::new_v4();
-    let row = overload_row(connection);
+    let row = overload_row(connection, "busy#1");
     let id = row.id;
     overload_demand(&table, id).await;
     table.inner.rows.lock().await.insert(id, row.clone());
@@ -878,6 +853,7 @@ async fn leaf_read_backoff_is_cancelled_by_disconnect() {
     });
     let abort = task.abort_handle();
     table.inner.tasks.lock().await.insert(id, task);
+    until("the read fails twice", async || attempts.load(Ordering::SeqCst) >= 2).await;
     for _ in 0..20 {
         tokio::task::yield_now().await;
     }

@@ -172,11 +172,12 @@ impl observation::ChangeRequestObservationSource for CountingChangeRequests {
     }
 }
 
-fn overload_row(connection_id: uuid::Uuid) -> LeafSubscriptionRow {
+/// A caller's wait, on connection `connection_id`, for launch `launch` to fail.
+fn overload_row(connection_id: uuid::Uuid, launch: &str) -> LeafSubscriptionRow {
     LeafSubscriptionRow {
         id: uuid::Uuid::new_v4(),
         namespace: "flotilla".into(),
-        leaves: vec![leaf(LeafAddress::Convoy { name: "busy".into() }, ".status.phase", "Failed")],
+        leaves: vec![leaf(LeafAddress::Convoy { name: launch.into() }, ".status.phase", "Failed")],
         watcher: LeafWatcher::WaitCaller { connection_id },
         maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
         freshness_demand: None,
@@ -203,19 +204,35 @@ async fn overload_demand(table: &LeafSubscriptionTable, id: uuid::Uuid) {
     assert_eq!(table.inner.change_requests.active_demands().await, 1);
 }
 
-async fn overload_convoy(backend: &ResourceBackend) {
-    let convoys = backend.using::<Convoy>("flotilla");
-    let mut object = convoys.get("busy").await.expect("convoy");
+/// 300 writes to one change-request record, outrunning the store's bounded watch ring. The
+/// engine's launches reach the router through their own feed, which conflates and never
+/// overflows, so the router's watch is lost through the store's kinds it also watches.
+async fn overload_store(backend: &ResourceBackend) {
+    let records = backend.using::<ChangeRequest>("flotilla");
+    let name = cr_name("github.com", "org/load", 2);
+    let spec = |authority: String| {
+        flotilla_resources::ChangeRequestSpec::builder()
+            .service("github.com".into())
+            .scope("org/load".into())
+            .number(2)
+            .observing_authority(authority)
+            .build()
+    };
+    let mut object = match records.get(&name).await {
+        Ok(object) => object,
+        Err(_) => records.create(&InputMeta::builder().name(name.clone()).build(), &spec("load".into())).await.expect("load record"),
+    };
     for index in 0..300 {
-        object = convoys
-            .update(
-                &InputMeta::from(&object.metadata),
-                &object.metadata.resource_version,
-                &ConvoySpec::builder().workflow_ref(format!("load-{index}")).build(),
-            )
+        object = records
+            .update(&InputMeta::from(&object.metadata), &object.metadata.resource_version, &spec(format!("load-{index}")))
             .await
             .expect("overload write");
     }
+}
+
+/// Changes launch `launch` as its view reads, through a note no leaf reads: an event on it.
+async fn touch(backend: &ResourceBackend, home: &EngineHome, launch: &str) {
+    home.note(backend, launch, |status| status.branch_subject_scan_at = Some(Utc::now())).await;
 }
 
 fn convoy_spec() -> ConvoySpec {
@@ -1301,6 +1318,44 @@ async fn launch_at(backend: &ResourceBackend, home: &EngineHome, name: &str, sta
     launch
 }
 
+/// Admits `name` with `spec` and exit `exit`, its coder owing a decision ledger, starts the
+/// coder, and keeps its ledger: the launch is Landing. Returns the launch.
+async fn landing_launch(backend: &ResourceBackend, home: &EngineHome, name: &str, spec: ConvoySpec, exit: ExitDeclaration) -> String {
+    let mut status = ledger_owed();
+    status.workflow_snapshot.as_mut().expect("workflow").exit = Some(exit);
+    let launch = home.admit(name, spec, status).await;
+    let vessel = home.vessel(&launch, "work", "env");
+    let session = format!("{}-coder", launch.replace('#', "-"));
+    home.seat(backend, &launch, (&vessel, "work"), ("coder", &session), CrewWorkPhase::Working).await;
+    home.keep(backend, &launch, "work", "coder").await;
+    assert_eq!(home.view(backend, &launch).await.status.expect("status").phase, ConvoyPhase::Landing);
+    launch
+}
+
+/// The convoy reconciler over `home`'s engine, woken by `table`, observing change requests
+/// no older than `stale_after` when given it.
+fn convoy_controller(
+    backend: &ResourceBackend,
+    home: &EngineHome,
+    table: &LeafSubscriptionTable,
+    stale_after: Option<Duration>,
+) -> tokio::task::JoinHandle<Result<(), ResourceError>> {
+    let reconciler = ConvoyReconciler::new().with_lifecycle_reads(home.reads()).with_engine(home.path());
+    let reconciler = match stale_after {
+        Some(stale_after) => reconciler.with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), stale_after),
+        None => reconciler,
+    };
+    tokio::spawn(
+        ControllerLoop {
+            primary: backend.using::<Convoy>("flotilla"),
+            secondaries: vec![table.reconciler_wake_watch()],
+            reconciler,
+            backend: backend.clone(),
+        }
+        .run(),
+    )
+}
+
 /// The coder of launch `launch` submits the decision ledger it owes, at `reference`, at `at`.
 async fn submit_ledger(home: &EngineHome, backend: &ResourceBackend, launch: &str, reference: &str, at: DateTime<Utc>) {
     use flotilla_resources::promises::{owned, PromiseKind, PromiseOperation, Submission};
@@ -1741,7 +1796,6 @@ mod change_request_authority;
 mod settlement;
 #[cfg(any())]
 mod stalls_supervision;
-#[cfg(any())]
 mod subscriptions;
 mod turn_delivery;
 

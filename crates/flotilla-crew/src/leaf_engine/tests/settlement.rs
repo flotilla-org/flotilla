@@ -1,40 +1,8 @@
 use super::*;
 
-/// Admits `name` with `spec` and the standard exit table, its coder owing a decision ledger,
-/// starts the coder, and keeps its ledger: the launch is Landing. Returns the launch.
-async fn landing_launch(backend: &ResourceBackend, home: &EngineHome, name: &str, spec: ConvoySpec) -> String {
-    let mut status = ledger_owed();
-    status.workflow_snapshot.as_mut().expect("workflow").exit = Some(ExitDeclaration::standard_table());
-    let launch = home.admit(name, spec, status).await;
-    let vessel = home.vessel(&launch, "work", "env");
-    let session = format!("{}-coder", launch.replace('#', "-"));
-    home.seat(backend, &launch, (&vessel, "work"), ("coder", &session), CrewWorkPhase::Working).await;
-    home.keep(backend, &launch, "work", "coder").await;
-    assert_eq!(home.view(backend, &launch).await.status.expect("status").phase, ConvoyPhase::Landing);
-    launch
-}
-
-/// The convoy reconciler over `home`'s engine, as the daemon runs it, woken by `table`.
-fn convoy_controller(
-    backend: &ResourceBackend,
-    home: &EngineHome,
-    table: &LeafSubscriptionTable,
-    stale_after: Option<Duration>,
-) -> tokio::task::JoinHandle<Result<(), ResourceError>> {
-    let reconciler = ConvoyReconciler::new().with_lifecycle_reads(home.reads()).with_engine(home.path());
-    let reconciler = match stale_after {
-        Some(stale_after) => reconciler.with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), stale_after),
-        None => reconciler,
-    };
-    tokio::spawn(
-        ControllerLoop {
-            primary: backend.using::<Convoy>("flotilla"),
-            secondaries: vec![table.reconciler_wake_watch()],
-            reconciler,
-            backend: backend.clone(),
-        }
-        .run(),
-    )
+/// [`landing_launch`] with the standard exit table.
+async fn standard_landing(backend: &ResourceBackend, home: &EngineHome, name: &str, spec: ConvoySpec) -> String {
+    landing_launch(backend, home, name, spec, ExitDeclaration::standard_table()).await
 }
 
 #[tokio::test]
@@ -64,7 +32,7 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
         .change_request(BoundChangeRequest::builder().id("1364".to_string()).repository_ref(repo_ref).title("wake".to_string()).build())
         .build();
     // The launch is Landing before the watcher boots.
-    let launch = landing_launch(&backend, &home, "wake", spec).await;
+    let launch = standard_landing(&backend, &home, "wake", spec).await;
     let convoys = backend.clone().using::<Convoy>("flotilla");
 
     let controller = convoy_controller(&backend, &home, &table, Some(cadence.stale_after));
@@ -178,7 +146,7 @@ async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
     );
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
     let convoys = backend.clone().using::<Convoy>("flotilla");
-    let launch = landing_launch(&backend, &home, "no-cr", convoy_spec()).await;
+    let launch = standard_landing(&backend, &home, "no-cr", convoy_spec()).await;
     let controller = convoy_controller(&backend, &home, &table, None);
 
     let status = tokio::time::timeout(Duration::from_secs(2), async {
@@ -231,7 +199,7 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
     let convoys = backend.clone().using::<Convoy>("flotilla");
     // The crew's work is kept, and the launch Landing, before its PR is bound: an operator links
     // it as what the launch produces.
-    let launch = landing_launch(&backend, &home, "adopt-late", spec).await;
+    let launch = standard_landing(&backend, &home, "adopt-late", spec).await;
     let pr = flotilla_protocol::Subject {
         kind: flotilla_protocol::SubjectKind::ChangeRequest,
         source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
@@ -357,7 +325,7 @@ fn retracted_unlinked_submission_does_not_recreate_observation(tc: hegel::TestCa
             .build()];
         if other_holder {
             let spec = ConvoySpec::builder().workflow_ref("single-agent".into()).build();
-            let other = landing_launch(&backend, &home, "other-holder", spec).await;
+            let other = standard_landing(&backend, &home, "other-holder", spec).await;
             let convoy = convoys.get(&other).await.unwrap();
             home.engine().link(&convoy, &subject, SubjectDiscoverySource::Operator, "operator").await.expect("the other holder's PR");
             // As the refresher records a launch's link: by its project, with no role.
