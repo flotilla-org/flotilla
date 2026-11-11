@@ -1023,7 +1023,13 @@ fn work_underway(engine: &flotilla_provisioning_testkit::EngineFixture, convoy: 
 /// Crew `role`'s agent session `session` in `vessel`, launched and ready as pool session
 /// `pool_session` with its harness recorded. A crew that starts eagerly, or whose task is
 /// delivered, then reads Working (#3108). Returns the session's launch.
-fn crew_at_work(engine: &flotilla_provisioning_testkit::EngineFixture, vessel: &str, role: &str, session: &str, pool_session: &str) -> String {
+fn crew_at_work(
+    engine: &flotilla_provisioning_testkit::EngineFixture,
+    vessel: &str,
+    role: &str,
+    session: &str,
+    pool_session: &str,
+) -> String {
     let launch = engine.terminals.request(&crew_session_request(session, vessel, role, "code", "crew-environment", "fake-terminals"));
     let facts = flotilla_resources::terminal_records::TerminalLaunchFacts {
         agent: Some(flotilla_resources::terminal_records::AgentLaunch {
@@ -9461,7 +9467,9 @@ async fn operator_forced_completion_settles_a_ledger_less_crew() {
     // carry the verdict's principal as the old completion override did (#3108).
     let coder = &status.promises["work"]["coder"];
     assert!(!coder.is_empty());
-    assert!(coder.iter().all(|promise| promise.state == flotilla_resources::promises::PromiseState::Kept && promise.submissions.is_empty()));
+    assert!(coder
+        .iter()
+        .all(|promise| promise.state == flotilla_resources::promises::PromiseState::Kept && promise.submissions.is_empty()));
 }
 
 async fn run_identity_command(daemon: &InProcessDaemon, action: CommandAction, selector: RepoSelector) -> CommandValue {
