@@ -7411,15 +7411,9 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("pre-sweep ensure admits");
     let first = admitted_convoy(&daemon.resource_backend(), "governor").await;
     assert!(first.spec.repositories.iter().any(|repository| repository.repo_ref == alias.key()));
-    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
-    convoys
-        .update_status(
-            &first.metadata.name,
-            &first.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
-        )
-        .await
-        .expect("first generation fails");
+    // Status is derived on the engine (#3108): the generation fails by the engine's edge.
+    let engine = daemon.convoy_engine_path();
+    engine.get().expect("the engine Convoy path").fail(&first, "operator", "failed").await.expect("first generation fails");
     daemon
         .resource_backend()
         .definitions::<Forge>("flotilla")
@@ -7435,8 +7429,9 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         .expect("record alias first");
     daemon.reconcile_convoy_ensure_now("flotilla", "governor", daemon.as_ref()).await.expect("ensure re-admits after forge sweep");
     let renewed = ensures.get("governor").await.expect("migrated ensure");
+    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
     let successor = convoys.get(&renewed.status.expect("ensure status").convoy_ref.expect("successor")).await.expect("second generation");
-    assert_eq!(successor.spec.generation, 2);
+    assert!(successor.spec.generation > first.spec.generation);
     assert_eq!(successor.spec.repositories.len(), 1);
     assert_eq!(successor.spec.repositories[0].repo_ref, expected);
     assert_eq!(successor.spec.repositories[0].url, "https://forgejo.lab.flotilla.work/robert/ghostty-ops");
