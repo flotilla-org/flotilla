@@ -1791,7 +1791,6 @@ fn engine_table(
     LeafSubscriptionTable::new(backend, event_sink, change_requests).with_lifecycle_reads(home.reads()).with_convoy_engine(home.path())
 }
 
-#[cfg(any())]
 mod change_request_authority;
 mod settlement;
 #[cfg(any())]

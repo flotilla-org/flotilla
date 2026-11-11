@@ -44,6 +44,11 @@ impl EngineHome {
         Self { engine, convoys, agents, namespace: namespace.to_owned(), host: home.to_owned(), service, _dir: dir }
     }
 
+    /// The home's decided store: another home's log is replicated into it as a peer's arrives.
+    pub fn service(&self) -> &Arc<Service> {
+        &self.service
+    }
+
     /// The Convoy path, as the crew and its leaf subscriptions take it.
     pub fn path(&self) -> EngineConvoyPath {
         self.convoys.path()
