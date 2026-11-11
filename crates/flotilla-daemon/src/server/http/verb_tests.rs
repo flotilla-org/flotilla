@@ -21,7 +21,7 @@ use flotilla_protocol::{
     table::{Message, Row},
     CallerProcess, CommandCaller, PrincipalRef,
 };
-use flotilla_resources::{Convoy, ConvoySpec, InputMeta, PROJECT_LABEL, ROLE_LABEL};
+use flotilla_resources::{ConvoySpec, PROJECT_LABEL, ROLE_LABEL};
 use flotilla_schema::{Table, Verb};
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -479,17 +479,19 @@ async fn requests_that_do_not_fit_the_verb_are_refused_whole() {
 async fn convoy_explain_finds_a_convoy_by_its_record_name_or_role() {
     let (_dir, daemon) = super::super::tests::empty_daemon().await;
     let namespace = daemon.provisioning_namespace().await;
-    let convoys = daemon.resource_backend().using::<Convoy>(&namespace);
     let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), "fix-3774".to_owned()), (PROJECT_LABEL.to_owned(), "flotilla".to_owned())]);
     let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role("fix-3774".into()).build();
-    convoys.create(&InputMeta::builder().name("convoy-0123".into()).labels(labels).build(), &spec).await.unwrap();
+    let mut convoy = flotilla_engine_convoys_testkit::convoy(&namespace, "convoy-0123", spec, flotilla_engine_convoys_testkit::single_agent("coder"));
+    convoy.metadata.labels = labels;
+    let launch = crate::testkits::engine::admit_convoy(&daemon, convoy).await;
     let router =
         HttpRouter::for_daemon(Arc::clone(&daemon), Arc::new(LoginStore::new(daemon.clock_for_scenarios())), ListenerOrigin::default())
             .into_router();
     let verbs = rows(&router, "/tables/verbs/rows").await;
     let explain = verbs.iter().find(|verb| verb["name"] == "convoy.explain").expect("listed");
     assert_eq!((&explain["effect"], &explain["picks"], &explain["broken"]), (&json!("read"), &json!("each"), &Value::Null));
-    let subjects = ["convoy:convoy-0123", "project:flotilla/convoy:fix-3774", "project:other/convoy:fix-3774"];
+    let record = format!("convoy:{launch}");
+    let subjects = [record.as_str(), "project:flotilla/convoy:fix-3774", "project:other/convoy:fix-3774"];
     let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.explain", json!({"invocation": "r", "subjects": subjects})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     for outcome in &body["outcomes"].as_array().unwrap()[..2] {

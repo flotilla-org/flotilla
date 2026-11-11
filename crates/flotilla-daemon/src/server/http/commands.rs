@@ -958,11 +958,12 @@ mod tests {
     async fn async_crew_completion_is_scoped() {
         for cbor in [false, true] {
             let (temp, daemon) = supervisor_daemon().await;
+            let target = crate::testkits::engine::current_launch(&daemon, "target");
             let h = Harness::from_daemon(temp, daemon);
             let caller =
                 CallerAuth::Environment { environment: flotilla_protocol::EnvironmentId::new("supervisor-environment"), peer: None };
             let command = Command::builder()
-                .action(CommandAction::ConvoyAbandon { namespace: None, name: "target".into(), reason: "scope test".into() })
+                .action(CommandAction::ConvoyAbandon { namespace: None, name: target, reason: "scope test".into() })
                 .build();
             let accepted = h.call("POST", "/v1/commands", Some(serde_json::to_value(command).unwrap()), cbor, caller.clone()).await;
             assert_eq!(accepted.0, StatusCode::ACCEPTED, "{}", accepted.1);

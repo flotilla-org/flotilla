@@ -1,5 +1,7 @@
 use super::*;
-use crate::testkits::engine::engine;
+use crate::testkits::engine::{admit_convoy, engine};
+use flotilla_engine_convoys_testkit::{agent, convoy};
+use flotilla_resources::convoy::engine::note;
 use flotilla_resources::vessel_records::VesselStep;
 use flotilla_resources::ResumeIntent;
 use tokio_util::task::AbortOnDropHandle;
@@ -60,38 +62,26 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         )
         .expect("register test environment");
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("credential-work"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                ..ConvoyStatus::default()
-            },
-        )
-        .await
-        .expect("mark work running");
+    let launch = admit_convoy(
+        &daemon,
+        convoy(
+            NAMESPACE,
+            "credential-work",
+            ConvoySpec::builder().workflow_ref("test".to_string()).build(),
+            credential_work(
+                VesselRequirement::builder()
+                    .name("work".to_string())
+                    .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                    .crew(vec![agent("coder")])
+                    .build(),
+            ),
+        ),
+    )
+    .await;
     let fixture = engine(&daemon);
     let vessels = &fixture.vessels;
     let host = daemon.local_host_id().expect("local host").to_string();
-    let vessel = vessels.request("credential-work", "work", &host);
+    let vessel = vessels.request(&launch, "work", &host);
     vessels.ready(&vessel, env_id.as_str());
     let live = create_credential_test_session(&engine(&daemon).terminals, "credential-work-session", &vessel, env_id.as_str());
     engine_environments(&daemon);
@@ -127,53 +117,24 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
                     .is_ok()
         }
     };
-    let settle = |phase| {
-        let convoys = &convoys;
-        async move {
-            let current = convoys.get("credential-work").await.expect("read convoy");
-            let mut status = current.status.expect("convoy status");
-            status.phase = phase;
-            status.work.get_mut("work").expect("work").phase = WorkPhase::Complete;
-            convoys.update_status("credential-work", &current.metadata.resource_version, &status).await.expect("settle work");
-        }
-    };
-
-    let unavailable_convoy = convoys
-        .create(
-            &empty_meta("unavailable-credential-work"),
-            &ConvoySpec::builder().workflow_ref("test".to_string()).placement_policy("missing-policy".to_string()).build(),
-        )
-        .await
-        .expect("create convoy with unavailable placement");
-    convoys
-        .update_status(
-            &unavailable_convoy.metadata.name,
-            &unavailable_convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("unavailable".to_string())
-                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                        .credential_scopes(BTreeMap::from([(
-                            "work-token".to_string(),
-                            BTreeSet::from([RepositoryKey("repo".to_string())]),
-                        )]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                work: BTreeMap::from([("unavailable".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                ..ConvoyStatus::default()
-            },
-        )
-        .await
-        .expect("mark unavailable work running");
-    let unavailable_vessel = vessels.request("unavailable-credential-work", "unavailable", &host);
+    let unavailable_launch = admit_convoy(
+        &daemon,
+        convoy(
+            NAMESPACE,
+            "unavailable-credential-work",
+            ConvoySpec::builder().workflow_ref("test".to_string()).placement_policy("missing-policy".to_string()).build(),
+            credential_work(
+                VesselRequirement::builder()
+                    .name("unavailable".to_string())
+                    .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                    .credential_scopes(BTreeMap::from([("work-token".to_string(), BTreeSet::from([RepositoryKey("repo".to_string())]))]))
+                    .crew(vec![agent("coder")])
+                    .build(),
+            ),
+        ),
+    )
+    .await;
+    let unavailable_vessel = vessels.request(&unavailable_launch, "unavailable", &host);
     vessels.ready(&unavailable_vessel, "aaa-unavailable");
     let unavailable =
         create_credential_test_session(&engine(&daemon).terminals, "unavailable-work-session", &unavailable_vessel, "aaa-unavailable");
@@ -203,42 +164,27 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         None,
     );
 
-    let conflicting_convoy = convoys
-        .create(
-            &empty_meta("conflicting-credential-work"),
-            &ConvoySpec::builder().workflow_ref("test".to_string()).placement_policy("test".to_string()).build(),
-        )
-        .await
-        .expect("create second crew convoy");
-    convoys
-        .update_status(
-            &conflicting_convoy.metadata.name,
-            &conflicting_convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("other-work".to_string())
-                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                        .credential_permissions(BTreeMap::from([(
-                            "work-token".to_string(),
-                            BTreeMap::from([("contents".to_string(), "read".to_string())]),
-                        )]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                work: BTreeMap::from([("other-work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                ..ConvoyStatus::default()
-            },
-        )
-        .await
-        .expect("mark second crew running");
-    let conflicting_vessel = vessels.request("conflicting-credential-work", "other-work", &host);
+    let conflicting_launch = admit_convoy(
+        &daemon,
+        convoy(
+            NAMESPACE,
+            "conflicting-credential-work",
+            ConvoySpec::builder().workflow_ref("test".to_string()).placement_policy("test".to_string()).build(),
+            credential_work(
+                VesselRequirement::builder()
+                    .name("other-work".to_string())
+                    .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                    .credential_permissions(BTreeMap::from([(
+                        "work-token".to_string(),
+                        BTreeMap::from([("contents".to_string(), "read".to_string())]),
+                    )]))
+                    .crew(vec![agent("coder")])
+                    .build(),
+            ),
+        ),
+    )
+    .await;
+    let conflicting_vessel = vessels.request(&conflicting_launch, "other-work", &host);
     vessels.ready(&conflicting_vessel, env_id.as_str());
     let conflicting =
         create_credential_test_session(&engine(&daemon).terminals, "conflicting-work-session", &conflicting_vessel, env_id.as_str());
@@ -251,18 +197,13 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
 
     deliver(env).await.expect("the resolved conflict stages the running crew's credentials");
     assert!(can_fill_git_credential().await);
-    let current = convoys.get("credential-work").await.expect("read running work");
-    let mut stalled = current.status.expect("work status");
-    stalled.work.get_mut("work").expect("work").phase = WorkPhase::Stalled;
-    convoys.update_status("credential-work", &current.metadata.resource_version, &stalled).await.expect("stall work");
-    deliver(env).await.expect("retain stalled credentials");
-    assert!(can_fill_git_credential().await);
-    settle(ConvoyPhase::Landing).await;
-    deliver(env).await.expect("retain credentials after claim admission");
-    assert!(can_fill_git_credential().await, "live crew can act after its claim is admitted");
-    flotilla_store::apply_status_patch(
-        &convoys,
-        "credential-work",
+    // The crew's work phases are derived on the engine, so only this home's notes on the launch
+    // change under a live crew: a resume brief and a review turn leave its credentials in place.
+    let path = daemon.convoy_engine_path();
+    let noted = || async { convoys.get(&launch).await.expect("read the launch") };
+    note(
+        &path,
+        &noted().await,
         &flotilla_resources::external_patches::resume_crew_work(
             "work".to_string(),
             "coder".to_string(),
@@ -272,17 +213,12 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
             ResumeIntent::Reopen,
         ),
     )
-    .await
     .expect("deliver resume brief");
     deliver(env).await.expect("retain credentials for resumed input");
     assert!(can_fill_git_credential().await);
-
-    settle(ConvoyPhase::Landing).await;
-    deliver(env).await.expect("retain credentials at review boundary");
-    assert!(can_fill_git_credential().await);
-    flotilla_store::apply_status_patch(
-        &convoys,
-        "credential-work",
+    note(
+        &path,
+        &noted().await,
         &flotilla_resources::external_patches::record_turn_delivery(
             "actionable-review".to_string(),
             flotilla_resources::TurnDeliveryEpisode::builder()
@@ -299,7 +235,6 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
             "address review".to_string(),
         ),
     )
-    .await
     .expect("deliver review turn");
     deliver(env).await.expect("retain credentials for review turn");
     assert!(can_fill_git_credential().await);
@@ -361,38 +296,26 @@ async fn a_missing_credential_declaration_is_delivered_once_it_arrives() {
             Some(passthrough_registry()),
         )
         .expect("register test environment");
-    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("late-work"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .credential_refs(BTreeSet::from(["late-token".to_string()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                ..ConvoyStatus::default()
-            },
-        )
-        .await
-        .expect("mark work running");
+    let launch = admit_convoy(
+        &daemon,
+        convoy(
+            NAMESPACE,
+            "late-work",
+            ConvoySpec::builder().workflow_ref("test".to_string()).build(),
+            credential_work(
+                VesselRequirement::builder()
+                    .name("work".to_string())
+                    .credential_refs(BTreeSet::from(["late-token".to_string()]))
+                    .crew(vec![agent("coder")])
+                    .build(),
+            ),
+        ),
+    )
+    .await;
     let fixture = engine(&daemon);
     let vessels = &fixture.vessels;
     let host = daemon.local_host_id().expect("local host").to_string();
-    let vessel = vessels.request("late-work", "work", &host);
+    let vessel = vessels.request(&launch, "work", &host);
     vessels.ready(&vessel, env_id.as_str());
     create_credential_test_session(&engine(&daemon).terminals, "late-session", &vessel, env_id.as_str());
     engine_environments(&daemon);
@@ -455,4 +378,19 @@ async fn a_missing_credential_declaration_is_delivered_once_it_arrives() {
     })
     .await
     .expect("the declaration's arrival delivers the credential");
+}
+
+/// A frozen workflow whose one vessel is `requirement`.
+fn credential_work(requirement: VesselRequirement) -> ConvoyStatus {
+    ConvoyStatus {
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: vec![requirement],
+        }),
+        ..ConvoyStatus::default()
+    }
 }

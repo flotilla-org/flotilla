@@ -1440,46 +1440,25 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
     ] {
         // #2634: delivered notify/Stop hooks must reach the actor obligation,
         // not just transient terminal attention.
-        let convoy_name = format!("hook-{harness_name}");
         let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
-        let created_convoy = convoys
-            .create(
-                &InputMeta::builder().name(convoy_name.clone()).build(),
-                &ConvoySpec::builder().workflow_ref("hook-test".into()).build(),
-            )
-            .await
-            .expect("convoy");
         let workflow = flotilla_resources::single_agent_workflow_spec();
-        convoys
-            .update_status(
-                &convoy_name,
-                &created_convoy.metadata.resource_version,
-                &flotilla_resources::ConvoyStatus {
-                    phase: flotilla_resources::ConvoyPhase::Active,
-                    work: BTreeMap::from([(
-                        "work".into(),
-                        flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-                    )]),
-                    crew_work: BTreeMap::from([(
-                        "work".into(),
-                        BTreeMap::from([(
-                            "coder".into(),
-                            flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                        )]),
-                    )]),
-                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                        cascade: None,
-                        vessels: workflow.vessels,
-                        exit: workflow.exit,
-                        turn_delivery: Default::default(),
-                        stall_nudges: Default::default(),
-                        supervision: None,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("convoy status");
+        let status = flotilla_resources::ConvoyStatus {
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
+                vessels: workflow.vessels,
+                exit: workflow.exit,
+                turn_delivery: Default::default(),
+                stall_nudges: Default::default(),
+                supervision: None,
+            }),
+            ..Default::default()
+        };
+        let spec = ConvoySpec::builder().workflow_ref("hook-test".into()).build();
+        let convoy_name = admit_convoy(
+            &daemon,
+            flotilla_engine_convoys_testkit::convoy("flotilla", &format!("hook-{harness_name}"), spec, status),
+        )
+        .await;
         let name = format!("terminal-{harness_name}");
         let vessel = install_engine(&daemon).vessels.request(&convoy_name, "work", daemon.local_host_id().expect("local host").as_str());
         let spec = TerminalSessionSpec {
@@ -5571,7 +5550,7 @@ async fn failed_connection_tasks_are_reaped() {
     assert!(tasks.is_empty());
 }
 
-use crate::testkits::engine::engine as install_engine;
+use crate::testkits::engine::{admit_convoy, current_launch, engine as install_engine};
 pub(super) use crate::testkits::engine::engine_environments;
 
 pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
@@ -5589,7 +5568,7 @@ pub(super) struct PlacedCrew<'a> {
 /// The launch that serves convoy `convoy`'s work at `daemon`: its crew's vessel.
 pub(super) fn vessel_of(daemon: &InProcessDaemon, convoy: &str) -> String {
     let engine = install_engine(daemon);
-    flotilla_resources::vessel_records::VesselRecords::of_convoy(engine.vessels.vessels.as_ref(), convoy)
+    flotilla_resources::vessel_records::VesselRecords::of_convoy(engine.vessels.vessels.as_ref(), &current_launch(daemon, convoy))
         .expect("read launches")
         .pop()
         .expect("a launch")
@@ -5605,43 +5584,28 @@ pub(super) fn launch_of(daemon: &InProcessDaemon, session: &str) -> String {
         .name
 }
 
-pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, placed: PlacedCrew<'_>) {
-    let backend = daemon.resource_backend();
-    let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name(placed.convoy.into()).build(),
-            &ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
-        )
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            placed.convoy,
-            &convoy.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Active,
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([(
-                        "coder".into(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                    )]),
-                )]),
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    vessels: flotilla_resources::single_agent_workflow_spec().vessels,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("active crew work");
-    let vessel = install_engine(daemon).vessels.request(placed.convoy, "work", daemon.local_host_id().expect("local host").as_str());
+/// Places `placed`'s crew in `environment`, returning its convoy's launch.
+pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, placed: PlacedCrew<'_>) -> String {
+    let mut vessels = flotilla_resources::single_agent_workflow_spec().vessels;
+    // These identity scenarios have no PR deliverable.
+    let coder = &mut vessels[0].crew[0];
+    coder.deliverer = false;
+    coder.completion_conditions.clear();
+    coder.promises.clear();
+    let status = flotilla_resources::ConvoyStatus {
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            vessels,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+        }),
+        ..Default::default()
+    };
+    let spec = ConvoySpec::builder().workflow_ref("single-agent".into()).build();
+    let convoy = admit_convoy(daemon, flotilla_engine_convoys_testkit::convoy("flotilla", placed.convoy, spec, status)).await;
+    let vessel = install_engine(daemon).vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
     let spec = TerminalSessionSpec {
         env_ref: environment.into(),
         role: "coder".into(),
@@ -5651,10 +5615,11 @@ pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, plac
         source: TerminalSessionSource::Agent {
             selector: Selector::for_capability("coding"),
             brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
-            context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: placed.convoy.into(), vessel_ref: vessel }),
+            context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: convoy.clone(), vessel_ref: vessel }),
         },
     };
     run_session(daemon, placed.session, &spec, &codex_crew_facts());
+    convoy
 }
 
 /// A release gate that sanctions every ended convoy's reclaim.
@@ -5688,6 +5653,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
     let (_tmp, daemon) = placed_crew_daemon("placed-environment").await;
     let backend = daemon.resource_backend();
     let convoys = backend.using::<Convoy>("flotilla");
+    let own = current_launch(&daemon, "own");
     let pm = Arc::new(Mutex::new(PeerManager::new(daemon.node_id().clone())));
     // CallerCrew.vessel is the resource reference used by artifact attribution,
     // not the within-convoy vessel display name.
@@ -5716,7 +5682,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
     };
     let claims = std::collections::HashMap::from([
         ("FLOTILLA_NAMESPACE".into(), "flotilla".into()),
-        ("FLOTILLA_CONVOY".into(), "own".into()),
+        ("FLOTILLA_CONVOY".into(), current_launch(&daemon, "own")),
         ("FLOTILLA_VESSEL".into(), vessel_of(&daemon, "own")),
         ("FLOTILLA_CREW_ROLE".into(), "coder".into()),
         ("FLOTILLA_CREW_ID".into(), launch_of(&daemon, "placed-session")),
@@ -5840,7 +5806,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
     };
     assert!(matches!(read_session_message(&client).await, Message::Event { event }
         if matches!(event.as_ref(), DaemonEvent::CommandFinished { command_id: finished, result: CommandValue::Ok, .. } if *finished == command_id)));
-    let convoy = convoys.get("own").await.expect("updated convoy");
+    let convoy = convoys.get(&own).await.expect("updated convoy");
     assert!(flotilla_resources::promises::owned(convoy.status.as_ref().expect("status"), "work", "coder")
         .iter()
         .any(|promise| promise.id == "relay-proof"));
@@ -5881,19 +5847,12 @@ pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
         )
         .await
         .unwrap();
-    for (name, project) in [("supervisor", "project-a"), ("target", "project-a"), ("foreign", "project-b")] {
-        backend
-            .using::<Convoy>("flotilla")
-            .create(
-                &InputMeta::builder().name(name.into()).build(),
-                &ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref(project.into()).build(),
-            )
-            .await
-            .unwrap();
-    }
     let host = daemon.local_host_id().expect("local host").to_string();
-    for convoy in ["supervisor", "target", "foreign"] {
-        install_engine(&daemon).vessels.request(convoy, "work", &host);
+    for (name, project) in [("supervisor", "project-a"), ("target", "project-a"), ("foreign", "project-b")] {
+        let spec = ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref(project.into()).build();
+        let status = flotilla_engine_convoys_testkit::single_agent("coder");
+        let launch = admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, status)).await;
+        install_engine(&daemon).vessels.request(&launch, "work", &host);
     }
     let spec = TerminalSessionSpec {
         env_ref: "supervisor-environment".into(),
@@ -5906,7 +5865,7 @@ pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
             brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
             context: Box::new(TerminalCrewContext {
                 namespace: "flotilla".into(),
-                convoy: "supervisor".into(),
+                convoy: current_launch(&daemon, "supervisor"),
                 vessel_ref: vessel_of(&daemon, "supervisor"),
             }),
         },
@@ -5925,7 +5884,7 @@ pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
         .update_status(
             "holder",
             &ensures.get("holder").await.unwrap().metadata.resource_version,
-            &ConvoyEnsureStatus { convoy_ref: Some("supervisor".into()), ..Default::default() },
+            &ConvoyEnsureStatus { convoy_ref: Some(current_launch(&daemon, "supervisor")), ..Default::default() },
         )
         .await
         .unwrap();
@@ -5946,10 +5905,12 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     ordinary.role = "governor".into(); // A name alone is never a binding.
     ordinary.terminal_session = None;
     let request = |action| Request::Execute { command: Command::builder().action(action).build() };
-    for (convoy, allowed) in [("target", true), ("foreign", false)] {
+    for (of, allowed) in [("target", true), ("foreign", false)] {
+        let convoy = current_launch(&daemon, of);
+        let convoy = convoy.as_str();
         let context = CrewCommandContext {
             convoy: Some(convoy.into()),
-            vessel_ref: Some(vessel_of(&daemon, convoy)),
+            vessel_ref: Some(vessel_of(&daemon, of)),
             role: Some("coder".into()),
             ..Default::default()
         };
@@ -6024,7 +5985,7 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     let mut forged = request(CommandAction::CrewFail {
         context: CrewCommandContext {
             crew_id: Some("forged-crew-id".into()),
-            convoy: Some("target".into()),
+            convoy: Some(current_launch(&daemon, "target")),
             vessel_ref: Some(vessel_of(&daemon, "target")),
             role: Some("coder".into()),
             ..Default::default()
@@ -6056,8 +6017,12 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     }
     // A valid own-project convoy cannot hide a foreign vessel or namespace.
     for context in [
-        CrewCommandContext { convoy: Some("target".into()), vessel_ref: Some(vessel_of(&daemon, "foreign")), ..Default::default() },
-        CrewCommandContext { namespace: Some("other".into()), convoy: Some("target".into()), ..Default::default() },
+        CrewCommandContext {
+            convoy: Some(current_launch(&daemon, "target")),
+            vessel_ref: Some(vessel_of(&daemon, "foreign")),
+            ..Default::default()
+        },
+        CrewCommandContext { namespace: Some("other".into()), convoy: Some(current_launch(&daemon, "target")), ..Default::default() },
     ] {
         assert!(super::environment_supervision::authorize(&daemon, &mut request(CommandAction::QueryCrewList { context }), &crew)
             .await
@@ -6065,7 +6030,7 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     }
     let mut fail = request(CommandAction::CrewFail {
         context: CrewCommandContext {
-            convoy: Some("target".into()),
+            convoy: Some(current_launch(&daemon, "target")),
             vessel_ref: Some(vessel_of(&daemon, "target")),
             role: Some("coder".into()),
             ..Default::default()
@@ -6101,7 +6066,7 @@ pub(super) fn caller_mountinfo(environment: &EnvironmentId, bound: bool) -> supe
 fn placed_caller_claims(daemon: &InProcessDaemon) -> HashMap<String, String> {
     HashMap::from([
         ("FLOTILLA_NAMESPACE".into(), "flotilla".into()),
-        ("FLOTILLA_CONVOY".into(), "own".into()),
+        ("FLOTILLA_CONVOY".into(), current_launch(daemon, "own")),
         ("FLOTILLA_VESSEL".into(), vessel_of(daemon, "own")),
         ("FLOTILLA_CREW_ROLE".into(), "coder".into()),
         ("FLOTILLA_CREW_ID".into(), launch_of(daemon, "placed-session")),
@@ -6112,14 +6077,7 @@ fn placed_caller_claims(daemon: &InProcessDaemon) -> HashMap<String, String> {
 async fn caller_can_stall_and_promise(daemon: &InProcessDaemon, caller: flotilla_protocol::CommandCaller) {
     let backend = daemon.resource_backend();
     let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys.get("own").await.unwrap();
-    let mut status = convoy.status.unwrap();
-    let coder = &mut status.workflow_snapshot.as_mut().unwrap().vessels[0].crew[0];
-    // This identity scenario has no PR deliverable.
-    coder.deliverer = false;
-    coder.completion_conditions.clear();
-    coder.promises.clear();
-    convoys.update_status("own", &convoy.metadata.resource_version, &status).await.unwrap();
+    let own = current_launch(daemon, "own");
     let context = CrewCommandContext { crew_id: caller.crew.as_ref().map(|crew| crew.crew_id.clone()), ..Default::default() };
     for action in [
         CommandAction::CrewStall {
@@ -6138,7 +6096,7 @@ async fn caller_can_stall_and_promise(daemon: &InProcessDaemon, caller: flotilla
         let id = daemon.execute_for_caller(Command::builder().action(action).build(), Some(caller.clone())).await.unwrap();
         let event = super::environment_connection::command_completion(&mut events, id).await.unwrap();
         assert!(matches!(&event, DaemonEvent::CommandFinished { result: CommandValue::Ok, .. }), "{event:?}");
-        let status = convoys.get("own").await.unwrap().status.unwrap();
+        let status = convoys.get(&own).await.unwrap().status.unwrap();
         assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Stalled);
         if !stalling {
             assert!(flotilla_resources::promises::owned(&status, "work", "coder").iter().any(|promise| promise.id == "follow-up"));

@@ -532,13 +532,11 @@ impl Daemon {
         serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap()
     }
 
-    async fn convoy(&self, name: &str) {
-        self.daemon
-            .resource_backend()
-            .using::<Convoy>("flotilla")
-            .create(&InputMeta::builder().name(name.into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-            .await
-            .unwrap();
+    /// Admits a launch of convoy `name`, returning the launch.
+    async fn convoy(&self, name: &str) -> String {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let convoy = flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, flotilla_engine_convoys_testkit::single_agent("coder"));
+        crate::testkits::engine::admit_convoy(&self.daemon, convoy).await
     }
 
     /// The framed protocol's result set for `query`, as `SubscribeQueries` replays it.
@@ -691,11 +689,10 @@ async fn named_query_cursors_resume_only_their_own_materialisation() {
 #[tokio::test]
 async fn waits_fire_once_and_cancelled_waits_do_not() {
     use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
-    use flotilla_resources::{ConvoyPhase, ConvoyStatus};
     let daemon = Daemon::start().await;
-    daemon.convoy("watched").await;
+    let watched = daemon.convoy("watched").await;
     let leaf = Leaf {
-        address: LeafAddress::Convoy { name: "watched".into() },
+        address: LeafAddress::Convoy { name: watched.clone() },
         field_path: ".status.phase".into(),
         operator: LeafOperator::Equal,
         literal: "Failed".into(),
@@ -708,9 +705,9 @@ async fn waits_fire_once_and_cancelled_waits_do_not() {
     client.send(json!({"type": "cancel", "id": "cancelled"})).await;
     assert!(client.fence().await.is_empty());
     let convoys = daemon.daemon.resource_backend().using::<Convoy>("flotilla");
-    let current = convoys.get("watched").await.unwrap();
-    let status = ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() };
-    convoys.update_status("watched", &current.metadata.resource_version, &status).await.unwrap();
+    let current = convoys.get(&watched).await.unwrap();
+    let engine = daemon.daemon.convoy_engine_path();
+    engine.get().expect("the Convoy path").fail(&current, "operator", "failed").await.unwrap();
     let mut received = client.until(|message| message["type"] == "wait_fired").await;
     let fired = received.last().unwrap().clone();
     assert_eq!((fired["id"].as_str(), fired["value"].as_str()), (Some("w"), Some("Failed")));

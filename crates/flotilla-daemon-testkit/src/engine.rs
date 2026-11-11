@@ -120,3 +120,8 @@ pub async fn admit_convoy(daemon: &InProcessDaemon, convoy: ResourceObject<Convo
     engine(daemon);
     flotilla_engine_convoys_testkit::launch(&daemon.convoy_engine_path(), convoy).await
 }
+
+/// The newest launch of convoy `of` at `daemon`'s engine.
+pub fn current_launch(daemon: &InProcessDaemon, of: &str) -> String {
+    daemon.engine_convoys().expect("the Convoy path is installed").get(of).unwrap_or_else(|| panic!("a launch of {of}")).name().to_owned()
+}

@@ -14,7 +14,7 @@ use flotilla_store::load_metrics::ControllerLoadMetrics;
 
 use super::*;
 use crate::runtime::primitives::MessageDelivery;
-use crate::testkits::engine::engine;
+use crate::testkits::engine::{admit_convoy, engine};
 
 /// A running crew session that holds role `coder` of convoy `turns`, typing through `pool`, with
 /// the engine's Message path open, as the runtime always opens it, and its fleet designated.
@@ -25,6 +25,8 @@ struct EngineCrew {
     primitives: Arc<MessagePrimitives>,
     /// The launch the crew's session runs as: its crew id.
     launch: String,
+    /// The convoy's launch.
+    convoy: String,
 }
 
 async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
@@ -32,7 +34,6 @@ async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"engine-turn-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let (daemon, _) = crew_daemon(config.clone()).await;
-    let backend = daemon.resource_backend();
     let mut registry = probe_local_provider_registry(&daemon, &config).await.expect("registry");
     Arc::get_mut(&mut registry).expect("exclusive registry").terminal_pools.insert(
         "turn-probe",
@@ -41,13 +42,18 @@ async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
     );
     let profile = build_local_profile(&daemon, &registry).await.expect("profile");
     ensure_host_direct_environment_exists(engine_environments(&daemon).reads.clone(), &profile).await.expect("environment");
-    backend
-        .using::<Convoy>(NAMESPACE)
-        .create(&empty_meta("turns"), &ConvoySpec::builder().workflow_ref("test".into()).project_ref(NAMESPACE.into()).build())
-        .await
-        .expect("convoy");
+    let convoy = admit_convoy(
+        &daemon,
+        flotilla_engine_convoys_testkit::convoy(
+            NAMESPACE,
+            "turns",
+            ConvoySpec::builder().workflow_ref("test".into()).project_ref(NAMESPACE.into()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        ),
+    )
+    .await;
     // The crew's vessel holds its session, which runs its agent under pool session `agent`.
-    let vessel = engine(&daemon).vessels.request("turns", "work", &profile.host_id);
+    let vessel = engine(&daemon).vessels.request(&convoy, "work", &profile.host_id);
     let terminals = &engine(&daemon).terminals;
     let launch = terminals.request(&flotilla_resources::terminal_records::TerminalLaunchRequest {
         session: "agent".into(),
@@ -87,7 +93,7 @@ async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
         profile.host_id.clone(),
         profile.host_direct_environment_name(),
     ));
-    EngineCrew { _temp: temp, daemon, state, primitives, launch }
+    EngineCrew { _temp: temp, daemon, state, primitives, launch, convoy }
 }
 
 impl EngineCrew {
@@ -98,7 +104,7 @@ impl EngineCrew {
     async fn send(&self, name: &str, sender: &str, relation: MessageRelation, body: &str) {
         let intent = MessageSpec::builder()
             .sender(sender.into())
-            .receiver(format!("{NAMESPACE}/turns/work/coder"))
+            .receiver(flotilla_resources::crew_role_address(NAMESPACE, &self.convoy, "work", "coder"))
             .relation(relation)
             .body(body.into())
             .build();

@@ -226,6 +226,8 @@ fn projection_parity_sequential_admissions(tc: hegel::TestCase) {
                         .name("work".to_string())
                         .crew(vec![CrewSpec::builder()
                             .role("coder".to_string())
+                            // A convoy owes something: the engine admits none that owes nothing.
+                            .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("coder")])
                             .source(CrewSource::Tool { command: "true".to_string() })
                             .build()])
                         .build()])
