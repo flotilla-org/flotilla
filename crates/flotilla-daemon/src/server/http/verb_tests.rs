@@ -610,7 +610,7 @@ async fn an_engine_kinds_row_address_acts_on_that_rows_record() {
     let mut sessions =
         Home::<AgentSession, flotilla_engine_store::StoreLog>::with_log("home", flotilla_engine_store::StoreLog::new(service.store()))
             .unwrap();
-    for (name, at) in [("s-1", 1), ("s-2", 2)] {
+    for (name, at) in [("s-1", 1), ("s-2", 2), ("s-3", 3)] {
         sessions.create(name, (), &MemoryAgentSessionWorld::default(), flotilla_schema::Timestamp(at)).unwrap();
     }
     let mut registry = VerbRegistry::new();
@@ -635,9 +635,12 @@ async fn an_engine_kinds_row_address_acts_on_that_rows_record() {
 
     let all = rows(&router, "/tables/agent_session/rows?columns=resource.name").await;
     let addresses: Vec<_> = all.iter().map(|row| (row["resource.name"].clone(), row["address"].clone())).collect();
-    assert_eq!(addresses, [(json!("s-1"), json!(format!("{CODER}/session:s-1"))), (json!("s-2"), json!(format!("{CODER}/session:s-2")))]);
-    let selected = rows(&router, &format!("/tables/agent_session/rows?where=address%20%3D%3D%20%22{CODER}/session:s-2%22")).await;
-    assert_eq!(selected.iter().map(|row| row["resource.name"].clone()).collect::<Vec<_>>(), [json!("s-2")]);
+    let expected: Vec<_> = ["s-1", "s-2", "s-3"].map(|name| (json!(name), json!(format!("{CODER}/session:{name}")))).into();
+    assert_eq!(addresses, expected);
+    // The filter on the derived address is evaluated over every stored row, not a page of them:
+    // under `limit=1` the last session is still found.
+    let selected = rows(&router, &format!("/tables/agent_session/rows?limit=1&where=address%20%3D%3D%20%22{CODER}/session:s-3%22")).await;
+    assert_eq!(selected.iter().map(|row| row["resource.name"].clone()).collect::<Vec<_>>(), [json!("s-3")]);
     for row in &all {
         let request = json!({"invocation": "s", "subjects": [row["address"]]});
         let (status, body) = invoke(&router, CallerAuth::Bearer, "session.name", request).await;
