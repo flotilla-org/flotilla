@@ -6,6 +6,7 @@ use std::{
 };
 
 use flotilla_protocol::{RepoIdentity, RepoSelector};
+use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
 use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, Project, Repository, RepositoryKey};
 use flotilla_store::ResourceBackend;
@@ -14,7 +15,7 @@ use flotilla_paths::path_context::canonical_or_original;
 
 pub async fn resolve_repository_with_lifecycle_reads(
     backend: &ResourceBackend,
-    observed: &ResourceBackend,
+    discovered: &DiscoveredCheckouts,
     namespace: &str,
     local_host: &str,
     selector: &RepoSelector,
@@ -61,7 +62,7 @@ pub async fn resolve_repository_with_lifecycle_reads(
         }
         RepoSelector::Path(cwd) => {
             let cwd = canonical_or_original(cwd);
-            let checkouts = local_checkouts_with_lifecycle_reads(observed, namespace, local_host, reads).await?;
+            let checkouts = local_checkouts_with_lifecycle_reads(discovered, namespace, local_host, reads).await?;
             // Nested known checkouts scope to the deepest containing checkout.
             let mut deepest = 0;
             for checkout in checkouts {
@@ -111,24 +112,16 @@ pub async fn resolve_repository_with_lifecycle_reads(
 }
 
 /// Ready checkouts on the local host: the engine's ready checkouts held here whose environment
-/// runs directly on this host, and the checkouts this host's refresh observed. An engine checkout
-/// of a name, ready or not, wins over the observation of it.
+/// runs directly on this host, and the checkouts this host's refresh discovered. An engine checkout
+/// of a name, ready or not, wins over the discovery of it.
 pub async fn local_checkouts_with_lifecycle_reads(
-    observed: &ResourceBackend,
+    discovered: &DiscoveredCheckouts,
     namespace: &str,
     local_host: &str,
     reads: &dyn LifecycleReads,
 ) -> Result<Vec<flotilla_resources::ResourceObject<Checkout>>, String> {
-    let mut checkouts = observed
-        .clone()
-        .using::<Checkout>(namespace)
-        .list()
-        .await
-        .map_err(|error| error.to_string())?
-        .items
-        .into_iter()
-        .map(|checkout| (checkout.metadata.name.clone(), checkout))
-        .collect::<BTreeMap<_, _>>();
+    let mut checkouts =
+        discovered.views(namespace).into_iter().map(|checkout| (checkout.metadata.name.clone(), checkout)).collect::<BTreeMap<_, _>>();
     let held = flotilla_resources::checkout_records::latest_launches(reads.checkouts()?.here()?);
     // The engine's checkout of a name, in any state, wins over the observation of it: an ended
     // checkout's stale observation cannot resurrect it.
@@ -142,9 +135,10 @@ pub async fn local_checkouts_with_lifecycle_reads(
     if !standing_on.is_empty() {
         let environments = reads.environments()?;
         for name in standing_on {
-            let environment = environments.find(name)?;
-            if environment.is_some_and(|environment| environment.spec.host_direct.is_some_and(|direct| direct.host_ref == local_host)) {
-                local_environments.insert(name.to_owned());
+            if let Some(environment) = environments.find(name)? {
+                if is_local_direct_environment(&environment.spec, local_host)? {
+                    local_environments.insert(name.to_owned());
+                }
             }
         }
     }
@@ -183,14 +177,71 @@ pub async fn local_checkouts_with_lifecycle_reads(
         .collect())
 }
 
+/// Whether `spec` is a direct environment of `local_host`: one its provider address places on
+/// the host, or, with no address, whose host reference names it.
+fn is_local_direct_environment(spec: &flotilla_resources::EnvironmentSpec, local_host: &str) -> Result<bool, String> {
+    if spec.host_direct.is_none() {
+        return Ok(false);
+    }
+    match &spec.provider_address {
+        Some(address) => {
+            let host_address =
+                flotilla_address::Address::root(flotilla_address::Kind::Host, local_host).map_err(|error| error.to_string())?;
+            Ok(address.to_string().starts_with(&format!("{host_address}/provider:")))
+        }
+        None => Ok(spec.host_direct.as_ref().is_some_and(|direct| direct.host_ref == local_host)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use flotilla_provisioning_testkit::Ending;
+    use flotilla_resources::discovered_checkouts::DiscoveredCheckout;
     use flotilla_resources::{InputMeta, ObservedCheckoutSpec, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositorySpec};
     use flotilla_store_memory::InMemoryBackend;
     use hegel::generators as gs;
 
     use super::*;
+
+    // WORKLOAD.md: admission must select only this host's direct environments,
+    // independently of the number of unrelated per-vessel environments.
+    #[hegel::test]
+    fn direct_environment_query_covers_only_local_current_and_legacy_records(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Escaped/case-sensitive hosts, both stored generations, missing direct
+        // inputs, and a conflicting legacy host alongside an explicit address.
+        let host = tc.draw(gs::text().alphabet("aZ09 /:%é").min_size(1).max_size(16));
+        let address = flotilla_address::Address::root(flotilla_address::Kind::Host, &host).expect("host address");
+        let mut selected = BTreeSet::new();
+        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(24));
+        let mut expected = BTreeSet::new();
+        for row in 0..count {
+            let local = tc.draw(gs::booleans());
+            let legacy = tc.draw(gs::booleans());
+            let direct = tc.draw(gs::booleans());
+            let target = if local { host.clone() } else { format!("{host}-other") };
+            let mut spec = serde_json::json!({});
+            if !legacy {
+                let place = flotilla_address::Address::root(flotilla_address::Kind::Host, &target).expect("place");
+                spec["provider_address"] = format!("{place}/provider:custom").into();
+            }
+            if direct {
+                spec["host_direct"] =
+                    serde_json::json!({"host_ref": if legacy { target.clone() } else { host.clone() }, "repo_default_dir":"/work"});
+            } else {
+                spec["docker"] = serde_json::json!({"host_ref": target, "image":"image"});
+            }
+            let name = format!("environment-{row}");
+            let spec = serde_json::from_value::<flotilla_resources::EnvironmentSpec>(spec).expect("environment spec");
+            if is_local_direct_environment(&spec, &host).expect("predicate") {
+                selected.insert(name.clone());
+            }
+            if local && direct {
+                expected.insert(name);
+            }
+            assert_eq!(selected, expected, "candidate cover after every insert at {address}");
+        }
+    }
 
     fn backend() -> ResourceBackend {
         ResourceBackend::new(InMemoryBackend::default())
@@ -199,7 +250,7 @@ mod tests {
     /// Resolves `selector` with no checkout held on the engine.
     async fn resolve_repository(
         durable: &ResourceBackend,
-        observed: &ResourceBackend,
+        observed: &DiscoveredCheckouts,
         namespace: &str,
         local_host: &str,
         selector: &RepoSelector,
@@ -253,18 +304,22 @@ mod tests {
         backend.using::<Project>("test").create(&InputMeta::builder().name(name.to_string()).build(), &spec).await.expect("project");
     }
 
+    /// Discovers checkout `name` of `key` at `path` on `host`, beside the others discovered.
     #[bon::builder]
-    async fn checkout(backend: &ResourceBackend, name: &str, path: &str, key: RepositoryKey, #[builder(default = "local")] host: &str) {
-        let spec = CheckoutSpec::Observed(
-            ObservedCheckoutSpec::builder()
+    fn checkout(discovered: &DiscoveredCheckouts, name: &str, path: &str, key: RepositoryKey, #[builder(default = "local")] host: &str) {
+        let mut found = discovered.all().into_iter().filter(|checkout| checkout.spec.repo_ref == key).collect::<Vec<_>>();
+        found.push(DiscoveredCheckout {
+            name: name.into(),
+            repo_slug: key.to_string(),
+            spec: ObservedCheckoutSpec::builder()
                 .r#ref("main".into())
                 .path(path.into())
-                .repo_ref(key)
+                .repo_ref(key.clone())
                 .host_ref(host.into())
                 .is_main(true)
                 .build(),
-        );
-        backend.using::<Checkout>("test").create(&InputMeta::builder().name(name.to_string()).build(), &spec).await.expect("checkout");
+        });
+        discovered.replace(&key, found);
     }
 
     // #1769: alias and forge slug name the same durable identity regardless of local presence.
@@ -277,7 +332,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
             let durable = backend();
-            let observed = backend();
+            let observed = DiscoveredCheckouts::default();
             let key = repository(&durable, "widgets", "acme/widgets").await;
             for i in 0..duplicates {
                 project(&durable, &format!("project-{i}"), key.clone(), "primary").await;
@@ -305,13 +360,13 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
             let durable = backend();
-            let observed = backend();
+            let observed = DiscoveredCheckouts::default();
             let parent = repository(&durable, "widgets", "acme/widgets").await;
             let child = repository(&durable, "other", "acme/other").await;
-            checkout().backend(&observed).name("parent").path("/work/widgets").key(parent.clone()).call().await;
-            checkout().backend(&observed).name("remote").path("/work/widgets/nested").key(child.clone()).host("remote").call().await;
+            checkout().discovered(&observed).name("parent").path("/work/widgets").key(parent.clone()).call();
+            checkout().discovered(&observed).name("remote").path("/work/widgets/nested").key(child.clone()).host("remote").call();
             if nested {
-                checkout().backend(&observed).name("nested").path("/work/widgets/nested").key(child.clone()).call().await;
+                checkout().discovered(&observed).name("nested").path("/work/widgets/nested").key(child.clone()).call();
             }
             let cwd = format!("/work/widgets/nested{}", "/src".repeat(depth));
             let expected = if nested { child } else { parent };
@@ -352,10 +407,10 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
             let durable = backend();
-            let observed = backend();
+            let observed = DiscoveredCheckouts::default();
             let key = repository(&durable, "widgets", "acme/widgets").await;
             let stored = if stored_alias { &alias } else { &physical };
-            checkout().backend(&observed).name("checkout").path(stored.to_str().expect("path")).key(key.clone()).call().await;
+            checkout().discovered(&observed).name("checkout").path(stored.to_str().expect("path")).key(key.clone()).call();
             let mut cwd = alias.clone();
             for _ in 0..depth {
                 cwd.push("missing");
@@ -374,7 +429,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_selectors_are_read_only_refusals() {
         let durable = backend();
-        let observed = backend();
+        let observed = DiscoveredCheckouts::default();
         let first = repository(&durable, "widgets", "acme/widgets").await;
         let second = repository(&durable, "other", "acme/other").await;
         project(&durable, "a", first, "primary").await;
@@ -392,7 +447,7 @@ mod tests {
             .await
             .is_err());
         assert_eq!(durable.using::<Repository>("test").list().await.expect("repositories").items.len(), 2);
-        assert!(observed.using::<Checkout>("test").list().await.expect("checkouts").items.is_empty());
+        assert!(observed.all().is_empty());
     }
     // An engine checkout scopes the CLI only once it is ready on this host: a requested
     // checkout's path, or one in another host's environment, never does, and its ending removes
@@ -402,7 +457,7 @@ mod tests {
         use flotilla_resources::FreshCloneCheckoutSpec;
 
         let durable = backend();
-        let observed = backend();
+        let observed = DiscoveredCheckouts::default();
         let key = repository(&durable, "widgets", "acme/widgets").await;
         let engine = engine_on("local");
         let spec = CheckoutSpec::FreshClone(
@@ -427,7 +482,7 @@ mod tests {
         assert_eq!(resolve("local", "/actual/widgets/src").await, Ok(Some(key.clone())));
         assert_eq!(resolve("remote", "/actual/widgets/src").await, Ok(None), "another host's checkout does not scope");
         // A stale observation of its name cannot resurrect a released checkout.
-        checkout().backend(&observed).name("created").path("/actual/widgets").key(key).call().await;
+        checkout().discovered(&observed).name("created").path("/actual/widgets").key(key).call();
         engine.finish(&launch, Ending::Released);
         assert_eq!(resolve("local", "/actual/widgets").await, Ok(None));
     }
@@ -439,12 +494,12 @@ mod tests {
     async fn repository_paths_follow_checkout_engine() {
         use flotilla_resources::CheckoutWorktreeSpec;
         let durable = backend();
-        let observed = backend();
+        let observed = DiscoveredCheckouts::default();
         let key = repository(&durable, "widgets", "acme/widgets").await;
         let temp = tempfile::tempdir().expect("paths");
         let live = temp.path().join("live");
         let stale = temp.path().join("stale");
-        checkout().backend(&observed).name("managed").path(stale.to_str().expect("path")).key(key.clone()).call().await;
+        checkout().discovered(&observed).name("managed").path(stale.to_str().expect("path")).key(key.clone()).call();
         let engine = engine_on("local");
         let launch = engine.request(
             "managed",

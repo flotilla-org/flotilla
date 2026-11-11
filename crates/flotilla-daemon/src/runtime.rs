@@ -736,7 +736,6 @@ fn spawn_controller_loops(
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
     let status_lifecycle_reads = state.daemon.lifecycle_reads();
-    let observed_backend = state.daemon.observed_resource_backend();
     let gh_default_branches = state
         .daemon
         .local_command_runner()
@@ -798,19 +797,17 @@ fn spawn_controller_loops(
         ),
         controller!(Repository, {
             let lifecycle_reads = state.daemon.lifecycle_reads();
-            let observed_backend = observed_backend.clone();
+            let discovered = state.daemon.discovered_checkouts();
             let forge_default_branch_resolver = forge_default_branch_resolver.clone();
             // A repository's clones wake it as their launches change.
             let decided = state.daemon.decided_store().ok();
-            move |_: ResourceBackend, namespace_string: String| {
-                let observed_backend = observed_backend.clone();
+            move |_: ResourceBackend, _: String| {
                 let forge_default_branch_resolver = forge_default_branch_resolver.clone();
-                let mut reconciler =
-                    RepositoryReconciler::new(observed_backend.clone(), &namespace_string).with_lifecycle_reads(lifecycle_reads.clone());
+                let mut reconciler = RepositoryReconciler::new(discovered.clone()).with_lifecycle_reads(lifecycle_reads.clone());
                 if let Some(resolver) = forge_default_branch_resolver {
                     reconciler = reconciler.with_forge_default_branch_resolver(resolver);
                 }
-                (RepositoryReconciler::secondary_watches(observed_backend, &namespace_string, decided.clone()), reconciler)
+                (RepositoryReconciler::secondary_watches(discovered.clone(), decided.clone()), reconciler)
             }
         }),
         controller!(Vessel, {
@@ -1212,7 +1209,7 @@ fn spawn_checkout_controller(state: &Arc<ControllerRuntimeState>) -> Option<Join
         }
         None => error!("the checkout inspector and forge observer have no Message path; requests to them here go unanswered"),
     }
-    tokio::spawn(checkouts::recheck_on_observed_refresh(Arc::clone(state)));
+    tokio::spawn(checkouts::recheck_on_discovered_refresh(Arc::clone(state)));
     match Controller::start(Arc::clone(&engine.checkouts), actuator, state.daemon.clock_for_scenarios(), service) {
         Ok(controller) => Some(tokio::spawn(async move {
             // A checkout's backing is observed at a recheck, not pushed.

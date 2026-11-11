@@ -12,12 +12,12 @@ use flotilla_config::ConfigStore;
 use flotilla_protocol::result_set::ConvoyChangeRequest;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId};
 use flotilla_resources::{
-    BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
-    CheckoutSpec as ResourceCheckoutSpec, CheckoutWorktreeSpec as ResourceCheckoutWorktreeSpec, Convoy as ResourceConvoy,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, CrewSource, CrewSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
-    ImageAcquisitionCost, InputMeta, ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository,
-    RepositorySpec, ResourceObject, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutWorktreeSpec as ResourceCheckoutWorktreeSpec, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch,
+    CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, FulfilmentGrant,
+    FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, ImageAcquisitionCost, InputMeta, ObservedChangeRequestState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec, ResourceObject, VesselRequirement, WorkflowTemplate,
+    WorkflowTemplateSpec,
 };
 use flotilla_store::ResourceBackend;
 
@@ -344,8 +344,8 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
     assert_eq!(convoys[0].spec.adopted_checkout_refs.len(), 1);
     assert!(flotilla_resources::convoy::adopted_checkout(&convoys[0]).expect("readable").is_some(), "adopted checkout recorded");
     let owned = convoys[0].spec.adopted_checkout_refs.values().cloned().collect::<BTreeSet<_>>();
-    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla").list().await.expect("observed checkouts").items;
-    assert!(observed.iter().all(|checkout| owned.contains(&checkout.metadata.name)), "loser must not publish an orphan observed checkout");
+    let discovered = daemon.discovered_checkouts().all();
+    assert!(discovered.iter().all(|checkout| owned.contains(&checkout.name)), "loser must not publish an orphan discovered checkout");
 }
 
 #[tokio::test]

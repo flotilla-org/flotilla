@@ -72,16 +72,15 @@ use flotilla_replay_testkit::ReplayHttpClient;
 use flotilla_replay_testkit::Session;
 use flotilla_resources::environment_records::EnvironmentRecords;
 use flotilla_resources::{
-    clone_key, Checkout, Checkout as ResourceCheckout, CheckoutSpec, CheckoutSpec as ResourceCheckoutSpec, CheckoutWorktreeSpec, Clone,
-    CloneSpec, ConditionValue, Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CredentialConsumer, CredentialGrant, CredentialLifecycle,
-    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, EnvironmentSpec, Forge,
-    ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec,
-    HostStatus, HostStatusPatch, InputMeta, ModelProbeState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementStatus,
-    Project, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceError, Selector, TerminalAttentionState,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement, VesselSpec, WorkPhase,
-    WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV,
-    MANAGED_BY_LABEL,
+    clone_key, Checkout, CheckoutSpec, CheckoutSpec as ResourceCheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, ConditionValue,
+    Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+    ConvoyTeardownRuntime, CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
+    CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, EnvironmentSpec, Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind,
+    FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, InputMeta,
+    ModelProbeState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementStatus, Project, Repository, RepositoryKey,
+    RepositorySpec, RepositoryTrust, Resource, ResourceError, Selector, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowTemplate,
+    WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
 };
 use flotilla_store::{controller::Reconciler, watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_terminal::{

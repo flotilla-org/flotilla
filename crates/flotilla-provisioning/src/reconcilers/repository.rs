@@ -1,19 +1,20 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::sync::Arc;
 
 use crate::engine::{checkouts::CheckoutRepositoryWake, clones::CloneRepositoryWake};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::checkout_records::latest_launches;
 use flotilla_resources::{
+    discovered_checkouts::DiscoveredCheckouts,
     lifecycle_reads::{LifecycleReads, NoLifecycleReads},
-    resolve_default_branch, Checkout, CheckoutSpec, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, LifecycleAuthority,
-    Repository, RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch, ResourceError, ResourceObject,
-    REPO_KEY_LABEL,
+    resolve_default_branch, CheckoutSpec, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, LifecycleAuthority, Repository,
+    RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch, ResourceError, ResourceObject,
 };
 use flotilla_store::{
-    controller::{ReconcileOutcome, Reconciler, ResolverLabelMappedWatch, SecondaryWatch},
-    ResourceBackend, TypedResolver,
+    controller::{ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
+    ResourceBackend,
 };
+use tokio::sync::broadcast::error::RecvError;
 
 #[async_trait]
 pub trait ForgeDefaultBranchResolver: Send + Sync {
@@ -21,8 +22,8 @@ pub trait ForgeDefaultBranchResolver: Send + Sync {
 }
 
 pub struct RepositoryReconciler {
-    /// The checkouts the host's refresh observed.
-    observed_checkouts: TypedResolver<Checkout>,
+    /// The checkouts the host's refresh discovered.
+    discovered: DiscoveredCheckouts,
     /// The engine's environments, clones and checkouts, through its readings: a checkout's host is
     /// its environment's, and each clone launch found the remote's default branch.
     lifecycle_reads: Arc<dyn LifecycleReads>,
@@ -30,12 +31,8 @@ pub struct RepositoryReconciler {
 }
 
 impl RepositoryReconciler {
-    pub fn new(observed: ResourceBackend, namespace: &str) -> Self {
-        Self {
-            observed_checkouts: observed.using::<Checkout>(namespace),
-            lifecycle_reads: Arc::new(NoLifecycleReads),
-            forge_default_branch_resolver: None,
-        }
+    pub fn new(discovered: DiscoveredCheckouts) -> Self {
+        Self { discovered, lifecycle_reads: Arc::new(NoLifecycleReads), forge_default_branch_resolver: None }
     }
 
     pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
@@ -48,19 +45,13 @@ impl RepositoryReconciler {
         self
     }
 
-    /// The kinds a repository follows: its observed checkouts, and with the engine's `service` its
+    /// What a repository follows: its discovered checkouts, and with the engine's `service` its
     /// checkouts and clones.
     pub fn secondary_watches(
-        observed: ResourceBackend,
-        namespace: &str,
+        discovered: DiscoveredCheckouts,
         service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
     ) -> Vec<Box<dyn SecondaryWatch<Primary = Repository>>> {
-        let mut watches: Vec<Box<dyn SecondaryWatch<Primary = Repository>>> =
-            vec![Box::new(ResolverLabelMappedWatch::<Checkout, Repository> {
-                label_key: REPO_KEY_LABEL,
-                resolver: observed.using::<Checkout>(namespace),
-                _marker: PhantomData,
-            })];
+        let mut watches: Vec<Box<dyn SecondaryWatch<Primary = Repository>>> = vec![Box::new(DiscoveredRepositoryWake(discovered))];
         if let Some(service) = service {
             watches.push(Box::new(CheckoutRepositoryWake::new(Arc::clone(&service))));
             watches.push(Box::new(CloneRepositoryWake::new(service)));
@@ -93,6 +84,40 @@ impl RepositoryReconciler {
     }
 }
 
+/// Wakes a Repository's reconciler when the checkouts discovered for it change.
+#[derive(Clone)]
+struct DiscoveredRepositoryWake(DiscoveredCheckouts);
+
+impl SecondaryWatch for DiscoveredRepositoryWake {
+    type Primary = Repository;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        sender: WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        let mut changes = self.0.changes();
+        Box::pin(async move {
+            loop {
+                match changes.recv().await {
+                    Ok(repository) => {
+                        if sender.send(repository.0).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => sender.send_every(),
+                    Err(RecvError::Closed) => return Ok(()),
+                }
+            }
+        })
+    }
+}
+
 impl Reconciler for RepositoryReconciler {
     type Resource = Repository;
     type Prepared = RepositoryStatus;
@@ -113,7 +138,7 @@ impl Reconciler for RepositoryReconciler {
         }
 
         // The engine's checkouts of this repository that have not ended: an adopted one is its
-        // finder's, a made one its holder's. The observed ones are as the refresh found them.
+        // finder's, a made one its holder's. The discovered ones are as the refresh found them.
         let reads = Arc::clone(&self.lifecycle_reads);
         let key = repository_key.clone();
         let engine = tokio::task::spawn_blocking(move || reads.checkouts().and_then(|checkouts| checkouts.of_repository(&key)))
@@ -125,12 +150,12 @@ impl Reconciler for RepositoryReconciler {
                 if matches!(record.spec, CheckoutSpec::Observed(_)) { LifecycleAuthority::Adopted } else { LifecycleAuthority::Managed };
             (record.checkout_name().to_owned(), record.spec, authority)
         });
-        let mut observed = Vec::new();
-        for checkout in self.observed_checkouts.list().await?.items {
-            let authority = checkout.metadata.lifecycle_authority()?.unwrap_or(LifecycleAuthority::Observed);
-            observed.push((checkout.metadata.name, checkout.spec, authority));
-        }
-        for (checkout_ref, spec, authority) in engine.chain(observed) {
+        let discovered = self
+            .discovered
+            .all()
+            .into_iter()
+            .map(|checkout| (checkout.name, CheckoutSpec::Observed(checkout.spec), LifecycleAuthority::Observed));
+        for (checkout_ref, spec, authority) in engine.chain(discovered) {
             if spec.repo_ref() != &repository_key {
                 continue;
             }

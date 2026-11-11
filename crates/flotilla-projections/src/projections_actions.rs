@@ -113,7 +113,6 @@ pub trait ProjectionsActionPort: Send + Sync {
 pub struct ProjectionsActions<'a> {
     pub port: &'a dyn ProjectionsActionPort,
     pub resource_backend: &'a ResourceBackend,
-    pub observed_resource_backend: &'a ResourceBackend,
     /// The ManifestRoots the views read (#3824 layer 2c).
     pub manifest_roots: &'a dyn flotilla_resources::manifest_roots::ManifestRoots,
     pub event_sink: &'a Arc<dyn EventSink>,
@@ -142,10 +141,7 @@ impl ProjectionsActions<'_> {
                 description,
             });
 
-            let (backend, kind) = match kind.strip_prefix("observed/") {
-                Some(kind) => (self.observed_resource_backend.clone(), kind.to_string()),
-                None => (self.resource_backend.clone(), kind),
-            };
+            let backend = self.resource_backend.clone();
             let event_sink = self.event_sink.clone();
             let active_ref = Arc::clone(self.active_commands);
             tokio::spawn(async move {
@@ -285,11 +281,7 @@ impl ProjectionsActions<'_> {
                 }
             }
             CommandAction::QueryResourceDigest { namespace, kind, query } => {
-                let (kind, backend) = match kind.strip_prefix("observed/") {
-                    Some(kind) => (kind, self.observed_resource_backend),
-                    None => (kind.as_str(), self.resource_backend),
-                };
-                let result = flotilla_store::digest_resource_kind(backend, namespace, kind, query).await;
+                let result = flotilla_store::digest_resource_kind(self.resource_backend, namespace, kind, query).await;
                 match result {
                     Ok(digest) => Ok(CommandValue::ResourceDigest(Box::new(digest.into()))),
                     Err(error) => Ok(CommandValue::Error { message: error.to_string() }),

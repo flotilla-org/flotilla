@@ -29,8 +29,7 @@ use flotilla_vcs::{
     vcs::{CheckoutMaterialisationError, LocalCloneRequest},
 };
 
-use futures::StreamExt;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     ports::{finish_clone_delivery, unauthorised_clone, RoutingCheckoutRuntime},
@@ -220,45 +219,40 @@ impl HolderInputs for ConvoyHolderInputs {
     }
 }
 
-/// Rechecks this home's checkout launches as the observed-checkout refresh sees their paths change
-/// (#3108): a checkout observed at a launch's path, or no longer observed there, names that launch
-/// to the Checkout controller, which observes it again. Its wake is the observed store's watch;
-/// a watch opened again after a failure rechecks every launch, since changes in the gap are unseen.
-pub(super) async fn recheck_on_observed_refresh(state: Arc<super::state::ControllerRuntimeState>) {
-    let namespace = state.namespace.clone();
-    let observed = state.daemon.observed_resource_backend().using::<flotilla_resources::Checkout>(&namespace);
-    let mut reopened = false;
+/// Rechecks this home's checkout launches as the refresh's discovered checkouts change (#3108): a
+/// checkout discovered at a launch's path, changed there, or no longer discovered there, names that
+/// launch to the Checkout controller, which observes it again.
+pub(super) async fn recheck_on_discovered_refresh(state: Arc<super::state::ControllerRuntimeState>) {
+    let discovered = state.daemon.discovered_checkouts();
+    // Subscribed before the first read, so a refresh between the two is not missed.
+    let mut changes = discovered.changes();
+    let mut known = discovered_by_name(&discovered);
     loop {
-        let mut watch = match observed.watch(flotilla_resources::WatchStart::Now).await {
-            Ok(watch) => watch,
-            Err(error) => {
-                error!(%error, "checkout rechecks stopped: the observed checkouts cannot be watched");
-                return;
-            }
-        };
-        if reopened && !recheck_launches(&state, None).await {
-            return;
+        match changes.recv().await {
+            // A lagged receiver missed some changes; the difference from what it knew covers them.
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
-        reopened = true;
-        while let Some(event) = watch.next().await {
-            let path = match event {
-                Ok(
-                    flotilla_resources::WatchEvent::Added(checkout)
-                    | flotilla_resources::WatchEvent::Modified(checkout)
-                    | flotilla_resources::WatchEvent::Deleted(checkout),
-                ) => flotilla_resources::checkout_path::checkout_path(&checkout).map(str::to_owned),
-                // A deletion by name carries no path: every launch here is observed again.
-                Ok(flotilla_resources::WatchEvent::DeletedByName(_)) => None,
-                Err(error) => {
-                    warn!(%error, "the observed checkout watch failed; it is opened again");
-                    break;
-                }
-            };
-            if !recheck_launches(&state, path.as_deref()).await {
+        let now = discovered_by_name(&discovered);
+        let mut paths = std::collections::BTreeSet::new();
+        for (name, spec) in known.iter().chain(&now) {
+            if known.get(name) != now.get(name) {
+                paths.insert(spec.path.clone());
+            }
+        }
+        known = now;
+        for path in paths {
+            if !recheck_launches(&state, Some(&path)).await {
                 return;
             }
         }
     }
+}
+
+fn discovered_by_name(
+    discovered: &flotilla_resources::discovered_checkouts::DiscoveredCheckouts,
+) -> std::collections::BTreeMap<String, flotilla_resources::ObservedCheckoutSpec> {
+    discovered.all().into_iter().map(|checkout| (checkout.name, checkout.spec)).collect()
 }
 
 /// Names this home's ready launches at `path` (every ready launch when `None`) to the Checkout

@@ -32,15 +32,16 @@ use flotilla_provider_runtime::{CommandRunner, ObservationError};
 use flotilla_resources::address::{record_name, remote_change_request_address};
 use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
+use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
 use flotilla_resources::{
     capped_github_app_permissions, is_prepared_snapshot, normalize_issue_source, AllocationDecision, BoundChangeRequest, CapabilityNeed,
-    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, Clock, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource, CrewSpec, Forge,
-    FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host as ResourceHost, InputMeta, InputValue, IssueSnapshot,
-    IssueSourceResolution, IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, Platform, Project, ProjectSpec,
-    ReadResourceObject, Repository, RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff,
-    SupervisionTarget, TerminalCrewContext, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, BRIEF_ARTIFACTS_ANNOTATION,
-    CODEX_CENTRAL_LOGIN_CAPABILITY, GENERATION_LABEL, PLACEMENT_SNAPSHOT_KIND, PROJECT_LABEL, ROLE_LABEL,
+    ChangeRequest as ResourceChangeRequest, Clock, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec,
+    ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource, CrewSpec, Forge, FulfilmentGrant, FulfilmentKind,
+    FulfilmentKindSpec, FulfilmentRealisation, Host as ResourceHost, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, Platform, Project, ProjectSpec, ReadResourceObject, Repository,
+    RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, TerminalCrewContext,
+    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, BRIEF_ARTIFACTS_ANNOTATION, CODEX_CENTRAL_LOGIN_CAPABILITY,
+    GENERATION_LABEL, PLACEMENT_SNAPSHOT_KIND, PROJECT_LABEL, ROLE_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{HoldAct, RepositorySpec, SystemClock};
@@ -107,7 +108,8 @@ pub struct ConvoyCreateAdmission<'a> {
 #[derive(bon::Builder)]
 pub struct ConvoyAdmission {
     backend: ResourceBackend,
-    observed_backend: ResourceBackend,
+    /// The checkouts this host's refresh discovered.
+    discovered_checkouts: DiscoveredCheckouts,
     #[builder(default = Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))]
     lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     /// The account kinds' records: the old store's, or the engine's behind `[primitives]`.
@@ -995,7 +997,7 @@ impl ConvoyAdmission {
         spec: &ConvoySpec,
         workflow: &WorkflowTemplateSpec,
         evidence: BriefEvidence<'_>,
-    ) -> Result<(ResourceBackend, ResourceBackend), String> {
+    ) -> Result<ResourceBackend, String> {
         use flotilla_resources::TerminalSession as ResourceTerminalSession;
         use flotilla_resources::{CrewDefaults, FleetDesignation, ReadResourceList, FLEET_DESIGNATION_NAME};
         let read_source = evidence.definitions;
@@ -1007,37 +1009,6 @@ impl ConvoyAdmission {
             .collect::<BTreeSet<_>>();
         let repositories = read_source
             .query_declared::<Repository>(namespace, &StoreQuery::names(repository_names.clone(), false))
-            .await
-            .map_err(|error| error.to_string())?;
-        let local_host = self.environments.local_host_id().as_str();
-        // This host's direct environments, from the engine: this home holds them.
-        let local_environments = {
-            let reads = Arc::clone(&self.lifecycle_reads);
-            let local_host = local_host.to_owned();
-            tokio::task::spawn_blocking(move || {
-                let mut local = Vec::new();
-                for environment in reads.environments()?.live()? {
-                    if is_local_direct_environment(&environment.spec, &local_host)? {
-                        local.push(environment.name);
-                    }
-                }
-                Ok::<_, String>(local)
-            })
-            .await
-            .map_err(|error| format!("read local environments: {error}"))??
-        };
-        let local_checkout_query = StoreQuery {
-            field_values: BTreeMap::from([("spec.repo_ref".into(), repository_names.into_iter().collect())]),
-            any_of: Some(vec![
-                StoreQuery { fields: BTreeMap::from([("spec.host_ref".into(), local_host.into())]), ..Default::default() },
-                StoreQuery { field_values: BTreeMap::from([("spec.env_ref".into(), local_environments)]), ..Default::default() },
-            ]),
-            ..Default::default()
-        };
-        // The checkouts this host's refresh observed; the engine's are read through its port.
-        let observed = self
-            .observed_backend
-            .query_declared::<ResourceCheckout>(namespace, &local_checkout_query)
             .await
             .map_err(|error| error.to_string())?;
         let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, namespace)?;
@@ -1097,9 +1068,7 @@ impl ConvoyAdmission {
             snapshot.insert::<ResourceTerminalSession>(terminals)?;
             snapshot.insert::<ConvoyEnsure>(ensures)?;
         }
-        let mut observed_snapshot = flotilla_store::RequestSnapshot::new(&self.observed_backend, namespace)?;
-        observed_snapshot.insert::<ResourceCheckout>(observed)?;
-        Ok((snapshot.finish(), observed_snapshot.finish()))
+        Ok(snapshot.finish())
     }
 
     pub async fn write_admission_briefs(
@@ -1167,7 +1136,7 @@ impl ConvoyAdmission {
                 BriefEvidence { definitions: &definitions, convoys: &convoys }
             }
         };
-        let (reads, observed) = self.brief_read_inventory(namespace, name, spec, workflow, evidence).await?;
+        let reads = self.brief_read_inventory(namespace, name, spec, workflow, evidence).await?;
         let mut annotations = BTreeMap::new();
         if workflow.exit.is_none() {
             annotations.insert(flotilla_charter::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "standing".to_string());
@@ -1191,7 +1160,7 @@ impl ConvoyAdmission {
         let templates = CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path());
         let repositories = reads.clone().using::<Repository>(namespace);
         let local_checkouts = crate::repository_addressing::local_checkouts_with_lifecycle_reads(
-            &observed,
+            &self.discovered_checkouts,
             namespace,
             self.environments.local_host_id().as_str(),
             self.lifecycle_reads.as_ref(),
@@ -1731,22 +1700,6 @@ impl PlacementBuildJoiner<'_> {
             builds.push(planned);
         }
         Ok((images, builds))
-    }
-}
-
-/// Whether `spec` is a direct environment of `local_host`: one its provider address places on
-/// the host, or, with no address, whose host reference names it.
-fn is_local_direct_environment(spec: &flotilla_resources::EnvironmentSpec, local_host: &str) -> Result<bool, String> {
-    if spec.host_direct.is_none() {
-        return Ok(false);
-    }
-    match &spec.provider_address {
-        Some(address) => {
-            let host_address =
-                flotilla_address::Address::root(flotilla_address::Kind::Host, local_host).map_err(|error| error.to_string())?;
-            Ok(address.to_string().starts_with(&format!("{host_address}/provider:")))
-        }
-        None => Ok(spec.host_direct.as_ref().is_some_and(|direct| direct.host_ref == local_host)),
     }
 }
 
@@ -4887,7 +4840,6 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         bag: flotilla_discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await,
     });
     let resource_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let observed_resource_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let provisioning_namespace = Arc::new(std::sync::RwLock::new("flotilla".into()));
     let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(FixtureQueries);
     let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(FixtureQueries);
@@ -4900,7 +4852,7 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
     let admission = ConvoyAdmission::builder()
         .backend(resource_backend.clone())
         .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(resource_backend.clone())))
-        .observed_backend(observed_resource_backend.clone())
+        .discovered_checkouts(DiscoveredCheckouts::default())
         .config(Arc::clone(&config))
         .discovery(Arc::clone(&discovery))
         .environments(Arc::clone(&environments))
@@ -4918,13 +4870,7 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         // The engine's readings, as composition installs them; none is held here.
         .lifecycle_reads(Arc::clone(crate::test_support::no_held_checkouts()))
         .build();
-    HandlerContractFixture {
-        owner: admission,
-        backend: resource_backend,
-        observed: observed_resource_backend,
-        namespace: provisioning_namespace,
-        temp,
-    }
+    HandlerContractFixture { owner: admission, backend: resource_backend, namespace: provisioning_namespace, temp }
 }
 
 /// Registers a ready host advertising one host-direct provider and the
@@ -4979,7 +4925,6 @@ pub async fn register_host_direct_kind(backend: &ResourceBackend, host: &str) {
 pub struct HandlerContractFixture {
     pub owner: ConvoyAdmission,
     pub backend: ResourceBackend,
-    pub observed: ResourceBackend,
     pub namespace: Arc<std::sync::RwLock<String>>,
     pub temp: tempfile::TempDir,
 }
@@ -5097,46 +5042,6 @@ mod tests {
 
     use flotilla_discovery_testkit::FakeChangeRequest;
     use flotilla_protocol::ChangeRequest;
-
-    // WORKLOAD.md: admission must select only this host's direct environments,
-    // independently of the number of unrelated per-vessel environments.
-    #[hegel::test]
-    fn direct_environment_query_covers_only_local_current_and_legacy_records(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        // Escaped/case-sensitive hosts, both stored generations, missing direct
-        // inputs, and a conflicting legacy host alongside an explicit address.
-        let host = tc.draw(gs::text().alphabet("aZ09 /:%é").min_size(1).max_size(16));
-        let address = flotilla_address::Address::root(flotilla_address::Kind::Host, &host).expect("host address");
-        let mut selected = BTreeSet::new();
-        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(24));
-        let mut expected = BTreeSet::new();
-        for row in 0..count {
-            let local = tc.draw(gs::booleans());
-            let legacy = tc.draw(gs::booleans());
-            let direct = tc.draw(gs::booleans());
-            let target = if local { host.clone() } else { format!("{host}-other") };
-            let mut spec = serde_json::json!({});
-            if !legacy {
-                let place = flotilla_address::Address::root(flotilla_address::Kind::Host, &target).expect("place");
-                spec["provider_address"] = format!("{place}/provider:custom").into();
-            }
-            if direct {
-                spec["host_direct"] =
-                    serde_json::json!({"host_ref": if legacy { target.clone() } else { host.clone() }, "repo_default_dir":"/work"});
-            } else {
-                spec["docker"] = serde_json::json!({"host_ref": target, "image":"image"});
-            }
-            let name = format!("environment-{row}");
-            let spec = serde_json::from_value::<flotilla_resources::EnvironmentSpec>(spec).expect("environment spec");
-            if is_local_direct_environment(&spec, &host).expect("predicate") {
-                selected.insert(name.clone());
-            }
-            if local && direct {
-                expected.insert(name);
-            }
-            assert_eq!(selected, expected, "candidate cover after every insert at {address}");
-        }
-    }
 
     // Artifact storage is the process boundary; read inventories and rendering
     // use real collaborators. Multiple vessels must not reread a kind.

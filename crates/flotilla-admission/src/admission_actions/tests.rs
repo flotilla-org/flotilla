@@ -24,8 +24,7 @@ fn handlers<'a>(
 // and serializes competing admissions so the duplicate creates no resources.
 #[tokio::test]
 async fn direct_admission_contract_success_and_duplicate() {
-    let HandlerContractFixture { owner, backend, observed: _, namespace, temp } =
-        super::super::convoy_admission::handler_contract_fixture().await;
+    let HandlerContractFixture { owner, backend, namespace, temp } = super::super::convoy_admission::handler_contract_fixture().await;
     super::super::convoy_admission::register_host_direct_kind(&backend, "host").await;
     let worker = Worker::default();
     let recording = Arc::new(RecordingEventSink::default());
@@ -87,7 +86,7 @@ async fn direct_admission_contract_success_and_duplicate() {
 // refuses without submission, and owner cleanup allows the next attempt.
 #[tokio::test]
 async fn direct_admission_contract_worker_cleanup_and_duplicate() {
-    let HandlerContractFixture { owner, backend, observed: _, namespace, temp: _temp } =
+    let HandlerContractFixture { owner, backend, namespace, temp: _temp } =
         super::super::convoy_admission::handler_contract_fixture().await;
     let worker = Worker::default();
     let recording = Arc::new(RecordingEventSink::default());

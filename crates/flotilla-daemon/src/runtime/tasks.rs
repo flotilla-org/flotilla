@@ -1134,6 +1134,7 @@ pub(super) fn spawn_aggregator_task(
                     flotilla_projections::AggregatorContext {
                         durable: daemon.resource_backend(),
                         observed: daemon.observed_resource_backend(),
+                        discovered: daemon.discovered_checkouts(),
                         host_name: daemon.host_name().clone(),
                         event_sink: daemon.event_sink(),
                         events: daemon.subscribe(),

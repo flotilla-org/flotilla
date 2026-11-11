@@ -6,7 +6,7 @@ use flotilla_config::ConfigStore;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_protocol::{CliListKind, Command, CommandAction, CommandValue, HostName, RepoIdentity};
 use flotilla_resources::{
-    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, ObservedChangeRequestState,
+    ChangeRequest as ResourceChangeRequest, CheckoutSpec as ResourceCheckoutSpec, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec,
 };
 use flotilla_store::ResourceBackend;
@@ -38,21 +38,17 @@ async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
     let repository = RepositorySpec::remote("https://github.com/team/repo.git").expect("repository");
     let key = repository.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository record");
-    daemon
-        .observed_resource_backend()
-        .using::<ResourceCheckout>("flotilla")
-        .create(
-            &test_meta("observed-checkout"),
-            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                r#ref: "feature".into(),
-                path: "/tmp/repo-feature".into(),
-                repo_ref: key,
-                host_ref: "local".into(),
-                is_main: false,
-            }),
-        )
-        .await
-        .expect("observed checkout");
+    super::discover_checkout(
+        &daemon,
+        "observed-checkout",
+        ResourceObservedCheckoutSpec {
+            r#ref: "feature".into(),
+            path: "/tmp/repo-feature".into(),
+            repo_ref: key,
+            host_ref: "local".into(),
+            is_main: false,
+        },
+    );
     let change_requests = backend.using::<ResourceChangeRequest>("flotilla");
     for (name, number, state) in [("open-pr", 42, ObservedChangeRequestState::Open), ("closed-pr", 43, ObservedChangeRequestState::Closed)]
     {
@@ -243,21 +239,17 @@ async fn cli_checkout_rows_follow_engine_checkouts() {
             .expect("convoy");
         super::support::admit_on_engine(&backend, &engine, &convoy_name).await;
         last_convoy = Some(convoy_name.clone());
-        daemon
-            .observed_resource_backend()
-            .using::<ResourceCheckout>("flotilla")
-            .create(
-                &test_meta(&name),
-                &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                    repo_ref: key.clone(),
-                    r#ref: "stale-observation".into(),
-                    path: "/stale".into(),
-                    host_ref: "local".into(),
-                    is_main: false,
-                }),
-            )
-            .await
-            .expect("observed shadow");
+        super::discover_checkout(
+            &daemon,
+            &name,
+            ResourceObservedCheckoutSpec {
+                repo_ref: key.clone(),
+                r#ref: "stale-observation".into(),
+                path: "/stale".into(),
+                host_ref: "local".into(),
+                is_main: false,
+            },
+        );
         let launch = engine.request(
             &name,
             &ResourceCheckoutSpec::Worktree(CheckoutWorktreeSpec {

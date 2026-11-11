@@ -36,8 +36,8 @@ use flotilla_protocol::{
     commands::RepositoryIdentityChange, AgentOverride, Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector,
 };
 use flotilla_resources::{
-    Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectRepositoryRole,
-    ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
+    CheckoutSpec, Convoy, ConvoyEnsure, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectRepositoryRole, ProjectSpec,
+    Repository, RepositoryKey, RepositorySpec, RepositoryStatus, WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use tracing::instrument::WithSubscriber;
@@ -615,9 +615,9 @@ async fn project_refresh_accepts_every_declared_lab_forge_url_for_an_observed_ch
         assert!(matches!(result, CommandValue::ProjectRegistered { .. } | CommandValue::ProjectRefreshed { .. }), "{result:?}");
         // Each spelling describes the same physical main checkout, so refresh
         // must never see two bootstrap candidates for the aliased directory.
-        let checkouts = daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("observed checkouts");
-        assert_eq!(checkouts.items.len(), 1);
-        let CheckoutSpec::Observed(observed) = &checkouts.items[0].spec else { panic!("observed checkout") };
+        let checkouts = daemon.discovered_checkouts().all();
+        assert_eq!(checkouts.len(), 1);
+        let observed = &checkouts[0].spec;
         assert_eq!(Path::new(&observed.path), checkout.canonicalize().expect("physical checkout"));
         assert!(observed.is_main);
         let project = backend.definitions::<Project>("flotilla").get("ghostty").await.expect("project");
@@ -1923,8 +1923,7 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
         backend.clone().using::<Repository>("flotilla").get(&repository_key.to_string()).await.expect("repository should exist");
     assert_eq!(repository.spec, repository_spec);
     repository.spec.verify_key(&repository_key).expect("repository key should verify");
-    let checkouts = daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("checkout list");
-    assert_eq!(checkouts.items.len(), 1);
+    assert_eq!(daemon.discovered_checkouts().all().len(), 1);
     let project = backend.using::<Project>("flotilla").get("my-project").await.expect("project should exist");
     assert_eq!(project.spec.display_name, "My Project");
     // #2719: generated Projects leave workflow choice to the cascade.
@@ -2002,16 +2001,8 @@ async fn project_checkout_set_with_store_history(tmp: &tempfile::TempDir, with_h
         CommandValue::ProjectAdded { name: "view-only".into() }
     );
     assert!(daemon.tracked_repo_paths().await.is_empty(), "project materialization must not depend on Plane-A tracking");
-    let mut specs = daemon
-        .observed_resource_backend()
-        .using::<Checkout>("flotilla")
-        .list()
-        .await
-        .expect("checkout list")
-        .items
-        .into_iter()
-        .map(|checkout| checkout.spec)
-        .collect::<Vec<_>>();
+    let mut specs =
+        daemon.discovered_checkouts().all().into_iter().map(|checkout| CheckoutSpec::Observed(checkout.spec)).collect::<Vec<_>>();
     specs.sort_by_key(|spec| spec.target_path().map(str::to_string));
     specs
 }
@@ -2051,19 +2042,18 @@ async fn repeated_project_materialization_updates_and_retracts_worktree_observat
     checkouts.write().expect("checkout inspection lock should not be poisoned")[1].git_ref = "renamed-feature".to_string();
     execute_project_add(&daemon, &mut rx, main_path.to_string_lossy().into_owned(), None, None).await;
 
-    let observed = daemon.observed_resource_backend().using::<Checkout>("flotilla");
-    let after_update = observed.list().await.expect("updated checkout list").items;
+    let after_update = daemon.discovered_checkouts().all();
     assert_eq!(after_update.len(), 2);
-    assert!(after_update.iter().any(|checkout| {
-        matches!(&checkout.spec, CheckoutSpec::Observed(spec) if spec.path == worktree_path.to_string_lossy() && spec.r#ref == "renamed-feature")
-    }));
+    assert!(after_update
+        .iter()
+        .any(|checkout| checkout.spec.path == worktree_path.to_string_lossy() && checkout.spec.r#ref == "renamed-feature"));
 
     checkouts.write().expect("checkout inspection lock should not be poisoned").pop();
     execute_project_add(&daemon, &mut rx, main_path.to_string_lossy().into_owned(), None, None).await;
 
-    let after_removal = observed.list().await.expect("checkout list after removal").items;
+    let after_removal = daemon.discovered_checkouts().all();
     assert_eq!(after_removal.len(), 1);
-    assert!(matches!(&after_removal[0].spec, CheckoutSpec::Observed(spec) if spec.path == main_path.to_string_lossy()));
+    assert_eq!(after_removal[0].spec.path, main_path.to_string_lossy());
 }
 
 #[tokio::test]
@@ -2082,7 +2072,7 @@ async fn project_add_catalog_slug_needs_no_local_checkout() {
     let result = execute_project_add(&daemon, &mut rx, "catalog-only".to_string(), None, None).await;
 
     assert_eq!(result, CommandValue::ProjectAdded { name: "catalog-only".into() });
-    assert!(daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("checkout list").items.is_empty());
+    assert!(daemon.discovered_checkouts().all().is_empty());
     let project = backend.using::<Project>("flotilla").get("catalog-only").await.expect("project should exist");
     assert_eq!(project.spec.repositories[0].repo, key);
 }

@@ -876,11 +876,15 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
     let spec = adopted("main");
     let mut launch = checkouts.put_ready("checkout", &spec, None);
     // Identical names on different origins remain distinct rows.
-    kiwi.observed_resource_backend()
-        .using::<Checkout>("flotilla")
-        .create(&InputMeta::builder().name("checkout".to_string()).build(), &spec)
-        .await
-        .expect("create local checkout");
+    let CheckoutSpec::Observed(discovered) = spec.clone() else { unreachable!("adopted checkouts are observed") };
+    kiwi.discovered_checkouts().replace(
+        &discovered.repo_ref.clone(),
+        vec![flotilla_resources::discovered_checkouts::DiscoveredCheckout {
+            name: "checkout".to_string(),
+            repo_slug: "widgets".to_string(),
+            spec: discovered,
+        }],
+    );
     let independent = flotilla_daemon_testkit::engine::run_session(
         &feta,
         "terminal-independent",

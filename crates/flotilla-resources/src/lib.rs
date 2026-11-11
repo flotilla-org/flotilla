@@ -52,6 +52,7 @@ pub use image_layer::{
 pub mod delivery_hold;
 #[doc(hidden)]
 pub mod digest;
+pub mod discovered_checkouts;
 pub use digest::{digest_bucket, DigestQuery, PartitionDigest, DIGEST_FANOUT};
 pub mod clone_records;
 #[doc(hidden)]

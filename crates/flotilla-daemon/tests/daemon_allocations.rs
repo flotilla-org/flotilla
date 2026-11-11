@@ -109,6 +109,7 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
             flotilla_projections::AggregatorContext {
                 durable: aggregate_daemon.resource_backend(),
                 observed: aggregate_daemon.observed_resource_backend(),
+                discovered: aggregate_daemon.discovered_checkouts(),
                 host_name: aggregate_daemon.host_name().clone(),
                 event_sink: aggregate_daemon.event_sink(),
                 events: aggregate_daemon.subscribe(),

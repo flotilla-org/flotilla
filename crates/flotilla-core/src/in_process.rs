@@ -92,13 +92,13 @@ use flotilla_protocol::{
     SurfaceDeclaration, TopologyResponse, TopologyRoute, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    host_direct_environment_name, observed_change_request_subjects, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, Forge,
-    ForgeKind, FulfilmentKind, InputMeta, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
-    ObservedChangeRequestState, Project, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError, ResourceObject,
-    ResourceProvenance, SystemClock, TerminalSessionTarget, TurnDeliveryRung, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase,
-    WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
+    host_direct_environment_name, observed_change_request_subjects, ChangeRequest as ResourceChangeRequest,
+    CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyRepositorySpec, ConvoySpec,
+    ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, Forge, ForgeKind, FulfilmentKind, InputMeta,
+    IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope, ObservedChangeRequestState, Project, Repository,
+    RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
+    TerminalSessionTarget, TurnDeliveryRung, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
+    WorkflowTemplateSpec, CONVOY_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{ConditionValue, TerminalSessionIdentity};
@@ -166,6 +166,7 @@ use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::checkout_path::checkout_path;
+use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
 
 struct ProviderChangeRequestQueryPort {
     forge_reads: flotilla_observation::forge_observation::ForgeReads,
@@ -801,6 +802,8 @@ pub struct InProcessDaemon {
     clock: Arc<dyn Clock>,
     surfaces: Surfaces,
     observed_resource_backend: ResourceBackend,
+    /// The checkouts this host's refresh discovered: local facts, in memory.
+    discovered_checkouts: DiscoveredCheckouts,
     /// Serializes observed Checkout publication with repository removal so a
     /// refresh captured before untracking cannot recreate deleted resources.
     /// Admission cleanup and resource deletion share this lock with adoption.
@@ -984,7 +987,6 @@ impl InProcessDaemon {
         projections_actions::ProjectionsActions {
             port: self,
             resource_backend: &self.resource_backend,
-            observed_resource_backend: &self.observed_resource_backend,
             manifest_roots: &*self.manifest_roots,
             event_sink: &self.event_sink,
             node_id: &self.node_id,
@@ -1089,6 +1091,7 @@ impl InProcessDaemon {
             .expect("failed to resolve local node id");
         let resource_backend = resource_backend.with_local_root(local_node_id.clone());
         let observed_resource_backend = ResourceBackend::new(InMemoryBackend::observed()).with_local_root(local_node_id.clone());
+        let discovered_checkouts = DiscoveredCheckouts::default();
         let local_environment_id =
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
         let local_host_id = resolve_local_host_id(config.state_dir().as_path(), config_machine_id, &*discovery.runner)
@@ -1231,15 +1234,12 @@ impl InProcessDaemon {
                             }
                         }
                         flotilla_observation::observed_resources::reconcile_checkouts(
-                            &observed_resource_backend,
-                            DEFAULT_PROVISIONING_NAMESPACE,
+                            &discovered_checkouts,
                             &key,
                             &spec.catalog_slug(),
                             &providers,
                             local_host_id.as_str(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                        );
                         Ok::<_, String>(key)
                     }
                     .await;
@@ -1351,7 +1351,7 @@ impl InProcessDaemon {
             CheckoutProviders::builder()
                 .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
                 .resource_backend(resource_backend.clone())
-                .observed_resource_backend(observed_resource_backend.clone())
+                .discovered_checkouts(discovered_checkouts.clone())
                 .config(Arc::clone(&config))
                 .discovery(Arc::clone(&discovery))
                 .environment_manager(Arc::clone(&environment_manager))
@@ -1415,7 +1415,7 @@ impl InProcessDaemon {
                 .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
                 .accounts(accounts.clone() as Arc<dyn flotilla_resources::account_access::AccountRecords>)
                 .backend(resource_backend.clone())
-                .observed_backend(observed_resource_backend.clone())
+                .discovered_checkouts(discovered_checkouts.clone())
                 .config(Arc::clone(&config))
                 .discovery(Arc::clone(&discovery))
                 .environments(Arc::clone(&environment_manager) as Arc<dyn Environments>)
@@ -1458,6 +1458,7 @@ impl InProcessDaemon {
             issue_observer,
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
+            discovered_checkouts: discovered_checkouts.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
             aggregator_projection_state: aggregator_projection_state.clone(),
             image_layer_refresh: Default::default(),
@@ -1763,7 +1764,7 @@ impl InProcessDaemon {
         let path = canonical_or_original(path);
         let namespace = self.provisioning_namespace().await;
         let checkouts = flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
-            &self.observed_resource_backend,
+            &self.discovered_checkouts,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
             self.lifecycle_reads.as_ref(),
@@ -1996,9 +1997,7 @@ impl InProcessDaemon {
                 meta.annotations.insert(SUPERSEDED_BY_ANNOTATION.to_string(), target_name.clone());
                 repositories.update(&meta, &source.metadata.resource_version, &source.spec).await.map_err(|error| error.to_string())?;
             } else {
-                flotilla_observation::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, namespace, &key)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                self.discovered_checkouts.forget_repository(&key);
                 repositories.delete(&source.metadata.name).await.map_err(|error| error.to_string())?;
             }
         }
@@ -2620,6 +2619,11 @@ impl InProcessDaemon {
         self.observed_resource_backend.clone()
     }
 
+    /// The checkouts this host's refresh discovered.
+    pub fn discovered_checkouts(&self) -> DiscoveredCheckouts {
+        self.discovered_checkouts.clone()
+    }
+
     /// Returns the current connection status for a peer host.
     pub async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState {
         self.host_registry.peer_connection_status(node_id).await
@@ -2940,7 +2944,7 @@ impl InProcessDaemon {
     ) -> Result<Option<RepositoryKey>, String> {
         flotilla_admission::repository_addressing::resolve_repository_with_lifecycle_reads(
             &self.resource_backend,
-            &self.observed_resource_backend,
+            &self.discovered_checkouts,
             &self.provisioning_namespace().await,
             self.environment_manager.local_host_id().as_str(),
             selector,
@@ -2989,7 +2993,7 @@ impl InProcessDaemon {
     ) -> Result<(PathBuf, String), String> {
         let namespace = self.provisioning_namespace().await;
         let checkouts = flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
-            &self.observed_resource_backend,
+            &self.discovered_checkouts,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
             self.lifecycle_reads.as_ref(),
@@ -3898,13 +3902,13 @@ impl InProcessDaemon {
             image_layer_refresh: Arc::clone(&self.image_layer_refresh),
             resource_backend: &self.resource_backend,
             manifest_roots: &*self.manifest_roots,
-            observed_resource_backend: &self.observed_resource_backend,
+            discovered_checkouts: &self.discovered_checkouts,
             clock: &self.clock,
             namespace: &self.provisioning_namespace,
             repository_index: RepositoryIndex {
                 lifecycle_reads: self.lifecycle_reads.as_ref(),
                 backend: &self.resource_backend,
-                observed: &self.observed_resource_backend,
+                discovered: &self.discovered_checkouts,
                 namespace: &self.provisioning_namespace,
                 host: self.environment_manager.local_host_id().as_str(),
             },
@@ -4009,34 +4013,17 @@ impl InProcessDaemon {
                     }
                 }
             }
-            for checkout in self
-                .observed_resource_backend
-                .clone()
-                .using::<ResourceCheckout>(&namespace)
-                .list()
-                .await
-                .map_err(|error| error.to_string())?
-                .items
-            {
-                if let ResourceCheckoutSpec::Observed(observed) = checkout.spec {
-                    if Path::new(&observed.path) == inspection.checkout.path && observed.repo_ref != repository_key {
-                        superseded_keys.insert(observed.repo_ref);
-                    }
+            for checkout in self.discovered_checkouts.all() {
+                if Path::new(&checkout.spec.path) == inspection.checkout.path && checkout.spec.repo_ref != repository_key {
+                    superseded_keys.insert(checkout.spec.repo_ref);
                 }
             }
         } else if let Some(previous) = &previous_tracked_key {
-            flotilla_observation::observed_resources::delete_observed_checkout_at_path(
-                &self.observed_resource_backend,
-                &namespace,
-                previous,
-                &inspection.checkout.path,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            self.discovered_checkouts.forget_path(previous, &inspection.checkout.path);
         }
 
         let other_tracked_keys = flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
-            &self.observed_resource_backend,
+            &self.discovered_checkouts,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
             self.lifecycle_reads.as_ref(),
@@ -4058,9 +4045,7 @@ impl InProcessDaemon {
                 remaining_projects.iter().any(|project| project.spec.repositories.iter().any(|entry| &entry.repo == old_key));
             let has_durable_checkout = self.repository_has_live_checkouts(old_key).await?;
             if !still_referenced && !has_durable_checkout {
-                flotilla_observation::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, &namespace, old_key)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                self.discovered_checkouts.forget_repository(old_key);
                 match repositories.delete(&old_key.to_string()).await {
                     Ok(()) | Err(ResourceError::NotFound { .. }) => {}
                     Err(error) => return Err(error.to_string()),
@@ -4395,17 +4380,8 @@ impl InProcessDaemon {
         }
 
         if stop_observing && removed_final_local_root {
-            let namespace = self.provisioning_namespace().await;
             if let Some(repository_key) = repository_key {
-                if let Err(error) = flotilla_observation::observed_resources::delete_observed_checkouts(
-                    &self.observed_resource_backend,
-                    &namespace,
-                    &repository_key,
-                )
-                .await
-                {
-                    warn!(repo = %repo_identity.path, %error, "failed to delete observed checkouts for untracked repo");
-                }
+                self.discovered_checkouts.forget_repository(&repository_key);
             } else {
                 warn!(repo = %repo_identity.path, "could not resolve repository identity while deleting observed checkouts");
             }
@@ -4574,7 +4550,7 @@ impl InProcessDaemon {
         }
         let mut paths = BTreeMap::<RepositoryKey, Vec<PathBuf>>::new();
         for checkout in flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
-            &self.observed_resource_backend,
+            &self.discovered_checkouts,
             namespace,
             self.environment_manager.local_host_id().as_str(),
             self.lifecycle_reads.as_ref(),
@@ -4658,25 +4634,15 @@ impl InProcessDaemon {
                         provider: None,
                     });
                 }
-                let observed =
-                    self.observed_resource_backend.using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?;
-                for checkout in observed.items {
-                    if held.contains_key(&checkout.metadata.name) {
+                for checkout in self.discovered_checkouts.all() {
+                    if held.contains_key(&checkout.name) {
                         continue;
                     }
-                    let status = match checkout.status.as_ref().map(|status| status.phase) {
-                        Some(ResourceCheckoutPhase::Gone) => continue,
-                        Some(ResourceCheckoutPhase::Pending) => "pending",
-                        Some(ResourceCheckoutPhase::Ready) => "ready",
-                        Some(ResourceCheckoutPhase::Failed) => "failed",
-                        None => "observed",
-                    };
-                    let reference = checkout.metadata.name;
-                    items.entry((String::new(), reference.clone())).or_insert(CliListRow {
-                        repo: Some(checkout.spec.repo_ref().to_string()),
-                        reference,
-                        name: checkout.spec.branch().to_string(),
-                        status: status.to_string(),
+                    items.entry((String::new(), checkout.name.clone())).or_insert(CliListRow {
+                        repo: Some(checkout.spec.repo_ref.to_string()),
+                        reference: checkout.name,
+                        name: checkout.spec.r#ref,
+                        status: "observed".to_string(),
                         provider: None,
                     });
                 }
@@ -4993,6 +4959,7 @@ impl InProcessDaemon {
         AttachResolver {
             resource_backend: &self.resource_backend,
             observed_resource_backend: &self.observed_resource_backend,
+            discovered_checkouts: &self.discovered_checkouts,
             aggregator_projection_state: &self.aggregator_projection_state,
             config: &self.config,
             host_registry: &self.host_registry,

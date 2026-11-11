@@ -103,6 +103,7 @@ impl AttachReadContext {
 pub(super) struct AttachResolver<'a> {
     pub(super) resource_backend: &'a ResourceBackend,
     pub(super) observed_resource_backend: &'a ResourceBackend,
+    pub(super) discovered_checkouts: &'a flotilla_resources::discovered_checkouts::DiscoveredCheckouts,
     pub(super) aggregator_projection_state: &'a AggregatorProjectionState,
     pub(super) config: &'a ConfigStore,
     pub(super) host_registry: &'a flotilla_projections::host_registry::HostRegistry,
@@ -240,7 +241,7 @@ impl<'a> AttachResolver<'a> {
         let namespace = self.provisioning_namespace().await;
         let repository_key = flotilla_admission::repository_addressing::resolve_repository_with_lifecycle_reads(
             self.resource_backend,
-            self.observed_resource_backend,
+            self.discovered_checkouts,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
             selector,
