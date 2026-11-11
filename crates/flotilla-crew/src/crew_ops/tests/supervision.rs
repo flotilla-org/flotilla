@@ -8,23 +8,42 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::{CrewCommandContext, PrincipalRef, ResourceRef};
 use flotilla_resources::{
-    external_patches as convoy_external_patches, Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase,
-    CrewWorkState, HoldAct, InputMeta, TerminalSession as ResourceTerminalSession, TerminalSessionPhase, TerminalSessionStatus,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    convoy::engine::{EngineConvoyPath, EngineConvoys},
+    external_patches as convoy_external_patches, Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, CrewWorkPhase, HoldAct, InputMeta,
+    TerminalSession as ResourceTerminalSession, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use tokio::sync::RwLock;
 
-use super::{fixture, old_store_fixture};
+use super::{fixture, old_store_fixture, old_store_prelude_fixture, old_store_shaped_fixture, shaped_fixture, Crewed, Held};
 use crate::crew_ops::{queue_pending_crew_message, CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator, ResolvedCrewContext};
 use crate::ports::WorkCredentialReconciler;
-use flotilla_resources::{CrewMessageSender, Selector, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, Vessel};
+use flotilla_resources::{CrewMessageSender, Selector, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec};
+
+/// A second vessel `review`, crewed by agent `reviewer` owing a decision ledger when `owes`.
+fn with_review(owes: bool) -> impl FnOnce(&mut WorkflowSnapshot) {
+    move |snapshot| {
+        let mut review = snapshot.vessels[0].clone();
+        review.name = "review".into();
+        review.crew[0].role = "reviewer".into();
+        review.crew[0].promises = if owes { vec![flotilla_resources::TemplatePromise::decision_ledger("reviewer")] } else { Vec::new() };
+        snapshot.vessels.push(review);
+    }
+}
+
+/// Agent `member` beside the coder in `work`.
+fn with_member(snapshot: &mut WorkflowSnapshot, member: &str) {
+    let mut crew = snapshot.vessels[0].crew[0].clone();
+    crew.role = member.into();
+    crew.promises = Vec::new();
+    snapshot.vessels[0].crew.push(crew);
+}
 
 // On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[hegel::test]
 fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
     use flotilla_messaging::MessageInbox;
-    use flotilla_resources::{Message, MessageReference, MessageRelation, MessageSpec, VesselSpec};
+    use flotilla_resources::{Message, MessageReference, MessageRelation, MessageSpec};
     use hegel::generators as gs;
 
     use crate::leaf_engine::ResourceIntentPublisher;
@@ -62,75 +81,58 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
         }
     }
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (crew, backend, probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
+        let (crew, backend, probe, held) =
+            old_store_shaped_fixture(CrewWorkPhase::Working, with_review(receiver_phase == CrewWorkPhase::Done)).await;
         probe.fail.store(false, Ordering::SeqCst);
-        backend
-            .using::<Vessel>("flotilla")
-            .create(
-                &InputMeta::builder().name("vessel".into()).build(),
-                &VesselSpec {
-                    convoy_ref: "crew".into(),
-                    vessel_name: "work".into(),
-                    fulfilment_kind_ref: "test".into(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                },
-            )
-            .await
-            .expect("caller vessel");
-        let convoys = backend.using::<ResourceConvoy>("flotilla");
-        let convoy = convoys.get("crew").await.expect("convoy");
-        let mut status = convoy.status.clone().expect("status");
-        let mut receiver_vessel = status.workflow_snapshot.as_ref().expect("snapshot").vessels[0].clone();
-        receiver_vessel.name = "review".into();
-        receiver_vessel.crew[0].role = "reviewer".into();
-        status.workflow_snapshot.as_mut().expect("snapshot").vessels.push(receiver_vessel);
-        status
-            .crew_work
-            .insert("review".into(), BTreeMap::from([("reviewer".into(), CrewWorkState::builder().phase(receiver_phase).build())]));
-        convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("second vessel");
+        let launch = held.launch.clone();
+        if receiver_phase == CrewWorkPhase::Done {
+            held.engine.keep(&backend, &launch, "review", "reviewer").await;
+        }
+        assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].phase, receiver_phase);
         let home = if remote { ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()) } else { backend.clone() };
         let publisher: Arc<dyn ResourceIntentPublisher> =
             Arc::new(ReceiverHome { inbox: MessageInbox::new(home.clone(), "flotilla"), fail: publication_fails });
         if remote || publication_fails {
             crew.set_resource_intent_publisher(Arc::downgrade(&publisher));
         }
-        let context = CrewCommandContext::builder().convoy("crew".into()).vessel_ref("vessel".into()).role("coder".into()).build();
+        let context = CrewCommandContext::builder().convoy(launch.clone()).vessel_ref(held.vessel.clone()).role("coder".into()).build();
+        let convoy = held.convoy(&backend).await;
         let carry = MessageReference::ControlRecord {
-            resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "crew"),
+            resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &launch),
             revision: convoy.metadata.resource_version.clone(),
         };
+        let reviewer = held.receiver("review", "reviewer");
+        let short = format!("{launch}/review/reviewer");
         if publication_fails {
-            let before = convoys.get("crew").await.expect("before handoff").status;
+            let before = held.convoy(&backend).await.status;
             for _ in 0..repeats {
-                crew.handoff_with_carries(&context, "crew/review/reviewer", "review this", vec![carry.clone()])
+                crew.handoff_with_carries(&context, &short, "review this", vec![carry.clone()])
                     .await
                     .expect_err("receiver publication fails");
-                assert_eq!(convoys.get("crew").await.expect("restored authority").status, before);
+                assert_eq!(held.convoy(&backend).await.status, before);
                 assert!(home.using::<Message>("flotilla").list().await.expect("inbox").items.is_empty());
             }
             return;
         }
         for index in 0..repeats {
-            let target = if index % 2 == 0 { "crew/review/reviewer" } else { "flotilla/crew/review/reviewer" };
+            let target = if index % 2 == 0 { short.as_str() } else { reviewer.as_str() };
             crew.handoff_with_carries(&context, target, "review this", vec![carry.clone()]).await.expect("handoff");
-            assert_eq!(
-                convoys.get("crew").await.expect("activated convoy").status.expect("status").crew_work["review"]["reviewer"].phase,
-                CrewWorkPhase::Working
-            );
+            // The handoff delivers the reviewer its task: it is wanted running, and its vessel starts it.
+            assert!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].task_assigned);
             let records = home.using::<Message>("flotilla").list().await.expect("receiver inbox").items;
             assert_eq!(records.len(), index + 1, "each handoff is distinct even when its body repeats");
             for record in records {
-                assert_eq!(record.spec.sender, "flotilla/crew/work/coder");
-                assert_eq!(record.spec.receiver, "flotilla/crew/review/reviewer");
+                assert_eq!(record.spec.sender, held.receiver("work", "coder"));
+                assert_eq!(record.spec.receiver, reviewer);
                 assert_eq!(record.spec.relation, MessageRelation::Peer);
                 assert_eq!(record.spec.references, vec![carry.clone()]);
                 assert_eq!(record.spec.body, "review this");
             }
         }
-        for invalid in ["crew/missing/reviewer", "other/review/reviewer", "principal:operator", "coder"] {
-            crew.handoff(&context, invalid, "review").await.expect_err("invalid crew target");
+        for invalid in [format!("{launch}/missing/reviewer"), "other/review/reviewer".into(), "principal:operator".into(), "coder".into()] {
+            crew.handoff(&context, &invalid, "review").await.expect_err("invalid crew target");
         }
-        crew.handoff(&context, "crew/review/reviewer", "").await.expect_err("empty handoff");
+        crew.handoff(&context, &short, "").await.expect_err("empty handoff");
         assert_eq!(home.using::<Message>("flotilla").list().await.expect("inbox").items.len(), repeats);
     });
 }
@@ -139,11 +141,11 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
 // On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[tokio::test]
 async fn operator_supervision_messages_working_crew() {
-    let (crew, backend, _probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
+    let (crew, backend, _probe, held) = old_store_fixture(CrewWorkPhase::Working).await;
     let principal = PrincipalRef { namespace: "flotilla".into(), name: "operator-alice".into() };
     crew.supervise(CrewSupervisionRequest {
         namespace: "flotilla",
-        convoy_name: "crew",
+        convoy_name: &held.launch,
         vessel: "work",
         role: "coder",
         operation: flotilla_protocol::CrewSupervisionAction::Resume,
@@ -156,29 +158,30 @@ async fn operator_supervision_messages_working_crew() {
     let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].spec.sender, "principal:operator-alice");
-    assert_eq!(messages[0].spec.receiver, "flotilla/crew/work/coder");
+    assert_eq!(messages[0].spec.receiver, held.receiver("work", "coder"));
     assert_eq!(messages[0].spec.relation, flotilla_resources::MessageRelation::Supervisor);
     assert_eq!(messages[0].spec.body, "please follow up");
-    assert!(backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy").status.expect("status").stalled.is_none());
+    assert!(held.convoy(&backend).await.status.expect("status").stalled.is_none());
 }
 
 // Legacy PendingBrief adoption is replay-safe and retains both attribution and continuation intent.
 // On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[tokio::test]
 async fn legacy_pending_brief_is_adopted_once_before_withdrawal() {
-    let (crew, backend, _probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let convoy = convoys.get("crew").await.expect("convoy");
-    let mut status = convoy.status.expect("status");
-    // Decode the exact previous-generation record rather than invoking a retired producer.
-    status.turn_deliveries.entry("operator".into()).or_default().pending_brief = Some(
-        serde_json::from_value(serde_json::json!({
-            "vessel": "work", "role": "coder", "content": "legacy follow-up", "queued_at": "2026-10-01T00:00:00Z",
-            "sender": {"kind": "operator-resume", "principal": {"namespace": "flotilla", "name": "alice"}}
-        }))
-        .expect("legacy PendingBrief"),
-    );
-    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("stored legacy queue");
+    let (crew, backend, _probe, held) = old_store_fixture(CrewWorkPhase::Working).await;
+    // Decode the exact previous-generation record rather than invoking a retired producer: the
+    // home's notes on its launch hold it, as an imported launch's do.
+    held.engine
+        .note(&backend, &held.launch, |status| {
+            status.turn_deliveries.entry("operator".into()).or_default().pending_brief = Some(
+                serde_json::from_value(serde_json::json!({
+                    "vessel": "work", "role": "coder", "content": "legacy follow-up", "queued_at": "2026-10-01T00:00:00Z",
+                    "sender": {"kind": "operator-resume", "principal": {"namespace": "flotilla", "name": "alice"}}
+                }))
+                .expect("legacy PendingBrief"),
+            );
+        })
+        .await;
     for _ in 0..2 {
         crew.adopt_legacy_convoy_queues_once("flotilla", None).await.expect("adoption");
         crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("follow-up");
@@ -187,10 +190,18 @@ async fn legacy_pending_brief_is_adopted_once_before_withdrawal() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].spec.sender, "principal:alice");
     assert_eq!(messages[0].spec.body, "legacy follow-up");
-    let status = convoys.get("crew").await.expect("convoy").status.expect("status");
+    let status = held.convoy(&backend).await.status.expect("status");
     assert!(status.pending_brief().is_none());
     assert_eq!(status.crew_work["work"]["coder"].pending_follow_up.as_ref().expect("continuation").name, messages[0].metadata.name);
-    assert_eq!(crew.withdraw_pending_brief("flotilla", "crew").await.expect("withdraw adopted Message"), Some("legacy follow-up".into()));
+    assert_eq!(
+        crew.withdraw_pending_brief("flotilla", &held.launch).await.expect("withdraw adopted Message"),
+        Some("legacy follow-up".into())
+    );
+}
+
+/// Supervision by the operator alone, the last rung.
+fn operator_supervision(snapshot: &mut WorkflowSnapshot) {
+    snapshot.supervision = Some(vec![flotilla_resources::SupervisionTarget::Operator]);
 }
 
 // Every governor ruling is a Message reply to the exact crew's open escalation.
@@ -210,82 +221,26 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
         _ => CrewSupervisionAction::Escalate,
     };
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (crew, backend, probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
+        let (crew, backend, probe, held) = old_store_shaped_fixture(CrewWorkPhase::Working, operator_supervision).await;
         probe.fail.store(false, Ordering::SeqCst);
         crew.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) })).await;
-        let convoys = backend.using::<ResourceConvoy>("flotilla");
-        apply_resource_status_patch(
-            &convoys,
-            "crew",
-            &convoy_external_patches::mark_crew_stalled(
-                "crew".into(),
-                "work".into(),
-                "coder".into(),
-                Utc::now(),
-                flotilla_protocol::StallReason::Scope,
-                None,
-                "blocked".into(),
-            ),
-        )
-        .await
-        .expect("declare stall");
-        let convoy = convoys.get("crew").await.expect("source convoy");
-        let mut status = convoy.status.expect("source status");
-        status.workflow_snapshot.as_mut().expect("workflow").supervision =
-            Some(vec![flotilla_resources::SupervisionTarget::Address { address: "principal:operator".into() }]);
-        let stalled = status.stalled.as_mut().expect("stall");
-        stalled.rung = StallRung::Governor;
-        stalled.supervisor = Some(StallSupervisor { convoy: "governor".into(), vessel: "watch".into(), role: "governor".into() });
-        convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("supervisor ownership");
-        convoys
-            .create(
-                &InputMeta::builder().name("governor".into()).build(),
-                &ConvoySpec::builder().workflow_ref("workflow".into()).role("governor".into()).build(),
-            )
-            .await
-            .expect("governor convoy");
-        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-        let source_session = sessions.get("session").await.expect("source session");
-        let mut spec = source_session.spec;
-        spec.role = "governor".into();
-        let governor_session = sessions
-            .create(
-                &InputMeta::builder()
-                    .name("governor-session".into())
-                    .labels(BTreeMap::from([
-                        (CONVOY_LABEL.into(), "governor".into()),
-                        (VESSEL_LABEL.into(), "watch".into()),
-                        (ROLE_LABEL.into(), "governor".into()),
-                    ]))
-                    .build(),
-                &spec,
-            )
-            .await
-            .expect("governor session");
-        sessions
-            .update_status(
-                "governor-session",
-                &governor_session.metadata.resource_version,
-                &flotilla_resources::TerminalSessionStatus {
-                    crew: Some(flotilla_resources::CrewSessionStatus {
-                        id: "governor-id".into(),
-                        adapter: "codex".into(),
-                        model: None,
-                        stance: "trusted-implicit".into(),
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("supervisor identity");
+        let (governor, governor_crew) = held.admit_crewed("governor", "governor", "watch", "governor", "governor-session").await;
+        let convoy = held
+            .stall(&backend, |stalled| {
+                stalled.rung = StallRung::Governor;
+                stalled.supervisor = Some(StallSupervisor { convoy: governor.clone(), vessel: "watch".into(), role: "governor".into() });
+            })
+            .await;
+        let coder = held.receiver("work", "coder");
+        let governor_address = flotilla_resources::crew_role_address("flotilla", &governor, "watch", "governor");
         let escalation = MessageSpec::builder()
-            .sender("flotilla/crew/work/coder".into())
-            .receiver("flotilla/governor/watch/governor".into())
+            .sender(coder.clone())
+            .receiver(governor_address.clone())
             .relation(MessageRelation::Supervisor)
             .body("blocked".into())
             .expectation(MessageExpectation::Reply)
             .references(vec![MessageReference::ControlRecord {
-                resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "crew"),
+                resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &held.launch),
                 revision: convoy.metadata.resource_version,
             }])
             .build();
@@ -299,12 +254,12 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
         // rather than inventing a record ID.
         crew.supervise(CrewSupervisionRequest {
             namespace: "flotilla",
-            convoy_name: "crew",
+            convoy_name: &held.launch,
             vessel: "work",
             role: "coder",
             operation: action,
             message: "ruling",
-            actor_crew_id: Some("governor-id"),
+            actor_crew_id: Some(&governor_crew),
             principal: None,
         })
         .await
@@ -313,13 +268,13 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
         assert_eq!(records.len(), 1 + usize::from(escalation_visible) + usize::from(action == CrewSupervisionAction::Escalate));
         let reply = records
             .iter()
-            .find(|record| record.metadata.name != "source-escalation" && record.spec.receiver == "flotilla/crew/work/coder")
+            .find(|record| record.metadata.name != "source-escalation" && record.spec.receiver == coder)
             .expect("ruling Message");
-        assert_eq!(reply.spec.sender, "flotilla/governor/watch/governor");
-        assert_eq!(reply.spec.receiver, "flotilla/crew/work/coder");
+        assert_eq!(reply.spec.sender, governor_address);
+        assert_eq!(reply.spec.receiver, coder);
         assert_eq!(reply.spec.in_reply_to.as_deref(), escalation_visible.then_some("source-escalation"));
         assert_eq!(reply.spec.relation, MessageRelation::Supervisor);
-        let status = convoys.get("crew").await.expect("convoy").status.expect("status");
+        let status = held.convoy(&backend).await.status.expect("status");
         match action {
             CrewSupervisionAction::Resume => assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working),
             CrewSupervisionAction::Fail => assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Failed),
@@ -328,8 +283,8 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
     });
 }
 
-// A durable ruling survives an authority mutation failure as a notification;
-// Message delivery never applies Fail/Escalate workflow transitions itself.
+// A durable ruling survives its convoy ending after publication as a notification; Message
+// delivery never applies Fail/Escalate workflow transitions itself.
 // On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[tokio::test]
 async fn supervisor_decision_survives_authority_disappearing_after_publication() {
@@ -337,57 +292,39 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
     use flotilla_resources::{Message, MessageSpec};
 
     use crate::leaf_engine::ResourceIntentPublisher;
-    // Boundary stand-in: the receiver admits intent, then a concurrent authority
-    // teardown removes the convoy before the supervisor's state patch can read it.
-    struct ReceiverAndTeardown(ResourceBackend);
+    // Boundary stand-in: the receiver admits intent, then an operator abandons the convoy before
+    // the supervisor's state change can apply to it.
+    struct ReceiverAndTeardown {
+        backend: ResourceBackend,
+        engine: Arc<dyn EngineConvoys>,
+        launch: String,
+    }
     #[async_trait]
     impl ResourceIntentPublisher for ReceiverAndTeardown {
         async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<ResourceRef, String> {
             let name = document["metadata"]["name"].as_str().expect("name").to_string();
             let spec: MessageSpec = serde_json::from_value(document["spec"].clone()).expect("intent");
-            MessageInbox::new(self.0.clone(), namespace)
+            MessageInbox::new(self.backend.clone(), namespace)
                 .accept(&InputMeta::builder().name(name.clone()).build(), &spec, Utc::now())
                 .await
                 .map_err(|error| error.to_string())?;
-            self.0.using::<ResourceConvoy>(namespace).delete("crew").await.map_err(|error| error.to_string())?;
+            let convoy = self.backend.using::<ResourceConvoy>(namespace).get(&self.launch).await.map_err(|error| error.to_string())?;
+            self.engine.abandon(&convoy, "operator", "torn down").await?;
             Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, name))
         }
     }
     for action in [flotilla_protocol::CrewSupervisionAction::Fail, flotilla_protocol::CrewSupervisionAction::Escalate] {
-        let (crew, backend, _probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
-        apply_resource_status_patch(
-            &backend.using::<ResourceConvoy>("flotilla"),
-            "crew",
-            &convoy_external_patches::mark_crew_stalled(
-                "crew".into(),
-                "work".into(),
-                "coder".into(),
-                Utc::now(),
-                flotilla_protocol::StallReason::Scope,
-                None,
-                "blocked".into(),
-            ),
-        )
-        .await
-        .expect("stall");
-        let convoys = backend.using::<ResourceConvoy>("flotilla");
-        let convoy = convoys.get("crew").await.expect("source");
-        let mut status = convoy.status.expect("status");
-        status.stalled.as_mut().expect("stall").rung = flotilla_resources::StallRung::Governor;
-        convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("governor rung");
-        let convoy = convoys.get("crew").await.expect("source");
-        let mut status = convoy.status.expect("status");
-        status.workflow_snapshot.as_mut().expect("workflow").supervision =
-            Some(vec![flotilla_resources::SupervisionTarget::Address { address: "principal:operator".into() }]);
-        convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("named operator");
-        _probe.fail.store(false, Ordering::SeqCst);
+        let (crew, backend, probe, held) = old_store_shaped_fixture(CrewWorkPhase::Working, operator_supervision).await;
+        held.stall(&backend, |stalled| stalled.rung = flotilla_resources::StallRung::Governor).await;
+        probe.fail.store(false, Ordering::SeqCst);
         crew.set_turn_delivery_actuator(Arc::new(super::super::CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) })).await;
-        let publisher: Arc<dyn ResourceIntentPublisher> = Arc::new(ReceiverAndTeardown(backend.clone()));
+        let publisher: Arc<dyn ResourceIntentPublisher> =
+            Arc::new(ReceiverAndTeardown { backend: backend.clone(), engine: held.engine.engine(), launch: held.launch.clone() });
         crew.set_resource_intent_publisher(Arc::downgrade(&publisher));
         let principal = PrincipalRef::implicit_for_namespace("flotilla");
         crew.supervise(CrewSupervisionRequest {
             namespace: "flotilla",
-            convoy_name: "crew",
+            convoy_name: &held.launch,
             vessel: "work",
             role: "coder",
             operation: action,
@@ -396,11 +333,11 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
             principal: Some(&principal),
         })
         .await
-        .expect_err("authority patch cannot read removed convoy");
+        .expect_err("the ruling cannot apply to an ended convoy");
         let records = backend.using::<Message>("flotilla").list().await.expect("decisions").items;
         assert_eq!(records.len(), if action == flotilla_protocol::CrewSupervisionAction::Escalate { 2 } else { 1 });
         let ruling = records.iter().find(|record| record.spec.body == "durable ruling").expect("durable ruling");
-        assert_eq!(ruling.spec.receiver, "flotilla/crew/work/coder");
+        assert_eq!(ruling.spec.receiver, held.receiver("work", "coder"));
         assert_eq!(ruling.spec.expectation, flotilla_resources::MessageExpectation::None);
     }
 }
@@ -417,45 +354,51 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
     let address_supervisor = tc.draw(gs::booleans());
     let retries = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (crew, backend, _, _dir) = old_store_fixture(CrewWorkPhase::Done).await;
-        let convoys = backend.using::<ResourceConvoy>("flotilla");
+        let (crew, backend, _, held) = old_store_shaped_fixture(CrewWorkPhase::Done, |snapshot| {
+            if local_supervisor {
+                with_member(snapshot, "bosun");
+            }
+            if address_supervisor {
+                snapshot.supervision =
+                    Some(vec![flotilla_resources::SupervisionTarget::Address { address: "project:flotilla/role:attended".into() }]);
+            }
+        })
+        .await;
         if local_supervisor {
-            let current = convoys.get("crew").await.expect("convoy");
-            let mut status = current.status.expect("status");
-            status.crew_work.get_mut("work").expect("work").insert("bosun".into(),
-                CrewWorkState::builder().phase(CrewWorkPhase::Working).build());
-            convoys.update_status("crew", &current.metadata.resource_version, &status).await.expect("supervisor");
-        }
-        if address_supervisor {
-            let current = convoys.get("crew").await.expect("convoy");
-            let mut status = current.status.expect("status");
-            status.workflow_snapshot.as_mut().expect("workflow").supervision = Some(vec![
-                flotilla_resources::SupervisionTarget::Address { address: "flotilla/attended".into() },
-            ]);
-            convoys.update_status("crew", &current.metadata.resource_version, &status).await.expect("address policy");
+            held.crew_session("bosun", "bosun-session");
+            held.assign(&backend, "work", "bosun").await;
+            assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["work"]["bosun"].phase, CrewWorkPhase::Working);
         }
         let mut request = crate::leaf_engine::CrewTurnIntent::builder()
-            .namespace("flotilla".into()).convoy("crew".into()).source("checks-settled".into())
+            .namespace("flotilla".into()).convoy(held.launch.clone()).source("checks-settled".into())
             .vessel("work".into()).role("coder".into()).brief("continue".into())
             .subject_revision("head-one".into()).sender("system:turn-rules".into()).build();
         for retry in 0..retries {
             request.subject_revision = format!("head-{retry}");
             crew.execute_turn_delivery_hold(&request, &HoldAct::State, "episode limit").await.expect("hold");
         }
-        let convoy = convoys.get("crew").await.expect("convoy");
+        let convoy = held.convoy(&backend).await;
         assert_eq!(convoy.status.expect("status").attention.expect("attention").reason, "episode limit");
         let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages");
         assert_eq!(messages.items.len(), 2, "retries cannot duplicate the supervisor signal or the crew notice");
         // #3565: the held crew is told why its wakes stopped.
-        let notice = messages.items.iter().find(|message| message.spec.receiver == "flotilla/crew/work/coder").expect("crew notice");
+        let coder = held.receiver("work", "coder");
+        let notice = messages.items.iter().find(|message| message.spec.receiver == coder).expect("crew notice");
         assert_eq!(notice.spec.relation, flotilla_resources::MessageRelation::System);
         assert!(notice.spec.body.contains("`checks-settled` turns for you are held") && notice.spec.body.contains("episode limit"));
-        let message = messages.items.iter().find(|message| message.spec.receiver != "flotilla/crew/work/coder").expect("supervisor signal");
-        assert_eq!(message.spec.receiver, if address_supervisor { "flotilla/attended" } else if local_supervisor { "flotilla/crew/work/bosun" } else { "flotilla/governor" });
+        let message = messages.items.iter().find(|message| message.spec.receiver != coder).expect("supervisor signal");
+        let expected = if address_supervisor {
+            "project:flotilla/role:attended".to_owned()
+        } else if local_supervisor {
+            held.receiver("work", "bosun")
+        } else {
+            "flotilla/governor".to_owned()
+        };
+        assert_eq!(message.spec.receiver, expected);
         assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::System);
         assert_eq!(message.spec.expectation, flotilla_resources::MessageExpectation::None);
         assert!(message.spec.body.contains("episode limit"));
-        assert!(matches!(message.spec.references.last(), Some(flotilla_resources::MessageReference::ControlRecord { resource, .. }) if resource.name == "crew"));
+        assert!(matches!(message.spec.references.last(), Some(flotilla_resources::MessageReference::ControlRecord { resource, .. }) if resource.name == held.launch));
     });
 }
 
@@ -464,18 +407,16 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
 #[tokio::test]
 async fn terminal_convoys_refuse_resume_and_turn_delivery() {
     for phase in [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned] {
-        let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;
-        let convoys = backend.using::<ResourceConvoy>("flotilla");
-        let convoy = convoys.get("crew").await.expect("convoy");
-        let mut status = convoy.status.expect("status");
-        status.phase = phase;
-        status.finished_at = Some(Utc::now());
-        let settled = convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("settle");
-        let error = crew.resume("flotilla", "crew", "resume", Some("work"), Some("coder")).await.expect_err("terminal resume refuses");
+        let (crew, backend, probe, held) = fixture(CrewWorkPhase::Done).await;
+        held.engine.end(&backend, &held.launch, phase).await;
+        let settled = held.convoy(&backend).await;
+        assert_eq!(settled.status.as_ref().expect("status").phase, phase);
+        let error =
+            crew.resume("flotilla", &held.launch, "resume", Some("work"), Some("coder")).await.expect_err("terminal resume refuses");
         assert!(error.contains("--continue-pr") && error.contains("new generation"), "{error}");
         let request = crate::leaf_engine::CrewTurnIntent::builder()
             .namespace("flotilla".into())
-            .convoy("crew".into())
+            .convoy(held.launch.clone())
             .source("review".into())
             .vessel("work".into())
             .role("coder".into())
@@ -485,7 +426,7 @@ async fn terminal_convoys_refuse_resume_and_turn_delivery() {
             .build();
         let error = crew.deliver_turn(&request).await.expect_err("terminal delivery refuses");
         assert!(error.contains("--continue-pr") && error.contains("new generation"), "{error}");
-        let after = convoys.get("crew").await.expect("convoy");
+        let after = held.convoy(&backend).await;
         assert_eq!(after.status, settled.status);
         assert_eq!(after.metadata.resource_version, settled.metadata.resource_version);
         assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items.is_empty());
@@ -497,40 +438,31 @@ async fn terminal_convoys_refuse_resume_and_turn_delivery() {
 // the unavailable rehydration path and never queues input or stages credentials.
 #[tokio::test]
 async fn lost_vessel_resume_explains_rehydration() {
-    let (mut crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
-    let (engine, launch) = super::launch_vessel(&mut crew, &backend, "env");
-    engine.vessels.step(&launch, flotilla_resources::vessel_records::VesselStep::Lost { reason: "host reboot".into() });
-    let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
-    let view = crew
-        .crew_state(
-            &ResolvedCrewContext {
-                namespace: "flotilla".into(),
-                convoy: "crew".into(),
-                vessel_ref: launch.clone(),
-                vessel: "work".into(),
-                caller_role: "coder".into(),
-                caller_session: None,
-            },
-            &convoy,
-        )
-        .await
-        .expect("crew state");
+    let (crew, backend, probe, held) = fixture(CrewWorkPhase::Working).await;
+    held.engine.engine.vessels.step(&held.vessel, flotilla_resources::vessel_records::VesselStep::Lost { reason: "host reboot".into() });
+    let context = ResolvedCrewContext {
+        namespace: "flotilla".into(),
+        convoy: held.launch.clone(),
+        vessel_ref: held.vessel.clone(),
+        vessel: "work".into(),
+        caller_role: "coder".into(),
+        caller_session: None,
+    };
+    let convoy = held.convoy(&backend).await;
+    let view = crew.crew_state(&context, &convoy).await.expect("crew state");
     assert_eq!(view.members[0].state, "lost");
     assert_eq!(view.members[0].reason.as_deref(), Some("lost, recoverable: host reboot"));
-    // A new daemon service has no remembered interruption. It must refuse
-    // resume from the persisted Lost record after Work has already rolled up.
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let mut status = convoy.status.expect("status");
-    status.phase = ConvoyPhase::Interrupted;
-    status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Interrupted;
-    status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Interrupted;
-    let status: ConvoyStatus = serde_json::from_value(serde_json::to_value(status).expect("persist")).expect("restart decode");
-    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("interruption roll-up");
+    // The lost vessel interrupts its work: the view derives it from the vessel's record.
+    let status = convoy.status.expect("status");
+    assert_eq!(status.phase, ConvoyPhase::Interrupted);
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Interrupted);
+    // A new daemon service has no remembered interruption. It must refuse resume from the lost
+    // vessel's record.
     let restarted = CrewService::builder()
         .resource_backend(backend.clone())
         .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())))
         .leaf_subscriptions(crew.leaf_subscriptions.clone())
-        .lifecycle_reads(engine.reads())
+        .lifecycle_reads(held.engine.reads())
         .work_credential_reconciler(RwLock::new(Some(probe.clone() as Arc<dyn WorkCredentialReconciler>)))
         .clock(crew.clock.clone())
         .provisioning_namespace(crew.provisioning_namespace.clone())
@@ -539,60 +471,56 @@ async fn lost_vessel_resume_explains_rehydration() {
         .brief_artifact_writer(crew.brief_artifact_writer.clone())
         .checkout_vcs(crew.checkout_vcs.clone())
         .local_environment_id(crew.local_environment_id.clone())
+        .convoy_engine(held.engine.path())
         .build();
     drop(crew);
-    let before = convoys.get("crew").await.expect("convoy");
-    let error = restarted.resume("flotilla", "crew", "resume", Some("work"), Some("coder")).await.expect_err("no rehydration");
+    let before = held.convoy(&backend).await;
+    let error = restarted.resume("flotilla", &held.launch, "resume", Some("work"), Some("coder")).await.expect_err("no rehydration");
     assert!(error.contains("lost, recoverable") && error.contains("host reboot") && error.contains("#2872"), "{error}");
     assert!(!error.contains("failed provisioning"), "{error}");
-    let after = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
+    let after = held.convoy(&backend).await;
     assert_eq!(after.status, before.status);
     assert_eq!(after.metadata.resource_version, before.metadata.resource_version);
     assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items.is_empty());
     assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+}
 
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let original = sessions.get("session").await.expect("session");
-    let mut session = sessions
-        .create(
-            &InputMeta::builder().name("mapped-session".into()).labels(BTreeMap::from([(VESSEL_REF_LABEL.into(), launch.clone())])).build(),
-            &original.spec,
-        )
-        .await
-        .expect("mapped session");
-    let context = ResolvedCrewContext {
-        namespace: "flotilla".into(),
-        convoy: "crew".into(),
-        vessel_ref: launch.clone(),
-        vessel: "work".into(),
-        caller_role: "coder".into(),
-        caller_session: None,
-    };
-    // Settled sessions retain their outcome, and completed crew work does not
-    // become lost merely because its vessel later loses backing.
-    for (session_phase, crew_phase, expected) in [
-        (TerminalSessionPhase::Stopped, CrewWorkPhase::Interrupted, "stopped"),
-        (TerminalSessionPhase::Failed, CrewWorkPhase::Interrupted, "failed"),
-        (TerminalSessionPhase::Running, CrewWorkPhase::Done, "active"),
-        (TerminalSessionPhase::Running, CrewWorkPhase::Failed, "active"),
-        (TerminalSessionPhase::Running, CrewWorkPhase::HandedBack, "active"),
-        (TerminalSessionPhase::Running, CrewWorkPhase::Interrupted, "lost"),
+// Settled sessions retain their outcome, and settled crew work does not become lost merely
+// because its vessel later loses backing. The crew phase is the view's, as the engine derives it
+// for the seat from the seat's records.
+#[tokio::test]
+async fn settled_crew_on_a_lost_vessel_keeps_its_outcome() {
+    for (session_ending, crew_phase, expected) in [
+        (Some("exited"), CrewWorkPhase::Interrupted, "stopped"),
+        (Some("failed"), CrewWorkPhase::Interrupted, "failed"),
+        (None, CrewWorkPhase::Done, "active"),
+        (None, CrewWorkPhase::Failed, "active"),
+        (None, CrewWorkPhase::HandedBack, "active"),
+        (None, CrewWorkPhase::Interrupted, "lost"),
     ] {
-        session = sessions
-            .update_status(
-                "mapped-session",
-                &session.metadata.resource_version,
-                &TerminalSessionStatus { phase: session_phase, ..Default::default() },
-            )
-            .await
-            .expect("session outcome");
-        let convoy = convoys.get("crew").await.expect("convoy");
-        let mut status = convoy.status.expect("status");
-        status.phase = ConvoyPhase::Active;
-        status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = crew_phase;
-        let convoy = convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("crew outcome");
-        let view = restarted.crew_state(&context, &convoy).await.expect("view");
-        assert_eq!(view.members[0].state, expected, "{session_phase:?}, {crew_phase:?}");
+        let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
+        held.engine
+            .engine
+            .vessels
+            .step(&held.vessel, flotilla_resources::vessel_records::VesselStep::Lost { reason: "host reboot".into() });
+        match session_ending {
+            Some("exited") => held.engine.engine.terminals.exited(&held.session, "agent exited with code 0"),
+            Some(_) => held.engine.engine.terminals.failed(&held.session, "agent launch rejected"),
+            None => {}
+        }
+        let context = ResolvedCrewContext {
+            namespace: "flotilla".into(),
+            convoy: held.launch.clone(),
+            vessel_ref: held.vessel.clone(),
+            vessel: "work".into(),
+            caller_role: "coder".into(),
+            caller_session: None,
+        };
+        let mut convoy = held.convoy(&backend).await;
+        convoy.status.as_mut().expect("status").crew_work.get_mut("work").expect("work").get_mut("coder").expect("coder").phase =
+            crew_phase;
+        let view = crew.crew_state(&context, &convoy).await.expect("view");
+        assert_eq!(view.members[0].state, expected, "{session_ending:?}, {crew_phase:?}");
         assert_eq!(view.members[0].reason.is_some(), expected == "lost");
     }
 }
@@ -600,36 +528,20 @@ async fn lost_vessel_resume_explains_rehydration() {
 // Escalating without a receiver must refuse and preserve the current owner's stall.
 #[tokio::test]
 async fn escalation_without_receiver_preserves_owner() {
-    let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    apply_resource_status_patch(
-        &convoys,
-        "crew",
-        &convoy_external_patches::mark_crew_stalled(
-            "crew".into(),
-            "work".into(),
-            "coder".into(),
-            Utc::now(),
-            flotilla_protocol::StallReason::Scope,
-            None,
-            "blocked".into(),
-        ),
-    )
-    .await
-    .expect("stall");
-    let convoy = convoys.get("crew").await.expect("convoy");
-    let mut status = convoy.status.expect("status");
-    let stalled = status.stalled.as_mut().expect("stall");
-    stalled.rung = flotilla_resources::StallRung::Governor;
-    stalled.supervision_index = Some(1);
-    stalled.supervisor =
-        Some(flotilla_resources::StallSupervisor { convoy: "governor".into(), vessel: "watch".into(), role: "governor".into() });
-    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("owner");
-    let before = convoys.get("crew").await.expect("convoy").status;
+    let (crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
+    let before = held
+        .stall(&backend, |stalled| {
+            stalled.rung = flotilla_resources::StallRung::Governor;
+            stalled.supervision_index = Some(1);
+            stalled.supervisor =
+                Some(flotilla_resources::StallSupervisor { convoy: "governor".into(), vessel: "watch".into(), role: "governor".into() });
+        })
+        .await
+        .status;
     let result = crew
         .supervise(CrewSupervisionRequest {
             namespace: "flotilla",
-            convoy_name: "crew",
+            convoy_name: &held.launch,
             vessel: "work",
             role: "coder",
             operation: flotilla_protocol::CrewSupervisionAction::Escalate,
@@ -642,7 +554,7 @@ async fn escalation_without_receiver_preserves_owner() {
         matches!(result, Ok(flotilla_protocol::CommandValue::CrewEscalationRefused { rung: flotilla_resources::StallRung::Operator, .. })),
         "missing receiver must refuse: {result:?}"
     );
-    assert_eq!(convoys.get("crew").await.expect("convoy").status, before);
+    assert_eq!(held.convoy(&backend).await.status, before);
 }
 
 // Escalation either transfers the obligation to a bound receiver, or refuses
@@ -679,6 +591,8 @@ use flotilla_resources::{Message, MessageExpectation, MessageRelation, MessageSp
 // admissions go through the real durable inbox, not an accepting mock.
 struct Delivery {
     backend: ResourceBackend,
+    path: EngineConvoyPath,
+    launch: String,
     reachable: bool,
     conflict: bool,
 }
@@ -709,10 +623,13 @@ impl TurnDeliveryActuator for Delivery {
             flotilla_messaging::MessageAdmission::Accepted(record) => record,
             flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
         };
-        if request.convoy == "crew" && request.vessel == "work" && request.role == "deputy" {
-            apply_resource_status_patch(
-                &self.backend.using::<ResourceConvoy>(&request.namespace),
-                "crew",
+        let convoys = self.backend.using::<ResourceConvoy>(&request.namespace);
+        if request.convoy == self.launch && request.vessel == "work" && request.role == "deputy" {
+            // The receiver's home delivers it the turn: its task is noted.
+            flotilla_store::note_convoy(
+                &self.path,
+                &convoys,
+                &self.launch,
                 &convoy_external_patches::resume_crew_work(
                     request.vessel.clone(),
                     request.role.clone(),
@@ -728,11 +645,9 @@ impl TurnDeliveryActuator for Delivery {
         // Inject a concurrent source-authority ruling at the publication
         // boundary; escalation must not overwrite it when committing ownership.
         if self.conflict {
-            let convoys = self.backend.using::<ResourceConvoy>(&request.namespace);
-            let source = convoys.get("crew").await.expect("source authority");
-            let mut status = source.status.expect("status");
-            status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").message = Some("concurrent ruling".into());
-            convoys.update_status("crew", &source.metadata.resource_version, &status).await.expect("concurrent ruling");
+            let source = convoys.get(&self.launch).await.expect("source authority");
+            let engine = self.path.get().expect("the Convoy path");
+            engine.fail_seat(&source, "work", "coder", "operator", "concurrent ruling").await.expect("concurrent ruling");
         }
         Ok(CrewTurnAdmission {
             new_turn: true,
@@ -766,113 +681,93 @@ async fn run_escalation_scenarios(
         (true, true, true, false, false, true, true),
         (bound, reachable, cursor, operator, conflict, collocated && !operator && !conflict, missing_terminal),
     ] {
+        // A bound next governor is a working convoy at the home; an unbound one names a convoy
+        // the home has never admitted.
+        let next = Crewed { name: "next", role: "governor", work: "watch", member: "governor", session: "next-session" };
+        let prelude = if bound && !operator && !collocated { std::slice::from_ref(&next) } else { &[] };
+        let (crew, backend, _, held) = old_store_prelude_fixture(CrewWorkPhase::Working, prelude, |snapshot, admitted| {
+            let next = admitted.first().map_or("next#1", |(launch, _)| launch.as_str());
+            let next = flotilla_resources::crew_role_address("flotilla", next, "watch", "governor");
+            escalation_shape(snapshot, operator, collocated, bound, if operator { "principal:operator" } else { &next })
+        })
+        .await;
+        let next = held.prelude.first().map(|(launch, _)| launch.clone());
         let receiver = if operator {
-            "principal:operator"
+            "principal:operator".to_owned()
         } else if collocated {
-            "flotilla/crew/work/deputy"
+            held.receiver("work", "deputy")
         } else {
-            "flotilla/next/watch/governor"
+            flotilla_resources::crew_role_address("flotilla", next.as_deref().unwrap_or("next#1"), "watch", "governor")
         };
-        let (crew, backend, _, _config) = old_store_fixture(CrewWorkPhase::Working).await;
-        crew.set_turn_delivery_actuator(Arc::new(Delivery { backend: backend.clone(), reachable, conflict })).await;
-        let convoys = backend.using::<ResourceConvoy>("flotilla");
-        seed_escalation_stall(&backend, cursor, operator, collocated, bound, receiver).await;
-        if bound && !operator && !collocated {
-            seed_next_receiver(&backend).await;
-        }
+        crew.set_turn_delivery_actuator(Arc::new(Delivery {
+            backend: backend.clone(),
+            path: held.engine.path(),
+            launch: held.launch.clone(),
+            reachable,
+            conflict,
+        }))
+        .await;
+        let bosun = seed_escalation_stall(&held, &backend, cursor, operator).await;
         if collocated && bound && !missing_terminal {
-            seed_collocated_receiver(&backend).await;
+            held.crew_session("deputy", "deputy-session");
         }
-        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-        let mut spec = sessions.get("session").await.expect("source session").spec;
-        spec.role = "bosun".into();
-        let terminal = sessions
-            .create(
-                &InputMeta::builder()
-                    .name("bosun-session".into())
-                    .labels(BTreeMap::from([
-                        (CONVOY_LABEL.into(), "crew".into()),
-                        (VESSEL_LABEL.into(), "work".into()),
-                        (ROLE_LABEL.into(), "bosun".into()),
-                    ]))
-                    .build(),
-                &spec,
-            )
-            .await
-            .expect("supervisor terminal");
-        sessions
-            .update_status(
-                "bosun-session",
-                &terminal.metadata.resource_version,
-                &TerminalSessionStatus {
-                    crew: Some(
-                        flotilla_resources::CrewSessionStatus::builder()
-                            .id("bosun-id".into())
-                            .adapter("codex".into())
-                            .stance("trusted-implicit".into())
-                            .build(),
-                    ),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("supervisor identity");
-        let before = convoys.get("crew").await.expect("source").status.expect("status").stalled;
+        let before = held.convoy(&backend).await.status.expect("status").stalled;
         let result = crew
             .supervise(CrewSupervisionRequest {
                 namespace: "flotilla",
-                convoy_name: "crew",
+                convoy_name: &held.launch,
                 vessel: "work",
                 role: "coder",
                 operation: flotilla_protocol::CrewSupervisionAction::Escalate,
                 message: "please handle this",
-                actor_crew_id: Some("bosun-id"),
+                actor_crew_id: Some(&bosun),
                 principal: None,
             })
             .await;
-        let after = convoys.get("crew").await.expect("source").status.expect("status").stalled;
+        let after = held.convoy(&backend).await.status.expect("status").stalled;
         let records = backend.using::<Message>("flotilla").list().await.expect("messages").items;
         if bound && reachable && conflict {
             assert!(result.is_err(), "a concurrent ruling must refuse the ownership transfer: {result:?}");
-            assert_eq!(after, before);
+            // The ruling failed the coder's seat and so the launch: its view shows no stall, and
+            // the home's note of it is the stall as it was.
+            assert_eq!(after, None);
+            assert_eq!(held.engine.engine().memory().get(&held.launch).stall, before);
             assert_eq!(
-                convoys.get("crew").await.expect("source").status.expect("status").crew_work["work"]["coder"].message.as_deref(),
+                held.convoy(&backend).await.status.expect("status").crew_work["work"]["coder"].message.as_deref(),
                 Some("concurrent ruling")
             );
             assert_eq!(records.len(), 2, "both admitted escalation and durable ruling survive the failed transfer");
             continue;
         }
         let result = result.expect("typed outcome");
+        let owner = if collocated { held.launch.clone() } else { next.clone().unwrap_or_default() };
         if bound && reachable && (!collocated || !missing_terminal) {
-            assert_escalation_transferred(&result, &after, &records, receiver, operator, collocated);
+            assert_escalation_transferred(&result, &after, &records, &receiver, operator, &owner);
             if collocated {
-                assert_eq!(
-                    convoys.get("crew").await.expect("source").status.expect("status").crew_work["work"]["deputy"].phase,
-                    CrewWorkPhase::Working
-                );
+                assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["work"]["deputy"].phase, CrewWorkPhase::Working);
                 continue;
             }
             for _ in 0..repeats {
                 let duplicate = crew
                     .supervise(CrewSupervisionRequest {
                         namespace: "flotilla",
-                        convoy_name: "crew",
+                        convoy_name: &held.launch,
                         vessel: "work",
                         role: "coder",
                         operation: flotilla_protocol::CrewSupervisionAction::Escalate,
                         message: "repeat",
-                        actor_crew_id: Some("bosun-id"),
+                        actor_crew_id: Some(&bosun),
                         principal: None,
                     })
                     .await;
                 assert!(duplicate.is_err(), "the old supervisor no longer owns the stall");
                 crew.reconcile_crew_stalls_once("flotilla").await.expect("judge");
-                let judged = convoys.get("crew").await.expect("source").status.expect("status").stalled.expect("still stalled");
+                let judged = held.convoy(&backend).await.status.expect("status").stalled.expect("still stalled");
                 if operator {
                     assert!(judged.supervisor.is_none());
                     assert_eq!(judged.rung, StallRung::Operator);
                 } else {
-                    assert_eq!(judged.supervisor.as_ref().expect("owner").convoy, if collocated { "crew" } else { "next" });
+                    assert_eq!(judged.supervisor.as_ref().expect("owner").convoy, owner);
                 }
                 assert_eq!(backend.using::<Message>("flotilla").list().await.expect("messages").items.len(), 2);
             }
@@ -882,44 +777,22 @@ async fn run_escalation_scenarios(
     }
 }
 
-async fn seed_escalation_stall(backend: &ResourceBackend, cursor: bool, operator: bool, collocated: bool, bound: bool, receiver: &str) {
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    apply_resource_status_patch(
-        &convoys,
-        "crew",
-        &convoy_external_patches::mark_crew_stalled(
-            "crew".into(),
-            "work".into(),
-            "coder".into(),
-            Utc::now(),
-            flotilla_protocol::StallReason::Scope,
-            None,
-            "blocked".into(),
-        ),
-    )
-    .await
-    .expect("stall");
-    let convoy = convoys.get("crew").await.expect("convoy");
-    let mut status = convoy.status.expect("status");
-    status.phase = ConvoyPhase::Active;
-    status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Running;
+/// The workflow an escalation scenario's convoy is admitted with: the coder settles an ordinary
+/// convoy obligation, and bosun supervises it before the next target (`receiver`, a collocated
+/// deputy, or the operator).
+fn escalation_shape(snapshot: &mut WorkflowSnapshot, operator: bool, collocated: bool, bound: bool, receiver: &str) {
     // This scenario escalates an ordinary convoy settlement obligation.
-    status.workflow_snapshot.as_mut().expect("workflow").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
-    status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0].completion_conditions =
-        vec![flotilla_resources::CrewCompletionExpectation::artifact_exists(
-            "coder",
-            "decision-ledger",
-            flotilla_resources::ArtifactSubjectBinding::Convoy,
-        )];
-    status.crew_work.get_mut("work").expect("crew").insert("bosun".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build());
+    snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+    snapshot.vessels[0].crew[0].completion_conditions = vec![flotilla_resources::CrewCompletionExpectation::artifact_exists(
+        "coder",
+        "decision-ledger",
+        flotilla_resources::ArtifactSubjectBinding::Convoy,
+    )];
+    with_member(snapshot, "bosun");
     if collocated && bound {
-        status
-            .crew_work
-            .get_mut("work")
-            .expect("crew")
-            .insert("deputy".into(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build());
+        with_member(snapshot, "deputy");
     }
-    status.workflow_snapshot.as_mut().expect("workflow").supervision = Some(vec![
+    snapshot.supervision = Some(vec![
         SupervisionTarget::ConvoyCrew { vessel: "work".into(), role: "bosun".into() },
         if operator && !bound {
             SupervisionTarget::Operator
@@ -929,114 +802,38 @@ async fn seed_escalation_stall(backend: &ResourceBackend, cursor: bool, operator
             SupervisionTarget::Address { address: receiver.into() }
         },
     ]);
-    let stall = status.stalled.as_mut().expect("stall");
-    // Mixed inferred leaves can put a non-crew leaf first. The request still
-    // identifies its stalled actor, so operator escalation must retain that maker.
-    if operator {
-        let mut inferred = stall.leaves[0].clone();
-        inferred.field_path = ".phase".into();
-        stall.leaves.insert(0, inferred);
-    }
-    stall.rung = StallRung::Bosun;
-    stall.supervision_index = cursor.then_some(0);
-    stall.supervisor = Some(StallSupervisor { convoy: "crew".into(), vessel: "work".into(), role: "bosun".into() });
-    stall.maker = Some(flotilla_resources::LeafMaker::Supervisor { convoy: "crew".into(), vessel: "work".into(), role: "bosun".into() });
-    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("owner");
 }
-async fn seed_next_receiver(backend: &ResourceBackend) {
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let next = convoys
-        .create(
-            &InputMeta::builder().name("next".into()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".into()).role("governor".into()).build(),
-        )
-        .await
-        .expect("next convoy");
-    convoys
-        .update_status(
-            "next",
-            &next.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                crew_work: BTreeMap::from([(
-                    "watch".into(),
-                    BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("next status");
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let mut spec = sessions.get("session").await.expect("source session").spec;
-    spec.role = "governor".into();
-    let terminal = sessions
-        .create(
-            &InputMeta::builder()
-                .name("next-session".into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "next".into()),
-                    (VESSEL_LABEL.into(), "watch".into()),
-                    (ROLE_LABEL.into(), "governor".into()),
-                ]))
-                .build(),
-            &spec,
-        )
-        .await
-        .expect("next terminal");
-    sessions
-        .update_status(
-            "next-session",
-            &terminal.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                attention: Some(flotilla_resources::TerminalAttention {
-                    state: flotilla_resources::TerminalAttentionState::Working,
-                    source: flotilla_resources::TerminalAttentionSource::Hook,
-                    as_of: Utc::now(),
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("receiver working");
-}
-async fn seed_collocated_receiver(backend: &ResourceBackend) {
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let mut spec = sessions.get("session").await.expect("source session").spec;
-    spec.role = "deputy".into();
-    let terminal = sessions
-        .create(
-            &InputMeta::builder()
-                .name("deputy-session".into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "crew".into()),
-                    (VESSEL_LABEL.into(), "work".into()),
-                    (ROLE_LABEL.into(), "deputy".into()),
-                ]))
-                .build(),
-            &spec,
-        )
-        .await
-        .expect("local receiver binding");
-    sessions
-        .update_status(
-            "deputy-session",
-            &terminal.metadata.resource_version,
-            &TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() },
-        )
-        .await
-        .expect("local receiver");
+
+/// The coder's stall, owned by its working bosun at the bosun rung; returns the bosun's crew id.
+async fn seed_escalation_stall(held: &Held, backend: &ResourceBackend, cursor: bool, operator: bool) -> String {
+    let bosun = held.crew_session("bosun", "bosun-session");
+    held.assign(backend, "work", "bosun").await;
+    let launch = held.launch.clone();
+    held.stall(backend, |stall| {
+        // Mixed inferred leaves can put a non-crew leaf first. The request still
+        // identifies its stalled actor, so operator escalation must retain that maker.
+        if operator {
+            let mut inferred = stall.leaves[0].clone();
+            inferred.field_path = ".phase".into();
+            stall.leaves.insert(0, inferred);
+        }
+        stall.rung = StallRung::Bosun;
+        stall.supervision_index = cursor.then_some(0);
+        stall.supervisor = Some(StallSupervisor { convoy: launch.clone(), vessel: "work".into(), role: "bosun".into() });
+        stall.maker = Some(flotilla_resources::LeafMaker::Supervisor { convoy: launch, vessel: "work".into(), role: "bosun".into() });
+    })
+    .await;
+    bosun
 }
 
 // Glue: resolution errors retain their command-error channel rather than claiming
 // a receiver is absent. The shared resolver validates this address before admission.
 #[tokio::test]
 async fn escalation_resolution_error_is_not_a_receiver_refusal() {
-    let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
-    seed_escalation_stall(&backend, true, false, false, true, "invalid-address").await;
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let before = convoys.get("crew").await.expect("source");
+    let (crew, backend, _, held) =
+        shaped_fixture(CrewWorkPhase::Working, |snapshot| escalation_shape(snapshot, false, false, true, "invalid-address")).await;
+    seed_escalation_stall(&held, &backend, true, false).await;
+    let before = held.convoy(&backend).await;
     let error = crew
         .leaf_subscriptions
         .escalate_stall("flotilla", &before, "principal:operator", "handle this", "work", "coder")
@@ -1044,7 +841,7 @@ async fn escalation_resolution_error_is_not_a_receiver_refusal() {
         .err()
         .expect("lookup error must not become a typed refusal");
     assert!(error.contains("invalid"), "{error}");
-    assert_eq!(convoys.get("crew").await.expect("source").status, before.status);
+    assert_eq!(held.convoy(&backend).await.status, before.status);
     assert!(backend.using::<Message>("flotilla").list().await.expect("messages").items.is_empty());
 }
 
@@ -1055,7 +852,7 @@ fn assert_escalation_transferred(
     records: &[flotilla_resources::ResourceObject<Message>],
     receiver: &str,
     operator: bool,
-    collocated: bool,
+    owner: &str,
 ) {
     let flotilla_protocol::CommandValue::CrewEscalated { receiver: actual } = result else {
         panic!("successful transfer must name its receiver: {result:?}");
@@ -1067,7 +864,7 @@ fn assert_escalation_transferred(
         assert_eq!(stall.rung, StallRung::Operator);
         assert_eq!(stall.maker, Some(flotilla_resources::LeafMaker::Actor { vessel: "work".into(), role: "coder".into() }));
     } else {
-        assert_eq!(stall.supervisor.as_ref().expect("owner").convoy, if collocated { "crew" } else { "next" });
+        assert_eq!(stall.supervisor.as_ref().expect("owner").convoy, owner);
     }
     assert_eq!(stall.supervision_index, Some(1));
     assert_eq!(records.len(), 2);
@@ -1100,23 +897,26 @@ fn assert_escalation_refused(
 // Owner ruling in #3430: retained terminal convoys never resume legacy briefs.
 #[tokio::test]
 async fn terminal_legacy_brief_is_ignored() {
-    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let convoy = convoys.get("crew").await.expect("convoy");
-    let mut status = convoy.status.expect("status");
-    status.phase = ConvoyPhase::Landed;
-    status.turn_deliveries.entry("operator".into()).or_default().pending_brief = Some(
-        serde_json::from_value(serde_json::json!({
-            "vessel": "work", "role": "coder", "content": "ignore terminal intent", "queued_at": "2026-10-01T00:00:00Z",
-            "sender": {"kind": "operator-resume", "principal": {"namespace": "flotilla", "name": "alice"}}
-        }))
-        .expect("legacy brief"),
-    );
-    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("terminal queue");
+    let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Done).await;
+    held.engine.end(&backend, &held.launch, ConvoyPhase::Landed).await;
+    let status = held
+        .engine
+        .note(&backend, &held.launch, |status| {
+            status.turn_deliveries.entry("operator".into()).or_default().pending_brief = Some(
+                serde_json::from_value(serde_json::json!({
+                    "vessel": "work", "role": "coder", "content": "ignore terminal intent", "queued_at": "2026-10-01T00:00:00Z",
+                    "sender": {"kind": "operator-resume", "principal": {"namespace": "flotilla", "name": "alice"}}
+                }))
+                .expect("legacy brief"),
+            );
+        })
+        .await
+        .status;
+    assert_eq!(status.as_ref().expect("status").phase, ConvoyPhase::Landed);
     crew.adopt_legacy_convoy_queues_once("flotilla", None).await.expect("adoption");
     crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("reconcile");
     assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items.is_empty());
-    assert_eq!(convoys.get("crew").await.expect("terminal").status, Some(status));
+    assert_eq!(held.convoy(&backend).await.status, status);
 }
 
 #[tokio::test]
@@ -1215,9 +1015,8 @@ fn lost_environment_resume_reports_cause(tc: hegel::TestCase) {
     let failed_session = tc.draw(hegel::generators::booleans());
     let provisioning_failed = tc.draw(hegel::generators::booleans());
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (mut crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
-        let (engine, _) = super::launch_vessel(&mut crew, &backend, "resume-env");
-        let environments = &engine.environments;
+        let (crew, _backend, probe, held) = fixture(CrewWorkPhase::Working).await;
+        let environments = &held.engine.engine.environments;
         let spec = EnvironmentSpec {
             host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
             ..Default::default()
@@ -1229,20 +1028,12 @@ fn lost_environment_resume_reports_cause(tc: hegel::TestCase) {
         } else {
             environments.lose("resume-env", "cgroup_oom");
         }
-        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-        let session = sessions.get("session").await.expect("session");
-        sessions
-            .update_status(
-                "session",
-                &session.metadata.resource_version,
-                &TerminalSessionStatus {
-                    phase: if failed_session { TerminalSessionPhase::Failed } else { TerminalSessionPhase::Lost },
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("session status");
-        let error = crew.resume("flotilla", "crew", "resume", Some("work"), Some("coder")).await.expect_err("lost backing");
+        if failed_session {
+            held.engine.engine.terminals.failed(&held.session, "cgroup_oom");
+        } else {
+            held.engine.engine.terminals.lost(&held.session, "cgroup_oom");
+        }
+        let error = crew.resume("flotilla", &held.launch, "resume", Some("work"), Some("coder")).await.expect_err("lost backing");
         assert!(error.contains("cgroup_oom"), "{error}");
         if provisioning_failed {
             assert!(error.contains("failed provisioning"), "{error}");
@@ -1258,22 +1049,9 @@ fn lost_environment_resume_reports_cause(tc: hegel::TestCase) {
 // described as failed provisioning (glue: refusal text from session status).
 #[tokio::test]
 async fn failed_session_resume_does_not_invent_provisioning_failure() {
-    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Interrupted).await;
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.get("session").await.expect("session");
-    sessions
-        .update_status(
-            "session",
-            &session.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Failed,
-                message: Some("agent launch rejected".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("failed session");
-    let error = crew.resume("flotilla", "crew", "resume", Some("work"), Some("coder")).await.expect_err("failed session");
+    let (crew, _backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
+    held.engine.engine.terminals.failed(&held.session, "agent launch rejected");
+    let error = crew.resume("flotilla", &held.launch, "resume", Some("work"), Some("coder")).await.expect_err("failed session");
     assert!(error.contains("agent launch rejected"), "{error}");
     assert!(!error.contains("failed provisioning"), "{error}");
 }
