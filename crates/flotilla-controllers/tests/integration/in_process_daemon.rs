@@ -1012,6 +1012,43 @@ fn crew_session_request(session: &str, vessel: &str, role: &str, capability: &st
     }
 }
 
+/// Work `work` of convoy `convoy` underway at its home (#3108): its vessel launch requested and
+/// realised. Returns the vessel launch, which holds the work's crew sessions.
+fn work_underway(engine: &flotilla_provisioning_testkit::EngineFixture, convoy: &str, work: &str) -> String {
+    let vessel = engine.vessels.request(convoy, work, "local");
+    engine.vessels.ready(&vessel, "crew-environment");
+    vessel
+}
+
+/// Crew `role`'s agent session `session` in `vessel`, launched and ready as pool session
+/// `pool_session` with its harness recorded. A crew that starts eagerly, or whose task is
+/// delivered, then reads Working (#3108). Returns the session's launch.
+fn crew_at_work(engine: &flotilla_provisioning_testkit::EngineFixture, vessel: &str, role: &str, session: &str, pool_session: &str) -> String {
+    let launch = engine.terminals.request(&crew_session_request(session, vessel, role, "code", "crew-environment", "fake-terminals"));
+    let facts = flotilla_resources::terminal_records::TerminalLaunchFacts {
+        agent: Some(flotilla_resources::terminal_records::AgentLaunch {
+            adapter: "codex".to_string(),
+            model: None,
+            stance: "contained".to_string(),
+        }),
+        ..Default::default()
+    };
+    engine.terminals.ready(&launch, pool_session, &facts);
+    launch
+}
+
+/// A frozen workflow of one vessel, `work`, crewed by `crew`.
+fn one_vessel_snapshot(crew: Vec<flotilla_resources::CrewSpec>) -> WorkflowSnapshot {
+    WorkflowSnapshot {
+        cascade: None,
+        stall_nudges: Default::default(),
+        supervision: None,
+        exit: None,
+        turn_delivery: Default::default(),
+        vessels: vec![flotilla_resources::VesselRequirement::builder().name("work".to_string()).crew(crew).build()],
+    }
+}
+
 #[tokio::test]
 async fn host_capability_provider_is_constructed_once_for_multiple_tracked_repositories() {
     let temp = tempfile::tempdir().expect("create tempdir");
@@ -9158,54 +9195,39 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
 
 #[tokio::test]
 async fn convoy_resume_queues_a_brief_while_crew_is_working() {
-    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let (_temp, _repo, daemon, engine) = daemon_for_plain_dir_with_decided_engine(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("busy-convoy".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([(
-                        "coder".to_string(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                    )]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark crew working");
+    // The coder, its convoy's first agent, starts eagerly: with its session ready it is Working.
+    let launch = launch_convoy(
+        &daemon,
+        "busy-convoy",
+        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        Default::default(),
+    )
+    .await;
+    let vessel = work_underway(&engine, &launch, "work");
+    crew_at_work(&engine, &vessel, "coder", "busy-coder-session", "busy-coder");
 
     daemon
-        .convoy_resume_internal("flotilla", "busy-convoy", "Check the edge case", Some("work"), Some("coder"), ResumeIntent::Reminder)
+        .convoy_resume_internal("flotilla", &launch, "Check the edge case", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("queue brief for busy crew");
 
-    let convoy = convoys.get("busy-convoy").await.expect("read convoy");
+    let convoy = convoys.get(&launch).await.expect("read convoy");
     let status = convoy.status.unwrap();
     assert!(status.pending_brief().is_none());
     let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
     let first = backend.using::<flotilla_resources::Message>("flotilla").get(&reference.name).await.unwrap();
     assert_eq!(first.spec.body, "Check the edge case");
-    assert_eq!(first.spec.receiver, "flotilla/busy-convoy/work/coder");
+    assert_eq!(first.spec.receiver, format!("flotilla/{launch}/work/coder"));
     assert_eq!(first.spec.sender, "principal:implicit");
     let outcome = daemon
-        .convoy_resume_internal("flotilla", "busy-convoy", "Use the newer instruction", Some("work"), Some("coder"), ResumeIntent::Reminder)
+        .convoy_resume_internal("flotilla", &launch, "Use the newer instruction", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("replace pending brief");
     assert_eq!(outcome, flotilla_crew::crew_ops::ConvoyResumeOutcome::Queued { displaced: Some("Check the edge case".to_string()) });
-    let convoy = convoys.get("busy-convoy").await.expect("read updated convoy");
+    let convoy = convoys.get(&launch).await.expect("read updated convoy");
     let status = convoy.status.unwrap();
     let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
     let replacement = backend.using::<flotilla_resources::Message>("flotilla").get(&reference.name).await.unwrap();
@@ -9214,23 +9236,15 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
         backend.using::<flotilla_resources::Message>("flotilla").get(&first.metadata.name).await.unwrap().status.unwrap().phase,
         flotilla_resources::MessagePhase::Superseded
     );
-    let withdrawn = daemon.convoy_withdraw_pending_brief_internal("flotilla", "busy-convoy").await.expect("withdraw pending brief");
+    let withdrawn = daemon.convoy_withdraw_pending_brief_internal("flotilla", &launch).await.expect("withdraw pending brief");
     assert_eq!(withdrawn.as_deref(), Some("Use the newer instruction"));
-    assert!(convoys.get("busy-convoy").await.expect("read withdrawn convoy").status.expect("convoy status").pending_brief().is_none());
+    assert!(convoys.get(&launch).await.expect("read withdrawn convoy").status.expect("convoy status").pending_brief().is_none());
 
-    apply_status_patch(
-        &convoys,
-        "busy-convoy",
-        &flotilla_resources::ConvoyStatusPatch::RollUpPhase {
-            phase: ConvoyPhase::Landed,
-            started_at: None,
-            finished_at: Some(chrono::Utc::now()),
-        },
-    )
-    .await
-    .expect("mark convoy terminal");
+    // The convoy lands: its work kept and delivered on the engine (#3108).
+    let landing = convoys.get(&launch).await.expect("read convoy");
+    flotilla_engine_convoys_testkit::land(&daemon.convoy_engine_path(), &landing).await;
     let error = daemon
-        .convoy_resume_internal("flotilla", "busy-convoy", "too late", Some("work"), Some("coder"), ResumeIntent::Reminder)
+        .convoy_resume_internal("flotilla", &launch, "too late", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect_err("terminal convoy should refuse a brief");
     assert!(error.contains("terminal phase `Landed`"), "unexpected refusal: {error}");
@@ -9382,38 +9396,43 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
 
 #[tokio::test]
 async fn convoy_explain_reports_completed_work_without_a_crew_claim() {
-    let (_temp, _repo, daemon) = daemon_for_cwd().await;
-    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("unclaimed-work".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([(
-                        "coder".to_string(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                    )]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("record unclaimed work");
+    let (_temp, _repo, daemon, engine) = daemon_for_plain_dir_with_decided_engine(fake_discovery(false)).await;
+    // The work's lead owes a decision ledger; its coder, a tool, owes nothing. Once the lead's
+    // ledger is kept the work is Complete while the coder still works: work nobody claimed.
+    let coder = flotilla_resources::CrewSpec::builder()
+        .role("coder".to_string())
+        .source(flotilla_resources::CrewSource::Tool { command: "code".to_string() })
+        .build();
+    let launch = launch_convoy(
+        &daemon,
+        "unclaimed-work",
+        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        flotilla_resources::ConvoyStatus {
+            workflow_snapshot: Some(one_vessel_snapshot(vec![flotilla_engine_convoys_testkit::agent("lead"), coder])),
+            ..Default::default()
+        },
+    )
+    .await;
+    let vessel = work_underway(&engine, &launch, "work");
+    let session = engine.terminals.request(&TerminalLaunchRequest {
+        session: "unclaimed-coder".to_string(),
+        environment: "crew-environment".to_string(),
+        vessel: Some(vessel),
+        role: "coder".to_string(),
+        pool: "fake-terminals".to_string(),
+        cwd: "/workspace".to_string(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Tool { command: "code".to_string() },
+    });
+    engine.terminals.ready(&session, "unclaimed-coder", &Default::default());
+    let convoy = daemon.resource_backend().using::<ResourceConvoy>("flotilla").get(&launch).await.expect("convoy");
+    let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: Some("lead".to_string()) };
+    let engine_path = daemon.convoy_engine_path();
+    engine_path.get().expect("the engine Convoy path").keep_by_verdict(&convoy, &scope, "operator", "lead done").await.expect("keep");
     let result = daemon
         .execute_query(
             Command::builder()
-                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: "unclaimed-work".to_string() })
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: launch.clone() })
                 .build(),
             uuid::Uuid::new_v4(),
         )
@@ -9422,7 +9441,8 @@ async fn convoy_explain_reports_completed_work_without_a_crew_claim() {
     let CommandValue::ConvoyExplanation(explanation) = result else { panic!("expected convoy explanation") };
     assert_eq!(explanation.unclaimed_work.len(), 1);
     assert_eq!(explanation.unclaimed_work[0].evidence, "work_complete");
-    assert!(explanation.decision_ledgers.is_empty());
+    // The coder claimed nothing, so no ledger is its; the lead's kept ledger is the work's.
+    assert!(explanation.decision_ledgers.iter().all(|ledger| ledger.role == "lead"), "{:?}", explanation.decision_ledgers);
 }
 
 #[tokio::test]
