@@ -303,6 +303,16 @@ async fn standing_ensure_fixture_for(
     let repository_key = repository_spec.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository_spec).await.expect("repository");
     create_host_direct_placement((&*daemon).into(), &format!("host-direct-{host}-vessels"), &format!("{host}-vessels")).await;
+    // A standing convoy's obligation is its agent seats' lifetime duties, so its governor is an
+    // agent, placed where a harness is (#3108: the engine refuses a convoy that owes nothing).
+    let facts = BTreeMap::from([(
+        "standing-agent".into(),
+        flotilla_resources::FulfilmentFacts {
+            harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
+            ..Default::default()
+        },
+    )]);
+    create_docker_placement((&*daemon).into(), "standing-agent", "standing-agent-host", BTreeSet::new(), facts).await;
     if materialize_ensure {
         backend
             .definitions::<Project>("flotilla")
@@ -335,7 +345,7 @@ async fn standing_ensure_fixture_for(
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
                     .repository_refs(vec![repository_key.clone()])
-                    .crew(Vec::new())
+                    .crew(vec![governor()])
                     .build()])
                 .build(),
         )
@@ -359,7 +369,7 @@ async fn standing_ensure_fixture_for(
                     role: "quartermaster".to_string(),
                     driver_ref: None,
                     workflow_ref: "quartermaster".to_string(),
-                    placement_policy: None,
+                    placement_policy: Some("standing-agent".to_string()),
                     escalation_reason: None,
                     repositories: vec![repository_key],
                     presents_as: Some("fleet".to_string()),
@@ -438,39 +448,27 @@ async fn fail_latest_ensured_generation(backend: &ResourceBackend, clock: &Virtu
     convoy.metadata.name
 }
 
+/// Sets the standing ensure's agent overrides; the fixture already placed its governor agent.
 async fn configure_standing_ensure_agent(daemon: &InProcessDaemon, overrides: Vec<flotilla_protocol::AgentOverride>) {
-    let facts = BTreeMap::from([(
-        "standing-agent".into(),
-        flotilla_resources::FulfilmentFacts {
-            harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
-            ..Default::default()
-        },
-    )]);
-    create_docker_placement(daemon.into(), "standing-agent", "standing-agent-host", BTreeSet::new(), facts).await;
-    let backend = &daemon.resource_backend();
-    let workflows = backend.using::<WorkflowTemplate>("flotilla");
-    let mut workflow = workflows.get("standing-project--quartermaster").await.expect("standing workflow");
-    workflow.spec.vessels[0].crew = vec![CrewSpec::builder()
+    let ensures = daemon.resource_backend().using::<ConvoyEnsure>("flotilla");
+    let mut ensure = ensures.get("quartermaster").await.expect("standing ensure");
+    ensure.spec.agent_overrides = overrides;
+    ensures
+        .update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &ensure.spec)
+        .await
+        .expect("update standing ensure");
+}
+
+/// The standing workflow's governor: an agent seat on a codex harness.
+fn governor() -> CrewSpec {
+    CrewSpec::builder()
         .role("governor".to_string())
         .source(CrewSource::Agent {
             selector: Selector { capability: "governor".to_string(), adapter: Some("codex".to_string()), model: None },
             prompt: None,
             brief_template: None,
         })
-        .build()];
-    workflows
-        .update(&InputMeta::from(&workflow.metadata), &workflow.metadata.resource_version, &workflow.spec)
-        .await
-        .expect("update standing workflow");
-
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
-    let mut ensure = ensures.get("quartermaster").await.expect("standing ensure");
-    ensure.spec.placement_policy = Some("standing-agent".to_string());
-    ensure.spec.agent_overrides = overrides;
-    ensures
-        .update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &ensure.spec)
-        .await
-        .expect("update standing ensure");
+        .build()
 }
 
 async fn admitted_standing_workflow(daemon: &InProcessDaemon, backend: &ResourceBackend) -> WorkflowTemplateSpec {
