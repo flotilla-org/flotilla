@@ -173,6 +173,25 @@ async fn launch_convoy(
     launch
 }
 
+/// The dispatch promises `convoy`'s engine launch owes, as admission froze them. The engine holds
+/// them with the launch's other promises; a convoy view's spec carries none (#3108).
+fn dispatch_promises(convoy: &flotilla_resources::ResourceObject<ResourceConvoy>) -> Vec<flotilla_resources::promises::DispatchPromise> {
+    let status = convoy.status.as_ref().expect("an admitted convoy's status");
+    status
+        .promises
+        .values()
+        .flat_map(BTreeMap::values)
+        .flatten()
+        .filter(|promise| promise.source == flotilla_resources::promises::PromiseSource::Dispatch)
+        .map(|promise| flotilla_resources::promises::DispatchPromise {
+            label: promise.id.clone(),
+            kind: promise.kind,
+            vessel: promise.vessel.clone(),
+            role: promise.role.clone(),
+        })
+        .collect()
+}
+
 async fn admitted_convoy(backend: &ResourceBackend, role: &str) -> flotilla_resources::ResourceObject<ResourceConvoy> {
     let selector = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), role.to_string())]);
     backend
@@ -2491,37 +2510,28 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         .await
         .expect("project create");
 
-    let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
-    let old = convoys
-        .create(
-            &InputMeta::builder().name("old-holder".into()).build(),
-            &flotilla_resources::ConvoySpec::builder()
-                .workflow_ref("single-agent-shepherd".into())
-                .role("old".into())
-                .project_ref("flotilla".into())
-                .r#ref("feat/existing-pr".into())
-                .repositories(vec![flotilla_resources::ConvoyRepositorySpec {
-                    repo_ref: repository_key.clone(),
-                    url: "https://github.com/owner/repo".into(),
-                    source_ref: "main".into(),
-                    target_ref: "main".into(),
-                    workspace_slug: "repo".into(),
-                    subpaths: vec![],
-                }])
-                .build(),
-        )
-        .await
-        .expect("old holder");
-    if continuing {
-        convoys
-            .update_status(
-                "old-holder",
-                &old.metadata.resource_version,
-                &flotilla_resources::ConvoyStatus { phase: flotilla_resources::ConvoyPhase::Failed, ..Default::default() },
-            )
-            .await
-            .expect("old failed");
-    }
+    // The PR's earlier holder, Failed when the new convoy continues its work.
+    let phase = if continuing { flotilla_resources::ConvoyPhase::Failed } else { flotilla_resources::ConvoyPhase::Pending };
+    launch_convoy(
+        &daemon,
+        "old-holder",
+        flotilla_resources::ConvoySpec::builder()
+            .workflow_ref("single-agent-shepherd".into())
+            .role("old".into())
+            .project_ref("flotilla".into())
+            .r#ref("feat/existing-pr".into())
+            .repositories(vec![flotilla_resources::ConvoyRepositorySpec {
+                repo_ref: repository_key.clone(),
+                url: "https://github.com/owner/repo".into(),
+                source_ref: "main".into(),
+                target_ref: "main".into(),
+                workspace_slug: "repo".into(),
+                subpaths: vec![],
+            }])
+            .build(),
+        flotilla_resources::ConvoyStatus { phase, ..Default::default() },
+    )
+    .await;
     let mut events = daemon.subscribe();
     let command_id = daemon
         .execute(
@@ -2599,7 +2609,9 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         let id = daemon.execute(start()).await.expect("second attempt");
         let refusal = recv_command_finished(&mut events, id).await;
         assert!(matches!(refusal, CommandValue::Error { ref message } if message.contains("live convoy")), "{refusal:?}");
-        convoys.delete(&convoy.metadata.name).await.expect("delete previous holder");
+        // On the engine a convoy ends and is never deleted (#3108): an operator abandons it.
+        let engine = daemon.convoy_engine_path();
+        engine.get().expect("the engine Convoy path").abandon(&convoy, "operator", "replaced").await.expect("abandon previous holder");
         let id = daemon.execute(start()).await.expect("replacement after deletion");
         assert!(matches!(recv_command_finished(&mut events, id).await, CommandValue::ConvoyStarted { .. }));
         let replacement = admitted_convoy(&backend, "replacement").await;
@@ -4246,7 +4258,7 @@ async fn convoy_start_freezes_dispatch_promises_and_refuses_unresolvable_ones() 
         role: "coder".into(),
     };
     assert_eq!(
-        convoy.spec.promises,
+        dispatch_promises(&convoy),
         vec![
             dispatched("api-split", flotilla_resources::promises::PromiseKind::Pr),
             dispatched("design-notes", flotilla_resources::promises::PromiseKind::DecisionLedger),
@@ -4257,7 +4269,7 @@ async fn convoy_start_freezes_dispatch_promises_and_refuses_unresolvable_ones() 
     let explicit = daemon.execute(start("explicit", "no-deliverer", &["pr:api-split@work/coder"])).await.expect("command accepted");
     assert!(matches!(recv_command_finished(&mut events, explicit).await, CommandValue::ConvoyStarted { .. }));
     assert_eq!(
-        admitted_convoy(&backend, "explicit").await.spec.promises,
+        dispatch_promises(&admitted_convoy(&backend, "explicit").await),
         vec![dispatched("api-split", flotilla_resources::promises::PromiseKind::Pr)]
     );
 
