@@ -1591,8 +1591,18 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                 flotilla_resources::TerminalAttentionSource::Hook
             };
             assert_eq!(attention.source, source);
-            daemon.reconcile_crew_stalls_once("flotilla").await.expect("observe actor hook");
-            let convoy_status = convoys.get(&convoy_name).await.expect("convoy").status.expect("status");
+            // The stall pass reads convoys from a watch of the engine's views, which hears a new
+            // launch a moment after its admission: pass until it judges this convoy.
+            let screen = source == flotilla_resources::TerminalAttentionSource::Screen;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let convoy_status = loop {
+                daemon.reconcile_crew_stalls_once("flotilla").await.expect("observe actor hook");
+                let status = convoys.get(&convoy_name).await.expect("convoy").status.expect("status");
+                if !screen || status.attention.is_some() || tokio::time::Instant::now() > deadline {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
             let hook_at = daemon.crew_progress().get(&name).hook_at;
             if source == flotilla_resources::TerminalAttentionSource::Hook {
                 assert!(hook_at.is_some(), "an attributed hook is seen");
