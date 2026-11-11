@@ -11,7 +11,7 @@ use flotilla_resources::{
     ROLE_LABEL, VESSEL_LABEL,
 };
 
-use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe};
+use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe, launch_underway};
 use super::{CrewTurnAdmission, CrewTurnIntent, LeafSubscriptionTable, TurnDeliveryActuator};
 
 /// Immutable producer key shared by escalation publication and pre-replication replies.
@@ -276,7 +276,7 @@ impl LeafSubscriptionTable {
         let active_probe = is_active_change_request_probe(status, rule, leaf, &forges);
         // A cached row can fire after its target stalls or settles, before the
         // reconciler removes it. Judge eligibility against the current status.
-        if (status.phase == ConvoyPhase::Active || is_merged_settlement_probe(leaf)) && !active_probe {
+        if (launch_underway(status.phase) || is_merged_settlement_probe(leaf)) && !active_probe {
             return Ok(());
         }
         let active_conflict = active_probe && is_conflict_probe(leaf);

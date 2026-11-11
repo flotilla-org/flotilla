@@ -355,6 +355,11 @@ pub(super) fn is_merged_settlement_probe(leaf: &Leaf) -> bool {
         && leaf.literal == "merged"
 }
 
+/// The launch has not ended: its crews work, including while a vessel is interrupted.
+pub(super) fn launch_underway(phase: ConvoyPhase) -> bool {
+    matches!(phase, ConvoyPhase::Active | ConvoyPhase::Interrupted)
+}
+
 /// Workflow-declared checks, review and merged settlement rules run during active crew work too,
 /// including custom rules. Merged settlement also resumes stalled crews so they
 /// can resolve remaining promises and claim completion; conflict probes retain
@@ -381,7 +386,7 @@ pub(super) fn is_active_change_request_probe(
         || is_merged_settlement_probe(leaf)
         || (matches!(leaf.address, LeafAddress::ChangeRequest { .. })
             && matches!(leaf.field_path.as_str(), ".checks" | ".review.actionable-at-head"));
-    status.phase == ConvoyPhase::Active
+    launch_underway(status.phase)
         && active_field
         && status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role)).is_some_and(|work| {
             work.finished_at.is_none()
@@ -845,7 +850,7 @@ impl ReconcilerWake {
         let mut selected_checkouts: Option<BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>> = None;
         let convoy_rows = rows.iter().filter(|row| {
                 row.namespace == namespace
-                    && (status.phase != ConvoyPhase::Active || !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }))
+                    && (!launch_underway(status.phase) || !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }))
                     && matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy: name } | LeafWatcher::TurnDelivery { convoy: name, .. } if name == &convoy.metadata.name)
             }).collect::<Vec<_>>();
         obligations.retain(|obligation| match &obligation.maker {

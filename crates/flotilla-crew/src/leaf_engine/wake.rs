@@ -26,7 +26,7 @@ use flotilla_store::{
 use tokio::sync::{broadcast, OnceCell};
 
 use super::sources::{change_request_sources, freshest_change_requests};
-use super::stalls::{is_active_change_request_probe, is_merged_settlement_probe};
+use super::stalls::{is_active_change_request_probe, is_merged_settlement_probe, launch_underway};
 use super::{EpisodeKeyFields, LeafSubscriptionRow, LeafSubscriptionTable, LeafWatcher, UnableEvidenceKey};
 use flotilla_resources::{queued_turn_evidence, queued_turn_session};
 
@@ -519,7 +519,7 @@ impl ReconcilerWake {
             None => convoys.values().collect(),
         };
         for convoy in selected_convoys.into_iter().map(ConvoyRead::convoy).filter(|convoy| {
-            convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing))
+            convoy.status.as_ref().is_some_and(|status| launch_underway(status.phase) || status.phase == ConvoyPhase::Landing)
         }) {
             #[cfg(test)]
             views.row_evaluations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -633,7 +633,7 @@ impl ReconcilerWake {
             }
             let convoy_vessels = select_convoy_children(convoy, &vessel_sources);
             inputs.extend(convoy_vessels.keys().cloned());
-            if status.phase == ConvoyPhase::Active {
+            if launch_underway(status.phase) {
                 if let Some(stalled) = status.stalled.as_ref().filter(|stalled| stalled.supervisor.is_some()) {
                     if let Some(maker @ LeafMaker::Supervisor { .. }) = &stalled.maker {
                         desired.push(LeafSubscriptionRow {
