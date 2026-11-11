@@ -9256,7 +9256,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     let discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&terminal_pool) as Arc<dyn TerminalPool>),
     );
-    let (_temp, _repo, daemon, engine) = daemon_for_plain_dir_with_engine(discovery).await;
+    let (_temp, _repo, daemon, engine) = daemon_for_plain_dir_with_decided_engine(discovery).await;
     let backend = daemon.resource_backend();
     let local_host_ref = daemon.local_host_id().expect("local host identity").to_string();
     backend
@@ -9269,54 +9269,30 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .await
         .expect("create local host resource");
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("idle-convoy".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                crew_work: BTreeMap::from([
-                    (
-                        "work".to_string(),
-                        BTreeMap::from([(
-                            "coder".to_string(),
-                            flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                        )]),
-                    ),
-                    (
-                        "review".to_string(),
-                        BTreeMap::from([(
-                            "qa".to_string(),
-                            flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Done).build(),
-                        )]),
-                    ),
-                ]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark crew working");
+    // The coder works on `work`; the qa crew of `review` is Done, its ledger kept.
+    let mut snapshot = one_vessel_snapshot(vec![flotilla_engine_convoys_testkit::agent("coder")]);
+    snapshot.vessels.push(
+        flotilla_resources::VesselRequirement::builder()
+            .name("review".to_string())
+            .crew(vec![flotilla_engine_convoys_testkit::agent("qa")])
+            .build(),
+    );
+    let launch = launch_convoy(
+        &daemon,
+        "idle-convoy",
+        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        flotilla_resources::ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() },
+    )
+    .await;
+    let convoy = convoys.get(&launch).await.expect("convoy");
+    let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "review".to_string(), role: None };
+    let engine_path = daemon.convoy_engine_path();
+    engine_path.get().expect("the engine Convoy path").keep_by_verdict(&convoy, &scope, "operator", "review done").await.expect("keep");
     // Each crew's vessel launch holds its session, launched and running.
     let mut launches = BTreeMap::new();
-    for (vessel, role, capability, session_id) in [("work", "coder", "coding", "idle-coder"), ("review", "qa", "review", "idle-review")] {
-        let vessel_ref = engine.vessels.request("idle-convoy", vessel, daemon.host_name().as_str());
-        let launch = engine.terminals.request(&crew_session_request(
-            &format!("idle-{role}-session"),
-            &vessel_ref,
-            role,
-            capability,
-            "idle-environment",
-            "fake-terminals",
-        ));
-        engine.terminals.ready(&launch, session_id, &Default::default());
-        launches.insert(role, launch);
+    for (vessel, role, session_id) in [("work", "coder", "idle-coder"), ("review", "qa", "idle-review")] {
+        let vessel_ref = work_underway(&engine, &launch, vessel);
+        launches.insert(role, crew_at_work(&engine, &vessel_ref, role, &format!("idle-{role}-session"), session_id));
     }
     let observations = engine.terminals.terminals.observations();
     observations.update(&launches["coder"], |observation| {
@@ -9331,16 +9307,16 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     });
 
     let queued = daemon
-        .convoy_resume_internal("flotilla", "idle-convoy", "Finish the current turn", Some("work"), Some("coder"), ResumeIntent::Reminder)
+        .convoy_resume_internal("flotilla", &launch, "Finish the current turn", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("queue brief while crew is working");
     assert_eq!(queued, flotilla_crew::crew_ops::ConvoyResumeOutcome::Queued { displaced: None });
     let unrelated = daemon
-        .convoy_resume_internal("flotilla", "idle-convoy", "Start the review", Some("review"), Some("qa"), ResumeIntent::Reopen)
+        .convoy_resume_internal("flotilla", &launch, "Start the review", Some("review"), Some("qa"), ResumeIntent::Reopen)
         .await
         .expect("resume unrelated crew");
     assert_eq!(unrelated, flotilla_crew::crew_ops::ConvoyResumeOutcome::Queued { displaced: None });
-    let status = convoys.get("idle-convoy").await.unwrap().status.unwrap();
+    let status = convoys.get(&launch).await.unwrap().status.unwrap();
     let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
     let first = backend.using::<flotilla_resources::Message>("flotilla").get(&reference.name).await.unwrap();
     assert_eq!(first.spec.body, "Finish the current turn");
@@ -9358,7 +9334,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     // #2755: a fresh idle observation from before queuing is sufficient when
     // there is no terminal turn in flight; an idle transition is unnecessary.
     daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("release already idle crew");
-    assert!(convoys.get("idle-convoy").await.expect("convoy").status.expect("status").pending_brief().is_none());
+    assert!(convoys.get(&launch).await.expect("convoy").status.expect("status").pending_brief().is_none());
 
     assert!(terminal_pool.delivered.lock().await.is_empty(), "agent messages should await reconciled delivery confirmation");
     let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap().items;
@@ -9366,7 +9342,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     assert!(records.iter().any(|message| message.spec.receiver.ends_with("/work/coder") && message.spec.body == "Finish the current turn"));
     let accepted = backend.using::<flotilla_resources::Message>("flotilla").get(&first.metadata.name).await.expect("queued follow-up");
     assert_eq!(accepted.status.expect("admitted status").phase, flotilla_resources::MessagePhase::Accepted);
-    let waiting = convoys.get("idle-convoy").await.expect("crew awaiting receipt").status.expect("status");
+    let waiting = convoys.get(&launch).await.expect("crew awaiting receipt").status.expect("status");
     assert!(waiting.crew_work["work"]["coder"].message.is_none(), "admission is not a receiver receipt");
     assert_eq!(waiting.crew_work["work"]["coder"].pending_follow_up.as_ref().expect("queued intent").name, first.metadata.name);
     // Stand in only for the receiver transport receipt. The ordinary admission
@@ -9388,10 +9364,15 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     .await
     .expect("receiver delivery receipt");
     daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("continue after receiver receipt");
-    let status = convoys.get("idle-convoy").await.expect("read resumed convoy").status.expect("convoy status");
+    let status = convoys.get(&launch).await.expect("read resumed convoy").status.expect("convoy status");
     assert!(status.pending_brief().is_none());
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("Finish the current turn"));
+    // The crew's current turn is the delivered follow-up: on the engine a crew's message is only
+    // its seat's failure, so the turn is read from its Message (#3108).
+    assert!(status.crew_work["work"]["coder"].pending_follow_up.is_none());
+    let delivered = backend.using::<flotilla_resources::Message>("flotilla").get(&first.metadata.name).await.expect("delivered turn");
+    assert_eq!(delivered.spec.body, "Finish the current turn");
+    assert_eq!(delivered.status.expect("delivered status").phase, flotilla_resources::MessagePhase::Delivered);
 }
 
 #[tokio::test]
