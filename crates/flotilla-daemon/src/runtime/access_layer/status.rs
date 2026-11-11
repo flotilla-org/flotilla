@@ -224,8 +224,12 @@ impl AccessStatusReconciler {
         // A place that ended is gone: its environment is not launched again.
         let place_gone = *place != self.state.host_direct_environment_name
             && self.state.environment(place).await?.is_none_or(|environment| environment.ended());
+        // A convoy that ended is gone too: a launch is ended, never deleted, and holds no access.
         let convoy_gone = match record.metadata.labels.get(CONVOY_LABEL) {
-            Some(convoy) => gone(backend.including_replicas::<Convoy>(&self.namespace).get(convoy).await.map(drop))?,
+            Some(convoy) => match backend.including_replicas::<Convoy>(&self.namespace).get(convoy).await {
+                Ok(read) => read.object.status.is_some_and(|status| status.phase.is_terminal()),
+                found => gone(found.map(drop))?,
+            },
             None => false,
         };
         if !(place_gone || convoy_gone) {
