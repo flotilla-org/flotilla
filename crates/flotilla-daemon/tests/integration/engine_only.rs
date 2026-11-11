@@ -11,10 +11,6 @@ fn text<'a>(row: &'a Row, column: &str) -> &'a str {
     row.get(column).and_then(serde_json::Value::as_str).unwrap_or_default()
 }
 
-fn in_state(state: &'static str) -> impl Fn(&Row) -> bool {
-    move |row| text(row, "state") == state
-}
-
 /// A row whose `column` names `name`: a reference to it, or an address ending in it.
 fn names<'a>(column: &'a str, name: &'a str) -> impl Fn(&Row) -> bool + 'a {
     move |row| {
@@ -218,40 +214,37 @@ async fn message_names(daemon: &TestDaemon) -> std::collections::BTreeSet<String
     daemon.list::<flotilla_resources::Message>().await.into_iter().map(|message| message.metadata.name).collect()
 }
 
+// Each stage waits for a state its record reached, read from the kind's log: the dummy fleet
+// moves records on between two reads, so the current state may already be past it.
 async fn delivered_convoy(daemon: &TestDaemon) {
     daemon.stage("admission");
     daemon.request_convoy(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
     // Admission: the convoy is Open, holding its crews' promises.
-    let open = daemon.wait_row("Open", "convoy", "", in_state("Open")).await;
-    let convoy = text(&open, "resource.name").to_owned();
-    assert!(!convoy.is_empty(), "the convoy row names its convoy: {open:?}");
+    let open = daemon.wait_reached("Open", "convoy", "Open", |_| true).await;
+    // The engine convoy is a launch of the admitted convoy's name: vessels name the convoy, its
+    // launch holds the checkouts and its promises.
+    let launch = text(&open, "resource.name").to_owned();
+    let convoy = text(&open, "launch_of").to_owned();
+    assert!(!convoy.is_empty() && launch.starts_with(&format!("{convoy}#")), "the convoy row names its launch: {open:?}");
     let promises = daemon.rows("convoy_promises", "").await;
-    assert!(promises.iter().any(|row| text(row, "resource.name") == convoy), "the convoy's promises: {promises:?}");
+    assert!(promises.iter().any(|row| text(row, "resource.name") == launch), "the convoy's promises: {promises:?}");
 
     // Placement and provisioning: a vessel per crew, each Realised, with its
     // environment, the coder's checkout and both terminal sessions.
     daemon.stage("vessels");
     let of_convoy = |rows: Vec<Row>| rows.into_iter().filter(names("convoy", &convoy)).collect::<Vec<_>>();
-    daemon.wait_row("a vessel Realised", "vessel", "", |row| names("convoy", &convoy)(row) && in_state("Realised")(row)).await;
+    daemon.wait_reached("a vessel Realised", "vessel", "Realised", names("convoy", &convoy)).await;
     let vessels: Vec<String> = of_convoy(daemon.rows("vessel", "").await).iter().map(|row| text(row, "resource.name").to_owned()).collect();
     assert_eq!(vessels.len(), 2, "a vessel per crew: {vessels:?}");
     daemon.stage("environments");
     for vessel in &vessels {
-        daemon
-            .wait_row("its environment Realised", "environment", "", |row| names("holder", vessel)(row) && in_state("Realised")(row))
-            .await;
+        daemon.wait_reached("its environment Realised", "environment", "Realised", names("holder", vessel)).await;
     }
     daemon.stage("checkout");
-    daemon
-        .wait_row("the coder's checkout Realised", "checkout", "", |row| names("holder", &convoy)(row) && in_state("Realised")(row))
-        .await;
+    daemon.wait_reached("the coder's checkout Realised", "checkout", "Realised", names("holder", &launch)).await;
     daemon.stage("terminal sessions");
     for vessel in &vessels {
-        daemon
-            .wait_row("its terminal session Realised", "terminal_session", "", |row| {
-                names("holder", vessel)(row) && in_state("Realised")(row)
-            })
-            .await;
+        daemon.wait_reached("its terminal session Realised", "terminal_session", "Realised", names("holder", vessel)).await;
     }
 
     // Crew turns and messages: each crew's session takes its turns, and the coder's
@@ -259,37 +252,35 @@ async fn delivered_convoy(daemon: &TestDaemon) {
     daemon.stage("crew turns and messages");
     daemon.wait_row("a live agent session", "agent_session", "", |_| true).await;
     daemon
-        .wait_row("a settled message in the convoy's inboxes", "message", "", |row| {
-            text(row, "inbox").contains(&format!("convoy:{convoy}")) && in_state("Settled")(row)
+        .wait_reached("a settled message in the convoy's inboxes", "message", "Settled", |row| {
+            text(row, "inbox").contains(&format!("convoy:{convoy}"))
         })
         .await;
 
     // The change request: the dummy forge's, observed on the engine, keeps the coder's promise.
     daemon.stage("change request");
     daemon
-        .wait_row("the coder's change request submitted", "convoy_promises_submissions", "", |row| text(row, "resource.name") == convoy)
+        .wait_row("the coder's change request submitted", "convoy_promises_submissions", "", |row| text(row, "resource.name") == launch)
         .await;
     daemon
-        .wait_row("a kept promise", "convoy_promises", "", |row| text(row, "resource.name") == convoy && text(row, "progress") == "Kept")
+        .wait_row("a kept promise", "convoy_promises", "", |row| text(row, "resource.name") == launch && text(row, "progress") == "Kept")
         .await;
 
     // Landing: every promise kept, the convoy is Delivered.
     daemon.stage("landing");
-    daemon.wait_row("Delivered", "convoy", "", |row| text(row, "resource.name") == convoy && in_state("Delivered")(row)).await;
+    daemon.wait_reached("Delivered", "convoy", "Delivered", |row| text(row, "resource.name") == launch).await;
 
     // Teardown: everything held for the convoy ends Gone, and the vendor's backings are destroyed.
     daemon.stage("teardown");
     for vessel in &vessels {
-        daemon.wait_row("the vessel Gone", "vessel", "", |row| text(row, "resource.name") == vessel && in_state("Gone")(row)).await;
-        daemon.wait_row("its environment Gone", "environment", "", |row| names("holder", vessel)(row) && in_state("Gone")(row)).await;
-        daemon
-            .wait_row("its terminal session Gone", "terminal_session", "", |row| names("holder", vessel)(row) && in_state("Gone")(row))
-            .await;
+        daemon.wait_reached("the vessel Gone", "vessel", "Gone", |row| text(row, "resource.name") == vessel).await;
+        daemon.wait_reached("its environment Gone", "environment", "Gone", names("holder", vessel)).await;
+        daemon.wait_reached("its terminal session Gone", "terminal_session", "Gone", names("holder", vessel)).await;
     }
-    daemon.wait_row("the coder's checkout Gone", "checkout", "", |row| names("holder", &convoy)(row) && in_state("Gone")(row)).await;
+    daemon.wait_reached("the coder's checkout Gone", "checkout", "Gone", names("holder", &launch)).await;
     for table in ["vessel", "environment", "terminal_session", "checkout"] {
         let held = |row: &Row| {
-            names("convoy", &convoy)(row) || names("holder", &convoy)(row) || vessels.iter().any(|vessel| names("holder", vessel)(row))
+            names("convoy", &convoy)(row) || names("holder", &launch)(row) || vessels.iter().any(|vessel| names("holder", vessel)(row))
         };
         let live: Vec<Row> = daemon
             .rows(table, "")

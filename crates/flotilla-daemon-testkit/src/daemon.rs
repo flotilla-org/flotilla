@@ -501,6 +501,34 @@ impl TestDaemon {
         })
     }
 
+    /// Wait until some row of engine table `table` satisfying `held` has reached
+    /// `state`, read from the kind's log rather than its current rows: the fleet
+    /// can move a record past a state between two reads. Returns the row as it
+    /// now is. The wait fails with the held rows and the log's last entries.
+    pub fn wait_reached<'a>(&'a self, what: &'a str, table: &'a str, state: &'a str, held: impl Fn(&Row) -> bool + 'a) -> Wait<'a, Row> {
+        let name = |row: &Row| row.get("resource.name").or_else(|| row.get("name")).and_then(serde_json::Value::as_str).map(str::to_owned);
+        Wait::new(WAIT, async move |deadline| loop {
+            let mut rows: Vec<Row> = self.rows(table, "").await.into_iter().filter(&held).collect();
+            let log = self.rows(&format!("{table}.log"), "").await;
+            let reached = |row: &Row| {
+                log.iter().any(|entry| name(entry) == name(row) && entry.get("to").and_then(serde_json::Value::as_str) == Some(state))
+            };
+            if let Some(found) = rows.iter().position(reached) {
+                return rows.swap_remove(found);
+            }
+            if tokio::time::Instant::now() > deadline {
+                let last = &log[log.len().saturating_sub(20)..];
+                panic!(
+                    "no {table} row reached {what}; held rows: {}; last log entries: {}; fleet: {:?}",
+                    shown(&rows),
+                    shown(last),
+                    self.counts()
+                );
+            }
+            tokio::time::sleep(POLL).await;
+        })
+    }
+
     /// Fails with every access, when the old store is unavailable and
     /// something reached it.
     pub fn assert_old_store_untouched(&self) {
@@ -578,7 +606,7 @@ pub struct Peering {
     _topology: super::server::InMemoryRequestTopology,
 }
 
-fn shown(value: &impl serde::Serialize) -> String {
+fn shown(value: &(impl serde::Serialize + ?Sized)) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|error| format!("<{error}>"))
 }
 
