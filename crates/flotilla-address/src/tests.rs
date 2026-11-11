@@ -124,6 +124,8 @@ fn session_print_then_parse_is_identity(tc: hegel::TestCase) {
     assert_eq!(parsed, session);
     assert_eq!((parsed.kind(), parsed.name(), parsed.parent()), (Kind::Session, id.as_str(), Some(role.clone())));
     assert_eq!(resolve(&text, &BuiltinForges).as_ref(), Ok(&session));
+    // #4355: the session's AgentSession record is named by its id.
+    assert_eq!(record_name(&session), Some(id.clone()));
     let elsewhere = role.parent().expect("a role has a parent");
     assert!(elsewhere.child(Kind::Session, &id).is_err(), "a session under {elsewhere} is refused");
     assert!(format!("{elsewhere}/session:x").parse::<Address>().is_err());

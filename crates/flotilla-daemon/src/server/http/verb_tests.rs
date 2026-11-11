@@ -100,7 +100,7 @@ struct Rows(BTreeMap<String, Row>);
 #[async_trait]
 impl Subjects for Rows {
     fn table(&self, kind: Kind) -> Option<Table> {
-        (kind == Kind::Convoy).then(|| tables::descriptor("convoys"))
+        (kind == Kind::Convoy).then(|| tables::descriptor("convoys", tables::SubjectTables::registered().of_table("convoys").as_ref()))
     }
 
     async fn row(&self, _namespace: &str, address: &Address) -> Result<Option<Row>, String> {
@@ -545,13 +545,13 @@ async fn a_convoy_rows_address_acts_on_that_rows_convoy() {
         }
     }
     let mut registry = VerbRegistry::new();
+    flotilla_store::register_subjects(&mut registry).unwrap();
     registry.register(Records, Presentation::default()).unwrap();
-    let verbs = verbs::serve(registry, Arc::new(verbs::subjects::ResourceSubjects::new(backend.clone())));
     let router = HttpRouter::builder()
         .backend(backend)
         .daemon(Arc::clone(&daemon))
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
-        .verbs(Arc::new(verbs))
+        .registry(registry)
         .build()
         .into_router();
     let rows = rows(&router, &format!("/tables/convoys/rows?namespace={namespace}")).await;
@@ -562,4 +562,93 @@ async fn a_convoy_rows_address_acts_on_that_rows_convoy() {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!((&body["outcomes"][0]["status"], &body["outcomes"][0]["result"]), (&json!("done"), &row["metadata.name"]), "{body}");
     }
+}
+
+/// A read verb on an agent session, answering with its session's record name.
+#[derive(Verb, Deserialize)]
+#[verb(name = "session.name", subject = "session", effect = "read")]
+struct SessionName {}
+
+struct SessionNames;
+
+#[async_trait]
+impl NativeVerb for SessionNames {
+    type Params = SessionName;
+
+    async fn run(&self, call: Call<'_>, _params: &SessionName) -> Result<Option<Value>, String> {
+        Ok(call.subjects.first().map(|subject| subject.row["resource.name"].clone()))
+    }
+}
+
+const CODER: &str = "project:flotilla/convoy:fix/role:coder";
+
+/// The session subject table as an owning crate would register it: `agent_session` rows, each
+/// the session of `CODER` its record names.
+fn sessions_of_coder() -> flotilla_verbs::SubjectTable {
+    flotilla_verbs::SubjectTable {
+        kind: Kind::Session,
+        table: "agent_session",
+        address: |row| CODER.parse::<Address>().ok()?.child(Kind::Session, row["resource.name"].as_str()?).ok(),
+    }
+}
+
+// Behaviour (#4355): a kind held only by the engine is a verb subject through its registration
+// alone. Its engine table, read through `/tables`, names the subject and gives each row its
+// `session` address, which `where` reads; the verb invoked on a row's address sees that row's
+// record. An address naming the record under another role is no row's, and finds no session.
+#[tokio::test]
+async fn an_engine_kinds_row_address_acts_on_that_rows_record() {
+    use flotilla_state_machines::{
+        machines::agent_session::{AgentSession, MemoryAgentSessionWorld},
+        Home,
+    };
+    let (dir, daemon) = super::super::tests::empty_daemon().await;
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(&dir.path().join("engine.db"), "home", crate::runtime::decided_registry().unwrap())
+            .unwrap(),
+    );
+    let mut sessions =
+        Home::<AgentSession, flotilla_engine_store::StoreLog>::with_log("home", flotilla_engine_store::StoreLog::new(service.store()))
+            .unwrap();
+    for (name, at) in [("s-1", 1), ("s-2", 2), ("s-3", 3)] {
+        sessions.create(name, (), &MemoryAgentSessionWorld::default(), flotilla_schema::Timestamp(at)).unwrap();
+    }
+    let mut registry = VerbRegistry::new();
+    registry.register_subject(sessions_of_coder()).unwrap();
+    registry.register(SessionNames, Presentation::default()).unwrap();
+    let router = HttpRouter::builder()
+        .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .daemon(Arc::clone(&daemon))
+        .table_store(service)
+        .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
+        .registry(registry)
+        .build()
+        .into_router();
+    let verbs = rows(&router, "/tables/verbs/rows").await;
+    assert_eq!((&verbs[0]["name"], &verbs[0]["broken"]), (&json!("session.name"), &Value::Null));
+    let (status, schema) = send(&router, CallerAuth::Bearer, "GET", "/tables/agent_session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let schema: Value = serde_json::from_slice(&schema).unwrap();
+    assert_eq!(schema["subject"], json!({"kind": "session", "field": "address"}));
+    let field = schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == "address").unwrap().clone();
+    assert_eq!(field["type"], "address");
+
+    let all = rows(&router, "/tables/agent_session/rows?columns=resource.name").await;
+    let addresses: Vec<_> = all.iter().map(|row| (row["resource.name"].clone(), row["address"].clone())).collect();
+    let expected: Vec<_> = ["s-1", "s-2", "s-3"].map(|name| (json!(name), json!(format!("{CODER}/session:{name}")))).into();
+    assert_eq!(addresses, expected);
+    // The filter on the derived address is evaluated over every stored row, not a page of them:
+    // under `limit=1` the last session is still found.
+    let selected = rows(&router, &format!("/tables/agent_session/rows?limit=1&where=address%20%3D%3D%20%22{CODER}/session:s-3%22")).await;
+    assert_eq!(selected.iter().map(|row| row["resource.name"].clone()).collect::<Vec<_>>(), [json!("s-3")]);
+    for row in &all {
+        let request = json!({"invocation": "s", "subjects": [row["address"]]});
+        let (status, body) = invoke(&router, CallerAuth::Bearer, "session.name", request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((&body["outcomes"][0]["status"], &body["outcomes"][0]["result"]), (&json!("done"), &row["resource.name"]), "{body}");
+    }
+    let elsewhere = "project:flotilla/convoy:fix/role:reviewer/session:s-1";
+    let (status, body) = invoke(&router, CallerAuth::Bearer, "session.name", json!({"invocation": "e", "subjects": [elsewhere]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcomes"][0], json!({"subject": elsewhere, "status": "failed", "error": format!("no session at `{elsewhere}`")}));
 }
