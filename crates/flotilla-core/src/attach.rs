@@ -650,13 +650,20 @@ impl<'a> AttachResolver<'a> {
                 return Ok((plan, self.host_name.clone()));
             }
         }
-        let host_ref = environment
-            .spec
+        // A provider-path vessel (#3981), a cloud one or one with no host
+        // binding, is reached only through its live handle; without one, it
+        // has not been adopted here, and its status says why.
+        let spec = &environment.spec;
+        let host_ref = spec
             .host_direct
             .as_ref()
             .map(|spec| spec.host_ref.as_str())
-            .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
-            .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
+            .or_else(|| spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
+            .filter(|_| spec.cloud_sandbox.is_none());
+        let Some(host_ref) = host_ref else {
+            let reason = environment.status.as_ref().and_then(|status| status.message.as_deref()).unwrap_or("no status message recorded");
+            return Err(format!("environment {}'s live handle is not adopted on this host: {reason}", session.spec.env_ref));
+        };
         if let Some((destination, host_environment)) = self
             .environment_manager
             .managed_environments()

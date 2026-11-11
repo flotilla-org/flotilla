@@ -108,15 +108,20 @@ impl DockerControllerRuntime {
 /// A composed image built for registry delivery is pulled as `repository@digest`
 /// with the fleet image cache's pull credential, admitted by an `image-pull`
 /// host-action grant for this host. The crew's work credentials never carry it.
-/// Local builds (an image ID) and other images return `None`.
+/// Local builds (an image ID) and other images return `None`. A composed image
+/// not yet resolved from its build (an empty image) is refused, never taken
+/// as one that needs no credential.
 pub(super) async fn composed_image_pull_auth(
     state: &ControllerRuntimeState,
     store: &CredentialStore,
     image: &str,
     image_build_ref: Option<&str>,
 ) -> Result<Option<flotilla_environment::environment::RegistryAuth>, String> {
-    if image_build_ref.is_none() {
-        return Ok(None);
+    let Some(image_build_ref) = image_build_ref else { return Ok(None) };
+    if image.is_empty() {
+        return Err(format!(
+            "composed image from ImageBuild {image_build_ref} is not resolved to an image; its pull credential is unknown"
+        ));
     }
     let Some((repository, _)) = image.split_once('@') else { return Ok(None) };
     let fleet = match state

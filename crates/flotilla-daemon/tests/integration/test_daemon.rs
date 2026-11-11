@@ -74,6 +74,33 @@ async fn a_restarted_daemon_adopts_its_running_vessels() {
     assert_eq!(daemon.counts().environments_destroyed, 1);
 }
 
+// A restarted daemon adopts its running cloud sandboxes (#4300): it reconnects
+// to the backing the vendor still holds rather than realising one again, the
+// Environment stays Ready throughout, and the working crew finishes so the
+// convoy lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_daemon_adopts_its_running_cloud_sandboxes() {
+    let daemon = TestDaemon::builder().agent("turn_delay_ms = 5000").start().await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_CLOUD_FULFILMENT_KIND).await;
+    let environment = daemon.wait("a Ready cloud sandbox", of_convoy(&convoy, EnvironmentPhase::Ready)).await;
+    daemon.wait("a launched coder", |_: &ResourceObject<Convoy>| daemon.counts().sessions_launched == 1).await;
+    let daemon = daemon.restart().await;
+    let name = environment.metadata.name;
+    // A refused adoption marks the sandbox not ready on every pass, so it is
+    // Ready once its crew completes only if the restarted daemon adopted it.
+    let adopted = |current: &ResourceObject<Environment>| {
+        current.metadata.name == name
+            && current.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready && status.ready)
+            && daemon.counts().crews_completed == 1
+    };
+    daemon.wait("Ready once its crew completes", adopted).await;
+    daemon.wait("Landed", in_phase(&convoy, ConvoyPhase::Landed)).await;
+    let counts = daemon.counts();
+    assert_eq!((counts.sessions_launched, counts.environments_provisioned, counts.command_errors), (1, 1, 0), "{counts:?}");
+    daemon.wait_gone::<Environment>(&name).await;
+    assert_eq!(daemon.counts().environments_destroyed, 1);
+}
+
 // A vendor that refuses to provision fails the convoy before any crew launches;
 // once it accepts again, the next convoy lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

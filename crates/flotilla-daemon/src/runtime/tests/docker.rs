@@ -327,7 +327,8 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
 // credential, admitted by an image-pull host-action grant for this host and
 // never through the crew's work credentials. Without that grant provisioning
 // refuses before the provider runs; a local build's image ID needs no
-// registry credential.
+// registry credential. A composed image not yet resolved from its build (an
+// empty image, #4300) is refused, never taken as one needing no credential.
 #[tokio::test]
 async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
     use flotilla_resources::{
@@ -336,7 +337,7 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
     };
     let repository = "registry.example/flotilla/crew-images";
     let image = format!("{repository}@sha256:{}", "d".repeat(64));
-    for case in ["granted", "ungranted", "local"] {
+    for case in ["granted", "ungranted", "local", "unresolved"] {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -449,7 +450,11 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
         let spec = flotilla_resources::DockerEnvironmentSpec {
             image_build_ref: Some("image-build".to_string()),
             host_ref: "host-test".to_string(),
-            image: if case == "local" { format!("sha256:{}", "d".repeat(64)) } else { image.clone() },
+            image: match case {
+                "local" => format!("sha256:{}", "d".repeat(64)),
+                "unresolved" => String::new(),
+                _ => image.clone(),
+            },
             declared_agent_adapters: BTreeSet::new(),
             required_agent_adapters: BTreeSet::new(),
             pull_policy: if case == "local" { flotilla_resources::DockerImagePullPolicy::Never } else { Default::default() },
@@ -469,6 +474,10 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
             "ungranted" => {
                 assert!(opts.is_none(), "the provider never runs without the pull credential");
                 assert!(error.to_string().contains("crew-image-registry-pull"), "{error}");
+            }
+            "unresolved" => {
+                assert!(opts.is_none(), "the provider never runs without knowing the pull credential: {error}");
+                assert!(error.to_string().contains("image-build"), "{error}");
             }
             _ => {
                 assert_eq!(error, EnvironmentProvisionError::Failed("stop after capturing create options".into()));

@@ -240,34 +240,44 @@ async fn a_failed_vessel_layer_discards_only_a_vessel_it_created() {
 
 /// The drydock stand-in, the provider instance flotilla composes for it, and
 /// a daemon holding a cloud-sandbox Environment for it with one crew frozen.
-struct StandIn {
-    temp: tempfile::TempDir,
-    convoy: String,
-    env_id: EnvironmentId,
-    spec: EnvironmentSpec,
-    state: Arc<ControllerRuntimeState>,
-    backend: ResourceBackend,
-    pool: Arc<FakeTerminalPool>,
+pub(super) struct StandIn {
+    pub(super) temp: tempfile::TempDir,
+    pub(super) convoy: String,
+    pub(super) env_id: EnvironmentId,
+    pub(super) spec: EnvironmentSpec,
+    pub(super) state: Arc<ControllerRuntimeState>,
+    pub(super) backend: ResourceBackend,
+    pub(super) pool: Arc<FakeTerminalPool>,
     /// Held for its lifetime: dropping the gateway stops the vessel's agent.
-    _gateway: Arc<Gateway>,
-    host: tokio::task::JoinHandle<()>,
-    crew_connections: tokio::sync::mpsc::UnboundedReceiver<(EnvironmentId, SocketReach, tokio::net::UnixStream)>,
-    refuse_tools: Arc<AtomicBool>,
+    pub(super) _gateway: Arc<Gateway>,
+    pub(super) host: tokio::task::JoinHandle<()>,
+    pub(super) crew_connections: CrewConnections,
+    pub(super) refuse_tools: Arc<AtomicBool>,
+    pub(super) controller: Controller,
 }
 
 impl StandIn {
-    fn root(&self) -> &Path {
+    /// Restart the controller: a new daemon, provider instance and crew socket
+    /// service over the same store, drydock and vessel. The old controller's
+    /// handles are dropped with it.
+    pub(super) async fn restart(&mut self, provider: impl FnOnce(Arc<dyn EnvironmentProvider>) -> Arc<dyn EnvironmentProvider>) {
+        let (state, crew_connections) = self.controller.start(Some(self.backend.clone()), provider).await;
+        self.state = state;
+        self.crew_connections = crew_connections;
+    }
+
+    pub(super) fn root(&self) -> &Path {
         self.temp.path()
     }
 
-    async fn handle(&self) -> Option<EnvironmentHandle> {
+    pub(super) async fn handle(&self) -> Option<EnvironmentHandle> {
         let provisioned = self.state.provisioned_environments.lock().await;
         provisioned.values().find(|active| active.handle.id() == &self.env_id).map(|active| active.handle.clone())
     }
 
     /// The stand-in vessel is this host: remove what this environment left at
     /// its contained base, and nothing another test shares there.
-    fn clean_up(&self) {
+    pub(super) fn clean_up(&self) {
         self.host.abort();
         let base = Path::new(flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE);
         let _ = fs::remove_dir_all(base.join("agent-material/requesters").join(&self.convoy));
@@ -295,7 +305,7 @@ impl ::drydock::launch::ImageResolver for Digests {
     }
 }
 
-async fn stand_in(declared_path: Option<&str>, harness_in_image: bool) -> StandIn {
+pub(super) async fn stand_in(declared_path: Option<&str>, harness_in_image: bool) -> StandIn {
     stand_in_with(declared_path, harness_in_image, false).await
 }
 
@@ -357,35 +367,24 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
     })
     .await
     .expect("stand-in ready");
-    let provider = DrydockEnvironmentProvider::new(
-        flotilla_drydock::api::provider_api(drydock),
-        flotilla_drydock::agent::link(),
-        "stand-in".into(),
-        "reference".into(),
-    )
-    .with_agent_build(BUILD.to_vec())
-    .with_guest_agent_socket(root.join("vessel/agent.sock"));
-
-    // The daemon: interior discovery finds the harness and the terminal pool.
     let config_base = root.join("config");
     fs::create_dir_all(&config_base).expect("config directory");
     fs::write(config_base.join("daemon.toml"), "machine_id = \"drydock-launch-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let pool = Arc::new(FakeTerminalPool::new());
-    let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(pool.clone()));
-    discovery.host_detectors = Arc::new(vec![Box::new(GuestHarness(harness_in_image)) as Box<dyn HostDetector>]);
-    let git = git_process_discovery(false);
-    discovery.factories.vcs = git.factories.vcs;
-    discovery.repo_detectors = git.repo_detectors;
-    let daemon = InProcessDaemon::new(
-        Vec::new(),
-        Arc::clone(&config),
-        discovery,
-        flotilla_protocol::HostName::new("controller"),
-        Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-    let backend = daemon.resource_backend();
+    let source = LocalSkillSource::new(root, "research");
+    let refuse_tools = Arc::new(AtomicBool::new(false));
+    let mut controller = Controller {
+        root: root.to_path_buf(),
+        drydock,
+        config,
+        pool,
+        harness_in_image,
+        skills: source.supply.clone(),
+        refuse_tools: Arc::clone(&refuse_tools),
+    };
+    let (state, crew_connections) = controller.start(None, |provider| provider).await;
+    let backend = state.daemon.resource_backend();
     backend
         .clone()
         .definitions::<CredentialSpec>(NAMESPACE)
@@ -401,11 +400,11 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
         )
         .await
         .expect("credential declaration");
-    let address: flotilla_address::Address = "account:stand-in/provider:stand-in".parse().expect("address");
+    let address: flotilla_address::Address = STAND_IN_ADDRESS.parse().expect("address");
     let mut env = BTreeMap::from([("LANG".to_string(), "C.UTF-8".to_string())]);
     env.extend(declared_path.map(|path| ("PATH".to_string(), path.to_string())));
     let spec = EnvironmentSpec {
-        provider_address: Some(address.clone()),
+        provider_address: Some(address),
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
             probe_needs: Default::default(),
             image: format!("example.test/crew@sha256:{}", "a".repeat(64)),
@@ -417,56 +416,109 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
         ..Default::default()
     };
     backend.using::<Environment>(NAMESPACE).create(&empty_meta(env_id.as_str()), &spec).await.expect("environment record");
-    let source = LocalSkillSource::new(root, "research");
     freeze_crew(&backend, &convoy, "demo-work", "coder", "claude-code", vec![source.selected.clone()]).await;
     bind_account(&backend, &convoy, "coder", "claude-max", "test@example.com").await;
+    let pool = Arc::clone(&controller.pool);
+    StandIn { temp, convoy, env_id, spec, state, backend, pool, _gateway: gateway, host, crew_connections, refuse_tools, controller }
+}
 
-    let adapters: Arc<dyn CommandRunner> =
-        Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build()));
-    let credential_store = Arc::new(CredentialStore::new_with_http(
-        backend.clone(),
-        NAMESPACE,
-        Arc::new(TestEnvVars::new([("TEST_CLAUDE_TOKEN", "oauth-secret-material")])),
-        EnvironmentBag::new(),
-        adapters,
-        Arc::new(ReplayHttpClient::new(Session::replaying_from_str("interactions: []\n", Masks::new()))),
-        config.state_dir().as_path().to_path_buf(),
-    ));
-    let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([(
-        FLOTILLA_SKILLS_DIR_ENV,
-        source.supply.display().to_string(),
-    )]))));
-    let (accepted, crew_connections) = tokio::sync::mpsc::unbounded_channel();
-    let sockets = EnvironmentSocketService::new(
-        Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
-        DaemonHostPath::new(root.join("sockets")),
-        move |listener, environment, reach| {
-            let accepted = accepted.clone();
-            tokio::spawn(async move {
-                while let Ok((stream, _)) = listener.accept().await {
-                    let _ = accepted.send((environment.clone(), reach, stream));
-                }
-            })
-        },
-    );
-    let mut state = ControllerRuntimeState::new(
-        Arc::clone(&daemon),
-        Arc::clone(&config),
-        Arc::new(ProviderRegistry::new()),
-        None,
-        "host-test".to_string(),
-        "host-direct-host-test".to_string(),
-    )
-    .with_credential_store(credential_store)
-    .with_agent_material(agent_material)
-    .with_skill_trees(LocalSkillSource::trees(root))
-    .with_environment_sockets(Some(sockets));
-    state.environment_providers.insert(address, Arc::new(provider)).expect("provider address");
-    let refuse_tools = Arc::new(AtomicBool::new(false));
-    let tools = GenerationCli { root: root.to_path_buf(), refused: Arc::clone(&refuse_tools) };
-    state.environment_tools = EnvironmentToolProvisioner::new(vec![Arc::new(tools)]);
-    let state = Arc::new(state);
-    StandIn { temp, convoy, env_id, spec, state, backend, pool, _gateway: gateway, host, crew_connections, refuse_tools }
+/// The stand-in's drydock provider instance.
+const STAND_IN_ADDRESS: &str = "account:stand-in/provider:stand-in";
+
+/// What a flotillad on the stand-in's host is made of: each start composes a
+/// fresh daemon, provider instance and crew socket service, as a process does.
+pub(super) struct Controller {
+    root: PathBuf,
+    drydock: Arc<Daemon>,
+    config: Arc<ConfigStore>,
+    pool: Arc<FakeTerminalPool>,
+    harness_in_image: bool,
+    skills: PathBuf,
+    refuse_tools: Arc<AtomicBool>,
+}
+
+pub(super) type CrewConnections = tokio::sync::mpsc::UnboundedReceiver<(EnvironmentId, SocketReach, tokio::net::UnixStream)>;
+
+impl Controller {
+    /// A controller over `backend`, the store an earlier one left, or a new
+    /// one; its provider instance passes through `provider`.
+    async fn start(
+        &mut self,
+        backend: Option<ResourceBackend>,
+        provider: impl FnOnce(Arc<dyn EnvironmentProvider>) -> Arc<dyn EnvironmentProvider>,
+    ) -> (Arc<ControllerRuntimeState>, CrewConnections) {
+        let root = self.root.as_path();
+        let instance = DrydockEnvironmentProvider::new(
+            flotilla_drydock::api::provider_api(self.drydock.clone()),
+            flotilla_drydock::agent::link(),
+            "stand-in".into(),
+            "reference".into(),
+        )
+        .with_agent_build(BUILD.to_vec())
+        .with_guest_agent_socket(root.join("vessel/agent.sock"));
+
+        // The daemon: interior discovery finds the harness and the terminal pool.
+        let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(self.pool.clone()));
+        discovery.host_detectors = Arc::new(vec![Box::new(GuestHarness(self.harness_in_image)) as Box<dyn HostDetector>]);
+        let git = git_process_discovery(false);
+        discovery.factories.vcs = git.factories.vcs;
+        discovery.repo_detectors = git.repo_detectors;
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::clone(&self.config),
+            discovery,
+            flotilla_protocol::HostName::new("controller"),
+            backend.unwrap_or_else(|| ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())),
+            Arc::new(crate::peer::HostPeerOverlay::default()),
+        )
+        .await;
+        let backend = daemon.resource_backend();
+        let adapters: Arc<dyn CommandRunner> =
+            Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build()));
+        let credential_store = Arc::new(CredentialStore::new_with_http(
+            backend.clone(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("TEST_CLAUDE_TOKEN", "oauth-secret-material"), ("TEST_WORK_TOKEN", "work-token-material")])),
+            EnvironmentBag::new(),
+            adapters,
+            Arc::new(ReplayHttpClient::new(Session::replaying_from_str("interactions: []\n", Masks::new()))),
+            self.config.state_dir().as_path().to_path_buf(),
+        ));
+        let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([(
+            FLOTILLA_SKILLS_DIR_ENV,
+            self.skills.display().to_string(),
+        )]))));
+        let (accepted, crew_connections) = tokio::sync::mpsc::unbounded_channel();
+        let sockets = EnvironmentSocketService::new(
+            Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
+            DaemonHostPath::new(root.join("sockets")),
+            move |listener, environment, reach| {
+                let accepted = accepted.clone();
+                tokio::spawn(async move {
+                    while let Ok((stream, _)) = listener.accept().await {
+                        let _ = accepted.send((environment.clone(), reach, stream));
+                    }
+                })
+            },
+        );
+        let mut state = ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            Arc::clone(&self.config),
+            Arc::new(ProviderRegistry::new()),
+            None,
+            "host-test".to_string(),
+            "host-direct-host-test".to_string(),
+        )
+        .with_credential_store(credential_store)
+        .with_agent_material(agent_material)
+        .with_skill_trees(LocalSkillSource::trees(root))
+        .with_environment_sockets(Some(sockets));
+        let address: flotilla_address::Address = STAND_IN_ADDRESS.parse().expect("address");
+        state.environment_providers.insert(address, provider(Arc::new(instance))).expect("provider address");
+        let tools = GenerationCli { root: root.to_path_buf(), refused: Arc::clone(&self.refuse_tools) };
+        state.environment_tools = EnvironmentToolProvisioner::new(vec![Arc::new(tools)]);
+        (Arc::new(state), crew_connections)
+    }
 }
 
 /// The vessel's image, as interior discovery finds it: with its harness, or without one.

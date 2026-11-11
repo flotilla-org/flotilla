@@ -393,8 +393,10 @@ pub(super) async fn reconcile_provisioned_environment(
 /// Persist diagnostics before marking backing lost: dependency watchers may
 /// immediately start teardown, and neither inspect nor cgroup evidence survives it.
 /// Cloud liveness uses provider facts, including cap loss. Restart adoption
-/// re-enters ordinary idempotent provisioning so forwarding and credentials are
-/// restored together; a cached image/SSH recipe never proves liveness.
+/// (#3765 B1) reconnects, delivers the vessel layer where it differs and
+/// registers; it never prepares, and never reads the desired image. A desired
+/// spec that has moved from what the backing runs calls for replacing the
+/// vessel (#3610), not for adoption.
 async fn reconcile_cloud_environment(
     state: &Arc<ControllerRuntimeState>,
     namespace: &str,
@@ -413,7 +415,11 @@ async fn reconcile_cloud_environment(
         Some(handle) => match handle.observe().await.state {
             ObservationState::Running => {
                 if cached.is_none() {
-                    if let Err(error) = super::provider_path::provision(state, &environment.metadata.name, &environment.spec).await {
+                    let adopted = match realised_image(environment) {
+                        Some(image) => super::provider_path::adopt(state, &environment.metadata.name, &environment.spec, image).await,
+                        None => Err("its Ready status records no realised image".to_string()),
+                    };
+                    if let Err(error) = adopted {
                         record_cloud_health(
                             state,
                             namespace,
@@ -467,6 +473,18 @@ async fn reconcile_cloud_environment(
             .await
         }
     }
+}
+
+/// The image the backing runs, as its Ready status recorded it at provision.
+/// A backing with none recorded is not adopted: its handle would report an
+/// unknown image to anything comparing it with the desired one (#3610).
+fn realised_image(environment: &ResourceObject<Environment>) -> Option<&str> {
+    let status = environment.status.as_ref()?;
+    status
+        .image_ref
+        .as_deref()
+        .or_else(|| status.provider_descriptor.as_ref().map(|descriptor| descriptor.image_digest.as_str()))
+        .filter(|image| !image.is_empty())
 }
 
 async fn record_cloud_health(

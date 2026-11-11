@@ -301,6 +301,12 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         Ok(Arc::clone(held) as EnvironmentHandle)
     }
 
+    /// Reconnect to the backing the vendor still holds for `id`, as a sandbox
+    /// vendor's API finds one by its label: nothing is prepared or realised.
+    async fn adopt(&self, id: &EnvironmentId, _image: &str) -> Result<Option<EnvironmentHandle>, String> {
+        Ok(self.backing(id.as_str()).map(|handle| handle as EnvironmentHandle))
+    }
+
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
         Ok(self.handles().values().filter(|handle| handle.held()).map(|handle| Arc::clone(handle) as EnvironmentHandle).collect())
     }
