@@ -519,6 +519,19 @@ impl EngineRecords for EngineHosts {
         Ok(resident.records.iter().filter_map(|((name, home), held)| self.object(name, home, held)).filter_map(warn_skipped).collect())
     }
 
+    /// Every home's Host `name`, read from the resident map by name.
+    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        refuse_kind(kind)?;
+        let resident = self.refresh()?;
+        Ok(resident
+            .records
+            .range((name.to_owned(), String::new())..)
+            .take_while(|((held, _), _)| held == name)
+            .filter_map(|((name, home), held)| self.object(name, home, held))
+            .filter_map(warn_skipped)
+            .collect())
+    }
+
     async fn apply(
         &self,
         kind: &str,
