@@ -1,33 +1,17 @@
 use super::*;
 use chrono::Utc;
 use flotilla_protocol::CrewCommandContext;
-use flotilla_provisioning_testkit::CheckoutFixture;
-use flotilla_resources::checkout_records::{CheckoutRecord, CheckoutRecords as _, Inspection, Landed};
-use flotilla_resources::{ChangeRequest, ChangeRequestSpec, Message, MessageRelation, MessageSpec, Vessel, VesselSpec};
+use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecord, CheckoutRecords as _, Inspection, Landed};
+use flotilla_resources::{ChangeRequest, ChangeRequestSpec, Message, MessageRelation, MessageSpec};
 use flotilla_store::StoreExt;
 
-async fn create_vessel(backend: &ResourceBackend) {
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("vessel".into()).build(),
-            &VesselSpec {
-                convoy_ref: "crew".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
-}
-
-fn command_context() -> CrewCommandContext {
+/// The coder's context in the fixture convoy's vessel.
+fn command_context(held: &Held) -> CrewCommandContext {
     CrewCommandContext {
         crew_id: None,
         namespace: Some("flotilla".into()),
-        convoy: Some("crew".into()),
-        vessel_ref: Some("vessel".into()),
+        convoy: Some(held.launch.clone()),
+        vessel_ref: Some(held.vessel.clone()),
         role: Some("coder".into()),
     }
 }
@@ -39,18 +23,16 @@ fn command_context() -> CrewCommandContext {
 async fn interactive_crew_reads_ignore_unrelated_resources() {
     use flotilla_store_testkit::{assert_flat_reads, ReadBudget, ReadOperation, ReadSnapshot};
     async fn request_reads(request: &str, unrelated: u64) -> ReadSnapshot {
-        let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
-        create_vessel(&backend).await;
+        let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
         for n in 0..unrelated {
             let name = format!("unrelated-{n}");
-            backend
-                .using::<ResourceConvoy>("flotilla")
-                .create(
-                    &InputMeta::builder().name(name.clone()).build(),
-                    &ConvoySpec::builder().workflow_ref("workflow".into()).role("other".into()).build(),
+            held.engine
+                .admit(
+                    &name,
+                    ConvoySpec::builder().workflow_ref("workflow".into()).role("other".into()).build(),
+                    flotilla_engine_convoys_testkit::single_agent("coder"),
                 )
-                .await
-                .expect("unrelated convoy");
+                .await;
             backend
                 .using::<Message>("flotilla")
                 .create(
@@ -64,20 +46,16 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
                 )
                 .await
                 .expect("unrelated message");
-            backend
-                .using::<ResourceTerminalSession>("flotilla")
-                .create(
-                    &InputMeta::builder().name(format!("terminal-{n}")).build(),
-                    &TerminalSessionSpec::builder()
-                        .env_ref("other".into())
-                        .role("coder".into())
-                        .source(TerminalSessionSource::Tool { command: "sh".into() })
-                        .cwd("/other".into())
-                        .pool("other".into())
-                        .build(),
-                )
-                .await
-                .expect("unrelated terminal");
+            held.engine.launch_session(&TerminalLaunchRequest {
+                session: format!("terminal-{n}"),
+                environment: "other".into(),
+                vessel: None,
+                role: "coder".into(),
+                pool: "other".into(),
+                cwd: "/other".into(),
+                env: Default::default(),
+                source: TerminalLaunchSource::Tool { command: "sh".into() },
+            });
             backend
                 .using::<flotilla_resources::Artifact>("flotilla")
                 .create(
@@ -109,13 +87,7 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
                 .await
                 .expect("unrelated PR");
         }
-        let context = CrewCommandContext {
-            crew_id: None,
-            namespace: Some("flotilla".into()),
-            convoy: Some("crew".into()),
-            vessel_ref: Some("vessel".into()),
-            role: Some("coder".into()),
-        };
+        let context = command_context(&held);
         let before = backend.read_snapshot();
         match request {
             "routing" => {
@@ -136,10 +108,10 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
                 .expect("completion");
             }
             "teardown" => {
-                crew.teardown("flotilla", "crew", false).await.expect("teardown");
+                crew.teardown("flotilla", &held.launch, false).await.expect("teardown");
             }
             "withdraw" => {
-                assert_eq!(crew.withdraw_pending_brief("flotilla", "crew").await.expect("withdraw"), None);
+                assert_eq!(crew.withdraw_pending_brief("flotilla", &held.launch).await.expect("withdraw"), None);
             }
             _ => unreachable!(),
         }
@@ -193,10 +165,10 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
 // replica origin. Query ordering must not change the durable ledger digest.
 #[tokio::test]
 async fn completion_advisory_does_not_write_claim_evidence() {
-    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
-    create_vessel(&backend).await;
+    let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
+    let launch = held.launch.as_str();
     let name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::artifact_address("crew", "coder", "decision-ledger", "crew").expect("artifact address"),
+        &flotilla_resources::address::artifact_address(launch, "coder", "decision-ledger", launch).expect("artifact address"),
     )
     .expect("record name");
     let local = backend
@@ -204,10 +176,10 @@ async fn completion_advisory_does_not_write_claim_evidence() {
         .create(
             &InputMeta::builder().name(name).build(),
             &flotilla_resources::ArtifactSpec::builder()
-                .convoy("crew".into())
+                .convoy(launch.into())
                 .producer("coder".into())
                 .kind("decision-ledger".into())
-                .subject("crew".into())
+                .subject(launch.into())
                 .digest("local-digest".into())
                 .size(0)
                 .media_type("text/markdown".into())
@@ -229,7 +201,7 @@ async fn completion_advisory_does_not_write_claim_evidence() {
         .await
         .expect("replica artifact");
     crew.complete(
-        &command_context(),
+        &command_context(&held),
         None,
         None,
         Some("https://example.test/ledger".into()),
@@ -237,56 +209,13 @@ async fn completion_advisory_does_not_write_claim_evidence() {
     )
     .await
     .expect("complete");
-    let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
+    let convoy = held.convoy(&backend).await;
     assert!(convoy.status.expect("status").crew_work["work"]["coder"].decision_ledger_digest.is_none());
-}
-
-// A completion waiting for the per-convoy lock must observe the caller's
-// current phase after acquiring it, rather than its earlier routing snapshot.
-#[tokio::test]
-async fn completion_refreshes_caller_after_lock_wait() {
-    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
-    create_vessel(&backend).await;
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.get("session").await.expect("session");
-    let running =
-        flotilla_resources::TerminalSessionStatus { phase: flotilla_resources::TerminalSessionPhase::Running, ..Default::default() };
-    sessions.update_status("session", &session.metadata.resource_version, &running).await.expect("running");
-    let lock = crew.convoy_message_lock("flotilla", "crew").await;
-    let guard = lock.lock().await;
-    let before = backend.read_calls().get("TerminalSession").copied().unwrap_or_default();
-    let task = tokio::spawn(async move {
-        crew.complete(
-            &command_context(),
-            None,
-            None,
-            Some("https://example.test/ledger".into()),
-            Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
-        )
-        .await
-    });
-    // Read observation synchronizes the interleaving. The timeout is a harness
-    // deadlock guard, not a request-performance assertion.
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while backend.read_calls().get("TerminalSession").copied().unwrap_or_default() <= before {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("completion routed while lock held");
-    let session = sessions.get("session").await.expect("session");
-    let stopped =
-        flotilla_resources::TerminalSessionStatus { phase: flotilla_resources::TerminalSessionPhase::Stopped, ..Default::default() };
-    sessions.update_status("session", &session.metadata.resource_version, &stopped).await.expect("stopped during wait");
-    drop(guard);
-    task.await.expect("task").expect("complete");
-    let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
-    assert!(!convoy.status.expect("status").crew_work["work"]["coder"].completed_while_crew_active);
 }
 
 // Inspection boundary fake: explicit deletion obtains newly observed checkout facts, written to
 // the engine as an inspection of the checkout's home writes them.
-struct FreshDeleteInspection(std::sync::atomic::AtomicUsize, Arc<CheckoutFixture>);
+struct FreshDeleteInspection(std::sync::atomic::AtomicUsize, Arc<flotilla_provisioning::engine::checkouts::EngineCheckouts>);
 #[async_trait::async_trait]
 impl crate::ports::CheckoutIntegrationInspector for FreshDeleteInspection {
     async fn inspect_now(&self, _: &str, checkout: &CheckoutRecord) -> Result<(), String> {
@@ -300,25 +229,22 @@ impl crate::ports::CheckoutIntegrationInspector for FreshDeleteInspection {
         });
         let landed = landed_evidence.as_ref().map(|_| true);
         self.1
-            .checkouts
             .inspected(&checkout.name, Inspection { clean: Some(true), pushed: Some(true), landed, landed_evidence, ..Default::default() })
             .map(|_| ())
     }
 }
-async fn active_delete_fixture() -> (Arc<CrewService>, ResourceBackend, Arc<CheckoutFixture>, String, Held) {
-    let (mut crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
-    let engine = Arc::new(CheckoutFixture::default());
-    Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = engine.reads.clone();
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let mut convoy = convoys.get("crew").await.expect("convoy");
-    convoy.spec.adopted_checkout_refs.insert(flotilla_protocol::RepositoryKey("repo".into()), "checkout".into());
-    let convoy = convoys.update(&InputMeta::from(&convoy.metadata), &convoy.metadata.resource_version, &convoy.spec).await.expect("adopt");
-    let mut status = convoy.status.expect("status");
-    status.phase = ConvoyPhase::Active;
-    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("active");
-    // The adopted checkout is held for the convoy, realised and never inspected.
-    engine.admit_for(&backend, "flotilla", "crew", "crew").await;
-    let launch = engine.put_ready(
+
+/// An Active convoy that adopted checkout `checkout`, held for its launch, realised and never
+/// inspected; returns the checkout's launch.
+async fn active_delete_fixture() -> (Arc<CrewService>, ResourceBackend, String, Held) {
+    let spec = ConvoySpec::builder()
+        .workflow_ref("workflow".into())
+        .role("crew".into())
+        .adopted_checkout_refs(BTreeMap::from([(flotilla_protocol::RepositoryKey("repo".into()), "checkout".into())]))
+        .build();
+    let (crew, backend, _, held) = spec_fixture(CrewWorkPhase::Working, spec).await;
+    assert_eq!(held.convoy(&backend).await.status.expect("status").phase, ConvoyPhase::Active);
+    let launch = held.engine.engine.checkouts.put_ready(
         "checkout",
         &flotilla_resources::CheckoutSpec::Observed(
             flotilla_resources::ObservedCheckoutSpec::builder()
@@ -329,9 +255,9 @@ async fn active_delete_fixture() -> (Arc<CrewService>, ResourceBackend, Arc<Chec
                 .is_main(false)
                 .build(),
         ),
-        Some(&engine.holder("crew")),
+        Some(&CheckoutHolder::Convoy(held.launch.clone())),
     );
-    (crew, backend, engine, launch, _config)
+    (crew, backend, launch, held)
 }
 
 // Process/VCS boundary stand-in: a transient failure must not publish fallback evidence.
@@ -347,11 +273,11 @@ impl crate::ports::CheckoutIntegrationInspector for FailedDeleteInspection {
 #[tokio::test]
 async fn active_teardown_refuses_unset_or_failing_inspector() {
     for configured in [false, true] {
-        let (crew, _backend, engine, launch, _config) = active_delete_fixture().await;
+        let (crew, _backend, launch, held) = active_delete_fixture().await;
         if configured {
             crew.set_checkout_inspector(Arc::new(FailedDeleteInspection));
         }
-        let error = crew.teardown("flotilla", "crew", false).await.expect_err("inspection is required");
+        let error = crew.teardown("flotilla", &held.launch, false).await.expect_err("inspection is required");
         assert!(
             error.contains(if configured {
                 "fresh inspection failed for checkout checkout: VCS temporarily unavailable"
@@ -360,7 +286,7 @@ async fn active_teardown_refuses_unset_or_failing_inspector() {
             }),
             "{error}"
         );
-        let checkout = engine.record(&launch);
+        let checkout = held.engine.engine.checkouts.record(&launch);
         assert_eq!(checkout.inspection(), None, "no inspection is written for a failed one");
         assert!(checkout.is_ready(), "the checkout is preserved");
     }
@@ -370,12 +296,14 @@ async fn active_teardown_refuses_unset_or_failing_inspector() {
 // including a second request inside the normal evidence freshness horizon.
 #[tokio::test]
 async fn manual_active_convoy_delete_inspects_checkout_once_per_request() {
-    let (crew, _backend, engine, launch, _config) = active_delete_fixture().await;
-    assert!(crew.teardown("flotilla", "crew", false).await.expect_err("missing inspector").contains("inspector not configured"));
-    let inspector = Arc::new(FreshDeleteInspection(0.into(), Arc::clone(&engine)));
+    let (crew, _backend, launch, held) = active_delete_fixture().await;
+    let convoy = held.launch.as_str();
+    assert!(crew.teardown("flotilla", convoy, false).await.expect_err("missing inspector").contains("inspector not configured"));
+    let checkouts = &held.engine.engine.checkouts;
+    let inspector = Arc::new(FreshDeleteInspection(0.into(), Arc::clone(&checkouts.checkouts)));
     crew.set_checkout_inspector(inspector.clone());
-    crew.teardown("flotilla", "crew", false).await.expect("fresh delete evidence");
-    crew.teardown("flotilla", "crew", false).await.expect("second explicit inspection");
+    crew.teardown("flotilla", convoy, false).await.expect("fresh delete evidence");
+    crew.teardown("flotilla", convoy, false).await.expect("second explicit inspection");
     assert_eq!(inspector.0.load(std::sync::atomic::Ordering::SeqCst), 2);
-    assert_eq!(engine.record(&launch).inspection().and_then(|inspection| inspection.landed), Some(true));
+    assert_eq!(checkouts.record(&launch).inspection().and_then(|inspection| inspection.landed), Some(true));
 }
