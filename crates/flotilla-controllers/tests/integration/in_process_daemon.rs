@@ -3025,6 +3025,7 @@ async fn capability_placement_selects_each_vessel_from_its_own_role_needs() {
                 .name("docs".to_string())
                 .crew(vec![flotilla_resources::CrewSpec::builder()
                     .role("writer".to_string())
+                    .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("writer")])
                     .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
                     .build()])
                 .build(),
@@ -3033,6 +3034,7 @@ async fn capability_placement_selects_each_vessel_from_its_own_role_needs() {
                 .crew(vec![flotilla_resources::CrewSpec::builder()
                     .role("operator".to_string())
                     .needs(BTreeSet::from([flotilla_resources::CapabilityNeed::HostAccountReach]))
+                    .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("operator")])
                     .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
                     .build()])
                 .build(),
@@ -3065,6 +3067,7 @@ async fn allocation_shares_equal_need_roles_and_explains_grouping() {
     let crew = |role: &str| {
         flotilla_resources::CrewSpec::builder()
             .role(role.to_string())
+            .promises(vec![flotilla_resources::TemplatePromise::decision_ledger(role)])
             .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
             .build()
     };
@@ -3247,6 +3250,7 @@ async fn allocation_separates_linux_coder_from_gui_verifier() {
         flotilla_resources::CrewSpec::builder()
             .role(role.to_string())
             .needs(BTreeSet::from([need.parse().expect("need")]))
+            .promises(vec![flotilla_resources::TemplatePromise::decision_ledger(role)])
             .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
             .build()
     };
@@ -3291,6 +3295,7 @@ async fn allocation_expands_project_platform_matrix() {
         .roles(vec![flotilla_resources::CrewSpec::builder()
             .role("verify".to_string())
             .needs(BTreeSet::from(["platform:$matrix".parse().expect("matrix need")]))
+            .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("verify")])
             .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
             .build()])
         .build();
@@ -3324,6 +3329,7 @@ async fn allocation_backtracks_a_legacy_union_no_kind_covers() {
         flotilla_resources::CrewSpec::builder()
             .role(role.to_string())
             .needs(BTreeSet::from([flotilla_resources::CapabilityNeed::Platform(platform.to_string())]))
+            .promises(vec![flotilla_resources::TemplatePromise::decision_ledger(role)])
             .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
             .build()
     };
@@ -3338,6 +3344,7 @@ async fn allocation_backtracks_a_legacy_union_no_kind_covers() {
                 .crew(vec![flotilla_resources::CrewSpec::builder()
                     .role("planner".to_string())
                     .needs(BTreeSet::from([flotilla_resources::CapabilityNeed::HostAccountReach]))
+                    .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("planner")])
                     .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
                     .build()])
                 .build(),
