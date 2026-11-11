@@ -897,10 +897,14 @@ async fn ssh_host_harness_path_is_composed_and_never_the_login_profile() {
         runner.run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Default).await.expect("runner PATH");
     let session_env = BTreeMap::from([("PATH".to_string(), format!("{}:{runner_path}", wrapper_dir.display()))]);
 
-    // The vessel's generation layer holds the delivered CLI.
-    // The crew's vessel is its work's first launch, which the runtime requests.
-    let vessel =
-        VesselPaths::new(&bag, &VesselKey::new(&EnvironmentId::new(ENVIRONMENT), &first_launch("demo-work"))).expect("vessel paths");
+    // A real shell stands in for the host here, so the crew selects no skills to fetch.
+    let runtime = ssh_host_runtime(
+        SshHost { runner, bag, host_environment, checkout: checkout.display().to_string(), session_env, skills: false },
+        "claude-code",
+    )
+    .await;
+    // The vessel's generation layer holds the delivered CLI, in the launch the runtime requested.
+    let vessel = &runtime.vessel;
     let cli = vessel.cli();
     let cli_dir = cli.parent().expect("CLI directory").to_path_buf();
     write_executable(&cli, "#!/bin/sh\necho generation-cli\n");
@@ -910,14 +914,8 @@ async fn ssh_host_harness_path_is_composed_and_never_the_login_profile() {
         "#!/bin/sh\n{ printf '%s\\n' \"$PATH\"; command -v gh; command -v flotilla; printf '%s\\n' \"${RUSTUP_HOME-unset}\"; } > \"$HOME/harness-report\"\n",
     );
 
-    let session = launch_ssh_host(
-        // A real shell stands in for the host here, so the crew selects no skills to fetch.
-        SshHost { runner, bag, host_environment, checkout: checkout.display().to_string(), session_env, skills: false },
-        "claude-code",
-        true,
-    )
-    .await
-    .expect("launch SSH host crew");
+    bind_account(&runtime.daemon, "demo", "coder", "claude-max", "crew@example.com").await;
+    let session = runtime.launch().await.expect("launch SSH host crew");
 
     // #4173: cleat runs a declared session's script in `sh -c` with exactly the
     // launch's environment over the pool's host baseline (the login basics);

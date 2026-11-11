@@ -120,7 +120,8 @@ fn lifecycle_value(state: &LifecycleState) -> Value {
     }
 }
 
-/// One vessel: its request until a grant, then the placements holding its lease and resource.
+/// One vessel: its request until a grant, then the placements holding its lease and resource,
+/// named by the launch the grant created.
 pub struct Composed<F: VesselLogs> {
     id: VesselId,
     request: Request,
@@ -176,7 +177,9 @@ impl<F: VesselLogs> Composed<F> {
             };
         };
         match placements.place(&self.id, evidence.host.clone(), Timestamp(0)) {
-            Ok(_) => {
+            Ok(vessel) => {
+                // The ledger holds the lease under the launch's name from here on.
+                self.id = VesselId::new(vessel.name());
                 F::check(placements.home());
                 self.placements = Some(placements);
                 Step::Accepted
