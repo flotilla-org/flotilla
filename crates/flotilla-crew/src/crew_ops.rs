@@ -3599,35 +3599,20 @@ impl CrewService {
         }
     }
 
+    /// An operator's delete of convoy `name`. A convoy ends on the engine and is never deleted
+    /// (#3108): once its teardown gate passes (force skips it), a live convoy is abandoned and an
+    /// ended one has nothing left to end. Its vessels, checkouts and sessions are released by
+    /// their controllers once it has ended.
     pub async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        if force {
-            let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-            for attempt in 0..3 {
-                let convoy = convoys.get(name).await.map_err(|error| error.to_string())?;
-                let expected_checkout = flotilla_resources::expected_checkout_refs(&convoy).map_or(true, |refs| !refs.is_empty());
-                let observed_checkout = self
-                    .held_checkouts(&convoy)
-                    .await?
-                    .iter()
-                    .any(|checkout| !checkout.ended() && !matches!(checkout.spec, flotilla_resources::CheckoutSpec::Observed(_)));
-                let mut meta = InputMeta::from(&convoy.metadata);
-                if expected_checkout || observed_checkout {
-                    meta = meta.with_added_finalizer(flotilla_resources::CONVOY_TEARDOWN_FINALIZER);
-                }
-                meta.annotations.insert(flotilla_resources::FORCE_TEARDOWN_ANNOTATION.to_string(), "true".to_string());
-                if meta.annotations == convoy.metadata.annotations && meta.finalizers == convoy.metadata.finalizers {
-                    break;
-                }
-                match convoys.update(&meta, &convoy.metadata.resource_version, &convoy.spec).await {
-                    Ok(_) => break,
-                    Err(ResourceError::Conflict { .. }) if attempt < 2 => continue,
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-        }
         self.teardown(namespace, name, force).await?;
         self.cascade_convoy_children(namespace, name).await?;
-        self.resource_backend.clone().using::<ResourceConvoy>(namespace).delete(name).await.map_err(|error| error.to_string())
+        let convoy = self.resource_backend.clone().using::<ResourceConvoy>(namespace).get(name).await.map_err(|error| error.to_string())?;
+        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            return Ok(());
+        }
+        let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
+            .ok_or_else(|| format!("convoy `{name}` is not held at this home"))?;
+        engine.abandon(&convoy, "operator", "deleted by an operator").await
     }
 }
 
