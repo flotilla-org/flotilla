@@ -1429,19 +1429,24 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
         )
         .await
         .expect("PR record");
-    // Pending roles await handoff, and settled/failed roles must not be reopened by CI/review
-    // probes. Each phase is a launch whose seat's facts read so.
+    // Pending roles await handoff, and handed-back or failed roles must not be reopened by CI/review
+    // probes. A Done seat has claimed by keeping its promises, and its landing launch still gets
+    // check failures and actionable reviews after the claim (#3108 Q5). Each phase is a launch
+    // whose seat's facts read so.
     let mut inactive = Vec::new();
     for phase in [CrewWorkPhase::Pending, CrewWorkPhase::Done, CrewWorkPhase::HandedBack, CrewWorkPhase::Failed] {
         let launch = produced_pr_launch(&backend, &home, workflow, role, phase).await;
         let updated = convoys.get(&launch).await.expect("inactive crew");
         wake.sync_rows("flotilla", &HashMap::from([(launch.clone(), updated)])).await.expect("inactive subscriptions");
-        assert!(
-            !table.rows().await.iter().any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { rule, .. }
-            if matches!(flotilla_resources::legacy_field_path(&rule.on.path).as_str(), ".checks" | ".review.actionable-at-head"))),
-            "{phase:?}"
-        );
-        inactive.push((phase, launch));
+        let armed = table.rows().await.iter().any(|row| {
+            matches!(&row.watcher, LeafWatcher::TurnDelivery { rule, .. }
+            if matches!(flotilla_resources::legacy_field_path(&rule.on.path).as_str(), ".checks" | ".review.actionable-at-head"))
+        });
+        // A Done reviewer beside a coder still pending leaves its launch Active, where a claimed
+        // seat is not probed.
+        let landing = convoys.get(&launch).await.expect("inactive crew").status.expect("status").phase == ConvoyPhase::Landing;
+        assert_eq!(armed, phase == CrewWorkPhase::Done && landing, "{phase:?}");
+        inactive.push((phase, launch, landing));
     }
     // A working crew. (An Interrupted crew's launch is Interrupted too, and arms no rows.)
     let launch = produced_pr_launch(&backend, &home, workflow, role, CrewWorkPhase::Working).await;
@@ -1554,7 +1559,8 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
         task.abort();
     }
     // A cached checks row cannot reopen an inactive role, even for a new
-    // settled head that has no delivery episode yet.
+    // settled head that has no delivery episode yet. At a Done seat of a landing
+    // launch the head settled after its claim, so the cached row delivers.
     loop {
         let current = records.get(&name).await.expect("record");
         let mut observed = current.status.expect("observation");
@@ -1566,12 +1572,13 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
             Err(error) => panic!("observe inactive head: {error}"),
         }
     }
-    let requests_before = actuator.requests.lock().expect("requests").len();
+    let mut requests_before = actuator.requests.lock().expect("requests").len();
     let holds_before = actuator.holds.load(Ordering::SeqCst);
-    for (phase, inactive) in &inactive {
+    for (phase, inactive, landing) in &inactive {
         // Keep the old row armed to model delivery racing its removal: it fires for a launch
         // whose seat no longer works.
         table.deliver_turn(row.id, inactive, source, rule, &row.leaves[0]).await.expect("ignore cached inactive row");
+        requests_before += usize::from(*phase == CrewWorkPhase::Done && *landing);
         assert_eq!(actuator.requests.lock().expect("requests").len(), requests_before, "{phase:?}");
         assert_eq!(actuator.holds.load(Ordering::SeqCst), holds_before, "{phase:?}");
         let current = convoys.get(inactive).await.expect("convoy").status.expect("status");
