@@ -861,20 +861,5 @@ pub(in crate::in_process) fn install_engine_messages(
 
 /// Declare and designate the fleet whose roles the engine's Message delivery reads.
 pub(in crate::in_process) async fn designate_fleet(backend: &ResourceBackend) {
-    backend
-        .definitions::<flotilla_resources::Project>("flotilla")
-        .apply(
-            &InputMeta::builder().name("fleet".into()).build(),
-            &flotilla_resources::ProjectSpec::builder().display_name("Fleet".into()).default_workflow_ref("work".into()).build(),
-        )
-        .await
-        .expect("fleet project");
-    backend
-        .definitions::<flotilla_resources::FleetDesignation>("flotilla")
-        .apply(
-            &InputMeta::builder().name("fleet".into()).build(),
-            &flotilla_resources::FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
-        )
-        .await
-        .expect("fleet designation");
+    flotilla_engine_messages_testkit::designate_fleet(backend, "flotilla").await;
 }

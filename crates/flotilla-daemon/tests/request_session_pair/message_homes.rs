@@ -11,9 +11,8 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_engine_messages::MessagePrimitives;
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
-    Convoy, ConvoySpec, FleetDesignation, FleetDesignationSpec, Host, InputMeta, MessageExpectation, MessageReference, MessageRelation,
-    MessageSpec, Project, ProjectSpec, Resource, ResourceProvenance, Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSource,
-    TerminalSessionSpec, Vessel, VesselSpec, FLEET_DESIGNATION_NAME,
+    Convoy, ConvoySpec, Host, InputMeta, MessageExpectation, MessageReference, MessageRelation, MessageSpec, Resource, ResourceProvenance,
+    Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
 };
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::{Follower, Service};
@@ -38,26 +37,7 @@ pub(super) async fn engine(daemon: &Arc<InProcessDaemon>) -> (Arc<Service>, Arc<
 
 /// The fleet the engine's Message delivery reads its roles from: Project `fleet`, designated.
 pub(super) async fn seed_fleet(backend: &flotilla_store::ResourceBackend) {
-    backend
-        .definitions::<Project>(NS)
-        .apply(
-            &InputMeta::builder().name("fleet".to_string()).build(),
-            &ProjectSpec::builder()
-                .display_name("Fleet".to_string())
-                .default_workflow_ref("w".to_string())
-                .repositories(Vec::new())
-                .build(),
-        )
-        .await
-        .expect("fleet project");
-    backend
-        .definitions::<FleetDesignation>(NS)
-        .apply(
-            &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
-            &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
-        )
-        .await
-        .expect("fleet designation");
+    flotilla_engine_messages_testkit::designate_fleet(backend, NS).await;
 }
 
 /// A home read served by another home's store, as its record socket serves one.

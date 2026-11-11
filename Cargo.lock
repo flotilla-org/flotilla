@@ -2260,6 +2260,7 @@ dependencies = [
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-engine-messages",
+ "flotilla-engine-messages-testkit",
  "flotilla-engine-store",
  "flotilla-environment",
  "flotilla-executor",
@@ -2409,6 +2410,7 @@ dependencies = [
  "flotilla-config",
  "flotilla-daemon-api",
  "flotilla-discovery-api",
+ "flotilla-engine-messages-testkit",
  "flotilla-environment",
  "flotilla-forge-github",
  "flotilla-messaging",
@@ -2496,6 +2498,7 @@ dependencies = [
  "flotilla-drydock",
  "flotilla-dummy-fleet",
  "flotilla-engine-messages",
+ "flotilla-engine-messages-testkit",
  "flotilla-engine-store",
  "flotilla-environment",
  "flotilla-executor",
@@ -2796,6 +2799,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "flotilla-address",
+ "flotilla-engine-messages-testkit",
  "flotilla-engine-store",
  "flotilla-inbox",
  "flotilla-messaging",
@@ -2805,12 +2809,31 @@ dependencies = [
  "flotilla-schema-sqlite",
  "flotilla-state-machines",
  "flotilla-store",
+ "flotilla-store-memory",
  "flotilla-tracing",
  "futures",
  "hegeltest",
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "flotilla-engine-messages-testkit"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flotilla-engine-messages",
+ "flotilla-engine-store",
+ "flotilla-inbox",
+ "flotilla-messaging",
+ "flotilla-resources",
+ "flotilla-schema",
+ "flotilla-schema-sqlite",
+ "flotilla-state-machines",
+ "flotilla-store",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -1068,9 +1068,11 @@ async fn credential_attention_reads_only_live_convoys() {
         should_surface: true,
         first_failure_at: None,
     };
-    // Only the convoy reads are measured: the attentions hold nothing and take every raise.
+    // The engine's attentions read no convoy either: only the live convoys are decoded.
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
+    let messages = flotilla_engine_messages_testkit::EngineMessagesHome::open("home", "flotilla", &backend);
     let (result, reads) = measure_reads(super::super::credentials::reconcile_credential_refresh_attention_in(
-        &flotilla_store_testkit::NoAttentions,
+        messages.primitives().as_ref(),
         &backend,
         "flotilla",
         &[failure],

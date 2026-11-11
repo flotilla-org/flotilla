@@ -152,9 +152,12 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
         ("routing", ReadBudget::new().objects("TerminalSession", Query, 1, 1)),
         (
             "orientation",
+            // The open credential attentions about the vessel: the convoy, for the inbox its
+            // attentions go to, and the FleetDesignation naming the roles that send them.
             ReadBudget::new()
-                .objects("Convoy", Get, 1, 1)
+                .objects("Convoy", Get, 2, 2)
                 .calls("Demand", Query, 1)
+                .objects("FleetDesignation", Get, 2, 1)
                 .objects("TerminalSession", Query, 2, 1)
                 .objects("Vessel", Get, 2, 2),
         ),
@@ -171,7 +174,9 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
                 .objects("Vessel", Get, 1, 1),
         ),
         ("teardown", ReadBudget::new().calls("Checkout", Query, 1).objects("Convoy", Get, 1, 1)),
-        ("withdraw", ReadBudget::new().objects("Convoy", Get, 4, 3).calls("Message", Query, 1)),
+        // Withdrawal on the engine reads the queued message from the engine, and the fleet roles
+        // its withdrawal is sent as.
+        ("withdraw", ReadBudget::new().objects("Convoy", Get, 4, 3).objects("FleetDesignation", Get, 2, 1)),
     ];
     for (request, budget) in budgets {
         // Unrelated resources cannot increase reads or decoding, per kind and operation.
@@ -300,7 +305,7 @@ impl crate::ports::CheckoutIntegrationInspector for FreshDeleteInspection {
             .map(|_| ())
     }
 }
-async fn active_delete_fixture() -> (Arc<CrewService>, ResourceBackend, Arc<CheckoutFixture>, String, tempfile::TempDir) {
+async fn active_delete_fixture() -> (Arc<CrewService>, ResourceBackend, Arc<CheckoutFixture>, String, Held) {
     let (mut crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
     let engine = Arc::new(CheckoutFixture::default());
     Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = engine.reads.clone();

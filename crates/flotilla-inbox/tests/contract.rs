@@ -215,7 +215,8 @@ async fn sqlite_rejects_consumer_in_another_store() {
 
 // Behaviour (ADR 0066 §4): a message's identity is `<inbox>/message:<id>`; a
 // keyed send's id is the digest of inbox, sender and key, so a repeated key
-// returns the existing message and admits nothing, on both stores.
+// returns the existing message and admits nothing, and another intent under the
+// key is refused, on both stores.
 #[tokio::test]
 async fn keyed_sends_name_one_message_under_their_inbox() {
     use flotilla_inbox::InboxBackend;
@@ -230,6 +231,11 @@ async fn keyed_sends_name_one_message_under_their_inbox() {
         let version = factory.inspect(&backend, &first).version();
         assert_eq!(backend.enqueue_as(spec(), &flotilla_inbox::keyed_id(&inbox(), &spec().sender, "hold")).await.expect("repeat"), first);
         assert_eq!(factory.inspect(&backend, &first).version(), version, "a repeated key writes nothing");
+        let mut changed = spec();
+        changed.body = flotilla_state_machines::machines::message::MessageBody::text("another intent").expect("body");
+        let refused = backend.enqueue_as(changed, &flotilla_inbox::keyed_id(&inbox(), &spec().sender, "hold")).await;
+        assert!(matches!(refused, Err(flotilla_inbox::Error::DifferentIntent(ref name)) if *name == first), "{refused:?}");
+        assert_eq!(factory.inspect(&backend, &first).version(), version, "a refused intent writes nothing");
         let other = backend.enqueue_as(spec(), &flotilla_inbox::keyed_id(&inbox(), &spec().sender, "other")).await.expect("other key");
         let unkeyed = backend.enqueue(spec()).await.expect("unkeyed");
         assert!(first != other && other != unkeyed);

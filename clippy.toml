@@ -65,6 +65,7 @@ absolute-paths-allowed-crates = [
     "flotilla_discovery",
     "flotilla_discovery_testkit",
     "flotilla_engine_messages",
+    "flotilla_engine_messages_testkit",
     "flotilla_environment",
     "flotilla_executor",
     "flotilla_fake_forge",

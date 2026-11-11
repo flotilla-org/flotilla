@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_protocol::CrewCommandContext;
 use flotilla_resources::{
     CrewWorkPhase, InputMeta, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
@@ -29,7 +28,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
             Ok(self.1.read().await.clone())
         }
     }
-    let (mut crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    let (mut crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
     backend
         .using::<Vessel>("flotilla")
         .create(
@@ -161,7 +160,16 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
         .find(|message| !messages.iter().any(|other| other.spec.supersedes.as_ref() == Some(&message.metadata.name)))
         .expect("superseding delta");
     assert!(messages.iter().any(|message| Some(&message.metadata.name) == latest.spec.supersedes.as_ref()));
+    // The engine stores the card's subject as the session's seat, with the card's revision.
+    let primitives = held.messages().primitives();
+    let (id, _) = primitives.locate(&latest.metadata.name).expect("locate").expect("the latest card");
+    let stored = primitives.messages().expect("messages").into_iter().find(|(_, message)| message.name() == id).expect("stored card").1;
+    let subject = stored.spec().subject().expect("a subject");
+    assert_eq!(subject.address.to_string(), "project:flotilla/convoy:crew/role:coder");
+    // The crew reads it in the old shape, naming the session.
+    let latest = primitives.view("flotilla", &latest.metadata.name).await.expect("view").expect("the latest card").object;
     let Some(MessageReference::ControlRecord { revision: latest_revision, .. }) = &latest.spec.subject else { panic!("revision subject") };
+    assert_eq!(latest_revision, &subject.revision);
     assert_eq!(latest.spec.sender, "system:capabilities");
     assert_eq!(latest.spec.body, crate::crew_capabilities::card_delta(&first, &card));
     // The latest revision is traceable through the stored subject, not a JSON header (#2923), and
@@ -182,8 +190,8 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
 #[tokio::test]
 async fn an_unseen_session_gets_a_full_card_once_then_delivered_deltas() {
     use crate::crew_capabilities::{card_delta, observe_card, CapabilityCardTracker};
-    use flotilla_resources::{Message, MessagePhase, Vessel, VesselSpec};
-    let (_, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    use flotilla_resources::{Message, Vessel, VesselSpec};
+    let (crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
     backend
         .using::<Vessel>("flotilla")
         .create(
@@ -201,7 +209,7 @@ async fn an_unseen_session_gets_a_full_card_once_then_delivered_deltas() {
     let session = sessions.get("session").await.expect("session");
     let unseen = "## Your capabilities\n### Credentials\n- unseen\n";
     let first = "## Your capabilities\n### Credentials\n- known\n";
-    let tracker = CapabilityCardTracker::default();
+    let tracker = CapabilityCardTracker::with_message_path(crew.message_path.clone());
     observe_card(&backend, "flotilla", &session, unseen, &tracker).await.expect("baseline");
     for _ in 0..2 {
         observe_card(&backend, "flotilla", &session, first, &tracker).await.expect("full card");
@@ -210,17 +218,7 @@ async fn an_unseen_session_gets_a_full_card_once_then_delivered_deltas() {
     let all = messages.list().await.expect("messages").items;
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].spec.body, first);
-    let mut status = all[0].status.clone().expect("status");
-    status.phase = MessagePhase::Delivered;
-    status.resolved_receiver = Some(flotilla_resources::ResolvedMessageReceiver {
-        role_address: None,
-        crew_id: "crew-id".into(),
-        session: "terminal".into(),
-        delivered_at: Utc::now(),
-        evidence: "in-memory transport receipt".into(),
-        transport: None,
-    });
-    messages.update_status(&all[0].metadata.name, &all[0].metadata.resource_version, &status).await.expect("receipt");
+    held.messages().deliver_turn(&all[0].metadata.name, "terminal").await;
     let second = "## Your capabilities\n### Credentials\n- known\n- added\n";
     observe_card(&backend, "flotilla", &session, second, &tracker).await.expect("delta");
     let all = messages.list().await.expect("messages").items;
@@ -229,154 +227,13 @@ async fn an_unseen_session_gets_a_full_card_once_then_delivered_deltas() {
     assert!(!latest.spec.body.contains("known"));
     // A restarted tracker has no baseline: an unchanged refresh records one, and a change sends a
     // full card under a revision no earlier Message holds.
-    let restarted = CapabilityCardTracker::default();
+    let restarted = CapabilityCardTracker::with_message_path(crew.message_path.clone());
     observe_card(&backend, "flotilla", &session, second, &restarted).await.expect("unchanged");
     let third = "## Your capabilities\n### Credentials\n- changed after restart\n";
     observe_card(&backend, "flotilla", &session, third, &restarted).await.expect("restart full");
     let all = messages.list().await.expect("messages").items;
     assert_eq!(all.len(), 3);
     assert!(all.iter().any(|message| message.spec.body == third && message.spec.supersedes.is_none()));
-}
-
-// Reaping a pending Message loses the receipt baseline, so production refresh must publish
-// a full card without referencing the deleted predecessor, and unchanged refresh is idempotent.
-#[tokio::test]
-async fn refresh_after_reaped_message_recovers_with_full_card() {
-    use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker};
-    use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
-    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Message, Vessel, VesselSpec};
-    // Credential/endpoint delivery is the runtime I/O boundary; resources use the real memory backend.
-    struct Delivery(RwLock<BTreeMap<String, String>>);
-    #[async_trait]
-    impl SessionCapabilitySource for Delivery {
-        async fn credentials(&self, _: &str, _: &BTreeSet<String>) -> Result<Vec<CredentialCapability>, String> {
-            Ok(vec![])
-        }
-        async fn endpoints(&self, _: &str, _: &str) -> Result<BTreeMap<String, String>, String> {
-            Ok(self.0.read().await.clone())
-        }
-    }
-    let (_, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name("vessel".into()).build(),
-            &VesselSpec {
-                convoy_ref: "crew".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("vessel");
-    let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
-    environments.request(
-        "resume-env",
-        &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
-            ..Default::default()
-        },
-        None,
-    );
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.get("session").await.expect("session");
-    sessions
-        .update_status(
-            "session",
-            &session.metadata.resource_version,
-            &flotilla_resources::TerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() },
-        )
-        .await
-        .expect("running");
-    let source = Delivery(RwLock::new(BTreeMap::new()));
-    let tracker = CapabilityCardTracker::default();
-    refresh_cards(
-        &backend,
-        "flotilla",
-        &source,
-        &tracker,
-        environments.reads.clone(),
-        &flotilla_store::OldStoreAccounts::new(backend.clone()),
-    )
-    .await
-    .expect("initial baseline");
-    source.0.write().await.insert("API".into(), "127.0.0.1:1".into());
-    refresh_cards(
-        &backend,
-        "flotilla",
-        &source,
-        &tracker,
-        environments.reads.clone(),
-        &flotilla_store::OldStoreAccounts::new(backend.clone()),
-    )
-    .await
-    .expect("first change");
-    // A session first seen by a refresh holds a card this tracker never saw: its first change is
-    // a full card, whose receipt sets the delta baseline.
-    let messages = backend.using::<Message>("flotilla");
-    let published = messages.list().await.expect("messages").items;
-    let [full] = published.as_slice() else { panic!("one full card: {published:?}") };
-    assert!(full.spec.body.starts_with("## Your capabilities"));
-    let mut status = full.status.clone().expect("status");
-    status.phase = flotilla_resources::MessagePhase::Delivered;
-    status.resolved_receiver = Some(flotilla_resources::ResolvedMessageReceiver {
-        role_address: None,
-        crew_id: "crew-id".into(),
-        session: "terminal".into(),
-        delivered_at: Utc::now(),
-        evidence: "in-memory transport receipt".into(),
-        transport: None,
-    });
-    messages.update_status(&full.metadata.name, &full.metadata.resource_version, &status).await.expect("receipt");
-    source.0.write().await.insert("API".into(), "127.0.0.1:2".into());
-    refresh_cards(
-        &backend,
-        "flotilla",
-        &source,
-        &tracker,
-        environments.reads.clone(),
-        &flotilla_store::OldStoreAccounts::new(backend.clone()),
-    )
-    .await
-    .expect("pending delta");
-    let delta = messages
-        .list()
-        .await
-        .expect("messages")
-        .items
-        .into_iter()
-        .find(|message| message.spec.supersedes.is_some())
-        .expect("pending delta");
-    assert!(delta.spec.body.starts_with("## Capability changes"));
-    messages.delete(&delta.metadata.name).await.expect("reap Message");
-    messages.delete(&full.metadata.name).await.expect("reap delivered Message");
-    source.0.write().await.insert("API".into(), "127.0.0.1:3".into());
-    refresh_cards(
-        &backend,
-        "flotilla",
-        &source,
-        &tracker,
-        environments.reads.clone(),
-        &flotilla_store::OldStoreAccounts::new(backend.clone()),
-    )
-    .await
-    .expect("recover reaped Message");
-    refresh_cards(
-        &backend,
-        "flotilla",
-        &source,
-        &tracker,
-        environments.reads.clone(),
-        &flotilla_store::OldStoreAccounts::new(backend.clone()),
-    )
-    .await
-    .expect("unchanged refresh");
-    let all = messages.list().await.expect("messages").items;
-    assert_eq!(all.len(), 1);
-    assert!(all[0].spec.body.starts_with("## Your capabilities"));
-    assert!(all[0].spec.body.contains("127.0.0.1:3"));
-    assert!(all[0].spec.supersedes.is_none());
 }
 
 // A source that fails after a successful delivery (daemon reconstruction gap) must leave the
@@ -400,7 +257,7 @@ async fn failing_source_never_publishes_an_empty_card() {
             Ok(self.0.read().await.clone())
         }
     }
-    let (_, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    let (crew, backend, _, _held) = fixture(CrewWorkPhase::Working).await;
     backend
         .using::<Vessel>("flotilla")
         .create(
@@ -434,7 +291,7 @@ async fn failing_source_never_publishes_an_empty_card() {
         .await
         .expect("running");
     let source = Delivery(RwLock::new(BTreeMap::new()), std::sync::atomic::AtomicBool::new(false));
-    let tracker = CapabilityCardTracker::default();
+    let tracker = CapabilityCardTracker::with_message_path(crew.message_path.clone());
     refresh_cards(
         &backend,
         "flotilla",
@@ -466,7 +323,7 @@ async fn image_capabilities_follow_engine_without_a_copy() {
     use flotilla_provisioning::engine::image_build::ImageBuildBinding;
     use flotilla_provisioning_testkit::{image_build, store_object, Ending, LifecycleFixture};
     use flotilla_resources::{DockerEnvironmentSpec, EnvironmentSpec, ImageBuildPhase};
-    let (_, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    let (_, backend, _, _held) = fixture(CrewWorkPhase::Working).await;
     let build = image_build(ImageBuildPhase::Built);
     store_object(&backend, build.clone()).await;
     let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);

@@ -25,6 +25,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+flotilla-engine-messages-testkit = { path = "../flotilla-engine-messages-testkit" }
+flotilla-store-memory = { path = "../flotilla-store-memory" }
 tokio = { workspace = true, features = ["test-util"] }
 hegeltest = { workspace = true }
 

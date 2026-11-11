@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 
 use flotilla_resources::{Convoy as ResourceConvoy, CrewWorkPhase};
 
-use super::fixture;
+use super::{fixture, old_store_fixture};
 use crate::crew_ops::ConvoyResumeOutcome;
 
 #[tokio::test]
@@ -58,6 +58,7 @@ async fn convoy_resume_body_is_author_text() {
 }
 
 // Working crew without fresh idle evidence queues replacements; withdrawal is idempotent (#2221).
+// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[hegel::test]
 fn queued_resume_replaces_and_withdraws_without_staging(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -66,7 +67,7 @@ fn queued_resume_replaces_and_withdraws_without_staging(tc: hegel::TestCase) {
     let operations: Vec<u8> = (0..steps).map(|_| tc.draw(gs::integers::<u8>().min_value(0).max_value(3))).collect();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
+        let (crew, backend, probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
         let mut expected = None;
         for operation in operations {
             match operation {

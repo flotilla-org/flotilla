@@ -15,11 +15,12 @@ use flotilla_resources::{
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
 use tokio::sync::RwLock;
 
-use super::fixture;
+use super::{fixture, old_store_fixture};
 use crate::crew_ops::{queue_pending_crew_message, CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator, ResolvedCrewContext};
 use crate::ports::WorkCredentialReconciler;
 use flotilla_resources::{CrewMessageSender, Selector, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, Vessel};
 
+// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[hegel::test]
 fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
     use flotilla_messaging::MessageInbox;
@@ -61,7 +62,7 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
         }
     }
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
+        let (crew, backend, probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
         probe.fail.store(false, Ordering::SeqCst);
         backend
             .using::<Vessel>("flotilla")
@@ -135,9 +136,10 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
 }
 
 // An authenticated operator can send supervisor guidance to crew that has no stall.
+// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[tokio::test]
 async fn operator_supervision_messages_working_crew() {
-    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
+    let (crew, backend, _probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
     let principal = PrincipalRef { namespace: "flotilla".into(), name: "operator-alice".into() };
     crew.supervise(CrewSupervisionRequest {
         namespace: "flotilla",
@@ -161,9 +163,10 @@ async fn operator_supervision_messages_working_crew() {
 }
 
 // Legacy PendingBrief adoption is replay-safe and retains both attribution and continuation intent.
+// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[tokio::test]
 async fn legacy_pending_brief_is_adopted_once_before_withdrawal() {
-    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
+    let (crew, backend, _probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let convoy = convoys.get("crew").await.expect("convoy");
     let mut status = convoy.status.expect("status");
@@ -191,6 +194,7 @@ async fn legacy_pending_brief_is_adopted_once_before_withdrawal() {
 }
 
 // Every governor ruling is a Message reply to the exact crew's open escalation.
+// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[hegel::test]
 fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
     use flotilla_messaging::MessageInbox;
@@ -206,7 +210,7 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
         _ => CrewSupervisionAction::Escalate,
     };
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
+        let (crew, backend, probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
         probe.fail.store(false, Ordering::SeqCst);
         crew.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) })).await;
         let convoys = backend.using::<ResourceConvoy>("flotilla");
@@ -326,6 +330,7 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
 
 // A durable ruling survives an authority mutation failure as a notification;
 // Message delivery never applies Fail/Escalate workflow transitions itself.
+// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[tokio::test]
 async fn supervisor_decision_survives_authority_disappearing_after_publication() {
     use flotilla_messaging::MessageInbox;
@@ -349,7 +354,7 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
         }
     }
     for action in [flotilla_protocol::CrewSupervisionAction::Fail, flotilla_protocol::CrewSupervisionAction::Escalate] {
-        let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
+        let (crew, backend, _probe, _config) = old_store_fixture(CrewWorkPhase::Working).await;
         apply_resource_status_patch(
             &backend.using::<ResourceConvoy>("flotilla"),
             "crew",
@@ -404,6 +409,7 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
 // Message, plus one notice to the held crew (#3565), across retries, with no forge
 // collaborator available. Cover local and project supervisors, no PR binding, and
 // retries carrying newer head identities.
+// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[hegel::test]
 fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -411,7 +417,7 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
     let address_supervisor = tc.draw(gs::booleans());
     let retries = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (crew, backend, _, _dir) = fixture(CrewWorkPhase::Done).await;
+        let (crew, backend, _, _dir) = old_store_fixture(CrewWorkPhase::Done).await;
         let convoys = backend.using::<ResourceConvoy>("flotilla");
         if local_supervisor {
             let current = convoys.get("crew").await.expect("convoy");
@@ -666,6 +672,7 @@ async fn escalation_without_receiver_preserves_owner() {
 
 // Escalation either transfers the obligation to a bound receiver, or refuses
 // without changing ownership. Repeated judgments must not return it to the caller.
+// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[hegel::test]
 fn escalation_admission_and_ownership(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -791,7 +798,7 @@ async fn run_escalation_scenarios(
         } else {
             "flotilla/next/watch/governor"
         };
-        let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+        let (crew, backend, _, _config) = old_store_fixture(CrewWorkPhase::Working).await;
         crew.set_turn_delivery_actuator(Arc::new(Delivery { backend: backend.clone(), reachable, conflict })).await;
         let convoys = backend.using::<ResourceConvoy>("flotilla");
         seed_escalation_stall(&backend, cursor, operator, collocated, bound, receiver).await;

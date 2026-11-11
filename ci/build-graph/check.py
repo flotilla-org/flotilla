@@ -74,6 +74,8 @@ STATE_MACHINE_DEPENDENTS = frozenset({
     "flotilla-engine-store", "flotilla-inbox", "flotilla-inbox-testkit", "flotilla-quint-testkit",
     # #3317: the composition root and its Message path, behind `[primitives]`.
     "flotilla-core", "flotilla-daemon", "flotilla-engine-messages",
+    # Dev-only: tests drive the real engine Message path.
+    "flotilla-engine-messages-testkit",
     # #3629: the provisioning lifecycle kinds declare their specs beside their requests.
     "flotilla-provisioning",
     # Dev-only reader contracts drive the real provisioning engine.

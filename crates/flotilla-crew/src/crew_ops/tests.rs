@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_change_request::observation::ChangeRequestObservationSource;
 use flotilla_config::ConfigStore;
+use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
 use flotilla_protocol::{EnvironmentId, HostName};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
@@ -75,18 +76,54 @@ impl WorkCredentialReconciler for StagingProbe {
     }
 }
 
-async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, tempfile::TempDir) {
+/// What a fixture's crew service needs kept alive: its config directory and the engine's
+/// Message path at its home.
+struct Held {
+    _config: tempfile::TempDir,
+    messages: Option<EngineMessagesHome>,
+}
+
+impl Held {
+    /// The engine's Message path at the fixture's home.
+    fn messages(&self) -> &EngineMessagesHome {
+        self.messages.as_ref().expect("a fixture on the engine's Message path")
+    }
+}
+
+async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
     fixture_with_message_path(phase, Default::default()).await
 }
 
 /// [`fixture`], with the `[primitives]` Message path the crew service and its
-/// leaf subscriptions share, as the composition root wires them.
+/// leaf subscriptions share, as the composition root wires them; the engine's
+/// path at this home unless `message_path` is already set.
 async fn fixture_with_message_path(
     phase: CrewWorkPhase,
     message_path: crate::ports::MessagePath,
-) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, tempfile::TempDir) {
+) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
+    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
+    let messages = EngineMessagesHome::open("host", "flotilla", &backend);
+    designate_fleet(&backend, "flotilla").await;
+    if message_path.get().is_none() {
+        let _ = message_path.set(messages.messages());
+    }
+    build_fixture(phase, backend, message_path, Some(messages)).await
+}
+
+/// [`fixture`] on the old Message store, for crew behaviour that compares old receiver and
+/// sender spellings. Goes when crew compares engine addresses (#3108 gate task).
+async fn old_store_fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
     let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
     backend.install_attentions(Arc::new(flotilla_store_testkit::NoAttentions));
+    build_fixture(phase, backend, Default::default(), None).await
+}
+
+async fn build_fixture(
+    phase: CrewWorkPhase,
+    backend: ResourceBackend,
+    message_path: crate::ports::MessagePath,
+    messages: Option<EngineMessagesHome>,
+) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
     let config_dir = tempfile::tempdir().expect("config directory");
     let config = Arc::new(ConfigStore::with_base(config_dir.path()));
     let environment = EnvironmentId::new("local");
@@ -117,6 +154,7 @@ async fn fixture_with_message_path(
             .brief_artifact_writer(Arc::new(RwLock::new(None)))
             .checkout_vcs(Arc::new(NoCheckoutVcs))
             .local_environment_id(environment)
+            .capability_cards(crate::crew_capabilities::CapabilityCardTracker::with_message_path(message_path.clone()))
             .message_path(message_path)
             .build(),
     );
@@ -192,7 +230,7 @@ async fn fixture_with_message_path(
         )
         .await
         .expect("session");
-    (crew, backend, probe, config_dir)
+    (crew, backend, probe, Held { _config: config_dir, messages })
 }
 
 // Resume must restore work on credential failure and stage credentials before retry delivery (#2221).

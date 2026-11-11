@@ -49,6 +49,8 @@ pub enum Error {
     /// The authoritative log can no longer bridge this cursor; take a new baseline.
     CursorExpired,
     CursorAhead,
+    /// A message already holds this name with a different intent.
+    DifferentIntent(String),
 }
 
 impl std::fmt::Display for Error {
@@ -59,6 +61,7 @@ impl std::fmt::Display for Error {
             Self::Storage(error) => write!(f, "inbox storage: {error}"),
             Self::CursorExpired => f.write_str("watch cursor expired; obtain a new pending baseline"),
             Self::CursorAhead => f.write_str("watch cursor is ahead of this home"),
+            Self::DifferentIntent(name) => write!(f, "message `{name}` already holds a different intent"),
         }
     }
 }
@@ -937,6 +940,16 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
         let name = message_address(&spec.inbox, id)?;
         self.access(move |backend, state| {
             if state.home.get(&name).is_some() || state.home.log_mut().exists(&name)? {
+                // The same intent again is the message already admitted; another intent under its
+                // name is refused. One no longer held here (archived) is taken as admitted.
+                if Self::load(state, &name)? {
+                    let held = state.home.get(&name).ok_or_else(|| Error::Storage("loaded message missing from Home".into()))?.spec();
+                    let mut again = spec;
+                    again.admitted_seq = held.admitted_seq;
+                    if *held != again {
+                        return Err(Error::DifferentIntent(name));
+                    }
+                }
                 return Ok(name);
             }
             backend.enqueue_named(state, spec, Some(name))

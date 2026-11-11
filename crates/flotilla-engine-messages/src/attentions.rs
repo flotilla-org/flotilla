@@ -9,7 +9,7 @@ use flotilla_address::{Address, Kind};
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
     attentions::{self, Attentions, Fact, OpenAttention, Sender, Subject},
-    ConvoyEnsure, ResourceObject, Vessel,
+    Convoy, ConvoyEnsure, Project, ResourceError, ResourceObject, Vessel,
 };
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
@@ -23,7 +23,8 @@ use flotilla_state_machines::{
 use super::{
     attention::{Attention, Cause, Read},
     convert::Conversion,
-    MessagePrimitives,
+    roles::FleetRoles,
+    MessagePrimitives, OldStoreRecords,
 };
 
 /// One attention message in this replica, with its home, what it is and the reason it gives.
@@ -86,32 +87,72 @@ impl MessagePrimitives {
         // none: clearing one then has nothing to clear, rather than failing the caller.
         let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(Vec::new()) };
         let people = self.person_inboxes(namespace).await?;
-        let messages = self.messages()?;
-        Ok(messages
-            .into_iter()
-            .filter_map(|(home, message)| {
-                let spec = message.spec();
-                if !people.contains(&spec.inbox) {
-                    return None;
-                }
-                let sender = Sender::from_role(roles.role_of(&spec.sender)?)?;
-                let subject_address = spec.subject()?.address.clone();
-                // An attention's body is always text; a typed request is no attention.
-                let MessageBody::Text(reason) = spec.body.value() else { return None };
-                let reason = reason.clone();
-                Some(Held {
-                    reason,
-                    home,
-                    sender,
-                    sender_address: spec.sender.clone(),
-                    subject: subject_of(&subject_address)?,
-                    subject_address,
-                    message,
-                })
-            })
-            .collect())
+        Ok(attentions_among(&roles, self.messages()?.into_iter().filter(|(_, message)| people.contains(&message.spec().inbox))))
     }
 
+    /// The open attentions about `scope`: for a subject in a convoy, only the pending messages
+    /// in the inbox that convoy's attentions are sent to, read by that inbox's index, so a
+    /// reader such as crew list reads no message history.
+    async fn open_about(&self, namespace: &str, scope: Option<&Subject>) -> Result<Vec<Held>, String> {
+        let convoy = match scope {
+            Some(Subject::Convoy { convoy } | Subject::Vessel { convoy, .. } | Subject::ConvoyRole { convoy, .. }) => convoy,
+            _ => return Ok(self.held(namespace).await?.into_iter().filter(Held::pending).collect()),
+        };
+        let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(Vec::new()) };
+        let Some(inbox) = self.convoy_attention_inbox(namespace, convoy, &roles).await? else {
+            return Ok(self.held(namespace).await?.into_iter().filter(Held::pending).collect());
+        };
+        Ok(attentions_among(&roles, self.pending_in(&inbox)?.into_iter()))
+    }
+
+    /// The person inbox a convoy's attentions are sent to, as [`Self::cause`] names it: its
+    /// dispatching principal's role in its project. None when the convoy is not held here.
+    async fn convoy_attention_inbox(&self, namespace: &str, convoy: &str, roles: &FleetRoles) -> Result<Option<Address>, String> {
+        let convoy = match self.backend.including_replicas::<Convoy>(namespace).get(convoy).await {
+            Ok(convoy) => convoy.object,
+            Err(ResourceError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let projects = match convoy.spec.project_ref.as_deref() {
+            Some(project) => match self.backend.definitions::<Project>(namespace).get(project).await {
+                Ok(project) => vec![project],
+                Err(ResourceError::NotFound { .. }) => Vec::new(),
+                Err(error) => return Err(error.to_string()),
+            },
+            None => Vec::new(),
+        };
+        let principal = format!("principal:{}", convoy.spec.dispatching_principal_ref.name);
+        let project = convoy.spec.project_ref.clone();
+        let records = OldStoreRecords::from_records(namespace, Vec::new(), vec![convoy], Vec::new(), Vec::new(), Vec::new(), projects);
+        let conversion = Conversion { roles, forges: &records.forges, records: &records };
+        conversion.person(&principal, project.as_deref()).map(Some)
+    }
+}
+
+/// The attentions among `messages`: from an attention's sender, about one subject, in text.
+fn attentions_among(roles: &FleetRoles, messages: impl Iterator<Item = (String, Resource<Message>)>) -> Vec<Held> {
+    messages
+        .filter_map(|(home, message)| {
+            let spec = message.spec();
+            let sender = Sender::from_role(roles.role_of(&spec.sender)?)?;
+            let subject_address = spec.subject()?.address.clone();
+            // An attention's body is always text; a typed request is no attention.
+            let MessageBody::Text(reason) = spec.body.value() else { return None };
+            let reason = reason.clone();
+            Some(Held {
+                reason,
+                home,
+                sender,
+                sender_address: spec.sender.clone(),
+                subject: subject_of(&subject_address)?,
+                subject_address,
+                message,
+            })
+        })
+        .collect()
+}
+
+impl MessagePrimitives {
     async fn about(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<Vec<Held>, String> {
         Ok(self.held(namespace).await?.into_iter().filter(|held| held.sender == sender && &held.subject == subject).collect())
     }
@@ -217,7 +258,7 @@ impl Attentions for MessagePrimitives {
 
     async fn open(&self, namespace: &str, from: Option<Sender>, scope: Option<&Subject>) -> Result<Vec<OpenAttention>, String> {
         Ok(self
-            .held(namespace)
+            .open_about(namespace, scope)
             .await?
             .into_iter()
             .filter(|held| {

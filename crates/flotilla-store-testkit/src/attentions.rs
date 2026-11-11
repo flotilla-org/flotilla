@@ -1,5 +1,5 @@
-//! Attentions for tests that never look at them: replaced by the real engine in crew tests
-//! (#3108 gate task).
+//! Attentions for the crew tests still on the old Message store, which never look at them. Goes
+//! when crew compares engine addresses (#3108 gate task); every other test uses the engine's.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

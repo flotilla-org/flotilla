@@ -352,7 +352,7 @@ fn a_missing_record_drops_when_settled_or_its_convoy_ended_and_is_refused_while_
             let (reason, detail) = if other == "replied-to message" {
                 ("a message it names is gone", "message-gone")
             } else {
-                ("it references a kind with no address", "TerminalSession")
+                ("a referenced session is gone", "session `terminal-1`")
             };
             (phase, receiver, reason, detail)
         }

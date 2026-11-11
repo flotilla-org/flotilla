@@ -36,7 +36,7 @@ use flotilla_inbox::{sqlite::SqliteInbox, ConsumerLog, ConsumerPort, InboxBacken
 use flotilla_resources::{
     address::{artifact_address, record_name as address_record_name, repository_address},
     Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, MessageSpec as OldSpec, Project,
-    ReadResourceObject, Repository, ResourceError, ResourceObject, ResourceProvenance, TerminalSession,
+    ReadResourceObject, Repository, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionSource,
 };
 use flotilla_schema::{Kind as StoredKind, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
@@ -84,31 +84,18 @@ impl Observations for GateWorld {
 
 /// Dead letters go to the sender's supervisor. A fleet role and a crew
 /// alike have none declared on this path yet, as the old store dead-letters
-/// only on an operator's batch failure, so no dead letter is sent. Were one
-/// sent, the system would send it as turn-rules of the designated project.
-struct NoSupervisors {
-    system: Arc<Mutex<Option<Address>>>,
-    fallback: Address,
-}
+/// only on an operator's batch failure, so no dead letter is sent.
+struct NoSupervisors;
 
 impl Supervision for NoSupervisors {
     fn supervisor(&self, _: &Address) -> Option<Address> {
         None
     }
     fn system_sender(&self) -> Address {
-        // Unreachable while no supervisor is declared; never a panic if that changes.
-        self.system.lock().expect("system sender").clone().unwrap_or_else(|| {
-            tracing::error!("a dead letter before the fleet roles were read sends as this namespace's turn-rules");
-            self.fallback.clone()
-        })
+        // The inbox asks only when sending a dead letter to a supervisor, and none is declared;
+        // declaring supervisors names the sender too.
+        unreachable!("no supervisor is declared, so no dead letter is sent")
     }
-}
-
-/// The daemon's default provisioning namespace's turn-rules role, for a dead
-/// letter sent before any designation was read; unreachable while no
-/// supervisor is declared.
-fn fallback_system_sender() -> Address {
-    Address::project("flotilla").and_then(|project| project.child(AddressKind::Role, "turn-rules")).expect("a valid default namespace")
 }
 
 pub use flotilla_resources::agent_activity::SCREEN_CAUSE;
@@ -401,7 +388,6 @@ pub struct MessagePrimitives {
     awaiting: Arc<awaiting::AwaitingReplies>,
     world: Arc<GateWorld>,
     backend: ResourceBackend,
-    system: Arc<Mutex<Option<Address>>>,
     consumers: Mutex<BTreeSet<Receiver>>,
     receipts: StoreLog,
     charter_pass: Arc<tokio::sync::Mutex<()>>,
@@ -438,14 +424,7 @@ impl MessagePrimitives {
         let log = flotilla_engine_store::MessageLog::new(store);
         let receipts = log.consumers();
         let world = Arc::new(GateWorld::new(Arc::clone(&clock)));
-        let system = Arc::new(Mutex::new(None));
-        let inbox = SqliteInbox::open(
-            home,
-            log,
-            world.clone(),
-            Arc::new(NoSupervisors { system: Arc::clone(&system), fallback: fallback_system_sender() }),
-        )
-        .map_err(|error| error.to_string())?;
+        let inbox = SqliteInbox::open(home, log, world.clone(), Arc::new(NoSupervisors)).map_err(|error| error.to_string())?;
         let sessions = Arc::new(Sessions {
             home: Mutex::new(Home::with_log(home, receipts.clone()).map_err(|error| format!("AgentSession home: {error:?}"))?),
         });
@@ -501,7 +480,6 @@ impl MessagePrimitives {
             services,
             awaiting,
             world,
-            system,
             consumers: Mutex::new(BTreeSet::new()),
             receipts,
             charter_pass: Arc::default(),
@@ -775,7 +753,10 @@ impl MessagePrimitives {
     /// person consumer is bound to all of them.
     pub async fn person_inboxes(&self, namespace: &str) -> Result<BTreeSet<Address>, String> {
         let roles = self.roles(namespace).await?;
-        let records = self.records(namespace).await.map_err(|error| error.to_string())?;
+        // Only the projects' charters name person roles: no other record is read.
+        let declared: Vec<ResourceObject<Project>> =
+            self.backend.definitions::<Project>(namespace).list().await.map_err(|error| error.to_string())?;
+        let records = OldStoreRecords::from_records(namespace, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), declared);
         let mut inboxes: BTreeSet<Address> = roles::PERSON_ROLES.iter().filter_map(|role| roles.person(role.name)).collect();
         let projects: BTreeSet<&str> = records.projects().chain([namespace]).collect();
         for project in projects {
@@ -866,7 +847,6 @@ impl MessagePrimitives {
             }
             Err(error) => return Err(format!("the fleet roles are read from the FleetDesignation record: {error}")),
         };
-        self.system.lock().expect("system sender").get_or_insert_with(|| roles.address("turn-rules").expect("a declared default"));
         Ok(Ok(roles))
     }
 
@@ -1262,6 +1242,32 @@ impl MessagePrimitives {
             .map_err(|error| error.to_string())
     }
 
+    /// The pending messages in `inbox`, at every home this replica follows, with their homes:
+    /// read through the inbox's pending index, not a scan of every message.
+    pub fn pending_in(&self, inbox: &Address) -> Result<Vec<(String, Resource<Message>)>, String> {
+        self.service
+            .with_store(|store| {
+                let mut out = Vec::new();
+                let query = MessageSpec::pending_by_inbox(inbox);
+                for home in self.service.homes() {
+                    let mut read = store.read()?;
+                    let mut after = 0;
+                    loop {
+                        let keys = read.integer_index_keys(&query, &home, after, 32)?;
+                        let Some(&(_, last)) = keys.last() else { break };
+                        for (id, _) in keys {
+                            if let Some(loaded) = read.load::<Resource<Message>>(id)? {
+                                out.push((home.clone(), loaded.value));
+                            }
+                        }
+                        after = last;
+                    }
+                }
+                Ok(out)
+            })
+            .map_err(|error| error.to_string())
+    }
+
     /// Every message in this home's replica, as engine resources with their homes.
     pub fn messages(&self) -> Result<Vec<(String, Resource<Message>)>, String> {
         self.service
@@ -1643,6 +1649,21 @@ impl OldStoreRecords {
         address.map_err(|error| format!("convoy `{name}`: {error}"))
     }
 
+    /// A crew session's seat, the address its convoy role's messages are received at (the crew's
+    /// receiver spelling, under the convoy's project or else the namespace): a capability card is
+    /// about the session's seat.
+    fn seat(&self, session: &str) -> Result<Address, String> {
+        let terminal = self.terminals.get(session).ok_or_else(|| format!("session `{session}` was not read"))?;
+        let TerminalSessionSource::Agent { context, .. } = &terminal.spec.source else {
+            return Err(format!("session `{session}` is no crew session"));
+        };
+        let project = self.convoy_project(&context.convoy).unwrap_or_else(|| self.namespace.clone());
+        Address::project(&project)
+            .and_then(|project| project.child(AddressKind::Convoy, &context.convoy))
+            .and_then(|convoy| convoy.child(AddressKind::Role, &terminal.spec.role))
+            .map_err(|error| format!("session `{session}`'s seat: {error}"))
+    }
+
     fn repository(&self, name: &str) -> Result<Address, String> {
         let repository = self
             .repositories
@@ -1667,6 +1688,9 @@ impl ReferenceAddresses for OldStoreRecords {
     fn missing(&self, reference: &OldReference) -> Option<&'static str> {
         match reference {
             OldReference::ControlRecord { resource, .. } if matches!(resource.kind.as_str(), "Convoy" | "Project") => None,
+            OldReference::ControlRecord { resource, .. } if resource.kind == "TerminalSession" => {
+                (!self.terminals.contains_key(&resource.name)).then_some("a referenced session is gone")
+            }
             OldReference::ControlRecord { .. } => Some("it references a kind with no address"),
             OldReference::Artifact { resource, .. } => {
                 (!self.artifacts.contains_key(&resource.name)).then_some("a referenced artifact is gone")
@@ -1692,6 +1716,7 @@ impl ReferenceAddresses for OldStoreRecords {
             OldReference::ControlRecord { resource, .. } if resource.kind == "Project" => {
                 Address::project(&resource.name).map_err(|error| format!("project `{}`: {error}", resource.name))
             }
+            OldReference::ControlRecord { resource, .. } if resource.kind == "TerminalSession" => self.seat(&resource.name),
             OldReference::Artifact { resource, .. } => {
                 let artifact = self.artifacts.get(&resource.name).ok_or_else(|| format!("artifact `{}` was not read", resource.name))?;
                 artifact_address(&artifact.spec.convoy, &artifact.spec.producer, &artifact.spec.kind, &artifact.spec.subject)
@@ -1767,6 +1792,15 @@ impl ViewLookups for OldStoreRecords {
                 Some(match address.kind() {
                     AddressKind::Commit => OldReference::Commit { repository, revision: revision.to_owned() },
                     _ => OldReference::Ref { repository, name: address.name().to_owned(), revision: revision.to_owned() },
+                })
+            }
+            // A crew session's seat: the session holding it, the old spelling's subject. It goes
+            // when crew compares engine addresses (#3108 gate task).
+            AddressKind::Role if address.get(AddressKind::Convoy).is_some() => {
+                let session = self.terminals.keys().find(|session| self.seat(session).as_ref() == Ok(address))?;
+                Some(OldReference::ControlRecord {
+                    resource: reference("TerminalSession", session, namespace),
+                    revision: revision.to_owned(),
                 })
             }
             _ => None,

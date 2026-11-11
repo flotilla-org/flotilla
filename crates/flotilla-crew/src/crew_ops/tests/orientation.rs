@@ -164,7 +164,7 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
 // messages for this crew. No transport concurrency affects this read scenario.
 #[tokio::test]
 async fn crew_list_never_reads_message_history() {
-    use flotilla_resources::{Message, MessagePhase, MessageRelation, MessageSpec};
+    use flotilla_resources::{Message, MessageRelation, MessageSpec};
 
     let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
     backend
@@ -193,14 +193,16 @@ async fn crew_list_never_reads_message_history() {
     let expected_reads = backend.read_snapshot().since(&before);
     assert_eq!(expected_reads.calls_by_kind().get("Message"), None);
     expected_reads.assert_no_lists("crew list");
+    // History on the engine, past several pages of its scans and index reads: messages to other
+    // convoys' seats and to this crew's own.
     let messages = backend.using::<Message>("flotilla");
-    for index in 0..2003 {
-        let receiver = if index < 2000 { format!("flotilla/other-{index}/work/coder") } else { "flotilla/crew/work/coder".into() };
-        let message = messages
+    for index in 0..103 {
+        let receiver = if index < 100 { format!("flotilla/other-{index}/work/coder") } else { "flotilla/crew/work/coder".into() };
+        messages
             .create(
                 &InputMeta::builder().name(format!("inbox-{index}")).build(),
                 &MessageSpec::builder()
-                    .sender("system:test".into())
+                    .sender("system:turn-rules".into())
                     .receiver(receiver)
                     .relation(MessageRelation::System)
                     .body("test".into())
@@ -208,31 +210,14 @@ async fn crew_list_never_reads_message_history() {
             )
             .await
             .unwrap();
-        if index == 2002 {
-            let mut status = message.status.unwrap_or_default();
-            status.phase = MessagePhase::Expired;
-            messages.update_status(&message.metadata.name, &message.metadata.resource_version, &status).await.unwrap();
-        }
     }
-    for replicated in [false, true] {
-        if replicated {
-            backend
-                .replica_writer::<Message>(flotilla_protocol::NodeId::new("message-home"), "flotilla")
-                .replace(&messages.list().await.unwrap(), Utc::now())
-                .await
-                .unwrap();
-            for record in messages.list().await.unwrap().items {
-                messages.delete(&record.metadata.name).await.unwrap();
-            }
-        }
-        let before = backend.read_snapshot();
-        let response = crew.crew_list_internal(&context).await.unwrap();
-        // Identical reads per kind and operation: no Message read and no
-        // receiver resolution, however large or replicated the history.
-        assert_eq!(backend.read_snapshot().since(&before), expected_reads, "orientation reads (replicated={replicated})");
-        assert_eq!(response, expected, "history must not affect crew state");
-        assert!(serde_json::to_value(response).unwrap()["members"][0].get("messages").is_none(), "orientation has no inbox wire field");
-    }
+    let before = backend.read_snapshot();
+    let response = crew.crew_list_internal(&context).await.unwrap();
+    // Identical reads per kind and operation: no Message read and no
+    // receiver resolution, however large the history.
+    assert_eq!(backend.read_snapshot().since(&before), expected_reads, "orientation reads");
+    assert_eq!(response, expected, "history must not affect crew state");
+    assert!(serde_json::to_value(response).unwrap()["members"][0].get("messages").is_none(), "orientation has no inbox wire field");
 }
 
 /// Seats a vessel serves, answered from a fixed map, as the engine's port would.

@@ -98,6 +98,7 @@ flotilla-drydock = { path = "../flotilla-drydock" }
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-engine-messages-testkit = { path = "../flotilla-engine-messages-testkit" }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 drydock-agent.workspace = true
 drydock-transport.workspace = true
