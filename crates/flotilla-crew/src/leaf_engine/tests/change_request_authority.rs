@@ -9,6 +9,7 @@ use super::*;
 #[tokio::test]
 async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request() {
     let authority = ResourceBackend::new(InMemoryBackend::default());
+    let home = EngineHome::install(&authority, "flotilla", "authority-root");
     let remote = ResourceBackend::new(InMemoryBackend::default());
     let repo_ref = RepositoryKey("repo".to_string());
     let spec = ConvoySpec::builder()
@@ -22,48 +23,23 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
             .workspace_slug("flotilla".to_string())
             .subpaths(Vec::new())
             .build()])
+        // An engine view names no placed checkout (its works carry no placement), so the
+        // launch's checkout is the one it adopted (#3108).
+        .adopted_checkout_refs(BTreeMap::from([(repo_ref.clone(), "remote-checkout".to_string())]))
         .build();
-    let mut meta =
-        InputMeta::builder().name("cross-host".to_string()).finalizers(vec!["flotilla.work/convoy-teardown".to_string()]).build();
-    meta.set_lifecycle_authority(LifecycleAuthority::Managed);
     let convoys = authority.clone().using::<Convoy>("flotilla");
-    let created = convoys.create(&meta, &spec).await.expect("create authority convoy");
-    let work = WorkState::builder()
-        .phase(WorkPhase::Complete)
-        .placement(PlacementStatus {
-            fields: BTreeMap::from([(
-                "checkout_refs".to_string(),
-                serde_json::json!(BTreeMap::from([(repo_ref.clone(), "remote-checkout".to_string())])),
-            )]),
-        })
-        .build();
-    convoys
-        .update_status(
-            "cross-host",
-            &created.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: Some(ExitDeclaration::standard_table()),
-                    turn_delivery: Default::default(),
-                    vessels: Vec::new(),
-                }),
-                observed_workflow_ref: Some("workflow".to_string()),
-                work: BTreeMap::from([("work".to_string(), work)]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark authority convoy Landing");
+    // The coder's work is done: it kept the ledger it owed, and the launch is landing.
+    let mut status = ledger_owed();
+    status.workflow_snapshot.as_mut().expect("workflow").exit = Some(ExitDeclaration::standard_table());
+    let launch = home.admit("cross-host", spec, status).await;
+    let launch = launch.as_str();
+    home.vessel(launch, "work", "env");
+    home.keep(&authority, launch, "work", "coder").await;
+    assert_eq!(home.view(&authority, launch).await.status.expect("status").phase, ConvoyPhase::Landing);
 
-    // The remote host's checkout, which the engine holds for the convoy at that host, inspected
-    // there: not landed, its branch associated with change request 1364 (#3108).
-    let remote_checkouts = flotilla_provisioning_testkit::CheckoutFixture::at("remote-root");
-    remote_checkouts.admit_for(&authority, "flotilla", "cross-host", "cross-host").await;
-    let launch = remote_checkouts.put_ready(
+    // The remote host's checkout, which the engine holds for the launch, inspected there: not
+    // landed, its branch associated with change request 1364 (#3108).
+    let checkout = home.engine.checkouts.put_ready(
         "remote-checkout",
         &CheckoutSpec::Observed(ObservedCheckoutSpec {
             r#ref: "feature/reconciler-wake".to_string(),
@@ -72,12 +48,11 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
             host_ref: "remote".to_string(),
             is_main: false,
         }),
-        Some(&remote_checkouts.holder("cross-host")),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(launch.to_owned())),
     );
     let inspection =
         flotilla_resources::checkout_records::Inspection { landed: Some(false), change_request: Some(1364), ..Default::default() };
-    use flotilla_resources::checkout_records::CheckoutRecords as _;
-    remote_checkouts.checkouts.inspected(&launch, inspection).expect("record remote checkout CR evidence");
+    home.engine.checkouts.checkouts.inspected(&checkout, inspection).expect("record remote checkout CR evidence");
 
     let remote_records = remote.using::<ChangeRequest>("flotilla");
     let record_name = cr_name("github.com", "flotilla-org/flotilla", 1364);
@@ -138,14 +113,14 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
         Arc::new(UnavailableChangeRequests),
         cadence,
     );
-    let table =
-        served_table(authority.clone(), broadcast_test_sink(event_tx), refresher).with_lifecycle_reads(remote_checkouts.reads.clone());
+    let table = engine_table(authority.clone(), &home, broadcast_test_sink(event_tx), refresher);
     let controller = tokio::spawn(
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: vec![table.reconciler_wake_watch()],
             reconciler: ConvoyReconciler::new()
-                .with_lifecycle_reads(remote_checkouts.reads.clone())
+                .with_lifecycle_reads(home.reads())
+                .with_engine(home.path())
                 .with_change_requests(authority.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
             backend: authority.clone(),
         }
@@ -154,7 +129,7 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
     // The checkout's inspection names the open change request: the convoy produces it.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let status = convoys.get("cross-host").await.expect("convoy").status.expect("status");
+            let status = convoys.get(launch).await.expect("convoy").status.expect("status");
             if status.produces_any(|subject| subject.id == "1364") {
                 break;
             }
@@ -166,7 +141,7 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
     publish(flotilla_resources::ObservedChangeRequestState::Merged).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if convoys.get("cross-host").await.expect("convoy").status.expect("status").phase == ConvoyPhase::Landed {
+            if convoys.get(launch).await.expect("convoy").status.expect("status").phase == ConvoyPhase::Landed {
                 break;
             }
             tokio::task::yield_now().await;
