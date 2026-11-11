@@ -348,9 +348,6 @@ impl<T: Resource> ViewState<T> {
         if query.message.is_some() {
             return Err(ResourceError::invalid("view queries support labels, declared fields and owners"));
         }
-        if query.replica_shadowing.is_some() {
-            return Err(ResourceError::invalid("view owns its replica shadowing scope"));
-        }
         let resolved = self.resolve_query(query)?;
         let query = &resolved;
         let (objects, index) = self.definitions.as_ref().map(|(objects, index)| (objects, index)).unwrap_or((&self.objects, &self.index));
@@ -359,9 +356,6 @@ impl<T: Resource> ViewState<T> {
             .into_iter()
             .filter_map(|key| objects.get(&key))
             .filter(|item| {
-                if query.replicas_only && matches!(item.provenance, ResourceProvenance::Local) {
-                    return false;
-                }
                 if !query.include_replicas && !matches!(item.provenance, ResourceProvenance::Local) {
                     return false;
                 }

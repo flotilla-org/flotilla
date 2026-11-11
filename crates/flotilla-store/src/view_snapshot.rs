@@ -141,7 +141,7 @@ impl Store for ViewSnapshot {
     }
     async fn query_raw(&self, kind: ResourceKind, namespace: &str, query: &crate::StoreQuery) -> Result<crate::QueryResult, ResourceError> {
         query.validate(kind)?;
-        if query.message.is_some() || query.replica_shadowing.is_some() {
+        if query.message.is_some() {
             return Err(ResourceError::invalid("snapshot queries support labels, declared fields and owners"));
         }
         let resolved = crate::resolve_semijoins(self, kind, namespace, query).await?;
@@ -157,13 +157,7 @@ impl Store for ViewSnapshot {
             .into_iter()
             .map(|identity| partition.items[&identity].as_ref().clone())
             .filter(|item| !query.suppress_self_origin || !self.shadowed(item, partition))
-            .filter(|item| {
-                if query.replicas_only {
-                    matches!(item.provenance, ResourceProvenance::Replica { .. })
-                } else {
-                    query.include_replicas || matches!(item.provenance, ResourceProvenance::Local)
-                }
-            })
+            .filter(|item| query.include_replicas || matches!(item.provenance, ResourceProvenance::Local))
             .collect();
         self.observe(kind, query.read_operation(), items.len());
         crate::sort_query_items(&mut items);
@@ -201,7 +195,6 @@ impl Store for ViewSnapshot {
                 let item = &partition.items[identity];
                 (!query.suppress_self_origin || !self.shadowed(item, partition))
                     && (query.include_replicas || matches!(item.provenance, ResourceProvenance::Local))
-                    && (!query.replicas_only || matches!(item.provenance, ResourceProvenance::Replica { .. }))
             })
             .collect();
         Ok(partition.index.values(field, &names))
