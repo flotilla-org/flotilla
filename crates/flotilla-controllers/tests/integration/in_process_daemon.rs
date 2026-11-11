@@ -10001,14 +10001,17 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
     // The engine's readings, which a running daemon always has.
     let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
-    backend
-        .using::<ResourceConvoy>("document-namespace")
-        .create(
-            &InputMeta::builder().name("namespace-convoy".into()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).build(),
-        )
-        .await
-        .expect("receiver declaration");
+    // The receiver's convoy, a launch in the document's namespace.
+    let convoy = flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy(
+            "document-namespace",
+            "namespace-convoy",
+            flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        ),
+    )
+    .await;
     let mut events = daemon.subscribe();
     let id = daemon
         .execute(
@@ -10017,7 +10020,7 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
                     namespace: "request-default".into(),
                     document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message",
             "metadata":{"name":"namespace-message","namespace":"document-namespace"},
-            "spec":{"sender":"system:test","receiver":"document-namespace/namespace-convoy/work/coder","relation":"system","body":"test"}}),
+            "spec":{"sender":"system:test","receiver":format!("document-namespace/{convoy}/work/coder"),"relation":"system","body":"test"}}),
                 })
                 .build(),
         )
