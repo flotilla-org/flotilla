@@ -50,16 +50,18 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
         provider.add_issues(vec![(reference.id.clone(), issue)]).await;
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_issue_tracker(provider));
         let config = test_config_store(tempfile::tempdir().unwrap().keep());
-        hosts.push(
-            InProcessDaemon::new(
-                vec![],
-                config,
-                discovery,
-                HostName::new(name),
-                Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-            )
-            .await,
-        );
+        let daemon = InProcessDaemon::new(
+            vec![],
+            config,
+            discovery,
+            HostName::new(name),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        // Composed with its engine, as the runtime composes a daemon: its convoys are the engine's
+        // launches, read through its views (#3108).
+        engine(&daemon);
+        hosts.push(daemon);
     }
     let home = Arc::clone(&hosts[0]);
     seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
