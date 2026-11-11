@@ -80,6 +80,8 @@ STATE_MACHINE_DEPENDENTS = frozenset({
     "flotilla-provisioning",
     # Dev-only reader contracts drive the real provisioning engine.
     "flotilla-provisioning-testkit",
+    # Dev-only: the ensure scenarios run this home's vessels as the daemon runs them.
+    "flotilla-orchestration-testkit",
 })
 # #3317: the Message switch composes the engine inbox; only these use it directly.
 INBOX_DEPENDENTS = frozenset({"flotilla-daemon", "flotilla-engine-messages"})
