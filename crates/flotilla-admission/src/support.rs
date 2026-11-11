@@ -41,8 +41,10 @@ pub fn parse_project_yaml(yaml: &str) -> Result<ProjectSpec, String> {
     serde_yml::from_str(yaml).map_err(|err| format!("invalid project YAML: {err}"))
 }
 
+/// The checkout launch `convoy_name` adopts: named for the launch's slug, since a checkout's own
+/// name may not carry a launch number.
 pub fn adopted_checkout_name(convoy_name: &str) -> String {
-    format!("adopted-checkout-{convoy_name}")
+    format!("adopted-checkout-{}", flotilla_resources::convoy::engine::launch_slug(convoy_name))
 }
 
 #[derive(bon::Builder)]

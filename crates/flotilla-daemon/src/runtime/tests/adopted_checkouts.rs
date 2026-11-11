@@ -110,17 +110,8 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let adopted_record = convoy_record_name(&backend, "convoy-adopted").await;
-    wait_until(|| {
-        let convoys = convoys.clone();
-        let adopted_record = adopted_record.clone();
-        async move {
-            matches!(
-                convoys.get(&adopted_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
-                Some(status)
-                    if status.phase == ConvoyPhase::Active
-                        && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
-            )
-        }
+    wait_for_convoy(&convoys, &adopted_record, "running", |status| {
+        status.phase == ConvoyPhase::Active && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
     })
     .await;
 
@@ -139,17 +130,8 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         .expect("convoy completion command should start");
     assert_eq!(wait_for_command_result(&mut rx, complete_id).await, CommandValue::Ok);
 
-    wait_until(|| {
-        let convoys = convoys.clone();
-        let adopted_record = adopted_record.clone();
-        async move {
-            matches!(
-                convoys.get(&adopted_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
-                Some(status)
-                    if status.phase == ConvoyPhase::Landed
-                        && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
-            )
-        }
+    wait_for_convoy(&convoys, &adopted_record, "landed", |status| {
+        status.phase == ConvoyPhase::Landed && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
     })
     .await;
 
