@@ -7,7 +7,7 @@ use super::{ConvoyEnd, ConvoyJoins, ConvoyNotes, ConvoyRecord, CrewNotes, SeatRe
 use crate::{
     convoy::{
         admission::AdmissionDocument,
-        promises::{Promise, PromiseKind, PromiseSource, PromiseState},
+        promises::{Promise, PromiseKind, PromiseSource, PromiseState, Submission, SubmissionVerdict},
         view::VesselReading,
         ConvoyAttention, ConvoyPhase, CrewWorkPhase, WorkPhase, WorkflowSnapshot,
     },
@@ -204,4 +204,49 @@ fn a_launch_reads_its_verdicts_and_how_it_ended() {
     assert_eq!((status.phase, status.disposition.as_deref(), status.finished_at), (ConvoyPhase::Landed, Some("landed"), Some(at(300))));
     assert_eq!(status.work["work"].phase, WorkPhase::Complete);
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
+}
+
+fn submitted(reference: &str, kept_at: Option<DateTime<Utc>>) -> Submission {
+    Submission {
+        reference: reference.into(),
+        metadata: BTreeMap::new(),
+        submitted_at: at(140),
+        verdict: kept_at.map(|at| SubmissionVerdict { accepted: true, who: "engine".into(), at, why: "kept".into() }),
+    }
+}
+
+// Behaviour (#3108 Q5): a seat's claim is derived from its promises. Once all are settled, the
+// seat reads finished when the last was kept, with the decision ledger it submitted; while one
+// is still unsettled it has no claim.
+#[test]
+fn a_seat_claims_when_its_last_promise_is_kept() {
+    let mut record = record(PromiseState::Kept);
+    let promises = record.promises.get_mut("work").and_then(|roles| roles.get_mut("coder")).expect("coder's promises");
+    promises[0].submissions = vec![submitted("https://github.com/o/r/pull/1", Some(at(150)))];
+    let mut ledger = promise("coder", PromiseState::Submitted);
+    ledger.id = "template/decision-ledger".into();
+    ledger.kind = PromiseKind::DecisionLedger;
+    ledger.submissions = vec![submitted("decision-ledger-fix-it-7", None)];
+    promises.push(ledger);
+    let kept_at = |at| {
+        BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), SeatRecord { kept_at: Some(at), ..SeatRecord::default() })]))])
+    };
+    record.seats = kept_at(at(150));
+    let none = BTreeSet::new();
+
+    let status = record.read_view("flotilla", ConvoyJoins { works: &ready(), working: &none, notes: None }).status.expect("status");
+    let coder = &status.crew_work["work"]["coder"];
+    assert_ne!(coder.phase, CrewWorkPhase::Done);
+    assert_eq!((coder.finished_at, coder.decision_ledger_ref.as_deref()), (None, None), "no claim while the ledger is unsettled");
+
+    let ledger = &mut record.promises.get_mut("work").and_then(|roles| roles.get_mut("coder")).expect("coder's promises")[1];
+    ledger.state = PromiseState::Kept;
+    ledger.submissions = vec![submitted("decision-ledger-fix-it-7", Some(at(170)))];
+    record.seats = kept_at(at(170));
+    let status = record.read_view("flotilla", ConvoyJoins { works: &ready(), working: &none, notes: None }).status.expect("status");
+    let coder = &status.crew_work["work"]["coder"];
+    assert_eq!(coder.phase, CrewWorkPhase::Done);
+    assert_eq!(coder.finished_at, Some(at(170)), "claimed when the last promise was kept");
+    assert_eq!(coder.decision_ledger_ref.as_deref(), Some("decision-ledger-fix-it-7"));
+    assert_eq!(status.phase, ConvoyPhase::Landing);
 }

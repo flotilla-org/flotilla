@@ -49,6 +49,8 @@ pub struct SeatRecord {
     pub handed_back: bool,
     /// An open AwaitingReply is raised about it.
     pub stalled: bool,
+    /// When the last of the promises it owns was kept; none while none is.
+    pub kept_at: Option<DateTime<Utc>>,
 }
 
 /// One launch of a convoy, as its home's engine holds it, in the old shapes its readers take.
@@ -272,6 +274,21 @@ impl ConvoyRecord {
         readings
     }
 
+    /// The claim seat `(work, role)` made by settling its promises: when the last of them was
+    /// kept, and the decision ledger it submitted. None while any is unsettled or none was kept.
+    fn claim(&self, work: &str, role: &str) -> Option<(DateTime<Utc>, Option<String>)> {
+        let owned = self.promises.get(work)?.get(role)?;
+        if owned.iter().any(|promise| !promise.state.terminal()) {
+            return None;
+        }
+        let at = self.seats.get(work)?.get(role)?.kept_at?;
+        let ledger = owned
+            .iter()
+            .filter(|promise| promise.state == promises::PromiseState::Kept && promise.kind == promises::PromiseKind::DecisionLedger)
+            .find_map(|promise| promise.submissions.last().map(|submission| submission.reference.clone()));
+        Some((at, ledger))
+    }
+
     /// The launch as an old Convoy object in `namespace`, its phases derived from `joins`.
     pub fn read_view(&self, namespace: &str, joins: ConvoyJoins<'_>) -> ResourceObject<Convoy> {
         let snapshot = &self.admission.workflow_snapshot;
@@ -311,6 +328,8 @@ impl ConvoyRecord {
                     .map(|(role, phase)| {
                         let noted = notes.crew.get(work).and_then(|roles| roles.get(role)).cloned().unwrap_or_default();
                         let failed = self.seats.get(work).and_then(|seats| seats.get(role)).and_then(|seat| seat.failed.clone());
+                        // A Done seat's claim is its settled promises; nothing of it is stored.
+                        let (claimed_at, decision_ledger_ref) = self.claim(work, role).filter(|_| *phase == CrewWorkPhase::Done).unzip();
                         let state = CrewWorkState::builder()
                             .task_assigned(noted.task_assigned)
                             .maybe_pending_follow_up(noted.pending_follow_up)
@@ -322,6 +341,8 @@ impl ConvoyRecord {
                             })
                             .maybe_resumed_at(noted.resumed_at)
                             .maybe_resume_brief_id(noted.resume_brief_id)
+                            .maybe_finished_at(claimed_at)
+                            .maybe_decision_ledger_ref(decision_ledger_ref.flatten())
                             .maybe_message(failed)
                             .build();
                         (role.clone(), state)

@@ -176,7 +176,10 @@ fn a_launch_reads_its_seats_links_stalls_and_end() {
         .expect("abandoned");
 
     let record = records.get(&launch, None).expect("read").expect("held");
-    assert_eq!(record.seats["work"]["coder"], SeatRecord { failed: Some("it looped".into()), handed_back: false, stalled: true });
+    assert_eq!(
+        record.seats["work"]["coder"],
+        SeatRecord { failed: Some("it looped".into()), handed_back: false, stalled: true, kept_at: None }
+    );
     assert_eq!(record.subjects.len(), 1);
     let linked = &record.subjects[0];
     assert_eq!(linked.subject, subject_for(&change).expect("subject"));
