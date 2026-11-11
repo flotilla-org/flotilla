@@ -7,7 +7,7 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_provisioning_testkit::{EngineFixture, EnvironmentFixture};
 use flotilla_resources::{
     terminal_records::{TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource},
-    TerminalSessionSource, TerminalSessionSpec,
+    Convoy, ResourceObject, TerminalSessionSource, TerminalSessionSpec,
 };
 use flotilla_schema_sqlite::stream::Service;
 
@@ -112,4 +112,11 @@ impl std::ops::Deref for Environments {
     fn deref(&self) -> &EnvironmentFixture {
         &self.0.environments
     }
+}
+
+/// Admits `convoy` at `daemon`'s engine as the next launch of what it is a launch of, the way
+/// admission does, and returns the launch.
+pub async fn admit_convoy(daemon: &InProcessDaemon, convoy: ResourceObject<Convoy>) -> String {
+    engine(daemon);
+    flotilla_engine_convoys_testkit::launch(&daemon.convoy_engine_path(), convoy).await
 }

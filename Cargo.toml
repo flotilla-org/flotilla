@@ -70,6 +70,7 @@ members = [
     "crates/flotilla-inbox",
     "crates/flotilla-engine-store",
     "crates/flotilla-engine-convoys",
+    "crates/flotilla-engine-convoys-testkit",
     "crates/flotilla-engine-messages",
     "crates/flotilla-engine-messages-testkit",
     "crates/flotilla-inbox-testkit",

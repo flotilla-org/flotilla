@@ -1572,6 +1572,7 @@ dependencies = [
  "flotilla-discovery",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
+ "flotilla-engine-convoys-testkit",
  "flotilla-engine-messages-testkit",
  "flotilla-environment",
  "flotilla-issue-tracker",
@@ -2190,6 +2191,7 @@ dependencies = [
  "flotilla-discovery",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
+ "flotilla-engine-convoys-testkit",
  "flotilla-engine-messages-testkit",
  "flotilla-environment",
  "flotilla-issue-tracker",
@@ -2260,6 +2262,7 @@ dependencies = [
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-engine-convoys",
+ "flotilla-engine-convoys-testkit",
  "flotilla-engine-messages",
  "flotilla-engine-messages-testkit",
  "flotilla-engine-store",
@@ -2411,6 +2414,7 @@ dependencies = [
  "flotilla-config",
  "flotilla-daemon-api",
  "flotilla-discovery-api",
+ "flotilla-engine-convoys-testkit",
  "flotilla-engine-messages-testkit",
  "flotilla-environment",
  "flotilla-forge-github",
@@ -2499,6 +2503,7 @@ dependencies = [
  "flotilla-drydock",
  "flotilla-dummy-fleet",
  "flotilla-engine-convoys",
+ "flotilla-engine-convoys-testkit",
  "flotilla-engine-messages",
  "flotilla-engine-messages-testkit",
  "flotilla-engine-store",
@@ -2612,6 +2617,7 @@ dependencies = [
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-dummy-fleet",
+ "flotilla-engine-convoys-testkit",
  "flotilla-forgejo-providers",
  "flotilla-github-providers",
  "flotilla-protocol",
@@ -2829,6 +2835,21 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "flotilla-engine-convoys-testkit"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flotilla-engine-convoys",
+ "flotilla-engine-store",
+ "flotilla-protocol",
+ "flotilla-resources",
+ "flotilla-schema-sqlite",
+ "flotilla-store",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -77,6 +77,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-engine-convoys-testkit = { path = "../flotilla-engine-convoys-testkit" }
 flotilla-engine-messages-testkit = { path = "../flotilla-engine-messages-testkit" }
 flotilla-inbox = { path = "../flotilla-inbox" }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
