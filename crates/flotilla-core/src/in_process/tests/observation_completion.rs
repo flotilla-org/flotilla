@@ -1,5 +1,4 @@
 use flotilla_store_memory::InMemoryBackend;
-use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,11 +12,8 @@ use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::{CrewCommandContext, HostName};
 use flotilla_resources::{
-    BoundChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
-    CrewWorkState, InputMeta, Repository, RepositorySpec, Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselRequirement,
-    VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    BoundChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, CrewWorkPhase, Repository,
+    RepositorySpec, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, VesselRequirement,
 };
 use flotilla_store::ResourceBackend;
 

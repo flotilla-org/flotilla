@@ -1,15 +1,13 @@
 use flotilla_resources::ResumeIntent;
 use flotilla_store_memory::InMemoryBackend;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{CrewCommandContext, DaemonEvent, HostName, NodeId};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase,
+    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
 };
 use flotilla_store::ResourceBackend;
 
@@ -102,9 +100,10 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     let status = wait_for_stall(&backend, &idle_crew, true).await;
     let stalled = status.stalled.expect("stalled");
     assert!(matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { ref role, .. }) if role == "coder"));
-    // The projectless fixture keeps its idle evidence and explains why the
-    // default ProjectCrew rung cannot supply a supervisor (#2522).
-    assert_eq!(stalled.evidence, "idle; cannot find governor: convoy has no project_ref");
+    // The idle evidence explains why the default ProjectCrew rung cannot supply a supervisor
+    // (#2522). A launch's project is its project_ref or, without one, its namespace, so the
+    // fixture's convoy is the namespace project's, which has no governor.
+    assert_eq!(stalled.evidence, "idle; no live governor for project flotilla (no matching convoy in replica view)");
     assert_eq!(stalled.source, flotilla_resources::StallEvidenceSource::Screen);
     let mut events = daemon.subscribe();
     let subscription = daemon
@@ -531,7 +530,9 @@ async fn promise_retractions_stall_unless_crew_sourced() {
         assert!(stalled.evidence.contains("retraction-proposed"));
         assert!(stalled.evidence.contains(id));
         assert!(stalled.evidence.contains("not achievable"));
-        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+        // The proposal is the home's stall judgement, made by the coder; the seat reads Stalled
+        // once its supervision opens a stall record about it.
+        assert_eq!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { vessel: "work".into(), role: "coder".into() }));
     }
     let status = convoys.get(&promise_crew).await.unwrap().status.unwrap();
     assert_eq!(status.promises["work"]["coder"][2].state, PromiseState::Retracted);

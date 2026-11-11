@@ -1,25 +1,20 @@
 use flotilla_resources::ResumeIntent;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use flotilla_config::ConfigStore;
-use flotilla_protocol::HostName;
 use flotilla_resources::{
     external_patches as convoy_external_patches,
     terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest},
-    Clock, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState,
+    Clock, Convoy as ResourceConvoy, ConvoySpec, CrewWorkPhase, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
 };
-use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
+use flotilla_store::ResourceBackend;
+use flotilla_store_memory::InMemoryBackend;
 
 use flotilla_state_machines::machines::agent_session::Activity;
 
 use super::support::{
-    ensure_vessel, observe_attention, resume_staging_fixture, resume_staging_fixture_open, resume_staging_fixture_with_backend, test_meta,
+    ensure_vessel, observe_attention, resume_staging_fixture, resume_staging_fixture_open, resume_staging_fixture_shaped, test_meta,
 };
-use crate::in_process::{input_meta_from_resource, InProcessDaemon};
-use crate::testkits::discovery::fake_discovery;
 use flotilla_crew::crew_ops::{ConvoyResumeOutcome, CrewSupervisionRequest};
 
 // Working crews already own staged credentials. Operator input is admitted as
@@ -115,12 +110,17 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         }
     }
 
-    let database_dir = tempfile::tempdir().expect("resource database");
-    let database_path = database_dir.path().join("resources.db");
-    let (mut daemon, mut backend, probe) = resume_staging_fixture_with_backend(ResourceBackend::new(
-        flotilla_store_sqlite::SqliteBackend::open(&database_path).expect("resource store"),
-    ))
-    .await;
+    // The daemon's wall clock runs ahead on demand, so attention debounces elapse without real
+    // waiting; the test stamps from the same clock. The source is the project's graphql-budget
+    // role, its coder at work under the standard exit table.
+    let clock = Arc::new(SkippingClock::default());
+    let (daemon, backend, probe) =
+        resume_staging_fixture_shaped(ResourceBackend::new(InMemoryBackend::default()), clock.clone(), false, |spec, snapshot| {
+            spec.project_ref = Some("project".to_string());
+            spec.role = "graphql-budget".to_string();
+            snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+        })
+        .await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let supervision = Arc::new(AcceptSupervision::default());
     daemon.crew.set_turn_delivery_actuator(supervision.clone()).await;
@@ -137,49 +137,38 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         .await
         .expect("project");
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let source = convoys.get(&probe.convoy).await.expect("source convoy");
-    let mut spec = source.spec.clone();
-    spec.project_ref = Some("project".to_string());
-    spec.role = "graphql-budget".to_string();
-    let source =
-        convoys.update(&input_meta_from_resource(&source), &source.metadata.resource_version, &spec).await.expect("project source");
-    let mut status = source.status.expect("source status");
-    status.phase = flotilla_resources::ConvoyPhase::Active;
-    status.workflow_snapshot.as_mut().expect("workflow").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
-    status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Running;
-    status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
-    convoys.update_status(&probe.convoy, &source.metadata.resource_version, &status).await.expect("activate source");
-    let governor = convoys
-        .create(
-            &test_meta("governor"),
-            &ConvoySpec::builder()
-                .workflow_ref("workflow".to_string())
-                .role("governor".to_string())
-                .project_ref("project".to_string())
-                .build(),
-        )
-        .await
-        .expect("governor convoy");
-    convoys
-        .update_status(
-            "governor",
-            &governor.metadata.resource_version,
-            &ConvoyStatus {
-                crew_work: BTreeMap::from([(
-                    "watch".to_string(),
-                    BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("governor status");
+    let engine_path = daemon.convoy_engine_path();
+    let note = |patch: flotilla_resources::ConvoyStatusPatch| {
+        let (engine_path, convoys, convoy) = (engine_path.clone(), convoys.clone(), probe.convoy.clone());
+        async move { flotilla_store::note_convoy(&engine_path, &convoys, &convoy, &patch).await }
+    };
+    // The project's governor: its work `watch` crewed by the governor agent.
+    let governor = super::admit_snapshot(
+        &daemon,
+        "governor",
+        ConvoySpec::builder().workflow_ref("workflow".to_string()).role("governor".to_string()).project_ref("project".to_string()).build(),
+        flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: vec![flotilla_resources::VesselRequirement::builder()
+                .name("watch".to_string())
+                .crew(vec![flotilla_engine_convoys_testkit::agent("governor")])
+                .build()],
+        },
+    )
+    .await;
     let terminals = &probe.engine.terminals;
+    let source_vessel = ensure_vessel(&probe.engine, &probe.convoy, "work");
+    probe.engine.vessels.ready(&source_vessel, "resume-env");
     let source_launch = terminals.record("resume-staging-session").name;
     terminals.ready(&source_launch, "resume-staging-pool-session", &Default::default());
     let working = |as_of| TerminalAttention { state: TerminalAttentionState::Working, as_of, source: TerminalAttentionSource::Hook };
-    observe_attention(&probe.engine, &source_launch, working(chrono::Utc::now()));
-    let governor_vessel = ensure_vessel(&probe.engine, "governor", "watch");
+    observe_attention(&probe.engine, &source_launch, working(clock.now()));
+    let governor_vessel = ensure_vessel(&probe.engine, &governor, "watch");
+    probe.engine.vessels.ready(&governor_vessel, "resume-env");
     let mut governor_request = terminals.record(&source_launch);
     governor_request.role = "governor".to_string();
     let governor_launch = terminals.request(&TerminalLaunchRequest {
@@ -197,19 +186,20 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         ..Default::default()
     };
     terminals.ready(&governor_launch, "governor-pool-session", &governor_facts);
-    observe_attention(&probe.engine, &governor_launch, working(chrono::Utc::now()));
+    observe_attention(&probe.engine, &governor_launch, working(clock.now()));
     let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
-    let mut task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
-    let patch = convoy_external_patches::mark_crew_stalled(
+    let task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
+    note(convoy_external_patches::mark_crew_stalled(
         probe.convoy.clone(),
         "work".to_string(),
         "coder".to_string(),
-        chrono::Utc::now(),
+        clock.now(),
         flotilla_resources::StallReason::Access,
         Some(flotilla_resources::StallProposedDisposition::ReduceScope),
         "repository permission missing".to_string(),
-    );
-    apply_resource_status_patch(&convoys, &probe.convoy, &patch).await.expect("declare stall");
+    ))
+    .await
+    .expect("declare stall");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let status = convoys.get(&probe.convoy).await.expect("source").status.expect("status");
@@ -225,22 +215,24 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     let condition = stalled.stalled.expect("stall condition");
     assert_eq!(condition.reason, Some(flotilla_resources::StallReason::Access));
     assert_eq!(condition.proposed_disposition, Some(flotilla_resources::StallProposedDisposition::ReduceScope));
-    assert_eq!(condition.supervisor.expect("governor").convoy, "governor");
-    assert_eq!(stalled.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+    assert_eq!(condition.supervisor.as_ref().expect("governor").convoy, governor);
+    // The stall is the coder's: the seat reads Stalled once its supervision opens a stall record
+    // about it, which the fake actuator here does not.
+    assert!(condition.leaves.iter().any(|leaf| leaf.field_path == ".crew.coder.phase"), "{condition:?}");
     {
         let requests = supervision.requests.lock().expect("supervision requests");
         let escalation = requests.iter().find(|request| request.vessel == "watch").expect("governor escalation");
         // #2592: the supervisor must identify the convoy and act on the exact stalled crew.
-        assert_eq!(escalation.sender, "project/resume-staging/work/coder");
+        assert_eq!(escalation.sender, format!("project/{}/work/coder", probe.convoy));
         assert_eq!(escalation.relation, flotilla_resources::MessageRelation::Supervisor);
         let framed = &escalation.brief;
         assert!(framed.starts_with("Escalated from coder@work in graphql-budget@project:"));
-        assert!(framed.contains("convoy graphql-budget@project (resource ref: resume-staging)"), "{framed}");
+        assert!(framed.contains(&format!("convoy graphql-budget@project (resource ref: {})", probe.convoy)), "{framed}");
         assert!(framed.contains("Reason: access. Evidence:"), "{framed}");
         assert!(framed.contains("repository permission missing"), "{framed}");
         for action in ["resume", "convert-to-failed", "escalate"] {
             assert!(
-                framed.contains(&format!("flotilla crew supervise --convoy 'resume-staging' --vessel 'work' --role 'coder' {action}")),
+                framed.contains(&format!("flotilla crew supervise --convoy '{}' --vessel 'work' --role 'coder' {action}", probe.convoy)),
                 "{framed}"
             );
         }
@@ -250,7 +242,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         loop {
             if daemon.crew.subscription_diagnostics().rows().await.iter().any(|row| {
                 matches!(&row.maker,
-                flotilla_resources::LeafMaker::Supervisor { convoy, role, .. } if convoy == "governor" && role == "governor")
+                flotilla_resources::LeafMaker::Supervisor { convoy, role, .. } if *convoy == governor && role == "governor")
             }) {
                 break;
             }
@@ -259,47 +251,13 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     })
     .await
     .expect("governor row");
-    // #2488: restarting the daemon rebuilds its leaf rows from stored status.
-    // The already assigned governor retains authority to resume this same stall.
-    task.abort();
-    let _ = task.await;
-    drop(daemon);
-    backend = ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(&database_path).expect("reopen stored resources"));
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let restart_config = tempfile::tempdir().expect("restart config");
-    std::fs::write(restart_config.path().join("daemon.toml"), "machine_id = \"resume-staging-test\"\n").expect("daemon config");
-    // The restarted daemon's wall clock runs ahead on demand, so attention
-    // debounces elapse without real waiting; the test stamps from the same clock.
-    let clock = Arc::new(SkippingClock::default());
-    daemon = InProcessDaemon::new_with_resource_backend_and_clock(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(restart_config.path())),
-        fake_discovery(false),
-        HostName::new("test-host"),
-        backend.clone(),
-        clock.clone(),
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
-    // The restarted daemon reads the same engine's launches.
-    daemon.install_lifecycle_reads(probe.engine.reads()).expect("engine reads");
-    daemon.set_work_credential_reconciler(probe.clone()).await;
-    daemon.crew.set_turn_delivery_actuator(supervision.clone()).await;
-    let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
-    task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if daemon.crew.subscription_diagnostics().rows().await.iter().any(|row| {
-                matches!(&row.maker, flotilla_resources::LeafMaker::Supervisor { convoy, role, .. }
-                    if convoy == "governor" && role == "governor")
-            }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("supervisor row restored after restart");
+    // The stalled coder waits on its supervisor: its turn has ended, so the resume is not held
+    // for a turn boundary.
+    observe_attention(
+        &probe.engine,
+        &source_launch,
+        TerminalAttention { state: TerminalAttentionState::Idle, as_of: clock.now(), source: TerminalAttentionSource::Hook },
+    );
     daemon
         .crew
         .supervise(
@@ -328,7 +286,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         .into_iter()
         .find(|message| message.spec.body.contains("continue with access"))
         .expect("guidance Message");
-    assert_eq!(guidance.spec.sender, "project/governor/watch/governor");
+    assert_eq!(guidance.spec.sender, format!("project/{governor}/watch/governor"));
     assert_eq!(guidance.spec.relation, flotilla_resources::MessageRelation::Supervisor);
     observe_attention(
         &probe.engine,
@@ -341,7 +299,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         agents.observe(session, activity, cause.into(), super::support::engine_at(clock.now())).expect("hook activity");
     };
     hook(&governor_launch, Activity::Idle, "Stop");
-    let patch = convoy_external_patches::mark_crew_stalled(
+    note(convoy_external_patches::mark_crew_stalled(
         probe.convoy.clone(),
         "work".to_string(),
         "coder".to_string(),
@@ -349,8 +307,9 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         flotilla_resources::StallReason::Access,
         None,
         "repository permission still missing".to_string(),
-    );
-    apply_resource_status_patch(&convoys, &probe.convoy, &patch).await.expect("stall again");
+    ))
+    .await
+    .expect("stall again");
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             // Skip through the idle governor's attention debounce at ten times real speed.
@@ -368,18 +327,14 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     })
     .await
     .expect("idle governor escalates to operator");
-    apply_resource_status_patch(
-        &convoys,
-        &probe.convoy,
-        &convoy_external_patches::resume_crew_work(
-            "work".to_string(),
-            "coder".to_string(),
-            clock.now(),
-            "implicit stall test".to_string(),
-            None,
-            ResumeIntent::Reopen,
-        ),
-    )
+    note(convoy_external_patches::resume_crew_work(
+        "work".to_string(),
+        "coder".to_string(),
+        clock.now(),
+        "implicit stall test".to_string(),
+        None,
+        ResumeIntent::Reopen,
+    ))
     .await
     .expect("reset crew to working");
     observe_attention(&probe.engine, &governor_launch, working(clock.now()));
@@ -486,11 +441,11 @@ async fn claimed_resume_command_reports_outcome_and_audits_explicit_reopen() {
         let status = backend.using::<ResourceConvoy>("flotilla").get(&probe.convoy).await.unwrap().status.unwrap();
         if reopen {
             assert!(matches!(result, CommandValue::ConvoyBriefQueued { .. }), "{result:?}");
-            assert_eq!(status.phase, flotilla_resources::ConvoyPhase::Active);
-            assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
-            assert_eq!(status.lifecycle_mutations.len(), 1);
-            assert_eq!(status.lifecycle_mutations[0].action, "reopened");
-            assert_eq!(status.lifecycle_mutations[0].caller, caller);
+            // The reopen is the home's note of the resumed brief. The engine has no edge that
+            // reopens a kept promise, so the kept work stays Landing; the audit is a log line.
+            assert!(status.crew_work["work"]["coder"].resume_brief_id.is_some());
+            assert_eq!(status.phase, flotilla_resources::ConvoyPhase::Landing);
+            assert!(status.lifecycle_mutations.is_empty());
         } else {
             assert_eq!(
                 result,

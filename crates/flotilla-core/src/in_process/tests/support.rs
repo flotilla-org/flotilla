@@ -19,8 +19,8 @@ use flotilla_discovery_api::UnmetRequirement;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
     terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords},
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, CrewWorkPhase, EnvironmentSpec as ResourceEnvironmentSpec,
-    FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost,
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, EnvironmentSpec as ResourceEnvironmentSpec, FulfilmentFacts,
+    FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost,
     HostDirectEnvironmentSpec, HostSpec, HostStatus, InputMeta, ResourceObject, TerminalAttention,
     TerminalSession as ResourceTerminalSession, VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL,
     PROJECT_LABEL, ROLE_LABEL,
@@ -39,6 +39,8 @@ use flotilla_provider_runtime::CommandRunner;
 
 pub(super) struct RecordingWorkCredentials {
     pub(super) backend: ResourceBackend,
+    /// The launch whose work the turn reopens.
+    pub(super) convoy: String,
     pub(super) delivered: tokio::sync::Mutex<BTreeSet<String>>,
     pub(super) fail_next: std::sync::atomic::AtomicBool,
 }
@@ -47,13 +49,11 @@ pub(super) struct RecordingWorkCredentials {
 impl WorkCredentialReconciler for RecordingWorkCredentials {
     async fn reconcile(&self, namespace: &str, environment_ref: &str) -> Result<(), String> {
         assert_eq!(environment_ref, "credential-env");
-        let convoy =
-            self.backend.clone().using::<ResourceConvoy>(namespace).get("turn-credential-work").await.map_err(|error| error.to_string())?;
+        let convoy = self.backend.clone().using::<ResourceConvoy>(namespace).get(&self.convoy).await.map_err(|error| error.to_string())?;
         let status = convoy.status.ok_or_else(|| "missing convoy status".to_string())?;
-        if status.phase != flotilla_resources::ConvoyPhase::Active
-            || status.work.get("work").is_none_or(|work| work.phase != flotilla_resources::WorkPhase::Running)
-            || status.crew_work.get("work").and_then(|crew| crew.get("coder")).is_none_or(|crew| crew.phase != CrewWorkPhase::Working)
-        {
+        // The turn's activation is its home's note of the resumed brief: the kept work's derived
+        // phases stay as its promises left them.
+        if status.crew_work.get("work").and_then(|crew| crew.get("coder")).is_none_or(|crew| crew.resume_brief_id.is_none()) {
             return Err("credentials reconciled before work reopened".to_string());
         }
         let refs = status
@@ -111,19 +111,27 @@ pub(super) async fn resume_staging_fixture_with_clock(
     backend: ResourceBackend,
     clock: Arc<dyn flotilla_resources::Clock>,
 ) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
-    resume_staging_fixture_shaped(backend, clock, true).await
+    resume_staging_fixture_shaped(backend, clock, true, |_, _| {}).await
 }
 
 /// [`resume_staging_fixture`] whose coder's work is still open: the convoy is Active.
 pub(super) async fn resume_staging_fixture_open() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
-    resume_staging_fixture_shaped(ResourceBackend::new(InMemoryBackend::default()), Arc::new(flotilla_resources::SystemClock), false).await
+    resume_staging_fixture_shaped(
+        ResourceBackend::new(InMemoryBackend::default()),
+        Arc::new(flotilla_resources::SystemClock),
+        false,
+        |_, _| {},
+    )
+    .await
 }
 
-/// The resume-staging convoy, its coder's work `complete` (Landing) or open (Active).
-async fn resume_staging_fixture_shaped(
+/// The resume-staging convoy, its coder's work `complete` (Landing) or open (Active), its spec and
+/// frozen workflow as `shape` leaves them.
+pub(super) async fn resume_staging_fixture_shaped(
     backend: ResourceBackend,
     clock: Arc<dyn flotilla_resources::Clock>,
     complete: bool,
+    shape: impl FnOnce(&mut ConvoySpec, &mut flotilla_resources::WorkflowSnapshot),
 ) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"resume-staging-test\"\n").expect("daemon config");
@@ -141,23 +149,17 @@ async fn resume_staging_fixture_shaped(
     // Its coder owes a decision ledger. When it is kept by an operator's verdict, the convoy is
     // Landing, its work Complete and its crew Done.
     let coder = claim_crew("coder");
-    let launch = admit(
-        &daemon,
-        "resume-staging",
-        ConvoySpec::builder().workflow_ref("implement-review".to_string()).role("resume-staging".to_string()).build(),
-        ConvoyStatus {
-            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![coder]).build()],
-            }),
-            ..Default::default()
-        },
-    )
-    .await;
+    let mut snapshot = flotilla_resources::WorkflowSnapshot {
+        cascade: None,
+        stall_nudges: Default::default(),
+        supervision: None,
+        exit: None,
+        turn_delivery: Default::default(),
+        vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![coder]).build()],
+    };
+    let mut spec = ConvoySpec::builder().workflow_ref("implement-review".to_string()).role("resume-staging".to_string()).build();
+    shape(&mut spec, &mut snapshot);
+    let launch = admit(&daemon, "resume-staging", spec, ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() }).await;
     if complete {
         complete_work(&daemon, &launch, "work").await;
     }
@@ -546,8 +548,8 @@ pub(super) fn trusted_codex_workflow() -> WorkflowTemplateSpec {
 pub(in crate::in_process) type TestEngine = Arc<flotilla_provisioning_testkit::EngineFixture>;
 
 /// The engines installed into test daemons, by the decided store they are on.
-static TEST_ENGINES: std::sync::LazyLock<std::sync::Mutex<Vec<(std::sync::Weak<flotilla_schema_sqlite::stream::Service>, TestEngine)>>> =
-    std::sync::LazyLock::new(Default::default);
+type InstalledEngines = Vec<(std::sync::Weak<flotilla_schema_sqlite::stream::Service>, TestEngine)>;
+static TEST_ENGINES: std::sync::LazyLock<std::sync::Mutex<InstalledEngines>> = std::sync::LazyLock::new(Default::default);
 
 /// [`TestEngine`] over `daemon`'s decided store, installed as its lifecycle reads on first use
 /// and the same engine after, as a composed daemon has one. Its readers and watchers follow the
@@ -839,6 +841,8 @@ pub(super) async fn stall_test_session(
     attention: TerminalAttention,
 ) -> String {
     let vessel_ref = ensure_vessel(engine, convoy, "work");
+    // The vessel is realised, so its work runs.
+    engine.vessels.ready(&vessel_ref, "env");
     let launch = engine.terminals.request(&TerminalLaunchRequest {
         session: name.into(),
         environment: "env".into(),

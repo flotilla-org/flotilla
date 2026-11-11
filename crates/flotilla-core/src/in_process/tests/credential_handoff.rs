@@ -311,6 +311,9 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
             messages.iter().map(|message| (&message.spec.receiver, &message.spec.body)).collect::<Vec<_>>()
         );
         let status = convoys.get(&concurrent).await.expect("convoy").status.expect("status");
-        assert_ne!(status.crew_work["work"]["aide"].phase, CrewWorkPhase::Pending, "the aide's work is reopened");
+        // The aide's work is reopened: it is assigned the task and owns the governor's promises.
+        // It reads Working only once its session is live.
+        assert!(status.crew_work["work"]["aide"].task_assigned, "the aide's work is reopened");
+        assert!(!flotilla_resources::promises::owned(&status, "work", "aide").is_empty(), "the aide owns the handed-off promises");
     }
 }

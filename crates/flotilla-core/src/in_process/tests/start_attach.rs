@@ -149,13 +149,16 @@ async fn start_attach_stage_uses_vessel_status() {
             let current = if failed { relaunch() } else { launch.clone() };
             engine.vessels.step(&current, step);
         }
-        let stage = daemon.convoy_start_stage("flotilla", &convoy).await;
         if failed {
-            assert!(stage.unwrap_err().contains(expected));
-        } else {
-            let stage = stage.unwrap();
-            // An admitted convoy whose work is ready to start reads Active.
-            assert!(stage.starts_with("active;") && stage.contains("vessel work") && stage.contains(expected), "{stage}");
+            // A failed vessel fails its work and so its convoy, and an ended convoy's vessels are
+            // listed no more: the start reads the failure, with the vessel's reason, from the convoy.
+            let status = backend.using::<Convoy>("flotilla").get(&slow).await.unwrap().status.unwrap();
+            assert_eq!(status.phase, flotilla_resources::ConvoyPhase::Failed);
+            assert!(status.work["work"].message.as_deref().is_some_and(|message| message.contains(expected)), "{status:?}");
+            continue;
         }
+        let stage = daemon.convoy_start_stage("flotilla", &convoy).await.unwrap();
+        // An admitted convoy whose work is ready to start reads Active.
+        assert!(stage.starts_with("active;") && stage.contains("vessel work") && stage.contains(expected), "{stage}");
     }
 }

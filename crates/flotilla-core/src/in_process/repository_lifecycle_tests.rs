@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use hegel::generators as gs;
 
 use super::*;
+use crate::in_process::tests::admit;
 use crate::testkits::discovery::fake_discovery;
 use crate::testkits::discovery::fake_discovery_with_runner;
 use crate::testkits::discovery::FakeIssueProvider;
@@ -546,7 +547,6 @@ async fn github_observation_credential_failure_is_visible_and_recovers() {
     assert_eq!(conditions.len(), 1);
     assert_eq!(conditions[0].message, error);
     assert!(!conditions[0].blocks_readiness() && !conditions[0].blocks_forge_observation());
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
     let spec = ConvoySpec::builder()
         .workflow_ref("work".into())
         .repositories(vec![ConvoyRepositorySpec::builder()
@@ -559,14 +559,8 @@ async fn github_observation_credential_failure_is_visible_and_recovers() {
             .build()])
         .build();
     let single_agent = flotilla_engine_convoys_testkit::single_agent;
-    let affected = crate::in_process::tests::admit(&daemon, "affected", spec, single_agent("coder")).await;
-    let unrelated = crate::in_process::tests::admit(
-        &daemon,
-        "unrelated",
-        ConvoySpec::builder().workflow_ref("work".into()).build(),
-        single_agent("coder"),
-    )
-    .await;
+    let affected = admit(&daemon, "affected", spec, single_agent("coder")).await;
+    let unrelated = admit(&daemon, "unrelated", ConvoySpec::builder().workflow_ref("work".into()).build(), single_agent("coder")).await;
     assert!(daemon.explain_convoy_internal(Some("flotilla"), &affected).await.expect("explain").warnings.contains(&error));
     assert!(daemon.explain_convoy_internal(Some("flotilla"), &unrelated).await.expect("explain").warnings.is_empty());
     tokio::time::advance(Duration::from_secs(29)).await;

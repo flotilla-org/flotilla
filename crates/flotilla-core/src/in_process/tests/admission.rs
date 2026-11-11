@@ -498,27 +498,14 @@ async fn abandon_archive_names_replica_checkouts_left_to_their_own_host() {
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    // The convoy and its checkout are held at feta: this host reads them, replicated in, but
-    // cannot inspect the checkout.
-    super::test_engine(&daemon);
+    // The convoy is held here; its checkout is held at feta: this host reads it, replicated in,
+    // but cannot inspect it.
+    let (holder, archive) = archive_convoy(&daemon, "archive-convoy").await;
     let decided = daemon.decided_store().expect("decided store");
     let feta = flotilla_provisioning_testkit::other_home_for(&decided, "feta");
     let feta_engine = flotilla_provisioning_testkit::EngineFixture::over_service(feta.service());
-    let feta_convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
-        feta.service(),
-        "flotilla",
-        &ResourceBackend::new(InMemoryBackend::default()),
-        Arc::new(flotilla_resources::SystemClock),
-        feta_engine.reads(),
-    );
-    let archive = feta_convoys
-        .launch(flotilla_engine_convoys_testkit::convoy(
-            "flotilla",
-            "archive-convoy",
-            ConvoySpec::builder().workflow_ref("work".into()).build(),
-            single_agent("coder"),
-        ))
-        .await;
+    // Feta hears this home's launch before it holds a checkout for it.
+    flotilla_provisioning_testkit::replicate_home(&decided, daemon.node_id().as_str(), feta.service());
     let repository = RepositorySpec::remote("https://github.com/acme/archive").unwrap().key();
     feta_engine.checkouts.put_ready(
         "remote-work",
@@ -529,7 +516,7 @@ async fn abandon_archive_names_replica_checkouts_left_to_their_own_host() {
             host_ref: "feta".into(),
             is_main: false,
         }),
-        Some(&CheckoutHolder::Convoy(archive.clone())),
+        Some(&holder),
     );
     feta.replicate_to(&decided);
 

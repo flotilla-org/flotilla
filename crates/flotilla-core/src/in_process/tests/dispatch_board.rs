@@ -6,7 +6,7 @@ use std::time::Duration;
 use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
-use flotilla_resources::{Convoy as ResourceConvoy, ConvoySpec, InputMeta, Project, ProjectSpec, PROJECT_LABEL, ROLE_LABEL};
+use flotilla_resources::{ConvoySpec, Project, ProjectSpec};
 use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, SuspendedBoardProvider};
@@ -168,33 +168,30 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
     }
     // #3313: convoy explain uses the shared warm board and live accounting,
     // exposes a ticket override, and never waits on a remote observation.
-    backend
-        .using::<ResourceConvoy>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("convoy-explained".into())
-                .labels(std::collections::BTreeMap::from([(ROLE_LABEL.into(), "explained".into()), (PROJECT_LABEL.into(), "large".into())]))
-                .build(),
-            &ConvoySpec::builder()
-                .workflow_ref("workflow".into())
-                .project_ref("large".into())
-                .issues(vec![flotilla_resources::ConvoyIssue {
-                    reference: flotilla_protocol::IssueRef { source: source.clone(), id: "0".into() },
-                    repository_ref: None,
-                    snapshot: flotilla_resources::IssueSnapshot {
-                        title: "Urgent".into(),
-                        body: None,
-                        state: flotilla_protocol::IssueState::Open,
-                        labels: vec!["priority:urgent".into()],
-                        as_of: now,
-                    },
-                }])
-                .build(),
-        )
-        .await
-        .expect("explained convoy");
+    let explained = super::support::admit(
+        &daemon,
+        "convoy-explained",
+        ConvoySpec::builder()
+            .workflow_ref("workflow".into())
+            .project_ref("large".into())
+            .role("explained".into())
+            .issues(vec![flotilla_resources::ConvoyIssue {
+                reference: flotilla_protocol::IssueRef { source: source.clone(), id: "0".into() },
+                repository_ref: None,
+                snapshot: flotilla_resources::IssueSnapshot {
+                    title: "Urgent".into(),
+                    body: None,
+                    state: flotilla_protocol::IssueState::Open,
+                    labels: vec!["priority:urgent".into()],
+                    as_of: now,
+                },
+            }])
+            .build(),
+        flotilla_engine_convoys_testkit::single_agent("coder"),
+    )
+    .await;
     // A live convoy's score is independent of whether its address is a record name, role or qualified role.
-    for address in ["convoy-explained", "explained", "explained@large"] {
+    for address in [explained.as_str(), "explained", "explained@large"] {
         let explanation = tokio::time::timeout(Duration::from_secs(1), daemon.explain_convoy_internal(Some("flotilla"), address))
             .await
             .expect("explain stays local")

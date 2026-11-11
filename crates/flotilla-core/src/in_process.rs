@@ -19,7 +19,7 @@ use flotilla_protocol::PlacementDecision;
 use flotilla_resources::address::{remote_change_request_subject, same_subject};
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 #[cfg(test)]
-use flotilla_resources::{CapabilityNeed, ProjectSpec, Resource};
+use flotilla_resources::{CapabilityNeed, ProjectSpec};
 use repository_discovery::discover_repository_change_request_with;
 #[cfg(test)]
 mod host_registry_tests;
@@ -636,18 +636,6 @@ pub async fn discover_repo_for_environment(
 }
 
 use flotilla_resources::definition_provenance::SUPERSEDED_BY_ANNOTATION;
-
-#[cfg(test)]
-fn input_meta_from_resource<T: Resource>(resource: &flotilla_resources::ResourceObject<T>) -> InputMeta {
-    InputMeta::builder()
-        .name(resource.metadata.name.clone())
-        .labels(resource.metadata.labels.clone())
-        .annotations(resource.metadata.annotations.clone())
-        .owner_references(resource.metadata.owner_references.clone())
-        .finalizers(resource.metadata.finalizers.clone())
-        .maybe_deletion_timestamp(resource.metadata.deletion_timestamp)
-        .build()
-}
 
 /// A resolved, currently-live convoy generation. Callers route by owner and
 /// select sessions by `record_name`; neither operation accepts a raw role.

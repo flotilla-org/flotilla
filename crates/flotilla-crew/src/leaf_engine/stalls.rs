@@ -1100,8 +1100,18 @@ impl ReconcilerWake {
                     || session.is_some_and(|session| {
                         session.status.as_ref().is_none_or(|status| status.phase == TerminalSessionPhase::Starting)
                     }));
-            if crew_phase == Some(CrewWorkPhase::Stalled) {
-                Err((status.crew_work[vessel][role].message.clone().unwrap_or_else(|| "crew stalled".into()), StallEvidenceSource::Crew))
+            // On the engine a seat reads Stalled once its supervision opens a stall record; until
+            // then the crew's declaration is the home's stall note on its seat.
+            let declared = status
+                .stalled
+                .as_ref()
+                .filter(|stalled| stalled.source == StallEvidenceSource::Crew && stalled_source_actor(stalled) == Some((vessel, role)));
+            if crew_phase == Some(CrewWorkPhase::Stalled) || declared.is_some() {
+                let message = status.crew_work.get(vessel).and_then(|crew| crew.get(role)).and_then(|work| work.message.clone());
+                Err((
+                    message.or_else(|| declared.map(|stalled| stalled.evidence.clone())).unwrap_or_else(|| "crew stalled".into()),
+                    StallEvidenceSource::Crew,
+                ))
             } else if status.phase == ConvoyPhase::Landing
                 && status.work.get(vessel).is_some_and(|work| work.phase == WorkPhase::Complete)
                 && session.is_none_or(|session| {
@@ -1457,11 +1467,13 @@ impl ReconcilerWake {
                 .and_then(|session| self.agent_view(session))
                 .filter(|agent| matches!(agent.live_activity(), Some(AgentActivity::Idle | AgentActivity::Interrupted)))
                 .and_then(|agent| agent.reading.activity_since);
+            // A crew that declared a stall has answered its resumed turn: a seat reads Working on
+            // the engine until its supervision opens a stall record, so the declaration says so.
             let resume_grace = status
                 .crew_work
                 .get(vessel)
                 .and_then(|crew| crew.get(role))
-                .filter(|work| work.phase == CrewWorkPhase::Working)
+                .filter(|work| work.phase == CrewWorkPhase::Working && declared.is_none())
                 .and_then(|work| work.resumed_at.zip(work.resume_brief_id.as_deref()))
                 .is_some_and(|(resumed_at, brief_id)| {
                     // A missing or recreated session must not suppress
