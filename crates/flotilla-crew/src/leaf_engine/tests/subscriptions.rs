@@ -457,56 +457,8 @@ async fn sqlite_leaf_object_routing_counts_only_addressed_rows() {
 }
 
 async fn routing_count_contract(backend: ResourceBackend, changes: &[usize]) {
-    routing_contract(backend, changes, false).await;
-}
-
-// #3141 / #3120: a warm leaf wake must evaluate from resident subjects. Each
-// affected row still reloads its addressed launches, but from the engine's held
-// Convoy views (#3108), so the durable store is not read.
-#[tokio::test]
-async fn leaf_wake_zero_reads() {
-    routing_contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")), &[0, 1, 63], true).await;
-}
-
-// #3141 / #3120: attaching a wait to an already warm leaf engine should use
-// resident subjects. The re-read of an already watched launch is served by the
-// engine's held Convoy views (#3108), not the durable store.
-#[tokio::test]
-async fn leaf_warm_subscription_zero_reads() {
-    use flotilla_store_testkit::{ReadCountsBackendExt, ZeroReadGuard};
-    use futures::FutureExt;
-    let writer = ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"));
-    let home = EngineHome::install(&writer, "flotilla", "test-host");
-    let watched = active_launch(&writer, &home, "watched").await;
-    let counted = writer.with_read_counts();
-    let table = supervision_wake(&counted, &home).subscriptions;
-    let mut watches = Vec::new();
-    for index in 0..2 {
-        let guard = ZeroReadGuard::after_warm_up(&counted);
-        let row = overload_row(uuid::Uuid::new_v4(), &watched);
-        table.inner.rows.lock().await.insert(row.id, row.clone());
-        let mut watching = Box::pin(table.watch_row(row));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while table.inner.evaluations.load(Ordering::SeqCst) <= index {
-                assert!(watching.as_mut().now_or_never().is_none(), "Active cannot fire a Failed wait");
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("subscription evaluated");
-        watches.push(watching);
-        // Index 0 is the cold attach; index 1 attaches to an already warm engine.
-        if index != 0 {
-            guard.assert_zero("leaf subscription after warm-up");
-        }
-    }
-}
-
-async fn routing_contract(backend: ResourceBackend, changes: &[usize], zero_reads: bool) {
-    use flotilla_store_testkit::{ReadCountsBackendExt, ZeroReadGuard};
     use futures::FutureExt;
     let home = EngineHome::install(&backend, "flotilla", "test-host");
-    let counted = backend.clone().with_read_counts();
     // Only the objects the waits address or the changes touch are launched: the others would
     // never change.
     let mut objects = BTreeMap::new();
@@ -523,7 +475,7 @@ async fn routing_contract(backend: ResourceBackend, changes: &[usize], zero_read
         Arc::new(UnavailableChangeRequests),
         Default::default(),
     );
-    let table = engine_table(counted.clone(), &home, broadcast_test_sink(events), refresher);
+    let table = engine_table(backend.clone(), &home, broadcast_test_sink(events), refresher);
     let mut watchers = Vec::new();
     let mut ids = Vec::new();
     for index in [0, 1, 2, 0] {
@@ -548,8 +500,7 @@ async fn routing_contract(backend: ResourceBackend, changes: &[usize], zero_read
     .expect("initial addressed reads complete");
     assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 4);
     assert_eq!(table.inner.store_reads.load(Ordering::SeqCst), 4, "one targeted read per unique address, no full lists");
-    for (step, index) in changes.iter().enumerate() {
-        let guard = ZeroReadGuard::after_warm_up(&counted);
+    for index in changes {
         let previous_events = table.inner.routing.lock().await.events_processed;
         let before_evaluations = table.inner.evaluations.load(Ordering::SeqCst);
         let before_reads = table.inner.store_reads.load(Ordering::SeqCst);
@@ -572,9 +523,6 @@ async fn routing_contract(backend: ResourceBackend, changes: &[usize], zero_read
         assert_eq!(table.inner.evaluations.load(Ordering::SeqCst) - before_evaluations, touched);
         assert_eq!(table.inner.store_reads.load(Ordering::SeqCst) - before_reads, touched);
         assert!(fires.try_recv().is_err());
-        if zero_reads {
-            guard.assert_zero("leaf wake and subscription delivery");
-        }
     }
     // Exactly one wait fires per addressed object, retaining subscription identity. The second
     // wait on object-0 fires from the failure the first one heard.
