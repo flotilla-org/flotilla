@@ -54,7 +54,10 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
                 }
             }
             if !mapped.stays_old.is_empty() {
-                *report.dropped.entry((KIND, "ended or not bootstrapped: stays on the old store")).or_default() += mapped.stays_old.len();
+                *report
+                    .dropped
+                    .entry((KIND, "ended or never bootstrapped: dropped by the import; the old resources.sqlite stays on disk"))
+                    .or_default() += mapped.stays_old.len();
             }
             for refusal in &mapped.refused {
                 report.refused.push(ImportRefusal { kind: KIND, record: refused_name(refusal), reason: refusal.to_string() });

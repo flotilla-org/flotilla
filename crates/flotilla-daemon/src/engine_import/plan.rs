@@ -61,13 +61,18 @@ pub const PLAN: &[(&str, Plan)] = &[
     ("AccessDelivery", Plan::Imported("access delivery import (#3824)")),
 ];
 
-/// The plan for the kind listed under `plural`, if it has one.
+/// The plan for the kind listed under `plural`, if it has one. A kind retired before the retired
+/// list (MaterialPool, #1931) has no plural any more: the old store's rows name it by kind, and
+/// its ruling drops them.
 pub fn plan(plural: &str) -> Option<(&'static str, Plan)> {
-    let kind = REGISTERED_RESOURCE_KINDS
+    let Some(kind) = REGISTERED_RESOURCE_KINDS
         .iter()
         .find(|entry| entry.plural == plural)
         .map(|entry| entry.kind)
-        .or_else(|| retired_resource_kind(plural).map(|retired| retired.kind))?;
+        .or_else(|| retired_resource_kind(plural).map(|retired| retired.kind))
+    else {
+        return PLAN.iter().find(|(name, plan)| *name == plural && matches!(plan, Plan::Retired(_))).copied();
+    };
     PLAN.iter().find(|(name, _)| *name == kind).copied()
 }
 
@@ -114,6 +119,7 @@ mod tests {
     fn a_retired_unregistered_kind_listed_by_an_older_daemon_is_dropped() {
         assert!(is_retired("crewimagebaselines"));
         assert!(is_retired("events"));
+        assert!(is_retired("MaterialPool"), "a kind purged before the retired list is read under its kind name");
         assert!(!is_retired("demands"), "a retired kind the import converts is not dropped");
     }
 }

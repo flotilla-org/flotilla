@@ -434,7 +434,7 @@ fn several_convoys_rehearse_at_one_home() {
 
 // Behaviour: each standing generation is its own convoy, a launch of the role's engine name. The
 // live generation imports with its own promise ids and is numbered by the home sequence its
-// create takes; an ended one stays on the old store, as any ended convoy does.
+// create takes; an ended one is dropped by the import, as any ended convoy is.
 #[test]
 fn a_standing_generation_imports_as_a_launch_of_its_role() {
     use flotilla_core::primitives::convoy_import::{rehearse_all, write};

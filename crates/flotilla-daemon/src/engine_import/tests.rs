@@ -450,6 +450,8 @@ fn rows_of_kinds_no_importer_reads_are_dropped_or_refused_here_only() {
         row("usages", HERE, "usage"),
         row("events", HERE, "event"),
         row("regards", HERE, "regard"),
+        // Purged before the retired list (#1931): the old store's row names it by kind.
+        row("MaterialPool", HERE, "pool"),
         row("widgets", HERE, "widget"),
         row("widgets", THERE, "their-widget"),
         row("regards", THERE, "their-regard"),
@@ -462,6 +464,7 @@ fn rows_of_kinds_no_importer_reads_are_dropped_or_refused_here_only() {
     assert_eq!(summary.kinds["Usage"].dropped, 1);
     assert_eq!(summary.kinds["Event"].dropped, 1);
     assert_eq!(summary.kinds["Regard"].dropped, 1, "only this home's row is dropped here");
+    assert_eq!(summary.kinds["MaterialPool"].dropped, 1);
     assert!(!summary.kinds.contains_key("FulfilmentKind"), "an imported kind's rows are its step's");
     assert_eq!(
         summary.refusals,
@@ -1257,4 +1260,58 @@ async fn placement_rows_import_as_kinds_and_none_stay_on_the_old_store() {
     for name in ["host-direct-feta", "docker-crew-image-feta", "placement-snapshot-0123456789ab"] {
         assert!(holds::<flotilla_provisioning::stored::placement::FulfilmentKindDefinition>(&mut store, name, HERE), "{name}");
     }
+}
+
+/// The own host of a real old store: the one Host homed there that describes a daemon.
+fn own_daemon_host(source: &Source, home: &str) -> Option<String> {
+    let mut daemons = source
+        .rows
+        .iter()
+        .filter(|row| row.plural == "hosts" && row.home == home)
+        .filter_map(|row| decode::<flotilla_resources::Host>(&row.document).ok())
+        .filter(|host| host.spec.connection.is_daemon())
+        .map(|host| host.metadata.name);
+    let own = daemons.next();
+    own.filter(|_| daemons.next().is_none())
+}
+
+// Rehearsal (#3108): the first start's import over a real old store copied into
+// `FLOTILLA_IMPORT_REHEARSAL_DIR`, which it writes its report and engine store beside. Prints
+// counts by kind and refusal reasons only; the report beside the copy names the records.
+#[test]
+#[ignore = "needs a real old store copy in FLOTILLA_IMPORT_REHEARSAL_DIR"]
+fn first_start_imports_a_real_old_store() {
+    let dir = std::path::PathBuf::from(std::env::var_os("FLOTILLA_IMPORT_REHEARSAL_DIR").expect("FLOTILLA_IMPORT_REHEARSAL_DIR"));
+    let home = "rehearsal-home";
+    let source = Source::read(&dir.join(OLD_STORE), home).expect("read old store");
+    let own_host = own_daemon_host(&source, home);
+    println!(
+        "rows: {}, homed here: {}, own daemon Host found: {}",
+        source.rows.len(),
+        source.rows.iter().filter(|row| row.home == home).count(),
+        own_host.is_some()
+    );
+    let result = first_start(&dir, home, own_host.as_deref());
+    let report = std::fs::read_dir(&dir)
+        .expect("dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("import-")))
+        .max()
+        .expect("report");
+    let report: Value = serde_json::from_slice(&std::fs::read(&report).expect("report")).expect("json");
+    println!("outcome: {}", report["outcome"]);
+    for (kind, counts) in report["kinds"].as_object().expect("kinds") {
+        println!("{kind}: {counts}");
+    }
+    let mut reasons = BTreeMap::<(String, String), usize>::new();
+    for refusal in report["refusals"].as_array().expect("refusals") {
+        *reasons
+            .entry((refusal["kind"].as_str().unwrap_or_default().to_owned(), refusal["reason"].as_str().unwrap_or_default().to_owned()))
+            .or_default() += 1;
+    }
+    for ((kind, reason), count) in reasons {
+        println!("refused {count} {kind}: {reason}");
+    }
+    println!("first_start: {}", if result.is_ok() { "ok" } else { "error" });
 }
