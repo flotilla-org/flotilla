@@ -813,7 +813,8 @@ async fn promise_less_crew_stall_survives_judge_ticks() {
         let objects = case.objects().await;
         case.wake.sync_rows("flotilla", &objects).await.expect("sync resolved rows");
         case.wake.judge_stalls_at("flotilla", &objects, now + chrono::Duration::seconds(5)).await.expect("judge resolution");
-        assert!(case.status().await.stalled.is_none(), "resolved {resolved:?}");
+        let status = case.status().await;
+        assert!(status.stalled.is_none(), "resolved {resolved:?} at {:?}: {:?}", status.phase, status.stalled);
     }
 }
 
