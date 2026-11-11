@@ -965,7 +965,12 @@ fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
 /// does: its terminal sessions are read at every home the store holds, so another daemon's
 /// arrive as that daemon's log is replicated in.
 fn install_decided_engine(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EngineFixture {
-    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&daemon.decided_store().expect("decided store"));
+    let service = daemon.decided_store().expect("decided store");
+    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&service);
+    // Its vessels' and terminal sessions' watchers hear each launch change, as the runtime's do;
+    // the followers run on the test's runtime and end with it.
+    drop(engine.vessels.vessels.follow(Arc::clone(&service)).expect("follow the vessels"));
+    drop(engine.terminals.terminals.follow(Arc::clone(&service)).expect("follow the terminal sessions"));
     daemon.install_lifecycle_reads(engine.reads()).expect("engine reads");
     engine
 }
