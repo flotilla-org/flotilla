@@ -15,6 +15,7 @@ flotilla-crew = { path = "../flotilla-crew" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-schema = { path = "../flotilla-schema" }
 flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-engine-convoys = { path = "../flotilla-engine-convoys" }
 flotilla-engine-messages = { path = "../flotilla-engine-messages" }
 flotilla-provisioning = { path = "../flotilla-provisioning" }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }

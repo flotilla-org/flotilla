@@ -4,7 +4,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::{TimeZone, Utc};
-use flotilla_core::primitives::{
+use flotilla_engine_convoys::{
     convoy_records::{seat_address, EngineConvoyRecords},
     convoys::Convoys,
 };

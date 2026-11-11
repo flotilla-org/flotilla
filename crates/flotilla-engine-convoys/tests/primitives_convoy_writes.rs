@@ -6,7 +6,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::Utc;
-use flotilla_core::primitives::{convoy_engine::ConvoyEngine, convoy_map, convoys::Convoys};
+use flotilla_engine_convoys::{convoy_engine::ConvoyEngine, convoy_map, convoys::Convoys};
 use flotilla_resources::{
     convoy::engine::{Actor, EngineConvoys, VerdictScope},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource as OldSource, PromiseState, Submission, SubmissionVerdict},
@@ -485,7 +485,7 @@ fn a_later_crew_of_a_seated_role_never_renames_the_seat() {
 // those stay applied; its recorded inputs are cleared, so the world does not grow.
 #[test]
 fn a_partial_edit_reports_what_applied() {
-    use flotilla_core::primitives::convoys::EditError;
+    use flotilla_engine_convoys::convoys::EditError;
     use flotilla_state_machines::{
         machines::convoy::{ConvoyRefusal, Declare, PromiseId, Submit},
         Ref, Source,

@@ -2259,6 +2259,7 @@ dependencies = [
  "flotilla-discovery",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
+ "flotilla-engine-convoys",
  "flotilla-engine-messages",
  "flotilla-engine-messages-testkit",
  "flotilla-engine-store",
@@ -2497,6 +2498,7 @@ dependencies = [
  "flotilla-discovery-testkit",
  "flotilla-drydock",
  "flotilla-dummy-fleet",
+ "flotilla-engine-convoys",
  "flotilla-engine-messages",
  "flotilla-engine-messages-testkit",
  "flotilla-engine-store",
@@ -2793,6 +2795,40 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "flotilla-engine-convoys"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "flotilla-address",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-os",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-engine-messages",
+ "flotilla-engine-store",
+ "flotilla-protocol",
+ "flotilla-provisioning",
+ "flotilla-resources",
+ "flotilla-schema",
+ "flotilla-schema-sqlite",
+ "flotilla-state-machines",
+ "flotilla-store",
+ "flotilla-store-memory",
+ "hegeltest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -21,7 +21,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use chrono::Utc;
-use flotilla_core::primitives::{convoy_engine::ConvoyEngine, convoys::Convoys};
+use flotilla_engine_convoys::{convoy_engine::ConvoyEngine, convoys::Convoys};
 use flotilla_resources::{
     convoy::engine::{Actor, EngineConvoys},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict},

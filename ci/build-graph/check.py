@@ -82,6 +82,8 @@ STATE_MACHINE_DEPENDENTS = frozenset({
     "flotilla-provisioning-testkit",
     # Dev-only: the ensure scenarios run this home's vessels as the daemon runs them.
     "flotilla-orchestration-testkit",
+    # #3108: Convoy on the engine, below the composition root so crew and testkits can seed launches.
+    "flotilla-engine-convoys",
 })
 # #3317: the Message switch composes the engine inbox; only these use it directly.
 INBOX_DEPENDENTS = frozenset({"flotilla-daemon", "flotilla-engine-messages"})
@@ -89,6 +91,10 @@ INBOX_DEPENDENTS = frozenset({"flotilla-daemon", "flotilla-engine-messages"})
 # crew takes it only as a dev-dependency for its tests.
 ENGINE_MESSAGES = "flotilla-engine-messages"
 ENGINE_MESSAGES_FORBIDDEN = (*CAPABILITY_FORBIDDEN, *sorted(CAPABILITY_CRATES))
+# #3108: the engine Convoy path sits beside engine Message, over provisioning's engine reads;
+# crew and the testkits take it only as a dev-dependency.
+ENGINE_CONVOYS = "flotilla-engine-convoys"
+ENGINE_CONVOYS_FORBIDDEN = (*CAPABILITY_FORBIDDEN, *sorted(CAPABILITY_CRATES - {"flotilla-provisioning"}))
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a
 # compiler without these drivers need an explicit entry when introduced.
@@ -190,6 +196,9 @@ def violations(metadata):
     for target in ENGINE_MESSAGES_FORBIDDEN:
         if ENGINE_MESSAGES in packages and target in packages and reaches(ENGINE_MESSAGES, target):
             errors.append(f"{ENGINE_MESSAGES}: must not depend on {target}, directly or transitively")
+    for target in ENGINE_CONVOYS_FORBIDDEN:
+        if ENGINE_CONVOYS in packages and target in packages and reaches(ENGINE_CONVOYS, target):
+            errors.append(f"{ENGINE_CONVOYS}: must not depend on {target}, directly or transitively")
     for target in DISCOVERY_FORBIDDEN:
         if DISCOVERY in packages and target in packages and reaches(DISCOVERY, target):
             errors.append(f"{DISCOVERY}: must not depend on {target}, directly or transitively")

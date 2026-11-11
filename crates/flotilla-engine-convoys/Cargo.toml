@@ -1,0 +1,47 @@
+[package]
+name = "flotilla-engine-convoys"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Convoy on the engine: its home, the old-shape convoy path, its readers' records and the old-store import (#3108)"
+
+[dependencies]
+flotilla-address = { path = "../flotilla-address" }
+flotilla-engine-messages = { path = "../flotilla-engine-messages" }
+flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-provisioning = { path = "../flotilla-provisioning" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-schema = { path = "../flotilla-schema" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-state-machines = { path = "../flotilla-state-machines" }
+flotilla-store = { path = "../flotilla-store" }
+async-trait = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+flotilla-store-memory = { path = "../flotilla-store-memory" }
+tokio = { workspace = true, features = ["test-util"] }
+hegeltest = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
+
+# Keep native library features stable across build and test commands: the
+# anchors of flotilla-engine-store, whose SQLite store the import rehearses on.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }
+

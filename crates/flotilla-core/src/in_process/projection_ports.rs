@@ -184,7 +184,7 @@ pub use agent_sessions::DecidedAgentSessions;
 pub(super) struct DecidedReads {
     pub(super) reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     pub(super) agent_sessions: DecidedAgentSessions,
-    pub(super) convoys: Arc<std::sync::OnceLock<Arc<crate::primitives::convoy_records::EngineConvoyRecords>>>,
+    pub(super) convoys: Arc<std::sync::OnceLock<Arc<flotilla_engine_convoys::convoy_records::EngineConvoyRecords>>>,
 }
 
 impl flotilla_resources::lifecycle_reads::LifecycleReads for DecidedReads {

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use flotilla_core::primitives::convoys::Convoys;
+use flotilla_engine_convoys::convoys::Convoys;
 use flotilla_schema::{Address, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{

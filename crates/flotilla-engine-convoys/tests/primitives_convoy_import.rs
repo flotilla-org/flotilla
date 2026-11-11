@@ -5,7 +5,7 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use chrono::Utc;
-use flotilla_core::primitives::convoy_import::{
+use flotilla_engine_convoys::convoy_import::{
     check, import_convoy, rehearse, rehearse_all, ConvoyImportRefusal, ConvoyImportWorld, ImportOutcome, ImportedConvoy,
 };
 use flotilla_resources::{
@@ -137,7 +137,7 @@ fn repeated_old_ids_import_seat_qualified() {
     assert_eq!(labels, vec!["template/pr", "@coder/notes", "template/decision-ledger", "@reviewer/notes"]);
     let qualified: Vec<_> = promises.iter().filter(|promise| promise.label.starts_with('@')).collect();
     assert_eq!(qualified.len(), 2);
-    assert!(qualified.iter().all(|promise| flotilla_core::primitives::convoy_map::old_id(promise) == "notes"));
+    assert!(qualified.iter().all(|promise| flotilla_engine_convoys::convoy_map::old_id(promise) == "notes"));
 }
 
 // Behaviour: a convoy with history imports one to one: each promise keeps its progress and
@@ -314,7 +314,7 @@ fn an_open_stall_becomes_the_seats_stall_record() {
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     let mut store =
         flotilla_schema_sqlite::Store::open(connection, HOME, flotilla_engine_store::registry().expect("registry")).expect("store");
-    flotilla_core::primitives::convoy_import::write(&mut store, &convoy).expect("written");
+    flotilla_engine_convoys::convoy_import::write(&mut store, &convoy).expect("written");
     let name = flotilla_engine_messages::awaiting::record_name(&record.message);
     let mut read = store.read().expect("read");
     let code = <flotilla_state_machines::Resource<flotilla_state_machines::machines::awaiting_reply::AwaitingReply> as flotilla_schema::Kind>::CODE;
@@ -348,7 +348,7 @@ fn the_import_is_one_change_at_the_convoys_time() {
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     let mut store =
         flotilla_schema_sqlite::Store::open(connection, HOME, flotilla_engine_store::registry().expect("registry")).expect("store");
-    let written = flotilla_core::primitives::convoy_import::write(&mut store, &convoy).expect("written");
+    let written = flotilla_engine_convoys::convoy_import::write(&mut store, &convoy).expect("written");
     let mut read = store.read().expect("read");
     let id = read.resolve(Resource::<Engine>::CODE, written.name(), HOME).expect("resolve").expect("created");
     let events = read.changes(id, 0, 10).expect("log");
@@ -437,7 +437,7 @@ fn several_convoys_rehearse_at_one_home() {
 // create takes; an ended one is dropped by the import, as any ended convoy is.
 #[test]
 fn a_standing_generation_imports_as_a_launch_of_its_role() {
-    use flotilla_core::primitives::convoy_import::{rehearse_all, write};
+    use flotilla_engine_convoys::convoy_import::{rehearse_all, write};
     let mut old = convoy("governor-1", ConvoyPhase::Landed, vec![agent("governor", true)]);
     let mut live = convoy("governor-2", ConvoyPhase::Active, vec![agent("governor", true)]);
     for (generation, record) in [(1, &mut old), (2, &mut live)] {

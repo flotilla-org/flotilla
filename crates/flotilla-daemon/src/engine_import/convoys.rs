@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use flotilla_address::Address;
-use flotilla_core::primitives::convoy_import::{import_all, write_into, ConvoyImportWorld};
+use flotilla_engine_convoys::convoy_import::{import_all, write_into, ConvoyImportWorld};
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport};
 use flotilla_resources::{Convoy, Forge};
@@ -68,8 +68,8 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
     carried.convoys.extend(written_convoys);
 }
 
-fn refused_name(refusal: &flotilla_core::primitives::convoy_import::ConvoyImportRefusal) -> String {
-    use flotilla_core::primitives::convoy_import::ConvoyImportRefusal;
+fn refused_name(refusal: &flotilla_engine_convoys::convoy_import::ConvoyImportRefusal) -> String {
+    use flotilla_engine_convoys::convoy_import::ConvoyImportRefusal;
     match refusal {
         ConvoyImportRefusal::NoObligations { convoy }
         | ConvoyImportRefusal::StandingAwaitsRuling { convoy }

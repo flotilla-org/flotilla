@@ -12,7 +12,7 @@
 use std::{collections::BTreeMap, time::Instant};
 
 use chrono::Utc;
-use flotilla_core::primitives::convoy_import::{import_convoy, rehearse, ConvoyImportWorld, ImportOutcome};
+use flotilla_engine_convoys::convoy_import::{import_convoy, rehearse, ConvoyImportWorld, ImportOutcome};
 use flotilla_resources::{
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, Submission},
     Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, ObjectMeta, ResourceObject,
