@@ -9423,52 +9423,29 @@ async fn convoy_explain_reports_completed_work_without_a_crew_claim() {
 
 #[tokio::test]
 async fn operator_forced_completion_settles_a_ledger_less_crew() {
-    let (_temp, _repo, daemon, engine) = daemon_for_cwd_with_engine().await;
+    let (_temp, _repo, daemon, engine) = daemon_for_plain_dir_with_decided_engine(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("missing-ledger".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([(
-                        "coder".to_string(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                    )]),
-                )]),
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: flotilla_resources::interactive_single_workflow_spec().vessels,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark crew working");
-    // The work's launch.
-    let vessel_ref = engine.vessels.request("missing-ledger", "work", daemon.host_name().as_str());
-
-    let admitted = convoys.get("missing-ledger").await.unwrap();
-    for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], admitted.status.as_ref().unwrap(), false) {
-        apply_status_patch(&convoys, "missing-ledger", &flotilla_resources::ConvoyStatusPatch::Promise { vessel, role, operation })
-            .await
-            .unwrap();
-    }
+    // Admission declares the coder's promises; it works in the work's realised launch.
+    let launch = launch_convoy(
+        &daemon,
+        "missing-ledger",
+        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        flotilla_resources::ConvoyStatus {
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: None,
+                turn_delivery: Default::default(),
+                vessels: flotilla_resources::interactive_single_workflow_spec().vessels,
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+    let vessel_ref = work_underway(&engine, &launch, "work");
+    crew_at_work(&engine, &vessel_ref, "coder", "missing-ledger-coder", "missing-ledger-coder");
     let operator = flotilla_protocol::PrincipalRef { namespace: "flotilla".to_string(), name: "operator".to_string() };
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -9478,7 +9455,7 @@ async fn operator_forced_completion_settles_a_ledger_less_crew() {
                     context: flotilla_protocol::CrewCommandContext {
                         crew_id: None,
                         namespace: Some("flotilla".to_string()),
-                        convoy: Some("missing-ledger".to_string()),
+                        convoy: Some(launch.clone()),
                         vessel_ref: Some(vessel_ref.clone()),
                         role: Some("coder".to_string()),
                     },
@@ -9493,10 +9470,14 @@ async fn operator_forced_completion_settles_a_ledger_less_crew() {
         .expect("dispatch forced completion");
     let forced = recv_command_finished(&mut events, command_id).await;
     assert_eq!(forced, CommandValue::Ok);
-    let status = convoys.get("missing-ledger").await.unwrap().status.unwrap();
+    let status = convoys.get(&launch).await.unwrap().status.unwrap();
     assert_eq!(status.phase, ConvoyPhase::Landing);
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
-    assert_eq!(status.crew_work["work"]["coder"].completion_override.as_ref().unwrap().principal, operator);
+    // The operator's verdict kept the coder's promises with nothing submitted. The view does not
+    // carry the verdict's principal as the old completion override did (#3108).
+    let coder = &status.promises["work"]["coder"];
+    assert!(!coder.is_empty());
+    assert!(coder.iter().all(|promise| promise.state == flotilla_resources::promises::PromiseState::Kept && promise.submissions.is_empty()));
 }
 
 async fn run_identity_command(daemon: &InProcessDaemon, action: CommandAction, selector: RepoSelector) -> CommandValue {
