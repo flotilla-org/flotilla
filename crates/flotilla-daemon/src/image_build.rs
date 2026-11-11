@@ -402,6 +402,7 @@ mod tests {
             .create(
                 &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
                 &FleetDesignationSpec {
+                    reach: Default::default(),
                     fleet: None,
                     project: "fleet".into(),
                     image_cache: Some(ImageCacheBinding {

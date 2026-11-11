@@ -8286,7 +8286,7 @@ mod project_parent_tests {
             .definitions::<FleetDesignation>("flotilla")
             .apply(
                 &InputMeta::builder().name("fleet".into()).build(),
-                &FleetDesignationSpec { fleet: None, project: "root".into(), image_cache: None },
+                &FleetDesignationSpec { reach: Default::default(), fleet: None, project: "root".into(), image_cache: None },
             )
             .await
             .expect("designation");

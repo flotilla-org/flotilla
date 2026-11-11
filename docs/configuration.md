@@ -395,6 +395,64 @@ measurement from silently disabling admission.
 Set the floor to `0` only when an external system provides an equivalent
 capacity guard.
 
+### Vessel reach
+
+Each vessel has a reach set: the destinations it must reach, composed at
+admission and frozen into its requirement (#4299). The set is the union of:
+
+- what the vessel is given: the hosts of its repositories' remotes and the
+  servers its credentials name (Git HTTP and Forgejo forges, GitHub, Docker
+  registries, the review-bundle object store);
+- what is declared for anything not derivable: the fleet's
+  `FleetDesignation.spec.reach` and the project's `reach:` in `project.yaml`
+  (or its Project's `spec.reach`), and a workflow vessel's own `reach`.
+
+The fleet's image cache is not in the set: the guest does not pull from it.
+
+A declared entry names a host and a port:
+
+```yaml
+reach:
+  - host: artifacts.lab.example
+    port: 443
+```
+
+Each environment provider instance declares the ways its vessels can reach a
+destination beyond their own egress, preferred first:
+
+- `host_network`: the vessel shares the controlling host's network. Docker and
+  host-direct instances declare it.
+- `outward_exposure`: the controlling host carries the connection under the
+  destination's own name and port, so TLS stays end to end.
+
+A drydock instance takes its ways from its module's declared capabilities: a
+module that runs the agent declares `outward_exposure`, and drydock's `local`
+module also declares `host_network` first.
+
+At placement each candidate answers, for every destination, how it would meet
+it or that it cannot, resolving names on its own controlling host. Admission
+looks nothing up. The candidate's default rule: a destination that resolves only
+to public addresses is met by the guest's egress; one that resolves to a
+private, shared (CGNAT, tailnet), loopback or link-local address is met by the
+first declared way that can carry it. An outward exposure stands at a name, so
+a private destination named only by an address needs `host_network`. A
+destination the candidate cannot meet, or gives no answer for, refuses it, and
+the refusal names the destination. A cloud sandbox's environment reports how it
+met each destination.
+
+A candidate acted for from another daemon answers, for now, from the ways it
+advertises, looking nothing up: `host_network` meets what its host reaches,
+`outward_exposure` carries a named destination, and an address is classified
+as it stands. Its host then checks each destination when it provisions, and the
+provision fails naming any it cannot meet. Placement will ask that daemon
+directly later.
+
+The earlier `[flotilla.provider.<instance>.lab_reach]` table in `drydock.toml`
+is retired: it is accepted and ignored for one roll, then refused. Its
+destination is no longer reached implicitly. A destination that is neither a
+repository remote nor a credential's server must be declared in the fleet's or
+project's `reach`.
+
 ## Forced checkout archives
 
 Forced checkout removal saves a Git bundle and patch under `.flotilla-archives/`

@@ -68,6 +68,8 @@ impl DummyFleet {
                 seed: self.config.seed,
                 realise_delay: Duration::from_millis(environment.realise_delay_ms),
                 failure_rate: environment.failure_rate,
+                reach_ways: environment.reach_ways.clone(),
+                private_destinations: environment.private_destinations.iter().map(|host| host.to_ascii_lowercase()).collect(),
             };
             let cleanup: flotilla_environment::environment::dummy::DummyEnvironmentCleanup = Arc::new(move |id| {
                 if let Some(fleet) = weak.upgrade() {

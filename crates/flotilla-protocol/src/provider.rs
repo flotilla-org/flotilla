@@ -100,6 +100,12 @@ pub struct ProviderCapabilities {
     /// at a container's fixed locations.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub host_filesystem: bool,
+    /// The ways this instance's vessels reach a destination beyond their own
+    /// egress, preferred first (#4299). With none, a vessel meets only what
+    /// its egress reaches. Empty is not written, so earlier records keep their
+    /// shape.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reach_ways: Vec<crate::reach::ReachWay>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

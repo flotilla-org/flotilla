@@ -776,7 +776,12 @@ async fn designate_fleet(daemon: &Incarnation, fleet: &str) {
         .definitions::<FleetDesignation>("flotilla")
         .apply(
             &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
-            &FleetDesignationSpec { fleet: Some(fleet.into()), project: "project-map".into(), image_cache: None },
+            &FleetDesignationSpec {
+                reach: Default::default(),
+                fleet: Some(fleet.into()),
+                project: "project-map".into(),
+                image_cache: None,
+            },
         )
         .await
         .expect("designation");

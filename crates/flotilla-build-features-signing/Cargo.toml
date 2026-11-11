@@ -21,6 +21,7 @@ sha2 = { workspace = true, features = ["oid"] }
 signature = { version = "2", default-features = false, features = ["alloc", "digest", "rand_core", "std"] }
 spki = { version = "0.7", default-features = false, features = ["pem", "std"] }
 subtle = { version = "2" }
+typenum = { version = "1", features = ["const-generics"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [dependencies]

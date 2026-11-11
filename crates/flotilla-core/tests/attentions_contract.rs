@@ -41,7 +41,7 @@ async fn records() -> ResourceBackend {
         .definitions::<FleetDesignation>(NAMESPACE)
         .create(
             &meta(FLEET_DESIGNATION_NAME),
-            &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
+            &FleetDesignationSpec { reach: Default::default(), fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
         )
         .await
         .expect("designation");

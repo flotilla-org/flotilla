@@ -1315,6 +1315,8 @@ impl DockerEnvironmentProvider {
             receives_host_tools: true,
             per_vessel: true,
             egress_route: super::EgressRoute::Open,
+            // Vessels share the controlling host's network view.
+            reach_ways: vec![flotilla_protocol::reach::ReachWay::HostNetwork],
             ..Default::default()
         }
     }

@@ -63,6 +63,7 @@ impl Binding for EnvironmentBinding {
                     lifetime_cap_seconds: cloud.lifetime_cap_seconds,
                     env: stored_env(&cloud.env),
                     probe_needs: cloud.probe_needs.clone(),
+                    reach: cloud.reach.clone(),
                 };
                 recipe.validate(image_build.as_ref())?;
                 (Recipe::of(&recipe)?, image_build)

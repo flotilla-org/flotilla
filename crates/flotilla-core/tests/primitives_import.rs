@@ -654,7 +654,12 @@ async fn named_designation_imports_fleet_role_messages() {
         .definitions::<FleetDesignation>("flotilla")
         .apply(
             &InputMeta::builder().name("fleet".into()).build(),
-            &FleetDesignationSpec { fleet: Some("lab".into()), project: "project-map".into(), image_cache: None },
+            &FleetDesignationSpec {
+                reach: Default::default(),
+                fleet: Some("lab".into()),
+                project: "project-map".into(),
+                image_cache: None,
+            },
         )
         .await
         .expect("designation");

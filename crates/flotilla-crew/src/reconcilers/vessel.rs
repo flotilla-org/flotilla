@@ -29,7 +29,7 @@ use flotilla_resources::{
     CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
-use flotilla_resources::{realisation_settings, BRIEF_ARTIFACTS_ANNOTATION};
+use flotilla_resources::{reach::ReachDestination, realisation_settings, BRIEF_ARTIFACTS_ANNOTATION};
 use flotilla_store::{
     controller::{delete_lifecycle_owned_matching, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     ReplicaReadResolver, ResourceBackend, TypedResolver,
@@ -788,7 +788,7 @@ impl VesselReconciler {
                             .filter(|need| need.requires_guest_probe())
                             .cloned()
                             .collect();
-                        let spec = match cloud_environment_spec(&placement, image, probe_needs, &required_adapters) {
+                        let spec = match cloud_environment_spec(&placement, image, probe_needs, &required_adapters, &requirement.reach) {
                             Ok(spec) => spec,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
@@ -1813,6 +1813,7 @@ fn cloud_environment_spec(
     image: &Option<PlacementImageSource>,
     probe_needs: BTreeSet<flotilla_resources::CapabilityNeed>,
     required_adapters: &BTreeSet<String>,
+    reach: &BTreeSet<ReachDestination>,
 ) -> Result<EnvironmentSpec, String> {
     let instance = placement
         .instance
@@ -1829,6 +1830,7 @@ fn cloud_environment_spec(
     Ok(EnvironmentSpec {
         provider_address: Some(address),
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+            reach: reach.clone(),
             image,
             image_build_ref,
             size,
@@ -2330,12 +2332,13 @@ mod tests {
         .unwrap();
         let needs: BTreeSet<flotilla_resources::CapabilityNeed> = ["toolchain:rust".parse().unwrap()].into_iter().collect();
         let unfrozen = Placement { kind: kind.clone(), instance: None };
-        assert!(cloud_environment_spec(&unfrozen, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new())
+        assert!(cloud_environment_spec(&unfrozen, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new(), &BTreeSet::new())
             .unwrap_err()
             .contains("names no provider instance"));
         let placement = Placement { kind, instance: Some("daytona".into()) };
         let spec =
-            cloud_environment_spec(&placement, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new()).expect("a typed spec");
+            cloud_environment_spec(&placement, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new(), &BTreeSet::new())
+                .expect("a typed spec");
         assert!(spec.docker.is_none() && spec.host_direct.is_none());
         assert_eq!(spec.provider_address.unwrap().to_string(), "account:daytona/provider:daytona");
         assert_eq!(
@@ -2352,8 +2355,8 @@ mod tests {
         sized_kind.spec.realisation =
             FulfilmentRealisation::CloudSandboxPerVessel { image: Some("image@sha256:digest".into()), size: Some(policy_size.clone()) };
         let sized = Placement { kind: sized_kind, instance: Some("daytona".into()) };
-        let spec =
-            cloud_environment_spec(&sized, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new()).expect("a typed spec");
+        let spec = cloud_environment_spec(&sized, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new(), &BTreeSet::new())
+            .expect("a typed spec");
         let cloud = spec.cloud_sandbox.unwrap();
         assert_eq!(cloud.size, policy_size);
         assert_eq!((cloud.image.as_str(), cloud.image_build_ref), ("image@sha256:digest", None), "a literal resolves now");
@@ -2380,10 +2383,13 @@ mod tests {
         }))
         .unwrap();
         let placement = Placement { kind, instance: Some("daytona".into()) };
-        let cloud = cloud_environment_spec(&placement, &Some(built), BTreeSet::new(), &BTreeSet::new()).unwrap().cloud_sandbox.unwrap();
+        let cloud = cloud_environment_spec(&placement, &Some(built), BTreeSet::new(), &BTreeSet::new(), &BTreeSet::new())
+            .unwrap()
+            .cloud_sandbox
+            .unwrap();
         assert_eq!((cloud.image.as_str(), cloud.image_build_ref.as_deref()), ("", Some("image-identity-amd64-registry")));
         assert_eq!(composed_image(&placement, None).map(|image| image.identity), Some("identity".to_string()));
-        assert!(cloud_environment_spec(&placement, &None, BTreeSet::new(), &BTreeSet::new())
+        assert!(cloud_environment_spec(&placement, &None, BTreeSet::new(), &BTreeSet::new(), &BTreeSet::new())
             .unwrap_err()
             .contains("not frozen at admission"));
     }
@@ -2408,7 +2414,7 @@ mod tests {
         let placement = Placement { kind, instance: Some("daytona".into()) };
         let env = |adapters: &[&str]| {
             let adapters = adapters.iter().map(|adapter| adapter.to_string()).collect();
-            cloud_environment_spec(&placement, &Some("image@sha256:digest".into()), BTreeSet::new(), &adapters)
+            cloud_environment_spec(&placement, &Some("image@sha256:digest".into()), BTreeSet::new(), &adapters, &BTreeSet::new())
                 .unwrap()
                 .cloud_sandbox
                 .unwrap()

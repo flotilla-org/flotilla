@@ -469,6 +469,7 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
             .vessels
             .into_iter()
             .map(|task| flotilla_resources::VesselRequirement {
+                reach: Default::default(),
                 name: task.name,
                 depends_on: task.depends_on,
                 repository_refs: task.repository_refs,

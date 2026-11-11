@@ -4,6 +4,7 @@ use flotilla_resources::{normalize_project_spec, CapabilityNeed, Platform, Proje
 
 fn project_with_matrix(platforms: &[&str]) -> ProjectSpec {
     ProjectSpec {
+        reach: Default::default(),
         image: None,
         charter: None,
         role_definitions: BTreeMap::new(),

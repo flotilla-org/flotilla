@@ -30,6 +30,7 @@ impl Resource for Project {
         spec: &Self::Spec,
         siblings: &[ResourceObject<Self>],
     ) -> Result<(), ResourceError> {
+        crate::reach::validate_declared(&spec.reach).map_err(ResourceError::invalid)?;
         let mut declared =
             siblings.iter().map(|object| (object.metadata.name.clone(), object.spec.parent.clone())).collect::<BTreeMap<_, _>>();
         declared.insert(meta.name.clone(), spec.parent.clone());
@@ -99,6 +100,11 @@ pub struct ProjectSpec {
     /// defaults; a project layer at `.flotilla/image/` is included regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<crate::ImageSelection>,
+    /// Destinations this project's vessels must reach that nothing they are
+    /// given names (#4299). Previous-generation Projects omit it.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reach: Vec<crate::reach::ReachDestination>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -681,6 +687,7 @@ mod tests {
     #[test]
     fn dispatch_policy_rejects_zero_staleness_threshold() {
         let spec = ProjectSpec {
+            reach: Default::default(),
             charter: None,
             role_definitions: BTreeMap::new(),
             charter_prose: BTreeMap::new(),
@@ -722,6 +729,7 @@ mod tests {
             default_branch: None,
         };
         let spec = ProjectSpec {
+            reach: Default::default(),
             charter: None,
             role_definitions: BTreeMap::new(),
             charter_prose: BTreeMap::new(),

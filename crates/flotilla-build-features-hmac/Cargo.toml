@@ -12,6 +12,7 @@ digest = { version = "0.10", features = ["mac", "oid", "std"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
 hmac = { version = "0.12", default-features = false, features = ["reset"] }
 subtle = { version = "2" }
+typenum = { version = "1", features = ["const-generics"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [dependencies]
