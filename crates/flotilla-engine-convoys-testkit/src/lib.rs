@@ -13,8 +13,8 @@ use flotilla_resources::{
     lifecycle_reads::{LifecycleReads, ProvisioningKind},
     terminal_records::TerminalRecords,
     vessel_records::VesselRecords,
-    Clock, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, ObjectMeta, ResourceObject, Selector,
-    VesselRequirement, WorkflowSnapshot,
+    Clock, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, ObjectMeta, ResourceObject, Selector, VesselRequirement,
+    WorkflowSnapshot,
 };
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::{ConvoyViews, ResourceBackend};

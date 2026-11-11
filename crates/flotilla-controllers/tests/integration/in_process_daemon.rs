@@ -161,7 +161,8 @@ async fn launch_convoy(
     }
     let phase = status.phase;
     let path = daemon.convoy_engine_path();
-    let launch = flotilla_engine_convoys_testkit::launch(&path, flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, status)).await;
+    let launch =
+        flotilla_engine_convoys_testkit::launch(&path, flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, status)).await;
     if matches!(phase, ConvoyPhase::Landing | ConvoyPhase::Landed) {
         let convoy = daemon.resource_backend().using::<ResourceConvoy>("flotilla").get(&launch).await.expect("launched convoy");
         if phase == ConvoyPhase::Landed {
@@ -1590,10 +1591,7 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
     let origin = authority.node_id().clone();
     let convoys = authority.resource_backend().using::<ResourceCheckout>("flotilla");
     convoys
-        .create(
-            &InputMeta::builder().name("remote-checkout".to_string()).build(),
-            &observed_checkout("wf"),
-        )
+        .create(&InputMeta::builder().name("remote-checkout".to_string()).build(), &observed_checkout("wf"))
         .await
         .expect("create checkout at authority");
     let snapshot = convoys.list().await.expect("authority snapshot");
@@ -1703,10 +1701,7 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
 
     let local = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
     local
-        .create(
-            &InputMeta::builder().name("orphaned-checkout".to_string()).build(),
-            &observed_checkout("wf"),
-        )
+        .create(&InputMeta::builder().name("orphaned-checkout".to_string()).build(), &observed_checkout("wf"))
         .await
         .expect("create authority record");
     let authority_snapshot = local.list().await.expect("list authority record");
@@ -1808,10 +1803,7 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
     let fixture_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let fixture = fixture_backend.using::<ResourceCheckout>("flotilla");
     fixture
-        .create(
-            &InputMeta::builder().name("lost-at-authority".to_string()).build(),
-            &observed_checkout("wf"),
-        )
+        .create(&InputMeta::builder().name("lost-at-authority".to_string()).build(), &observed_checkout("wf"))
         .await
         .expect("create stale source object");
     let stale_snapshot = fixture.list().await.expect("snapshot stale source object");
@@ -2033,17 +2025,11 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
     let _engine = install_engine_reads(&daemon);
     let convoys = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
     let created = convoys
-        .create(
-            &InputMeta::builder().name("watched-checkout".to_string()).build(),
-            &observed_checkout("wf"),
-        )
+        .create(&InputMeta::builder().name("watched-checkout".to_string()).build(), &observed_checkout("wf"))
         .await
         .expect("create checkout");
     let ignored = convoys
-        .create(
-            &InputMeta::builder().name("ignored-checkout".to_string()).build(),
-            &observed_checkout("ignored-wf"),
-        )
+        .create(&InputMeta::builder().name("ignored-checkout".to_string()).build(), &observed_checkout("ignored-wf"))
         .await
         .expect("create ignored checkout");
 
@@ -2094,11 +2080,7 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
 
     let updated_spec = observed_checkout("wf-v2");
     convoys
-        .update(
-            &InputMeta::from(&ignored.metadata),
-            &ignored.metadata.resource_version,
-            &observed_checkout("ignored-wf-v2"),
-        )
+        .update(&InputMeta::from(&ignored.metadata), &ignored.metadata.resource_version, &observed_checkout("ignored-wf-v2"))
         .await
         .expect("update ignored checkout");
     convoys
@@ -5738,10 +5720,9 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
     // so the convoy, fail. Status is derived on the engine (#3108), so this is the vessel's step.
     let work_message = "agent adapter claude cannot realize contained stance";
     let vessel = engine.vessels.request(&record_name, "work", "host");
-    engine.vessels.step(
-        &vessel,
-        flotilla_resources::vessel_records::VesselStep::Failed { cause: work_message.to_string(), retryable: false },
-    );
+    engine
+        .vessels
+        .step(&vessel, flotilla_resources::vessel_records::VesselStep::Failed { cause: work_message.to_string(), retryable: false });
 
     let result = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
