@@ -539,7 +539,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
             )
             .expect("record observed absence of a change request");
     }
-    record_successful_empty_branch_scan(&backend, &crew_record).await;
+    record_successful_empty_branch_scan(&daemon, &crew_record).await;
     // This recovery fixture's reviewer has no promises, so only the operator's forced completion
     // ends its part.
     assert_eq!(

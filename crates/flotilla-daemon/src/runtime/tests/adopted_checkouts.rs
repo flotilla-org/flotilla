@@ -124,7 +124,7 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
     })
     .await;
 
-    record_successful_empty_branch_scan(&backend, &adopted_record).await;
+    record_successful_empty_branch_scan(&daemon, &adopted_record).await;
     let complete_id = daemon
         .execute(
             Command::builder()

@@ -55,7 +55,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
         .with_terminals(Arc::clone(&engine.terminals.terminals) as _)
         .with_vessels(Arc::clone(&vessels.vessels) as _),
     );
-    daemon.install_lifecycle_reads(reads).expect("engine reads");
+    daemon.install_lifecycle_reads(Arc::clone(&reads)).expect("engine reads");
     let clone_path = temp.path().join("clone").display().to_string();
     engine.environments.put_ready(
         "host-direct-test",
@@ -75,20 +75,40 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     flotilla_store::ensure_repository(&backend.using::<Repository>(NAMESPACE), &repository_key, &repository_spec)
         .await
         .expect("repository");
-    let convoy = backend
-        .using::<Convoy>(NAMESPACE)
-        .create(
-            &InputMeta::builder()
-                .name("clone-failure-convoy".to_string())
-                .labels(BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "clone-failure-convoy".to_string())]))
-                .build(),
-            &ConvoySpec::builder()
-                .workflow_ref("missing-workflow".to_string())
-                .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "clone-failure-checkout".to_string())]))
-                .build(),
-        )
-        .await
-        .expect("convoy");
+    // The convoy, admitted with its adopted checkout.
+    let status = ConvoyStatus {
+        observed_workflow_ref: Some("missing-workflow".into()),
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+            vessels: vec![VesselRequirement::builder()
+                .name("work".into())
+                .repository_refs(vec![repository_key.clone()])
+                .crew(vec![CrewSpec::builder()
+                    .role("shell".into())
+                    .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("shell")])
+                    .source(CrewSource::Tool { command: "true".into() })
+                    .build()])
+                .build()],
+        }),
+        ..Default::default()
+    };
+    let spec = ConvoySpec::builder()
+        .workflow_ref("missing-workflow".to_string())
+        .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "clone-failure-checkout".to_string())]))
+        .build();
+    // The convoys are on the clones' store too, so the checkout's holder is open where it is held.
+    let convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
+        &engine.service,
+        NAMESPACE,
+        &backend,
+        Arc::new(flotilla_resources::SystemClock),
+        Arc::clone(&reads),
+    );
+    let convoy = convoys.launch(flotilla_engine_convoys_testkit::convoy(NAMESPACE, "clone-failure-convoy", spec, status)).await;
     let launch = engine
         .clones
         .request(
@@ -102,9 +122,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
             false,
         )
         .expect("clone request");
-    // The convoy's checkout, held for its engine Convoy, made from the clone.
-    let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
-    engine.checkouts.admit_for(&backend, NAMESPACE, &engine_convoy, &convoy.metadata.name).await;
+    // The convoy's checkout, held for its launch, made from the clone.
     engine.checkouts.request(
         "clone-failure-checkout",
         &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
@@ -115,7 +133,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
             target_path: temp.path().join("checkout").display().to_string(),
             clone_ref: launch.clone(),
         }),
-        Some(&engine.checkouts.holder(&engine_convoy)),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy.clone())),
     );
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -135,7 +153,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
             Command::builder()
                 .action(CommandAction::QueryExplainConvoy {
                     namespace: Some(NAMESPACE.to_string()),
-                    name: "clone-failure-convoy".to_string(),
+                    name: convoy.clone(),
                 })
                 .build(),
             uuid::Uuid::new_v4(),

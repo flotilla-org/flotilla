@@ -1876,24 +1876,30 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
 async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause() {
     let (_tmp, daemon) = empty_daemon().await;
     let home = HostName::new("feta");
-    apply_convoy_replica_feed(&daemon, "flotilla", "stranded", home.clone()).await;
-    let replica_fixture = ResourceBackend::new(InMemoryBackend::default());
-    replica_fixture
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("stranded".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
-        )
-        .await
-        .expect("create replica fixture");
-    let replica_snapshot = replica_fixture.using::<Convoy>("flotilla").list().await.expect("list replica fixture");
-    let last_seen_at = chrono::DateTime::parse_from_rfc3339("2026-08-21T12:34:56Z").expect("fixed timestamp").with_timezone(&chrono::Utc);
-    daemon
-        .resource_backend()
-        .replica_writer::<Convoy>(node("feta"), "flotilla")
-        .replace(&replica_snapshot, last_seen_at)
-        .await
-        .expect("seed last-seen replica");
+    // Feta's launch, last seen when it was admitted there.
+    let decided = daemon.decided_store().expect("decided store");
+    let feta = flotilla_provisioning_testkit::other_home_for(&decided, "feta");
+    let feta_convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
+        feta.service(),
+        "flotilla",
+        &ResourceBackend::new(InMemoryBackend::default()),
+        Arc::new(flotilla_resources::SystemClock),
+        daemon.lifecycle_reads(),
+    );
+    let stranded = feta_convoys
+        .launch(flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "stranded",
+            ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        ))
+        .await;
+    feta.replicate_to(&decided);
+    apply_convoy_replica_feed(&daemon, "flotilla", &stranded, home.clone()).await;
+    let replica = daemon.resource_backend().including_replicas::<Convoy>("flotilla").get(&stranded).await.expect("feta's launch");
+    let flotilla_resources::ResourceProvenance::Replica { last_synced_at: last_seen_at, .. } = replica.provenance else {
+        panic!("feta's launch is a replica here")
+    };
     daemon
         .publish_peer_summary(
             HostSummary::builder()
@@ -1917,17 +1923,25 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
     let message = remote_command_router
         .dispatch_execute(
             Command::builder()
-                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: "stranded".to_string(), force: true })
+                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: stranded.clone(), force: true })
                 .build(),
         )
         .await
         .expect_err("failed peer send should reject dispatch");
 
+    // Last seen is when feta's launch reached here, whichever read of it the router made.
+    let (seen, rest) = message
+        .strip_prefix(&format!("convoy flotilla/{stranded} is homed at feta, last seen "))
+        .and_then(|rest| rest.split_once("; "))
+        .unwrap_or_else(|| panic!("{message}"));
+    let seen = chrono::DateTime::parse_from_rfc3339(seen).unwrap_or_else(|error| panic!("{message}: {error}"));
+    assert!((seen.with_timezone(&chrono::Utc) - last_seen_at).num_seconds().abs() < 5, "{message}");
     assert_eq!(
-        message,
-        "convoy flotilla/stranded is homed at feta, last seen 2026-08-21T12:34:56+00:00; home is unreachable: \
-         connect to feta at ssh://feta.example: outbound channel closed. Break glass: flotilla resource delete convoys stranded \
-         --namespace flotilla --host feta"
+        rest,
+        format!(
+            "home is unreachable: connect to feta at ssh://feta.example: outbound channel closed. Break glass: flotilla resource \
+             delete convoys {stranded} --namespace flotilla --host feta"
+        )
     );
 }
 
@@ -5106,7 +5120,7 @@ impl flotilla_discovery_api::Factory for GatedStartupEnvironmentFactory {
 #[tokio::test]
 async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() {
     use flotilla_resources::{
-        ConvoyPhase, ConvoyStatus, CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
+        ConvoyStatus, CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
         CredentialSpec, CredentialSpecSpec, VesselRequirement, WorkflowSnapshot,
     };
 

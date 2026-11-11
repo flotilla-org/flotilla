@@ -58,7 +58,10 @@ impl CommandRunner for Stage4aGitRunner {
 #[async_trait]
 impl CommandRunner for NoPrProcessRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-        if cmd == "gh" {
+        if cmd == "gh" && args.ends_with(&["--jq", ".default_branch"]) {
+            // The forge names its default branch.
+            Ok("main\n".to_string())
+        } else if cmd == "gh" {
             Ok("[]".to_string())
         } else {
             ProcessCommandRunner.run(cmd, args, cwd, label).await
@@ -145,52 +148,32 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     flotilla_store::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_key, &repository_spec)
         .await
         .expect("repository create should succeed");
-    backend
-        .clone()
-        .using::<Convoy>(NAMESPACE)
-        .create(
-            &InputMeta::builder()
-                .name("convoy-a".to_string())
-                .labels(BTreeMap::from([
-                    (flotilla_resources::PROJECT_LABEL.to_string(), "test".to_string()),
-                    (flotilla_resources::ROLE_LABEL.to_string(), "convoy-a".to_string()),
-                    (flotilla_resources::GENERATION_LABEL.to_string(), "1".to_string()),
-                ]))
+    let mut rx = daemon.subscribe();
+    let create_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "convoy-a".to_string(),
+                    workflow_ref: "wf-a".to_string(),
+                    inputs: Vec::new(),
+                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
+                    r#ref: Some("stage4a-work".to_string()),
+                    project_ref: None,
+                    placement_policy: Some(format!("host-direct-{host_id}")),
+                    adopted_checkout: None,
+                })
                 .build(),
-            &ConvoySpec {
-                continuation: None,
-                subjects: Vec::new(),
-                role: "convoy-a".to_string(),
-                generation: 1,
-                workflow_ref: "wf-a".to_string(),
-                dispatching_principal_ref: Default::default(),
-                inputs: BTreeMap::new(),
-                placement_policy: Some(format!("host-direct-{host_id}")),
-                repositories: vec![ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/flotilla.git".to_string(),
-                    repo_ref: repository_key,
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: repository_spec.leaf_slug(),
-                    subpaths: Vec::new(),
-                }],
-                r#ref: Some("stage4a-work".to_string()),
-                project_ref: Some("test".to_string()),
-                adopted_checkout_refs: BTreeMap::new(),
-                issues: Vec::new(),
-                change_request: None,
-                instruction: None,
-                promises: Vec::new(),
-            },
         )
         .await
-        .expect("convoy create should succeed");
+        .expect("convoy create command should start");
+    assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "convoy-a".to_string() });
+    let convoy_name = convoy_record_name(&backend, "convoy-a").await;
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let run_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if matches!(
-            convoys.get("convoy-a").await.ok().and_then(|convoy| convoy.status).as_ref(),
+            convoys.get(&convoy_name).await.ok().and_then(|convoy| convoy.status).as_ref(),
             Some(status)
                 if status.phase == ConvoyPhase::Active
                     && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
@@ -198,7 +181,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
             break;
         }
         if tokio::time::Instant::now() >= run_deadline {
-            let convoy = convoys.get("convoy-a").await.expect("convoy should exist");
+            let convoy = convoys.get(&convoy_name).await.expect("convoy should exist");
             let workspace = backend.clone().using::<Vessel>(NAMESPACE).list().await.expect("workspace list should succeed");
             panic!("convoy did not reach running state: convoy={convoy:?} vessels={workspace:?}");
         }
@@ -213,10 +196,10 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     let launch = daemon
         .lifecycle_reads()
         .vessels()
-        .and_then(|vessels| vessels.of_convoy("convoy-a"))
+        .and_then(|vessels| vessels.of_convoy(&convoy_name))
         .expect("convoy launches")
         .into_iter()
-        .find(|launch| launch.launch_of == "convoy-a-implement" && !launch.ended())
+        .find(|launch| launch.work() == "implement" && !launch.ended())
         .expect("the work's launch")
         .name;
     let sqlite_path = config.state_dir().as_path().join("resources.sqlite");
@@ -239,7 +222,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
 
     let teardown_checkout_path = if matches!(completion_action, CompletionAction::Delete) {
         // The convoy's checkout, held for the launch its record names.
-        let convoy = convoys.get("convoy-a").await.expect("convoy");
+        let convoy = convoys.get(&convoy_name).await.expect("convoy");
         let holder = flotilla_resources::convoy::engine::checkout_holder(&convoy).expect("held for its launch");
         let checkout = daemon
             .lifecycle_reads()
@@ -262,12 +245,12 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         None
     };
 
-    record_successful_empty_branch_scan(&backend, "convoy-a").await;
+    record_successful_empty_branch_scan(&daemon, &convoy_name).await;
     daemon
         .execute(
             Command::builder()
                 .action(CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-a@test".to_string(),
+                    convoy: "convoy-a".to_string(),
                     work: "implement".to_string(),
                     message: Some(match completion_action {
                         CompletionAction::Delete => "https://github.com/flotilla-org/flotilla/pull/884".to_string(),
@@ -284,9 +267,10 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
 
     wait_until(|| {
         let convoys = convoys.clone();
+        let convoy_name = convoy_name.clone();
         async move {
             matches!(
-                convoys.get("convoy-a").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                convoys.get(&convoy_name).await.ok().and_then(|convoy| convoy.status).as_ref(),
                 Some(status)
                     if status.phase == ConvoyPhase::Landed
                         && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
@@ -301,13 +285,14 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         wait_until(|| {
             let convoys = convoys.clone();
             let checkout_path = checkout_path.clone();
+            let convoy_name = convoy_name.clone();
             let released = reads
                 .vessels()
                 .and_then(|vessels| vessels.get(&launch, None))
                 .is_ok_and(|record| record.is_some_and(|record| record.ended()));
             async move {
                 convoys
-                    .get("convoy-a")
+                    .get(&convoy_name)
                     .await
                     .ok()
                     .and_then(|convoy| convoy.status)
@@ -340,9 +325,10 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     }
 }
 
-pub(super) async fn record_successful_empty_branch_scan(backend: &ResourceBackend, convoy: &str) {
-    flotilla_store::apply_status_patch(
-        &backend.clone().using::<Convoy>(NAMESPACE),
+pub(super) async fn record_successful_empty_branch_scan(daemon: &InProcessDaemon, convoy: &str) {
+    flotilla_store::note_convoy(
+        &daemon.convoy_engine_path(),
+        &daemon.resource_backend().using::<Convoy>(NAMESPACE),
         convoy,
         &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: chrono::Utc::now() },
     )
