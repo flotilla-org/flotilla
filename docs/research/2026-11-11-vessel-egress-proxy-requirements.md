@@ -52,7 +52,7 @@ What these imply for the requirements that follow. Each is derived here, not rul
 
 ## Decisions from the grill, 2026-11-11
 
-Ten questions were settled with the owner on 2026-11-11. The rows below have been updated to match; the last column names them.
+Seventeen decisions, R1 to R17, were settled with the owner on 2026-11-11. The rows below have been updated to match; the last column names them.
 
 | ID | Decision | Supersedes or settles |
 | --- | --- | --- |
@@ -84,7 +84,7 @@ Still to verify by test:
 
 ## A. Shape, placement and control plane
 
-The proxy is a separate, shareable process that takes its whole state declaratively from flotilla. The engine is the one item here with contradictory rulings (conflict X1). Issue links are in the source index at the end.
+The proxy is a separate, shareable process that takes its whole state declaratively from flotilla. The engine, once contradictory (X1), is settled by R14. Issue links are in the source index at the end.
 
 | ID | Requirement | Status | Source |
 | --- | --- | --- | --- |
@@ -104,7 +104,7 @@ The proxy is a separate, shareable process that takes its whole state declarativ
 
 ## B. Identity, bindings, leases and revocation
 
-The proxy must know which vessel and which session binding a connection belongs to, keep that account selection sticky, and keep serving for a bounded lease when the control plane is unreachable. Two rulings on where vessel identity comes from disagree (conflict X2).
+The proxy must know which vessel and which session binding a connection belongs to, keep that account selection sticky, and keep serving for a bounded lease when the control plane is unreachable. Where vessel identity comes from, once disputed (X2), is settled by R3.
 
 | ID | Requirement | Status | Source |
 | --- | --- | --- | --- |
@@ -129,7 +129,7 @@ The proxy must know which vessel and which session binding a connection belongs 
 
 ## C. Credentials, injection and refresh
 
-In proxy mode the vessel holds placeholders and the proxy attaches real tokens; exactly one owner refreshes each upstream session and every proxy only consumes. How material reaches the proxy is the main open item (gap G2).
+In proxy mode the vessel holds placeholders and the proxy attaches real tokens; exactly one owner refreshes each upstream session and every proxy only consumes. How material reaches the proxy is settled by R5, R6 and R7.
 
 | ID | Requirement | Status | Source |
 | --- | --- | --- | --- |
@@ -165,10 +165,10 @@ The proxy must behave as the upstream drydock's vessel agent already expects: an
 | D2 | The agent sends `CONNECT host:port HTTP/1.1` with a `Host` header and nothing else. The proxy answers a final 2xx directly, with no interim 1xx, within 30 s and with a head under 16 KiB. | Decided, built | drydock#52; `drydock-agent/src/egress.rs:162-199` |
 | D3 | A refusal is a non-2xx status carrying a `Proxy-Status` header (RFC 9209) that names the policy. Unknown targets need an explicit terminal refusal so they return 403, not 404. | Decided, built; 403 is a lesson | `egress.rs:144-160`; `fetch.rs:638-639`; #3593 |
 | D4 | TLS handling is per destination: Inspect, Tunnel or Deny. MITM happens only where explicitly configured. An Inspect failure never falls back to Tunnel. | Decided | #3312 body |
-| D5 | Which destinations are intercepted. Three rulings disagree; see X3. | Conflict | ADR 0069 via #3478 Q3; #3263 revision; #3312 body |
+| D5 | Interception is per destination, only where explicitly configured, initially for credential injection. This settles X3; see D4 and N11. | Decided (owner, 2026-11-11) | ADR 0069 via #3478 Q3; #3263 revision; #3312 body |
 | D6 | The controller supplies the complete combined PEM trust bundle, public roots included, and the proxy's CA must be in it. The CA and `HTTPS_PROXY` variables are set on every launched process, but capture does not depend on them. | Decided, built | drydock#52; #3487; agent README 588-595 |
 | D7 | The agent answers DNS locally with fake addresses from 198.18.0.0/15 and asks the proxy by hostname. The proxy does the real lookup and applies policy. | Decided, built | #3478 Q1 and Q2; `egress.rs:47-136` |
-| D8 | The deny check runs after resolution: no private, metadata or loopback address, and no bare-IP CONNECT. This needs a custom connector. Bare IPs later became a policy choice (#3263 revision). | Proposed | #3477 §4.7 |
+| D8 | Superseded by R17 (see E3): the check runs after resolution, a private or loopback address is refused unless the destination is named, and the metadata address is always refused. It still needs a custom connector. | Superseded (R17) | #3477 §4.7 |
 | D9 | The proxy will see CONNECT authorities that are hostnames, numeric IPv4 or bracketed IPv6, on any port, including private and loopback targets. | Decided, built | `egress.rs:126-135`; agent README 625-629 |
 | D10 | Connections arrive as outward-forward streams over the agent link, which the controller claims within 30 s and splices to a per-vessel host endpoint: a Unix path or a numeric TCP address. | Decided, built | `drydock-agent/src/streams.rs:117-200`; `client.rs:783` |
 | D11 | Explicit-proxy traffic from `HTTPS_PROXY` clients arrives on the same endpoint under the same policy, with the client's own headers unchanged. | Decided, built | #3478 Q1; `egress.rs:660-665` |
@@ -180,11 +180,11 @@ The proxy must behave as the upstream drydock's vessel agent already expects: an
 | D17 | Capture is Linux-only and needs `CAP_NET_ADMIN`, an `nft` binary and a route. Elsewhere only the explicit-proxy route can apply. Guest root can undo capture, so enforcement must sit outside the guest. | Decided, built | agent README 597-619; drydock#52 |
 | D18 | Proxy features: absolute-URI forwarding for plain HTTP, certificates minted per SNI, streaming both ways without buffering, WebSocket upgrades inside CONNECT, h2 over ALPN, and a generous listen backlog. | Proposed | #3477 §4 |
 | D19 | Removing a listener must leave open CONNECT sessions a long enough drain. In the Envoy experiment 3 s cut a stream and 15 s did not. | Proposed (lesson) | #3593; #3312 ruling comment |
-| D20 | How non-HTTP TCP such as SSH is allowed, refused or logged; see X8. | Conflict | #3477; #3478 Q1 |
+| D20 | Non-HTTP TCP such as SSH is allowed at first and restrictable later (X8). How it is logged or credentialed is not ruled. | Provisional (owner, 2026-11-11) | #3477; #3478 Q1 |
 
 ## E. Egress policy, reach, placement and enforcement
 
-Egress policy is data chosen per project or charter, built from a reach set frozen at admission, and enforced by the proxy plus whatever the environment kind can enforce outside the guest. The shipped default (X4), first-version policy depth (X5), private destinations (X6) and registries (X7) each have conflicting rulings.
+Egress policy is data chosen per project or charter, built from a reach set frozen at admission, and enforced by the proxy plus whatever the environment kind can enforce outside the guest. The shipped default (X4), first-version policy depth (X5), private destinations (X6) and registries (X7) once had conflicting rulings; all four are settled, and the rows state the outcome.
 
 | ID | Requirement | Status | Source |
 | --- | --- | --- | --- |
@@ -252,7 +252,7 @@ A proxy for drydock's own calls to sandbox vendors is a brainstorm with nothing 
 | M11 | Dial reach traffic does not pass through drydockd, so neither replay nor a drydockd-side proxy covers it. | Decided as a limit | drydock#333; drydock#230 |
 | M12 | Module hosts become clients of the same proxy later. Kept possible now by two things: injection can target any header name, and per-request spans carry the client and its label, nothing vessel-specific (R15). Recording for replay stays with drydock#333. | Decided (R15) | Owner, 2026-11-11 |
 
-## Conflicts that need an owner ruling
+## Conflicts between rulings, and how they were settled
 
 Of eight contradictions, the owner resolved five on 2026-11-11 and X8 provisionally. X1 (engine) and X5 (policy depth) were settled in the grill (R14, R13). The last column records the response.
 
