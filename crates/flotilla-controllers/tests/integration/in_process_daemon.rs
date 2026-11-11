@@ -5275,38 +5275,25 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
     let backend = daemon.resource_backend();
     let repo_ref = RepositoryKey("repo-a".to_string());
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name("merged-deleted-branch".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder()
-                .workflow_ref("implement-review".to_string())
-                .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
-                    .url("https://github.com/owner/repo".to_string())
-                    .repo_ref(repo_ref.clone())
-                    .source_ref("main".to_string())
-                    .target_ref("main".to_string())
-                    .workspace_slug("repo".to_string())
-                    .subpaths(Vec::new())
-                    .build()])
-                .build(),
-        )
-        .await
-        .expect("create convoy");
-    let mut status = flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() };
-    status.work.insert(
-        "work".to_string(),
-        WorkState {
-            phase: WorkPhase::Complete,
-            placement: Some(flotilla_resources::PlacementStatus {
-                fields: BTreeMap::from([(
-                    "checkout_refs".to_string(),
-                    serde_json::json!(BTreeMap::from([(repo_ref.clone(), "merged-checkout".to_string())])),
-                )]),
-            }),
-            ..WorkState::builder().phase(WorkPhase::Complete).build()
-        },
-    );
-    let convoy = convoys.update_status("merged-deleted-branch", &convoy.metadata.resource_version, &status).await.expect("mark landed");
+    // The convoy landed on the engine (#3108); its work's checkout is held for the launch.
+    let launch = launch_convoy(
+        &daemon,
+        "merged-deleted-branch",
+        flotilla_resources::ConvoySpec::builder()
+            .workflow_ref("implement-review".to_string())
+            .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
+                .url("https://github.com/owner/repo".to_string())
+                .repo_ref(repo_ref.clone())
+                .source_ref("main".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("repo".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .build(),
+        flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+    )
+    .await;
+    let convoy = convoys.get(&launch).await.expect("landed convoy");
     // The forge observed change request 127 merged.
     let record_name = cr_name("github.com", "owner/repo", 127);
     let changes = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
@@ -5356,7 +5343,7 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
             target_path: "/tmp/merged-checkout".to_string(),
             clone_ref: "clone-test".to_string(),
         }),
-        holder: Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy("merged-deleted-branch".to_string())),
+        holder: Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy(launch.clone())),
         requested_at: now,
         reading: flotilla_protocol::LifecycleReading::Ready { identity: "/tmp/merged-checkout".to_string() },
         degraded: None,
@@ -5429,48 +5416,44 @@ async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_st
     let backend = daemon.resource_backend();
     let repo_ref = RepositoryKey("repo-a".to_string());
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name("landed-missing-status".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder()
-                .workflow_ref("implement-review".to_string())
-                .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
-                    .url("https://github.com/owner/repo".to_string())
-                    .repo_ref(repo_ref.clone())
-                    .source_ref("main".to_string())
-                    .target_ref("main".to_string())
-                    .workspace_slug("repo".to_string())
-                    .subpaths(Vec::new())
-                    .build()])
-                .build(),
+    // The convoy lands on the engine (#3108) once its crew has linked what it produced; its
+    // work's checkout is held for the launch.
+    let launch = launch_convoy(
+        &daemon,
+        "landed-missing-status",
+        flotilla_resources::ConvoySpec::builder()
+            .workflow_ref("implement-review".to_string())
+            .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
+                .url("https://github.com/owner/repo".to_string())
+                .repo_ref(repo_ref.clone())
+                .source_ref("main".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("repo".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .build(),
+        Default::default(),
+    )
+    .await;
+    // The crew's claim linked the change request it produced.
+    let engine_path = daemon.convoy_engine_path();
+    let engine = engine_path.get().expect("the engine Convoy path");
+    let launched = convoys.get(&launch).await.expect("launched convoy");
+    engine
+        .link(
+            &launched,
+            &flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: IssueSource { service: "github.com".to_string(), scope: "owner/repo".to_string() },
+                id: "42".to_string(),
+            },
+            flotilla_resources::SubjectDiscoverySource::Claim,
+            "crew",
         )
         .await
-        .expect("create convoy");
-    let mut status = flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() };
-    status.discover_subject(
-        flotilla_protocol::Subject {
-            kind: flotilla_protocol::SubjectKind::ChangeRequest,
-            source: IssueSource { service: "github.com".to_string(), scope: "owner/repo".to_string() },
-            id: "42".to_string(),
-        },
-        flotilla_protocol::Relationship::Produces,
-        flotilla_resources::SubjectDiscoverySource::Claim,
-        chrono::Utc::now(),
-    );
-    status.work.insert(
-        "work".to_string(),
-        WorkState {
-            phase: WorkPhase::Complete,
-            placement: Some(flotilla_resources::PlacementStatus {
-                fields: BTreeMap::from([(
-                    "checkout_refs".to_string(),
-                    serde_json::json!(BTreeMap::from([(repo_ref.clone(), "missing-status".to_string())])),
-                )]),
-            }),
-            ..WorkState::builder().phase(WorkPhase::Complete).build()
-        },
-    );
-    let convoy = convoys.update_status("landed-missing-status", &convoy.metadata.resource_version, &status).await.expect("mark landed");
+        .expect("link the produced change request");
+    flotilla_engine_convoys_testkit::land(&engine_path, &launched).await;
+    let convoy = convoys.get(&launch).await.expect("landed convoy");
     // The engine holds the checkout, never inspected.
     let target_path = temp.path().join("removed-worktree").display().to_string();
     let checkout = flotilla_resources::checkout_records::CheckoutRecord {
@@ -5484,7 +5467,7 @@ async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_st
             target_path: target_path.clone(),
             clone_ref: "clone-test".to_string(),
         }),
-        holder: Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy("landed-missing-status".to_string())),
+        holder: Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy(launch.clone())),
         requested_at: chrono::Utc::now(),
         reading: flotilla_protocol::LifecycleReading::Ready { identity: target_path },
         degraded: None,
