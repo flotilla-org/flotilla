@@ -869,10 +869,32 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let daemon = in_memory_daemon(Vec::new(), config.clone()).await;
     let env_id = EnvironmentId::new("env-work");
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: vec![VesselRequirement::builder()
+                .name("work".to_string())
+                .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                .build()],
+        }),
+        ..ConvoyStatus::default()
+    };
+    let spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+    let convoy = flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy(NAMESPACE, "credential-work", spec, status),
+    )
+    .await;
     // The work's launch and its live crew, running before this start as the last run's controller left them.
     // Written on its decided store before the runtime starts, as the runtime's engine finds them.
     let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store().expect("decided store"));
-    let vessel = vessels.request("credential-work", "work", daemon.local_host_id().expect("local host").as_str());
+    let vessel = vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
     vessels.ready(&vessel, env_id.as_str());
     create_credential_test_session(&runtime_terminals(&daemon), "live-crew", &vessel, env_id.as_str());
     let runtime = DaemonRuntime::start_with_options(
@@ -924,28 +946,6 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
             Some(passthrough_registry()),
         )
         .expect("adopt test environment");
-    let status = ConvoyStatus {
-        phase: ConvoyPhase::Active,
-        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-            cascade: None,
-            stall_nudges: Default::default(),
-            supervision: None,
-            exit: None,
-            turn_delivery: Default::default(),
-            vessels: vec![VesselRequirement::builder()
-                .name("work".to_string())
-                .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
-                .build()],
-        }),
-        ..ConvoyStatus::default()
-    };
-    let spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
-    flotilla_engine_convoys_testkit::launch(
-        &daemon.convoy_engine_path(),
-        flotilla_engine_convoys_testkit::convoy(NAMESPACE, "credential-work", spec, status),
-    )
-    .await;
     let state = Arc::new(
         ControllerRuntimeState::new(daemon.clone(), config, passthrough_registry(), None, "test-host".into(), "host-direct-test".into())
             .with_credential_store(store.clone()),
