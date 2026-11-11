@@ -921,6 +921,21 @@ async fn daemon_for_plain_dir_with_discovery(discovery: DiscoveryRuntime) -> (te
 async fn daemon_for_plain_dir_with_engine(
     discovery: DiscoveryRuntime,
 ) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, flotilla_provisioning_testkit::EngineFixture) {
+    plain_dir_daemon(discovery, install_engine).await
+}
+
+/// [`daemon_for_plain_dir_with_engine`], its engine over the daemon's decided store: what the
+/// engine writes there wakes the daemon's convoy readers, as at a running daemon.
+async fn daemon_for_plain_dir_with_decided_engine(
+    discovery: DiscoveryRuntime,
+) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, flotilla_provisioning_testkit::EngineFixture) {
+    plain_dir_daemon(discovery, install_decided_engine).await
+}
+
+async fn plain_dir_daemon(
+    discovery: DiscoveryRuntime,
+    install: fn(&InProcessDaemon) -> flotilla_provisioning_testkit::EngineFixture,
+) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, flotilla_provisioning_testkit::EngineFixture) {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
@@ -934,7 +949,7 @@ async fn daemon_for_plain_dir_with_engine(
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let engine = install_engine(&daemon);
+    let engine = install(&daemon);
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     (temp, repo, daemon, engine)
 }
@@ -5671,7 +5686,7 @@ async fn convoy_start_worker_panic_finishes_the_command_and_allows_retry() {
 
 #[tokio::test]
 async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeout() {
-    let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let (temp, _repo, daemon, engine) = daemon_for_plain_dir_with_decided_engine(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&daemon, None).await;
     let mut events = daemon.subscribe();
@@ -5719,47 +5734,14 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
     .await
     .expect("convoy should be persisted");
 
-    let workflow = single_agent_workflow_spec();
-    apply_status_patch(
-        &convoys,
-        &record_name,
-        &convoy_controller_patches::bootstrap(
-            WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: workflow.turn_delivery,
-                vessels: workflow.vessels,
-            },
-            "single-agent".into(),
-            BTreeMap::new(),
-            BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Pending).build())]),
-            BTreeMap::new(),
-            Vec::new(),
-            false,
-            ConvoyPhase::Pending,
-            None,
-        ),
-    )
-    .await
-    .expect("convoy bootstrap patch");
-
+    // The work's vessel fails at the convoy's home, and cannot succeed on a retry: its work, and
+    // so the convoy, fail. Status is derived on the engine (#3108), so this is the vessel's step.
     let work_message = "agent adapter claude cannot realize contained stance";
-    apply_status_patch(
-        &convoys,
-        &record_name,
-        &convoy_controller_patches::roll_up_work("work".into(), WorkPhase::Failed, chrono::Utc::now(), Some(work_message.into())),
-    )
-    .await
-    .expect("work failure patch");
-    apply_status_patch(
-        &convoys,
-        &record_name,
-        &convoy_controller_patches::fail_convoy(BTreeMap::new(), chrono::Utc::now(), Some("convoy bootstrap failed".into())),
-    )
-    .await
-    .expect("convoy failure patch");
+    let vessel = engine.vessels.request(&record_name, "work", "host");
+    engine.vessels.step(
+        &vessel,
+        flotilla_resources::vessel_records::VesselStep::Failed { cause: work_message.to_string(), retryable: false },
+    );
 
     let result = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
