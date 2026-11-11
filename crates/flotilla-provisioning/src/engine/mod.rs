@@ -47,7 +47,7 @@ pub mod image_build;
 pub mod import;
 pub mod kinds;
 pub mod launch_log;
-pub(crate) mod log_cursor;
+pub mod log_cursor;
 pub mod manifest_root;
 pub mod manifest_root_import;
 pub mod observations;

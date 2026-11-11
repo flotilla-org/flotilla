@@ -12,7 +12,7 @@ use flotilla_schema_sqlite::stream::{CommitListener, Committed};
 
 /// A [`ChangeCursor`](flotilla_resources::lifecycle_reads::ChangeCursor) over some kinds in the
 /// decided log at every home the store holds, passed on the caller's thread under the store's lock.
-pub(crate) struct LogCursor<C> {
+pub struct LogCursor<C> {
     reads: super::reads::StoreReads,
     homes: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     follower: Follower,
@@ -24,7 +24,7 @@ pub(crate) struct LogCursor<C> {
 
 impl<C> LogCursor<C> {
     /// Follows `kinds` from each home's current sequence, each followed write told as `change`.
-    pub(crate) fn start(
+    pub fn start(
         reads: super::reads::StoreReads,
         homes: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         kinds: impl IntoIterator<Item = KindCode>,

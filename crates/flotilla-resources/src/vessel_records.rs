@@ -84,6 +84,48 @@ impl VesselRecord {
     pub fn launch_number(&self) -> u64 {
         self.name.rsplit_once('#').and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
     }
+
+    /// The crew agents of `requirement` wanted running (`active`, by crew index) whose session
+    /// stopped, by role, each with the session: its newest launch among `terminals` (every launch
+    /// of each session held for this launch) exited, was lost by its pool or was released, or is
+    /// relaunching. While this launch is ready, any one interrupts it until the next session runs.
+    pub fn interrupted_roles(
+        &self,
+        requirement: &VesselRequirement,
+        terminals: &[TerminalRecord],
+        active: impl Fn(usize) -> bool,
+    ) -> BTreeMap<String, String> {
+        let newest: Vec<TerminalRecord> = crate::terminal_records::newest_launches(terminals.iter().cloned()).into_values().collect();
+        let mut interrupted = BTreeMap::new();
+        for (index, member) in requirement.crew.iter().enumerate() {
+            if !matches!(member.source, CrewSource::Agent { .. }) || !active(index) {
+                continue;
+            }
+            let Some(terminal) = newest.iter().find(|terminal| terminal.role == member.role) else { continue };
+            let stopped = matches!(terminal.reading, LifecycleReading::Lost { .. } | LifecycleReading::Released);
+            let relaunching = !matches!(terminal.reading, LifecycleReading::Ready { .. })
+                && terminals.iter().any(|earlier| {
+                    earlier.home == terminal.home && earlier.session_name() == terminal.session_name() && earlier.name != terminal.name
+                });
+            if stopped || relaunching {
+                interrupted.insert(member.role.clone(), terminal.session_name().to_owned());
+            }
+        }
+        interrupted
+    }
+
+    /// Its phase, a ready launch Interrupted while `interrupted` names a stopped crew session.
+    pub fn phase_with(&self, interrupted: &BTreeMap<String, String>) -> VesselPhase {
+        match self.phase() {
+            VesselPhase::Ready if !interrupted.is_empty() => VesselPhase::Interrupted,
+            phase => phase,
+        }
+    }
+}
+
+/// Why a launch is Interrupted, naming the first of `interrupted`'s stopped sessions.
+pub fn interrupted_message(interrupted: &BTreeMap<String, String>) -> Option<String> {
+    interrupted.values().next().map(|session| format!("crew terminal session {session} disappeared; relaunching from its durable brief"))
 }
 
 /// What a vessel's home asks of its next launch.
@@ -257,39 +299,19 @@ impl VesselRecord {
             })
             .unwrap_or_default();
 
-        // The newest launch of each session is the one it shows. A crew agent wanted running
-        // whose newest launch stopped (exited, lost by its pool or released) interrupts the
-        // vessel until its next launch runs.
         let terminals: Vec<TerminalRecord> =
             crate::terminal_records::newest_launches(joins.terminals.iter().cloned()).into_values().collect();
-        let mut interrupted = BTreeMap::new();
-        if let (Some(convoy), Some(requirement)) = (convoy, requirement) {
-            for (index, member) in requirement.crew.iter().enumerate() {
-                if !matches!(member.source, CrewSource::Agent { .. }) || !crew_active(convoy, requirement, index) {
-                    continue;
-                }
-                let Some(terminal) = terminals.iter().find(|terminal| terminal.role == member.role) else { continue };
-                let stopped = matches!(terminal.reading, LifecycleReading::Lost { .. } | LifecycleReading::Released);
-                let relaunching = !matches!(terminal.reading, LifecycleReading::Ready { .. })
-                    && joins.terminals.iter().any(|earlier| {
-                        earlier.home == terminal.home && earlier.session_name() == terminal.session_name() && earlier.name != terminal.name
-                    });
-                if stopped || relaunching {
-                    interrupted.insert(member.role.clone(), terminal.session_name().to_owned());
-                }
+        let interrupted = match (convoy, requirement) {
+            (Some(convoy), Some(requirement)) => {
+                self.interrupted_roles(requirement, joins.terminals, |index| crew_active(convoy, requirement, index))
             }
-        }
+            _ => BTreeMap::new(),
+        };
         let ready = matches!(self.reading, LifecycleReading::Ready { .. });
-        let mut phase = self.phase();
-        if ready && !interrupted.is_empty() {
-            phase = VesselPhase::Interrupted;
-        }
+        let phase = self.phase_with(&interrupted);
         let environment = joins.environment;
         let message = if phase == VesselPhase::Interrupted {
-            interrupted
-                .values()
-                .next()
-                .map(|session| format!("crew terminal session {session} disappeared; relaunching from its durable brief"))
+            interrupted_message(&interrupted)
         } else if self.ended() || matches!(self.reading, LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. }) {
             self.reading.reason()
         } else if !ready {

@@ -2345,11 +2345,7 @@ impl InProcessDaemon {
             DEFAULT_PROVISIONING_NAMESPACE,
             Arc::clone(&reads),
         )));
-        self.resource_backend.install_engine_records(Arc::new(flotilla_store::ConvoyViews::new(
-            self.resource_backend.clone(),
-            DEFAULT_PROVISIONING_NAMESPACE,
-            reads,
-        )));
+        self.resource_backend.install_engine_records(Arc::new(flotilla_store::ConvoyViews::new(DEFAULT_PROVISIONING_NAMESPACE, reads)));
         Ok(())
     }
 

@@ -223,20 +223,22 @@ impl ConvoyRecord {
         self.admission.ensure_admission.as_ref().map_or(self.admission.role.as_str(), |ensure| ensure.role.as_str())
     }
 
-    /// The seats `(work, role)` at work: each whose session is `live`, an eager role from its
-    /// launch and any other once its task is delivered (`notes`, at the launch's home).
+    /// The seats `(work, role)` at work: each whose session is `live` and that is wanted running.
     pub fn working(&self, live: &BTreeSet<(String, String)>, notes: Option<&ConvoyNotes>) -> BTreeSet<(String, String)> {
-        let eager: BTreeSet<(String, String)> = self
+        live.iter().filter(|(work, role)| self.wanted_running(work, role, notes)).cloned().collect()
+    }
+
+    /// Whether seat `(work, role)` is wanted running: an eager role from its launch, any other
+    /// once its task is delivered (`notes`, at the launch's home).
+    pub fn wanted_running(&self, work: &str, role: &str, notes: Option<&ConvoyNotes>) -> bool {
+        let eager = self
             .admission
             .workflow_snapshot
             .vessels
             .iter()
-            .flat_map(|vessel| vessel.eagerly_started_roles().into_iter().map(|role| (vessel.name.clone(), role)))
-            .collect();
-        let assigned = |work: &str, role: &str| {
-            notes.and_then(|notes| notes.crew.get(work)).and_then(|roles| roles.get(role)).is_some_and(|crew| crew.task_assigned)
-        };
-        live.iter().filter(|(work, role)| eager.contains(&(work.clone(), role.clone())) || assigned(work, role)).cloned().collect()
+            .find(|vessel| vessel.name == work)
+            .is_some_and(|vessel| vessel.eagerly_started_roles().contains(role));
+        eager || notes.and_then(|notes| notes.crew.get(work)).and_then(|roles| roles.get(role)).is_some_and(|crew| crew.task_assigned)
     }
 
     fn end(&self) -> Option<Ended> {
@@ -445,10 +447,10 @@ pub trait ConvoyRecords: Send + Sync {
     fn changes(&self) -> tokio::sync::broadcast::Receiver<ConvoyChange> {
         tokio::sync::broadcast::channel(1).1
     }
-    /// Tells [`ConvoyRecords::changes`] of every change committed before this call, before it
-    /// returns, so a reader that drains its changes after it reads what the store holds.
-    fn catch_up(&self) -> Result<(), String> {
-        Ok(())
+    /// A cursor over the launches' changes from now on, read from the log; none where no log is
+    /// held, and a reader then reads everything afresh.
+    fn cursor(&self) -> Option<Box<dyn crate::lifecycle_reads::ChangeCursor<ConvoyChange>>> {
+        None
     }
     /// What this home observes of its own launches.
     fn memory(&self) -> &ConvoyMemory;

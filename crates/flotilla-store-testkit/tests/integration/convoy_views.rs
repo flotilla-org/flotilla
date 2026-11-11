@@ -1,6 +1,6 @@
 //! Convoys read from the engine's launches in the old Convoy shape (#3108): each launch joined
-//! with its works' Vessels and its seats' sessions, its home's notes at that home only, and every
-//! write refused.
+//! with its works' Vessel launches and their sessions, its home's notes at that home only, and
+//! every write refused.
 
 use std::{
     collections::BTreeMap,
@@ -17,19 +17,18 @@ use chrono::{DateTime, TimeZone, Utc};
 use flotilla_protocol::{LifecycleReading, PrincipalRef};
 use flotilla_resources::{
     convoy::admission::AdmissionDocument,
-    convoy_records::{ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes},
+    convoy_records::{ConvoyChange, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes},
     engine_records::EngineRecords,
-    lifecycle_reads::{LifecycleReads, ProvisioningKind},
+    lifecycle_reads::{ChangeCursor, LifecycleReads, ProvisioningKind},
     promises::{Promise, PromiseKind, PromiseSource, PromiseState},
     terminal_records::{
-        TerminalLaunchRequest, TerminalLaunchSource, TerminalObservations, TerminalRecord, TerminalRecords, TerminalRenewal,
+        TerminalChange, TerminalLaunchRequest, TerminalLaunchSource, TerminalObservations, TerminalRecord, TerminalRecords, TerminalRenewal,
     },
+    vessel_records::{VesselChange, VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep},
     workflow_template::{CrewSource, CrewSpec, Selector, VesselRequirement},
-    ConvoyAttention, ConvoyPhase, CrewWorkPhase, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkPhase, WorkflowSnapshot,
+    ConvoyAttention, ConvoyPhase, CrewWorkPhase, WorkPhase, WorkflowSnapshot,
 };
-use flotilla_store::{ConvoyViews, ResourceBackend};
-use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_testkit::fixtures::resource_meta;
+use flotilla_store::ConvoyViews;
 
 const HERE: &str = "home-a";
 
@@ -121,6 +120,15 @@ fn session(vessel: &str, role: &str, reading: LifecycleReading) -> TerminalRecor
     }
 }
 
+/// A cursor over records that never change once read.
+struct Unchanging;
+
+impl<C> ChangeCursor<C> for Unchanging {
+    fn pass(&mut self) -> Result<Vec<C>, String> {
+        Ok(Vec::new())
+    }
+}
+
 struct Convoys {
     records: Vec<ConvoyRecord>,
     memory: ConvoyMemory,
@@ -150,6 +158,9 @@ impl ConvoyRecords for Convoys {
     }
     fn memory(&self) -> &ConvoyMemory {
         &self.memory
+    }
+    fn cursor(&self) -> Option<Box<dyn ChangeCursor<ConvoyChange>>> {
+        Some(Box::new(Unchanging))
     }
 }
 
@@ -186,10 +197,70 @@ impl TerminalRecords for Terminals {
     fn observations(&self) -> &TerminalObservations {
         &self.observations
     }
+    fn cursor(&self) -> Option<Box<dyn ChangeCursor<TerminalChange>>> {
+        Some(Box::new(Unchanging))
+    }
+}
+
+struct Vessels {
+    records: Vec<VesselRecord>,
+}
+
+impl VesselRecords for Vessels {
+    fn home(&self) -> &str {
+        HERE
+    }
+    fn get(&self, name: &str, home: Option<&str>) -> Result<Option<VesselRecord>, String> {
+        let home = home.unwrap_or(HERE);
+        Ok(self.records.iter().find(|record| record.name == name && record.home == home).cloned())
+    }
+    fn launches(&self, convoy: &str, convoy_home: &str, launch_of: &str, home: Option<&str>) -> Result<Vec<VesselRecord>, String> {
+        let home = home.unwrap_or(HERE);
+        Ok(self
+            .records
+            .iter()
+            .filter(|record| {
+                record.convoy == convoy && record.convoy_home == convoy_home && record.launch_of == launch_of && record.home == home
+            })
+            .cloned()
+            .collect())
+    }
+    fn at(&self, home: &str) -> Result<Vec<VesselRecord>, String> {
+        Ok(self.records.iter().filter(|record| record.home == home).cloned().collect())
+    }
+    fn every(&self) -> Result<Vec<VesselRecord>, String> {
+        Ok(self.records.clone())
+    }
+    fn request(&self, _request: &VesselLaunchRequest) -> Result<String, String> {
+        Err("not requested here".into())
+    }
+    fn step(&self, _name: &str, _step: &VesselStep) -> Result<VesselRecord, String> {
+        Err("not stepped here".into())
+    }
+    fn cursor(&self) -> Option<Box<dyn ChangeCursor<VesselChange>>> {
+        Some(Box::new(Unchanging))
+    }
+}
+
+/// The ready launch of `convoy`'s work `work`, held here.
+fn ready_vessel(convoy: &str, work: &str) -> VesselRecord {
+    let launch_of = flotilla_resources::vessel_resource_name(flotilla_resources::convoy::launch_of(convoy), work);
+    VesselRecord {
+        name: format!("{launch_of}#1"),
+        home: HERE.into(),
+        convoy: convoy.into(),
+        convoy_home: HERE.into(),
+        launch_of,
+        host: "host-a".into(),
+        requested_at: at(110),
+        since: at(115),
+        reading: LifecycleReading::Ready { identity: "env".into() },
+    }
 }
 
 struct Reads {
     convoys: Convoys,
+    vessels: Vessels,
     terminals: Terminals,
 }
 
@@ -200,32 +271,21 @@ impl LifecycleReads for Reads {
     fn terminals(&self) -> Result<&dyn TerminalRecords, String> {
         Ok(&self.terminals)
     }
+    fn vessels(&self) -> Result<&dyn VesselRecords, String> {
+        Ok(&self.vessels)
+    }
     fn convoys(&self) -> Result<&dyn ConvoyRecords, String> {
         Ok(&self.convoys)
     }
 }
 
-async fn ready_vessel(backend: &ResourceBackend, name: &str) {
-    let vessels = backend.using::<Vessel>("flotilla");
-    let spec = VesselSpec {
-        convoy_ref: "fix-it#1".into(),
-        vessel_name: "work".into(),
-        fulfilment_kind_ref: "docker".into(),
-        adopted_checkout_refs: Default::default(),
-    };
-    let created = vessels.create(&resource_meta().name(name).call(), &spec).await.expect("vessel");
-    let status = VesselStatus { phase: VesselPhase::Ready, started_at: Some(at(110)), ready_at: Some(at(115)), ..VesselStatus::default() };
-    vessels.update_status(name, &created.metadata.resource_version, &status).await.expect("status");
-}
-
 // Behaviour: a launch reads as a Convoy named by its launch, its work Running on its ready
-// Vessel, its eager seat working on its live session and its latent one once its home delivered
+// Vessel launch, its eager seat working on its live session and its latent one once its home delivered
 // its task. Its home's notes show at that home; another home's launch reads without them. The
 // views are held: a read reads no record, and a change reads again only the launch it touches.
 #[tokio::test]
 async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    ready_vessel(&backend, "fix-it#1-work").await;
+    let vessel = ready_vessel("fix-it#1", "work");
     let reads = Arc::new(Reads {
         convoys: Convoys {
             records: vec![launch("fix-it#1", HERE), launch("other#1", "home-b")],
@@ -234,13 +294,14 @@ async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
         },
         terminals: Terminals {
             records: vec![
-                session("fix-it#1-work", "coder", LifecycleReading::Ready { identity: "s1".into() }),
-                session("fix-it#1-work", "reviewer", LifecycleReading::Ready { identity: "s2".into() }),
+                session(&vessel.name, "coder", LifecycleReading::Ready { identity: "s1".into() }),
+                session(&vessel.name, "reviewer", LifecycleReading::Ready { identity: "s2".into() }),
             ],
             observations: TerminalObservations::default(),
         },
+        vessels: Vessels { records: vec![vessel.clone()] },
     });
-    let views = ConvoyViews::new(backend.clone(), "flotilla", reads.clone());
+    let views = ConvoyViews::new("flotilla", reads.clone());
 
     let convoy = views.get("fix-it#1").await.expect("read");
     let status = convoy.status.expect("status");
@@ -281,12 +342,12 @@ async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
 // Behaviour: the views write nothing; a convoy is admitted, edged and ended on the engine.
 #[tokio::test]
 async fn the_views_refuse_writes() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
     let reads = Arc::new(Reads {
         convoys: Convoys { records: vec![launch("fix-it#1", HERE)], memory: ConvoyMemory::default(), read: AtomicUsize::new(0) },
         terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
+        vessels: Vessels { records: Vec::new() },
     });
-    let views = ConvoyViews::new(backend, "flotilla", reads);
+    let views = ConvoyViews::new("flotilla", reads);
     let none = BTreeMap::new();
     assert!(views.apply("Convoy", "fix-it#1", &none, &none, serde_json::Value::Null).await.is_err());
     assert!(views.set_status("Convoy", "fix-it#1", serde_json::Value::Null).await.is_err());

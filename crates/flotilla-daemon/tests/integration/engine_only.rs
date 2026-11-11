@@ -221,8 +221,8 @@ async fn delivered_convoy(daemon: &TestDaemon) {
     daemon.request_convoy(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
     // Admission: the convoy is Open, holding its crews' promises.
     let open = daemon.wait_reached("Open", "convoy", "Open", |_| true).await;
-    // The engine convoy is a launch of the admitted convoy's name: vessels name the convoy, its
-    // launch holds the checkouts and its promises.
+    // The engine convoy is a launch of the admitted convoy's name: the launch holds the vessels,
+    // the checkouts and the promises.
     let launch = text(&open, "resource.name").to_owned();
     let convoy = text(&open, "launch_of").to_owned();
     assert!(!convoy.is_empty() && launch.starts_with(&format!("{convoy}#")), "the convoy row names its launch: {open:?}");
@@ -232,8 +232,8 @@ async fn delivered_convoy(daemon: &TestDaemon) {
     // Placement and provisioning: a vessel per crew, each Realised, with its
     // environment, the coder's checkout and both terminal sessions.
     daemon.stage("vessels");
-    let of_convoy = |rows: Vec<Row>| rows.into_iter().filter(names("convoy", &convoy)).collect::<Vec<_>>();
-    daemon.wait_reached("a vessel Realised", "vessel", "Realised", names("convoy", &convoy)).await;
+    let of_convoy = |rows: Vec<Row>| rows.into_iter().filter(names("convoy", &launch)).collect::<Vec<_>>();
+    daemon.wait_reached("a vessel Realised", "vessel", "Realised", names("convoy", &launch)).await;
     let vessels: Vec<String> = of_convoy(daemon.rows("vessel", "").await).iter().map(|row| text(row, "resource.name").to_owned()).collect();
     assert_eq!(vessels.len(), 2, "a vessel per crew: {vessels:?}");
     daemon.stage("environments");
@@ -280,7 +280,7 @@ async fn delivered_convoy(daemon: &TestDaemon) {
     daemon.wait_reached("the coder's checkout Gone", "checkout", "Gone", names("holder", &launch)).await;
     for table in ["vessel", "environment", "terminal_session", "checkout"] {
         let held = |row: &Row| {
-            names("convoy", &convoy)(row) || names("holder", &launch)(row) || vessels.iter().any(|vessel| names("holder", vessel)(row))
+            names("convoy", &launch)(row) || names("holder", &launch)(row) || vessels.iter().any(|vessel| names("holder", vessel)(row))
         };
         let live: Vec<Row> = daemon
             .rows(table, "")
