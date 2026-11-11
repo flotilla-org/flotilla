@@ -146,6 +146,33 @@ impl flotilla_crew::leaf_engine::ResourceIntentPublisher for ReceiverIntentPubli
     }
 }
 
+/// Admits convoy `name` at `daemon`'s home as admission would, with `status`'s frozen workflow (one
+/// agent seat for `coder` when it has none), and brings it to `status`'s phase with the engine's
+/// edges: kept for Landing, kept and delivered for Landed, ended for Failed or Abandoned. Returns
+/// its launch's name: on the engine a convoy is a launch, `<name>#<n>` (#3108).
+async fn launch_convoy(
+    daemon: &InProcessDaemon,
+    name: &str,
+    spec: flotilla_resources::ConvoySpec,
+    mut status: flotilla_resources::ConvoyStatus,
+) -> String {
+    if status.workflow_snapshot.is_none() {
+        status.workflow_snapshot = flotilla_engine_convoys_testkit::single_agent("coder").workflow_snapshot;
+    }
+    let phase = status.phase;
+    let path = daemon.convoy_engine_path();
+    let launch = flotilla_engine_convoys_testkit::launch(&path, flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, status)).await;
+    if matches!(phase, ConvoyPhase::Landing | ConvoyPhase::Landed) {
+        let convoy = daemon.resource_backend().using::<ResourceConvoy>("flotilla").get(&launch).await.expect("launched convoy");
+        if phase == ConvoyPhase::Landed {
+            flotilla_engine_convoys_testkit::land(&path, &convoy).await;
+        } else {
+            flotilla_engine_convoys_testkit::keep_all(&path, &convoy).await;
+        }
+    }
+    launch
+}
+
 async fn admitted_convoy(backend: &ResourceBackend, role: &str) -> flotilla_resources::ResourceObject<ResourceConvoy> {
     let selector = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), role.to_string())]);
     backend
@@ -1063,15 +1090,13 @@ async fn resource_list_and_get_queries_return_wire_json() {
     .await;
     // The engine's readings, which a running daemon always has.
     let _engine = install_engine_reads(&daemon);
-    daemon
-        .resource_backend()
-        .using::<ResourceConvoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("resource-demo".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
-        )
-        .await
-        .expect("create convoy");
+    let launch = launch_convoy(
+        &daemon,
+        "resource-demo",
+        flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        Default::default(),
+    )
+    .await;
 
     let listed = daemon
         .execute_query(
@@ -1092,7 +1117,7 @@ async fn resource_list_and_get_queries_return_wire_json() {
     let listed_object = listed.records[0].object.as_ref().expect("listed object");
     assert_eq!(listed_object["apiVersion"], "flotilla.work/v1");
     assert_eq!(listed_object["kind"], "Convoy");
-    assert_eq!(listed_object["metadata"]["name"], "resource-demo");
+    assert_eq!(listed_object["metadata"]["name"], launch.as_str());
 
     let fetched = daemon
         .execute_query(
@@ -1100,7 +1125,7 @@ async fn resource_list_and_get_queries_return_wire_json() {
                 .action(CommandAction::QueryResourceGet {
                     namespace: "flotilla".to_string(),
                     kind: "Convoy".to_string(),
-                    name: "resource-demo".to_string(),
+                    name: launch.clone(),
                 })
                 .build(),
             uuid::Uuid::new_v4(),
@@ -1109,7 +1134,7 @@ async fn resource_list_and_get_queries_return_wire_json() {
         .expect("get query");
     let CommandValue::ResourceRead(fetched) = fetched else { panic!("expected resource read") };
     let fetched_object = fetched.records[0].object.as_ref().expect("fetched object");
-    assert_eq!(fetched_object["metadata"]["name"], "resource-demo");
+    assert_eq!(fetched_object["metadata"]["name"], launch.as_str());
     assert_eq!(fetched_object["spec"]["workflow_ref"], "wf");
     assert_eq!(fetched.cursor.position().expect("decode cursor").0, listed.cursor.position().expect("decode cursor").0);
 
@@ -1491,6 +1516,19 @@ async fn operator_can_remove_a_wrong_repository_remote_without_deleting_the_reco
     assert_eq!(repository.spec.remotes(), [stable]);
 }
 
+/// An observed checkout on `branch`, as these tests' home-bound kind. They exercise the old
+/// store's replica, delete and watch paths, which a Convoy, served from the engine, no longer
+/// takes (#3108).
+fn observed_checkout(branch: &str) -> ResourceCheckoutSpec {
+    ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
+        r#ref: branch.to_string(),
+        path: format!("/tmp/{branch}"),
+        repo_ref: flotilla_resources::RepositoryKey("repo-a".to_string()),
+        host_ref: "home".to_string(),
+        is_main: false,
+    })
+}
+
 #[tokio::test]
 async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
     let authority_temp = tempfile::tempdir().expect("authority tempdir");
@@ -1516,21 +1554,21 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
     // The engine's readings, which a running daemon always has.
     let _engine = install_engine_reads(&replica);
     let origin = authority.node_id().clone();
-    let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
+    let convoys = authority.resource_backend().using::<ResourceCheckout>("flotilla");
     convoys
         .create(
-            &InputMeta::builder().name("remote-convoy".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+            &InputMeta::builder().name("remote-checkout".to_string()).build(),
+            &observed_checkout("wf"),
         )
         .await
-        .expect("create convoy at authority");
+        .expect("create checkout at authority");
     let snapshot = convoys.list().await.expect("authority snapshot");
     replica
         .resource_backend()
-        .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+        .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
         .replace(&snapshot, chrono::Utc::now())
         .await
-        .expect("replicate convoy");
+        .expect("replicate checkout");
 
     let mut events = replica.subscribe();
     let command_id = replica
@@ -1538,8 +1576,8 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
             Command::builder()
                 .action(CommandAction::ResourceDelete {
                     namespace: "flotilla".to_string(),
-                    kind: "convoys".to_string(),
-                    name: "remote-convoy".to_string(),
+                    kind: "checkouts".to_string(),
+                    name: "remote-checkout".to_string(),
                     replica_origin: None,
                 })
                 .build(),
@@ -1551,9 +1589,9 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
         matches!(result, CommandValue::Error { ref message } if message.contains(origin.as_str())),
         "a replica delete must identify its origin: {result:?}"
     );
-    assert!(convoys.get("remote-convoy").await.is_ok(), "authority record must remain");
+    assert!(convoys.get("remote-checkout").await.is_ok(), "authority record must remain");
     assert!(
-        replica.resource_backend().including_replicas::<ResourceConvoy>("flotilla").get("remote-convoy").await.is_ok(),
+        replica.resource_backend().including_replicas::<ResourceCheckout>("flotilla").get("remote-checkout").await.is_ok(),
         "replica must remain visible"
     );
 
@@ -1561,14 +1599,14 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
         CommandAction::ResourceStatusPatch {
             expected_resource_version: None,
             namespace: "flotilla".to_string(),
-            kind: "convoys".to_string(),
-            name: "remote-convoy".to_string(),
+            kind: "checkouts".to_string(),
+            name: "remote-checkout".to_string(),
             status: serde_json::json!({}),
         },
         CommandAction::ResourceApply {
             namespace: "flotilla".to_string(),
             document: serde_json::json!({
-                "apiVersion": "flotilla.work/v1", "kind": "Convoy", "metadata": {"name": "remote-convoy"}, "spec": {}
+                "apiVersion": "flotilla.work/v1", "kind": "Checkout", "metadata": {"name": "remote-checkout"}, "spec": {}
             }),
         },
     ] {
@@ -1629,19 +1667,19 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
     let origin = authority_node.node_id.clone();
     daemon.set_configured_peers(vec![authority_node.clone()]).await;
 
-    let local = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+    let local = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
     local
         .create(
-            &InputMeta::builder().name("orphaned-convoy".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+            &InputMeta::builder().name("orphaned-checkout".to_string()).build(),
+            &observed_checkout("wf"),
         )
         .await
         .expect("create authority record");
     let authority_snapshot = local.list().await.expect("list authority record");
-    local.delete("orphaned-convoy").await.expect("authority store vanishes");
+    local.delete("orphaned-checkout").await.expect("authority store vanishes");
     daemon
         .resource_backend()
-        .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+        .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
         .replace(&authority_snapshot, chrono::Utc::now())
         .await
         .expect("retain stale replica after authority disappears");
@@ -1653,8 +1691,8 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
             Command::builder()
                 .action(CommandAction::ResourceDelete {
                     namespace: "flotilla".to_string(),
-                    kind: "convoys".to_string(),
-                    name: "orphaned-convoy".to_string(),
+                    kind: "checkouts".to_string(),
+                    name: "orphaned-checkout".to_string(),
                     replica_origin: Some(origin.clone()),
                 })
                 .build(),
@@ -1673,8 +1711,8 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
             Command::builder()
                 .action(CommandAction::ResourceDelete {
                     namespace: "flotilla".to_string(),
-                    kind: "convoys".to_string(),
-                    name: "orphaned-convoy".to_string(),
+                    kind: "checkouts".to_string(),
+                    name: "orphaned-checkout".to_string(),
                     replica_origin: Some(origin),
                 })
                 .build(),
@@ -1687,7 +1725,7 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
     assert!(
         daemon
             .resource_backend()
-            .including_replicas::<ResourceConvoy>("flotilla")
+            .including_replicas::<ResourceCheckout>("flotilla")
             .list()
             .await
             .expect("list after collection")
@@ -1734,11 +1772,11 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
     let _engine = install_engine_reads(&peer_two);
     let origin = authority.node_id().clone();
     let fixture_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let fixture = fixture_backend.using::<ResourceConvoy>("flotilla");
+    let fixture = fixture_backend.using::<ResourceCheckout>("flotilla");
     fixture
         .create(
             &InputMeta::builder().name("lost-at-authority".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+            &observed_checkout("wf"),
         )
         .await
         .expect("create stale source object");
@@ -1748,24 +1786,24 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
     for daemon in [&authority, &peer_one, &peer_two] {
         daemon
             .resource_backend()
-            .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+            .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
             .replace(&stale_snapshot, stale_synced_at)
             .await
             .expect("seed stale replica");
     }
 
-    let authority_convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
+    let authority_convoys = authority.resource_backend().using::<ResourceCheckout>("flotilla");
     let listed = authority_convoys.list().await.expect("list before authority tombstone");
     let mut authority_watch = authority_convoys.watch(WatchStart::resuming_from(&listed)).await.expect("watch authority tombstones");
     let mut peer_one_relay =
-        peer_one.resource_backend().including_replicas::<ResourceConvoy>("flotilla").watch().await.expect("watch first peer replicas");
+        peer_one.resource_backend().including_replicas::<ResourceCheckout>("flotilla").watch().await.expect("watch first peer replicas");
     let mut authority_events = authority.subscribe();
     let delete_id = authority
         .execute(
             Command::builder()
                 .action(CommandAction::ResourceDelete {
                     namespace: "flotilla".to_string(),
-                    kind: "convoys".to_string(),
+                    kind: "checkouts".to_string(),
                     name: "lost-at-authority".to_string(),
                     replica_origin: None,
                 })
@@ -1788,7 +1826,7 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
     let tombstone_synced_at = chrono::Utc::now();
     for peer in [&peer_one, &peer_two] {
         peer.resource_backend()
-            .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+            .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
             .apply(tombstone_event.clone(), tombstone_synced_at)
             .await
             .expect("relay authority tombstone to peer");
@@ -1807,7 +1845,7 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
     };
     peer_two
         .resource_backend()
-        .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+        .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
         .apply(WatchEvent::DeletedByName(tombstone), last_synced_at)
         .await
         .expect("apply peer relay tombstone");
@@ -1815,14 +1853,14 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
     for daemon in [&authority, &peer_one, &peer_two] {
         daemon
             .resource_backend()
-            .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+            .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
             .apply(WatchEvent::Added(stale_object.clone()), stale_synced_at)
             .await
             .expect("exercise a stale relay cycle after deletion");
         assert!(
             daemon
                 .resource_backend()
-                .including_replicas::<ResourceConvoy>("flotilla")
+                .including_replicas::<ResourceCheckout>("flotilla")
                 .list()
                 .await
                 .expect("list converged replicas")
@@ -1837,7 +1875,7 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
             Command::builder()
                 .action(CommandAction::ResourceDelete {
                     namespace: "flotilla".to_string(),
-                    kind: "convoys".to_string(),
+                    kind: "checkouts".to_string(),
                     name: "lost-at-authority".to_string(),
                     replica_origin: None,
                 })
@@ -1959,21 +1997,21 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
     .await;
     // The engine's readings, which a running daemon always has.
     let _engine = install_engine_reads(&daemon);
-    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+    let convoys = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
     let created = convoys
         .create(
-            &InputMeta::builder().name("watched-convoy".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+            &InputMeta::builder().name("watched-checkout".to_string()).build(),
+            &observed_checkout("wf"),
         )
         .await
-        .expect("create convoy");
+        .expect("create checkout");
     let ignored = convoys
         .create(
-            &InputMeta::builder().name("ignored-convoy".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("ignored-wf".to_string()).build(),
+            &InputMeta::builder().name("ignored-checkout".to_string()).build(),
+            &observed_checkout("ignored-wf"),
         )
         .await
-        .expect("create ignored convoy");
+        .expect("create ignored checkout");
 
     let mut rx = daemon.subscribe();
     let command_id = daemon
@@ -1981,8 +2019,8 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
             Command::builder()
                 .action(CommandAction::ResourceWatch {
                     namespace: "flotilla".to_string(),
-                    kind: "convoys".to_string(),
-                    name: Some("watched-convoy".to_string()),
+                    kind: "checkouts".to_string(),
+                    name: Some("watched-checkout".to_string()),
                     include_replicas: false,
                     replica_sources: false,
                     cursor: None,
@@ -2004,7 +2042,7 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
     };
     assert_eq!(watched.records.len(), 1);
     assert_eq!(watched.records[0].record_type, flotilla_protocol::ResourceRecordType::Added);
-    assert_eq!(watched.records[0].object.as_ref().expect("current object")["metadata"]["name"], "watched-convoy");
+    assert_eq!(watched.records[0].object.as_ref().expect("current object")["metadata"]["name"], "watched-checkout");
     assert!(matches!(watched.records[0].provenance, flotilla_protocol::ResourceRecordProvenance::Local { .. }));
 
     let _bookmark = loop {
@@ -2020,19 +2058,19 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
         }
     };
 
-    let updated_spec = flotilla_resources::ConvoySpec::builder().workflow_ref("wf-v2".to_string()).build();
+    let updated_spec = observed_checkout("wf-v2");
     convoys
         .update(
             &InputMeta::from(&ignored.metadata),
             &ignored.metadata.resource_version,
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("ignored-wf-v2".to_string()).build(),
+            &observed_checkout("ignored-wf-v2"),
         )
         .await
-        .expect("update ignored convoy");
+        .expect("update ignored checkout");
     convoys
         .update(&InputMeta::from(&created.metadata), &created.metadata.resource_version, &updated_spec)
         .await
-        .expect("update watched convoy");
+        .expect("update watched checkout");
     let modified = loop {
         match recv_event(&mut rx).await {
             DaemonEvent::CommandStepUpdate { command_id: id, status, .. } if id == command_id => {
@@ -2046,11 +2084,11 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
         }
     };
     let resume_cursor = modified.cursor.clone();
-    assert_eq!(modified.records[0].object.as_ref().expect("modified object")["spec"]["workflow_ref"], "wf-v2");
+    assert_eq!(modified.records[0].object.as_ref().expect("modified object")["spec"]["ref"], "wf-v2");
 
     daemon.cancel(command_id).await.expect("cancel initial watch");
     assert!(matches!(recv_command_finished(&mut rx, command_id).await, CommandValue::Cancelled));
-    convoys.delete("watched-convoy").await.expect("delete watched convoy");
+    convoys.delete("watched-checkout").await.expect("delete watched checkout");
 
     let mut resumed_events = daemon.subscribe();
     let resumed_command_id = daemon
@@ -2058,8 +2096,8 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
             Command::builder()
                 .action(CommandAction::ResourceWatch {
                     namespace: "flotilla".to_string(),
-                    kind: "convoys".to_string(),
-                    name: Some("watched-convoy".to_string()),
+                    kind: "checkouts".to_string(),
+                    name: Some("watched-checkout".to_string()),
                     include_replicas: false,
                     replica_sources: false,
                     cursor: Some(resume_cursor),
@@ -2080,7 +2118,7 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
             _ => {}
         }
     };
-    assert_eq!(deleted.records[0].object.as_ref().expect("deleted object")["metadata"]["name"], "watched-convoy");
+    assert_eq!(deleted.records[0].object.as_ref().expect("deleted object")["metadata"]["name"], "watched-checkout");
     daemon.cancel(resumed_command_id).await.expect("cancel resumed watch");
 }
 
