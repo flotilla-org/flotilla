@@ -906,8 +906,11 @@ async fn ops_entries_materialization_scenario() {
         }
     );
     assert!(matches!(ensures.get(&ensure_name).await, Err(flotilla_resources::ResourceError::NotFound { .. })));
-    assert!(
-        matches!(convoys.get(&ensured_convoy_ref).await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+    // A convoy ends on the engine and is never deleted: the torn-down standing convoy reads Abandoned.
+    let ended = convoys.get(&ensured_convoy_ref).await.expect("the ended standing convoy");
+    assert_eq!(
+        ended.status.map(|status| status.phase),
+        Some(flotilla_resources::ConvoyPhase::Abandoned),
         "removing the ops entry must tear down its live standing convoy"
     );
 

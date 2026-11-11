@@ -598,6 +598,9 @@ async fn acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
         presents_as: None,
         agent_overrides: Vec::new(),
     };
+    // Each generation fails before provisioning, as the vendor refuses it: a strike. An operator's
+    // abandon would not be one (decision 78(3)).
+    fleet.vendor().refuse_provisioning(true);
     apply_annotated::<ConvoyEnsure>(&fleet, "quartermaster", &annotations, ensure).await;
 
     let generations = || async {
@@ -618,28 +621,6 @@ async fn acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
             latest.as_ref().map(|convoy| (convoy.metadata.name.clone(), convoy.status.as_ref().map(|status| status.phase))),
             ensure().await
         );
-        // Each generation fails, as its convoy controller records a failure before provisioning:
-        // a strike. An operator's abandon would not be one (decision 78(3)), and a standing
-        // generation's failed vessel is retried in place until Convoy moves onto the engine.
-        // The write is conditional on what was read, as a controller's is; a conflict is retried
-        // on the next turn.
-        if let Some((convoy, status)) = latest.as_ref().and_then(|convoy| Some((convoy, convoy.status.as_ref()?))) {
-            if !status.phase.is_terminal() {
-                let mut status = status.clone();
-                let now = flotilla_resources::Clock::now(&*clock);
-                flotilla_resources::controller_patches::fail_init(ConvoyPhase::Failed, "the generation failed".into(), now)
-                    .apply(&mut status);
-                fleet
-                    .execute(CommandAction::ResourceStatusPatch {
-                        expected_resource_version: Some(convoy.metadata.resource_version.clone()),
-                        namespace: NAMESPACE.into(),
-                        kind: "Convoy".into(),
-                        name: convoy.metadata.name.clone(),
-                        status: serde_json::to_value(status).expect("status"),
-                    })
-                    .await;
-            }
-        }
         // Each ended generation waits out its backoff; skip just that.
         skip_to_retry(&clock, ensure().await.and_then(|status| status.retry_at));
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -665,6 +646,7 @@ async fn acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(generations().await.len(), 3, "the hold holds until a person acknowledges it");
 
+    fleet.vendor().refuse_provisioning(false);
     let acknowledged =
         fleet.execute(CommandAction::PersonAcknowledge { namespace: Some(NAMESPACE.into()), message: item.message.clone() }).await;
     assert_eq!(acknowledged, CommandValue::Ok);
@@ -713,6 +695,7 @@ async fn a_stall_past_every_supervisor_reaches_the_projects_operator_and_the_per
     let CommandValue::PersonInbox(listing) = fleet.execute(inbox.clone()).await else { panic!("a person inbox") };
     assert!(listing.items.iter().any(|left| left.message == item.message), "listing it is no receipt: {listing:?}");
 
+    fleet.vendor().refuse_provisioning(false);
     let acknowledged =
         fleet.execute(CommandAction::PersonAcknowledge { namespace: Some(NAMESPACE.into()), message: item.message.clone() }).await;
     assert_eq!(acknowledged, CommandValue::Ok);
