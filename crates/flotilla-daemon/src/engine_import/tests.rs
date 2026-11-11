@@ -278,6 +278,17 @@ fn holds_launch<K: flotilla_provisioning::stored::Launches>(store: &mut flotilla
     !read.integer_index_keys_before(&K::by_launch(of), home, i64::MAX, 1).expect("launches").is_empty()
 }
 
+/// Asserts every old row in `report` is imported, dropped or another home's, once.
+fn every_row_accounted(report: &Value) {
+    let rows = report["rows"].as_object().expect("rows");
+    assert!(!rows.is_empty(), "{report:#}");
+    for (kind, counts) in rows {
+        let sum = ["imported", "dropped", "other_home"].iter().map(|field| counts[field].as_u64().expect(field)).sum::<u64>();
+        assert_eq!(counts["rows"].as_u64(), Some(sum), "{kind}: {counts}");
+        assert_eq!(counts["unaccounted"], 0, "{kind}: {counts}");
+    }
+}
+
 #[tokio::test]
 async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -316,6 +327,8 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     );
     assert_eq!(kinds["Convoy"], json!({"imported": 0, "dropped": 1, "refused": 0}), "an unbootstrapped convoy stays old");
     assert!(kinds.get("Forge").is_none(), "another host's records are not this host's to count: {report:#}");
+    every_row_accounted(&report);
+    assert_eq!(report["rows"]["Forge"]["other_home"], 1, "another host's record is counted as that home's: {report:#}");
 
     let mut store = engine(dir.path());
     assert!(holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut store, "ours", HERE));
@@ -1283,6 +1296,10 @@ fn own_daemon_host(source: &Source, home: &str) -> Option<String> {
 fn first_start_imports_a_real_old_store() {
     let dir = std::path::PathBuf::from(std::env::var_os("FLOTILLA_IMPORT_REHEARSAL_DIR").expect("FLOTILLA_IMPORT_REHEARSAL_DIR"));
     let home = "rehearsal-home";
+    // An engine store an earlier rehearsal put in place is replaced: the copy's old store is the source.
+    for file in [ENGINE_STORE, "decided.sqlite-wal", "decided.sqlite-shm"] {
+        let _ = std::fs::remove_file(dir.join(file));
+    }
     let source = Source::read(&dir.join(OLD_STORE), home).expect("read old store");
     let own_host = own_daemon_host(&source, home);
     println!(
@@ -1313,5 +1330,9 @@ fn first_start_imports_a_real_old_store() {
     for ((kind, reason), count) in reasons {
         println!("refused {count} {kind}: {reason}");
     }
+    for (kind, rows) in report["rows"].as_object().expect("rows") {
+        println!("rows {kind}: {rows}");
+    }
     println!("first_start: {}", if result.is_ok() { "ok" } else { "error" });
+    every_row_accounted(&report);
 }

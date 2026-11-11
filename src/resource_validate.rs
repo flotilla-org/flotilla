@@ -434,6 +434,12 @@ fn print_import(summary: &engine_import::Summary) {
     for (kind, counts) in &summary.kinds {
         println!("import rehearsal: {kind}: {} imported, {} dropped, {} refused", counts.imported, counts.dropped, counts.refused);
     }
+    for (kind, rows) in &summary.rows {
+        println!(
+            "import rehearsal: {kind} rows: {} = {} imported + {} dropped + {} at another home, {} unaccounted",
+            rows.rows, rows.imported, rows.dropped, rows.other_home, rows.unaccounted
+        );
+    }
     for note in &summary.notes {
         println!("import rehearsal: note: {note}");
     }

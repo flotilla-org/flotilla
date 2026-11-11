@@ -43,7 +43,7 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
             for convoy in &mapped.imported {
                 match write_into(target, convoy) {
                     Ok(written) => {
-                        *report.imported.entry((KIND, "open")).or_default() += 1;
+                        report.import_row(KIND, "open");
                         written_convoys
                             .push(((convoy.home.clone(), convoy.record.clone()), (written.name().to_owned(), written.version().0)));
                     }
@@ -54,10 +54,11 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
                 }
             }
             if !mapped.stays_old.is_empty() {
-                *report
-                    .dropped
-                    .entry((KIND, "ended or never bootstrapped: dropped by the import; the old resources.sqlite stays on disk"))
-                    .or_default() += mapped.stays_old.len();
+                report.drop_rows(
+                    KIND,
+                    "ended or never bootstrapped: dropped by the import; the old resources.sqlite stays on disk",
+                    mapped.stays_old.len(),
+                );
             }
             for refusal in &mapped.refused {
                 report.refused.push(ImportRefusal { kind: KIND, record: refused_name(refusal), reason: refusal.to_string() });

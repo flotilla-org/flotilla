@@ -145,14 +145,73 @@ pub struct ImportReport {
     /// Rows not carried onto the engine, by kind and reason (a built-in's stored copy, say). Each
     /// count is of old rows: every copy of a dropped name, whatever the reason.
     pub dropped: BTreeMap<(&'static str, &'static str), usize>,
+    /// What became of each old row the import read, by its old kind: the counts above are of
+    /// records written and of what was dropped, a row's or a field's, so this is the ledger that
+    /// accounts for every row once.
+    pub rows: BTreeMap<&'static str, RowCounts>,
+}
+
+/// One old kind's rows, by what became of them. A refused row is named in the refusals instead.
+/// A row homed where the import writes is imported, dropped or another home's; a row homed
+/// elsewhere is that home's unless the import consumed it here, as the copy an observation is
+/// imported from.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RowCounts {
+    /// Carried onto the engine as a record.
+    pub imported: usize,
+    /// Not carried, for a reason the report counts.
+    pub dropped: usize,
+    /// A copy of a record another home holds and imports: a definition folded into the record at
+    /// its declaring or creating home, another daemon's Host, or an observation imported at its
+    /// observer.
+    pub other_home: usize,
+    /// Another home's copy carried onto the engine here.
+    pub copies_imported: usize,
+    /// Another home's copy read here and not carried (a staler copy of an imported observation).
+    pub copies_dropped: usize,
+}
+
+/// What became of an old row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowOutcome {
+    Imported,
+    Dropped,
+    OtherHome,
+    CopyImported,
+    CopyDropped,
 }
 
 impl ImportReport {
     pub fn record<K: LifecycleKind>(&mut self, result: &Result<ImportedResource<K>, ImportRefusal>) {
         match result {
-            Ok(imported) => *self.imported.entry((K::NAME, label(imported.resource.state()))).or_default() += 1,
+            Ok(imported) => self.import_row(K::NAME, label(imported.resource.state())),
             Err(refusal) => self.refused.push(refusal.clone()),
         }
+    }
+
+    /// Counts `count` rows of the old `kind` in the ledger as `outcome`.
+    pub fn rows(&mut self, kind: &'static str, outcome: RowOutcome, count: usize) {
+        let rows = self.rows.entry(kind).or_default();
+        match outcome {
+            RowOutcome::Imported => rows.imported += count,
+            RowOutcome::Dropped => rows.dropped += count,
+            RowOutcome::OtherHome => rows.other_home += count,
+            RowOutcome::CopyImported => rows.copies_imported += count,
+            RowOutcome::CopyDropped => rows.copies_dropped += count,
+        }
+    }
+
+    /// Counts a row of `kind` imported as a record of its own kind labelled `label`, in the
+    /// records written and in the ledger.
+    pub fn import_row(&mut self, kind: &'static str, label: &'static str) {
+        *self.imported.entry((kind, label)).or_default() += 1;
+        self.rows(kind, RowOutcome::Imported, 1);
+    }
+
+    /// Counts `count` rows of `kind` dropped for `reason`, in the drops and in the ledger.
+    pub fn drop_rows(&mut self, kind: &'static str, reason: &'static str, count: usize) {
+        *self.dropped.entry((kind, reason)).or_default() += count;
+        self.rows(kind, RowOutcome::Dropped, count);
     }
 }
 
@@ -268,9 +327,11 @@ pub fn import_vessels(
         if pinned_host(vessel).is_none() {
             match vessel.status.as_ref().map(|status| status.phase).unwrap_or_default() {
                 VesselPhase::Pending => {
+                    report.drop_rows("Vessel", "not placed yet: its home requests its work's launch", 1);
                     report.notes.push(format!("Vessel `{name}` is not placed yet: not stored; its home requests its work's launch"))
                 }
                 VesselPhase::Lost | VesselPhase::Failed => {
+                    report.drop_rows("Vessel", "ended before it was placed", 1);
                     report.notes.push(format!("Vessel `{name}` ended before it was placed: not stored"))
                 }
                 // Provisioning or later with no recorded placement has no lease to import: refused,
@@ -368,7 +429,7 @@ pub fn import_environments(
                 && environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Lost)
         });
     if !dropped.is_empty() {
-        *report.dropped.entry(("Environment", "a deleted cloud sandbox, its sandbox gone")).or_default() += dropped.len();
+        report.drop_rows("Environment", "a deleted cloud sandbox, its sandbox gone", dropped.len());
     }
     for (environment, home) in &kept {
         let refuse = |reason: String| ImportRefusal { kind: EnvironmentKind::NAME, record: environment.metadata.name.clone(), reason };

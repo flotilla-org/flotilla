@@ -34,7 +34,7 @@ use flotilla_resources::{
 };
 use flotilla_schema::{Kind, Timestamp};
 
-use super::import::{created, ImportRefusal, ImportReport};
+use super::import::{created, ImportRefusal, ImportReport, RowOutcome};
 use crate::stored::host::{self as stored, Condition, Expiry, Facts, HostObservation, HostRecord, Provider, ProviderImages};
 
 const HOST: &str = <HostRecord as Kind>::KIND;
@@ -92,6 +92,11 @@ pub enum Imported {
     Dropped(&'static str),
 }
 
+/// A copy of another daemon's Host: that daemon imports its own.
+const ANOTHER_DAEMONS: &str = "a copy of another daemon's Host";
+/// A copy of an SSH host another daemon owns: its owner imports it.
+const ANOTHER_OWNERS: &str = "a copy of an SSH host another daemon owns";
+
 /// The records `old`, held at a home whose own host is `own_host`, imports to, or why it is
 /// dropped; refused with the reason.
 pub fn import_host(old: &ResourceObject<Host>, own_host: &str) -> Result<Imported, String> {
@@ -99,10 +104,8 @@ pub fn import_host(old: &ResourceObject<Host>, own_host: &str) -> Result<Importe
         return Ok(Imported::Dropped("deleted"));
     }
     match &old.spec.connection {
-        HostConnection::Daemon if old.metadata.name != own_host => return Ok(Imported::Dropped("a copy of another daemon's Host")),
-        HostConnection::SshHost { owning_daemon, .. } if owning_daemon != own_host => {
-            return Ok(Imported::Dropped("a copy of an SSH host another daemon owns"))
-        }
+        HostConnection::Daemon if old.metadata.name != own_host => return Ok(Imported::Dropped(ANOTHER_DAEMONS)),
+        HostConnection::SshHost { owning_daemon, .. } if owning_daemon != own_host => return Ok(Imported::Dropped(ANOTHER_OWNERS)),
         _ => {}
     }
     let mut dropped = Vec::new();
@@ -271,7 +274,7 @@ pub fn import_hosts(copies: &HostCopies, target: &mut impl ImportTarget, report:
     for copy in copies.copies.iter().filter(|copy| target.imports(&copy.home)) {
         let refuse = refusal(copy);
         if copy.object.metadata.deletion_timestamp.is_some() {
-            *report.dropped.entry((HOST, "deleted")).or_default() += 1;
+            report.drop_rows(HOST, "deleted", 1);
             continue;
         }
         let Some(own_host) = copies.homes.get(&copy.home) else {
@@ -279,7 +282,12 @@ pub fn import_hosts(copies: &HostCopies, target: &mut impl ImportTarget, report:
             continue;
         };
         match import_host(&copy.object, own_host) {
-            Ok(Imported::Dropped(reason)) => *report.dropped.entry((HOST, reason)).or_default() += 1,
+            Ok(Imported::Dropped(reason)) => {
+                *report.dropped.entry((HOST, reason)).or_default() += 1;
+                // Another daemon's Host is imported at that daemon's home.
+                let outcome = if [ANOTHER_DAEMONS, ANOTHER_OWNERS].contains(&reason) { RowOutcome::OtherHome } else { RowOutcome::Dropped };
+                report.rows(HOST, outcome, 1);
+            }
             Ok(Imported::Records { host, observation, dropped }) => importing.push((copy, Ok((host, observation, dropped)))),
             Err(reason) => importing.push((copy, Err(reason))),
         }
@@ -313,7 +321,7 @@ pub fn import_hosts(copies: &HostCopies, target: &mut impl ImportTarget, report:
                     report.refused.push(refusal);
                     continue;
                 }
-                *report.imported.entry((HOST, "spec")).or_default() += 1;
+                report.import_row(HOST, "spec");
                 if observation.is_some() {
                     *report.imported.entry((OBSERVATION, "observed")).or_default() += 1;
                 }

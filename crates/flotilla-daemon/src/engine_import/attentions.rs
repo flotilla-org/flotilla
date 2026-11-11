@@ -11,7 +11,7 @@ use flotilla_core::primitives::{
 };
 use flotilla_engine_messages::convert::Conversion;
 use flotilla_engine_store::{Import, ImportTarget};
-use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport};
+use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport, RowOutcome};
 use flotilla_resources::{Convoy, ConvoyEnsure, TerminalSession, Vessel};
 
 use super::{
@@ -83,9 +83,10 @@ fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, c
     counted.refused.extend(failed.iter().cloned());
     for (label, count) in counted.imported {
         *report.imported.entry((KIND, label)).or_default() += count;
+        report.rows(KIND, RowOutcome::Imported, count);
     }
     for (reason, count) in counted.dropped {
-        *report.dropped.entry((KIND, reason)).or_default() += count;
+        report.drop_rows(KIND, reason, count);
     }
     report.refused.extend(counted.refused.into_iter().map(|refusal| ImportRefusal {
         kind: KIND,

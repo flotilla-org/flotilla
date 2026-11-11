@@ -669,7 +669,7 @@ pub fn import_accounts(
         });
         match written {
             Ok(_) => {
-                *report.imported.entry(("AccountBinding", label)).or_default() += 1;
+                report.import_row("AccountBinding", label);
                 renamed.insert((home.clone(), old.metadata.name.clone()), (home.clone(), name));
             }
             Err(reason) => report.refused.push(refuse(reason)),
@@ -716,7 +716,7 @@ pub fn import_accounts(
             }
         }
         match target.write(home, &old.metadata.name, &change(&old.metadata), &spec) {
-            Ok(()) => *report.imported.entry(("AccountProvision", label)).or_default() += 1,
+            Ok(()) => report.import_row("AccountProvision", label),
             Err(reason) => report.refused.push(refuse(reason)),
         }
     }

@@ -37,7 +37,7 @@ pub fn import_access_deliveries(copies: &[AccessDeliveryCopy], target: &mut impl
         let name = &copy.object.metadata.name;
         let refuse = |reason: String| ImportRefusal { kind: KIND, record: name.clone(), reason: format!("at `{}`: {reason}", copy.home) };
         if copy.object.metadata.deletion_timestamp.is_some() {
-            *report.dropped.entry((KIND, "deleted")).or_default() += 1;
+            report.drop_rows(KIND, "deleted", 1);
             continue;
         }
         let held = namespaces.get(&(name.as_str(), copy.home.as_str())).cloned().unwrap_or_default();
@@ -47,9 +47,7 @@ pub fn import_access_deliveries(copies: &[AccessDeliveryCopy], target: &mut impl
             continue;
         }
         match target.write(&copy.home, name, &created(&copy.object), &copy.object.spec) {
-            Ok(()) => {
-                *report.imported.entry((KIND, if copy.object.spec.retry.is_some() { "retrying" } else { "delivered" })).or_default() += 1
-            }
+            Ok(()) => report.import_row(KIND, if copy.object.spec.retry.is_some() { "retrying" } else { "delivered" }),
             Err(reason) => report.refused.push(refuse(reason)),
         }
     }

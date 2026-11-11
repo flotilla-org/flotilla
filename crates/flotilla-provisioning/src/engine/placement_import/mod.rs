@@ -25,7 +25,7 @@ use flotilla_schema::{Kind, Timestamp};
 use self::retired::{PolicySpec, RetiredPolicy};
 use super::{
     definition_import::label,
-    import::{ImportRefusal, ImportReport},
+    import::{ImportRefusal, ImportReport, RowOutcome},
     kinds,
 };
 use crate::stored::placement::{self as stored, FulfilmentKindDefinition};
@@ -55,6 +55,8 @@ pub struct Placed {
     pub created: DateTime<Utc>,
     /// What the report counts it under: its writer.
     pub writer: &'static str,
+    /// The old kind of the row it is made from.
+    pub from: &'static str,
 }
 
 #[derive(Default)]
@@ -138,7 +140,7 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
         let report = if imports(&copy.home) { &mut *report } else { &mut ignored };
         let metadata = &copy.object.metadata;
         if metadata.deletion_timestamp.is_some() {
-            *report.dropped.entry((KINDS, "deleted")).or_default() += 1;
+            report.drop_rows(KINDS, "deleted", 1);
             continue;
         }
         let spec = &copy.object.spec;
@@ -154,6 +156,7 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
                 annotations: metadata.annotations.clone(),
                 created: metadata.creation_timestamp,
                 writer,
+                from: KINDS,
             })
         });
         if let (Ok(_), FulfilmentRealisation::HostDirect, Some(platform)) =
@@ -173,7 +176,7 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
         let refuse =
             |reason: String| ImportRefusal { kind: POLICIES, record: name.clone(), reason: format!("at `{}`: {reason}", copy.home) };
         if metadata.deletion_timestamp.is_some() {
-            *report.dropped.entry((POLICIES, "deleted")).or_default() += 1;
+            report.drop_rows(POLICIES, "deleted", 1);
             continue;
         }
         if spec.priority != 0 {
@@ -204,6 +207,7 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
         if let Some(entry) = kinds.get_mut(&key) {
             // The daemon already migrated it to this kind.
             entry.namespaces.insert(copy.namespace.clone());
+            report.drop_rows(POLICIES, "migrated already: its FulfilmentKind imports", 1);
         } else {
             if let Some(instance) = spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.clone()) {
                 unpinned.push((POLICIES, name.clone(), copy.home.clone(), instance));
@@ -223,6 +227,7 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
                     annotations: metadata.annotations.clone(),
                     created: metadata.creation_timestamp,
                     writer,
+                    from: POLICIES,
                 })
                 .map_err(|reason| format!("its kind: {reason}"));
             let refused = record.is_err();
@@ -281,7 +286,10 @@ pub fn write_placement(copies: &PlacementCopies, target: &mut impl ImportTarget,
         let written = kinds::change_of(&placed.labels, &placed.annotations, &placed.home, Timestamp::from_datetime(&placed.created))
             .and_then(|change| target.write(&placed.home, &placed.name, &change, &placed.record));
         match written {
-            Ok(()) => *report.imported.entry((KINDS, placed.writer)).or_default() += 1,
+            Ok(()) => {
+                *report.imported.entry((KINDS, placed.writer)).or_default() += 1;
+                report.rows(placed.from, RowOutcome::Imported, 1);
+            }
             Err(reason) => report.refused.push(ImportRefusal { kind: KINDS, record: placed.name, reason }),
         }
     }

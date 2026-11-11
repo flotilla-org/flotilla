@@ -39,7 +39,7 @@ use flotilla_schema::{Kind, Timestamp};
 use flotilla_store::{definition_is_live, merge_definition_copies};
 
 use super::{
-    import::{ImportRefusal, ImportReport},
+    import::{ImportRefusal, ImportReport, RowOutcome},
     project_import::write_project_ops,
     provenance::change_of,
 };
@@ -200,7 +200,7 @@ where
         }
         let refuse = |reason: String| ImportRefusal { kind, record: name.to_owned(), reason };
         if is_builtin(kind, name) {
-            *report.dropped.entry((kind, "built-in, served from the code")).or_default() += held;
+            report.drop_rows(kind, "built-in, served from the code", held);
             continue;
         }
         let merged = match merge_definition_copies(
@@ -225,7 +225,7 @@ where
             }
         }
         if !definition_is_live(&merged) {
-            *report.dropped.entry((kind, "deleted")).or_default() += held;
+            report.drop_rows(kind, "deleted", held);
             continue;
         }
         let live: Vec<_> = copies.iter().copied().filter(|copy| copy.object.metadata.deletion_timestamp.is_none()).collect();
@@ -246,6 +246,9 @@ where
             report.refused.push(refuse("the merge reads it as live, but every copy is deleted".to_owned()));
             continue;
         }
+        // A copy held here that folds into the record at another home is that home's to import.
+        let folded_here = copies.iter().filter(|copy| imports(&copy.home) && !homes.iter().any(|kept| kept.home == copy.home)).count();
+        report.rows(kind, RowOutcome::OtherHome, folded_here);
         let folded: BTreeSet<_> =
             copies.iter().map(|copy| copy.home.as_str()).filter(|home| !homes.iter().any(|kept| kept.home == *home)).collect();
         if !folded.is_empty() {
@@ -275,7 +278,7 @@ where
                 }),
                 Ok(Mapped::Dropped(reason)) => {
                     // The spec is the merged one, so every home's record drops alike: count the copies once.
-                    *report.dropped.entry((kind, reason)).or_default() += held;
+                    report.drop_rows(kind, reason, held);
                     break;
                 }
                 Err(reason) => report.refused.push(refuse(format!("at `{}`: {reason}", copy.home))),
@@ -323,7 +326,7 @@ where
         let change = change_of(&imported.origin, &imported.home, imported.created);
         match target.write(&imported.home, &imported.name, &change, &imported.record) {
             Ok(()) => {
-                *report.imported.entry((kind, label(&imported.origin))).or_default() += 1;
+                report.import_row(kind, label(&imported.origin));
                 written.insert((imported.namespace, imported.name));
             }
             Err(reason) => report.refused.push(ImportRefusal { kind, record: imported.name, reason }),

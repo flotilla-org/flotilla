@@ -21,7 +21,7 @@ use flotilla_protocol::IssueSource;
 use flotilla_resources::{select_change_request_sources, ChangeRequest, Issue, Resource, ResourceObject};
 use flotilla_schema::Kind;
 
-use super::import::{created, ImportRefusal, ImportReport};
+use super::import::{created, ImportRefusal, ImportReport, RowOutcome};
 use crate::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
 
 /// One home's old copy of an observation: the object, and the home that wrote it.
@@ -80,6 +80,7 @@ fn candidate<R: Resource>(
     };
     if let Some(skip) = skip.as_ref().filter(|_| target.imports(&copy.home)) {
         *report.dropped.entry((kind, skip.label())).or_default() += 1;
+        report.rows(kind, if matches!(skip, Skip::Elsewhere) { RowOutcome::OtherHome } else { RowOutcome::Dropped }, 1);
         if matches!(skip, Skip::NoObserver) {
             let note = format!("{kind} of {}/{} not imported: no Project declares its source", source.service, source.scope);
             if !report.notes.contains(&note) {
@@ -91,6 +92,49 @@ fn candidate<R: Resource>(
         None | Some(Skip::Elsewhere) => observer.filter(|home| target.imports(home)),
         Some(_) => None,
     }
+}
+
+/// The candidate copies of one kind, homed here or elsewhere, and how many of each were chosen:
+/// one copy per subject is imported, and the rest are staler copies of it.
+#[derive(Default)]
+struct Candidates {
+    here: usize,
+    elsewhere: usize,
+    chosen_here: usize,
+    chosen_elsewhere: usize,
+}
+
+impl Candidates {
+    fn read(&mut self, here: bool) {
+        if here {
+            self.here += 1;
+        } else {
+            self.elsewhere += 1;
+        }
+    }
+
+    fn chose(&mut self, here: bool) {
+        if here {
+            self.chosen_here += 1;
+        } else {
+            self.chosen_elsewhere += 1;
+        }
+    }
+
+    /// Counts the copies not chosen as dropped: a staler copy homed here is counted where it is
+    /// homed, and one homed elsewhere only in the ledger.
+    fn account(self, kind: &'static str, report: &mut ImportReport) {
+        let (stale_here, stale_elsewhere) = (self.here - self.chosen_here, self.elsewhere - self.chosen_elsewhere);
+        if stale_here > 0 {
+            report.drop_rows(kind, "a staler copy of an imported subject", stale_here);
+        }
+        report.rows(kind, RowOutcome::CopyDropped, stale_elsewhere);
+    }
+}
+
+/// Counts a chosen copy written, homed here or elsewhere, in the ledger.
+fn imported(kind: &'static str, here: bool, report: &mut ImportReport) {
+    report.rows(kind, if here { RowOutcome::Imported } else { RowOutcome::CopyImported }, 1);
 }
 
 /// Writes `record` as `name` at `home` and counts it, or names the refusal.
@@ -126,21 +170,29 @@ pub fn import_change_requests(
 ) {
     const KIND: &str = "ChangeRequest";
     let mut live = Vec::new();
+    let mut candidates = Candidates::default();
     for copy in copies {
         let source = IssueSource { service: copy.object.spec.service.clone(), scope: copy.object.spec.scope.clone() };
         let unusable = copy.object.status.is_none().then_some("never observed");
         if let Some(home) = candidate(KIND, copy, &source, unusable, observer_of, target, report) {
-            live.push((&copy.object, home));
+            let here = target.imports(&copy.home);
+            candidates.read(here);
+            live.push((&copy.object, (home, here)));
         }
     }
-    for (_, (object, home)) in select_change_request_sources(live) {
+    for (_, (object, (home, here))) in select_change_request_sources(live) {
+        candidates.chose(here);
         let Some(status) = &object.status else { continue };
         let name = object.metadata.name.clone();
         let record = ChangeRequestRecord::from_old(&object.spec, status);
-        if write(KIND, target, &home, &name, &object, &record, report) && !object.spec.subject_of.is_empty() {
-            *report.dropped.entry((KIND, "convoy history")).or_default() += 1;
+        if write(KIND, target, &home, &name, &object, &record, report) {
+            imported(KIND, here, report);
+            if !object.spec.subject_of.is_empty() {
+                *report.dropped.entry((KIND, "convoy history")).or_default() += 1;
+            }
         }
     }
+    candidates.account(KIND, report);
 }
 
 /// Imports every issue whose source's observer `target` imports, one record per subject, from the
@@ -152,7 +204,8 @@ pub fn import_issues(
     report: &mut ImportReport,
 ) {
     const KIND: &str = "Issue";
-    let mut selected = BTreeMap::<(String, String, u64), (&ResourceObject<Issue>, String)>::new();
+    let mut selected = BTreeMap::<(String, String, u64), (&ResourceObject<Issue>, String, bool)>::new();
+    let mut candidates = Candidates::default();
     let rank = |object: &ResourceObject<Issue>| {
         (
             object.status.as_ref().map(|status| status.state.observed_at),
@@ -165,17 +218,23 @@ pub fn import_issues(
         let source = IssueSource { service: copy.object.spec.service.clone(), scope: copy.object.spec.scope.clone() };
         let unusable = copy.object.status.is_none().then_some("never observed");
         let Some(home) = candidate(KIND, copy, &source, unusable, observer_of, target, report) else { continue };
+        let here = target.imports(&copy.home);
+        candidates.read(here);
         let key = (copy.object.spec.service.clone(), copy.object.spec.scope.clone(), copy.object.spec.number);
         match selected.get(&key) {
-            Some((prior, _)) if rank(prior) >= rank(&copy.object) => {}
+            Some((prior, _, _)) if rank(prior) >= rank(&copy.object) => {}
             _ => {
-                selected.insert(key, (&copy.object, home));
+                selected.insert(key, (&copy.object, home, here));
             }
         }
     }
-    for (object, home) in selected.into_values() {
+    for (object, home, here) in selected.into_values() {
+        candidates.chose(here);
         let Some(status) = &object.status else { continue };
         let name = object.metadata.name.clone();
-        write(KIND, target, &home, &name, object, &IssueRecord::from_old(&object.spec, status), report);
+        if write(KIND, target, &home, &name, object, &IssueRecord::from_old(&object.spec, status), report) {
+            imported(KIND, here, report);
+        }
     }
+    candidates.account(KIND, report);
 }

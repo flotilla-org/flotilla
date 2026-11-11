@@ -26,7 +26,7 @@ use std::{
 
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 use flotilla_engine_store::{Import, ImportTarget};
-use flotilla_provisioning::engine::import::ImportReport;
+use flotilla_provisioning::engine::import::{ImportReport, RowCounts};
 use flotilla_resources::{K8sResourceObject, Resource, ResourceObject};
 use flotilla_store::REGISTERED_RESOURCE_KINDS;
 use serde::{Deserialize, Serialize};
@@ -240,17 +240,41 @@ pub struct Refusal {
     pub reason: String,
 }
 
+/// One old kind's rows, every home's, by what became of them. When none of them is refused,
+/// imported, dropped and other-home add up to its rows; `unaccounted` is what they miss by.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct Rows {
+    pub rows: usize,
+    pub imported: usize,
+    pub dropped: usize,
+    /// Rows another home imports: its own records, and the copies held here of them.
+    pub other_home: usize,
+    pub unaccounted: i64,
+}
+
 /// What an import did with the records homed at its store's home.
 #[derive(Debug, Default)]
 pub struct Summary {
+    /// Records written and dropped, by the kind the importer counts them under.
     pub kinds: BTreeMap<String, Counts>,
+    /// Every old row, by its old kind.
+    pub rows: BTreeMap<String, Rows>,
     pub refusals: Vec<Refusal>,
     /// Imported, but on an assumption worth reading, or kept in the old store by design.
     pub notes: Vec<String>,
+    ledger: BTreeMap<String, RowCounts>,
 }
 
 impl Summary {
     fn absorb(&mut self, report: ImportReport) {
+        for (kind, counts) in report.rows {
+            let ledger = self.ledger.entry(kind.to_owned()).or_default();
+            ledger.imported += counts.imported;
+            ledger.dropped += counts.dropped;
+            ledger.other_home += counts.other_home;
+            ledger.copies_imported += counts.copies_imported;
+            ledger.copies_dropped += counts.copies_dropped;
+        }
         for ((kind, _), count) in report.imported {
             self.kinds.entry(kind.to_owned()).or_default().imported += count;
         }
@@ -271,6 +295,38 @@ impl Summary {
     pub fn refused(&self) -> bool {
         !self.refusals.is_empty()
     }
+
+    /// Accounts for every row of `source` by its old kind: a row homed where `target` imports is
+    /// as its importer counted it, and one homed elsewhere is that home's unless the import
+    /// consumed it here.
+    fn account(&mut self, source: &Source, target: &impl ImportTarget) {
+        let mut held = BTreeMap::<String, (usize, usize)>::new();
+        for row in &source.rows {
+            let kind = plan::plan(&row.plural).map_or_else(|| row.plural.clone(), |(kind, _)| kind.to_owned());
+            let (here, elsewhere) = held.entry(kind).or_default();
+            if target.imports(&row.home) {
+                *here += 1;
+            } else {
+                *elsewhere += 1;
+            }
+        }
+        for (kind, (here, elsewhere)) in held {
+            let ledger = self.ledger.get(&kind).copied().unwrap_or_default();
+            let consumed = ledger.copies_imported + ledger.copies_dropped;
+            let rows = Rows {
+                rows: here + elsewhere,
+                imported: ledger.imported + ledger.copies_imported,
+                dropped: ledger.dropped + ledger.copies_dropped,
+                other_home: ledger.other_home + elsewhere.saturating_sub(consumed),
+                unaccounted: 0,
+            };
+            let carried = rows.imported + rows.dropped + rows.other_home;
+            self.rows.insert(kind, Rows { unaccounted: rows.rows as i64 - carried as i64, ..rows });
+        }
+        for kind in self.ledger.keys().filter(|kind| !self.rows.contains_key(*kind)) {
+            self.notes.push(format!("the ledger counts rows of `{kind}`, which the old store does not hold"));
+        }
+    }
 }
 
 /// Counts the rows of kinds no importer reads, homed where `target` imports: a retired kind's are
@@ -279,7 +335,10 @@ fn plan_rows(source: &Source, target: &impl ImportTarget, summary: &mut Summary)
     for row in source.rows.iter().filter(|row| target.imports(&row.home)) {
         match plan::plan(&row.plural) {
             Some((_, Plan::Imported(_))) => {}
-            Some((kind, Plan::Retired(_))) => summary.kinds.entry(kind.to_owned()).or_default().dropped += 1,
+            Some((kind, Plan::Retired(_))) => {
+                summary.kinds.entry(kind.to_owned()).or_default().dropped += 1;
+                summary.ledger.entry(kind.to_owned()).or_default().dropped += 1;
+            }
             None => {
                 let unreadable =
                     row.document.get(UNREADABLE).and_then(Value::as_str).map(|error| format!("; its stored body is not JSON: {error}"));
@@ -327,6 +386,7 @@ pub fn import(source: &Source, target: &mut Import) -> Summary {
         (step.run)(source, target, &mut carried, &mut report);
         summary.absorb(report);
     }
+    summary.account(source, target);
     summary
 }
 
@@ -361,6 +421,8 @@ pub struct Report {
     pub source: String,
     pub outcome: Outcome,
     pub kinds: BTreeMap<String, Counts>,
+    /// Every old row, by its old kind.
+    pub rows: BTreeMap<String, Rows>,
     pub refusals: Vec<Refusal>,
 }
 
@@ -371,6 +433,7 @@ impl Report {
             source: OLD_STORE.to_owned(),
             outcome: if summary.refused() { Outcome::Refused } else { Outcome::Imported },
             kinds: summary.kinds.clone(),
+            rows: summary.rows.clone(),
             refusals: summary.refusals.clone(),
         }
     }

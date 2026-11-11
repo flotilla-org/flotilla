@@ -10,7 +10,7 @@ use flotilla_provisioning::engine::{
     image_build::ImageBuildBinding,
     import::{
         import_checkouts, import_clones, import_environments, import_records, import_terminal_sessions, import_vessels, ImportRefusal,
-        ImportReport,
+        ImportReport, RowOutcome,
     },
 };
 use flotilla_resources::{
@@ -98,13 +98,17 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
     for record in
         source.owned::<Checkout>("checkouts", namespace, "Checkout", target, report).into_iter().map(|record| (record.object, record.home))
     {
+        // Another home's checkout is that home's to import or drop.
+        if !target.imports(&record.1) {
+            continue;
+        }
         let convoy_home = record.0.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).unwrap_or(&record.1).clone();
         let holder = |old: &str| {
             let (launch, version) = carried.convoys.get(&(convoy_home.clone(), old.to_owned()))?;
             Some((Identity { kind: convoy_code, name: launch.clone(), home: convoy_home.clone() }, *version))
         };
         if record.0.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| holder(convoy).is_none()) {
-            *report.dropped.entry(("Checkout", "held for a convoy that was not imported")).or_default() += 1;
+            report.drop_rows("Checkout", "held for a convoy that was not imported", 1);
             continue;
         }
         import_checkouts(std::slice::from_ref(&record), &holder, &clone_launches, target, report);
@@ -156,6 +160,7 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
     let (counts, refused) = import_ensures(&ensures, target);
     for (label, count) in counts {
         *report.imported.entry(("Ensure", label)).or_default() += count;
+        report.rows("ConvoyEnsure", RowOutcome::Imported, count);
     }
     report.refused.extend(refused.into_iter().map(|(record, reason)| ImportRefusal { kind: "Ensure", record, reason }));
 }

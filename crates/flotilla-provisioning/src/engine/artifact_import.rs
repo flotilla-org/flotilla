@@ -74,14 +74,14 @@ pub fn import_artifacts(copies: &[ArtifactCopy], target: &mut impl ImportTarget,
             // Each record starts at its home as a fresh write; its old versions are not carried.
             Ok(Imported::Record(record)) => match target.write(&copy.home, name, &created(&copy.object), &*record) {
                 Ok(()) => {
-                    *report.imported.entry((KIND, "stored")).or_default() += 1;
+                    report.import_row(KIND, "stored");
                     if copy.object.status.as_ref().is_some_and(|status| !status.ledger_comment_creations.is_empty()) {
                         *report.dropped.entry((KIND, "ledger comment reservations")).or_default() += 1;
                     }
                 }
                 Err(reason) => report.refused.push(refuse(reason)),
             },
-            Ok(Imported::Dropped(reason)) => *report.dropped.entry((KIND, reason)).or_default() += 1,
+            Ok(Imported::Dropped(reason)) => report.drop_rows(KIND, reason, 1),
             Err(reason) => report.refused.push(refuse(reason)),
         }
     }

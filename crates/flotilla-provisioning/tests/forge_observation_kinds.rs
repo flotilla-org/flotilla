@@ -12,7 +12,7 @@ use flotilla_protocol::IssueSource;
 use flotilla_provisioning::{
     engine::{
         forge_observation_import::{import_change_requests, import_issues, ObservationCopy},
-        import::ImportReport,
+        import::{ImportReport, RowCounts},
     },
     stored::forge_observation::{self as stored, ChangeRequestRecord, IssueRecord},
 };
@@ -240,8 +240,9 @@ fn every_observed_issue_imports_with_its_values(tc: hegel::TestCase) {
 }
 
 // Behaviour (ADR 0047; one import per subject): among every home's copies of one
-// subject, the observer imports the one readers pick today; deleted, never-observed and
-// undeclared copies are dropped, counted where they are homed, and convoy history is dropped.
+// subject, the observer imports the one readers pick today; deleted, never-observed, undeclared
+// and staler copies are dropped, counted where they are homed, and convoy history is dropped.
+// Every row is accounted for once: the copy imported from another home as that home's.
 #[test]
 fn the_observer_imports_the_copy_readers_pick_and_counts_the_rest() {
     let observer_of = |source: &IssueSource| (source.scope == SCOPE).then(|| "alpha".to_owned());
@@ -274,7 +275,17 @@ fn the_observer_imports_the_copy_readers_pick_and_counts_the_rest() {
     let record: ChangeRequestRecord = load(&mut alpha, "cr-1", "alpha").expect("imported");
     assert_eq!(record.state, Some(stored::ChangeRequestState::Merged));
     let dropped: Vec<_> = report.dropped.iter().map(|((_, reason), count)| (*reason, *count)).collect();
-    assert_eq!(dropped, [("convoy history", 1), ("deleted", 1), ("never observed", 1), ("no declared observer", 1)]);
+    assert_eq!(
+        dropped,
+        [
+            ("a staler copy of an imported subject", 1),
+            ("convoy history", 1),
+            ("deleted", 1),
+            ("never observed", 1),
+            ("no declared observer", 1)
+        ]
+    );
+    assert_eq!(report.rows["ChangeRequest"], RowCounts { dropped: 4, copies_imported: 1, ..RowCounts::default() });
     assert_eq!(report.notes, ["ChangeRequest of github.com/someone/else not imported: no Project declares its source"]);
 
     let mut beta = import_at("beta");
@@ -283,6 +294,7 @@ fn the_observer_imports_the_copy_readers_pick_and_counts_the_rest() {
     assert!(names::<ChangeRequestRecord>(&mut beta, "beta").is_empty());
     let dropped: Vec<_> = report.dropped.iter().map(|((_, reason), count)| (*reason, *count)).collect();
     assert_eq!(dropped, [("imported at its observer", 1)]);
+    assert_eq!(report.rows["ChangeRequest"], RowCounts { other_home: 1, ..RowCounts::default() });
 }
 
 // Behaviour (one import per subject): hosts holding different copies, each importing
