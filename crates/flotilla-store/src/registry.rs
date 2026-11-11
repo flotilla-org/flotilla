@@ -110,7 +110,7 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<Issue>(RegisteredResource::Issue, &[]),
     engine_kind::<Checkout>(RegisteredResource::Checkout, &[]),
     engine_kind::<CloneResource>(RegisteredResource::Clone, &[]),
-    kind::<Convoy>(RegisteredResource::Convoy, &[]),
+    engine_kind::<Convoy>(RegisteredResource::Convoy, &[]),
     kind::<ConvoyEnsure>(RegisteredResource::ConvoyEnsure, &["convoyensure", "convoy_ensure", "convoy-ensure"]),
     kind::<CredentialGrant>(
         RegisteredResource::CredentialGrant,
@@ -430,6 +430,11 @@ pub async fn query_resource_kind(
     query: &crate::StoreQuery,
 ) -> Result<Value, ResourceError> {
     let registered = lookup_resource_kind(requested_kind)?;
+    if backend.engine_records(registered.kind).is_some() {
+        // The engine serves this kind: its records are read through their views, as its typed
+        // readers read them, never the old store's rows.
+        return dispatch_resource_kind!(registered.resource, query_engine_typed(backend, namespace, query).await);
+    }
     let descriptor = declared_resource_kinds().into_iter().find(|kind| kind.paths.kind == registered.kind).expect("registered descriptor");
     let listed = backend.store().query_raw(descriptor, namespace, query).await?;
     let position = listed.position;
@@ -1003,6 +1008,27 @@ impl DynamicApplyMetadata {
 fn unknown_kind(kind: &str) -> ResourceError {
     let supported = REGISTERED_RESOURCE_KINDS.iter().map(|entry| entry.plural).collect::<Vec<_>>().join(", ");
     ResourceError::invalid(format!("unknown resource kind '{kind}' (supported: {supported})"))
+}
+
+/// [`query_resource_kind`]'s document for a kind the engine serves.
+async fn query_engine_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, query: &crate::StoreQuery) -> Result<Value, ResourceError> {
+    let listed = backend.query_declared::<T>(namespace, query).await?;
+    let items = listed
+        .items
+        .iter()
+        .map(|item| {
+            let mut value = read_object_value(item)?;
+            value["apiVersion"] = json!(api_version(T::API_PATHS));
+            value["kind"] = json!(T::API_PATHS.kind);
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, ResourceError>>()?;
+    Ok(json!({
+        "apiVersion": api_version(T::API_PATHS),
+        "kind": format!("{}List", T::API_PATHS.kind),
+        "metadata": {"resourceVersion": "overlay"},
+        "items": items,
+    }))
 }
 
 async fn list_typed<T: Resource>(backend: &ResourceBackend, namespace: &str) -> Result<DynamicResourceList, ResourceError> {
