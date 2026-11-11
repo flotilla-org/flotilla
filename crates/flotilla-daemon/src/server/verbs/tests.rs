@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use super::{
     catalog::{Catalog, Entry, Subjects},
     invoke::{allow_all, Policy, Refusal, Verbs},
-    subjects::ResourceSubjects,
+    subjects::StoredSubjects,
 };
 use crate::server::tables;
 
@@ -60,7 +60,7 @@ struct Convoys;
 #[async_trait]
 impl Subjects for Convoys {
     fn table(&self, kind: Kind) -> Option<Table> {
-        (kind == Kind::Convoy).then(|| tables::descriptor("convoys"))
+        (kind == Kind::Convoy).then(|| tables::descriptor("convoys", tables::SubjectTables::registered().of_table("convoys").as_ref()))
     }
 
     async fn row(&self, _namespace: &str, _address: &Address) -> Result<Option<Row>, String> {
@@ -108,7 +108,9 @@ fn the_load_check_lists_broken_verbs_with_their_reasons() {
 async fn the_registered_verbs_are_not_broken() {
     let (_dir, daemon) = super::super::tests::empty_daemon().await;
     let registry = crate::runtime::verb_registry(Some(Arc::clone(&daemon))).expect("each verb registered once");
-    let catalog = Catalog::new(registry, &ResourceSubjects::new(daemon.resource_backend()));
+    let subjects = tables::SubjectTables::new(registry.subjects());
+    let stores = tables::Catalog::stores(daemon.resource_backend(), daemon.decided_store().ok(), subjects, "test".into());
+    let catalog = Catalog::new(registry, &StoredSubjects::new(stores));
     for entry in catalog.entries() {
         assert_eq!(entry.broken, None, "{}", entry.declaration.name);
     }

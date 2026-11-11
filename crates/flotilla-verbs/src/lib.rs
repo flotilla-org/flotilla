@@ -6,6 +6,8 @@
 //! - [`Presentation`] and [`Picks`]: how a verb is shown and how it takes the rows it is offered.
 //! - [`VerbRegistry`]: the verbs a composition root collects from each declaring crate's
 //!   `register_verbs`, as `register_crew` collects kinds (#4267 ruling 1).
+//! - [`SubjectTable`]: the table holding a subject kind's rows and each row's canonical address,
+//!   registered by the crate owning the kind (#4355).
 //!
 //! The daemon serves what is registered here: the catalog and its load checks, the `verbs`
 //! table, invocation and the route. The handler trait serves in-process verbs only; another
@@ -19,10 +21,12 @@ pub mod declaration;
 mod native;
 mod presentation;
 mod registry;
+mod subject;
 
 pub use declaration::{Param, ParamDeclaration, ParamType, Verb, VerbDeclaration, VerbEffect};
 pub use flotilla_address::Kind;
 pub use flotilla_schema_derive::Verb;
 pub use native::{Call, Handler, NativeVerb, Params, Subject};
 pub use presentation::{Picks, Presentation};
-pub use registry::{DuplicateVerb, Registered, VerbRegistry};
+pub use registry::{Duplicate, Registered, VerbRegistry};
+pub use subject::SubjectTable;
