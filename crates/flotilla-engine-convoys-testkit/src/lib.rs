@@ -8,13 +8,13 @@ use std::sync::{Arc, OnceLock};
 use flotilla_engine_convoys::{convoy_engine::ConvoyEngine, convoy_records::EngineConvoyRecords, convoys::Convoys};
 use flotilla_protocol::LifecycleReading;
 use flotilla_resources::{
-    convoy::engine::{engine_name, set_notes, EngineConvoyPath, EngineConvoys},
+    convoy::engine::{engine_name, set_notes, EngineConvoyPath, EngineConvoys, VerdictScope},
     convoy_records::ConvoyRecords,
     lifecycle_reads::{LifecycleReads, ProvisioningKind},
     terminal_records::TerminalRecords,
     vessel_records::VesselRecords,
-    Clock, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, ObjectMeta, ResourceObject, Selector,
-    VesselRequirement, WorkflowSnapshot,
+    Clock, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, ObjectMeta, ResourceObject, Selector, VesselRequirement,
+    WorkflowSnapshot,
 };
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::{ConvoyViews, ResourceBackend};
@@ -107,6 +107,23 @@ pub async fn launch(path: &EngineConvoyPath, mut convoy: ResourceObject<Convoy>)
         }
     }
     launch
+}
+
+/// Keeps the promises of every work of launch `convoy` at `path`'s home, as an operator's verdict
+/// on each: it reads Landing.
+pub async fn keep_all(path: &EngineConvoyPath, convoy: &ResourceObject<Convoy>) {
+    let engine = path.get().expect("the Convoy path is installed");
+    let snapshot = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).expect("a launch's frozen workflow");
+    for vessel in &snapshot.vessels {
+        let scope = VerdictScope { vessel: vessel.name.clone(), role: None };
+        engine.keep_by_verdict(convoy, &scope, "operator", "kept").await.expect("keep the work");
+    }
+}
+
+/// [`keep_all`], then delivers launch `convoy`: it reads Landed.
+pub async fn land(path: &EngineConvoyPath, convoy: &ResourceObject<Convoy>) {
+    keep_all(path, convoy).await;
+    path.get().expect("the Convoy path is installed").deliver(convoy).await.expect("deliver the launch");
 }
 
 /// Convoy `name` in `namespace` as admission hands it to the engine: `spec`, and `status` with

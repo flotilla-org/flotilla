@@ -537,12 +537,13 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
     let _messages = install_engine_messages(&daemon);
     let engine = test_engine(&daemon);
     let env = create_test_environment(&engine.environments, "local-env", &host);
-    let backend = daemon.resource_backend();
     let mut crew_one = String::new();
-    for (convoy, project) in [("convoy-one", "island-one"), ("convoy-two", "island-two")] {
-        create_identity_convoy(&backend, convoy, convoy, Some(project)).await;
-        if convoy == "convoy-one" {
-            let vessel = ensure_vessel(&engine, convoy, "work");
+    let mut launches = BTreeMap::new();
+    for (record, project) in [("convoy-one", "island-one"), ("convoy-two", "island-two")] {
+        let convoy = create_identity_convoy(&daemon, record, record, Some(project)).await;
+        launches.insert(record, convoy.clone());
+        if record == "convoy-one" {
+            let vessel = ensure_vessel(&engine, &convoy, "work");
             let launch = engine.terminals.request(&TerminalLaunchRequest {
                 session: "terminal-convoy-one".to_string(),
                 environment: env.clone(),
@@ -571,22 +572,23 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
             // Its crew id is its launch's name.
             crew_one = launch;
         } else {
-            create_running_session(&engine, &env, &format!("terminal-{convoy}"), convoy, "coder").await;
+            create_running_session(&engine, &env, &format!("terminal-{record}"), &convoy, "coder").await;
         }
     }
 
     let fleet = daemon.scoped_fleet_list(None, None, None).await.expect("fleet");
     assert_eq!(fleet.rows.len(), 2);
-    let scoped = daemon.scoped_fleet_list(None, None, Some("convoy-one")).await.expect("crew convoy scope");
+    let (one, two) = (launches["convoy-one"].as_str(), launches["convoy-two"].as_str());
+    let scoped = daemon.scoped_fleet_list(None, None, Some(one)).await.expect("crew convoy scope");
     assert_eq!(scoped.rows.len(), 1);
-    assert_eq!(scoped.rows[0].convoy_ref.as_deref(), Some("convoy-one"));
+    assert_eq!(scoped.rows[0].convoy_ref.as_deref(), Some(one));
     let by_crew = daemon.scoped_fleet_list(None, Some(&crew_one), None).await.expect("crew identity scope");
     assert_eq!(by_crew.rows.len(), 1);
-    assert_eq!(by_crew.rows[0].convoy_ref.as_deref(), Some("convoy-one"));
+    assert_eq!(by_crew.rows[0].convoy_ref.as_deref(), Some(one));
     assert!(daemon.scoped_fleet_list(None, Some("missing"), None).await.is_err());
-    let explicit = daemon.scoped_fleet_list(Some("island-two"), None, Some("convoy-one")).await.expect("explicit scope");
+    let explicit = daemon.scoped_fleet_list(Some("island-two"), None, Some(one)).await.expect("explicit scope");
     assert_eq!(explicit.rows.len(), 1);
-    assert_eq!(explicit.rows[0].convoy_ref.as_deref(), Some("convoy-two"));
+    assert_eq!(explicit.rows[0].convoy_ref.as_deref(), Some(two));
     let explicit_with_stale_crew = daemon.scoped_fleet_list(Some("island-two"), Some("missing"), None).await.expect("explicit scope wins");
     assert_eq!(explicit_with_stale_crew.rows.len(), 1);
 }

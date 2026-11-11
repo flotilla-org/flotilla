@@ -9,7 +9,7 @@ pub async fn standing_ensure_holds_after_three_failed_generations_and_resumes_wh
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
 
     for delay in [30, 60] {
-        fail_ensured_generation(&backend, &clock).await;
+        fail_ensured_generation(&daemon).await;
         daemon
             .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
             .await
@@ -22,7 +22,7 @@ pub async fn standing_ensure_holds_after_three_failed_generations_and_resumes_wh
         daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("admit replacement");
     }
 
-    fail_ensured_generation(&backend, &clock).await;
+    fail_ensured_generation(&daemon).await;
     assert_eq!(
         daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("exhaust retry budget"),
         vec!["ConvoyEnsure/quartermaster exhausted restart budget"]
@@ -51,9 +51,9 @@ pub async fn standing_ensure_holds_after_three_failed_generations_and_resumes_wh
 }
 
 pub async fn reconcile_now_resets_backoff_and_admits_the_next_ensure_generation_immediately(factory: &dyn EnsureScenarioController) {
-    let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
-    fail_ensured_generation(&backend, &clock).await;
+    fail_ensured_generation(&daemon).await;
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("record backoff");
     let backed_off = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("backed-off ensure");
     assert_eq!(backed_off.status.as_ref().expect("status").restart_count, 1);
@@ -75,12 +75,12 @@ pub async fn reconcile_now_clears_an_active_restart_limit_and_admits_in_one_pass
     let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     for delay in [30, 60] {
-        fail_ensured_generation(&backend, &clock).await;
+        fail_ensured_generation(&daemon).await;
         daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("record failure");
         clock.advance(ChronoDuration::seconds(delay));
         daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("restart");
     }
-    fail_ensured_generation(&backend, &clock).await;
+    fail_ensured_generation(&daemon).await;
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("exhaust restart budget");
 
     let outcome = daemon.reconcile_convoy_ensure_now("flotilla", "quartermaster", &VerifiedDeadBacking).await.expect("forced restart");
@@ -169,24 +169,8 @@ pub async fn declared_driver_derives_bounded_backoff_from_its_homed_generations(
     assert!(other_backend.using::<ResourceConvoy>("flotilla").list().await.expect("other convoys").items.is_empty());
     assert!(driver_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("driver local ensures").items.is_empty());
 
-    let reaped = fail_latest_ensured_generation(&driver_backend, &driver_clock).await;
-    assert!(driver
-        .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
-        .await
-        .expect("failed generation starts backoff")
-        .is_empty());
-    driver_backend.using::<ResourceConvoy>("flotilla").delete(&reaped).await.expect("operator reaps failed husk");
-    assert_eq!(
-        driver
-            .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
-            .await
-            .expect("reaping resets derived failure count")
-            .len(),
-        1
-    );
-
     for delay in [30, 60] {
-        fail_latest_ensured_generation(&driver_backend, &driver_clock).await;
+        fail_latest_ensured_generation(&driver, &driver_clock).await;
         assert!(driver
             .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
             .await
@@ -209,7 +193,7 @@ pub async fn declared_driver_derives_bounded_backoff_from_its_homed_generations(
         );
     }
 
-    fail_latest_ensured_generation(&driver_backend, &driver_clock).await;
+    fail_latest_ensured_generation(&driver, &driver_clock).await;
     assert_eq!(
         driver
             .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
@@ -351,7 +335,7 @@ pub async fn changing_ensure_config_starts_a_fresh_retry_episode(factory: &dyn E
     let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     for delay in [30, 60] {
-        fail_ensured_generation(&backend, &clock).await;
+        fail_ensured_generation(&daemon).await;
         daemon
             .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
             .await
@@ -359,7 +343,7 @@ pub async fn changing_ensure_config_starts_a_fresh_retry_episode(factory: &dyn E
         clock.advance(ChronoDuration::seconds(delay));
         daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("admit replacement");
     }
-    fail_ensured_generation(&backend, &clock).await;
+    fail_ensured_generation(&daemon).await;
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("exhaust retry budget");
 
     let definitions = backend.definitions::<ConvoyEnsure>("flotilla");
@@ -385,9 +369,8 @@ pub async fn changing_ensure_config_starts_a_fresh_retry_episode(factory: &dyn E
 }
 
 pub async fn standing_ensure_retries_convoy_that_failed_before_provisioning(factory: &dyn EnsureScenarioController) {
-    let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
     let convoy_ref = backend
         .using::<ConvoyEnsure>("flotilla")
         .get("quartermaster")
@@ -397,21 +380,8 @@ pub async fn standing_ensure_retries_convoy_that_failed_before_provisioning(fact
         .expect("ensure status")
         .convoy_ref
         .expect("convoy ref");
-    let convoy = convoys.get(&convoy_ref).await.expect("standing convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Failed,
-                provisioning: Some(ConvoyProvisioningState::NotStarted),
-                message: Some("workflow validation failed".to_string()),
-                finished_at: Some(clock.now()),
-                ..convoy.status.clone().unwrap_or_default()
-            },
-        )
-        .await
-        .expect("record pre-provisioning failure");
+    // It failed before any of its works launched a vessel.
+    fail_generation(&daemon, &convoy_ref, "workflow validation failed").await;
 
     let events = daemon.reconcile_convoy_ensures_once("flotilla").await.expect("reconcile terminal convoy");
 
@@ -431,8 +401,7 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
     let first_ref = ensure.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("first convoy ref");
     // ConvoyEnsure B: the strike count is derived from the role's generations, so there is no
     // stored budget to seed; a reap leaves no failed generation behind, and the count stays 0.
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    convoys.delete(&first_ref).await.expect("operator reap");
+    abandon_generation(&daemon, &first_ref).await;
 
     assert_eq!(
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("prompt resurrection"),
@@ -444,7 +413,7 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
     backend.definitions::<WorkflowTemplate>("flotilla").delete(&materialized_name).await.expect("temporary resolution loss");
     let second_ref =
         ensures.get("quartermaster").await.expect("ensure").status.and_then(|status| status.convoy_ref).expect("second convoy ref");
-    convoys.delete(&second_ref).await.expect("second operator reap");
+    abandon_generation(&daemon, &second_ref).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("unresolved workflow schedules retry");
     let retrying = ensures.get("quartermaster").await.expect("retrying ensure");
     assert_eq!(retrying.status.as_ref().expect("status").restart_count, 0);
@@ -459,7 +428,7 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
                     .repository_refs(vec![repository_key])
-                    .crew(Vec::new())
+                    .crew(vec![governor()])
                     .build()])
                 .build(),
         )

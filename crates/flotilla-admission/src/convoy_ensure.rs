@@ -124,20 +124,24 @@ impl StandingConvoyBackingInspector for ResourceStandingConvoyBackingInspector {
             .unwrap_or_default();
         let convoy_name = convoy.metadata.name.clone();
         let reads = Arc::clone(&self.lifecycle_reads);
-        let environments = tokio::task::spawn_blocking(move || {
+        let (launched, environments) = tokio::task::spawn_blocking(move || {
             let environments = reads.environments()?;
             let vessels = reads.vessels()?.of_convoy(&convoy_name)?;
+            let mut launched = false;
             let mut held = Vec::new();
             for vessel in vessels.iter().filter(|vessel| works.contains(vessel.work())).map(|vessel| &vessel.name) {
+                launched = true;
                 held.extend(environments.held(vessel)?);
             }
-            Ok::<_, String>(held)
+            Ok::<_, String>((launched, held))
         })
         .await
         .map_err(|error| format!("could not inspect backing environments: {error}"))?
         .map_err(|error| format!("could not inspect backing environments: {error}"))?;
         if environments.is_empty() {
-            if convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted) {
+            // A convoy none of whose works launched a vessel never began provisioning (#3108: the
+            // engine's view derives no provisioning state, so the vessels are the evidence).
+            if !launched || convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted) {
                 return Ok(());
             }
             return Err("no backing environment evidence is available".to_string());
@@ -189,13 +193,14 @@ mod tests {
             let engine = EngineFixture::default();
             let fixture = &engine.environments;
             let inspector = ResourceStandingConvoyBackingInspector::new(backend).with_lifecycle_reads(engine.reads());
-            assert!(inspector.verify_backing_dead(&convoy).await.is_err(), "a provisioning convoy with no environment has no evidence");
+            assert!(inspector.verify_backing_dead(&convoy).await.is_ok(), "a convoy that launched no vessel never provisioned");
             let spec = EnvironmentSpec {
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
                 ..Default::default()
             };
             // The work's launch holds its environment.
             let launch = engine.vessels.request("convoy", "work", "host");
+            assert!(inspector.verify_backing_dead(&convoy).await.is_err(), "a provisioning convoy with no environment has no evidence");
             fixture.request("env", &spec, Some(&launch));
             assert!(inspector.verify_backing_dead(&convoy).await.is_err());
             fixture.finish("env", ending);

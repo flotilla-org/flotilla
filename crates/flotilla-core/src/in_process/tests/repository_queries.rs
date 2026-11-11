@@ -218,7 +218,8 @@ async fn cli_checkout_rows_follow_engine_checkouts() {
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    let engine = super::test_engine(&daemon).checkouts;
+    let fixture = super::test_engine(&daemon);
+    let engine = &fixture.checkouts;
     let repository = RepositorySpec::remote("https://github.com/org/repo").expect("repository spec");
     let key = repository.key();
     backend
@@ -229,19 +230,16 @@ async fn cli_checkout_rows_follow_engine_checkouts() {
     let mut last_convoy = None;
     for ending in ["ready", "lost"] {
         let name = format!("checkout-{ending}");
-        let convoy_name = format!("crew-{name}");
-        backend
-            .using::<flotilla_resources::Convoy>("flotilla")
-            .create(
-                &test_meta(&convoy_name),
-                &flotilla_resources::ConvoySpec::builder()
-                    .workflow_ref("workflow".into())
-                    .adopted_checkout_refs(std::collections::BTreeMap::from([(key.clone(), name.clone())]))
-                    .build(),
-            )
-            .await
-            .expect("convoy");
-        super::support::admit_on_engine(&backend, &engine, &convoy_name).await;
+        let convoy_name = super::admit(
+            &daemon,
+            &format!("crew-{name}"),
+            flotilla_resources::ConvoySpec::builder()
+                .workflow_ref("workflow".into())
+                .adopted_checkout_refs(std::collections::BTreeMap::from([(key.clone(), name.clone())]))
+                .build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        )
+        .await;
         last_convoy = Some(convoy_name.clone());
         daemon
             .observed_resource_backend()
@@ -268,7 +266,7 @@ async fn cli_checkout_rows_follow_engine_checkouts() {
                 target_path: "/work".into(),
                 clone_ref: "source".into(),
             }),
-            Some(&engine.holder(&convoy_name)),
+            Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy_name.clone())),
         );
         let rows = daemon.list_cli_items_internal(CliListKind::Checkout).await.expect("progress");
         assert_eq!(rows.items.iter().find(|row| row.reference == name).expect("row").status, "pending");

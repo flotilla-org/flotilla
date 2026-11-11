@@ -1,5 +1,5 @@
 use flotilla_store_memory::InMemoryBackend;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -7,13 +7,12 @@ use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
     terminal_records::{TerminalLaunchRequest, TerminalLaunchSource},
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TurnDeliveryRung, VesselRequirement,
+    Convoy as ResourceConvoy, ConvoySpec, CrewWorkPhase, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TurnDeliveryRung,
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{ensure_vessel, observe_attention, resume_staging_fixture, test_meta, RecordingWorkCredentials};
+use super::support::{ensure_vessel, observe_attention, resume_staging_fixture, RecordingWorkCredentials};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 
@@ -31,7 +30,7 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
     terminals.exited(&exited.name, "exit 0");
     let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
-        .convoy("resume-staging".to_string())
+        .convoy(probe.convoy.clone())
         .source("review".to_string())
         .vessel("work".to_string())
         .role("coder".to_string())
@@ -49,7 +48,7 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].spec.body, "fresh turn");
     assert_eq!(messages[0].spec.sender, "system:turn-rules");
-    assert_eq!(messages[0].spec.receiver, "flotilla/resume-staging/work/coder");
+    assert_eq!(messages[0].spec.receiver, format!("flotilla/{}/work/coder", probe.convoy));
     assert_eq!(session.status.expect("status").phase, ResourceTerminalSessionPhase::Starting);
 }
 
@@ -59,7 +58,7 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
-        .convoy("resume-staging".to_string())
+        .convoy(probe.convoy.clone())
         .source("review".to_string())
         .vessel("work".to_string())
         .role("coder".to_string())
@@ -117,50 +116,27 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
         .await;
         // The engine's readings, which a running daemon always has.
         let engine = super::test_engine(&daemon);
+        // The coder's work is kept: the convoy is Landing, its work Complete and its crew Done.
+        let mut snapshot = super::support::stall_workflow_snapshot(vec![super::support::claim_crew("coder")]);
+        snapshot.vessels[0].credential_refs = BTreeSet::from(["github-crew-pr".to_string()]);
+        let convoy = super::admit_snapshot(
+            &daemon,
+            "turn-credential-work",
+            ConvoySpec::builder().workflow_ref("implement-review".to_string()).build(),
+            snapshot,
+        )
+        .await;
+        super::complete_work(&daemon, &convoy, "work").await;
         let credentials = Arc::new(RecordingWorkCredentials {
             backend: backend.clone(),
+            convoy: convoy.clone(),
             delivered: tokio::sync::Mutex::new(BTreeSet::new()),
             fail_next: std::sync::atomic::AtomicBool::new(true),
         });
         daemon.set_work_credential_reconciler(credentials.clone()).await;
         let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-        let convoy = convoys
-            .create(&test_meta("turn-credential-work"), &ConvoySpec::builder().workflow_ref("implement-review".to_string()).build())
-            .await
-            .expect("convoy");
-        convoys
-            .update_status(
-                &convoy.metadata.name,
-                &convoy.metadata.resource_version,
-                &ConvoyStatus {
-                    phase: flotilla_resources::ConvoyPhase::Landing,
-                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                        cascade: None,
-                        stall_nudges: Default::default(),
-                        supervision: None,
-                        exit: None,
-                        turn_delivery: Default::default(),
-                        vessels: vec![VesselRequirement::builder()
-                            .name("work".to_string())
-                            .credential_refs(BTreeSet::from(["github-crew-pr".to_string()]))
-                            .crew(Vec::new())
-                            .build()],
-                    }),
-                    work: BTreeMap::from([(
-                        "work".to_string(),
-                        flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
-                    )]),
-                    crew_work: BTreeMap::from([(
-                        "work".to_string(),
-                        BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
-                    )]),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("admitted claim");
         let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-        let vessel = ensure_vessel(&engine, "turn-credential-work", "work");
+        let vessel = ensure_vessel(&engine, &convoy, "work");
         let launch = engine.terminals.request(&TerminalLaunchRequest {
             session: "turn-credential-session".to_string(),
             environment: "credential-env".to_string(),
@@ -191,7 +167,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
         }
         let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
             .namespace("flotilla".to_string())
-            .convoy("turn-credential-work".to_string())
+            .convoy(convoy.clone())
             .source("conflicting".to_string())
             .vessel("work".to_string())
             .role("coder".to_string())
@@ -200,7 +176,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             .sender("system:turn-rules".into())
             .build();
         assert!(daemon.deliver_standing_turn(&request).await.is_err(), "failed staging must prevent delivery");
-        let after_failure = convoys.get("turn-credential-work").await.expect("convoy after failed staging").status.expect("status");
+        let after_failure = convoys.get(&convoy).await.expect("convoy after failed staging").status.expect("status");
         assert_eq!(after_failure.phase, flotilla_resources::ConvoyPhase::Landing);
         assert_eq!(after_failure.work["work"].phase, flotilla_resources::WorkPhase::Complete);
         assert_eq!(after_failure.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
@@ -222,28 +198,28 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
 // ceiling (including zero), and clear their stall when the convoy lands.
 #[tokio::test]
 async fn idle_crew_nudges_are_bounded_and_credential_staged() {
-    use super::support::resume_staging_fixture_with_clock;
+    use super::support::resume_staging_fixture_shaped;
     use flotilla_resources::{Clock, StallRung};
     use flotilla_state_machines::machines::agent_session::Activity;
     use flotilla_store_testkit::VirtualClock;
 
     for limit in [0, 2] {
         let clock = Arc::new(VirtualClock::new(Utc::now() + chrono::Duration::hours(1)));
+        // The coder's work is open, its convoy Active, under the standard exit table and the nudge ceiling.
         let (daemon, backend, probe) =
-            resume_staging_fixture_with_clock(ResourceBackend::new(InMemoryBackend::default()), clock.clone()).await;
+            resume_staging_fixture_shaped(ResourceBackend::new(InMemoryBackend::default()), clock.clone(), false, |_, snapshot| {
+                snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+                snapshot.stall_nudges.insert(
+                    "work/coder".to_string(),
+                    flotilla_resources::StallNudgePolicy { max_per_episode: limit, max_refusals: None, idle_grace_seconds: Some(0) },
+                );
+            })
+            .await;
         probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
         let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-        let convoy = convoys.get("resume-staging").await.expect("convoy");
-        let mut status = convoy.status.expect("status");
-        status.phase = flotilla_resources::ConvoyPhase::Active;
-        status.workflow_snapshot.as_mut().expect("workflow").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
-        status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Running;
-        status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
-        status.workflow_snapshot.as_mut().expect("workflow").stall_nudges.insert(
-            "work/coder".to_string(),
-            flotilla_resources::StallNudgePolicy { max_per_episode: limit, max_refusals: None, idle_grace_seconds: Some(0) },
-        );
-        convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("active convoy");
+        // The vessel is realised and the session ready: the coder is at work.
+        let vessel = ensure_vessel(&probe.engine, &probe.convoy, "work");
+        probe.engine.vessels.ready(&vessel, "resume-env");
         let launch = probe.engine.terminals.record("resume-staging-session").name;
         probe.engine.terminals.ready(&launch, "resume-staging-pool-session", &Default::default());
         let idle = |as_of| TerminalAttention { state: TerminalAttentionState::Idle, as_of, source: TerminalAttentionSource::Hook };
@@ -255,7 +231,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         hook(Activity::Idle, "Stop", clock.now());
         let expected_rung = if limit == 0 { StallRung::Operator } else { StallRung::Nudge };
         daemon.reconcile_crew_stalls_once("flotilla").await.expect("first stall judgement");
-        let first = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
+        let first = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").stalled.expect("stalled");
         assert_eq!(first.rung, expected_rung);
         assert_eq!(first.nudge_history.len(), limit.min(1) as usize);
         if limit == 0 {
@@ -295,20 +271,23 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
                 hook(Activity::Idle, "Stop", clock.now());
                 observe_attention(&probe.engine, &launch, idle(idle_again));
                 daemon.reconcile_crew_stalls_once("flotilla").await.expect("next idle episode judgement");
-                let stalled = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
+                let stalled = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").stalled.expect("stalled");
                 assert_eq!(stalled.nudge_history.len(), 2);
                 assert_eq!(stalled.rung, desired_rung);
             }
-            let stalled = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
+            let stalled = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").stalled.expect("stalled");
             assert_eq!(stalled.nudge_history.len(), 2);
         }
-        let convoy = convoys.get("resume-staging").await.expect("convoy");
-        let mut status = convoy.status.expect("status");
-        status.phase = flotilla_resources::ConvoyPhase::Landed;
-        status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Done;
-        convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("complete");
+        // The coder's work is kept and the convoy delivered: it lands.
+        super::complete_work(&daemon, &probe.convoy, "work").await;
+        let landing = convoys.get(&probe.convoy).await.expect("convoy");
+        super::convoy_engine(&daemon).deliver(&landing).await.expect("land");
+        assert_eq!(
+            convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").phase,
+            flotilla_resources::ConvoyPhase::Landed
+        );
         daemon.reconcile_crew_stalls_once("flotilla").await.expect("clear stall");
-        assert!(convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.is_none());
+        assert!(convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").stalled.is_none());
     }
 }
 
@@ -322,7 +301,7 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".into())
-        .convoy("resume-staging".into())
+        .convoy(probe.convoy.clone())
         .source("legacy".into())
         .vessel("work".into())
         .role("coder".into())

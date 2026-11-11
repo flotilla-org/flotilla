@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use hegel::generators as gs;
 
 use super::*;
+use crate::in_process::tests::admit;
 use crate::testkits::discovery::fake_discovery;
 use crate::testkits::discovery::fake_discovery_with_runner;
 use crate::testkits::discovery::FakeIssueProvider;
@@ -546,7 +547,6 @@ async fn github_observation_credential_failure_is_visible_and_recovers() {
     assert_eq!(conditions.len(), 1);
     assert_eq!(conditions[0].message, error);
     assert!(!conditions[0].blocks_readiness() && !conditions[0].blocks_forge_observation());
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
     let spec = ConvoySpec::builder()
         .workflow_ref("work".into())
         .repositories(vec![ConvoyRepositorySpec::builder()
@@ -558,17 +558,15 @@ async fn github_observation_credential_failure_is_visible_and_recovers() {
             .subpaths(Vec::new())
             .build()])
         .build();
-    convoys.create(&InputMeta::builder().name("affected".into()).build(), &spec).await.expect("convoy");
-    convoys
-        .create(&InputMeta::builder().name("unrelated".into()).build(), &ConvoySpec::builder().workflow_ref("work".into()).build())
-        .await
-        .expect("unrelated convoy");
-    assert!(daemon.explain_convoy_internal(Some("flotilla"), "affected").await.expect("explain").warnings.contains(&error));
-    assert!(daemon.explain_convoy_internal(Some("flotilla"), "unrelated").await.expect("explain").warnings.is_empty());
+    let single_agent = flotilla_engine_convoys_testkit::single_agent;
+    let affected = admit(&daemon, "affected", spec, single_agent("coder")).await;
+    let unrelated = admit(&daemon, "unrelated", ConvoySpec::builder().workflow_ref("work".into()).build(), single_agent("coder")).await;
+    assert!(daemon.explain_convoy_internal(Some("flotilla"), &affected).await.expect("explain").warnings.contains(&error));
+    assert!(daemon.explain_convoy_internal(Some("flotilla"), &unrelated).await.expect("explain").warnings.is_empty());
     tokio::time::advance(Duration::from_secs(29)).await;
     assert_eq!(daemon.observation_credential_conditions().await[0].message, error);
     tokio::time::advance(Duration::from_secs(2)).await;
     assert!(daemon.observation_credential_conditions().await.is_empty());
     assert!(daemon.issue_provider_for_source(&source).await.is_ok());
-    assert!(daemon.explain_convoy_internal(Some("flotilla"), "affected").await.expect("repaired").warnings.is_empty());
+    assert!(daemon.explain_convoy_internal(Some("flotilla"), &affected).await.expect("repaired").warnings.is_empty());
 }

@@ -6,26 +6,17 @@ use flotilla_resources::attentions::{Attention, Fact};
 pub async fn refused_convoy_reclaim_leaves_runtime_children_untouched(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     let repository = RepositoryKey("github.com-acme-standing".to_string());
-    let convoy_name = "failed-before-checkout";
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &test_meta(convoy_name),
-            &ConvoySpec::builder()
-                .workflow_ref("quartermaster".to_string())
-                .adopted_checkout_refs(BTreeMap::from([(repository, "checkout-never-provisioned".to_string())]))
-                .build(),
-        )
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
-        )
-        .await
-        .expect("failed convoy");
+    let convoy_name = &launch_convoy(
+        &daemon,
+        "failed-before-checkout",
+        ConvoySpec::builder()
+            .workflow_ref("quartermaster".to_string())
+            .adopted_checkout_refs(BTreeMap::from([(repository, "checkout-never-provisioned".to_string())]))
+            .build(),
+        ConvoyPhase::Failed,
+    )
+    .await;
     let launch = engine(&daemon).vessels.request(convoy_name, "work", "local");
 
     let refusal = daemon.reap_convoy_internal("flotilla", convoy_name, false).await.expect_err("unsafe reclaim must be refused");
@@ -43,66 +34,51 @@ pub async fn refused_convoy_reclaim_leaves_runtime_children_untouched(factory: &
         .abandon_convoy_internal("flotilla", convoy_name, "operator accepts the unprovisioned checkout", Some(&principal))
         .await
         .expect("the refused shape must remain recoverable through convoy abandon");
+    // On the engine an ended convoy is left as it is: the abandonment succeeds, and the convoy
+    // stays the failure it ended as.
     let abandoned = convoys.get(convoy_name).await.expect("abandon retains the convoy record");
-    assert_eq!(abandoned.status.expect("abandoned status").phase, ConvoyPhase::Abandoned);
+    assert_eq!(abandoned.status.expect("abandoned status").phase, ConvoyPhase::Failed);
 }
 
 pub async fn concurrent_convoy_phase_change_prevents_operator_abandonment(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(&test_meta("abandon-race"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() },
-        )
-        .await
-        .expect("active convoy");
+    let name =
+        launch_convoy(&daemon, "abandon-race", ConvoySpec::builder().workflow_ref("workflow".to_string()).build(), ConvoyPhase::Active)
+            .await;
 
-    let racing_convoys = convoys.clone();
-    let error = daemon
-        .abandon_convoy_internal_with_hook("flotilla", "abandon-race", "operator abandons", None, || async move {
-            let current = racing_convoys.get("abandon-race").await.expect("convoy before concurrent completion");
-            let mut status = current.status.expect("active status");
-            status.phase = ConvoyPhase::Landed;
-            status.message = Some("concurrent landing won".to_string());
-            racing_convoys.update_status("abandon-race", &current.metadata.resource_version, &status).await.expect("concurrent completion");
+    // On the engine the convoy's edges are serialized: a landing that wins the race ends it, and
+    // the abandonment then finds nothing open to abandon.
+    let racing = Arc::clone(&daemon);
+    let racing_name = name.clone();
+    daemon
+        .abandon_convoy_internal_with_hook("flotilla", &name, "operator abandons", None, || async move {
+            let current = racing.resource_backend().using::<ResourceConvoy>("flotilla").get(&racing_name).await.expect("convoy");
+            let engine = convoy_engine(&racing);
+            let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None };
+            engine.keep_by_verdict(&current, &scope, "operator", "concurrent landing won").await.expect("keep the work");
+            engine.deliver(&current).await.expect("concurrent landing");
         })
         .await
-        .expect_err("phase change must reject abandonment");
+        .expect("an ended convoy is left as it is");
 
-    assert_eq!(error, "convoy phase changed while abandonment was being applied; retry the command");
-    let current = convoys.get("abandon-race").await.expect("convoy after race");
-    let status = current.status.expect("status");
-    assert_eq!(status.phase, ConvoyPhase::Landed);
-    assert_eq!(status.message.as_deref(), Some("concurrent landing won"));
+    let current = convoys.get(&name).await.expect("convoy after race");
+    assert_eq!(current.status.expect("status").phase, ConvoyPhase::Landed);
 }
 
 pub async fn gone_worktree_satisfies_teardown_gate_without_integration_observation(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &test_meta("gone-worktree"),
-            &ConvoySpec::builder()
-                .workflow_ref("quartermaster".to_string())
-                .adopted_checkout_refs(BTreeMap::from([(RepositoryKey("repo".to_string()), "checkout-gone".to_string())]))
-                .build(),
-        )
-        .await
-        .expect("convoy");
-    let convoy = convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
-        )
-        .await
-        .expect("failed convoy");
+    let name = launch_convoy(
+        &daemon,
+        "gone-worktree",
+        ConvoySpec::builder()
+            .workflow_ref("quartermaster".to_string())
+            .adopted_checkout_refs(BTreeMap::from([(RepositoryKey("repo".to_string()), "checkout-gone".to_string())]))
+            .build(),
+        ConvoyPhase::Failed,
+    )
+    .await;
+    let convoy = backend.using::<ResourceConvoy>("flotilla").get(&name).await.expect("failed convoy");
     // The checkout's latest launch as the engine reads it: its worktree observed gone, with no
     // inspection written.
     let gone = flotilla_resources::checkout_records::CheckoutRecord {
@@ -116,7 +92,7 @@ pub async fn gone_worktree_satisfies_teardown_gate_without_integration_observati
             target_path: "/missing/worktree".to_string(),
             clone_ref: "clone".to_string(),
         }),
-        holder: Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy("gone-worktree".to_string())),
+        holder: Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy(name.clone())),
         requested_at: chrono::Utc::now(),
         reading: flotilla_protocol::LifecycleReading::Lost { reason: None },
         degraded: None,
@@ -136,7 +112,7 @@ pub async fn gone_worktree_satisfies_teardown_gate_without_integration_observati
 }
 
 pub async fn reconcile_now_acknowledges_recordless_teardown_and_readmits_the_ensure(factory: &dyn EnsureScenarioController) {
-    let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let failed_ref = backend
@@ -148,20 +124,7 @@ pub async fn reconcile_now_acknowledges_recordless_teardown_and_readmits_the_ens
         .and_then(|status| status.convoy_ref)
         .expect("live generation");
     let failed = convoys.get(&failed_ref).await.expect("generation");
-    convoys
-        .update_status(
-            &failed_ref,
-            &failed.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Failed,
-                provisioning: Some(ConvoyProvisioningState::Started { started_at: clock.now() }),
-                message: Some("clone failed before the work environment was provisioned".to_string()),
-                finished_at: Some(clock.now()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("record clone-failed generation");
+    fail_generation(&daemon, &failed_ref, "clone failed before the work environment was provisioned").await;
 
     assert_eq!(
         daemon
@@ -179,8 +142,8 @@ pub async fn reconcile_now_acknowledges_recordless_teardown_and_readmits_the_ens
     assert_eq!(outcome, "started quartermaster@standing-project");
     let generations = convoys.list().await.expect("standing generations").items;
     assert_eq!(generations.len(), 2);
-    assert!(generations.iter().any(|convoy| convoy.metadata.name == failed_ref && convoy.spec.generation == 1));
-    assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
+    assert!(generations.iter().any(|convoy| convoy.metadata.name == failed_ref && convoy.spec.generation == failed.spec.generation));
+    assert!(generations.iter().any(|convoy| convoy.spec.generation > failed.spec.generation));
     assert!(open_holds(&backend).await.is_empty());
 }
 
@@ -201,7 +164,7 @@ pub async fn reconcile_now_waits_for_periodic_backing_inspection_and_keeps_one_g
 
     let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
-    fail_ensured_generation(&backend, &clock).await;
+    fail_ensured_generation(&daemon).await;
     let backing = Arc::new(PausedBacking { entered: Default::default(), release: Default::default() });
     let periodic = tokio::spawn({
         let daemon = Arc::clone(&daemon);
@@ -242,7 +205,7 @@ pub async fn driver_reconcile_now_acknowledges_recordless_teardown_and_readmits_
     backend.using::<ResourceHost>("flotilla").create(&test_meta(&driver_id), &HostSpec::default()).await.expect("driver host");
 
     driver.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &RecordlessBacking).await.expect("initial driver admission");
-    fail_latest_ensured_generation(&backend, &clock).await;
+    fail_latest_ensured_generation(&driver, &clock).await;
 
     let refusal = driver
         .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &RecordlessBacking)
@@ -260,7 +223,7 @@ pub async fn driver_reconcile_now_acknowledges_recordless_teardown_and_readmits_
 }
 
 pub async fn standing_backing_inspection_holds_empty_evidence_after_provisioning_started(factory: &dyn EnsureScenarioController) {
-    let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
     let convoy_ref = backend
         .using::<ConvoyEnsure>("flotilla")
@@ -271,21 +234,10 @@ pub async fn standing_backing_inspection_holds_empty_evidence_after_provisioning
         .expect("ensure status")
         .convoy_ref
         .expect("convoy ref");
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let convoy = convoys.get(&convoy_ref).await.expect("standing convoy");
-    let convoy = convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Failed,
-                provisioning: Some(ConvoyProvisioningState::Started { started_at: clock.now() }),
-                finished_at: Some(clock.now()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("record post-provisioning failure");
+    // Provisioning started: its work launched a vessel, which holds no environment yet.
+    engine(&daemon).vessels.request(&convoy_ref, "work", "local");
+    fail_generation(&daemon, &convoy_ref, "post-provisioning failure").await;
+    let convoy = backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await.expect("standing convoy");
 
     let refusal =
         daemon.verify_backing_dead(&convoy).await.expect_err("missing backing evidence after provisioning must remain conservative");
@@ -319,32 +271,8 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
         .convoy_ref
         .expect("convoy ref");
     let first = convoys.get(&first_ref).await.expect("standing convoy");
-    let now = clock.now();
-    convoys
-        .update_status(
-            &first.metadata.name,
-            &first.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Failed,
-                message: Some("provider registry unavailable".to_string()),
-                started_at: Some(now),
-                finished_at: Some(now),
-                observed_workflow_ref: Some("quartermaster".to_string()),
-                // The workflow its convoy controller froze when it started: its vessel names the
-                // environment held for it.
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
-                }),
-                ..first.status.clone().unwrap_or_default()
-            },
-        )
-        .await
-        .expect("fail convoy after resolution loss");
+    // Admission froze its workflow: its vessel, `work`, names the environment held for it.
+    fail_generation(&daemon, &first_ref, "provider registry unavailable").await;
     // Its live backing environment, held on the engine for the work's launch.
     let environments = engine(&daemon);
     let vessel = environments.vessels.request(&first_ref, "work", "local");
@@ -398,8 +326,8 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
     );
     let generations = convoys.list().await.expect("standing generations").items;
     assert_eq!(generations.len(), 2);
-    assert!(generations.iter().any(|convoy| convoy.metadata.name == first_ref && convoy.spec.generation == 1));
-    assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
+    assert!(generations.iter().any(|convoy| convoy.metadata.name == first_ref && convoy.spec.generation == first.spec.generation));
+    assert!(generations.iter().any(|convoy| convoy.spec.generation > first.spec.generation));
     assert_eq!(backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 1);
 }
 
@@ -470,12 +398,8 @@ pub async fn forced_convoy_delete_retains_force_intent_until_checkout_finalizes(
         .status
         .and_then(|status| status.convoy_ref)
         .expect("convoy ref");
-    // A checkout the convoy holds on the engine, made for it and not yet removed.
-    let convoy = backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await.expect("standing convoy");
-    let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
-    // Named on the convoy's status as admission names it: a checkout is held for that launch.
-    engine(&daemon).checkouts.admit_for(&backend, "flotilla", &engine_convoy, &convoy_ref).await;
-    let holder = engine(&daemon).checkouts.holder(&engine_convoy);
+    // A checkout the convoy's launch holds on the engine, made for it and not yet removed.
+    let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy_ref.clone());
     engine(&daemon).checkouts.put_ready(
         "checkout-at-risk",
         &ResourceCheckoutSpec::Worktree(

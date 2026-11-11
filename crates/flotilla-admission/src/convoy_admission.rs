@@ -3910,9 +3910,8 @@ pub async fn refuse_live_convoy_in(backend: &ResourceBackend, namespace: &str, p
 /// taken under the admission lock. Neither performs reads in a candidate loop.
 fn refuse_live_convoy(generations: &[ReadResourceObject<ResourceConvoy>], project: Option<&str>, role: &str) -> Result<(), String> {
     // A convoy that names no project is held in its namespace's.
-    let in_project = |convoy: &ResourceObject<ResourceConvoy>| {
-        convoy.spec.project_ref.as_deref() == Some(project.unwrap_or(&convoy.metadata.namespace))
-    };
+    let in_project =
+        |convoy: &ResourceObject<ResourceConvoy>| convoy.spec.project_ref.as_deref() == Some(project.unwrap_or(&convoy.metadata.namespace));
     for source in generations.iter().filter(|source| in_project(&source.object) && source.object.spec.role == role) {
         let convoy = &source.object;
         if convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()) {
@@ -4904,9 +4903,15 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
     // The engine's Convoy path, over a decided store in the fixture's directory, which the path
     // keeps open.
     let reads = Arc::clone(crate::test_support::no_held_checkouts());
-    let convoys =
-        flotilla_engine_convoys_testkit::EngineConvoysHome::open_in(temp.path(), "host", "flotilla", &resource_backend, Arc::clone(&clock), reads)
-            .path();
+    let convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::open_in(
+        temp.path(),
+        "host",
+        "flotilla",
+        &resource_backend,
+        Arc::clone(&clock),
+        reads,
+    )
+    .path();
     let admission = ConvoyAdmission::builder()
         .backend(resource_backend.clone())
         .convoys(convoys)
