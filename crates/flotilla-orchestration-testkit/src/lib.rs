@@ -28,12 +28,9 @@ use flotilla_resources::ConvoyEnsureHoldReason;
 use flotilla_resources::ConvoyEnsureSpec;
 use flotilla_resources::ConvoyEnsureStatus;
 use flotilla_resources::ConvoyPhase;
-use flotilla_resources::ConvoyProvisioningState;
 use flotilla_resources::ConvoyStatus;
 use flotilla_resources::CrewSource;
 use flotilla_resources::CrewSpec;
-use flotilla_resources::CrewWorkPhase;
-use flotilla_resources::CrewWorkState;
 use flotilla_resources::EnvironmentSpec as ResourceEnvironmentSpec;
 use flotilla_resources::FulfilmentKindSpec;
 use flotilla_resources::FulfilmentRealisation;
@@ -152,7 +149,8 @@ async fn assert_independent_placement_snapshots(factory: &dyn EnsureScenarioCont
     second_store.using::<FulfilmentKind>("flotilla").get(snapshot).await.expect("second origin retains its placement");
 }
 
-async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {
+/// Admits convoy `record` at `daemon`'s home with `role`'s identity in `project`; returns its launch.
+async fn create_identity_convoy(daemon: &InProcessDaemon, record: &str, role: &str, project: Option<&str>) -> String {
     let labels = BTreeMap::from([
         (PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string()),
         (ROLE_LABEL.to_string(), role.to_string()),
@@ -160,12 +158,18 @@ async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &
     ]);
     let mut spec = ConvoySpec::builder().workflow_ref("review".to_string()).role(role.to_string()).generation(1).build();
     spec.project_ref = project.map(str::to_string);
-    backend
-        .clone()
-        .using::<ResourceConvoy>("flotilla")
-        .create(&InputMeta::builder().name(record.to_string()).labels(labels).build(), &spec)
-        .await
-        .expect("convoy");
+    let mut convoy = flotilla_engine_convoys_testkit::convoy("flotilla", record, spec, flotilla_engine_convoys_testkit::single_agent(role));
+    convoy.metadata.labels = labels;
+    flotilla_engine_convoys_testkit::launch(&daemon.convoy_engine_path(), convoy).await
+}
+
+/// Lands convoy `name` at `daemon`'s home: an operator keeps its work, and it is delivered.
+async fn land_convoy(daemon: &InProcessDaemon, name: &str) {
+    let convoy = daemon.resource_backend().using::<ResourceConvoy>("flotilla").get(name).await.expect("convoy");
+    let engine = convoy_engine(daemon);
+    let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None };
+    engine.keep_by_verdict(&convoy, &scope, "operator", "landed").await.expect("keep the work");
+    engine.deliver(&convoy).await.expect("deliver");
 }
 
 async fn seed_convoy_routing_row(
@@ -303,16 +307,7 @@ async fn standing_ensure_fixture_for(
     let repository_key = repository_spec.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository_spec).await.expect("repository");
     create_host_direct_placement((&*daemon).into(), &format!("host-direct-{host}-vessels"), &format!("{host}-vessels")).await;
-    // A standing convoy's obligation is its agent seats' lifetime duties, so its governor is an
-    // agent, placed where a harness is (#3108: the engine refuses a convoy that owes nothing).
-    let facts = BTreeMap::from([(
-        "standing-agent".into(),
-        flotilla_resources::FulfilmentFacts {
-            harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
-            ..Default::default()
-        },
-    )]);
-    create_docker_placement((&*daemon).into(), "standing-agent", "standing-agent-host", BTreeSet::new(), facts).await;
+    create_standing_agent_placement(&daemon).await;
     if materialize_ensure {
         backend
             .definitions::<Project>("flotilla")
@@ -382,6 +377,20 @@ async fn standing_ensure_fixture_for(
     (daemon, backend, clock, temp)
 }
 
+/// A standing convoy's obligation is its agent seats' lifetime duties, so its governor is an
+/// agent, placed where a harness is (#3108: the engine refuses a convoy that owes nothing). This
+/// is the `standing-agent` kind such an ensure places onto, at `daemon`.
+async fn create_standing_agent_placement(daemon: &InProcessDaemon) {
+    let facts = BTreeMap::from([(
+        "standing-agent".into(),
+        flotilla_resources::FulfilmentFacts {
+            harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
+            ..Default::default()
+        },
+    )]);
+    create_docker_placement(daemon.into(), "standing-agent", "standing-agent-host", BTreeSet::new(), facts).await;
+}
+
 struct VerifiedDeadBacking;
 
 #[async_trait]
@@ -400,20 +409,40 @@ impl StandingConvoyBackingInspector for RecordlessBacking {
     }
 }
 
-/// A generation's status once it failed: what it recorded while it ran (its admitted
-/// configuration among it), ended Failed now.
-fn failed_status(status: Option<ConvoyStatus>, clock: &VirtualClock) -> ConvoyStatus {
-    ConvoyStatus {
-        phase: ConvoyPhase::Failed,
-        message: Some("placement failed".to_string()),
-        started_at: Some(clock.now()),
-        finished_at: Some(clock.now()),
-        ..status.unwrap_or_default()
-    }
+/// The engine's Convoy path at `daemon`'s home.
+fn convoy_engine(daemon: &InProcessDaemon) -> Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> {
+    Arc::clone(daemon.convoy_engine_path().get().expect("the engine Convoy path"))
 }
 
-async fn fail_ensured_generation(backend: &ResourceBackend, clock: &VirtualClock) -> String {
-    let convoy_ref = backend
+/// Admits convoy `name` at `daemon`'s home as admission would, its one agent seat owing the
+/// work of vessel `work`, and ends it as `phase` says when that is Failed or Abandoned. Returns
+/// its launch's name: on the engine an operator's convoy is a launch (#3108).
+async fn launch_convoy(daemon: &InProcessDaemon, name: &str, spec: ConvoySpec, phase: ConvoyPhase) -> String {
+    let status = ConvoyStatus { phase, ..flotilla_engine_convoys_testkit::single_agent("governor") };
+    flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, status),
+    )
+    .await
+}
+
+/// Ends generation `name` Failed at `daemon`'s home now, as its work failing would. Status is
+/// derived on the engine (#3108), so the failure is the engine's edge, not a status write.
+async fn fail_generation(daemon: &InProcessDaemon, name: &str, reason: &str) {
+    let convoy = daemon.resource_backend().using::<ResourceConvoy>("flotilla").get(name).await.expect("generation");
+    convoy_engine(daemon).fail(&convoy, "operator", reason).await.expect("fail generation");
+}
+
+/// An operator abandons generation `name` at `daemon`'s home: on the engine a convoy ends and is
+/// never deleted (#3108), so this is what reaping a live generation is.
+async fn abandon_generation(daemon: &InProcessDaemon, name: &str) {
+    let convoy = daemon.resource_backend().using::<ResourceConvoy>("flotilla").get(name).await.expect("generation");
+    convoy_engine(daemon).abandon(&convoy, "operator", "operator reap").await.expect("abandon generation");
+}
+
+async fn fail_ensured_generation(daemon: &InProcessDaemon) -> String {
+    let convoy_ref = daemon
+        .resource_backend()
         .using::<ConvoyEnsure>("flotilla")
         .get("quartermaster")
         .await
@@ -421,18 +450,14 @@ async fn fail_ensured_generation(backend: &ResourceBackend, clock: &VirtualClock
         .status
         .and_then(|status| status.convoy_ref)
         .expect("live generation");
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let convoy = convoys.get(&convoy_ref).await.expect("generation");
-    convoys
-        .update_status(&convoy_ref, &convoy.metadata.resource_version, &failed_status(convoy.status, clock))
-        .await
-        .expect("fail generation");
+    fail_generation(daemon, &convoy_ref, "placement failed").await;
     convoy_ref
 }
 
-async fn fail_latest_ensured_generation(backend: &ResourceBackend, clock: &VirtualClock) -> String {
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let convoy = convoys
+async fn fail_latest_ensured_generation(daemon: &InProcessDaemon, clock: &VirtualClock) -> String {
+    let convoy = daemon
+        .resource_backend()
+        .using::<ResourceConvoy>("flotilla")
         .list()
         .await
         .expect("generations")
@@ -440,11 +465,9 @@ async fn fail_latest_ensured_generation(backend: &ResourceBackend, clock: &Virtu
         .into_iter()
         .max_by_key(|convoy| convoy.spec.generation)
         .expect("latest generation");
-    clock.set(convoy.metadata.creation_timestamp);
-    convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &failed_status(convoy.status, clock))
-        .await
-        .expect("fail generation");
+    // It fails as soon as it was admitted, which the engine's view gives as its start.
+    clock.set(convoy.status.as_ref().and_then(|status| status.started_at).expect("an admitted generation's start"));
+    fail_generation(daemon, &convoy.metadata.name, "placement failed").await;
     convoy.metadata.name
 }
 

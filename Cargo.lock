@@ -3394,6 +3394,7 @@ dependencies = [
  "flotilla-discovery",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
+ "flotilla-engine-convoys-testkit",
  "flotilla-engine-messages",
  "flotilla-engine-messages-testkit",
  "flotilla-environment",
