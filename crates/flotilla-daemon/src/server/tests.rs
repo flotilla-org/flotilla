@@ -6271,18 +6271,13 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
     use flotilla_state_machines::machines::agent_session::Activity;
     use tower::ServiceExt;
     for enabled in [false, true] {
-        let (tmp, daemon) = empty_daemon().await;
-        let service = Arc::new(
-            flotilla_schema_sqlite::stream::Service::open(
-                &tmp.path().join("activity.sqlite"),
-                "home",
-                flotilla_engine_store::registry().unwrap(),
-            )
-            .unwrap(),
-        );
+        let (_tmp, daemon) = empty_daemon().await;
+        // The primitives share the daemon's decided store and home, where its Convoy path is.
+        let service = daemon.decided_store().unwrap();
+        let home = daemon.node_id().as_str().to_owned();
         let primitives = Arc::new(
             flotilla_engine_messages::MessagePrimitives::open(
-                "home",
+                &home,
                 Arc::clone(&service),
                 daemon.resource_backend(),
                 Arc::new(flotilla_resources::SystemClock),
@@ -6391,7 +6386,7 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
         }
         // Reopening from the actual store preserves current activity and its cause.
         let reopened = flotilla_engine_messages::MessagePrimitives::open(
-            "home",
+            &home,
             service,
             daemon.resource_backend(),
             Arc::new(flotilla_resources::SystemClock),
@@ -6411,17 +6406,11 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
 async fn activity_failure_test_daemon(
 ) -> (tempfile::TempDir, Arc<InProcessDaemon>, Arc<flotilla_engine_messages::MessagePrimitives>, String) {
     let (tmp, daemon) = empty_daemon().await;
-    let service = Arc::new(
-        flotilla_schema_sqlite::stream::Service::open(
-            &tmp.path().join("activity.sqlite"),
-            "home",
-            flotilla_engine_store::registry().unwrap(),
-        )
-        .unwrap(),
-    );
+    // The primitives share the daemon's decided store and home, where its Convoy path is.
+    let service = daemon.decided_store().unwrap();
     let primitives = Arc::new(
         flotilla_engine_messages::MessagePrimitives::open(
-            "home",
+            daemon.node_id().as_str(),
             service,
             daemon.resource_backend(),
             Arc::new(flotilla_resources::SystemClock),
@@ -6457,7 +6446,7 @@ async fn agent_activity_store_failure_preserves_legacy_attention() {
         .service()
         .with_store(|store| {
             let mut write = store.write()?;
-            let id = write.resolve(Resource::<AgentSession>::CODE, &launch, "home")?.unwrap();
+            let id = write.resolve(Resource::<AgentSession>::CODE, &launch, daemon.node_id().as_str())?.unwrap();
             let loaded = write.load::<Resource<AgentSession>>(id)?.unwrap();
             write.delete::<Resource<AgentSession>>(loaded.stamp(), &NewChange::new("test", Timestamp(1)))?;
             write.commit()

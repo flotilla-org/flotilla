@@ -192,6 +192,8 @@ const HOST_HARNESS_FILES: &[(&str, &str)] = &[
 
 struct SshHostLaunch {
     host: Arc<FakeHost>,
+    /// The convoy's launch the crew serves; empty when the launch was refused.
+    convoy: String,
     env: TerminalEnvVars,
     command: String,
     /// What `convoy explain` shows the access layer delivered.
@@ -221,13 +223,14 @@ async fn try_launch_on_ssh_host(adapter: &str, grant_claude: bool) -> Result<Ssh
     match launched {
         Ok(session) => Ok(SshHostLaunch {
             host,
+            convoy: session.convoy,
             env: session.env_vars,
             command: session.command,
             deliveries: session.deliveries,
             artifacts: session.artifacts,
         }),
         Err(error) => {
-            let refused = SshHostLaunch { host, env: Vec::new(), command: String::new(), deliveries: Vec::new(), artifacts: Vec::new() };
+            let refused = SshHostLaunch { host, convoy: String::new(), env: Vec::new(), command: String::new(), deliveries: Vec::new(), artifacts: Vec::new() };
             assert_host_harness_untouched(&refused);
             Err(error)
         }
@@ -273,6 +276,8 @@ struct SshHost {
 /// What the terminal pool was asked to start.
 #[derive(Debug)]
 struct LaunchedSession {
+    /// The convoy's launch the crew serves.
+    convoy: String,
     env_vars: TerminalEnvVars,
     command: String,
     deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>,
@@ -286,6 +291,8 @@ struct SshHostRuntime {
     /// The owning daemon's home, holding the central Codex login only its refresher writes.
     daemon_home: PathBuf,
     daemon: Arc<InProcessDaemon>,
+    /// The convoy's launch the crew serves.
+    convoy: String,
     state: Arc<ControllerRuntimeState>,
     pool: Arc<FakeTerminalPool>,
     agents: Arc<RunnerVesselAgents>,
@@ -363,7 +370,7 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
         .expect("register SSH host resources");
     let source = LocalSkillSource::new(temp.path(), "research");
     let skills = if skills { vec![source.selected.clone()] } else { Vec::new() };
-    let launch = freeze_crew(&daemon, "demo", "coder", adapter, skills).await;
+    let (convoy, launch) = freeze_crew(&daemon, "demo", "coder", adapter, skills).await;
     let credential_store = Arc::new(CredentialStore::new(
         backend,
         NAMESPACE,
@@ -409,7 +416,7 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
             },
             context: Box::new(flotilla_resources::TerminalCrewContext {
                 namespace: NAMESPACE.to_string(),
-                convoy: "demo".to_string(),
+                convoy: convoy.clone(),
                 vessel_ref: launch.clone(),
             }),
         },
@@ -417,7 +424,7 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
         env: session_env,
         pool: "cleat".to_string(),
     };
-    SshHostRuntime { _temp: temp, daemon_home, daemon, state, pool, agents, vessel, spec, bag }
+    SshHostRuntime { _temp: temp, daemon_home, daemon, convoy, state, pool, agents, vessel, spec, bag }
 }
 
 /// The owning daemon's central Codex login under `home`, as its refresher leaves it.
@@ -441,7 +448,7 @@ fn assert_holds_central_copy(host: &FakeHost, home: &str, access_token: &str) {
 async fn launch_ssh_host(host: SshHost, adapter: &str, grant_claude: bool) -> Result<LaunchedSession, String> {
     let runtime = ssh_host_runtime(host, adapter).await;
     if grant_claude {
-        bind_account(&runtime.daemon, "demo", "coder", "claude-max", "crew@example.com").await;
+        bind_account(&runtime.daemon, &runtime.convoy, "coder", "claude-max", "crew@example.com").await;
     }
     runtime.launch().await
 }
@@ -470,6 +477,7 @@ impl SshHostRuntime {
         assert_eq!(prepared.environment.get("FLOTILLA_DAEMON_SOCKET").map(PathBuf::from), socket);
         assert!(matches!(prepared.forwards.as_slice(), [(guest, _)] if *guest == vessel.daemon_socket()), "{:?}", prepared.forwards);
         Ok(LaunchedSession {
+            convoy: self.convoy.clone(),
             env_vars: launch.env_vars.clone(),
             command: launch.command.clone(),
             deliveries: self.deliveries().await,
@@ -483,7 +491,7 @@ impl SshHostRuntime {
             &self.daemon.resource_backend(),
             self.daemon.lifecycle_reads().as_ref(),
             NAMESPACE,
-            "demo",
+            &self.convoy,
         )
         .await
         .expect("access deliveries")
@@ -557,14 +565,14 @@ fn assert_image_harness_environment(launch: &SshHostLaunch) {
 async fn ssh_host_claude_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_ssh_host("claude-code").await;
     // #3929: the launched home is the recorded requester home, not a level below it.
-    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/claude");
+    let home = requester_home_at(HOST_BASE, &launch.convoy, "claude");
 
     assert_eq!(launch.value("CLAUDE_CONFIG_DIR").as_deref(), Some(home.as_str()));
     assert_staged_into_launched_home(&launch, "CLAUDE_CONFIG_DIR", "claude-code");
     // #3907: the vessel agent wrote the bound token into the requester's material directory
     // on the runtime base; the session environment carries no token of its own.
     assert_eq!(launch.value("CLAUDE_CODE_OAUTH_TOKEN"), None);
-    assert_eq!(launch.host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("oauth-secret-material".into())));
+    assert_eq!(launch.host.entry(format!("{}/.flotilla-oauth-token", bound_material(&launch.convoy))), Some(HostEntry::File("oauth-secret-material".into())));
     assert!(!launch
         .host
         .files
@@ -572,7 +580,7 @@ async fn ssh_host_claude_crew_starts_in_a_prepared_flotilla_home() {
         .expect("files")
         .keys()
         .any(|path| path.starts_with(&home) && path.ends_with(".flotilla-oauth-token")));
-    assert!(launch.command.contains(&claude_token_prefix(BOUND_MATERIAL)), "{}", launch.command);
+    assert!(launch.command.contains(&claude_token_prefix(&bound_material(&launch.convoy))), "{}", launch.command);
     assert_eq!(launch.value("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(ENVIRONMENT));
     let state = launch.host.json(format!("{home}/.claude.json"));
     assert_eq!(state["hasCompletedOnboarding"], true);
@@ -594,7 +602,7 @@ async fn launched_claude_crew() -> (SshHostRuntime, Arc<FakeHost>, flotilla_test
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
     let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "claude-code").await;
-    bind_account(&runtime.daemon, "demo", "coder", "claude-max", "crew@example.com").await;
+    bind_account(&runtime.daemon, &runtime.convoy, "coder", "claude-max", "crew@example.com").await;
     let launched = runtime.launch().await.expect("first launch");
     (runtime, host, runtime_dir, launched)
 }
@@ -608,7 +616,7 @@ impl SshHostRuntime {
         let TerminalSessionSource::Agent { context, .. } = &mut self.spec.source else { panic!("an agent session") };
         let fixture = engine(&self.daemon);
         fixture.vessels.step(&context.vessel_ref, flotilla_resources::vessel_records::VesselStep::Released);
-        let launch = fixture.vessels.request("demo", "work", self.daemon.local_host_id().expect("local host").as_str());
+        let launch = fixture.vessels.request(&self.convoy, "work", self.daemon.local_host_id().expect("local host").as_str());
         self.vessel = VesselPaths::new(&self.bag, &VesselKey::new(&EnvironmentId::new(ENVIRONMENT), &launch)).expect("vessel paths");
         context.vessel_ref = launch;
     }
@@ -716,7 +724,7 @@ async fn a_harness_that_cannot_be_delivered_again_fails_the_launch_by_name() {
 #[tokio::test]
 async fn ssh_host_codex_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_ssh_host("codex").await;
-    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/codex");
+    let home = requester_home_at(HOST_BASE, &launch.convoy, "codex");
 
     assert_eq!(launch.value("CODEX_HOME").as_deref(), Some(home.as_str()));
     assert_eq!(launch.value("FLOTILLA_ENVIRONMENT_ID").as_deref(), Some(ENVIRONMENT));
@@ -914,7 +922,7 @@ async fn ssh_host_harness_path_is_composed_and_never_the_login_profile() {
         "#!/bin/sh\n{ printf '%s\\n' \"$PATH\"; command -v gh; command -v flotilla; printf '%s\\n' \"${RUSTUP_HOME-unset}\"; } > \"$HOME/harness-report\"\n",
     );
 
-    bind_account(&runtime.daemon, "demo", "coder", "claude-max", "crew@example.com").await;
+    bind_account(&runtime.daemon, &runtime.convoy, "coder", "claude-max", "crew@example.com").await;
     let session = runtime.launch().await.expect("launch SSH host crew");
 
     // #4173: cleat runs a declared session's script in `sh -c` with exactly the
@@ -1057,8 +1065,8 @@ async fn bound_ssh_host_crew_with(
         .await
         .expect("box account declaration");
     match skew {
-        None => bind_account(&runtime.daemon, "demo", "coder", "claude-box-a", "box-a@example.com").await,
-        Some((home, ahead)) => bind_account_from_home(&runtime.daemon, home, "demo", "coder", "claude-box-a", ahead).await,
+        None => bind_account(&runtime.daemon, &runtime.convoy, "coder", "claude-box-a", "box-a@example.com").await,
+        Some((home, ahead)) => bind_account_from_home(&runtime.daemon, home, &runtime.convoy, "coder", "claude-box-a", ahead).await,
     }
     let launch = request_session(&runtime.daemon, "terminal-demo-work-coder", &runtime.spec);
     runtime.launch().await.expect("bound launch");
@@ -1068,12 +1076,28 @@ async fn bound_ssh_host_crew_with(
 }
 
 /// Where the bound token lies: the requester's material directory on the runtime base.
-const BOUND_MATERIAL: &str = "/run/user/1000/flotilla/agent-material/requesters/demo/coder/claude";
+/// Where the bound Claude token lies for convoy launch `convoy`: its requester material on the
+/// runtime base.
+fn bound_material(convoy: &str) -> String {
+    flotilla_resources::account_access::requester_material(Path::new(RUNTIME_BASE), convoy, "coder", "claude").display().to_string()
+}
+
+/// Convoy launch `convoy`'s coder's requester home for `harness` under `base`.
+fn requester_home_at(base: &str, convoy: &str, harness: &str) -> String {
+    flotilla_resources::account_access::requester_home(Path::new(base), convoy, "coder", harness).display().to_string()
+}
+
+/// Ends convoy launch `convoy` at `daemon`'s home, as an operator's abandon ends it.
+async fn end_convoy(daemon: &InProcessDaemon, convoy: &str) {
+    let view = daemon.resource_backend().using::<Convoy>(NAMESPACE).get(convoy).await.expect("convoy");
+    let engine = daemon.convoy_engine_path().get().cloned().expect("the Convoy path");
+    engine.abandon(&view, "operator", "ended").await.expect("convoy ended");
+}
 
 /// The requester's current binding, as the account port reads it.
-async fn binding(daemon: &InProcessDaemon) -> flotilla_resources::account_access::BindingRecord {
+async fn binding(daemon: &InProcessDaemon, convoy: &str) -> flotilla_resources::account_access::BindingRecord {
     let access = flotilla_resources::account_access::AccessName(flotilla_agent::account_access::CLAUDE_SUBSCRIPTION.to_string());
-    daemon.account_records().requester_binding(NAMESPACE, "demo", "coder", &access).await.expect("read binding").expect("binding")
+    daemon.account_records().requester_binding(NAMESPACE, convoy, "coder", &access).await.expect("read binding").expect("binding")
 }
 
 /// This place's provision record of the requester's binding.
@@ -1087,10 +1111,10 @@ async fn provision(daemon: &InProcessDaemon) -> Option<flotilla_resources::Accou
 }
 
 /// Reopens the requester's binding a second later, as an explicit rebind does.
-async fn rebind(daemon: &InProcessDaemon) {
-    let current = binding(daemon).await;
+async fn rebind(daemon: &InProcessDaemon, convoy: &str) {
+    let current = binding(daemon, convoy).await;
     let now = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + chrono::Duration::seconds(1)));
-    let reopened = super::launch_support::pending_binding("demo", "coder", "claude-box-a", "box-a@example.com", now);
+    let reopened = super::launch_support::pending_binding(convoy, "coder", "claude-box-a", "box-a@example.com", now);
     assert_eq!(reopened.spec.requester, current.spec.requester);
     daemon.account_records().rebind(NAMESPACE, reopened, None, now).await.expect("rebind");
 }
@@ -1104,22 +1128,22 @@ async fn a_refreshed_token_is_pushed_into_the_bound_home_without_moving_the_bind
     let token = tokens.path().join("box-a");
     fs::write(&token, "generation-one\n").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
-    let bound = binding(&runtime.daemon).await.spec;
+    let bound = binding(&runtime.daemon, &runtime.convoy).await.spec;
     let delivered = provision(&runtime.daemon).await.expect("provision recorded at launch");
     assert_eq!((delivered.place.as_str(), delivered.environment_kind.as_str()), (ENVIRONMENT, "ssh-host"));
-    assert_eq!(delivered.home, BOUND_MATERIAL, "the provision records where the copy lies");
-    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("generation-one".into())));
+    assert_eq!(delivered.home, bound_material(&runtime.convoy), "the provision records where the copy lies");
+    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), Some(HostEntry::File("generation-one".into())));
 
     fs::write(&token, "generation-two\n").expect("refreshed token");
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
-    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("generation-two".into())));
+    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), Some(HostEntry::File("generation-two".into())));
     let pushed = provision(&runtime.daemon).await.expect("provision kept");
     let generation =
         |spec: &flotilla_resources::AccountProvisionSpec| spec.delivered.as_ref().map(|delivered| delivered.generation.clone());
     assert_ne!(generation(&pushed), generation(&delivered));
     assert_eq!(generation(&pushed), Some(flotilla_resources::account_access::material_generation("generation-two")));
-    assert_eq!(binding(&runtime.daemon).await.spec, bound);
+    assert_eq!(binding(&runtime.daemon, &runtime.convoy).await.spec, bound);
 }
 
 // Acceptance (#3907 grant withdrawal, at the place): once the binding is revoked, the place
@@ -1131,7 +1155,7 @@ async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
-    let bound = binding(&runtime.daemon).await;
+    let bound = binding(&runtime.daemon, &runtime.convoy).await;
     let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
     let revoked = flotilla_resources::account_access::BindingState::Revoked {
         reason: "binding revoked: no authorizing grant".into(),
@@ -1141,7 +1165,7 @@ async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
 
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
-    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), None, "the delivered copy is deleted");
+    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), None, "the delivered copy is deleted");
     assert!(provision(&runtime.daemon).await.is_none(), "the provision record is removed");
     assert_eq!(*runtime.pool.killed.lock().await, ["terminal-demo-work-coder"], "the harness session is stopped");
     let refused = runtime.launch().await.expect_err("a revoked requester waits");
@@ -1156,11 +1180,11 @@ async fn a_rebound_requester_loses_its_old_copy_and_session() {
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
-    rebind(&runtime.daemon).await;
+    rebind(&runtime.daemon, &runtime.convoy).await;
 
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
-    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), None);
+    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), None);
     // A rebind closes the old binding and opens a new one under its own name, so the old
     // binding's provision goes with its copy; a relaunch records the new binding's afresh.
     assert_eq!(provision(&runtime.daemon).await, None, "the closed binding's provision is removed");
@@ -1180,16 +1204,16 @@ async fn a_restart_keeps_the_account_and_a_gone_place_is_swept() {
     old_place.place = "replaced-vessel-env".into();
     let accounts = runtime.daemon.account_records();
     let old_name = format!("{}.replaced-vessel-env", old_place.binding.name);
-    accounts.record_provision(NAMESPACE, &old_name, "demo", &old_place, false).await.expect("old place record");
+    accounts.record_provision(NAMESPACE, &old_name, &runtime.convoy, &old_place, false).await.expect("old place record");
 
     let restarted = runtime.launch().await.expect("restart");
     let token_file = restarted.env_vars.iter().find(|(name, _)| name == "FLOTILLA_CLAUDE_OAUTH_TOKEN_FILE").map(|(_, value)| value.clone());
-    assert_eq!(token_file.as_deref(), Some(format!("{BOUND_MATERIAL}/.flotilla-oauth-token").as_str()));
+    assert_eq!(token_file.as_deref(), Some(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy)).as_str()));
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
     let provisions = accounts.local_provisions(NAMESPACE).await.expect("provisions");
     assert_eq!(provisions.iter().map(|record| record.spec.place.as_str()).collect::<Vec<_>>(), [ENVIRONMENT]);
-    let binding = binding(&runtime.daemon).await.spec;
+    let binding = binding(&runtime.daemon, &runtime.convoy).await.spec;
     assert_eq!(binding.credential.0, "claude-box-a");
 }
 
@@ -1203,7 +1227,7 @@ async fn a_relaunch_moves_a_copy_recorded_in_the_old_home() {
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
     let recorded = provision_record(&runtime.daemon).await.expect("provision");
-    let old_home = format!("{RUNTIME_BASE}/agent-homes/requesters/demo/coder/claude");
+    let old_home = requester_home_at(RUNTIME_BASE, &runtime.convoy, "claude");
     host.put(&Path::new(&old_home).join(".flotilla-oauth-token"), "box-a-token");
     let old = flotilla_resources::AccountProvisionSpec { home: old_home.clone(), ..recorded.spec.clone() };
     let written = runtime.daemon.account_records().update_provision(NAMESPACE, &recorded, &old).await.expect("pre-#4012 record");
@@ -1212,8 +1236,8 @@ async fn a_relaunch_moves_a_copy_recorded_in_the_old_home() {
     runtime.launch().await.expect("relaunch");
 
     assert_eq!(host.entry(format!("{old_home}/.flotilla-oauth-token")), None, "the old copy is deleted");
-    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
-    assert_eq!(provision(&runtime.daemon).await.expect("provision").home, BOUND_MATERIAL);
+    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(provision(&runtime.daemon).await.expect("provision").home, bound_material(&runtime.convoy));
 }
 
 // Review #3910: a binding homed on another daemon whose clock runs ahead of this place is still
@@ -1230,7 +1254,7 @@ async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
 
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
-    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), Some(HostEntry::File("box-a-token".into())));
     assert_eq!(provision(&runtime.daemon).await, Some(delivered));
     assert!(runtime.pool.killed.lock().await.is_empty(), "the session keeps running");
 }
@@ -1243,8 +1267,8 @@ async fn a_withdrawal_waits_for_a_delivery_in_progress() {
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
-    let bound = binding(&runtime.daemon).await;
-    rebind(&runtime.daemon).await;
+    let bound = binding(&runtime.daemon, &runtime.convoy).await;
+    rebind(&runtime.daemon, &runtime.convoy).await;
 
     let lock = runtime.state.account_delivery_lock(&bound.name);
     let delivering = lock.lock().await;
@@ -1252,11 +1276,11 @@ async fn a_withdrawal_waits_for_a_delivery_in_progress() {
     let withdrawal = tokio::spawn(async move { reconcile_place_provisions(&state, NAMESPACE).await });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(!withdrawal.is_finished(), "the withdrawal waits for the delivery");
-    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), Some(HostEntry::File("box-a-token".into())));
 
     drop(delivering);
     withdrawal.await.expect("join").expect("place pass");
-    assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), None);
+    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), None);
 }
 
 // #3964 contract 4: a failed delivery records, for its access, the need it failed at and
@@ -1275,7 +1299,7 @@ async fn failed_delivery_waits_for_its_retry_and_is_cleared_once_delivered() {
     let failed = retry(runtime.deliveries().await).expect("the failure is recorded");
     assert_eq!((failed.need.as_str(), failed.attempts), ("account", 1));
 
-    bind_account(&runtime.daemon, "demo", "coder", "claude-max", "crew@example.com").await;
+    bind_account(&runtime.daemon, &runtime.convoy, "coder", "claude-max", "crew@example.com").await;
     runtime.launch().await.expect_err("the retry is not yet due");
     assert_eq!(retry(runtime.deliveries().await), Some(failed), "no attempt before the retry is due");
 
@@ -1331,7 +1355,7 @@ async fn access_status_goes_with_its_convoy() {
     let (_, reconciler) = super::super::access_layer::status::status_controller(Arc::clone(&runtime.state), NAMESPACE.to_string());
     reconciler.retire(&record).await.expect("retire");
     assert_eq!(records.list().await.expect("records").items.len(), 1, "kept while its place and convoy remain");
-    backend.using::<Convoy>(NAMESPACE).delete("demo").await.expect("convoy ended");
+    end_convoy(&runtime.daemon, &runtime.convoy).await;
     reconciler.retire(&record).await.expect("retire");
     assert!(records.list().await.expect("records").items.is_empty(), "removed with its convoy");
 }
@@ -1349,14 +1373,14 @@ async fn retiring_a_convoy_removes_its_requester_state_from_the_ssh_host() {
         files.keys().filter(|path| path.components().any(|part| part.as_os_str() == "requesters")).cloned().collect::<Vec<_>>()
     };
     let before = requester_files(&host);
-    assert!(before.iter().any(|path| path.starts_with(BOUND_MATERIAL)), "the material landed: {before:?}");
+    assert!(before.iter().any(|path| path.starts_with(bound_material(&runtime.convoy))), "the material landed: {before:?}");
     let backend = runtime.daemon.resource_backend();
     let records = backend.clone().using::<flotilla_resources::AccessDelivery>(NAMESPACE);
     let [record] = records.list().await.expect("records").items.try_into().expect("one record");
     let (_, reconciler) = super::super::access_layer::status::status_controller(Arc::clone(&runtime.state), NAMESPACE.to_string());
     reconciler.retire(&record).await.expect("retire");
     assert_eq!(requester_files(&host), before, "kept while its convoy remains");
-    backend.using::<Convoy>(NAMESPACE).delete("demo").await.expect("convoy ended");
+    end_convoy(&runtime.daemon, &runtime.convoy).await;
     reconciler.retire(&record).await.expect("retire");
     assert_eq!(requester_files(&host), Vec::<PathBuf>::new(), "removed with its convoy");
     reconciler.retire(&record).await.expect("retiring again is a no-op");
@@ -1371,7 +1395,7 @@ async fn a_rotated_central_login_is_pushed_into_the_ssh_host_crew_home() {
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
     let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "codex").await;
     runtime.launch().await.expect("delivered");
-    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/codex");
+    let home = requester_home_at(HOST_BASE, &runtime.convoy, "codex");
     let landed = |deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>| {
         let [delivery] = deliveries.as_slice() else { panic!("one access: {deliveries:?}") };
         delivery.needs.iter().find(|need| need.need == "login").expect("login need").digest.clone()
@@ -1400,7 +1424,7 @@ async fn a_failed_login_push_is_explained_and_retried() {
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
     let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "codex").await;
     runtime.launch().await.expect("delivered");
-    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/codex");
+    let home = requester_home_at(HOST_BASE, &runtime.convoy, "codex");
     let retry = |deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>| {
         let [delivery] = deliveries.as_slice() else { panic!("one access: {deliveries:?}") };
         delivery.retry.clone()
@@ -1440,7 +1464,7 @@ async fn an_exhausted_login_push_waits_for_the_next_rotation() {
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
     let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "codex").await;
     runtime.launch().await.expect("delivered");
-    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/codex");
+    let home = requester_home_at(HOST_BASE, &runtime.convoy, "codex");
     let redeliver = |rotated| super::super::access_layer::redeliver_central_logins(&runtime.state, NAMESPACE, rotated);
     let attempts = || async {
         let [delivery] = runtime.deliveries().await.try_into().expect("one access");
@@ -1475,7 +1499,7 @@ async fn a_rotation_wakes_credential_delivery_to_push_the_new_login() {
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
     let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "codex").await;
     runtime.launch().await.expect("delivered");
-    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/codex");
+    let home = requester_home_at(HOST_BASE, &runtime.convoy, "codex");
     let delivery = super::super::credential_delivery::CredentialDelivery::new(Arc::clone(&runtime.state)).expect("a credential store");
     let _controller = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
         delivery.run(runtime.state.controller_metrics.for_kind("CredentialDelivery")),

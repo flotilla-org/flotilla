@@ -130,10 +130,12 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
         .await
         .expect("launch");
 
-    let home = Path::new(flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE)
-        .join("agent-homes/requesters")
-        .join(&stand_in.convoy)
-        .join("coder/claude");
+    let home = flotilla_resources::account_access::requester_home(
+        Path::new(flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE),
+        &stand_in.convoy,
+        "coder",
+        "claude",
+    );
     let launched = stand_in
         .pool
         .ensured
@@ -281,7 +283,11 @@ impl StandIn {
     fn clean_up(&self) {
         self.host.abort();
         let base = Path::new(flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE);
-        let _ = fs::remove_dir_all(base.join("agent-material/requesters").join(&self.convoy));
+        let _ = fs::remove_dir_all(flotilla_resources::account_access::requester_convoy_dir(
+            base,
+            flotilla_resources::account_access::REQUESTER_MATERIAL_DIR,
+            &self.convoy,
+        ));
         let digest = format!("{:x}", sha2::Sha256::digest(self.env_id.as_str().as_bytes()));
         let _ = fs::remove_dir_all(base.join("crew-sockets").join(&digest[..16]));
         let _ = fs::remove_dir_all(base.join("vessel-layers").join(&digest[..16]));
@@ -429,7 +435,7 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
     };
     engine_environments(&daemon).request(env_id.as_str(), &spec, None);
     let source = LocalSkillSource::new(root, "research");
-    let vessel = freeze_crew(&daemon, &convoy, "coder", "claude-code", vec![source.selected.clone()]).await;
+    let (convoy, vessel) = freeze_crew(&daemon, &convoy, "coder", "claude-code", vec![source.selected.clone()]).await;
     bind_account(&daemon, &convoy, "coder", "claude-max", "test@example.com").await;
 
     let adapters: Arc<dyn CommandRunner> =

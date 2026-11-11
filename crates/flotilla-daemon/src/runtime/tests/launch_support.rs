@@ -72,21 +72,17 @@ pub(super) async fn bind_account_from_home(
     other.replicate_to(&target);
 }
 
-/// Freeze one crew aboard work `work` in convoy `convoy`'s workflow snapshot, as admission
-/// does, and request the work's launch on this daemon's host: the crew's frozen skills are
-/// what its access layer delivers. Returns the launch, which the crew's sessions name.
+/// Admit a launch of convoy `convoy` with one crew aboard work `work` in its workflow snapshot, as
+/// admission does, and request the work's launch on this daemon's host: the crew's frozen skills
+/// are what its access layer delivers. Returns the convoy's launch and the work's, which the
+/// crew's sessions name.
 pub(super) async fn freeze_crew(
     daemon: &InProcessDaemon,
     convoy: &str,
     role: &str,
     adapter: &str,
     skills: Vec<flotilla_resources::SkillCatalogEntry>,
-) -> String {
-    let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
-    let created = convoys
-        .create(&empty_meta(convoy), &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build())
-        .await
-        .expect("convoy");
+) -> (String, String) {
     let crew = CrewSpec::builder()
         .role(role.to_string())
         .skills(flotilla_resources::ResolvedSkills { selected: skills, provenance: Vec::new() })
@@ -96,25 +92,26 @@ pub(super) async fn freeze_crew(
             brief_template: None,
         })
         .build();
-    convoys
-        .update_status(
-            convoy,
-            &created.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![crew]).build()],
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("frozen workflow");
-    engine(daemon).vessels.request(convoy, "work", daemon.local_host_id().expect("local host").as_str())
+    let status = flotilla_resources::ConvoyStatus {
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![crew]).build()],
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+        }),
+        ..Default::default()
+    };
+    let engine = engine(daemon);
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build();
+    let convoy = flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy(NAMESPACE, convoy, spec, status),
+    )
+    .await;
+    let vessel = engine.vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
+    (convoy, vessel)
 }
 
 /// A frozen selection of `name` from the generation's `mattpocock-skills` source.
@@ -145,6 +142,8 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         )
         .await
         .expect("Claude credential declaration");
+    // Managed launch cards read durable context, just as the live command does.
+    let (convoy, vessel) = freeze_crew(&daemon, "demo", "coder", "claude-code", Vec::new()).await;
 
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("workspace");
@@ -155,7 +154,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         engine_environments(&daemon).request(env_id.as_str(), &spec, None);
     }
     // #3907: the requester's bound home, keyed by convoy and role.
-    let crew_config_dir = PathBuf::from("/home/crew/flotilla/agent-homes/requesters/demo/coder/claude");
+    let crew_config_dir = flotilla_resources::account_access::requester_home(Path::new("/home/crew/flotilla"), &convoy, "coder", "claude");
     let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
         DiscoveryMockRunner::builder()
             .tool_exists("claude", true)
@@ -231,8 +230,6 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         .lock()
         .await
         .insert(handle.backing_id().to_string(), super::super::environments::ActiveProvisionedEnvironment { handle });
-    // Managed launch cards read durable context, just as the live command does.
-    let vessel = freeze_crew(&daemon, "demo", "coder", "claude-code", Vec::new()).await;
     let spec = flotilla_resources::TerminalSessionSpec {
         env_ref: env_id.to_string(),
         role: "coder".to_string(),
@@ -246,7 +243,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
             },
             context: Box::new(flotilla_resources::TerminalCrewContext {
                 namespace: NAMESPACE.to_string(),
-                convoy: "demo".to_string(),
+                convoy: convoy.clone(),
                 vessel_ref: vessel.clone(),
             }),
         },
@@ -262,7 +259,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         LaunchObservationRecord::Present => request_session(&daemon, "terminal-demo-work-coder", &spec),
         _ => first_launch("terminal-demo-work-coder"),
     };
-    bind_account(&daemon, "demo", "coder", "claude-max", "test@example.com").await;
+    bind_account(&daemon, &convoy, "coder", "claude-max", "test@example.com").await;
     let tags: [flotilla_terminal::TerminalSessionTag; 0] = [];
 
     let launched = TerminalControllerRuntime { state }
@@ -313,7 +310,8 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         "the session environment carries no token; the plan's file is the only source"
     );
     // #4012: the token lies in the requester's material directory, outside its home.
-    let material = "/home/crew/flotilla/agent-material/requesters/demo/coder/claude";
+    let material = flotilla_resources::account_access::requester_material(Path::new("/home/crew/flotilla"), &convoy, "coder", "claude");
+    let material = material.to_str().expect("a path in UTF-8");
     assert!(launch.env_vars.iter().any(|(name, value)| name == flotilla_agent::account_access::CLAUDE_OAUTH_TOKEN_FILE_ENV
         && value == &format!("{material}/.flotilla-oauth-token")));
     assert!(launch.command.contains(&claude_token_prefix(material)), "{}", launch.command);
@@ -337,7 +335,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
     assert!(launched.facts.agent.is_some(), "the contained launch resolves its crew's harness");
     for (name, expected) in [
         ("FLOTILLA_CREW_ID", launch_name.as_str()),
-        ("FLOTILLA_CONVOY", "demo"),
+        ("FLOTILLA_CONVOY", convoy.as_str()),
         ("FLOTILLA_VESSEL", vessel.as_str()),
         ("FLOTILLA_CREW_ROLE", "coder"),
         ("FLOTILLA_NAMESPACE", NAMESPACE),

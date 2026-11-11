@@ -13,36 +13,30 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     daemon.open_message_primitives().expect("message path");
     designate_fleet(&daemon).await;
     let backend = daemon.resource_backend();
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("credential-convoy"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .credential_refs(BTreeSet::from(["github-app".to_string(), "forgejo".to_string()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                ..ConvoyStatus::default()
-            },
-        )
-        .await
-        .expect("set convoy status");
     let engine = engine(&daemon);
-    let launch = engine.vessels.request("credential-convoy", "work", daemon.local_host_id().expect("local host").as_str());
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: vec![VesselRequirement::builder()
+                .name("work".to_string())
+                .credential_refs(BTreeSet::from(["github-app".to_string(), "forgejo".to_string()]))
+                .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                .build()],
+        }),
+        ..ConvoyStatus::default()
+    };
+    let spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+    let convoy = flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy(NAMESPACE, "credential-convoy", spec, status),
+    )
+    .await;
+    let launch = engine.vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
     engine_environments(&daemon).request(
         "standing-vessel",
         &EnvironmentSpec {
@@ -94,7 +88,7 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     .expect("raise attention");
     let told = open().await;
     assert_eq!(told.len(), 1);
-    assert_eq!(told[0].subject, Subject::Vessel { convoy: "credential-convoy".into(), vessel: "work".into() });
+    assert_eq!(told[0].subject, Subject::Vessel { convoy: convoy.clone(), vessel: "work".into() });
     assert!(told[0].reason.contains("expires in 120 seconds"));
     acknowledge_all().await;
     reconcile_credential_refresh_attention_in(
@@ -419,10 +413,10 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
     spec.docker.as_mut().expect("docker").required_agent_adapters = BTreeSet::from(["claude-code".into()]);
     engine_environments(&daemon).request(env_id.as_str(), &spec, None);
     let source = LocalSkillSource::new(temp.path(), "research");
-    let vessel = freeze_crew(&daemon, "demo", "coder", "claude-code", vec![source.selected.clone()]).await;
-    bind_account(&daemon, "demo", "coder", "claude-max", "test@example.com").await;
+    let (convoy, vessel) = freeze_crew(&daemon, "demo", "coder", "claude-code", vec![source.selected.clone()]).await;
+    bind_account(&daemon, &convoy, "coder", "claude-max", "test@example.com").await;
 
-    let home = PathBuf::from("/home/crew/flotilla/agent-homes/requesters/demo/coder/claude");
+    let home = flotilla_resources::account_access::requester_home(Path::new("/home/crew/flotilla"), &convoy, "coder", "claude");
     let runner: Arc<dyn CommandRunner> =
         Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build()));
     let bag = EnvironmentBag::new()
@@ -496,7 +490,7 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
             },
             context: Box::new(flotilla_resources::TerminalCrewContext {
                 namespace: NAMESPACE.to_string(),
-                convoy: "demo".to_string(),
+                convoy: convoy.clone(),
                 vessel_ref: vessel.clone(),
             }),
         },
@@ -524,7 +518,7 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
         &backend,
         state.daemon.lifecycle_reads().as_ref(),
         NAMESPACE,
-        "demo",
+        &convoy,
     )
     .await
     .expect("deliveries");
@@ -930,34 +924,28 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
             Some(passthrough_registry()),
         )
         .expect("adopt test environment");
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("credential-work"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                ..ConvoyStatus::default()
-            },
-        )
-        .await
-        .expect("live convoy");
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: vec![VesselRequirement::builder()
+                .name("work".to_string())
+                .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                .build()],
+        }),
+        ..ConvoyStatus::default()
+    };
+    let spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+    flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy(NAMESPACE, "credential-work", spec, status),
+    )
+    .await;
     let state = Arc::new(
         ControllerRuntimeState::new(daemon.clone(), config, passthrough_registry(), None, "test-host".into(), "host-direct-test".into())
             .with_credential_store(store.clone()),
