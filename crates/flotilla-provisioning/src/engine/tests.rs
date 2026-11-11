@@ -25,6 +25,11 @@ use crate::stored::{
 
 const HOME: &str = "home";
 
+/// The time the engine records for a write made at `now`.
+fn at(now: DateTime<Utc>) -> flotilla_schema::Timestamp {
+    flotilla_schema::Timestamp::from_datetime(&now)
+}
+
 fn meta(name: &str) -> ObjectMeta {
     ObjectMeta {
         name: name.into(),
@@ -606,8 +611,7 @@ async fn a_vessel_lease_is_granted_on_its_pinned_host_and_ends_gone() {
 
     use super::vessel::PINNED_CLASS;
     let home = placements();
-    let name =
-        home.request("convoy-a-implement", lease("convoy-a-implement", "feta"), super::at(Utc::now())).expect("granted").name().to_owned();
+    let name = home.request("convoy-a-implement", lease("convoy-a-implement", "feta"), at(Utc::now())).expect("granted").name().to_owned();
     assert!(name.starts_with("convoy-a-implement#"), "{name} is a launch of its work");
     let state = || home.get(&name).map(|vessel| vessel.state().clone());
 
@@ -618,10 +622,10 @@ async fn a_vessel_lease_is_granted_on_its_pinned_host_and_ends_gone() {
     assert_eq!(lease.request.convoy, flotilla_schema::Ref::new("convoy-a", HOME));
     assert_eq!(state(), Some(LifecycleState::requested()));
 
-    home.step(&name, &Step::Realised { identity: "env-a".into() }, super::at(Utc::now())).expect("ready");
+    home.step(&name, &Step::Realised { identity: "env-a".into() }, at(Utc::now())).expect("ready");
     assert_eq!(state(), Some(LifecycleState::Realised { identity: "env-a".into() }));
 
-    home.step(&name, &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }, super::at(Utc::now()))
+    home.step(&name, &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }, at(Utc::now()))
         .expect("lost");
     assert_eq!(state(), Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost }));
     home.with_placements(|placements| assert!(placements.ledger().vessel(&VesselId::new(&name)).is_none(), "the lease is freed"));
@@ -634,10 +638,9 @@ async fn a_vessel_failing_before_ready_returns_its_lease() {
     use flotilla_state_machines::{placement::VesselId, Cause, CauseCategory, Outcome};
 
     let home = placements();
-    let name =
-        home.request("convoy-a-implement", lease("convoy-a-implement", "feta"), super::at(Utc::now())).expect("granted").name().to_owned();
+    let name = home.request("convoy-a-implement", lease("convoy-a-implement", "feta"), at(Utc::now())).expect("granted").name().to_owned();
     let failed = Outcome::Failed { cause: Cause::new(CauseCategory::External, "placement policy docker not found"), retryable: false };
-    home.step(&name, &Step::Attempted(failed), super::at(Utc::now())).expect("failed");
+    home.step(&name, &Step::Attempted(failed), at(Utc::now())).expect("failed");
     let state = home.get(&name).expect("failed vessel");
     assert_eq!(state.state().cause().map(|cause| cause.detail.as_str()), Some("placement policy docker not found"));
     assert!(matches!(state.state(), LifecycleState::GaveUp { .. }));
@@ -653,7 +656,7 @@ fn a_restart_puts_each_live_lease_back_on_its_pinned_host() {
         Cause, CauseCategory, Outcome,
     };
 
-    use super::{at, vessel::PlacementLifecycles};
+    use super::vessel::PlacementLifecycles;
     let home = placements();
     let request = |of: &str| home.request(of, lease(of, "feta"), at(DateTime::UNIX_EPOCH)).expect("granted").name().to_owned();
     let live = request("live");

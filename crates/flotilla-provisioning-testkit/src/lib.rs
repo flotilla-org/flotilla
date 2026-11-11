@@ -18,18 +18,9 @@ use std::sync::{Arc, Mutex};
 pub use terminals::TerminalsFixture;
 pub use vessels::VesselsFixture;
 
-use flotilla_engine_store::StoreLog;
-use flotilla_provisioning::engine::{
-    reads::{LifecycleReadPort, StoreReads},
-    Binding, LifecycleHome, Lifecycles, Step,
-};
+use flotilla_provisioning::engine::reads::{LifecycleReadPort, StoreReads};
 use flotilla_resources::{environment_records::EnvironmentRecords, lifecycle_reads::LifecycleReads, ResourceObject};
-use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::Store;
-use flotilla_state_machines::{
-    machines::lifecycle::{Attempted, Lifecycle, LifecycleKind, MemoryLifecycleWorld},
-    Cause, CauseCategory, Home, Log, Outcome,
-};
 
 /// The engine's environments, image builds, clones, checkouts, terminal sessions and vessels homed
 /// at one home on one store, each fixture's `reads` serving them all, as a daemon's lifecycle reads do.
@@ -107,126 +98,6 @@ pub enum Ending<'a> {
     Released,
     Failed(&'a str),
     GaveUp(&'a str),
-}
-
-/// Drives the real engine and SQLite adapter without publishing any old status copy.
-pub struct LifecycleFixture<B: Binding>
-where
-    StoreLog: Log<Lifecycle<B::Kind>>,
-{
-    pub home: Arc<LifecycleHome<B::Kind, StoreLog>>,
-    pub reads: Arc<dyn LifecycleReads>,
-    pub store: Arc<Mutex<Store>>,
-    /// The environments its readers find, homed at `home` on the same store.
-    pub environments: EnvironmentFixture,
-    /// The clones its readers find, homed at `home` on the same store.
-    pub clones: CloneFixture,
-    /// The checkouts its readers find, and the engine Convoys they are held for, homed at `home`
-    /// on the same store.
-    pub checkouts: CheckoutFixture,
-    /// The terminal sessions its readers find, homed at `home` on the same store.
-    pub terminals: TerminalsFixture,
-}
-
-impl<B: Binding> LifecycleFixture<B>
-where
-    <B::Kind as LifecycleKind>::Request: Send + Sync,
-    StoreLog: Log<Lifecycle<B::Kind>>,
-{
-    pub fn new(replica: bool) -> Self {
-        Self::over(Arc::new(Mutex::new(memory_store("home"))), replica)
-    }
-
-    /// A fixture homed at "home" over `store`, read from "reader" when `replica`.
-    pub fn over(store: Arc<Mutex<Store>>, replica: bool) -> Self {
-        let home = Arc::new(LifecycleHome::new("home", Home::with_log("home", StoreLog::new(Arc::clone(&store))).expect("home")));
-        let environments = EnvironmentFixture::over("home", Arc::clone(&store));
-        let clones = CloneFixture::over("home", Arc::clone(&store));
-        let checkouts = CheckoutFixture::over("home", Arc::clone(&store));
-        let terminals = TerminalsFixture::over("home", Arc::clone(&store));
-        let reads = Arc::new(
-            LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), if replica { "reader" } else { "home" }.into())
-                .with_environments(Arc::clone(&environments.environments) as Arc<dyn EnvironmentRecords>)
-                .with_clones(Arc::clone(&clones.clones) as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
-                .with_checkouts(Arc::clone(&checkouts.checkouts) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
-                .with_terminals(Arc::clone(&terminals.terminals) as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>),
-        );
-        Self { home, reads, store, environments, clones, checkouts, terminals }
-    }
-
-    pub fn name(&self, obj: &ResourceObject<B::Old>) -> String {
-        flotilla_provisioning::engine::current::<B>(self.home.as_ref(), obj).0
-    }
-
-    pub fn request(&self, obj: &ResourceObject<B::Old>) {
-        self.home.request(&self.name(obj), B::request(obj, "home").expect("request"), Timestamp(1_000_000)).expect("requested");
-    }
-
-    pub fn retry(&self, obj: &ResourceObject<B::Old>, cause: &str) {
-        self.home
-            .step(
-                &self.name(obj),
-                &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, cause), retryable: true }),
-                Timestamp(2_000_000),
-            )
-            .expect("retry");
-    }
-
-    /// Persist only Attempted, modelling a restart before GiveUp; later assertions use the store read port.
-    pub fn exhaust_before_give_up(&self, obj: &ResourceObject<B::Old>, cause: &str) {
-        let mut home = Home::<Lifecycle<B::Kind>, _>::with_log("home", StoreLog::new(Arc::clone(&self.store))).expect("home");
-        home.restore(self.home.get(&self.name(obj)).expect("requested resource")).expect("restore");
-        home.apply(
-            &self.name(obj),
-            Attempted { outcome: Outcome::Failed { cause: Cause::new(CauseCategory::Refused, cause), retryable: false } },
-            &MemoryLifecycleWorld::default(),
-            Timestamp(2_000_000),
-        )
-        .expect("durable failed attempt");
-    }
-
-    pub fn finish(&self, obj: &ResourceObject<B::Old>, ending: Ending<'_>) {
-        let name = self.name(obj);
-        let name = name.as_str();
-        let step = match ending {
-            Ending::Ready(identity) => Step::Realised { identity: identity.into() },
-            Ending::Lost(identity) => {
-                if !self.home.get(name).is_some_and(|resource| {
-                    matches!(resource.state(), flotilla_state_machines::machines::lifecycle::LifecycleState::Realised { .. })
-                }) {
-                    self.home.step(name, &Step::Realised { identity: identity.into() }, Timestamp(3_000_000)).expect("ready");
-                }
-                Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }
-            }
-            Ending::Released => Step::Released,
-            Ending::Failed(reason) => {
-                if !self.home.get(name).is_some_and(|resource| {
-                    matches!(resource.state(), flotilla_state_machines::machines::lifecycle::LifecycleState::Realised { .. })
-                }) {
-                    self.home.step(name, &Step::Realised { identity: "backing".into() }, Timestamp(3_000_000)).expect("ready");
-                }
-                Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: reason.into() } }
-            }
-            Ending::GaveUp(cause) => {
-                Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Refused, cause), retryable: false })
-            }
-        };
-        self.home.step(name, &step, Timestamp(4_000_000)).expect("ending");
-    }
-
-    /// Restore the controller's home from SQLite after an interrupted write sequence.
-    pub fn reopen(&self) -> Arc<dyn Lifecycles<B::Kind>>
-    where
-        flotilla_state_machines::Resource<Lifecycle<B::Kind>>: flotilla_schema::Kind,
-    {
-        let home: Home<Lifecycle<B::Kind>, StoreLog> =
-            flotilla_engine_store::open_home(StoreLog::new(Arc::clone(&self.store))).expect("restore home");
-        Arc::new(LifecycleHome::new("home", home))
-    }
-
-    pub fn poison(&self) {
-        flotilla_store_testkit::poison_mutex(Arc::clone(&self.store));
-    }
 }
 
 /// A stale resource snapshot for pure reader seams; no provider or persistence is replaced.

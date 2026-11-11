@@ -1,10 +1,10 @@
 //! The import of old provisioning and crew records into the engine (#3629 layer 9).
 //!
 //! One function per kind maps an old record's status onto a stored lifecycle state; the request is
-//! the kind's [`Binding::request`], as the write path makes it (an Environment's is the request
-//! the environment port makes, [`super::environments::request_of`], and a Clone's the clone port's,
+//! the one the kind's write path makes (an Environment's is the request the environment port
+//! makes, [`super::environments::request_of`], and a Clone's the clone port's,
 //! [`super::clones::request_of`]). A record that cannot be mapped is
-//! refused with the record named. [`import_records`] writes every mapped resource into an
+//! refused with the record named. Each kind's `import_*s` writes every mapped resource into an
 //! [`ImportTarget`], reads it back, and lists what it refused.
 //!
 //! | Kind | Old phase | Stored state |
@@ -66,7 +66,7 @@ use flotilla_resources::{
     vessel_resource_name, CONVOY_LABEL,
 };
 
-use super::{checkouts, clones, environments, image_builds, terminals, vessel::PINNED_CLASS, Binding};
+use super::{checkouts, clones, environments, image_builds, terminals, vessel::PINNED_CLASS};
 use crate::stored::{
     checkout::{CheckoutFacts, CheckoutKind},
     clone::{CloneFacts, CloneKind},
@@ -77,12 +77,6 @@ use crate::stored::{
     terminal_session::TerminalSessionKind,
     Holder,
 };
-
-/// A kind whose old records the import maps.
-pub trait Imported: Binding {
-    /// The stored state `obj`'s old status maps to, or why it maps to none.
-    fn imported_state(obj: &ResourceObject<Self::Old>) -> Result<LifecycleState, String>;
-}
 
 /// One old record mapped onto the engine, ready to restore at its home. A launch carries its old
 /// name until [`write_imported`] numbers it.
@@ -105,20 +99,6 @@ impl std::fmt::Display for ImportRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} `{}` refused: {}", self.kind, self.record, self.reason)
     }
-}
-
-/// Maps old record `obj`, homed at `home`, onto its kind's engine resource.
-pub fn import<B: Imported>(obj: &ResourceObject<B::Old>, home: &str) -> Result<ImportedResource<B::Kind>, ImportRefusal> {
-    let kind = <B::Kind as LifecycleKind>::NAME;
-    let refuse = |reason: String| ImportRefusal { kind, record: obj.metadata.name.clone(), reason };
-    let request = B::request(obj, home).map_err(refuse)?;
-    let state = B::imported_state(obj).map_err(refuse)?;
-    let since = Timestamp::from_datetime(&obj.metadata.creation_timestamp);
-    Ok(ImportedResource {
-        record: obj.metadata.name.clone(),
-        home: home.to_owned(),
-        resource: Resource::stored(obj.metadata.name.clone(), request, State::new(state, since), Version(1)),
-    })
 }
 
 /// Writes `imported`'s resource into `target` at its home under `change`, and holds the resource
@@ -281,46 +261,6 @@ where
             write_imported(&mut rehearsal, &mut resource, &change).err().map(|reason| refuse(index, reason))
         })
         .collect()
-}
-
-/// Imports `records` (each an old record and its home) of `B`'s kind into `target`, each created
-/// at its old creation time: a refused import, or a resource the target refuses, is listed; the
-/// rest are counted. Records of a home `target` does not import are left to that home.
-pub fn import_records<B>(records: &[(ResourceObject<B::Old>, String)], target: &mut impl ImportTarget, report: &mut ImportReport)
-where
-    B: Imported,
-    Resource<Lifecycle<B::Kind>>: Kind + PartialEq + Clone,
-{
-    for (record, home) in records {
-        if !target.imports(home) {
-            continue;
-        }
-        let result = import::<B>(record, home).and_then(|mut imported| {
-            let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
-            write_imported(target, &mut imported, &change).map(|()| imported).map_err(|reason| ImportRefusal {
-                kind: <B::Kind as LifecycleKind>::NAME,
-                record: record.metadata.name.clone(),
-                reason,
-            })
-        });
-        report.record(&result);
-    }
-}
-
-/// [`import_records`] into a [`rehearsal`] of its own.
-pub fn rehearse_records<B>(records: &[(ResourceObject<B::Old>, String)], report: &mut ImportReport)
-where
-    B: Imported,
-    Resource<Lifecycle<B::Kind>>: Kind + PartialEq + Clone,
-{
-    match rehearsal() {
-        Ok(mut rehearsal) => import_records::<B>(records, &mut rehearsal, report),
-        Err(reason) => report.refused.extend(records.iter().map(|(record, _)| ImportRefusal {
-            kind: <B::Kind as LifecycleKind>::NAME,
-            record: record.metadata.name.clone(),
-            reason: reason.clone(),
-        })),
-    }
 }
 
 /// Each imported vessel's launch, by its home and old name: what was held for the old vessel (its
