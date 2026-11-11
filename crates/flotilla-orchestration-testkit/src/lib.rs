@@ -22,6 +22,7 @@ use flotilla_charter::ops_entry::SOURCE_ENTRY_PATH_ANNOTATION;
 use flotilla_charter::ops_entry::SOURCE_REPOSITORY_ANNOTATION;
 use flotilla_core::in_process::*;
 use flotilla_discovery_testkit::fake_discovery;
+use flotilla_resources::attentions::{OpenAttention, Sender};
 use flotilla_resources::controller_patches;
 use flotilla_resources::ConvoyEnsureHoldReason;
 use flotilla_resources::ConvoyEnsureSpec;
@@ -33,8 +34,6 @@ use flotilla_resources::CrewSource;
 use flotilla_resources::CrewSpec;
 use flotilla_resources::CrewWorkPhase;
 use flotilla_resources::CrewWorkState;
-use flotilla_resources::Demand as ResourceDemand;
-use flotilla_resources::DemandStatusPatch;
 use flotilla_resources::EnvironmentSpec as ResourceEnvironmentSpec;
 use flotilla_resources::FulfilmentKindSpec;
 use flotilla_resources::FulfilmentRealisation;
@@ -194,6 +193,30 @@ async fn seed_convoy_routing_row(
 /// store, as the runtime's composition does; a scenario daemon is not composed by the runtime.
 fn install_engine(daemon: &InProcessDaemon) {
     daemon.install_lifecycle_reads(engine(daemon).reads()).expect("install the engine's readings");
+    // Attentions are Messages on the engine, as the daemon composes them.
+    daemon.open_message_primitives().expect("the engine Message path");
+}
+
+/// The standing role's holds open in `flotilla`.
+async fn open_holds(backend: &ResourceBackend) -> Vec<OpenAttention> {
+    let open = backend.attentions().open("flotilla", Some(Sender::Standing), None).await.expect("attentions");
+    open.into_iter().filter(OpenAttention::is_hold).collect()
+}
+
+/// Every attention open in `flotilla`.
+async fn open_attentions(backend: &ResourceBackend) -> Vec<OpenAttention> {
+    backend.attentions().open("flotilla", None, None).await.expect("attentions")
+}
+
+/// A person acknowledges every message waiting for them at `daemon`'s home, and says how many.
+async fn acknowledge_waiting(daemon: &InProcessDaemon) -> usize {
+    let messages = daemon.message_primitives().expect("the engine Message path");
+    let waiting = messages.person_messages("flotilla").await.expect("person messages");
+    for (_, message) in &waiting {
+        let record = flotilla_engine_messages::view::record_name(message.name()).expect("a message record");
+        messages.acknowledge("flotilla", &record).await.expect("acknowledge");
+    }
+    waiting.len()
 }
 
 /// The engine over `daemon`'s decided store: one per store, so a scenario's writes go through the
@@ -272,6 +295,7 @@ async fn standing_ensure_fixture_for(
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
     install_engine(&daemon);
     daemon
         .install_convoy_ensure_reconciler(factory.create(daemon.convoy_teardown(), daemon.resource_backend(), daemon.clock_for_scenarios()))

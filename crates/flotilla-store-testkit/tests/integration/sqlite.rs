@@ -24,7 +24,7 @@ use flotilla_store_testkit::fixtures::{
         assert_replica_read_view_contract, assert_stale_resource_version_conflicts_with_backend,
         assert_store_diagnostics_report_retained_events_with_backend, assert_watch_from_version_replays_with_backend,
         assert_watch_now_semantics_with_backend, assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
-        assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture, DemandFixture,
+        assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture,
     },
     convoy_meta, convoy_spec, resource_meta, valid_workflow_template_spec, workflow_template_meta,
 };
@@ -289,7 +289,6 @@ macro_rules! resource_contract_tests {
 }
 
 resource_contract_tests!(convoy_contract, ConvoyFixture);
-resource_contract_tests!(demand_contract, DemandFixture);
 
 #[tokio::test]
 async fn replica_read_view_contract() {

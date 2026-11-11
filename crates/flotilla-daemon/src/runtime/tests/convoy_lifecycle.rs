@@ -187,7 +187,7 @@ async fn repeated_reclaim_refusal_with_changing_reason_raises_demand() {
         .adopted_checkout_refs
         .insert(flotilla_resources::RepositoryKey("repo".to_string()), "checkout-still-orphaned".to_string());
     runtime.verify_reclaim(&changed_reason_convoy, &[]).await.expect_err("changed missing checkout must still refuse reclaim");
-    assert!(daemon.resource_backend().using::<Demand>(NAMESPACE).list().await.expect("list demands").items.is_empty());
+    assert!(daemon.attentions().open(NAMESPACE, None, None).await.expect("open attentions").is_empty(), "two refusals raise nothing yet");
 
     runtime.verify_reclaim(&changed_reason_convoy, &[]).await.expect_err("persistent missing checkout must refuse reclaim");
 

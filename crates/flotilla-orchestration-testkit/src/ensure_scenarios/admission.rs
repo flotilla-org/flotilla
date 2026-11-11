@@ -246,7 +246,7 @@ pub async fn explicit_ensure_roll_readmits_current_config_and_retains_the_previo
     );
     daemon.roll_convoy_ensure("flotilla", "quartermaster").await.expect("repeated roll is a no-op without drift");
     assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.expect("status").convoy_ref.as_deref(), Some(next_ref.as_str()));
-    assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("attention cleared").items.is_empty());
+    assert!(open_attentions(&backend).await.is_empty(), "attention cleared");
 }
 
 pub async fn changed_ensure_driver_waits_for_operator_roll_of_the_running_remote_generation(factory: &dyn EnsureScenarioController) {
@@ -1026,7 +1026,7 @@ pub async fn driverless_ensure_home_case(
             before[index],
             "non-home writes no status or retry state"
         );
-        assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("demands").items.is_empty(), "non-home raises no stall");
+        assert!(open_attentions(backend).await.is_empty(), "non-home raises no stall");
         assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.is_empty(), "non-home never admits");
     }
     if refused {

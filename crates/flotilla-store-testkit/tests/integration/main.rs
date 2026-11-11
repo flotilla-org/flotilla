@@ -17,7 +17,6 @@ mod manifest_root;
 mod owner_gc;
 mod platform_vocabulary;
 mod prepared_snapshot_gc;
-mod principal_attention_status_patch;
 mod provisioning_http_wire;
 mod provisioning_resources_in_memory;
 mod provisioning_status_patch;

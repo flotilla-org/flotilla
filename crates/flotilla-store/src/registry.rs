@@ -14,10 +14,10 @@ use crate::{
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     AccessDelivery, AccountBinding, AccountProvision, Artifact, ChangeRequest, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
-    CredentialGrant, CredentialSpec, CrewDefaults, Demand, Environment, FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild,
-    ImageLayer, InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project, ReadResourceList, ReadWatchEvent,
-    ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
-    ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    CredentialGrant, CredentialSpec, CrewDefaults, Environment, FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild, ImageLayer,
+    InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project, ReadResourceList, ReadWatchEvent, ReplicaCursor,
+    ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
+    TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
@@ -48,7 +48,6 @@ enum RegisteredResource {
     CrewDefaults,
     ImageBuild,
     ImageLayer,
-    Demand,
     AccountBinding,
     AccountProvision,
     AccessDelivery,
@@ -127,7 +126,6 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<CrewDefaults>(RegisteredResource::CrewDefaults, &["crew-defaults"]),
     kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
     kind::<ImageLayer>(RegisteredResource::ImageLayer, &["image-layer"]),
-    kind::<Demand>(RegisteredResource::Demand, &[]),
     kind::<AccountBinding>(RegisteredResource::AccountBinding, &["account-binding"]),
     kind::<AccountProvision>(RegisteredResource::AccountProvision, &["account-provision"]),
     kind::<AccessDelivery>(RegisteredResource::AccessDelivery, &["access-delivery"]),
@@ -184,6 +182,9 @@ pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
     RetiredResourceKind { kind: "Event", plural: "events", api_version: "flotilla.work/v1" },
     // Deleted by #3108 with its salience boost (#3824 layer 8); remove one roll after this generation ships.
     RetiredResourceKind { kind: "Regard", plural: "regards", api_version: "flotilla.work/v1" },
+    // Retired by #3108: attentions are Messages on the engine and nothing writes a Demand. The
+    // cut-over import converts open demands into attentions; remove one roll after this generation ships.
+    RetiredResourceKind { kind: "Demand", plural: "demands", api_version: "flotilla.work/v1" },
 ];
 
 /// What a stored document decoded as.
@@ -247,7 +248,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::CredentialGrant => poll_typed_resource!($body::<CredentialGrant>($($arg),*)),
             RegisteredResource::CredentialSpec => poll_typed_resource!($body::<CredentialSpec>($($arg),*)),
             RegisteredResource::CrewDefaults => poll_typed_resource!($body::<CrewDefaults>($($arg),*)),
-            RegisteredResource::Demand => poll_typed_resource!($body::<Demand>($($arg),*)),
             RegisteredResource::AccountBinding => poll_typed_resource!($body::<AccountBinding>($($arg),*)),
             RegisteredResource::AccountProvision => poll_typed_resource!($body::<AccountProvision>($($arg),*)),
             RegisteredResource::AccessDelivery => poll_typed_resource!($body::<AccessDelivery>($($arg),*)),
@@ -279,7 +279,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::CredentialGrant => $body::<CredentialGrant>(),
             RegisteredResource::CredentialSpec => $body::<CredentialSpec>(),
             RegisteredResource::CrewDefaults => $body::<CrewDefaults>(),
-            RegisteredResource::Demand => $body::<Demand>(),
             RegisteredResource::AccountBinding => $body::<AccountBinding>(),
             RegisteredResource::AccountProvision => $body::<AccountProvision>(),
             RegisteredResource::AccessDelivery => $body::<AccessDelivery>(),
@@ -311,7 +310,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::CredentialGrant => $body::<CredentialGrant>($($arg),*),
             RegisteredResource::CredentialSpec => $body::<CredentialSpec>($($arg),*),
             RegisteredResource::CrewDefaults => $body::<CrewDefaults>($($arg),*),
-            RegisteredResource::Demand => $body::<Demand>($($arg),*),
             RegisteredResource::AccountBinding => $body::<AccountBinding>($($arg),*),
             RegisteredResource::AccountProvision => $body::<AccountProvision>($($arg),*),
             RegisteredResource::AccessDelivery => $body::<AccessDelivery>($($arg),*),
@@ -412,7 +410,6 @@ pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
             RegisteredResource::CredentialGrant => crate::ResourceKind::of::<CredentialGrant>(),
             RegisteredResource::CredentialSpec => crate::ResourceKind::of::<CredentialSpec>(),
             RegisteredResource::CrewDefaults => crate::ResourceKind::of::<CrewDefaults>(),
-            RegisteredResource::Demand => crate::ResourceKind::of::<Demand>(),
             RegisteredResource::AccountBinding => crate::ResourceKind::of::<AccountBinding>(),
             RegisteredResource::AccountProvision => crate::ResourceKind::of::<AccountProvision>(),
             RegisteredResource::AccessDelivery => crate::ResourceKind::of::<AccessDelivery>(),
@@ -1629,10 +1626,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::{Duration, Utc};
-    use flotilla_protocol::{NodeId, ResourceRef};
+    use flotilla_protocol::NodeId;
 
     use super::*;
-    use crate::{Convoy, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandSpec, HostSpec, InputMeta, PrincipalRef};
+    use crate::{Convoy, ConvoySpec, HostSpec, InputMeta};
 
     // Finite authoring contract: missing, null and string decisions are invalid;
     // both boolean choices work. Stored legacy records remain readable.
@@ -1855,128 +1852,64 @@ mod tests {
         assert!(message.contains("convoys"));
     }
 
-    #[tokio::test]
-    async fn attention_resource_kinds_are_registered_for_dynamic_listing() {
-        let backend = ResourceBackend::new(crate::test_store::memory_backend());
-        backend
-            .using::<Demand>("flotilla")
-            .create(
-                &InputMeta::builder().name("demo-permission".to_string()).build(),
-                &DemandSpec::builder()
-                    .originating_work_ref(ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-implement"))
-                    .kind(DemandKind::Permission)
-                    .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
-                    .build(),
-            )
-            .await
-            .expect("create demand");
-
-        let demands = list_resource_kind(&backend, "flotilla", "demands").await.expect("list demands dynamically");
-
-        assert_eq!(demands.kind, "Demand");
-        assert_eq!(demands.value["items"][0]["kind"], "Demand");
+    /// A Convoy document named `demo` running `workflow`.
+    fn convoy_document(workflow: &str) -> Value {
+        json!({
+            "apiVersion": "flotilla.work/v1",
+            "kind": "Convoy",
+            "metadata": { "name": "demo" },
+            "spec": { "workflow_ref": workflow }
+        })
     }
 
     #[tokio::test]
     async fn apply_resource_document_creates_registered_resources() {
         let backend = ResourceBackend::new(crate::test_store::memory_backend());
-        let applied = apply_resource_document(
-            &backend,
-            "flotilla",
-            json!({
-                "apiVersion": "flotilla.work/v1",
-                "kind": "Demand",
-                "metadata": {
-                    "name": "demo-review"
-                },
-                "spec": {
-                    "originating_work_ref": {
-                        "api_version": "flotilla.work/v1",
-                        "kind": "Vessel",
-                        "namespace": "flotilla",
-                        "name": "demo-review"
-                    },
-                    "kind": "review",
-                    "addressee": {
-                        "kind": "principal",
-                        "principal_ref": { "namespace": "flotilla", "name": "implicit" }
-                    }
-                }
-            }),
-        )
-        .await
-        .expect("apply demand document");
+        let applied = apply_resource_document(&backend, "flotilla", convoy_document("review")).await.expect("apply convoy document");
 
-        assert_eq!(applied.kind, "Demand");
-        assert_eq!(applied.value["metadata"]["name"], "demo-review");
-        assert_eq!(backend.using::<Demand>("flotilla").get("demo-review").await.expect("stored demand").spec.kind, DemandKind::Review);
+        assert_eq!(applied.kind, "Convoy");
+        assert_eq!(applied.value["metadata"]["name"], "demo");
+        assert_eq!(backend.using::<Convoy>("flotilla").get("demo").await.expect("stored convoy").spec.workflow_ref, "review");
     }
 
     #[tokio::test]
     async fn apply_resource_document_reapply_preserves_existing_metadata_when_omitted() {
         let backend = ResourceBackend::new(crate::test_store::memory_backend());
-        let resolver = backend.using::<Demand>("flotilla");
+        let resolver = backend.using::<Convoy>("flotilla");
         let owner_reference = OwnerReference {
             api_version: "flotilla.work/v1".to_string(),
-            kind: "Vessel".to_string(),
-            name: "demo-implement".to_string(),
+            kind: "ConvoyEnsure".to_string(),
+            name: "standing".to_string(),
             controller: true,
         };
         resolver
             .create(
                 &InputMeta::builder()
-                    .name("demo-review".to_string())
-                    .labels(BTreeMap::from([("controller".to_string(), "attention".to_string())]))
+                    .name("demo".to_string())
+                    .labels(BTreeMap::from([("controller".to_string(), "standing".to_string())]))
                     .owner_references(vec![owner_reference.clone()])
-                    .finalizers(vec!["attention.flotilla.work/finalizer".to_string()])
+                    .finalizers(vec!["standing.flotilla.work/finalizer".to_string()])
                     .build(),
-                &DemandSpec::builder()
-                    .originating_work_ref(ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-implement"))
-                    .kind(DemandKind::Permission)
-                    .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
-                    .build(),
+                &ConvoySpec::builder().workflow_ref("implement".to_string()).build(),
             )
             .await
-            .expect("create demand with metadata");
+            .expect("create convoy with metadata");
 
-        let reapply_review_document = || {
-            json!({
-                "apiVersion": "flotilla.work/v1",
-                "kind": "Demand",
-                "metadata": {
-                    "name": "demo-review"
-                },
-                "spec": {
-                    "originating_work_ref": {
-                        "api_version": "flotilla.work/v1",
-                        "kind": "Vessel",
-                        "namespace": "flotilla",
-                        "name": "demo-implement"
-                    },
-                    "kind": "review",
-                    "addressee": {
-                        "kind": "principal",
-                        "principal_ref": { "namespace": "flotilla", "name": "implicit" }
-                    }
-                }
-            })
-        };
+        apply_resource_document(&backend, "flotilla", convoy_document("review")).await.expect("reapply convoy document");
 
-        apply_resource_document(&backend, "flotilla", reapply_review_document()).await.expect("reapply demand document");
-
-        let updated = resolver.get("demo-review").await.expect("updated demand");
-        assert_eq!(updated.spec.kind, DemandKind::Review);
+        let updated = resolver.get("demo").await.expect("updated convoy");
+        assert_eq!(updated.spec.workflow_ref, "review");
         assert_eq!(updated.metadata.owner_references, vec![owner_reference]);
-        assert_eq!(updated.metadata.labels.get("controller").map(String::as_str), Some("attention"));
-        assert_eq!(updated.metadata.finalizers, vec!["attention.flotilla.work/finalizer"]);
+        assert_eq!(updated.metadata.labels.get("controller").map(String::as_str), Some("standing"));
+        assert_eq!(updated.metadata.finalizers, vec!["standing.flotilla.work/finalizer"]);
 
-        resolver.delete("demo-review").await.expect("mark demand for deletion");
-        let deleting = resolver.get("demo-review").await.expect("deleting demand");
+        resolver.delete("demo").await.expect("mark convoy for deletion");
+        let deleting = resolver.get("demo").await.expect("deleting convoy");
         let deletion_timestamp = deleting.metadata.deletion_timestamp.expect("deletion timestamp should be set");
 
-        apply_resource_document(&backend, "flotilla", reapply_review_document()).await.expect("reapply pending-delete demand document");
+        apply_resource_document(&backend, "flotilla", convoy_document("review")).await.expect("reapply pending-delete convoy document");
 
-        let reapplied = resolver.get("demo-review").await.expect("reapplied pending-delete demand");
+        let reapplied = resolver.get("demo").await.expect("reapplied pending-delete convoy");
         assert_eq!(reapplied.metadata.deletion_timestamp, Some(deletion_timestamp));
     }
 }

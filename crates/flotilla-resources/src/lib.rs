@@ -85,7 +85,6 @@ pub mod placement;
 mod platform;
 #[doc(hidden)]
 pub mod prepared_snapshot;
-mod principal_attention;
 mod project;
 pub mod provider_placement;
 mod provisioning_identity;
@@ -198,11 +197,6 @@ pub use manifest_root::{
 pub use placement::{DockerImagePullPolicy, PlacementImageSource, DOCKER_POLICY_NAME_PREFIX};
 pub use platform::Platform;
 pub use prepared_snapshot::{content_hash, is_prepared_snapshot, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND};
-pub use principal_attention::{
-    Demand, DemandAddressee, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DemandStatus, DemandStatusPatch,
-    DemandTransition, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION,
-    ENSURE_DRIFT_ATTENTION_PREFIX, ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION,
-};
 pub use project::{
     normalize_issue_source, normalize_project_spec, resolve_project_issue_sources_from_inventory, DeclarationRefusedCondition,
     DispatchLane, DispatchMission, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, IssueFieldValue, IssueFilter, IssueSource,
@@ -270,7 +264,6 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::ImageLayer>($($argument),*);
         $callback::<$crate::CrewDefaults>($($argument),*);
         $callback::<$crate::FulfilmentKind>($($argument),*);
-        $callback::<$crate::Demand>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::FleetDesignation>($($argument),*);
         $callback::<$crate::Forge>($($argument),*);

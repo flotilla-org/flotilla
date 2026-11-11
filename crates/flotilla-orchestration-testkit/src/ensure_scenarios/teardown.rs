@@ -181,10 +181,7 @@ pub async fn reconcile_now_acknowledges_recordless_teardown_and_readmits_the_ens
     assert_eq!(generations.len(), 2);
     assert!(generations.iter().any(|convoy| convoy.metadata.name == failed_ref && convoy.spec.generation == 1));
     assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
-    assert!(matches!(
-        backend.using::<ResourceDemand>("flotilla").get("ensure-attention-quartermaster").await,
-        Err(ResourceError::NotFound { .. })
-    ));
+    assert!(open_holds(&backend).await.is_empty());
 }
 
 pub async fn reconcile_now_waits_for_periodic_backing_inspection_and_keeps_one_generation(factory: &dyn EnsureScenarioController) {
@@ -387,7 +384,7 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
         "unexpected ensure status: {:?}",
         held.status
     );
-    assert_eq!(backend.using::<ResourceDemand>("flotilla").list().await.expect("attention demands").items.len(), 1);
+    assert_eq!(open_holds(&backend).await.len(), 1, "the live backing holds it for a person");
 
     // Its container stopped: on the engine the environment vanished, failed.
     environments
@@ -420,7 +417,7 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
     // Convoy teardown ends its managed children: its vessel's launch is released by the vessel
     // requester once the convoy is gone; its sessions are the engine's, released once it ends.
     let launch = engine(&daemon).vessels.request(&convoy_ref, "work", "local");
-    // Attentions about the convoy, its vessel and its role, every one acknowledged, end with them.
+    // Attentions about the convoy, its vessel and its role end with them.
     let attentions = backend.attentions();
     let now = chrono::Utc::now();
     for attention in [
@@ -434,17 +431,11 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
     ] {
         attentions.raise("flotilla", &attention).await.expect("raise");
     }
-    let demands = backend.using::<ResourceDemand>("flotilla");
-    let raised = demands.list().await.expect("demands").items;
-    assert_eq!(raised.len(), 3, "one demand per attention");
-    for demand in raised {
-        let patch = flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "person".into() };
-        flotilla_store::apply_status_patch(&demands, &demand.metadata.name, &patch).await.expect("acknowledge");
-    }
+    assert_eq!(open_attentions(&backend).await.len(), 3, "one message per attention");
 
     daemon.reap_convoy_internal("flotilla", &convoy_ref, true).await.expect("convoy teardown");
 
-    assert!(demands.list().await.expect("demands").items.is_empty(), "no attention is left about the reaped convoy");
+    assert!(open_attentions(&backend).await.is_empty(), "no attention is left about the reaped convoy");
 
     assert!(matches!(backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await, Err(ResourceError::NotFound { .. })));
     let requests = flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(

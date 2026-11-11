@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use chrono::Utc;
+use flotilla_core::primitives::demand_import::retired;
 use flotilla_engine_store::ImportTarget;
 use flotilla_protocol::NodeId;
 use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
@@ -108,6 +109,17 @@ async fn own<R: Resource>(backend: &SqliteBackend, document: Value) -> Value {
     kind.encode_object(&created).expect("encode")
 }
 
+/// A record of a retired kind, stored as the previous generation stored it.
+fn own_retired(dir: &Path, document: Value) {
+    let connection = rusqlite::Connection::open(dir.join(OLD_STORE)).expect("old store");
+    connection
+        .execute(
+            "INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json) VALUES ('flotilla.work', 'v1', ?1, ?2, ?3, 1, ?4)",
+            rusqlite::params![document["kind"].as_str().expect("kind"), NS, document["metadata"]["name"].as_str().expect("name"), document.to_string()],
+        )
+        .expect("retired row");
+}
+
 /// A copy of `origin`'s record, as replication stores it.
 async fn replica<R: Resource>(backend: &SqliteBackend, origin: &str, document: Value) {
     let kind = ResourceKind::of::<R>();
@@ -157,16 +169,15 @@ async fn populated(dir: &Path) -> SqliteBackend {
     )
     .await;
     own::<Convoy>(&backend, document("Convoy", "governor-1", json!({"workflow_ref": "w", "inputs": {}}), Value::Null)).await;
-    own::<flotilla_resources::Demand>(
-        &backend,
+    own_retired(
+        dir,
         demand(
             "reclaim-refusal-governor-1",
             ("Convoy", "governor-1"),
-            &[(flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION, "checkout is dirty")],
+            &[(retired::RECLAIM_REFUSAL_REASON_ANNOTATION, "checkout is dirty")],
             "raised",
         ),
-    )
-    .await;
+    );
     let repository = json!({"forge": {"repository": "org/repo", "service_url": "https://github.com"},
         "identity": {"canonical_remote": "https://github.com/org/repo", "kind": "remote"}, "remotes": ["https://github.com/org/repo"]});
     let key = serde_json::from_value::<RepositorySpec>(repository.clone()).expect("repository").key().0;
@@ -1002,17 +1013,11 @@ type MessageResource = flotilla_state_machines::Resource<flotilla_state_machines
 
 fn demand(name: &str, target: (&str, &str), annotations: &[(&str, &str)], state: &str) -> Value {
     let target = flotilla_protocol::ResourceRef::new("flotilla.work/v1", target.0, NS, target.1);
-    let spec = flotilla_resources::DemandSpec::for_dispatching_principal(
-        target,
-        flotilla_resources::DemandKind::HumanGate,
-        flotilla_protocol::PrincipalRef::implicit_for_namespace(NS),
-    );
-    let mut record = document(
-        "Demand",
-        name,
-        serde_json::to_value(spec).expect("spec"),
-        json!({"state": state, "raised": {"as_of": "2026-10-20T00:00:00Z", "authority": "writer"}}),
-    );
+    let principal = flotilla_protocol::PrincipalRef::implicit_for_namespace(NS);
+    let spec =
+        json!({"originating_work_ref": target, "kind": "human_gate", "addressee": {"kind": "principal", "principal_ref": principal}});
+    let mut record =
+        document("Demand", name, spec, json!({"state": state, "raised": {"as_of": "2026-10-20T00:00:00Z", "authority": "writer"}}));
     record["metadata"]["annotations"] = annotations.iter().map(|(key, value)| ((*key).to_owned(), json!(value))).collect();
     record
 }
@@ -1029,11 +1034,11 @@ fn attention_records() -> Vec<Value> {
         json!({"phase": "Running", "session_id": "s1"}),
     );
     terminal["metadata"]["labels"] = json!({"flotilla.work/convoy": "demo", "flotilla.work/role": "coder"});
-    let reclaim = flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION;
-    let credential = flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION;
-    let vessel = flotilla_resources::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
-    let drift = flotilla_charter::ops_entry::ENSURE_CONFIG_DRIFT_REASON_ANNOTATION;
-    let delivery = flotilla_resources::delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION;
+    let reclaim = retired::RECLAIM_REFUSAL_REASON_ANNOTATION;
+    let credential = retired::CREDENTIAL_REFRESH_REASON_ANNOTATION;
+    let vessel = retired::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
+    let drift = retired::ENSURE_CONFIG_DRIFT_REASON_ANNOTATION;
+    let delivery = retired::DELIVERY_HOLD_REASON_ANNOTATION;
     let mut pooled = demand("ensure-attention-pooled", ("Convoy", "standing-gui-1"), &[], "raised");
     pooled["spec"]["addressee"] = json!({"kind": "pool", "pool_ref": "reviewers"});
     vec![
@@ -1120,7 +1125,7 @@ fn open_demands_import_as_the_attentions_their_writers_send() {
 fn attentions_of_two_namespaces_at_one_home_take_distinct_admission_sequences() {
     let records = |namespace: &str| {
         let spec = flotilla_resources::ConvoySpec::builder().workflow_ref("w".into()).project_ref(namespace.into()).build();
-        let reclaim = flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION;
+        let reclaim = retired::RECLAIM_REFUSAL_REASON_ANNOTATION;
         [
             designation(),
             document("Convoy", "finished", serde_json::to_value(spec).expect("spec"), json!({"phase": "Landed"})),
@@ -1130,7 +1135,13 @@ fn attentions_of_two_namespaces_at_one_home_take_distinct_admission_sequences() 
         .map(|mut document| {
             document["metadata"]["namespace"] = json!(namespace);
             let kind = document["kind"].as_str().expect("kind").to_owned();
-            let plural = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.kind == kind).expect("registered").plural;
+            let plural = REGISTERED_RESOURCE_KINDS
+                .iter()
+                .map(|entry| (entry.kind, entry.plural))
+                .chain(flotilla_store::RETIRED_RESOURCE_KINDS.iter().map(|retired| (retired.kind, retired.plural)))
+                .find(|(registered, _)| *registered == kind)
+                .expect("registered or retired")
+                .1;
             Row { namespace: namespace.into(), plural: plural.into(), home: HERE.into(), document }
         })
         .collect::<Vec<_>>()
@@ -1142,8 +1153,8 @@ fn attentions_of_two_namespaces_at_one_home_take_distinct_admission_sequences() 
 
 #[test]
 fn a_credential_group_with_no_vessel_drops_every_demand_for_that_reason() {
-    let credential = flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION;
-    let vessel = flotilla_resources::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
+    let credential = retired::CREDENTIAL_REFRESH_REASON_ANNOTATION;
+    let vessel = retired::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
     let mut records: Vec<Value> = attention_records().into_iter().filter(|record| record["kind"] != "Demand").collect();
     records.extend([
         demand("credential-refresh-demo-gone-a", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "gone")], "raised"),
@@ -1159,8 +1170,8 @@ fn a_credential_group_with_no_vessel_drops_every_demand_for_that_reason() {
 
 #[test]
 fn a_credential_group_addressed_to_different_people_is_refused_whole() {
-    let credential = flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION;
-    let vessel = flotilla_resources::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
+    let credential = retired::CREDENTIAL_REFRESH_REASON_ANNOTATION;
+    let vessel = retired::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
     let mut records: Vec<Value> = attention_records().into_iter().filter(|record| record["kind"] != "Demand").collect();
     let mut other = demand("credential-refresh-demo-work-b", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "work")], "raised");
     other["status"]["raised"]["as_of"] = json!("2026-10-21T00:00:00Z");

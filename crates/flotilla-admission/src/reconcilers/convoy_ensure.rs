@@ -1266,7 +1266,8 @@ mod tests {
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;
-    use flotilla_resources::{Demand as ResourceDemand, InputMeta};
+    use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+    use flotilla_resources::InputMeta;
 
     // Stands in for provider-backed admission and lifecycle operations. Resource
     // storage, status patches, the clock and the reconcile loop are real.
@@ -1283,6 +1284,9 @@ mod tests {
         commits: Arc<AtomicU32>,
         #[builder(skip)]
         reaps: Arc<AtomicU32>,
+        /// The engine Message path its attentions are raised on, kept open for the test.
+        #[builder(skip)]
+        _messages: Option<Arc<EngineMessagesHome>>,
     }
 
     #[async_trait]
@@ -1462,13 +1466,21 @@ mod tests {
             )
             .await
             .expect("fixture operation succeeds");
-        let admission = Admission::builder().backend(backend.clone()).build();
+        designate_fleet(&backend, "test").await;
+        let messages = EngineMessagesHome::open_with_clock("home", "test", &backend, clock.clone());
+        let admission = Admission { _messages: Some(Arc::new(messages)), ..Admission::builder().backend(backend.clone()).build() };
         let controller = EnsureReconciler::builder()
             .teardown(Arc::new(admission.clone()))
             .resource_backend(backend.clone())
             .clock(clock.clone())
             .build();
         (controller, admission, clock)
+    }
+
+    /// Whether the standing role's hold on its convoy is open.
+    async fn hold_open(admission: &Admission) -> bool {
+        let open = admission.backend.attentions().open("test", Some(Sender::Standing), None).await.expect("attentions");
+        open.iter().any(OpenAttention::is_hold)
     }
     async fn fail_current(admission: &Admission, clock: &VirtualClock) {
         let ensure = admission.backend.using::<ConvoyEnsure>("test").get("standing").await.expect("ensure fixture");
@@ -1568,14 +1580,13 @@ mod tests {
             .await
             .expect("fixture operation succeeds");
         assert_eq!(admission.commits.load(Ordering::SeqCst), 1);
-        let demands = admission.backend.using::<ResourceDemand>("test");
-        assert!(demands.get("ensure-attention-standing").await.is_ok());
+        assert!(hold_open(&admission).await, "live backing holds it for a person");
         for expected_commits in 2..=3 {
             controller
                 .reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead)
                 .await
                 .expect("fixture operation succeeds");
-            assert!(matches!(demands.get("ensure-attention-standing").await, Err(ResourceError::NotFound { .. })));
+            assert!(!hold_open(&admission).await, "verified death clears the hold");
             clock.advance(ChronoDuration::minutes(3));
             controller
                 .reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead)
@@ -1595,7 +1606,7 @@ mod tests {
             .expect("fixture operation succeeds")
             .is_empty());
         assert_eq!(admission.commits.load(Ordering::SeqCst), 3);
-        assert!(demands.get("ensure-attention-standing").await.is_ok(), "the restart limit holds it for a person");
+        assert!(hold_open(&admission).await, "the restart limit holds it for a person");
     }
 
     // #4310: a commit that fails after creating its convoy has admitted a generation all the same;

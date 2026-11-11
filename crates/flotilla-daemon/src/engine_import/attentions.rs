@@ -2,33 +2,35 @@
 //! admitted at the demand's home after the messages imported there.
 
 use flotilla_core::primitives::{
-    demand_import::{import_demands, DemandRecords, OldDemand},
+    demand_import::{
+        import_demands,
+        retired::{RetiredDemand, KIND, PLURAL},
+        DemandRecords, OldDemand,
+    },
     import::{write_messages, ImportRefusal as MessageRefusal, ImportReport as MessageReport, Imported},
 };
 use flotilla_engine_messages::convert::Conversion;
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport};
-use flotilla_resources::{Convoy, ConvoyEnsure, Demand, TerminalSession, Vessel};
+use flotilla_resources::{Convoy, ConvoyEnsure, TerminalSession, Vessel};
 
 use super::{
     messages::{fleet_roles, old_store_records},
     Carried, Source,
 };
 
-const KIND: &str = "Demand";
-
 pub(super) fn attentions(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
-    for namespace in source.namespaces(&["demands"]) {
+    for namespace in source.namespaces(&[PLURAL]) {
         namespace_attentions(source, namespace, target, carried, report);
     }
 }
 
 fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
     let demands: Vec<_> = source
-        .owned::<Demand>("demands", Some(namespace), KIND, target, report)
+        .owned_as(PLURAL, Some(namespace), KIND, target, report, RetiredDemand::decode)
         .into_iter()
-        .filter(|demand| target.imports(&demand.home))
-        .map(|demand| (demand.object, demand.home))
+        .filter(|(_, _, home)| target.imports(home))
+        .map(|(_, demand, home)| (demand, home))
         .collect();
     if demands.is_empty() {
         return;

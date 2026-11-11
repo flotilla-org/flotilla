@@ -39,6 +39,7 @@ sha2 = { workspace = true }
 
 
 [dev-dependencies]
+flotilla-engine-messages-testkit = { path = "../flotilla-engine-messages-testkit" }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 flotilla-provisioning = { path = "../flotilla-provisioning" }
 flotilla-orchestration-testkit = { path = "../flotilla-orchestration-testkit" }

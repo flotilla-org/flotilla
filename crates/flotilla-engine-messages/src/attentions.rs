@@ -159,8 +159,12 @@ impl MessagePrimitives {
 
     /// The engine's cause and person inbox for a fact, read from the records it names.
     async fn cause(&self, namespace: &str, fact: &Fact, conversion: &Conversion<'_>) -> Result<(Cause, Address), String> {
-        let records = self.records(namespace).await.map_err(|error| error.to_string())?;
         let name = fact.convoy();
+        let mut records = self.records(namespace).await.map_err(|error| error.to_string())?;
+        if !records.convoys.contains_key(name) {
+            // The held read may predate the convoy: a miss is judged again on a read made now.
+            records = self.read_records(namespace, true).await.map_err(|error| error.to_string())?.records;
+        }
         let convoy = records.convoys.get(name).ok_or_else(|| format!("convoy `{name}` is not in this home's records"))?;
         let held = Read { address: records.convoy_address(name)?, revision: convoy.metadata.resource_version.clone() };
         let principal = format!("principal:{}", convoy.spec.dispatching_principal_ref.name);

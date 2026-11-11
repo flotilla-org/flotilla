@@ -5029,9 +5029,17 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
     drop(temp);
 }
 
+/// Opens the engine Message path the daemon raises its attentions on, as a running daemon has it,
+/// with the fleet whose roles those attentions are sent as.
+async fn open_attentions(daemon: &InProcessDaemon) {
+    daemon.open_message_primitives().expect("the engine Message path");
+    flotilla_engine_messages_testkit::designate_fleet(&daemon.resource_backend(), "flotilla").await;
+}
+
 #[tokio::test]
 async fn convoy_admission_generates_records_and_enforces_one_live_role_generation() {
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    open_attentions(&daemon).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&daemon, None).await;
     let command = Command::builder()
@@ -5116,6 +5124,7 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
 #[tokio::test]
 async fn convoy_delete_reaps_a_landed_pre_identity_record() {
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    open_attentions(&daemon).await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys
@@ -7193,6 +7202,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     .await;
     // The engine's readings, which a running daemon always has.
     let _engine = install_engine_reads(&daemon);
+    open_attentions(&daemon).await;
     daemon
         .set_repository_inspector(Arc::new(ForgeAliasInspector {
             path: repo.clone(),

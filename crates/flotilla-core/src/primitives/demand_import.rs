@@ -16,13 +16,8 @@
 use std::collections::BTreeMap;
 
 use flotilla_address::{Address, Kind};
-use flotilla_charter::ops_entry::{ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX};
 use flotilla_protocol::ResourceRef;
-use flotilla_resources::{
-    delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION, Convoy, ConvoyEnsure, Demand, DemandAddressee, DemandState, MessageReference,
-    ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION,
-    ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION, ROLE_LABEL,
-};
+use flotilla_resources::{Convoy, ConvoyEnsure, MessageReference, ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, ROLE_LABEL};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::message::{Message as Machine, MessageState},
@@ -36,6 +31,14 @@ use flotilla_engine_messages::{
 
 use super::import::{check, imported_name, ImportDrop, ImportRefusal, Imported, ImportedMessage};
 
+pub mod retired;
+
+use retired::{
+    DemandAddressee, DemandState, RetiredDemand, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION,
+    DELIVERY_HOLD_REASON_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX, ENSURE_HOLD_REASON_ANNOTATION,
+    RECLAIM_REFUSAL_REASON_ANNOTATION,
+};
+
 const HOLD: &str = "ensure-attention-";
 const RECLAIM: &str = "reclaim-refusal-";
 const CREDENTIAL: &str = "credential-refresh-";
@@ -45,7 +48,7 @@ const DECLARATION_REFUSED: &str = "declaration-refused-";
 
 /// One old Demand, as the import reads it: the record and the host it is homed at.
 pub struct OldDemand<'a> {
-    pub record: &'a ResourceObject<Demand>,
+    pub record: &'a RetiredDemand,
     pub home: String,
 }
 
@@ -167,7 +170,7 @@ fn alone(result: Result<Imported, ImportRefusal>) -> DemandImport {
     DemandImport { result, folded_into: None }
 }
 
-fn raised(record: &ResourceObject<Demand>) -> chrono::DateTime<chrono::Utc> {
+fn raised(record: &RetiredDemand) -> chrono::DateTime<chrono::Utc> {
     record.status.as_ref().and_then(|status| status.raised.as_ref()).map_or(record.metadata.creation_timestamp, |raised| raised.as_of)
 }
 
@@ -229,12 +232,12 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
 }
 
 /// The person a demand is addressed to.
-fn addressed(record: &ResourceObject<Demand>) -> String {
+fn addressed(record: &RetiredDemand) -> String {
     let DemandAddressee::Principal { principal_ref } = &record.spec.addressee;
     format!("principal:{}", principal_ref.name)
 }
 
-fn convoy_target(record: &ResourceObject<Demand>) -> Result<&str, String> {
+fn convoy_target(record: &RetiredDemand) -> Result<&str, String> {
     let target = &record.spec.originating_work_ref;
     if target.kind != "Convoy" {
         return Err(format!("it is about a {}, not a Convoy", target.kind));
@@ -242,7 +245,7 @@ fn convoy_target(record: &ResourceObject<Demand>) -> Result<&str, String> {
     Ok(target.name.as_str())
 }
 
-fn reason(record: &ResourceObject<Demand>, annotation: &str, otherwise: impl FnOnce() -> String) -> String {
+fn reason(record: &RetiredDemand, annotation: &str, otherwise: impl FnOnce() -> String) -> String {
     record.metadata.annotations.get(annotation).cloned().unwrap_or_else(otherwise)
 }
 
@@ -259,7 +262,7 @@ fn child(parent: &Address, kind: Kind, name: &str) -> Result<Address, String> {
 }
 
 fn map(
-    record: &ResourceObject<Demand>,
+    record: &RetiredDemand,
     writer: Writer<'_>,
     principal: String,
     conversion: &Conversion<'_>,

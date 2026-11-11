@@ -12,7 +12,6 @@ pub use flotilla_resources::definition_provenance::{
 pub const ENSURE_PROVENANCE_ANNOTATION: &str = "flotilla.work/ensure-provenance";
 pub const PRESENTS_AS_ANNOTATION: &str = "flotilla.work/presents-as";
 pub const DECLARATION_STALE_AFTER: chrono::Duration = chrono::Duration::hours(24);
-pub use flotilla_resources::{ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX};
 
 /// Store identity for a project-owned workflow template.
 ///

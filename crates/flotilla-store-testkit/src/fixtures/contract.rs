@@ -5,12 +5,11 @@ use std::{
 };
 
 use chrono::Utc;
-use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    Convoy, Demand, DemandAddressee, DemandKind, DemandSpec, Host, HostSpec, HostStatus, InputMeta, IssueSource, OwnerReference,
-    PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, RepositoryKey, Resource, ResourceError, ResourceObject, ResourceProvenance,
-    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-    WatchEvent, WatchStart, WorkflowTemplate, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    Convoy, Host, HostSpec, HostStatus, InputMeta, IssueSource, OwnerReference, Project, ProjectRepositorySpec, ProjectSpec, RepositoryKey,
+    Resource, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, WatchEvent, WatchStart, WorkflowTemplate, CONVOY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 use flotilla_store::{delete_resource_kind, ResourceBackend, TypedResolver};
 use futures::StreamExt;
@@ -167,50 +166,6 @@ impl ResourceContractFixture for WorkflowTemplateFixture {
             other => panic!("expected tool process, got {other:?}"),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct DemandFixture;
-
-impl ResourceContractFixture for DemandFixture {
-    type Resource = Demand;
-
-    fn label() -> &'static str {
-        "Demand"
-    }
-
-    fn meta(name: &str) -> InputMeta {
-        InputMeta::builder().name(name.to_string()).build()
-    }
-
-    fn spec() -> <Self::Resource as Resource>::Spec {
-        DemandSpec::builder()
-            .originating_work_ref(resource_ref("Vessel", "alpha-implement"))
-            .kind(DemandKind::Permission)
-            .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
-            .build()
-    }
-
-    fn updated_spec() -> <Self::Resource as Resource>::Spec {
-        DemandSpec::builder()
-            .originating_work_ref(resource_ref("Vessel", "alpha-review"))
-            .kind(DemandKind::Review)
-            .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
-            .build()
-    }
-
-    fn assert_created(created: &ResourceObject<Self::Resource>) {
-        assert_eq!(created.spec.kind, DemandKind::Permission);
-        assert!(created.status.is_none());
-    }
-
-    fn assert_updated(updated: &ResourceObject<Self::Resource>) {
-        assert_eq!(updated.spec.kind, DemandKind::Review);
-    }
-}
-
-fn resource_ref(kind: &str, name: &str) -> ResourceRef {
-    ResourceRef::new("flotilla.work/v1", kind, "flotilla", name)
 }
 
 pub fn in_memory_backend() -> ResourceBackend {

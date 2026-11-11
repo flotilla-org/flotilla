@@ -27,6 +27,7 @@ dirs = "6"
 futures = "0.3"
 
 [dev-dependencies]
+flotilla-engine-messages-testkit = { path = "../flotilla-engine-messages-testkit" }
 flotilla-crew = { path = "../flotilla-crew" }
 flotilla-messaging = { path = "../flotilla-messaging" }
 flotilla-terminal = { path = "../flotilla-terminal" }

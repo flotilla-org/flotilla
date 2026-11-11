@@ -55,6 +55,7 @@ pub const PLAN: &[(&str, Plan)] = &[
     ("Issue", Plan::Imported("forge observations import (#3824 layer 5)")),
     ("ForgeRead", Plan::Retired("#4333: forge reads are a per-host cache until 5c")),
     ("Artifact", Plan::Imported("Artifact import (#3824 layer 7)")),
+    // Retired; each open demand becomes the attention its writer sends.
     ("Demand", Plan::Imported("attention import (#3824 layer 8)")),
     ("Regard", Plan::Retired("#3824 layer 8, 2026-11-01: dropped with its salience boost")),
     ("AccessDelivery", Plan::Imported("access delivery import (#3824)")),
@@ -113,6 +114,6 @@ mod tests {
     fn a_retired_unregistered_kind_listed_by_an_older_daemon_is_dropped() {
         assert!(is_retired("crewimagebaselines"));
         assert!(is_retired("events"));
-        assert!(!is_retired("demands"), "an imported kind is not retired");
+        assert!(!is_retired("demands"), "a retired kind the import converts is not dropped");
     }
 }

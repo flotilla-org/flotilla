@@ -141,13 +141,6 @@ impl ResourceBackend {
     /// same backend installs its reopened engine in place of the last.
     pub fn install_attentions(&self, attentions: std::sync::Arc<dyn flotilla_resources::attentions::Attentions>) {
         *self.attentions.0.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attentions);
-        // A Demand is an attention Message on the engine.
-        self.refuse_generic_verbs("Demand", "use `flotilla message inbox` and `flotilla message acknowledge`");
-    }
-
-    /// Whether the engine's attentions are installed, so Demand is written by no one.
-    pub fn attentions_on_engine(&self) -> bool {
-        self.attentions.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
     }
 
     /// The engine's attentions; before they are installed, every attention call is refused.

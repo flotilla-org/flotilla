@@ -31,8 +31,7 @@ pub async fn standing_ensure_holds_after_three_failed_generations_and_resumes_wh
     let held = ensures.get("quartermaster").await.expect("held ensure");
     assert_eq!(held.status.as_ref().expect("status").restart_count, 3);
     assert_eq!(held.status.as_ref().expect("status").hold_reason, Some(ConvoyEnsureHoldReason::RestartLimit));
-    let demands = backend.using::<ResourceDemand>("flotilla");
-    demands.get("ensure-attention-quartermaster").await.expect("restart escalation");
+    assert_eq!(open_holds(&backend).await.len(), 1, "restart escalation");
 
     clock.advance(ChronoDuration::hours(6));
     assert!(daemon
@@ -43,13 +42,7 @@ pub async fn standing_ensure_holds_after_three_failed_generations_and_resumes_wh
     assert_eq!(daemon.convoy_ensure_next_due("flotilla").await.expect("next due"), None, "a hold waits for a person, not a time");
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 3);
 
-    apply_resource_status_patch(
-        &demands,
-        "ensure-attention-quartermaster",
-        &DemandStatusPatch::Acknowledge { as_of: clock.now(), authority: "operator".to_string() },
-    )
-    .await
-    .expect("operator acknowledges escalation");
+    assert_eq!(acknowledge_waiting(&daemon).await, 1, "operator acknowledges escalation");
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("clear hold");
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("schedule fresh episode");
     clock.advance(ChronoDuration::seconds(30));
@@ -99,10 +92,7 @@ pub async fn reconcile_now_clears_an_active_restart_limit_and_admits_in_one_pass
     assert_eq!(status.restart_count, 3);
     assert_eq!(status.retry_at, None);
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 4);
-    assert!(matches!(
-        backend.using::<ResourceDemand>("flotilla").get("ensure-attention-quartermaster").await,
-        Err(ResourceError::NotFound { .. })
-    ));
+    assert!(open_holds(&backend).await.is_empty());
 }
 
 pub async fn concurrent_periodic_and_explicit_ensure_admission_creates_only_one_live_generation(factory: &dyn EnsureScenarioController) {
@@ -227,8 +217,7 @@ pub async fn declared_driver_derives_bounded_backoff_from_its_homed_generations(
             .expect("escalate bounded failures"),
         vec!["ConvoyEnsure/quartermaster exhausted restart budget"]
     );
-    let demands = driver_backend.using::<ResourceDemand>("flotilla");
-    demands.get("ensure-attention-quartermaster").await.expect("driver-homed escalation");
+    assert_eq!(open_holds(&driver_backend).await.len(), 1, "driver-homed escalation");
     driver_clock.advance(ChronoDuration::hours(1));
     assert!(driver
         .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
@@ -244,7 +233,7 @@ pub async fn declared_driver_derives_bounded_backoff_from_its_homed_generations(
             .expect("forced reconcile bypasses active driver escalation"),
         "started quartermaster@standing-project".to_string()
     );
-    assert!(matches!(demands.get("ensure-attention-quartermaster").await, Err(ResourceError::NotFound { .. })));
+    assert!(open_holds(&driver_backend).await.is_empty());
     assert_eq!(driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("resumed generations").items.len(), 4);
     assert!(
         authority_backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("authority ensure").status.is_none(),
@@ -314,10 +303,7 @@ pub async fn declared_driver_admission_refusals_retry_indefinitely_without_strik
         assert_eq!(status.restart_count, 0);
         assert_eq!(status.retry_at.expect("deadline") - clock.now(), ChronoDuration::seconds((expected_delay * 2).min(900)));
     }
-    assert!(matches!(
-        backend.using::<ResourceDemand>("flotilla").get("ensure-attention-quartermaster").await,
-        Err(ResourceError::NotFound { .. })
-    ));
+    assert!(open_holds(&backend).await.is_empty());
 
     let ensure = ensures.get("quartermaster").await.expect("failed ensure");
     let mut recovered_spec = ensure.spec.clone();
@@ -394,7 +380,7 @@ pub async fn changing_ensure_config_starts_a_fresh_retry_episode(factory: &dyn E
     let status = definitions.get("quartermaster").await.expect("ensure").status.expect("status");
     assert_eq!(status.restart_count, 0);
     assert_eq!(status.hold_reason, None);
-    assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("demands").items.is_empty());
+    assert!(open_attentions(&backend).await.is_empty());
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 4);
 }
 
@@ -432,7 +418,7 @@ pub async fn standing_ensure_retries_convoy_that_failed_before_provisioning(fact
     assert!(events.iter().any(|event| event.contains("backing off")), "unexpected events: {events:?}");
     let ensure = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure");
     assert!(ensure.status.expect("ensure status").retry_at.is_some());
-    assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("demands").items.is_empty());
+    assert!(open_attentions(&backend).await.is_empty());
 }
 
 pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_retry_survives_restart(

@@ -4,16 +4,19 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_core::primitives::{
-    demand_import::{import_demands, DemandRecords, OldDemand},
+    demand_import::{
+        import_demands,
+        retired::{
+            DemandAddressee, DemandSpec, DemandState, DemandStatus, DemandTransition, RetiredDemand, CREDENTIAL_REFRESH_REASON_ANNOTATION,
+            CREDENTIAL_REFRESH_VESSEL_ANNOTATION,
+        },
+        DemandRecords, OldDemand,
+    },
     import::{check, Imported},
 };
 use flotilla_engine_messages::{convert::Conversion, roles::FleetRoles, OldStoreRecords};
 use flotilla_protocol::{PrincipalRef, ResourceRef};
-use flotilla_resources::{
-    Convoy, ConvoyEnsure, ConvoySpec, Demand, DemandKind, DemandSpec, DemandState, DemandStatus, DemandTransition, ObjectMeta,
-    ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION,
-    ROLE_LABEL,
-};
+use flotilla_resources::{Convoy, ConvoyEnsure, ConvoySpec, ObjectMeta, ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, ROLE_LABEL};
 use flotilla_state_machines::machines::message::MessageState;
 use hegel::{generators as gs, generators::Generator, TestCase};
 use serde_json::json;
@@ -76,7 +79,7 @@ struct Drawn {
     verdict: bool,
 }
 
-fn demand(index: usize, drawn: &Drawn) -> ResourceObject<Demand> {
+fn demand(index: usize, drawn: &Drawn) -> RetiredDemand {
     let convoy = |name: &str| ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", name);
     let (name, target) = match drawn.writer {
         Writer::Hold => (format!("ensure-attention-standing-{index}"), convoy("demo")),
@@ -96,22 +99,23 @@ fn demand(index: usize, drawn: &Drawn) -> ResourceObject<Demand> {
         }
         Writer::Unknown => (format!("surprise-{index}"), convoy("demo")),
     };
-    let mut spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, PrincipalRef::implicit_for_namespace("flotilla"));
-    if drawn.options {
-        spec.retired_response_options = Some(json!([{"name": "approve", "title": "Approve"}]));
-    }
+    let spec = DemandSpec {
+        originating_work_ref: target,
+        addressee: DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") },
+        retired_response_options: drawn.options.then(|| json!([{"name": "approve", "title": "Approve"}])),
+        retired_human_gate: None,
+    };
     let status = DemandStatus {
         state: drawn.state,
-        raised: Some(DemandTransition { as_of: at(2_000 + index as i64), authority: "writer".into() }),
+        raised: Some(DemandTransition { as_of: at(2_000 + index as i64) }),
         retired_verdict: drawn.verdict.then(|| json!({"disposition": {"kind": "other"}})),
-        ..DemandStatus::default()
     };
     let mut metadata = meta(&name);
     if drawn.writer == Writer::Credential {
         metadata.annotations.insert(CREDENTIAL_REFRESH_REASON_ANNOTATION.into(), "refused".into());
         metadata.annotations.insert(CREDENTIAL_REFRESH_VESSEL_ANNOTATION.into(), "work".into());
     }
-    ResourceObject { metadata, spec, status: Some(status) }
+    RetiredDemand { metadata, spec, status: Some(status) }
 }
 
 #[hegel::test(test_cases = 200)]
