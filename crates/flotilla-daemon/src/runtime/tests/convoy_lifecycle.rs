@@ -777,6 +777,29 @@ async fn sqlite_stage4a_flow_reaches_running_and_completes_convoy() {
 }
 
 #[tokio::test]
+async fn deleting_a_live_convoy_ends_it_and_releases_its_vessel_checkout_and_sessions() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_default_dir = temp.path().join("flotilla-repos");
+    let git_repo =
+        TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
+    let repo = git_repo.path().to_path_buf();
+    let config_base = temp.path().join("config");
+    fs::create_dir_all(&config_base).expect("config directory");
+    fs::write(config_base.join("daemon.toml"), "machine_id = \"delete-live-convoy-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(config_base));
+    config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
+    let daemon = daemon_with_backend_runner_and_change_requests(
+        vec![repo.clone()],
+        Arc::clone(&config),
+        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        Arc::new(Stage4aGitRunner { inner: Arc::new(NoPrProcessRunner), upstream: repo.clone() }),
+        Some(Arc::new(FakeChangeRequest::new())),
+    )
+    .await;
+    run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::DeleteLive).await;
+}
+
+#[tokio::test]
 async fn passing_teardown_gate_removes_the_managed_worktree_path() {
     let temp = TempDir::new().expect("tempdir");
     let repo_default_dir = temp.path().join("flotilla-repos");

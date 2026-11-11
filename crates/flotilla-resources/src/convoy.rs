@@ -520,11 +520,6 @@ pub fn convoy_sanctions_checkout_reclaim(convoy: &crate::ResourceObject<Convoy>)
         || convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landed | ConvoyPhase::Abandoned))
 }
 
-/// Explicit operator force on a convoy deletion. Checkout authorities use
-/// this durable metadata after replication, including while finalizers run.
-pub const FORCE_TEARDOWN_ANNOTATION: &str = "flotilla.work/force-teardown";
-pub const CONVOY_TEARDOWN_FINALIZER: &str = "flotilla.work/convoy-teardown";
-
 /// The address of a convoy's explicitly bound change request, resolving its
 /// repository's remote through `forges`.
 pub fn bound_change_request_address(

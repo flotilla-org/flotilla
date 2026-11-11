@@ -342,8 +342,8 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
         .status
         .and_then(|status| status.convoy_ref)
         .expect("convoy ref");
-    // Convoy teardown ends its managed children: its vessel's launch is released by the vessel
-    // requester once the convoy is gone; its sessions are the engine's, released once it ends.
+    // Convoy teardown ends the convoy and its managed children: its vessel's launch is released by
+    // the vessel requester once the convoy has ended; its sessions are the engine's, released then too.
     let launch = engine(&daemon).vessels.request(&convoy_ref, "work", "local");
     // Attentions about the convoy, its vessel and its role end with them.
     let attentions = backend.attentions();
@@ -365,29 +365,45 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
 
     assert!(open_attentions(&backend).await.is_empty(), "no attention is left about the reaped convoy");
 
-    assert!(matches!(backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await, Err(ResourceError::NotFound { .. })));
+    // The convoy ends and is never deleted (#3108).
+    let convoy = backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await.expect("an ended convoy is kept");
+    assert_eq!(convoy.status.expect("status").phase, ConvoyPhase::Abandoned);
+    let gate = std::sync::Arc::new(Sanctioned::default());
+    // The convoys as the daemon reads them, homed at its node, where its launches are held.
     let requests = flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), "flotilla")),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(daemon.resource_backend(), "flotilla")),
         daemon.lifecycle_reads(),
-        std::sync::Arc::new(NoGate),
+        gate.clone(),
         flotilla_protocol::CanonicalHostId::resolved("local"),
         [],
     );
     let pass = requests.sync_once(chrono::Utc::now()).await.expect("vessel requests");
     assert_eq!(pass.released, vec![launch], "a reaped convoy's vessel is released");
+    assert_eq!(*gate.asked.lock().expect("asked"), vec![convoy_ref.clone()], "an ended convoy's reclaim is sanctioned first");
+
+    // Deleting it again has nothing left to end.
+    daemon.reap_convoy_internal("flotilla", &convoy_ref, true).await.expect("a second teardown is a no-op");
+    assert_eq!(
+        backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await.expect("convoy").status.expect("status").phase,
+        ConvoyPhase::Abandoned
+    );
 }
 
-/// A gate never asked: a convoy that is gone sanctions its own reclaim.
-struct NoGate;
+/// A gate that sanctions every reclaim, recording the convoys it was asked about.
+#[derive(Default)]
+struct Sanctioned {
+    asked: std::sync::Mutex<Vec<String>>,
+}
 
 #[async_trait::async_trait]
-impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for NoGate {
+impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for Sanctioned {
     async fn may_release(&self, convoy: &str, _convoy_home: &str) -> Result<(), String> {
-        panic!("convoy {} is gone; its reclaim needs no gate", convoy)
+        self.asked.lock().expect("asked").push(convoy.to_owned());
+        Ok(())
     }
 }
 
-pub async fn forced_convoy_delete_retains_force_intent_until_checkout_finalizes(factory: &dyn EnsureScenarioController) {
+pub async fn forced_convoy_delete_ends_a_convoy_whose_checkout_is_at_risk(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
     let convoy_ref = backend
@@ -414,9 +430,9 @@ pub async fn forced_convoy_delete_retains_force_intent_until_checkout_finalizes(
         Some(&holder),
     );
 
+    // Force skips the gate, which would first ask the checkout's home to inspect it afresh: the
+    // convoy ends, and the checkout is released by its controller.
     daemon.reap_convoy_internal("flotilla", &convoy_ref, true).await.expect("force delete");
-
-    let convoy = backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await.expect("convoy must await checkout");
-    assert_eq!(convoy.metadata.annotations.get(flotilla_resources::FORCE_TEARDOWN_ANNOTATION).map(String::as_str), Some("true"));
-    assert!(convoy.metadata.deletion_timestamp.is_some());
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    assert_eq!(convoys.get(&convoy_ref).await.expect("an ended convoy is kept").status.expect("status").phase, ConvoyPhase::Abandoned);
 }

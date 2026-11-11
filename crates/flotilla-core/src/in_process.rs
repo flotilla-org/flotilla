@@ -3727,7 +3727,7 @@ impl InProcessDaemon {
     }
 
     pub async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        self.crew.reap(namespace, name, force).await
+        self.crew.reap(namespace, name, force, None).await
     }
 
     pub fn admission_free_space_floor_bytes(&self) -> Result<u64, String> {
@@ -5699,7 +5699,9 @@ impl InProcessDaemon {
             }
             CommandAction::ConvoyLink { .. } => return boxed_action!(crew.execute_action_convoy_link(id, &command)),
             CommandAction::ConvoyUnlink { .. } => return boxed_action!(crew.execute_action_convoy_unlink(id, &command)),
-            CommandAction::ConvoyDelete { .. } => return boxed_action!(crew.execute_action_convoy_delete(id, &command, &caller)),
+            CommandAction::ConvoyDelete { .. } => {
+                return boxed_action!(crew.execute_action_convoy_delete(id, &command, &caller, &dispatching_principal_ref))
+            }
             CommandAction::ConvoyAbandon { .. } => {
                 return boxed_action!(crew.execute_action_convoy_abandon(id, &command, &caller, &dispatching_principal_ref))
             }
@@ -6392,7 +6394,7 @@ impl flotilla_admission::ports::ConvoyTeardown for CrewTeardown {
         self.0.abandon(namespace, name, reason, principal).await.map(|_| ())
     }
     async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        self.0.reap(namespace, name, force).await
+        self.0.reap(namespace, name, force, None).await
     }
 }
 
