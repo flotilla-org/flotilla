@@ -14,7 +14,6 @@ mod k8s_integration;
 mod lifecycle_hygiene;
 mod lifecycle_status_patch;
 mod manifest_root;
-mod owner_gc;
 mod platform_vocabulary;
 mod prepared_snapshot_gc;
 mod provisioning_http_wire;

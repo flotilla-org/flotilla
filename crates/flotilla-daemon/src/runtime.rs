@@ -782,20 +782,7 @@ fn spawn_controller_loops(
         }};
     }
 
-    let gc_backend = backend.clone();
-    let gc_namespace = namespace_string.clone();
-    let gc_supervision = supervision.clone();
-    let gc_health = runtime_health.clone();
-    let gc = tokio::spawn(async move {
-        supervise_controller("owner_gc", gc_supervision, gc_health, move || {
-            let collector = flotilla_store::OwnerGarbageCollector::new(gc_backend.clone(), gc_namespace.clone());
-            async move { collector.run().await }
-        })
-        .await;
-    });
-
     let mut controllers = vec![
-        gc,
         spawn_vessel_requests(
             flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
                 std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(

@@ -35,8 +35,6 @@ pub mod message_query;
 pub use message_query::*;
 mod off_frame;
 pub use off_frame::off_frame;
-mod owner_gc;
-pub use owner_gc::*;
 mod placement_image;
 pub use placement_image::*;
 mod prepared_snapshot;

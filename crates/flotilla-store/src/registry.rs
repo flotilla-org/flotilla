@@ -1,8 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
 
-#[cfg(test)]
-pub(crate) static GC_FULL_KIND_LISTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 use chrono::Utc;
 use flotilla_protocol::NodeId;
 use futures::{stream::BoxStream, StreamExt};
@@ -138,14 +135,14 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     ),
     kind::<Host>(RegisteredResource::Host, &[]),
     kind::<ManifestRoot>(RegisteredResource::ManifestRoot, &["manifest-root", "manifest_root"]),
-    kind::<Message>(RegisteredResource::Message, &[]),
+    engine_kind::<Message>(RegisteredResource::Message, &[]),
     kind::<Project>(RegisteredResource::Project, &[]),
     kind::<Repository>(RegisteredResource::Repository, &[]),
-    kind::<TerminalSession>(
+    engine_kind::<TerminalSession>(
         RegisteredResource::TerminalSession,
         &["terminalsession", "terminal_session", "terminal_sessions", "terminal-session", "terminal-sessions"],
     ),
-    kind::<Vessel>(RegisteredResource::Vessel, &[]),
+    engine_kind::<Vessel>(RegisteredResource::Vessel, &[]),
     kind::<WorkflowTemplate>(
         RegisteredResource::WorkflowTemplate,
         &["workflowtemplate", "workflow_template", "workflow_templates", "workflow-template", "workflow-templates"],
@@ -220,12 +217,6 @@ const fn engine_kind<T: Resource>(resource: RegisteredResource, aliases: &'stati
 /// holds.
 pub fn old_store_resource_kinds() -> impl Iterator<Item = &'static RegisteredResourceKind> {
     REGISTERED_RESOURCE_KINDS.iter().filter(|kind| !kind.engine_held)
-}
-
-/// Whether an owner reference names a kind whose records this store holds. An engine-held or
-/// unknown owner is not evidence of an absent owner here.
-fn collectable_owner(owner: &OwnerReference) -> bool {
-    owner.controller && owner.api_version == "flotilla.work/v1" && old_store_resource_kinds().any(|kind| kind.kind == owner.kind)
 }
 
 macro_rules! poll_typed_resource {
@@ -599,89 +590,6 @@ pub async fn get_resource_kind_all_provenances(
     name: &str,
 ) -> Result<DynamicResourceList, ResourceError> {
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, get_all_typed(backend, namespace, name).await)
-}
-
-/// Collect only children authored here, never replica rows. A deleted owner
-/// filter makes the normal path precise; `None` is restart/backstop recovery.
-pub(crate) async fn collect_owned_resources(
-    backend: &ResourceBackend,
-    namespace: &str,
-    deleted_owner: Option<&OwnerReference>,
-) -> Result<(), ResourceError> {
-    for kind in old_store_resource_kinds() {
-        dispatch_resource_kind!(kind.resource, collect_owned_typed(backend, namespace, deleted_owner).await)?;
-    }
-    Ok(())
-}
-
-/// Recheck an indexed child against current local state before requesting its
-/// deletion. Watch events are hints: the child may have been reparented since
-/// the event, or a replica may now satisfy the owner reference.
-pub(crate) async fn collect_indexed_child(
-    backend: &ResourceBackend,
-    namespace: &str,
-    kind: &str,
-    name: &str,
-    deleted_owner: &OwnerReference,
-) -> Result<(), ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, collect_indexed_typed(backend, namespace, name, deleted_owner).await)
-}
-
-async fn collect_indexed_typed<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    name: &str,
-    deleted_owner: &OwnerReference,
-) -> Result<(), ResourceError> {
-    let resolver = backend.using::<T>(namespace);
-    let child = match resolver.get(name).await {
-        Ok(child) => child,
-        Err(ResourceError::NotFound { .. }) => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    collect_owned_child(backend, namespace, &resolver, &child, Some(deleted_owner)).await
-}
-
-async fn collect_owned_typed<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    deleted_owner: Option<&OwnerReference>,
-) -> Result<(), ResourceError> {
-    #[cfg(test)]
-    GC_FULL_KIND_LISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let resolver = backend.using::<T>(namespace);
-    for child in resolver.list().await?.items {
-        collect_owned_child(backend, namespace, &resolver, &child, deleted_owner).await?;
-    }
-    Ok(())
-}
-
-async fn collect_owned_child<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    resolver: &crate::TypedResolver<T>,
-    child: &ResourceObject<T>,
-    deleted_owner: Option<&OwnerReference>,
-) -> Result<(), ResourceError> {
-    if matches!(child.metadata.lifecycle_authority()?, Some(crate::LifecycleAuthority::Observed | crate::LifecycleAuthority::Adopted)) {
-        return Ok(());
-    }
-    for owner in &child.metadata.owner_references {
-        if !collectable_owner(owner) || deleted_owner.is_some_and(|deleted| deleted != owner) {
-            continue;
-        }
-        match get_resource_kind_including_replicas(backend, namespace, &owner.kind, &owner.name).await {
-            Ok(_) => continue, // Also protects a replacement or another surviving authority.
-            Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
-        match resolver.delete(&child.metadata.name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
-        break;
-    }
-    Ok(())
 }
 
 pub async fn delete_resource_kind(
