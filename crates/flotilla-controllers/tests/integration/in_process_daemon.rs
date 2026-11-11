@@ -10140,73 +10140,36 @@ async fn explicit_convoy_name_survives_failed_branch_generation() {
 // preserving the accepted claim all the way through the ordinary reconciler.
 #[tokio::test]
 async fn convoy_resume_milliseconds_after_complete_still_lands() {
-    use flotilla_resources::StatusPatch;
-    use flotilla_store::controller::Reconciler;
-    let (_temp, _repo, daemon, engine) = daemon_for_cwd_with_engine().await;
+    let (_temp, _repo, daemon, engine) = daemon_for_plain_dir_with_decided_engine(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("claimed-resume".into()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).role("claimed-resume".into()).build(),
-        )
-        .await
-        .unwrap();
-    let mut workflow = flotilla_resources::single_agent_workflow_spec();
-    // Artifact readiness is covered separately; this scenario isolates the accepted claim.
-    workflow.vessels[0].crew[0].promises.clear();
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                observed_workflow_ref: Some("workflow".into()),
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: workflow.exit,
-                    turn_delivery: workflow.turn_delivery,
-                    vessels: workflow.vessels,
-                }),
-                work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([(
-                        "coder".into(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                    )]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    // The work's launch.
-    engine.vessels.request("claimed-resume", "work", daemon.host_name().as_str());
-    let mut events = daemon.subscribe();
-    let mut current = convoys.get("claimed-resume").await.unwrap();
-    let status = current.status.as_mut().unwrap();
-    flotilla_resources::promises::apply(
-        status,
-        "work",
-        "coder",
-        &flotilla_resources::promises::PromiseOperation::Declare {
-            id: "finished".into(),
-            kind: flotilla_resources::promises::PromiseKind::Pr,
-            source: flotilla_resources::promises::PromiseSource::Crew,
+    let workflow = flotilla_resources::single_agent_workflow_spec();
+    let launch = launch_convoy(
+        &daemon,
+        "claimed-resume",
+        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).role("claimed-resume".into()).build(),
+        flotilla_resources::ConvoyStatus {
+            workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: workflow.exit,
+                turn_delivery: workflow.turn_delivery,
+                vessels: workflow.vessels,
+            }),
+            ..Default::default()
         },
-    );
-    flotilla_resources::promises::apply(
-        status,
-        "work",
-        "coder",
-        &flotilla_resources::promises::PromiseOperation::Retract { id: "finished".into(), reason: "No PR needed".into() },
-    );
-    flotilla_resources::promises::next_completion(status, chrono::Utc::now()).unwrap().apply(status);
-    convoys.update_status("claimed-resume", &current.metadata.resource_version, status).await.unwrap();
-    let claimed = convoys.get("claimed-resume").await.unwrap().status.unwrap();
+    )
+    .await;
+    // The coder works in the work's launch.
+    let vessel = work_underway(&engine, &launch, "work");
+    crew_at_work(&engine, &vessel, "coder", "claimed-coder-session", "claimed-coder");
+    let mut events = daemon.subscribe();
+    // The coder's work is claimed: every promise it owes is closed, so the convoy is Landing. On
+    // the engine an operator's verdict closes them (#3108).
+    let current = convoys.get(&launch).await.unwrap();
+    flotilla_engine_convoys_testkit::keep_all(&daemon.convoy_engine_path(), &current).await;
+    let claimed = convoys.get(&launch).await.unwrap().status.unwrap();
     assert_eq!(claimed.phase, ConvoyPhase::Landing);
     tokio::time::sleep(Duration::from_millis(1)).await;
     let resume_id = daemon
@@ -10214,7 +10177,7 @@ async fn convoy_resume_milliseconds_after_complete_still_lands() {
             Command::builder()
                 .action(CommandAction::ConvoyResume {
                     namespace: Some("flotilla".into()),
-                    name: "claimed-resume".into(),
+                    name: launch.clone(),
                     prompt: "please complete".into(),
                     vessel: None,
                     role: None,
@@ -10228,17 +10191,17 @@ async fn convoy_resume_milliseconds_after_complete_still_lands() {
         recv_command_finished(&mut events, resume_id).await,
         CommandValue::ConvoyBriefInformational { message: "crew already claimed; delivered without reopening".into() }
     );
-    assert_eq!(convoys.get("claimed-resume").await.unwrap().status.unwrap(), claimed);
+    assert_eq!(convoys.get(&launch).await.unwrap().status.unwrap(), claimed);
+    // The convoy reconciler delivers it, one edge a pass as the controller runs it.
+    use flotilla_store::controller::Reconciler;
     let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
-        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads);
+        .with_engine(daemon.convoy_engine_path())
+        .with_lifecycle_reads(daemon.lifecycle_reads());
     for _ in 0..3 {
-        let current = convoys.get("claimed-resume").await.unwrap();
-        let prepared = reconciler.prepare(&current).await.unwrap();
-        if let Some(patch) = reconciler.reconcile(&current, &prepared, chrono::Utc::now()).patch {
-            apply_status_patch(&convoys, "claimed-resume", &patch).await.unwrap();
-        }
+        let current = convoys.get(&launch).await.unwrap();
+        reconciler.prepare(&current).await.unwrap();
     }
-    let settled = convoys.get("claimed-resume").await.unwrap().status.unwrap();
+    let settled = convoys.get(&launch).await.unwrap().status.unwrap();
     assert_eq!(settled.phase, ConvoyPhase::Landed, "{settled:?}");
 }
 
