@@ -65,10 +65,8 @@ fn read_sync(service: &Service, name: &str, query: &Query) -> Result<(u64, Table
                                 },
                                 Cell::Text(value) | Cell::Str(value) => json!(value),
                                 Cell::Blob(bytes) => match columns[name.as_str()] {
-                                    ColumnType::Cbor | ColumnType::Frozen => {
-                                        flotilla_cbor::from_slice::<Value>(&bytes, &Default::default())
-                                            .map_err(|error| flotilla_schema_sqlite::StoreError::Stream(error.to_string()))?
-                                    }
+                                    ColumnType::Cbor | ColumnType::Frozen => crate::cbor_json::cbor_to_json(&bytes, &Default::default())
+                                        .map_err(|error| flotilla_schema_sqlite::StoreError::Stream(error.to_string()))?,
                                     _ => {
                                         use base64::Engine;
                                         json!(base64::engine::general_purpose::STANDARD.encode(bytes))

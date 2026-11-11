@@ -1231,6 +1231,45 @@ mod source_contract_tests {
             assert!(matches!(messages.next().await, Some(Message::Synced { .. })));
         }
     }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Admission {
+        workflow: String,
+        opaque: flotilla_cbor::Bytes,
+    }
+    #[derive(flotilla_schema::Stored)]
+    #[store(kind = "FrozenSample", code = "fz")]
+    struct FrozenSample {
+        #[store(frozen)]
+        admission: flotilla_schema::Frozen<Admission>,
+    }
+    // A frozen document holding a byte string, as a convoy's admission document does, reads
+    // with the bytes as base64.
+    #[tokio::test]
+    async fn a_frozen_document_with_a_byte_string_reads_as_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut kinds = flotilla_schema::KindRegistry::new();
+        kinds.register::<FrozenSample>().unwrap();
+        let service = Arc::new(flotilla_schema_sqlite::stream::Service::open(&directory.path().join("feed.db"), "home", kinds).unwrap());
+        let admission =
+            flotilla_schema::Frozen::new(Admission { workflow: "implement".into(), opaque: flotilla_cbor::Bytes(vec![0xa1, 0]) }).unwrap();
+        service
+            .with_store(|store| {
+                let mut write = store.write()?;
+                write.insert(
+                    "one",
+                    &FrozenSample { admission },
+                    &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(1)),
+                )?;
+                write.commit()
+            })
+            .unwrap();
+        let source = TableSource::Decided { service, name: "frozen_sample".into() };
+        let description = source.describe().await.unwrap();
+        let query = Query::parse(&[], &description.table).unwrap();
+        let snapshot = source.read(&description.table, &query).await.unwrap();
+        let [row] = snapshot.rows.as_slice() else { panic!("one row: {:?}", snapshot.rows) };
+        assert_eq!(row["admission"], json!({"workflow": "implement", "opaque": "oQA="}));
+    }
     #[test]
     fn live_diff_observes_projected_values_only() {
         let table = descriptor("convoys");

@@ -448,7 +448,7 @@ pub(crate) fn readable(bundle: &Bundle, kinds: &KindRegistry) -> Result<Value, S
             Cell::Text(value) | Cell::Str(value) => json!(value),
             Cell::Blob(bytes) => match column.map(|column| &column.ty) {
                 Some(flotilla_schema::ColumnType::Cbor) => {
-                    flotilla_cbor::from_slice::<Value>(bytes, &Default::default()).unwrap_or_else(|_| {
+                    crate::cbor_json::cbor_to_json(bytes, &Default::default()).unwrap_or_else(|_| {
                         use base64::Engine;
                         json!({ "undecodable_cbor": base64::engine::general_purpose::STANDARD.encode(bytes) })
                     })
@@ -463,7 +463,7 @@ pub(crate) fn readable(bundle: &Bundle, kinds: &KindRegistry) -> Result<Value, S
                 .rows
                 .objects
                 .get(hash)
-                .and_then(|bytes| flotilla_cbor::from_slice::<Value>(bytes, &Default::default()).ok())
+                .and_then(|bytes| crate::cbor_json::cbor_to_json(bytes, &Default::default()).ok())
                 .unwrap_or_else(|| json!(hash.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>())),
         }
     };
