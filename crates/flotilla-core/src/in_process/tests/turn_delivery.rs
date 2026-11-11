@@ -49,7 +49,7 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].spec.body, "fresh turn");
     assert_eq!(messages[0].spec.sender, "system:turn-rules");
-    assert_eq!(messages[0].spec.receiver, "flotilla/resume-staging/work/coder");
+    assert_eq!(messages[0].spec.receiver, format!("flotilla/{}/work/coder", probe.convoy));
     assert_eq!(session.status.expect("status").phase, ResourceTerminalSessionPhase::Starting);
 }
 

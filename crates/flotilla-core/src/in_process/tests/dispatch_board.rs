@@ -88,14 +88,13 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
             .expect("readiness projection");
     }
     for id in 0..400 {
-        backend
-            .using::<ResourceConvoy>("flotilla")
-            .create(
-                &test_meta(&format!("convoy-{id}")),
-                &ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("large".to_string()).build(),
-            )
-            .await
-            .expect("convoy");
+        super::support::admit(
+            &daemon,
+            &format!("convoy-{id}"),
+            ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("large".to_string()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        )
+        .await;
     }
     let cold = tokio::time::timeout(Duration::from_secs(1), daemon.dispatch_board_internal(Some("large")))
         .await

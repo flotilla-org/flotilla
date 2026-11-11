@@ -304,7 +304,8 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
         let messages = backend.clone().using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items;
         assert!(
             messages.iter().any(|message| {
-                message.spec.receiver == format!("project:flotilla/convoy:{concurrent}/role:aide") && message.spec.body == "Task 1."
+                message.spec.receiver == format!("project:flotilla/convoy:{}/role:aide", concurrent.replace('#', "%23"))
+                    && message.spec.body == "Task 1."
             }),
             "the handoff is queued for the aide: {:?}",
             messages.iter().map(|message| (&message.spec.receiver, &message.spec.body)).collect::<Vec<_>>()

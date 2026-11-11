@@ -111,6 +111,20 @@ pub(super) async fn resume_staging_fixture_with_clock(
     backend: ResourceBackend,
     clock: Arc<dyn flotilla_resources::Clock>,
 ) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
+    resume_staging_fixture_shaped(backend, clock, true).await
+}
+
+/// [`resume_staging_fixture`] whose coder's work is still open: the convoy is Active.
+pub(super) async fn resume_staging_fixture_open() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
+    resume_staging_fixture_shaped(ResourceBackend::new(InMemoryBackend::default()), Arc::new(flotilla_resources::SystemClock), false).await
+}
+
+/// The resume-staging convoy, its coder's work `complete` (Landing) or open (Active).
+async fn resume_staging_fixture_shaped(
+    backend: ResourceBackend,
+    clock: Arc<dyn flotilla_resources::Clock>,
+    complete: bool,
+) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"resume-staging-test\"\n").expect("daemon config");
     let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
@@ -124,10 +138,9 @@ pub(super) async fn resume_staging_fixture_with_clock(
     )
     .await;
     let engine = test_engine(&daemon);
-    // Its coder owes a decision ledger, kept by an operator's verdict: the convoy is Landing,
-    // its work Complete and its crew Done.
-    let mut coder = claim_crew("coder");
-    coder.promises = vec![flotilla_resources::TemplatePromise::decision_ledger("coder")];
+    // Its coder owes a decision ledger. When it is kept by an operator's verdict, the convoy is
+    // Landing, its work Complete and its crew Done.
+    let coder = claim_crew("coder");
     let launch = admit(
         &daemon,
         "resume-staging",
@@ -145,9 +158,9 @@ pub(super) async fn resume_staging_fixture_with_clock(
         },
     )
     .await;
-    let convoy = backend.clone().using::<ResourceConvoy>("flotilla").get(&launch).await.expect("convoy");
-    let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: Some("coder".to_string()) };
-    convoy_engine(&daemon).keep_by_verdict(&convoy, &scope, "operator", "work done").await.expect("work complete");
+    if complete {
+        complete_work(&daemon, &launch, "work").await;
+    }
     let vessel = ensure_vessel(&engine, &launch, "work");
     engine.terminals.request(&TerminalLaunchRequest {
         session: "resume-staging-session".to_string(),
@@ -576,6 +589,45 @@ pub(in crate::in_process) async fn admit(daemon: &InProcessDaemon, convoy: &str,
     admit_convoy(daemon, flotilla_engine_convoys_testkit::convoy("flotilla", convoy, spec, status)).await
 }
 
+/// Admits `convoy` with `spec` on `daemon`, its workflow frozen as `snapshot`; see [`admit_convoy`].
+pub(in crate::in_process) async fn admit_snapshot(
+    daemon: &InProcessDaemon,
+    convoy: &str,
+    spec: ConvoySpec,
+    snapshot: flotilla_resources::WorkflowSnapshot,
+) -> String {
+    admit(daemon, convoy, spec, ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() }).await
+}
+
+/// Admits standing role `role` of project `project` on `daemon`, as its ConvoyEnsure admits a
+/// generation, its workflow frozen as `snapshot`. Returns the launch.
+pub(in crate::in_process) async fn admit_standing(
+    daemon: &InProcessDaemon,
+    project: &str,
+    role: &str,
+    snapshot: flotilla_resources::WorkflowSnapshot,
+) -> String {
+    let mut spec = ConvoySpec::builder().workflow_ref("standing".to_string()).role(role.to_string()).build();
+    spec.project_ref = Some(project.to_string());
+    let ensure = flotilla_resources::ConvoyEnsureSpec::builder()
+        .project_ref(project.to_string())
+        .role(role.to_string())
+        .repositories(Vec::new())
+        .build();
+    let status = ConvoyStatus { workflow_snapshot: Some(snapshot), ensure_admission: Some(ensure), ..Default::default() };
+    let mut convoy = flotilla_engine_convoys_testkit::convoy("flotilla", role, spec, status);
+    convoy.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.to_string(), role.to_string());
+    admit_convoy(daemon, convoy).await
+}
+
+/// Keeps every promise of launch `convoy`'s `work` by an operator's verdict: the work is
+/// Complete, its crew Done and, once nothing else is open, the convoy Landing.
+pub(in crate::in_process) async fn complete_work(daemon: &InProcessDaemon, convoy: &str, work: &str) {
+    let object = daemon.resource_backend().using::<ResourceConvoy>("flotilla").get(convoy).await.expect("convoy");
+    let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: work.to_string(), role: None };
+    convoy_engine(daemon).keep_by_verdict(&object, &scope, "operator", "work done").await.expect("work complete");
+}
+
 /// An engine not installed into any daemon: each fixture's `reads` serve all of them.
 pub(in crate::in_process) fn engine_fixture() -> flotilla_provisioning_testkit::EngineFixture {
     flotilla_provisioning_testkit::EngineFixture::default()
@@ -773,6 +825,7 @@ pub(super) fn claim_crew(role: &str) -> flotilla_resources::CrewSpec {
             "decision-ledger",
             flotilla_resources::ArtifactSubjectBinding::Convoy,
         )])
+        .promises(vec![flotilla_resources::TemplatePromise::decision_ledger(role)])
         .build()
 }
 

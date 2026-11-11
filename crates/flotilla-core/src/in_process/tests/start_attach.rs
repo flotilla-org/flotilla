@@ -154,7 +154,8 @@ async fn start_attach_stage_uses_vessel_status() {
             assert!(stage.unwrap_err().contains(expected));
         } else {
             let stage = stage.unwrap();
-            assert!(stage.contains("pending") && stage.contains("vessel work") && stage.contains(expected), "{stage}");
+            // An admitted convoy whose work is ready to start reads Active.
+            assert!(stage.starts_with("active;") && stage.contains("vessel work") && stage.contains(expected), "{stage}");
         }
     }
 }

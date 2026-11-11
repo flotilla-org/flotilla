@@ -15,7 +15,9 @@ use flotilla_store::{apply_status_patch as apply_resource_status_patch, Resource
 
 use flotilla_state_machines::machines::agent_session::Activity;
 
-use super::support::{ensure_vessel, observe_attention, resume_staging_fixture, resume_staging_fixture_with_backend, test_meta};
+use super::support::{
+    ensure_vessel, observe_attention, resume_staging_fixture, resume_staging_fixture_open, resume_staging_fixture_with_backend, test_meta,
+};
 use crate::in_process::{input_meta_from_resource, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_crew::crew_ops::{ConvoyResumeOutcome, CrewSupervisionRequest};
@@ -24,12 +26,13 @@ use flotilla_crew::crew_ops::{ConvoyResumeOutcome, CrewSupervisionRequest};
 // durable intent; ordinary attention changes cannot fabricate its delivery receipt.
 #[tokio::test]
 async fn working_resume_uses_message_delivery_instead_of_pending_brief_release() {
-    let (daemon, backend, probe) = resume_staging_fixture().await;
+    let (daemon, backend, probe) = resume_staging_fixture_open().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let current = convoys.get(&probe.convoy).await.expect("convoy");
-    let mut status = current.status.expect("status");
-    status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
-    convoys.update_status(&current.metadata.name, &current.metadata.resource_version, &status).await.expect("working crew");
+    // The coder's session runs: it is at work.
+    let launch = probe.engine.terminals.record("resume-staging-session").name;
+    probe.engine.terminals.ready(&launch, "resume-staging-pool-session", &Default::default());
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     daemon
         .convoy_resume_internal("flotilla", &probe.convoy, "operator guidance", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await

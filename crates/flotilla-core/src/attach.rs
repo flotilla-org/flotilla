@@ -2316,9 +2316,10 @@ mod tests {
 
         let convoy_peer = identity_launch(&daemon, "convoy-peer", successor).await;
         let peer = create_running_session(&engine, &environment, "terminal-peer", &convoy_peer, "coder").await;
-        let error =
-            resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect_err("same generation is ambiguous");
-        assert!(error.contains("ambiguous"), "{error}");
+        // A launch's generation is its launch number, so no two launches at one home share one:
+        // the later launch is the newer generation.
+        let newest = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect("later launch");
+        assert_eq!(newest.binding.and_then(|binding| binding.session), Some("terminal-peer".to_string()));
 
         // The peer's launch ends; the newest generation's next launch runs in a pool nothing serves.
         engine.terminals.release(&peer);
@@ -2394,23 +2395,15 @@ mod tests {
             assert_eq!(binding.session.as_deref(), Some("terminal-main"));
             assert_eq!(binding.convoy_phase, Some(flotilla_protocol::ConvoyPhase::Failed));
             let reads = request_backend.read_snapshot();
-            // Direct session references select no Convoy candidates; one
-            // exact parent get restores phase without a namespace read.
-            let convoy_calls = if reference.starts_with("terminal-") { 2 } else { 1 };
-            assert_eq!(reads.calls_by_kind().get("Convoy"), Some(&convoy_calls));
-            assert_eq!(reads.objects_by_kind().get("Convoy"), Some(&1));
-            // Terminal sessions are read from the engine's launches through keyed reads, never
-            // from this counted store.
+            // Convoys and terminal sessions are read from the engine's launches through keyed
+            // reads, never from this counted store.
+            assert_eq!(reads.calls_by_kind().get("Convoy"), None);
             assert_eq!(reads.calls_by_kind().get("TerminalSession"), None);
             // #3078: reachability checks and final planning share one Host
             // catalog snapshot for this request. The store counts its local
             // and replica source lists separately.
             reads.assert_within(
-                &ReadBudget::new()
-                    .objects("Convoy", ReadOperation::Query, 1, 1)
-                    .objects("Convoy", ReadOperation::Get, 1, 1)
-                    .objects("Environment", ReadOperation::Get, 2, 2)
-                    .calls("Host", ReadOperation::List, 2),
+                &ReadBudget::new().objects("Environment", ReadOperation::Get, 2, 2).calls("Host", ReadOperation::List, 2),
                 reference,
             );
             let observed = request_observations.read_snapshot();

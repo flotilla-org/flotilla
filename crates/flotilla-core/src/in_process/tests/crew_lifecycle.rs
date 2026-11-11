@@ -16,8 +16,8 @@ use flotilla_store::ResourceBackend;
 use flotilla_state_machines::machines::agent_session::Activity;
 
 use super::support::{
-    agent_sessions, claim_crew, engine_at, observe_attention, resume_staging_fixture, stall_test_daemon, stall_test_session,
-    stall_workflow_snapshot, test_meta, wait_for_stall,
+    admit_snapshot, admit_standing, agent_sessions, claim_crew, complete_work, engine_at, observe_attention, resume_staging_fixture_open,
+    stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
 };
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
@@ -45,28 +45,19 @@ async fn crew_fail_requires_operator_force() {
     assert!(error.contains("crew stall"), "{error}");
 
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let convoy =
-        convoys.create(&test_meta("operator-failure"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("crew status");
-    let vessel = super::support::ensure_vessel(&engine, "operator-failure", "work");
+    let failure = admit_snapshot(
+        &daemon,
+        "operator-failure",
+        ConvoySpec::builder().workflow_ref("test".into()).build(),
+        stall_workflow_snapshot(vec![claim_crew("coder")]),
+    )
+    .await;
+    let vessel = super::support::ensure_vessel(&engine, &failure, "work");
     daemon
         .crew_fail_internal(
             &CrewCommandContext {
                 namespace: Some("flotilla".into()),
-                convoy: Some("operator-failure".into()),
+                convoy: Some(failure.clone()),
                 vessel_ref: Some(vessel),
                 role: Some("coder".into()),
                 ..Default::default()
@@ -77,7 +68,7 @@ async fn crew_fail_requires_operator_force() {
         )
         .await
         .expect("operator force failure");
-    let status = convoys.get("operator-failure").await.expect("convoy").status.expect("status");
+    let status = convoys.get(&failure).await.expect("convoy").status.expect("status");
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Failed);
     watch.abort();
 }
@@ -86,42 +77,19 @@ async fn crew_fail_requires_operator_force() {
 async fn active_idle_crew_stalls_and_working_crew_clears() {
     let (daemon, backend, _temp, watch, engine) = stall_test_daemon().await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created =
-        convoys.create(&test_meta("idle-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
-    convoys
-        .update_status(
-            "idle-crew",
-            &created.metadata.resource_version,
-            &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Active,
-                workflow_snapshot: Some({
-                    let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
-                    snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
-                    snapshot.stall_nudges.insert(
-                        "work/coder".into(),
-                        flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(3) },
-                    );
-                    snapshot
-                }),
-                work: BTreeMap::from([(
-                    "work".into(),
-                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-                )]),
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("active status");
+    let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
+    snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+    snapshot.stall_nudges.insert(
+        "work/coder".into(),
+        flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(3) },
+    );
+    let idle_crew = admit_snapshot(&daemon, "idle-crew", ConvoySpec::builder().workflow_ref("test".into()).build(), snapshot).await;
     // The screen read Idle six seconds ago: quiet from a second ago, after the screen debounce,
     // so the three-second grace runs out two seconds from now.
     let idle_at = Utc::now() - chrono::Duration::seconds(6);
     let launch = stall_test_session(
         &engine,
-        "idle-crew",
+        &idle_crew,
         "idle-session",
         "coder",
         TerminalAttention { state: TerminalAttentionState::Idle, as_of: idle_at, source: TerminalAttentionSource::Screen },
@@ -130,8 +98,8 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     let agents = agent_sessions(&daemon);
     agents.observe_screen(&launch, Activity::Idle, engine_at(idle_at)).expect("idle activity");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(convoys.get("idle-crew").await.expect("convoy").status.expect("status").stalled.is_none());
-    let status = wait_for_stall(&backend, "idle-crew", true).await;
+    assert!(convoys.get(&idle_crew).await.expect("convoy").status.expect("status").stalled.is_none());
+    let status = wait_for_stall(&backend, &idle_crew, true).await;
     let stalled = status.stalled.expect("stalled");
     assert!(matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { ref role, .. }) if role == "coder"));
     // The projectless fixture keeps its idle evidence and explains why the
@@ -145,7 +113,7 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
             uuid::Uuid::new_v4(),
             flotilla_protocol::WaitSubscriptionRequest {
                 namespace: "flotilla".into(),
-                leaves: vec!["convoy/idle-crew .status.stalled == true".parse().expect("stall leaf")],
+                leaves: vec![format!("convoy/{idle_crew} .status.stalled == true").parse().expect("stall leaf")],
                 freshness_demand: None,
             },
         )
@@ -168,39 +136,24 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
         TerminalAttention { state: TerminalAttentionState::Working, as_of: Utc::now(), source: TerminalAttentionSource::Screen },
     );
     agents.observe_screen(&launch, Activity::Working, engine_at(Utc::now())).expect("working activity");
-    assert!(wait_for_stall(&backend, "idle-crew", false).await.stalled.is_none());
+    assert!(wait_for_stall(&backend, &idle_crew, false).await.stalled.is_none());
     watch.abort();
 }
 
 #[tokio::test]
 async fn stale_working_attention_does_not_stall_crew() {
-    let (_daemon, backend, _temp, watch, engine) = stall_test_daemon().await;
+    let (daemon, backend, _temp, watch, engine) = stall_test_daemon().await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created =
-        convoys.create(&test_meta("stale-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
-    convoys
-        .update_status(
-            "stale-crew",
-            &created.metadata.resource_version,
-            &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Active,
-                workflow_snapshot: Some(stall_workflow_snapshot(vec![claim_crew("coder")])),
-                work: BTreeMap::from([(
-                    "work".into(),
-                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-                )]),
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("active status");
+    let stale_crew = admit_snapshot(
+        &daemon,
+        "stale-crew",
+        ConvoySpec::builder().workflow_ref("test".into()).build(),
+        stall_workflow_snapshot(vec![claim_crew("coder")]),
+    )
+    .await;
     stall_test_session(
         &engine,
-        "stale-crew",
+        &stale_crew,
         "stale-session",
         "coder",
         TerminalAttention {
@@ -211,7 +164,7 @@ async fn stale_working_attention_does_not_stall_crew() {
     )
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
-    assert!(convoys.get("stale-crew").await.expect("convoy").status.expect("status").stalled.is_none());
+    assert!(convoys.get(&stale_crew).await.expect("convoy").status.expect("status").stalled.is_none());
     watch.abort();
 }
 
@@ -234,32 +187,14 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
         )
         .build();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys.create(&test_meta("landed-claim"), &spec).await.expect("convoy");
     let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
     snapshot.exit = Some(flotilla_resources::ExitDeclaration::Table(indexmap::IndexMap::from([(
         "shipped".into(),
         flotilla_resources::parse_leaf_template("$cr.state == merged").expect("leaf template"),
     )])));
-    convoys
-        .update_status(
-            "landed-claim",
-            &created.metadata.resource_version,
-            &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Landing,
-                workflow_snapshot: Some(snapshot),
-                work: BTreeMap::from([(
-                    "work".into(),
-                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
-                )]),
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("landing status");
+    let landed = admit_snapshot(&daemon, "landed-claim", spec, snapshot).await;
+    // The coder's work is complete: the convoy is Landing.
+    complete_work(&daemon, &landed, "work").await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if daemon
@@ -268,7 +203,7 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
                 .rows()
                 .await
                 .iter()
-                .any(|row| matches!(&row.watcher, flotilla_resources::LeafWatcher::ReconcilerWake { convoy } if convoy == "landed-claim"))
+                .any(|row| matches!(&row.watcher, flotilla_resources::LeafWatcher::ReconcilerWake { convoy } if *convoy == landed))
             {
                 break;
             }
@@ -303,43 +238,30 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
         .expect("fresh observation");
     stall_test_session(
         &engine,
-        "landed-claim",
+        &landed,
         "idle-landing-session",
         "coder",
         TerminalAttention { state: TerminalAttentionState::Idle, as_of: Utc::now(), source: TerminalAttentionSource::Hook },
     )
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
-    assert!(convoys.get("landed-claim").await.expect("convoy").status.expect("status").stalled.is_none());
+    assert!(convoys.get(&landed).await.expect("convoy").status.expect("status").stalled.is_none());
     watch.abort();
 }
 
 #[tokio::test]
 async fn landing_without_armed_exit_rows_stalls() {
-    let (_daemon, backend, _temp, watch, _engine) = stall_test_daemon().await;
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created =
-        convoys.create(&test_meta("unarmed-landing"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
-    convoys
-        .update_status(
-            "unarmed-landing",
-            &created.metadata.resource_version,
-            &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Landing,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: Vec::new(),
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("landing status");
-    let stalled = wait_for_stall(&backend, "unarmed-landing", true).await.stalled.expect("stalled");
+    let (daemon, backend, _temp, watch, _engine) = stall_test_daemon().await;
+    // Its coder's work is complete, so it is Landing, and it declares no exit.
+    let unarmed = admit_snapshot(
+        &daemon,
+        "unarmed-landing",
+        ConvoySpec::builder().workflow_ref("test".into()).build(),
+        stall_workflow_snapshot(vec![claim_crew("coder")]),
+    )
+    .await;
+    complete_work(&daemon, &unarmed, "work").await;
+    let stalled = wait_for_stall(&backend, &unarmed, true).await.stalled.expect("stalled");
     assert_eq!(stalled.maker, None);
     assert_eq!(stalled.evidence, flotilla_crew::leaf_engine::NO_EXIT_STALL_EVIDENCE);
     watch.abort();
@@ -367,29 +289,14 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
         )
         .build();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys.create(&test_meta("stale-observation"), &spec).await.expect("convoy");
-    convoys
-        .update_status(
-            "stale-observation",
-            &created.metadata.resource_version,
-            &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Landing,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: Some(flotilla_resources::ExitDeclaration::Table(indexmap::IndexMap::from([(
-                        "shipped".into(),
-                        flotilla_resources::parse_leaf_template("$cr.state == merged").expect("leaf template"),
-                    )]))),
-                    turn_delivery: Default::default(),
-                    vessels: Vec::new(),
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("landing status");
+    let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
+    snapshot.exit = Some(flotilla_resources::ExitDeclaration::Table(indexmap::IndexMap::from([(
+        "shipped".into(),
+        flotilla_resources::parse_leaf_template("$cr.state == merged").expect("leaf template"),
+    )])));
+    let stale = admit_snapshot(&daemon, "stale-observation", spec, snapshot).await;
+    // The coder's work is complete: the convoy is Landing.
+    complete_work(&daemon, &stale, "work").await;
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
     let record_name = cr_name("github.com", "flotilla-org/flotilla", 1391);
     let record = records
@@ -436,10 +343,10 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
         .await
         .expect("observer reads failing");
     daemon.reconcile_crew_stalls_once("flotilla").await.expect("judge inside observer grace");
-    assert!(convoys.get("stale-observation").await.expect("convoy").status.expect("status").stalled.is_none());
+    assert!(convoys.get(&stale).await.expect("convoy").status.expect("status").stalled.is_none());
     clock.advance(chrono::Duration::hours(1));
     daemon.reconcile_crew_stalls_once("flotilla").await.expect("judge expired observer grace");
-    let stalled = wait_for_stall(&backend, "stale-observation", true).await.stalled.expect("stalled");
+    let stalled = wait_for_stall(&backend, &stale, true).await.stalled.expect("stalled");
     assert!(matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Observed { .. })));
     assert!(stalled.evidence.contains("stale"), "{}", stalled.evidence);
     assert!(stalled.evidence.contains("observer behind scheduled refresh grace"));
@@ -452,33 +359,13 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
     let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(Utc::now()));
     let (daemon, backend, _temp, watch, engine) = super::support::stall_test_daemon_with_clock(clock.clone()).await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys.create(&test_meta("standing"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
-    convoys
-        .update_status(
-            "standing",
-            &created.metadata.resource_version,
-            &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Active,
-                workflow_snapshot: Some(stall_workflow_snapshot(vec![flotilla_resources::CrewSpec::builder()
-                    .role("governor".into())
-                    .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
-                    .build()])),
-                work: BTreeMap::from([(
-                    "work".into(),
-                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-                )]),
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("active status");
+    // A standing governor owes only its lifetime duty, no promise.
+    let standing =
+        admit_standing(&daemon, "flotilla", "governor", stall_workflow_snapshot(vec![flotilla_engine_convoys_testkit::agent("governor")]))
+            .await;
     stall_test_session(
         &engine,
-        "standing",
+        &standing,
         "governor-session",
         "governor",
         TerminalAttention {
@@ -491,7 +378,7 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
     daemon.reconcile_crew_stalls_once("flotilla").await.expect("initial judgement");
     clock.advance(chrono::Duration::hours(1));
     daemon.reconcile_crew_stalls_once("flotilla").await.expect("past idle grace");
-    assert!(convoys.get("standing").await.expect("convoy").status.expect("status").stalled.is_none());
+    assert!(convoys.get(&standing).await.expect("convoy").status.expect("status").stalled.is_none());
     watch.abort();
 }
 
@@ -552,50 +439,48 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
 // that an exited agent cannot send; both observed and not-yet-observed exits work.
 #[tokio::test]
 async fn resume_relaunches_exited_active_and_interrupted_crew() {
-    for phase in [CrewWorkPhase::Working, CrewWorkPhase::Interrupted] {
-        let (daemon, backend, probe) = resume_staging_fixture().await;
-        probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
-        let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-        let convoy = convoys.get(&probe.convoy).await.expect("convoy");
-        let mut status = convoy.status.expect("status");
-        status.phase = ConvoyPhase::Active;
-        status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Interrupted;
-        status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = phase;
-        convoys.update_status(&probe.convoy, &convoy.metadata.resource_version, &status).await.expect("unfinished work");
-        let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-        let session = sessions.get("resume-staging-session").await.expect("session");
-        let original_cwd = session.spec.cwd.clone();
-        let terminals = &probe.engine.terminals;
-        let exited = terminals.record("resume-staging-session").name;
-        terminals.ready(&exited, "resume-staging-pool-session", &Default::default());
-        terminals.exited(&exited, "exit 0");
-        daemon
-            .convoy_resume_internal(
-                "flotilla",
-                &probe.convoy,
-                "Recover the unfinished review",
-                Some("work"),
-                Some("coder"),
-                ResumeIntent::Reminder,
-            )
-            .await
-            .expect("resume exited agent");
-        let session = sessions.get("resume-staging-session").await.expect("same session");
-        assert_eq!(session.spec.cwd, original_cwd);
-        assert_eq!(session.status.expect("session status").phase, ResourceTerminalSessionPhase::Starting);
-        assert_ne!(terminals.record("resume-staging-session").name, exited, "the resume starts the session's next launch");
-        assert!(backend
-            .using::<flotilla_resources::Message>("flotilla")
-            .list()
-            .await
-            .expect("inbox")
-            .items
-            .iter()
-            .any(|message| message.spec.body.contains("Recover the unfinished review")));
-        let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
-        assert!(status.pending_brief().is_none(), "an exited process cannot consume a pending brief");
-        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
-    }
+    let (daemon, backend, probe) = resume_staging_fixture_open().await;
+    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
+    let session = sessions.get("resume-staging-session").await.expect("session");
+    let original_cwd = session.spec.cwd.clone();
+    let terminals = &probe.engine.terminals;
+    let exited = terminals.record("resume-staging-session").name;
+    terminals.ready(&exited, "resume-staging-pool-session", &Default::default());
+    terminals.exited(&exited, "exit 0");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert_eq!(status.phase, ConvoyPhase::Active, "its work is unfinished");
+    daemon
+        .convoy_resume_internal(
+            "flotilla",
+            &probe.convoy,
+            "Recover the unfinished review",
+            Some("work"),
+            Some("coder"),
+            ResumeIntent::Reminder,
+        )
+        .await
+        .expect("resume exited agent");
+    let session = sessions.get("resume-staging-session").await.expect("same session");
+    assert_eq!(session.spec.cwd, original_cwd);
+    assert_eq!(session.status.expect("session status").phase, ResourceTerminalSessionPhase::Starting);
+    let relaunched = terminals.record("resume-staging-session").name;
+    assert_ne!(relaunched, exited, "the resume starts the session's next launch");
+    assert!(backend
+        .using::<flotilla_resources::Message>("flotilla")
+        .list()
+        .await
+        .expect("inbox")
+        .items
+        .iter()
+        .any(|message| message.spec.body.contains("Recover the unfinished review")));
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert!(status.pending_brief().is_none(), "an exited process cannot consume a pending brief");
+    // The pool starts the next launch: the coder is at work again.
+    terminals.ready(&relaunched, "resume-staging-pool-session-2", &Default::default());
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
 }
 
 // ADR 0061: crew retraction is immediate only for crew-sourced promises;
@@ -603,47 +488,43 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
 #[tokio::test]
 async fn promise_retractions_stall_unless_crew_sourced() {
     use flotilla_protocol::commands::CrewPromiseOperation;
-    use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState};
+    use flotilla_resources::promises::{PromiseKind, PromiseState};
     let (daemon, backend, _temp, watch, engine) = stall_test_daemon().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let created = convoys.create(&test_meta("promise-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.unwrap();
-    let mut status = ConvoyStatus {
-        phase: ConvoyPhase::Active,
-        workflow_snapshot: Some(stall_workflow_snapshot(vec![flotilla_resources::CrewSpec::builder()
-            .role("coder".into())
-            .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
-            .build()])),
-        crew_work: BTreeMap::from([(
-            "work".into(),
-            BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-        )]),
-        ..Default::default()
-    };
-    for (id, source) in [("template", PromiseSource::Template), ("dispatch", PromiseSource::Dispatch), ("own", PromiseSource::Crew)] {
-        flotilla_resources::promises::apply(
-            &mut status,
-            "work",
-            "coder",
-            &PromiseOperation::Declare { id: id.into(), kind: PromiseKind::Pr, source },
-        );
-    }
-    convoys.update_status("promise-crew", &created.metadata.resource_version, &status).await.unwrap();
-    let vessel = super::support::ensure_vessel(&engine, "promise-crew", "work");
+    // The template and the dispatch each declare a PR promise for the coder; the coder declares
+    // its own.
+    let crew = flotilla_resources::CrewSpec::builder()
+        .role("coder".into())
+        .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
+        .promises(vec![flotilla_resources::TemplatePromise { kind: PromiseKind::Pr, owner: "coder".into() }])
+        .build();
+    let spec = ConvoySpec::builder()
+        .workflow_ref("test".into())
+        .promises(vec![flotilla_resources::promises::DispatchPromise {
+            label: "dispatch".into(),
+            kind: PromiseKind::Pr,
+            vessel: "work".into(),
+            role: "coder".into(),
+        }])
+        .build();
+    let promise_crew = admit_snapshot(&daemon, "promise-crew", spec, stall_workflow_snapshot(vec![crew])).await;
+    let vessel = super::support::ensure_vessel(&engine, &promise_crew, "work");
     let context = CrewCommandContext {
         namespace: Some("flotilla".into()),
-        convoy: Some("promise-crew".into()),
+        convoy: Some(promise_crew.clone()),
         vessel_ref: Some(vessel),
         role: Some("coder".into()),
         ..Default::default()
     };
-    let status = convoys.get("promise-crew").await.unwrap().status.unwrap();
-    for id in ["template", "dispatch", "own"] {
+    daemon.crew.promise(&context, CrewPromiseOperation::Promise { id: "own".into(), kind: "pr".into() }).await.unwrap();
+    let status = convoys.get(&promise_crew).await.unwrap().status.unwrap();
+    for id in ["template/pr", "dispatch", "own"] {
         assert!(status.promises["work"]["coder"].iter().any(|p| p.id == id && p.state == PromiseState::Open), "{id}");
     }
     daemon.crew.promise(&context, CrewPromiseOperation::Retract { id: "own".into(), reason: "scope reduced".into() }).await.unwrap();
-    for id in ["template", "dispatch"] {
+    for id in ["template/pr", "dispatch"] {
         daemon.crew.promise(&context, CrewPromiseOperation::Retract { id: id.into(), reason: "not achievable".into() }).await.unwrap();
-        let status = convoys.get("promise-crew").await.unwrap().status.unwrap();
+        let status = convoys.get(&promise_crew).await.unwrap().status.unwrap();
         let promise = status.promises["work"]["coder"].iter().find(|p| p.id == id).unwrap();
         assert_eq!(promise.state, PromiseState::Open);
         let stalled = status.stalled.as_ref().unwrap();
@@ -652,7 +533,7 @@ async fn promise_retractions_stall_unless_crew_sourced() {
         assert!(stalled.evidence.contains("not achievable"));
         assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
     }
-    let status = convoys.get("promise-crew").await.unwrap().status.unwrap();
+    let status = convoys.get(&promise_crew).await.unwrap().status.unwrap();
     assert_eq!(status.promises["work"]["coder"][2].state, PromiseState::Retracted);
     watch.abort();
 }
