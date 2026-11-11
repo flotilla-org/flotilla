@@ -13,6 +13,7 @@ pub(crate) type EngineSnapshot = Arc<Result<Vec<EngineObject>, String>>;
 #[derive(Debug)]
 pub(crate) struct EngineFeed {
     snapshots: tokio::sync::watch::Receiver<EngineSnapshot>,
+    catch_ups: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -28,24 +29,45 @@ impl EngineFeed {
         let mut changes = records.changes().await?;
         let initial = records.sources(kind).await?;
         let (publish, snapshots) = tokio::sync::watch::channel(Arc::new(Ok(initial)));
+        let (catch_ups, mut requests) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>(16);
         let task = tokio::spawn(async move {
-            while changes.next().await.is_some() {
+            loop {
+                let caught_up = tokio::select! {
+                    tick = changes.next() => match tick {
+                        Some(()) => None,
+                        None => return,
+                    },
+                    request = requests.recv() => match request {
+                        Some(caught_up) => Some(caught_up),
+                        None => return,
+                    },
+                };
                 // A tick says only that something changed: the ticks already queued behind it are
-                // answered by the same listing, not one listing each.
+                // answered by the same listing, not one listing each. A catch-up lists only when
+                // a tick is queued.
+                let mut changed = caught_up.is_none();
                 let mut ended = false;
                 while let Some(next) = changes.next().now_or_never() {
-                    if next.is_none() {
-                        ended = true;
-                        break;
+                    match next {
+                        Some(()) => changed = true,
+                        None => {
+                            ended = true;
+                            break;
+                        }
                     }
                 }
-                publish.send_replace(Arc::new(records.sources(kind).await));
+                if changed {
+                    publish.send_replace(Arc::new(records.sources(kind).await));
+                }
+                if let Some(caught_up) = caught_up {
+                    caught_up.send(()).ok();
+                }
                 if ended {
                     return;
                 }
             }
         });
-        Ok(Self { snapshots, task })
+        Ok(Self { snapshots, catch_ups, task })
     }
 
     /// The latest listing, marked seen, and a receiver of the ones after it.
@@ -53,6 +75,16 @@ impl EngineFeed {
         let mut snapshots = self.snapshots.clone();
         let current = snapshots.borrow_and_update().clone();
         (current, snapshots)
+    }
+
+    /// Returns once the published listing holds every change ticked before the call: a write's
+    /// tick is queued when the write commits, so a reader that saw the write reads it. Lists
+    /// again only when a tick is queued.
+    pub(crate) async fn catch_up(&self) {
+        let (caught_up, done) = tokio::sync::oneshot::channel();
+        if self.catch_ups.send(caught_up).await.is_ok() {
+            done.await.ok();
+        }
     }
 }
 
@@ -76,6 +108,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct Counted {
         listings: AtomicUsize,
+        /// How many times each listing yields before it answers, as a listing read from storage does.
+        yields: AtomicUsize,
         records: Mutex<Vec<EngineObject>>,
         subscribers: Mutex<Vec<futures::channel::mpsc::UnboundedSender<()>>>,
     }
@@ -119,6 +153,9 @@ mod tests {
         }
         async fn sources(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
             self.listings.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..self.yields.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
             Ok(self.records.lock().expect("records").clone())
         }
         async fn apply(
@@ -189,5 +226,28 @@ mod tests {
         let (later, _later) = watch().await;
         assert_eq!(later.len(), 2);
         assert_eq!(records.listings.load(Ordering::SeqCst), 3);
+    }
+
+    // Behaviour: a view of an engine kind reads every change committed before the read, without
+    // waiting for the feed's own pass; a read with nothing changed lists nothing again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_view_reads_the_engine_changes_committed_before_the_read() {
+        let records = Arc::new(Counted::default());
+        records.put("v#1", 1);
+        let backend = crate::test_store::memory_backend();
+        backend.install_engine_records(records.clone());
+        let view = crate::WatchView::<Vessel>::start(backend, "flotilla").await.expect("view");
+        records.yields.store(8, Ordering::SeqCst);
+        let names = || async {
+            let mut names = view.list().await.expect("list").items.into_iter().map(|read| read.object.metadata.name).collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        records.put("v#2", 1);
+        records.tick();
+        assert_eq!(names().await, ["v#1", "v#2"]);
+        let listings = records.listings.load(Ordering::SeqCst);
+        assert_eq!(names().await, ["v#1", "v#2"]);
+        assert_eq!(records.listings.load(Ordering::SeqCst), listings, "an unchanged kind is not listed again");
     }
 }
