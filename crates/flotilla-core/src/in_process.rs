@@ -717,6 +717,10 @@ const ENVIRONMENT_ADOPTION_DEADLINE: std::time::Duration = std::time::Duration::
 pub struct InProcessDaemon {
     change_stream_rounds: change_stream::Rounds,
     decided_store: std::sync::Mutex<Option<Arc<flotilla_schema_sqlite::stream::Service>>>,
+    /// The decided store's writes as load metrics, recorded by `decided_store_commits`.
+    decided_store_metrics: Arc<flotilla_store::load_metrics::StoreLoadMetrics>,
+    /// The commit listener recording `decided_store_metrics`; the store holds it only weakly.
+    decided_store_commits: std::sync::OnceLock<Arc<flotilla_schema_sqlite::stream::CommitListener>>,
     change_request_branches: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>>,
     /// The forge observations' records (ChangeRequest and Issue), whose changes wake the aggregator.
     observation_records: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::EngineRecords>>,
@@ -1451,6 +1455,8 @@ impl InProcessDaemon {
             clock: Arc::clone(&clock),
             surfaces: Surfaces::default(),
             decided_store: Default::default(),
+            decided_store_metrics: Default::default(),
+            decided_store_commits: Default::default(),
             change_request_branches: Default::default(),
             observation_records: Default::default(),
             change_stream_rounds: Default::default(),
@@ -2310,6 +2316,13 @@ impl InProcessDaemon {
             };
             fleet.report_change_stream(&node, update);
         }))?;
+        let metrics = Arc::clone(&self.decided_store_metrics);
+        let listener = self.decided_store_commits.get_or_init(|| {
+            let record: Arc<flotilla_schema_sqlite::stream::CommitListener> =
+                Arc::new(move |committed: &flotilla_schema_sqlite::stream::Committed<'_>| metrics.write_execution.record(committed.took));
+            record
+        });
+        service.on_commit(Arc::downgrade(listener));
         *slot = Some(Arc::clone(&service));
         drop(slot);
         // Convoys are launches on this store, so the store brings this home's Convoy path.
@@ -2520,6 +2533,12 @@ impl InProcessDaemon {
     }
 
     /// Present only after the first kind migration installs its registered store.
+    /// The decided store's load metrics: each write it commits, local or applied from another
+    /// home, with how long it ran.
+    pub fn decided_store_metrics(&self) -> Arc<flotilla_store::load_metrics::StoreLoadMetrics> {
+        Arc::clone(&self.decided_store_metrics)
+    }
+
     pub fn decided_store(&self) -> Result<Arc<flotilla_schema_sqlite::stream::Service>, String> {
         self.decided_store
             .lock()

@@ -24,7 +24,7 @@ use flotilla_provisioning::engine::controller::BackingEvent;
 use flotilla_provisioning::reconcilers::clone::runtime::CloneFlights;
 use flotilla_provisioning::reconcilers::ForgeDefaultBranchResolver;
 use flotilla_resources::environment_records::EnvironmentRecord;
-use flotilla_resources::{Convoy, ConvoyProvisioningState, Host, HostSpec, ResourceError, ResourceObject};
+use flotilla_resources::{Convoy, Host, HostSpec, ResourceError, ResourceObject};
 use flotilla_store::load_metrics::ControllerMetricsRegistry;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -532,20 +532,22 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             .unwrap_or_default();
         let convoy_name = convoy.metadata.name.clone();
         let reads = self.daemon.lifecycle_reads();
-        let environments = tokio::task::spawn_blocking(move || {
+        let (launched, environments) = tokio::task::spawn_blocking(move || {
             let environments = reads.environments()?;
             let vessels = reads.vessels()?.of_convoy(&convoy_name)?;
+            let mut launched = false;
             let mut held = Vec::new();
             for vessel in vessels.iter().filter(|vessel| works.contains(vessel.work())).map(|vessel| &vessel.name) {
+                launched = true;
                 held.extend(environments.held(vessel)?.into_iter().filter(|environment| !environment.ended()));
             }
-            Ok::<_, String>(held)
+            Ok::<_, String>((launched, held))
         })
         .await
         .map_err(|error| format!("could not inspect backing environments: {error}"))?
         .map_err(|error| format!("could not inspect backing environments: {error}"))?;
         if environments.is_empty() {
-            if convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted) {
+            if flotilla_admission::convoy_ensure::never_provisioned(convoy, launched) {
                 return Ok(());
             }
             let local_host_id = CanonicalHostId::resolved(&self.local_host_ref);
