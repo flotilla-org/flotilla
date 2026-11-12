@@ -33,6 +33,7 @@ use flotilla_crew::reconcilers::vessel::{ConvoyVesselWake, CrewSeats, VesselPlan
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
+use flotilla_provisioning::engine::ProvisioningLifecycles;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Host, Repository, Resource, ResourceError, TerminalSession, Vessel};
@@ -161,7 +162,6 @@ impl DaemonRuntime {
         // ADR 0064 (#3108): Message and the provisioning lifecycles run on the decided store.
         result_phase("open_message_primitives", open_message_primitives(&daemon)).await?;
         let (provisioning, lifecycle_followers) = open_provisioning_lifecycles(&daemon).await?;
-        let provisioning_lifecycles = Some(provisioning);
         daemon.require_lifecycle_reads_installed()?;
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
@@ -513,7 +513,6 @@ impl DaemonRuntime {
                 .with_image_build_service(image_build_service)
                 .with_forge_default_branches(forge_default_branches)
                 .with_controller_metrics(Arc::clone(&controller_metrics))
-                .with_provisioning_lifecycles(provisioning_lifecycles.clone())
                 .with_runtime_health(runtime_health.clone()),
             );
             if state.ssh_host_vessels.is_some() {
@@ -545,6 +544,7 @@ impl DaemonRuntime {
                 .local_registry(local_registry)
                 .credential_store(credential_store)
                 .maybe_state(controller_state)
+                .provisioning(provisioning)
                 .options(options)
                 .runtime_health(runtime_health)
                 .build(),
@@ -562,6 +562,9 @@ struct StartupRestoration {
     local_registry: Arc<ProviderRegistry>,
     credential_store: Arc<CredentialStore>,
     state: Option<Arc<ControllerRuntimeState>>,
+    /// The provisioning kinds' engine homes, the single writer of the resources they hold, for
+    /// their controllers.
+    provisioning: ProvisioningLifecycles,
     options: RuntimeOptions,
     runtime_health: RuntimeHealth,
     /// The credential delivery controller, once its start pass has run.
@@ -665,9 +668,15 @@ impl StartupRestoration {
         controller_tasks.push(AbortOnDropHandle::new(spawn_environment_orphan_sweep_task(Arc::clone(state))));
         controller_tasks.push(AbortOnDropHandle::new(remotes::spawn_remote_probe_task(Arc::clone(state), remotes::REMOTE_PROBE_INTERVAL)));
         controller_tasks.extend(
-            spawn_controller_loops(Arc::clone(state), &options.namespace, options.controller_supervision.clone(), runtime_health.clone())
-                .into_iter()
-                .map(AbortOnDropHandle::new),
+            spawn_controller_loops(
+                Arc::clone(state),
+                &self.provisioning,
+                &options.namespace,
+                options.controller_supervision.clone(),
+                runtime_health.clone(),
+            )
+            .into_iter()
+            .map(AbortOnDropHandle::new),
         );
         // The guards abort all owned controllers when shutdown cancels restoration.
         futures::future::pending::<Result<(), ResourceError>>().await
@@ -710,6 +719,7 @@ impl Drop for DaemonRuntime {
 
 fn spawn_controller_loops(
     state: Arc<ControllerRuntimeState>,
+    provisioning: &ProvisioningLifecycles,
     namespace: &str,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
@@ -845,11 +855,11 @@ fn spawn_controller_loops(
             }
         }),
     ];
-    controllers.extend(spawn_environment_controller(&state));
-    controllers.extend(spawn_clone_controller(&state));
-    controllers.extend(spawn_checkout_controller(&state));
-    controllers.extend(spawn_terminal_controller(&state));
-    controllers.extend(spawn_vessel_controller(&state));
+    controllers.extend(spawn_environment_controller(&state, provisioning));
+    controllers.extend(spawn_clone_controller(&state, provisioning));
+    controllers.extend(spawn_checkout_controller(&state, provisioning));
+    controllers.extend(spawn_terminal_controller(&state, provisioning));
+    controllers.extend(spawn_vessel_controller(&state, provisioning));
     if let Some(distributor) = &state.image_inventory {
         let distributor = Arc::clone(distributor);
         controllers.push(tokio::spawn(async move {
@@ -862,7 +872,7 @@ fn spawn_controller_loops(
             }
         }));
     }
-    controllers.extend(spawn_image_build_controller(&state));
+    controllers.extend(spawn_image_build_controller(&state, provisioning));
     // Message delivery is the engine path's adapter (#3317, #3108); the runtime opens that path at
     // startup, before any controller runs.
     match state.daemon.message_primitives() {
@@ -978,9 +988,8 @@ fn archive_shipper(
 
 /// The Environment controller (#3108): the single writer of this home's environment launches,
 /// realising them through the host's providers and told by its probes what became of them.
-fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHandle<()>> {
+fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{controller::Controller, environment_actuator::EnvironmentActuator, reads::StoreReads};
-    let engine = state.provisioning.as_ref()?;
     let backings = state.environment_backing_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
     let service = match state.daemon.decided_store() {
         Ok(service) => service,
@@ -1009,9 +1018,8 @@ fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>) -> Option<J
 /// The Clone controller (#3108): the single writer of this home's clone launches, cloning each
 /// repository once into its environment. A clone that cannot reach its remote waits for this
 /// host's probe (`remotes`) to reach it again.
-fn spawn_clone_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHandle<()>> {
+fn spawn_clone_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{clone_actuator::CloneActuator, controller::Controller, reads::StoreReads};
-    let engine = state.provisioning.as_ref()?;
     let service = match state.daemon.decided_store() {
         Ok(service) => service,
         Err(error) => {
@@ -1044,11 +1052,10 @@ fn spawn_clone_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHan
 /// credential store, the launcher launches each build any home demands of this host, and the
 /// controller is the single writer of those launches, building each through the build service.
 /// Elsewhere nothing builds here.
-fn spawn_image_build_controller(state: &Arc<ControllerRuntimeState>) -> Vec<JoinHandle<()>> {
+fn spawn_image_build_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Vec<JoinHandle<()>> {
     use flotilla_provisioning::engine::{
         controller::Controller, image_build_actuator::ImageBuildActuator, image_builds::ImageBuildLauncher,
     };
-    let Some(engine) = state.provisioning.as_ref() else { return Vec::new() };
     let (Some(build_service), Some(credentials)) = (state.image_build_service.clone(), state.credential_store.clone()) else {
         if state.image_build_service.is_some() {
             warn!("no credential store; image builds demanded of this host will not run");
@@ -1103,13 +1110,12 @@ fn spawn_image_build_controller(state: &Arc<ControllerRuntimeState>) -> Vec<Join
 /// The TerminalSession controller (#3108): the single writer of this home's terminal launches,
 /// starting each in its environment's terminal pool and killing it once its holder has ended. This
 /// host's probe looks at the running launches at an interval, pushing each one it finds ended.
-fn spawn_terminal_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHandle<()>> {
+fn spawn_terminal_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{
         controller::Controller,
         reads::StoreReads,
         terminal_actuator::{TerminalActuator, TerminalProbe, TERMINAL_PROBE_EVERY},
     };
-    let engine = state.provisioning.as_ref()?;
     let service = match state.daemon.decided_store() {
         Ok(service) => service,
         Err(error) => {
@@ -1148,9 +1154,8 @@ fn spawn_terminal_controller(state: &Arc<ControllerRuntimeState>) -> Option<Join
 /// each in its environment for its holder Convoy and removing it once that convoy has ended. The
 /// observed-checkout refresh names the launches whose paths it saw change, and each is observed
 /// again: one still there has its registration protected again, one gone is recorded lost.
-fn spawn_checkout_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHandle<()>> {
+fn spawn_checkout_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{checkout_actuator::CheckoutActuator, controller::Controller, reads::StoreReads};
-    let engine = state.provisioning.as_ref()?;
     let rechecks = state.checkout_recheck_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
     let service = match state.daemon.decided_store() {
         Ok(service) => service,
@@ -1214,9 +1219,8 @@ fn vessel_planning(state: &Arc<ControllerRuntimeState>, backend: &ResourceBacken
 /// The Vessel controller (#3108): the single writer of this home's vessel launches, realising each
 /// in its environment once what its planner requests for it is realised. Its holdings' commits
 /// wake it; its convoy's, its crews' bindings' and its seats' changes are told as rechecks.
-fn spawn_vessel_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHandle<()>> {
+fn spawn_vessel_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{controller::Controller, vessel_actuator::VesselActuator};
-    let engine = state.provisioning.as_ref()?;
     let rechecks = state.vessel_recheck_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
     let service = match state.daemon.decided_store() {
         Ok(service) => service,

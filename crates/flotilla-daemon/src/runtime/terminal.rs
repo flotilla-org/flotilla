@@ -55,11 +55,10 @@ pub enum TerminalDeliveryFailure {
     SubmissionUnconfirmed,
 }
 
+/// An engine turn reserved in a crew's terminal, which owns its receipt (#3894).
 pub(super) struct PendingTerminalDelivery {
-    pub(super) message_batch: Option<String>,
     pub(super) task: JoinHandle<Result<TerminalDeliveryOutcome, String>>,
-    /// Present for an engine turn, which owns its receipt (#3894).
-    pub(super) engine_turn: Option<EngineTurn>,
+    pub(super) engine_turn: EngineTurn,
 }
 
 /// An engine turn's teardown state: teardown stops a turn not yet typed, and
@@ -742,7 +741,7 @@ impl TerminalControllerRuntime {
         let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
         let Some(delivery) = deliveries.get_mut(session_id) else { return false };
         let finished = delivery.task.is_finished();
-        let Some(turn) = delivery.engine_turn.as_mut() else { return false };
+        let turn = &mut delivery.engine_turn;
         turn.stop.cancel();
         if finished {
             return false;
@@ -754,14 +753,11 @@ impl TerminalControllerRuntime {
     pub(super) async fn kill_session(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
         {
             // A settled engine turn stays reserved: the delivery adapter records its
-            // receipt. Any other reservation, or an engine turn that outlasted its
-            // settle bound, is aborted.
+            // receipt. A turn that outlasted its settle bound is aborted.
             let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
-            if deliveries.get(session_id).is_some_and(|delivery| delivery.engine_turn.is_none() || !delivery.task.is_finished()) {
+            if deliveries.get(session_id).is_some_and(|delivery| !delivery.task.is_finished()) {
                 let delivery = deliveries.remove(session_id).expect("reserved delivery");
-                if delivery.engine_turn.is_some() {
-                    warn!(%session_id, "an engine turn did not settle before teardown; aborting it");
-                }
+                warn!(%session_id, "an engine turn did not settle before teardown; aborting it");
                 delivery.task.abort();
             }
         }

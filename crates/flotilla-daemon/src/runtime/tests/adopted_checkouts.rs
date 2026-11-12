@@ -21,19 +21,16 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
     let provisioning = engine_startup(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat should succeed");
 
-    let state = Arc::new(
-        ControllerRuntimeState::new(
-            Arc::clone(&daemon),
-            Arc::clone(&config),
-            passthrough_registry(),
-            None,
-            profile.host_id.clone(),
-            profile.host_direct_environment_name(),
-        )
-        .with_provisioning_lifecycles(Some(provisioning)),
-    );
+    let state = Arc::new(ControllerRuntimeState::new(
+        Arc::clone(&daemon),
+        Arc::clone(&config),
+        passthrough_registry(),
+        None,
+        profile.host_id.clone(),
+        profile.host_direct_environment_name(),
+    ));
     let controller_handles =
-        spawn_controller_loops(Arc::clone(&state), NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
+        spawn_controller_loops(Arc::clone(&state), &provisioning, NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
 
     backend
         .clone()

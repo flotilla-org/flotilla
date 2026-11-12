@@ -116,17 +116,14 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         "the placement host must begin with an empty replica store"
     );
 
-    let kiwi_state = Arc::new(
-        ControllerRuntimeState::new(
-            Arc::clone(&kiwi),
-            Arc::clone(&kiwi_config),
-            passthrough_registry(),
-            None,
-            kiwi_host_ref.clone(),
-            kiwi_profile.host_direct_environment_name(),
-        )
-        .with_provisioning_lifecycles(Some(kiwi_provisioning)),
-    );
+    let kiwi_state = Arc::new(ControllerRuntimeState::new(
+        Arc::clone(&kiwi),
+        Arc::clone(&kiwi_config),
+        passthrough_registry(),
+        None,
+        kiwi_host_ref.clone(),
+        kiwi_profile.host_direct_environment_name(),
+    ));
     let feta_registry = if docker {
         let home = temp.path().join("container-home").display().to_string();
         passthrough_registry_with_environment(move |id| {
@@ -150,11 +147,17 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
             feta_host_ref.clone(),
             feta_profile.host_direct_environment_name(),
         )
-        .with_environment_tools(fixed_environment_tools(temp.path()))
-        .with_provisioning_lifecycles(Some(feta_provisioning)),
+        .with_environment_tools(fixed_environment_tools(temp.path())),
     );
-    let mut controller_handles = spawn_controller_loops(kiwi_state, NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
-    controller_handles.extend(spawn_controller_loops(feta_state, NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default()));
+    let mut controller_handles =
+        spawn_controller_loops(kiwi_state, &kiwi_provisioning, NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
+    controller_handles.extend(spawn_controller_loops(
+        feta_state,
+        &feta_provisioning,
+        NAMESPACE,
+        ControllerSupervision::default(),
+        RuntimeHealth::default(),
+    ));
     let bridge = tokio::spawn({
         let kiwi = Arc::clone(&kiwi);
         let feta = Arc::clone(&feta);

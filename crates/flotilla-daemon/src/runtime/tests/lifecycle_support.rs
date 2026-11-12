@@ -97,19 +97,16 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     let provisioning = engine_startup(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat should succeed");
 
-    let state = Arc::new(
-        ControllerRuntimeState::new(
-            Arc::clone(&daemon),
-            Arc::clone(&config),
-            passthrough_registry(),
-            None,
-            profile.host_id.clone(),
-            profile.host_direct_environment_name(),
-        )
-        .with_provisioning_lifecycles(Some(provisioning)),
-    );
+    let state = Arc::new(ControllerRuntimeState::new(
+        Arc::clone(&daemon),
+        Arc::clone(&config),
+        passthrough_registry(),
+        None,
+        profile.host_id.clone(),
+        profile.host_direct_environment_name(),
+    ));
     let controller_handles =
-        spawn_controller_loops(Arc::clone(&state), NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
+        spawn_controller_loops(Arc::clone(&state), &provisioning, NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
     // Startup realises the host's environment before work arrives. Nothing holds a host-direct
     // environment, so its realisation wakes no vessel: one placed before it waits for the resync.
     let host_environment = profile.host_direct_environment_name();

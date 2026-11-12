@@ -34,12 +34,11 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         None,
         profile.host_id.clone(),
         profile.host_direct_environment_name(),
-    )
-    .with_provisioning_lifecycles(Some(provisioning));
+    );
     state.local_core_count = || Ok(std::num::NonZeroUsize::new(32).expect("32 cores"));
     let state = Arc::new(state);
     let controller_handles =
-        spawn_controller_loops(Arc::clone(&state), NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
+        spawn_controller_loops(Arc::clone(&state), &provisioning, NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
 
     backend
         .clone()
@@ -413,19 +412,16 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .collect();
     pool.add_sessions(surviving_sessions).await;
     let provisioning = engine_provisioning(&daemon).await;
-    let state = Arc::new(
-        ControllerRuntimeState::new(
-            Arc::clone(&daemon),
-            Arc::clone(&config),
-            local_registry,
-            None,
-            profile.host_id.clone(),
-            profile.host_direct_environment_name(),
-        )
-        .with_provisioning_lifecycles(Some(provisioning)),
-    );
+    let state = Arc::new(ControllerRuntimeState::new(
+        Arc::clone(&daemon),
+        Arc::clone(&config),
+        local_registry,
+        None,
+        profile.host_id.clone(),
+        profile.host_direct_environment_name(),
+    ));
     let controller_handles =
-        spawn_controller_loops(Arc::clone(&state), NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
+        spawn_controller_loops(Arc::clone(&state), &provisioning, NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
     wait_until(|| {
         let terminals = terminals.clone();
         let name = coder.metadata.name.clone();

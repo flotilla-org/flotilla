@@ -86,9 +86,6 @@ pub(super) struct ControllerRuntimeState {
     pub(super) forge_default_branches: Option<Arc<dyn ForgeDefaultBranchResolver>>,
     /// Per-kind controller loop load metrics (#3206).
     pub(super) controller_metrics: Arc<ControllerMetricsRegistry>,
-    /// The provisioning kinds' engine homes behind `[primitives]` (#3629): the single writer
-    /// of the resources they hold. Absent with the switch off.
-    pub(super) provisioning: Option<flotilla_provisioning::engine::ProvisioningLifecycles>,
     /// What the host's probes observe of its environments' backings, for the Environment
     /// controller: the sender the probes use, and the receiver its controller takes once.
     pub(super) environment_backings: tokio::sync::mpsc::Sender<BackingEvent>,
@@ -340,7 +337,6 @@ impl ControllerRuntimeState {
             checkout_removals: Semaphore::new(DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY.get()),
             forge_default_branches: None,
             controller_metrics: Arc::default(),
-            provisioning: None,
             environment_backings,
             environment_backing_events: StdMutex::new(Some(environment_backing_events)),
             checkout_rechecks,
@@ -355,14 +351,6 @@ impl ControllerRuntimeState {
     /// Publishes the remotes this host's clones cannot reach on `health`'s heartbeat.
     pub(super) fn with_runtime_health(mut self, health: super::health::RuntimeHealth) -> Self {
         self.remote_reachability = Arc::new(RemoteProbe::new(health));
-        self
-    }
-
-    pub(super) fn with_provisioning_lifecycles(
-        mut self,
-        lifecycles: Option<flotilla_provisioning::engine::ProvisioningLifecycles>,
-    ) -> Self {
-        self.provisioning = lifecycles;
         self
     }
 

@@ -53,8 +53,6 @@ use super::{
     terminal::{submit_and_confirm, EngineTurn, PendingTerminalDelivery, TerminalControllerRuntime},
 };
 
-/// Marks a terminal delivery reserved by this adapter in the shared map.
-const ENGINE_BATCH: &str = "engine-message-turn";
 /// The wait before retrying a failed pass, or reopening a failed watch.
 const RETRY: flotilla_resources::RetryBackoff =
     flotilla_resources::RetryBackoff { initial: Duration::from_secs(1), maximum: Duration::from_secs(60) };
@@ -361,21 +359,12 @@ impl MessageDelivery {
             let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
             self.inflight
                 .keys()
-                .filter(|session| {
-                    deliveries
-                        .get(*session)
-                        .is_none_or(|delivery| delivery.message_batch.as_deref() != Some(ENGINE_BATCH) || delivery.task.is_finished())
-                })
+                .filter(|session| deliveries.get(*session).is_none_or(|delivery| delivery.task.is_finished()))
                 .cloned()
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|session| {
-                    let task = deliveries
-                        .get(&session)
-                        .filter(|delivery| delivery.message_batch.as_deref() == Some(ENGINE_BATCH))
-                        .is_some()
-                        .then(|| deliveries.remove(&session))
-                        .flatten();
+                    let task = deliveries.remove(&session);
                     (session, task)
                 })
                 .collect()
@@ -619,10 +608,7 @@ impl MessageDelivery {
             }
             .instrument(primary_span),
         );
-        deliveries.insert(
-            holder.session_id.clone(),
-            PendingTerminalDelivery { message_batch: Some(ENGINE_BATCH.into()), task, engine_turn: Some(EngineTurn::new(stop)) },
-        );
+        deliveries.insert(holder.session_id.clone(), PendingTerminalDelivery { task, engine_turn: EngineTurn::new(stop) });
         self.inflight.insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members, submitted_at });
         Ok(())
     }

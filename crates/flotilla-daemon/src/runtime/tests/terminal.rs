@@ -564,11 +564,7 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
         });
         runtime.state.terminal_deliveries.lock().expect("deliveries").insert(
             session_name.to_string(),
-            PendingTerminalDelivery {
-                message_batch: Some("engine-message-turn".into()),
-                task,
-                engine_turn: Some(super::terminal::EngineTurn::new(stop.clone())),
-            },
+            PendingTerminalDelivery { task, engine_turn: super::terminal::EngineTurn::new(stop.clone()) },
         );
 
         // The finalizer's pass: wait, without blocking, while the turn settles; then kill.
