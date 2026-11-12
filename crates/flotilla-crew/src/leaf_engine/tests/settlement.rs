@@ -1,87 +1,8 @@
 use super::*;
 
-/// A spec whose one repository works on `branch`, with change request `bound` bound when given.
-fn repository_spec(branch: &str, bound: Option<(&str, &str)>) -> ConvoySpec {
-    let repo_ref = RepositoryKey("repo".to_string());
-    let mut spec = ConvoySpec::builder()
-        .workflow_ref("workflow".to_string())
-        .repositories(vec![ConvoyRepositorySpec::builder()
-            .url("https://github.com/flotilla-org/flotilla".to_string())
-            .repo_ref(repo_ref.clone())
-            .source_ref(branch.to_string())
-            .target_ref("main".to_string())
-            .workspace_slug("flotilla".to_string())
-            .subpaths(Vec::new())
-            .build()])
-        .build();
-    spec.change_request =
-        bound.map(|(id, title)| BoundChangeRequest::builder().id(id.to_string()).repository_ref(repo_ref).title(title.to_string()).build());
-    spec
-}
-
-/// Admits `name` with `spec`, its coder owing a decision ledger under `exit`, and keeps the ledger:
-/// the launch is landing. Returns the launch.
-async fn landing_launch(backend: &ResourceBackend, home: &EngineHome, name: &str, spec: ConvoySpec, exit: ExitDeclaration) -> String {
-    let mut status = ledger_owed();
-    status.workflow_snapshot.as_mut().expect("workflow").exit = Some(exit);
-    let launch = home.admit(name, spec, status).await;
-    home.vessel(&launch, "work", "env");
-    home.keep(backend, &launch, "work", "coder").await;
-    assert_eq!(home.view(backend, &launch).await.status.expect("status").phase, ConvoyPhase::Landing);
-    launch
-}
-
-/// The convoy reconciler over `home`'s engine, woken by `table`'s rows, reading change requests
-/// stale after `stale_after`.
-fn convoy_controller(
-    backend: &ResourceBackend,
-    home: &EngineHome,
-    table: &LeafSubscriptionTable,
-    stale_after: Duration,
-) -> tokio::task::JoinHandle<impl Send + 'static> {
-    tokio::spawn(
-        ControllerLoop {
-            primary: backend.using::<Convoy>("flotilla"),
-            secondaries: vec![table.reconciler_wake_watch()],
-            reconciler: ConvoyReconciler::new()
-                .with_lifecycle_reads(home.reads())
-                .with_engine(home.path())
-                .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), stale_after),
-            backend: backend.clone(),
-        }
-        .run(),
-    )
-}
-
-/// Launch `launch`'s status once it has landed.
-async fn landed(backend: &ResourceBackend, launch: &str, expect: &str) -> ConvoyStatus {
-    let convoys = backend.using::<Convoy>("flotilla");
-    let landed = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let status = convoys.get(launch).await.expect("convoy").status.expect("status");
-            if status.phase == ConvoyPhase::Landed {
-                break status;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    match landed {
-        Ok(status) => status,
-        Err(_) => {
-            let status = convoys.get(launch).await.expect("convoy").status.expect("status");
-            let requests = backend
-                .using::<ChangeRequest>("flotilla")
-                .list()
-                .await
-                .expect("change requests")
-                .items
-                .into_iter()
-                .map(|record| (record.metadata.name, record.status.map(|status| status.state)))
-                .collect::<Vec<_>>();
-            panic!("{expect}: {:?} promises {:?} change requests {requests:?}", status.phase, status.promises)
-        }
-    }
+/// [`landing_launch`] with the standard exit table.
+async fn standard_landing(backend: &ResourceBackend, home: &EngineHome, name: &str, spec: ConvoySpec) -> String {
+    landing_launch(backend, home, name, spec, ExitDeclaration::standard_table()).await
 }
 
 #[tokio::test]
@@ -97,11 +18,24 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
     };
     let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
-    let spec = repository_spec("feature/reconciler-wake", Some(("1364", "wake")));
-    // The launch is landing before the watcher boots.
-    let launch = landing_launch(&backend, &home, "wake", spec, ExitDeclaration::standard_table()).await;
+    let repo_ref = RepositoryKey("repo".to_string());
+    let spec = ConvoySpec::builder()
+        .workflow_ref("workflow".to_string())
+        .repositories(vec![ConvoyRepositorySpec::builder()
+            .url("https://github.com/flotilla-org/flotilla".to_string())
+            .repo_ref(repo_ref.clone())
+            .source_ref("feature/reconciler-wake".to_string())
+            .target_ref("main".to_string())
+            .workspace_slug("flotilla".to_string())
+            .subpaths(Vec::new())
+            .build()])
+        .change_request(BoundChangeRequest::builder().id("1364".to_string()).repository_ref(repo_ref).title("wake".to_string()).build())
+        .build();
+    // The launch is Landing before the watcher boots.
+    let launch = standard_landing(&backend, &home, "wake", spec).await;
+    let convoys = backend.clone().using::<Convoy>("flotilla");
 
-    let controller = convoy_controller(&backend, &home, &table, cadence.stale_after);
+    let controller = convoy_controller(&backend, &home, &table, Some(cadence.stale_after));
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -117,7 +51,6 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
         table.rows().await.iter().any(|row| row.freshness_demand.is_some()),
         "Landing settlement must demand fresh targeted observations"
     );
-    let convoys = backend.using::<Convoy>("flotilla");
     assert_eq!(convoys.get(&launch).await.expect("open convoy").status.expect("status").phase, ConvoyPhase::Landing);
     let change_requests = backend.using::<ChangeRequest>("flotilla");
     let record_name = cr_name("github.com", "flotilla-org/flotilla", 1364);
@@ -134,7 +67,16 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
     assert_eq!(change_request.spec.observing_authority, "authority");
 
     source.merged.store(true, Ordering::SeqCst);
-    landed(&backend, &launch, "leaf fire must enqueue reconcile without waiting for hourly resync").await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if convoys.get(&launch).await.expect("convoy").status.expect("status").phase == ConvoyPhase::Landed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("leaf fire must enqueue reconcile without waiting for hourly resync");
     controller.abort();
 }
 
@@ -203,10 +145,21 @@ async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
         cadence,
     );
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
-    let launch = landing_launch(&backend, &home, "no-cr", convoy_spec(), ExitDeclaration::standard_table()).await;
-    let controller = convoy_controller(&backend, &home, &table, cadence.stale_after);
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let launch = standard_landing(&backend, &home, "no-cr", convoy_spec()).await;
+    let controller = convoy_controller(&backend, &home, &table, None);
 
-    let status = landed(&backend, &launch, "zero-subject convoy should claim-exit").await;
+    let status = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = convoys.get(&launch).await.expect("convoy").status.expect("status");
+            if status.phase == ConvoyPhase::Landed {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("zero-subject convoy should claim-exit");
     assert_eq!(status.disposition.as_deref(), Some("claim"));
     // The wake follows the landing in its own task: once it has, no leaf stays armed.
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -219,8 +172,6 @@ async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
     controller.abort();
 }
 
-// A launch's spec is fixed at admission, so a change request is bound late by an operator
-// linking it once the crew's promises are kept.
 #[tokio::test]
 async fn change_request_bound_after_claims_instantiates_and_settles() {
     let (backend, home) = engine_backend();
@@ -232,33 +183,32 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
         freshness_demanded: Duration::from_millis(20),
         stale_after: Duration::from_secs(60),
     };
-    // This daemon, a host with a heartbeat, observes the change requests no other declares an
-    // observer for.
-    use flotilla_resources::{Host, HostSpec, HostStatus};
-    let hosts = backend.using::<Host>("flotilla");
-    let host = hosts.create(&InputMeta::builder().name("this-host".into()).build(), &HostSpec::default()).await.expect("host");
-    let ready = HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() };
-    hosts.update_status("this-host", &host.metadata.resource_version, &ready).await.expect("host heartbeat");
-    let authority = backend.local_root().expect("local root").to_string();
-    let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), authority, source.clone(), cadence);
+    let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
-    let launch =
-        landing_launch(&backend, &home, "adopt-late", repository_spec("feature/adopt-late", None), ExitDeclaration::standard_table()).await;
-    let adopted = flotilla_protocol::Subject {
+    let spec = ConvoySpec::builder()
+        .workflow_ref("workflow".to_string())
+        .repositories(vec![ConvoyRepositorySpec::builder()
+            .url("https://github.com/flotilla-org/flotilla".to_string())
+            .repo_ref(RepositoryKey("repo".to_string()))
+            .source_ref("feature/adopt-late".to_string())
+            .target_ref("main".to_string())
+            .workspace_slug("flotilla".to_string())
+            .subpaths(Vec::new())
+            .build()])
+        .build();
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    // The crew's work is kept, and the launch Landing, before its PR is bound: an operator links
+    // it as what the launch produces.
+    let launch = standard_landing(&backend, &home, "adopt-late", spec).await;
+    let pr = flotilla_protocol::Subject {
         kind: flotilla_protocol::SubjectKind::ChangeRequest,
         source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
         id: "1391".into(),
     };
-    let convoy = home.view(&backend, &launch).await;
-    home.engine().link(&convoy, &adopted, SubjectDiscoverySource::Operator, "operator").await.expect("bind CR after claims");
+    let landing = convoys.get(&launch).await.expect("landing launch");
+    home.engine().link(&landing, &pr, SubjectDiscoverySource::Operator, "operator").await.expect("bind CR after claims");
 
-    // The link reopens the launch with the PR its crew now owes: the launch's subjects, not
-    // landing settlement, demand that PR's observation.
-    let demands = tokio::spawn({
-        let table = table.clone();
-        async move { table.watch_change_request_convoy_demands("flotilla").await }
-    });
-    let controller = convoy_controller(&backend, &home, &table, cadence.stale_after);
+    let controller = convoy_controller(&backend, &home, &table, Some(cadence.stale_after));
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if !table.rows().await.is_empty() {
@@ -270,10 +220,23 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
     .await
     .expect("late binding should instantiate exit leaves");
     source.merged.store(true, Ordering::SeqCst);
-    let status = landed(&backend, &launch, "late-bound CR should settle").await;
+    let status = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = convoys.get(&launch).await.expect("convoy").status.expect("status");
+            if status.phase == ConvoyPhase::Landed {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let Ok(status) = status else {
+        let held = convoys.get(&launch).await.expect("held convoy").status;
+        let records = backend.using::<ChangeRequest>("flotilla").list().await.expect("records").items;
+        panic!("late-bound CR should settle: {held:?}; rows {:?}; records {records:?}", table.rows().await);
+    };
     assert_eq!(status.disposition.as_deref(), Some("merged"));
     controller.abort();
-    demands.abort();
 }
 
 // #3140: a stalled crew must resume once per merged PR even with another
@@ -287,13 +250,13 @@ async fn stalled_merged_unclaimed_crew_resumes_with_open_promises() {
     }
 }
 
-// #3651 operator recovery: a retracted submission does not restore settlement
-// demand after explicit unlink, including after restart. Another launch's live
-// subject still demands the very same PR.
+// #3651 operator recovery: an old retracted submission and refusal do not
+// restore settlement demand after explicit unlink, including after restart.
+// Another convoy's live subject still demands the very same PR.
 #[hegel::test]
 fn retracted_unlinked_submission_does_not_recreate_observation(tc: hegel::TestCase) {
     use flotilla_resources::convoy::engine::Actor;
-    use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission};
+    use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, Submission};
     use flotilla_resources::{ChangeRequestSpec, ChangeRequestSubjectHistory};
     let other_holder = tc.draw(hegel::generators::booleans());
     let reconciliations = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
@@ -303,56 +266,73 @@ fn retracted_unlinked_submission_does_not_recreate_observation(tc: hegel::TestCa
         let convoys = backend.using::<Convoy>("flotilla");
         let address = flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/rigging", 70, &[]).unwrap();
         let subject = flotilla_resources::address::subject_for(&address).unwrap();
-        let spec = ConvoySpec::builder().workflow_ref("single-agent".into()).role("coder".into()).build();
-        // The coder owes only a decision ledger: its PR promise is the one it submits.
-        let launch = home.admit("mistaken-submission", spec, ledger_owed()).await;
-        let vessel = home.vessel(&launch, "work", "env");
-        home.seat(&backend, &launch, (&vessel, "work"), ("coder", "mistaken-coder"), CrewWorkPhase::Working).await;
-        // The coder submits the wrong PR; an operator retracts it, keeping its audit history, and
-        // unlinks the subject.
-        let convoy = home.view(&backend, &launch).await;
-        let submission = PromiseOperation::Submit {
-            id: "mistaken-pr".into(),
-            kind: PromiseKind::Pr,
-            source: PromiseSource::Crew,
-            submission: Submission {
-                reference: "cr/github.com/flotilla-org/rigging/70".into(),
-                metadata: BTreeMap::new(),
-                submitted_at: Utc::now(),
-                verdict: None,
-            },
-        };
-        home.engine().promise(&convoy, "work", "coder", &submission, Actor::Crew).await.expect("the mistaken submission");
-        let convoy = home.view(&backend, &launch).await;
-        home.engine().verdict(&convoy, "mistaken-pr", false, "operator", "incorrect PR number").await.expect("retract the submission");
-        let convoy = home.view(&backend, &launch).await;
-        home.engine().link(&convoy, &subject, SubjectDiscoverySource::Claim, "crew").await.expect("the claimed subject");
-        let convoy = home.view(&backend, &launch).await;
-        home.engine().unlink(&convoy, &subject, "operator").await.expect("unlink the subject");
-        let convoy = home.view(&backend, &launch).await;
-        let status = convoy.status.as_ref().unwrap();
-        let retracted =
-            flotilla_resources::promises::owned(status, "work", "coder").iter().find(|promise| promise.id == "mistaken-pr").unwrap();
-        assert_eq!(retracted.state, PromiseState::Retracted);
-        assert_eq!(retracted.submissions.len(), 1, "the retraction keeps the mistaken reference");
+        let status = ConvoyStatus { workflow_snapshot: Some(stock_snapshot("single-agent")), ..Default::default() };
+        let mistaken = home.admit("mistaken-submission", ConvoySpec::builder().workflow_ref("single-agent".into()).build(), status).await;
+        let mistaken = mistaken.as_str();
+        let vessel = home.vessel(mistaken, "work", "env");
+        home.seat(&backend, mistaken, (&vessel, "work"), ("coder", "mistaken-coder"), CrewWorkPhase::Working).await;
+        // The coder submitted the wrong PR, and an operator retracted it. Its audit history stays.
+        let operations = [
+            (Actor::Crew, PromiseOperation::Submit {
+                id: "mistaken-pr".into(),
+                kind: PromiseKind::Pr,
+                source: PromiseSource::Crew,
+                submission: Submission {
+                    reference: "cr/github.com/flotilla-org/rigging/70".into(),
+                    metadata: BTreeMap::new(),
+                    submitted_at: Utc::now(),
+                    verdict: None,
+                },
+            }),
+            (Actor::Operator { principal: "operator".into() }, PromiseOperation::Retract { id: "mistaken-pr".into(), reason: "incorrect PR number".into() }),
+        ];
+        for (actor, operation) in &operations {
+            let convoy = convoys.get(mistaken).await.unwrap();
+            home.engine().promise(&convoy, "work", "coder", operation, actor.clone()).await.expect("the coder's promise");
+        }
+        let convoy = convoys.get(mistaken).await.unwrap();
+        home.engine().link(&convoy, &subject, SubjectDiscoverySource::Claim, "crew").await.expect("the crew claims the PR");
+        let convoy = convoys.get(mistaken).await.unwrap();
+        home.engine().unlink(&convoy, &subject, "operator").await.expect("the operator unlinks it");
+        // The coder owes nothing else: the operator rules its other promises kept.
+        home.keep(&backend, mistaken, "work", "coder").await;
+        let status = convoys.get(mistaken).await.unwrap().status.unwrap();
+        // Decode the old refusal shape, which the current writer no longer emits.
+        let mut stored = serde_json::to_value(&status).unwrap();
+        stored["crew_work"]["work"]["coder"]["completion_refusal"] = serde_json::json!({
+            "expectation": "cr/github.com/flotilla-org/rigging/70", "consecutive_count": 2,
+            "causes": [{"kind": "missing_change_request_observation", "service": "github.com", "scope": "flotilla-org/rigging", "number": 70}]
+        });
+        let restored: ConvoyStatus = serde_json::from_value(stored).unwrap();
+        assert!(restored.crew_work["work"]["coder"].completion_refusal.is_some());
+        let convoy = convoys.get(mistaken).await.unwrap();
         assert!(flotilla_resources::expected_change_request_leaves(&convoy, &[]).unwrap().is_empty());
-        assert!(!flotilla_resources::promises::needs_observation(status, PromiseKind::Pr));
-        assert!(!flotilla_resources::promises::pending(status, "work", "coder").contains(&"mistaken-pr".to_string()));
+        assert!(
+            !flotilla_resources::promises::needs_observation(&restored, PromiseKind::Pr),
+            "{:?} {:?}",
+            restored.promises,
+            restored.subjects
+        );
+        assert!(flotilla_resources::promises::pending(&restored, "work", "coder").is_empty(), "{:?}", restored.promises);
 
         let mut history = vec![ChangeRequestSubjectHistory::builder()
             .namespace("flotilla".into())
-            .convoy(launch.clone())
+            .convoy(mistaken.into())
             .origin("fleet".into())
             .relationship(flotilla_protocol::Relationship::Produces)
             .role("coder".into())
             .last_seen(Utc::now())
             .build()];
         if other_holder {
-            let other = landing_other_holder(&backend, &home).await;
-            let convoy = home.view(&backend, &other).await;
-            home.engine().link(&convoy, &subject, SubjectDiscoverySource::Operator, "operator").await.expect("the other launch's subject");
+            let spec = ConvoySpec::builder().workflow_ref("single-agent".into()).build();
+            let other = standard_landing(&backend, &home, "other-holder", spec).await;
+            let convoy = convoys.get(&other).await.unwrap();
+            home.engine().link(&convoy, &subject, SubjectDiscoverySource::Operator, "operator").await.expect("the other holder's PR");
+            // As the refresher records a launch's link: by its project, with no role.
             let mut entry = history[0].clone();
             entry.convoy = other;
+            entry.role = String::new();
+            entry.project = Some("flotilla".into());
             history.push(entry);
         }
         let name = cr_name("github.com", "flotilla-org/rigging", 70);
@@ -365,7 +345,7 @@ fn retracted_unlinked_submission_does_not_recreate_observation(tc: hegel::TestCa
                     .scope("flotilla-org/rigging".into())
                     .number(70)
                     .observing_authority("authority".into())
-                    .subject_of(history.clone())
+                    .subject_of(history)
                     .build(),
             )
             .await
@@ -374,10 +354,12 @@ fn retracted_unlinked_submission_does_not_recreate_observation(tc: hegel::TestCa
         let refresher = &wake.subscriptions.inner.change_requests;
         refresher.garbage_collect_orphans().await.unwrap();
         for _ in 0..reconciliations {
-            let snapshot = convoys.list().await.unwrap().items.into_iter().map(|c| (c.metadata.name.clone(), c)).collect::<HashMap<_, _>>();
+            let mut snapshot = convoys.list().await.unwrap().items.into_iter().map(|c| (c.metadata.name.clone(), c)).collect::<HashMap<_, _>>();
+            // Exercise the old decoded refusal: the current writer omits it.
+            snapshot.get_mut(mistaken).unwrap().status = Some(restored.clone());
             wake.sync_rows("flotilla", &snapshot).await.unwrap();
             for row in wake.subscriptions.rows().await {
-                if matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy } if *convoy == launch) {
+                if matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy } if convoy == mistaken) {
                     assert!(!row.leaves.iter().any(|leaf| matches!(leaf.address, LeafAddress::ChangeRequest { number: 70, .. })));
                 }
             }
@@ -385,20 +367,13 @@ fn retracted_unlinked_submission_does_not_recreate_observation(tc: hegel::TestCa
             tokio::time::advance(Duration::from_secs(16 * 60)).await;
             assert_eq!(requests.get(&name).await.is_ok(), other_holder, "unheld record must stay absent after polling");
             if other_holder {
-                // The other launch's live demand records its own history beside the one written
-                // here; only the unlinked launch's is released.
                 let record = requests.get(&name).await.unwrap();
-                assert!(!record.spec.subject_of.is_empty());
-                assert!(record.spec.subject_of.iter().all(|entry| entry.convoy == history[1].convoy), "{:?}", record.spec.subject_of);
+                assert_eq!(record.spec.subject_of.len(), 1, "{:?}", record.spec.subject_of);
+                assert!(record.spec.subject_of[0].convoy.starts_with("other-holder"));
             }
         }
         for row in wake.subscriptions.rows().await {
             wake.subscriptions.finish(row.id).await;
         }
     });
-}
-
-/// Another launch, landing, that will hold the same PR.
-async fn landing_other_holder(backend: &ResourceBackend, home: &EngineHome) -> String {
-    landing_launch(backend, home, "other-holder", convoy_spec(), ExitDeclaration::standard_table()).await
 }

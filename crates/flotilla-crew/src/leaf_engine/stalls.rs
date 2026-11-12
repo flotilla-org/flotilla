@@ -287,10 +287,18 @@ fn empty_row_evidence(status: &ConvoyStatus) -> String {
 }
 
 pub(super) fn stalled_source_actor(condition: &StalledCondition) -> Option<(&str, &str)> {
-    let leaf = condition.leaves.first()?;
-    let LeafAddress::Work { work, .. } = &leaf.address else { return None };
-    let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
-    Some((work, role))
+    condition.seat()
+}
+
+/// Whether the seat a stall is about still reads Stalled: a seat that handed its work back, failed
+/// or settled has resolved its own stall, whatever other rows remain.
+fn declared_seat_stalled(status: &ConvoyStatus, stall: &StalledCondition) -> bool {
+    stall.seat().and_then(|(vessel, role)| status.crew_work.get(vessel)?.get(role)).is_some_and(|work| work.phase == CrewWorkPhase::Stalled)
+}
+
+/// The stall crew `role@vessel` declared, while its note is open.
+fn declared_stall<'a>(status: &'a ConvoyStatus, vessel: &str, role: &str) -> Option<&'a StalledCondition> {
+    status.stalled.as_ref().filter(|stall| stall.source == StallEvidenceSource::Crew && stall.seat() == Some((vessel, role)))
 }
 
 /// Shared by supervisor delivery and the operator backstop, so both identify
@@ -692,7 +700,9 @@ impl ReconcilerWake {
                         || (status.phase == ConvoyPhase::Active
                             && actionable_rows > 0
                             && (stalled.supervisor.is_some()
-                                || (stalled.rung == StallRung::Operator && stalled.source == StallEvidenceSource::Crew)))
+                                || (stalled.rung == StallRung::Operator
+                                    && stalled.source == StallEvidenceSource::Crew
+                                    && declared_seat_stalled(status, stalled))))
                 })
                 .cloned()
         };
@@ -1100,8 +1110,11 @@ impl ReconcilerWake {
                     || session.is_some_and(|session| {
                         session.status.as_ref().is_none_or(|status| status.phase == TerminalSessionPhase::Starting)
                     }));
-            if crew_phase == Some(CrewWorkPhase::Stalled) {
-                Err((status.crew_work[vessel][role].message.clone().unwrap_or_else(|| "crew stalled".into()), StallEvidenceSource::Crew))
+            if let Some(declared) = declared_stall(status, vessel, role) {
+                // The crew's own stall note, whichever rung it has reached: its report, not the
+                // diagnostics the judge added to the note's evidence.
+                let report = status.crew_work[vessel][role].message.clone().unwrap_or_else(|| declared.evidence.clone());
+                Err((report, StallEvidenceSource::Crew))
             } else if status.phase == ConvoyPhase::Landing
                 && status.work.get(vessel).is_some_and(|work| work.phase == WorkPhase::Complete)
                 && session.is_none_or(|session| {
@@ -1614,9 +1627,7 @@ impl ReconcilerWake {
         nudges: usize,
     ) -> Result<Result<(), String>, String> {
         let StallTick { namespace, now, .. } = tick;
-        let declared_stall =
-            status.crew_work.get(vessel).and_then(|crew| crew.get(role)).is_some_and(|crew| crew.phase == CrewWorkPhase::Stalled);
-        let obligation = if declared_stall {
+        let obligation = if declared_stall(status, vessel, role).is_some() {
             "Your stall is recorded. What changed since your report? If the blocker persists, update the stall with new evidence; if it has cleared, ask your supervisor to resume you.".into()
         } else {
             actor_obligation(leaf)?

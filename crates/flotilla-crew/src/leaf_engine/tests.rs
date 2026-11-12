@@ -172,6 +172,69 @@ impl observation::ChangeRequestObservationSource for CountingChangeRequests {
     }
 }
 
+/// A caller's wait, on connection `connection_id`, for launch `launch` to fail.
+fn overload_row(connection_id: uuid::Uuid, launch: &str) -> LeafSubscriptionRow {
+    LeafSubscriptionRow {
+        id: uuid::Uuid::new_v4(),
+        namespace: "flotilla".into(),
+        leaves: vec![leaf(LeafAddress::Convoy { name: launch.into() }, ".status.phase", "Failed")],
+        watcher: LeafWatcher::WaitCaller { connection_id },
+        maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
+        freshness_demand: None,
+        created_at: Utc::now(),
+        episode_key: EpisodeKeyFields::default(),
+    }
+}
+
+async fn overload_demand(table: &LeafSubscriptionTable, id: uuid::Uuid) {
+    table
+        .inner
+        .change_requests
+        .demand(
+            id,
+            ChangeRequestKey::new(
+                "flotilla",
+                flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 1, &[]).expect("address"),
+            )
+            .expect("key"),
+            None,
+        )
+        .await
+        .expect("refresher demand");
+    assert_eq!(table.inner.change_requests.active_demands().await, 1);
+}
+
+/// 300 writes to one change-request record, outrunning the store's bounded watch ring. The
+/// engine's launches reach the router through their own feed, which conflates and never
+/// overflows, so the router's watch is lost through the store's kinds it also watches.
+async fn overload_store(backend: &ResourceBackend) {
+    let records = backend.using::<ChangeRequest>("flotilla");
+    let name = cr_name("github.com", "org/load", 2);
+    let spec = |authority: String| {
+        flotilla_resources::ChangeRequestSpec::builder()
+            .service("github.com".into())
+            .scope("org/load".into())
+            .number(2)
+            .observing_authority(authority)
+            .build()
+    };
+    let mut object = match records.get(&name).await {
+        Ok(object) => object,
+        Err(_) => records.create(&InputMeta::builder().name(name.clone()).build(), &spec("load".into())).await.expect("load record"),
+    };
+    for index in 0..300 {
+        object = records
+            .update(&InputMeta::from(&object.metadata), &object.metadata.resource_version, &spec(format!("load-{index}")))
+            .await
+            .expect("overload write");
+    }
+}
+
+/// Changes launch `launch` as its view reads, through a note no leaf reads: an event on it.
+async fn touch(backend: &ResourceBackend, home: &EngineHome, launch: &str) {
+    home.note(backend, launch, |status| status.branch_subject_scan_at = Some(Utc::now())).await;
+}
+
 fn convoy_spec() -> ConvoySpec {
     ConvoySpec::builder().workflow_ref("workflow".to_string()).build()
 }
@@ -281,20 +344,14 @@ impl Case {
     /// Waits until `wake`'s views have heard the work's launch as it now reads: a judge skips a
     /// launch whose view lags, until the watch catches up.
     async fn caught_up(&self, wake: &ReconcilerWake) {
-        let current = self.convoy().await.metadata.resource_version;
-        let cell = wake.views("flotilla").await.expect("views");
-        let views = cell.get().expect("initialized views");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let heard = views.convoys.shared_named(&self.work).await.expect("view");
-                if heard.iter().any(|read| read.object.metadata.resource_version == current) {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the views hear the launch");
+        caught_up(wake, &self.convoy().await).await;
+    }
+
+    /// `wake` judges the work's launch at `now`, once its views have heard the launch as it reads.
+    async fn judge(&self, wake: &ReconcilerWake, now: DateTime<Utc>) {
+        let convoy = self.convoy().await;
+        caught_up(wake, &convoy).await;
+        wake.judge_stalls_at("flotilla", &HashMap::from([(self.work.clone(), convoy)]), now).await.expect("judge scenario");
     }
 
     /// The launch of the governor the case was given as `name`.
@@ -456,7 +513,7 @@ async fn observe_actor_source(
 ) {
     observe_session(&case.home, "resumed-coder", Some(TerminalAttention { state, as_of: now, source }));
     observe_agent(&case.home, "resumed-coder", state, source, now);
-    wake.judge_stalls_at("flotilla", &case.objects().await, now).await.expect("judge scenario");
+    case.judge(wake, now).await;
 }
 
 /// This home observes `attention` of session `session`'s running launch.
@@ -750,7 +807,8 @@ async fn promise_less_crew_stall_survives_judge_ticks() {
         let objects = case.objects().await;
         case.wake.sync_rows("flotilla", &objects).await.expect("sync resolved rows");
         case.wake.judge_stalls_at("flotilla", &objects, now + chrono::Duration::seconds(5)).await.expect("judge resolution");
-        assert!(case.status().await.stalled.is_none(), "resolved {resolved:?}");
+        let status = case.status().await;
+        assert!(status.stalled.is_none(), "resolved {resolved:?} at {:?}: {:?}", status.phase, status.stalled);
     }
 }
 
@@ -882,6 +940,8 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
     let base = Utc::now() - chrono::Duration::seconds(2);
     let records = backend.using::<ChangeRequest>("flotilla");
     let name = cr_name("github.com", "flotilla-org/flotilla", 2596);
+    // The home's Host is the forge's only observer, so the record is its own: a foreign
+    // authority would be taken over, and its observation dropped, once a row demands it.
     records
         .create(
             &InputMeta::builder().name(name.clone()).build(),
@@ -889,7 +949,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                 .service("github.com".into())
                 .scope("flotilla-org/flotilla".into())
                 .number(2596)
-                .observing_authority("authority".into())
+                .observing_authority("test-host".into())
                 .build(),
         )
         .await
@@ -908,7 +968,9 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
             "{phase:?}"
         );
     }
-    let launch = produced_pr_launch(&backend, &home, "single-agent", "coder", CrewWorkPhase::Interrupted).await;
+    // An unclaimed crew still at work. (A crew reads Interrupted only once its vessel is lost,
+    // which interrupts the launch too, and an Interrupted launch arms no rows.)
+    let launch = produced_pr_launch(&backend, &home, "single-agent", "coder", CrewWorkPhase::Working).await;
     let launch = launch.as_str();
     if stalled {
         use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, Submission};
@@ -968,6 +1030,15 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
         mergeable: Default::default(),
         review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
     };
+    // Arm this launch's rows before the PR is observed: the sync retires the earlier launches'
+    // rows, and the record they alone demanded is collected and recreated unobserved. Disarm
+    // their watches so the merged observation fires only through the deterministic evaluation
+    // below.
+    let objects = HashMap::from([(launch.to_owned(), convoys.get(launch).await.expect("convoy"))]);
+    wake.sync_rows("flotilla", &objects).await.expect("active subscriptions");
+    for task in table.inner.tasks.lock().await.drain().map(|(_, task)| task) {
+        task.abort();
+    }
     let record = records.get(&name).await.expect("record");
     let record = records.update_status(&name, &record.metadata.resource_version, &observed).await.expect("merged observation");
     if stalled {
@@ -1242,6 +1313,44 @@ async fn launch_at(backend: &ResourceBackend, home: &EngineHome, name: &str, sta
     launch
 }
 
+/// Admits `name` with `spec` and exit `exit`, its coder owing a decision ledger, starts the
+/// coder, and keeps its ledger: the launch is Landing. Returns the launch.
+async fn landing_launch(backend: &ResourceBackend, home: &EngineHome, name: &str, spec: ConvoySpec, exit: ExitDeclaration) -> String {
+    let mut status = ledger_owed();
+    status.workflow_snapshot.as_mut().expect("workflow").exit = Some(exit);
+    let launch = home.admit(name, spec, status).await;
+    let vessel = home.vessel(&launch, "work", "env");
+    let session = format!("{}-coder", launch.replace('#', "-"));
+    home.seat(backend, &launch, (&vessel, "work"), ("coder", &session), CrewWorkPhase::Working).await;
+    home.keep(backend, &launch, "work", "coder").await;
+    assert_eq!(home.view(backend, &launch).await.status.expect("status").phase, ConvoyPhase::Landing);
+    launch
+}
+
+/// The convoy reconciler over `home`'s engine, woken by `table`, observing change requests
+/// no older than `stale_after` when given it.
+fn convoy_controller(
+    backend: &ResourceBackend,
+    home: &EngineHome,
+    table: &LeafSubscriptionTable,
+    stale_after: Option<Duration>,
+) -> tokio::task::JoinHandle<Result<(), ResourceError>> {
+    let reconciler = ConvoyReconciler::new().with_lifecycle_reads(home.reads()).with_engine(home.path());
+    let reconciler = match stale_after {
+        Some(stale_after) => reconciler.with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), stale_after),
+        None => reconciler,
+    };
+    tokio::spawn(
+        ControllerLoop {
+            primary: backend.using::<Convoy>("flotilla"),
+            secondaries: vec![table.reconciler_wake_watch()],
+            reconciler,
+            backend: backend.clone(),
+        }
+        .run(),
+    )
+}
+
 /// The coder of launch `launch` submits the decision ledger it owes, at `reference`, at `at`.
 async fn submit_ledger(home: &EngineHome, backend: &ResourceBackend, launch: &str, reference: &str, at: DateTime<Utc>) {
     use flotilla_resources::promises::{owned, PromiseKind, PromiseOperation, Submission};
@@ -1263,6 +1372,29 @@ async fn submit_ledger(home: &EngineHome, backend: &ResourceBackend, launch: &st
 
 /// Whether this home's notes changed since `notes` last looked: a write the old store counted
 /// as a status update.
+/// Waits until `wake`'s views have heard `convoy` at its version, on their change events: a judge
+/// skips a launch whose view lags, until the watch catches up.
+async fn caught_up(wake: &ReconcilerWake, convoy: &ResourceObject<Convoy>) {
+    let (name, current) = (&convoy.metadata.name, &convoy.metadata.resource_version);
+    let cell = wake.views("flotilla").await.expect("views");
+    let views = cell.get().expect("initialized views");
+    let mut changes = views.convoys.subscribe_local_keys();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let heard = views.convoys.shared_named(name).await.expect("view");
+            if heard.iter().any(|read| read.object.metadata.resource_version == *current) {
+                return;
+            }
+            match changes.recv().await {
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => panic!("the convoy view stopped"),
+            }
+        }
+    })
+    .await
+    .expect("the views hear the launch");
+}
+
 fn notes_changed(notes: &mut broadcast::Receiver<String>) -> bool {
     let mut changed = false;
     loop {
@@ -1297,27 +1429,30 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
         )
         .await
         .expect("PR record");
-    // Pending roles await handoff, and settled/failed roles must not be reopened by CI/review
-    // probes. Each phase is a launch whose seat's facts read so.
+    // Pending roles await handoff, and handed-back or failed roles must not be reopened by CI/review
+    // probes. A Done seat has claimed by keeping its promises, and its landing launch still gets
+    // check failures and actionable reviews after the claim (#3108 Q5). Each phase is a launch
+    // whose seat's facts read so.
     let mut inactive = Vec::new();
     for phase in [CrewWorkPhase::Pending, CrewWorkPhase::Done, CrewWorkPhase::HandedBack, CrewWorkPhase::Failed] {
         let launch = produced_pr_launch(&backend, &home, workflow, role, phase).await;
         let updated = convoys.get(&launch).await.expect("inactive crew");
         wake.sync_rows("flotilla", &HashMap::from([(launch.clone(), updated)])).await.expect("inactive subscriptions");
-        assert!(
-            !table.rows().await.iter().any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { rule, .. }
-            if matches!(flotilla_resources::legacy_field_path(&rule.on.path).as_str(), ".checks" | ".review.actionable-at-head"))),
-            "{phase:?}"
-        );
-        inactive.push((phase, launch));
+        let armed = table.rows().await.iter().any(|row| {
+            matches!(&row.watcher, LeafWatcher::TurnDelivery { rule, .. }
+            if matches!(flotilla_resources::legacy_field_path(&rule.on.path).as_str(), ".checks" | ".review.actionable-at-head"))
+        });
+        // A Done reviewer beside a coder still pending leaves its launch Active, where a claimed
+        // seat is not probed.
+        let landing = convoys.get(&launch).await.expect("inactive crew").status.expect("status").phase == ConvoyPhase::Landing;
+        assert_eq!(armed, phase == CrewWorkPhase::Done && landing, "{phase:?}");
+        inactive.push((phase, launch, landing));
     }
-    let mut launch = String::new();
-    for phase in [CrewWorkPhase::Interrupted, CrewWorkPhase::Working] {
-        launch = produced_pr_launch(&backend, &home, workflow, role, phase).await;
-        let updated = convoys.get(&launch).await.expect("active crew");
-        wake.sync_rows("flotilla", &HashMap::from([(launch.clone(), updated)])).await.expect("active subscriptions");
-        assert!(table.rows().await.iter().any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { rule, .. } if rule.to.role == role && flotilla_resources::legacy_field_path(&rule.on.path) == ".checks")), "{phase:?}");
-    }
+    // A working crew. (An Interrupted crew's launch is Interrupted too, and arms no rows.)
+    let launch = produced_pr_launch(&backend, &home, workflow, role, CrewWorkPhase::Working).await;
+    let updated = convoys.get(&launch).await.expect("active crew");
+    wake.sync_rows("flotilla", &HashMap::from([(launch.clone(), updated)])).await.expect("active subscriptions");
+    assert!(table.rows().await.iter().any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { rule, .. } if rule.to.role == role && flotilla_resources::legacy_field_path(&rule.on.path) == ".checks")));
     let launch = launch.as_str();
     let objects = HashMap::from([(launch.to_owned(), convoys.get(launch).await.expect("convoy"))]);
     // Drive each evaluation deterministically, using the same evaluator and
@@ -1424,7 +1559,8 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
         task.abort();
     }
     // A cached checks row cannot reopen an inactive role, even for a new
-    // settled head that has no delivery episode yet.
+    // settled head that has no delivery episode yet. At a Done seat of a landing
+    // launch the head settled after its claim, so the cached row delivers.
     loop {
         let current = records.get(&name).await.expect("record");
         let mut observed = current.status.expect("observation");
@@ -1436,12 +1572,13 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
             Err(error) => panic!("observe inactive head: {error}"),
         }
     }
-    let requests_before = actuator.requests.lock().expect("requests").len();
+    let mut requests_before = actuator.requests.lock().expect("requests").len();
     let holds_before = actuator.holds.load(Ordering::SeqCst);
-    for (phase, inactive) in &inactive {
+    for (phase, inactive, landing) in &inactive {
         // Keep the old row armed to model delivery racing its removal: it fires for a launch
         // whose seat no longer works.
         table.deliver_turn(row.id, inactive, source, rule, &row.leaves[0]).await.expect("ignore cached inactive row");
+        requests_before += usize::from(*phase == CrewWorkPhase::Done && *landing);
         assert_eq!(actuator.requests.lock().expect("requests").len(), requests_before, "{phase:?}");
         assert_eq!(actuator.holds.load(Ordering::SeqCst), holds_before, "{phase:?}");
         let current = convoys.get(inactive).await.expect("convoy").status.expect("status");

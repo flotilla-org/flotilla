@@ -26,7 +26,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{
     machines::{
         awaiting_reply::{AwaitingReply, AwaitingReplySpec},
-        convoy::{AbandonCause, Convoy, ConvoySpec, ConvoyState, LinkSource, PromiseSource},
+        convoy::{AbandonCause, Convoy, ConvoySpec, ConvoyState, LinkSource, Progress, PromiseSource},
     },
     Resource,
 };
@@ -280,7 +280,14 @@ fn record(read: &mut Read<'_>, convoy: Resource<Convoy>, home: &str, version: u6
         }) || spec.seats.iter().any(|row| row.record.parent.as_ref() == Some(&name));
         let subject = seat_address(&project, convoy.name(), &seat.role)
             .map_err(|error| StoreError::Stream(format!("convoy {}'s seat {}: {error}", convoy.name(), seat.role)))?;
-        let record = SeatRecord { failed: seat.failed.clone(), handed_back, stalled: stalled(read, &subject)? };
+        let kept_at = spec
+            .promises
+            .iter()
+            .map(|row| &row.record)
+            .filter(|promise| promise.owner == name && promise.progress.value == Progress::Kept)
+            .map(|promise| time(promise.progress.since))
+            .max();
+        let record = SeatRecord { failed: seat.failed.clone(), handed_back, stalled: stalled(read, &subject)?, kept_at };
         seats.entry(work).or_default().insert(role, record);
     }
 

@@ -23,23 +23,20 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
             .workspace_slug("flotilla".to_string())
             .subpaths(Vec::new())
             .build()])
-        // An engine view names no placed checkout (its works carry no placement), so the
-        // launch's checkout is the one it adopted (#3108).
+        // A view's works carry no placement, so the checkout a convoy expects is one it adopts.
         .adopted_checkout_refs(BTreeMap::from([(repo_ref.clone(), "remote-checkout".to_string())]))
         .build();
+    // The authority's launch, its work done: Landing.
+    let cross_host = landing_launch(&authority, &home, "cross-host", spec, ExitDeclaration::standard_table()).await;
     let convoys = authority.clone().using::<Convoy>("flotilla");
-    // The coder's work is done: it kept the ledger it owed, and the launch is landing.
-    let mut status = ledger_owed();
-    status.workflow_snapshot.as_mut().expect("workflow").exit = Some(ExitDeclaration::standard_table());
-    let launch = home.admit("cross-host", spec, status).await;
-    let launch = launch.as_str();
-    home.vessel(launch, "work", "env");
-    home.keep(&authority, launch, "work", "coder").await;
-    assert_eq!(home.view(&authority, launch).await.status.expect("status").phase, ConvoyPhase::Landing);
 
-    // The remote host's checkout, which the engine holds for the launch, inspected there: not
-    // landed, its branch associated with change request 1364 (#3108).
-    let checkout = home.engine.checkouts.put_ready(
+    // The remote host's checkout, which it holds for the authority's launch, inspected there: not
+    // landed, its branch associated with change request 1364. The remote's log reaches the
+    // authority as a peer's does (#3108).
+    let remote_home = flotilla_provisioning_testkit::other_home_for(home.service(), "remote-root");
+    flotilla_provisioning_testkit::replicate_home(home.service(), "authority-root", remote_home.service());
+    let remote_checkouts = flotilla_provisioning_testkit::CheckoutFixture::over("remote-root", remote_home.service().store());
+    let launch = remote_checkouts.put_ready(
         "remote-checkout",
         &CheckoutSpec::Observed(ObservedCheckoutSpec {
             r#ref: "feature/reconciler-wake".to_string(),
@@ -48,11 +45,13 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
             host_ref: "remote".to_string(),
             is_main: false,
         }),
-        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(launch.to_owned())),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(cross_host.clone())),
     );
     let inspection =
         flotilla_resources::checkout_records::Inspection { landed: Some(false), change_request: Some(1364), ..Default::default() };
-    home.engine.checkouts.checkouts.inspected(&checkout, inspection).expect("record remote checkout CR evidence");
+    use flotilla_resources::checkout_records::CheckoutRecords as _;
+    remote_checkouts.checkouts.inspected(&launch, inspection).expect("record remote checkout CR evidence");
+    remote_home.replicate_to(home.service());
 
     let remote_records = remote.using::<ChangeRequest>("flotilla");
     let record_name = cr_name("github.com", "flotilla-org/flotilla", 1364);
@@ -114,22 +113,11 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
         cadence,
     );
     let table = engine_table(authority.clone(), &home, broadcast_test_sink(event_tx), refresher);
-    let controller = tokio::spawn(
-        ControllerLoop {
-            primary: convoys.clone(),
-            secondaries: vec![table.reconciler_wake_watch()],
-            reconciler: ConvoyReconciler::new()
-                .with_lifecycle_reads(home.reads())
-                .with_engine(home.path())
-                .with_change_requests(authority.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
-            backend: authority.clone(),
-        }
-        .run(),
-    );
+    let controller = convoy_controller(&authority, &home, &table, Some(cadence.stale_after));
     // The checkout's inspection names the open change request: the convoy produces it.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let status = convoys.get(launch).await.expect("convoy").status.expect("status");
+            let status = convoys.get(&cross_host).await.expect("convoy").status.expect("status");
             if status.produces_any(|subject| subject.id == "1364") {
                 break;
             }
@@ -141,7 +129,7 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
     publish(flotilla_resources::ObservedChangeRequestState::Merged).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if convoys.get(launch).await.expect("convoy").status.expect("status").phase == ConvoyPhase::Landed {
+            if convoys.get(&cross_host).await.expect("convoy").status.expect("status").phase == ConvoyPhase::Landed {
                 break;
             }
             tokio::task::yield_now().await;

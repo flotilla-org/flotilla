@@ -49,6 +49,8 @@ pub struct SeatRecord {
     pub handed_back: bool,
     /// An open AwaitingReply is raised about it.
     pub stalled: bool,
+    /// When the last of the promises it owns was kept; none while none is.
+    pub kept_at: Option<DateTime<Utc>>,
 }
 
 /// One launch of a convoy, as its home's engine holds it, in the old shapes its readers take.
@@ -99,6 +101,9 @@ pub struct CrewNotes {
     pub pending_follow_up: Option<flotilla_protocol::ResourceRef>,
     pub resumed_at: Option<DateTime<Utc>>,
     pub resume_brief_id: Option<String>,
+    /// What the crew said when it declared its stall. The stall note's evidence also gathers the
+    /// judge's delivery diagnostics, so the report is kept apart from it.
+    pub stall_report: Option<String>,
 }
 
 /// What the convoy's home observes of one launch, in memory (owner's ruling: local observations
@@ -164,6 +169,9 @@ impl ConvoyNotes {
                 state.pending_follow_up = noted.pending_follow_up;
                 state.resumed_at = noted.resumed_at;
                 state.resume_brief_id = noted.resume_brief_id;
+                if state.phase == CrewWorkPhase::Stalled {
+                    state.message = noted.stall_report.or(state.message.take());
+                }
             }
         }
     }
@@ -177,6 +185,8 @@ impl ConvoyNotes {
         self.branch_subject_scan_at = status.branch_subject_scan_at;
         self.branch_subject_scan_error.clone_from(&status.branch_subject_scan_error);
         self.target_mismatches.clone_from(&status.target_mismatches);
+        let declared =
+            status.stalled.as_ref().filter(|stall| stall.source == crate::StallEvidenceSource::Crew).and_then(StalledCondition::seat);
         self.crew = status
             .crew_work
             .iter()
@@ -189,6 +199,10 @@ impl ConvoyNotes {
                             pending_follow_up: state.pending_follow_up.clone(),
                             resumed_at: state.resumed_at,
                             resume_brief_id: state.resume_brief_id.clone(),
+                            stall_report: state
+                                .message
+                                .clone()
+                                .filter(|_| state.phase == CrewWorkPhase::Stalled && declared == Some((work.as_str(), role.as_str()))),
                         };
                         (role.clone(), noted)
                     })
@@ -249,7 +263,13 @@ impl ConvoyRecord {
         })
     }
 
-    fn crew_readings(&self, working: &BTreeSet<(String, String)>) -> BTreeMap<String, BTreeMap<String, CrewReading>> {
+    /// Each seat's reading. A seat is stalled while a stall is raised about it: replicated as its
+    /// open stall AwaitingReply, or the home's open stall note, whichever rung it is at.
+    fn crew_readings(
+        &self,
+        working: &BTreeSet<(String, String)>,
+        notes: Option<&ConvoyNotes>,
+    ) -> BTreeMap<String, BTreeMap<String, CrewReading>> {
         let mut readings: BTreeMap<String, BTreeMap<String, CrewReading>> = BTreeMap::new();
         for (work, roles) in &self.promises {
             for (role, owned) in roles {
@@ -266,16 +286,34 @@ impl ConvoyRecord {
                 reading.stalled = seat.stalled;
             }
         }
+        if let Some((work, role)) = notes.and_then(|notes| notes.stall.as_ref()).and_then(StalledCondition::seat) {
+            readings.entry(work.to_owned()).or_default().entry(role.to_owned()).or_default().stalled = true;
+        }
         for (work, role) in working {
             readings.entry(work.clone()).or_default().entry(role.clone()).or_default().working = true;
         }
         readings
     }
 
+    /// The claim seat `(work, role)` made by settling its promises: when the last of them was
+    /// kept, and the decision ledger it submitted. None while any is unsettled or none was kept.
+    fn claim(&self, work: &str, role: &str) -> Option<(DateTime<Utc>, Option<String>)> {
+        let owned = self.promises.get(work)?.get(role)?;
+        if owned.iter().any(|promise| !promise.state.terminal()) {
+            return None;
+        }
+        let at = self.seats.get(work)?.get(role)?.kept_at?;
+        let ledger = owned
+            .iter()
+            .filter(|promise| promise.state == promises::PromiseState::Kept && promise.kind == promises::PromiseKind::DecisionLedger)
+            .find_map(|promise| promise.submissions.last().map(|submission| submission.reference.clone()));
+        Some((at, ledger))
+    }
+
     /// The launch as an old Convoy object in `namespace`, its phases derived from `joins`.
     pub fn read_view(&self, namespace: &str, joins: ConvoyJoins<'_>) -> ResourceObject<Convoy> {
         let snapshot = &self.admission.workflow_snapshot;
-        let readings = self.crew_readings(joins.working);
+        let readings = self.crew_readings(joins.working, joins.notes);
         let vessels: BTreeMap<String, VesselReading> = joins.works.iter().map(|(work, facts)| (work.clone(), facts.reading)).collect();
         let derived = view::derive(&ConvoyFacts { ended: self.end(), snapshot, vessels: &vessels, crew: &readings });
         let notes = joins.notes.cloned().unwrap_or_default();
@@ -311,6 +349,8 @@ impl ConvoyRecord {
                     .map(|(role, phase)| {
                         let noted = notes.crew.get(work).and_then(|roles| roles.get(role)).cloned().unwrap_or_default();
                         let failed = self.seats.get(work).and_then(|seats| seats.get(role)).and_then(|seat| seat.failed.clone());
+                        // A Done seat's claim is its settled promises; nothing of it is stored.
+                        let (claimed_at, decision_ledger_ref) = self.claim(work, role).filter(|_| *phase == CrewWorkPhase::Done).unzip();
                         let state = CrewWorkState::builder()
                             .task_assigned(noted.task_assigned)
                             .maybe_pending_follow_up(noted.pending_follow_up)
@@ -322,7 +362,9 @@ impl ConvoyRecord {
                             })
                             .maybe_resumed_at(noted.resumed_at)
                             .maybe_resume_brief_id(noted.resume_brief_id)
-                            .maybe_message(failed)
+                            .maybe_finished_at(claimed_at)
+                            .maybe_decision_ledger_ref(decision_ledger_ref.flatten())
+                            .maybe_message(failed.or(noted.stall_report.filter(|_| *phase == CrewWorkPhase::Stalled)))
                             .build();
                         (role.clone(), state)
                     })

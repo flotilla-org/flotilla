@@ -34,9 +34,17 @@ async fn sync_snapshot(backend: &ResourceBackend, wake: &ReconcilerWake) -> bool
         .any(|row| matches!(&row.maker, LeafMaker::Controller { resource_kind, .. } if resource_kind == "Convoy"))
 }
 
+/// Change request `number` of github.com/team/one, as a launch links it.
+fn team_one_request(number: u64) -> flotilla_protocol::Subject {
+    flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "team/one".into() },
+        id: number.to_string(),
+    }
+}
+
 // #3710: every merged field and empty claim exits remain final. Unchanged
-// evidence is evaluated once; a new revision of the launch invalidates its
-// cached proof.
+// evidence is evaluated once; a change of the launch invalidates its cached proof.
 #[hegel::test]
 fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestCase) {
     let field = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4));
@@ -60,6 +68,7 @@ fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestC
                     .build()];
                 spec.change_request = Some(BoundChangeRequest::builder().id("1".into()).repository_ref(repo).title("test".into()).build());
             }
+            let convoys = backend.using::<Convoy>("flotilla");
             let exit = if field == 3 {
                 ExitDeclaration::standard_table()
             } else {
@@ -74,13 +83,7 @@ fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestC
                     .unwrap(),
                 )]))
             };
-            // The coder kept the ledger it owed: the launch is landing.
-            let mut status = ledger_owed();
-            status.workflow_snapshot.as_mut().unwrap().exit = Some(exit);
-            let launch = home.admit("cached", spec, status).await;
-            home.vessel(&launch, "work", "env");
-            home.keep(&backend, &launch, "work", "coder").await;
-            assert_eq!(home.view(&backend, &launch).await.status.unwrap().phase, ConvoyPhase::Landing);
+            let cached = landing_launch(&backend, &home, "cached", spec, exit).await;
             if field != 3 {
                 let records = backend.using::<ChangeRequest>("flotilla");
                 let name = cr_name("github.com", "team/one", 1);
@@ -118,9 +121,13 @@ fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestC
             clock.advance(chrono::Duration::seconds(181));
             assert!(sync_snapshot(&backend, &wake).await);
             assert_eq!(calls(), before);
-            // A new revision of the launch: its home notes a branch scan. Its exit is frozen at
-            // admission, so the proof holds again once re-evaluated.
-            home.note(&backend, &launch, |status| status.branch_subject_scan_at = Some(now)).await;
+            // The launch changes: an operator links another change request and unlinks it. Its
+            // exit is fixed at admission, so the settlement stays final, evaluated once again.
+            let other = team_one_request(2);
+            let current = convoys.get(&cached).await.unwrap();
+            home.engine().link(&current, &other, SubjectDiscoverySource::Operator, "operator").await.unwrap();
+            let current = convoys.get(&cached).await.unwrap();
+            home.engine().unlink(&current, &other, "operator").await.unwrap();
             assert!(sync_snapshot(&backend, &wake).await);
             assert_eq!(calls(), before + 1);
         }
@@ -128,13 +135,13 @@ fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestC
 }
 
 // One stale episode consults the observer schedule only once. Lag evidence is
-// stable across ticks, so unchanged lag does not write the launch's notes every
-// second; a fresh observation clears it and allows a new episode to read a schedule.
+// stable across ticks, so unchanged lag does not write the convoy every second;
+// a fresh observation clears it and allows a new episode to read a schedule.
 #[tokio::test]
 async fn stale_episode_reads_one_schedule_and_does_not_rewrite_lag() {
     let (backend, home) = engine_backend();
     let wake = supervision_wake(&backend, &home);
-    let launch = launch_at(&backend, &home, "lag", ledger_owed(), ConvoyPhase::Landing).await;
+    let lag = landing_launch(&backend, &home, "lag", convoy_spec(), ExitDeclaration::standard_table()).await;
     let start = Utc::now();
     let id = uuid::Uuid::new_v4();
     wake.subscriptions.inner.rows.lock().await.insert(
@@ -143,7 +150,7 @@ async fn stale_episode_reads_one_schedule_and_does_not_rewrite_lag() {
             id,
             namespace: "flotilla".into(),
             leaves: vec!["cr/github.com/team/one/1 .state == merged".parse().unwrap()],
-            watcher: LeafWatcher::ReconcilerWake { convoy: launch.clone() },
+            watcher: LeafWatcher::ReconcilerWake { convoy: lag.clone() },
             maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
             freshness_demand: Some(start),
             created_at: start,
@@ -152,15 +159,22 @@ async fn stale_episode_reads_one_schedule_and_does_not_rewrite_lag() {
     );
     let convoys = backend.using::<Convoy>("flotilla");
     let mut notes = home.engine().memory().subscribe();
+    // Each judgement waits for the views to hear the launch as it now reads, or it skips it.
+    let current = || async {
+        let convoy = convoys.get(&lag).await.unwrap();
+        caught_up(&wake, &convoy).await;
+        HashMap::from([(lag.clone(), convoy)])
+    };
     for age in [0, 19, 21, 22, 23, 24] {
-        let objects = HashMap::from([(launch.clone(), convoys.get(&launch).await.unwrap())]);
+        let objects = current().await;
         wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
         assert_eq!(wake.subscriptions.inner.change_requests.grace_schedule_reads(), 1);
-        let current = convoys.get(&launch).await.unwrap();
+        let current = convoys.get(&lag).await.unwrap();
         assert_eq!(current.status.unwrap().stalled.is_some(), age >= 20);
-        let changed = notes_changed(&mut notes);
+        // The stall is a note on the launch: once written, unchanged lag writes nothing.
+        let noted = notes_changed(&mut notes);
         if age >= 22 {
-            assert!(!changed, "unchanged lag must not write at age {age}");
+            assert!(!noted, "unchanged lag rewrote the launch at {age}s");
         }
     }
     let records = backend.using::<ChangeRequest>("flotilla");
@@ -185,77 +199,64 @@ async fn stale_episode_reads_one_schedule_and_does_not_rewrite_lag() {
         )
         .await
         .unwrap();
-    let objects = HashMap::from([(launch.clone(), convoys.get(&launch).await.unwrap())]);
+    let objects = current().await;
     wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(24)).await.unwrap();
-    assert!(convoys.get(&launch).await.unwrap().status.unwrap().stalled.is_none());
+    assert!(convoys.get(&lag).await.unwrap().status.unwrap().stalled.is_none());
     wake.subscriptions.inner.rows.lock().await.get_mut(&id).unwrap().freshness_demand = Some(start + chrono::Duration::seconds(25));
-    let objects = HashMap::from([(launch.clone(), convoys.get(&launch).await.unwrap())]);
+    let objects = current().await;
     wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(25)).await.unwrap();
     assert_eq!(wake.subscriptions.inner.change_requests.grace_schedule_reads(), 2);
 }
 
 // A remote event must not materialize the replica inventory in the leaf engine.
-// 320 launches of another home carry a 30 KB workflow/brief-sized payload and
-// reach this home as that home's log does; setup is outside timing.
+// 320 bodies carry a 30 KB workflow/brief-sized payload; setup is outside timing.
 #[tokio::test]
 async fn replica_event_work_measurement() {
-    use flotilla_resources::convoy::engine::Actor;
-    use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource};
     use flotilla_store_testkit::ReadCountsBackendExt;
     let (backend, home) = engine_backend();
-    let elsewhere = ResourceBackend::new(InMemoryBackend::default());
-    let remote = EngineHome::install(&elsewhere, "flotilla", "remote");
+    // The launches are another daemon's, heard here as its log arrives.
+    let remote_backend = ResourceBackend::new(InMemoryBackend::default());
+    let remote = EngineHome::install(&remote_backend, "flotilla", "remote");
+    let mut spec = convoy_spec();
+    spec.instruction = Some("x".repeat(30_000));
     let mut launches = Vec::new();
     for index in 0..320 {
-        let mut spec = convoy_spec();
-        spec.instruction = Some("x".repeat(30_000));
-        let launch = remote.admit(&format!("replica-{index}"), spec, ledger_owed()).await;
-        remote.vessel(&launch, "work", "env");
-        launches.push(launch);
+        launches.push(remote.admit(&format!("replica-{index}"), spec.clone(), ledger_owed()).await);
     }
     flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", home.service());
-    let counted = backend.clone().with_read_counts();
+    let replicas = backend.including_replicas::<Convoy>("flotilla");
+    assert_eq!(replicas.list().await.unwrap().items.len(), 320, "the remote's launches are heard here");
+    let counted = backend.with_read_counts();
     let wake = supervision_wake(&counted, &home);
     wake.local_convoys("flotilla").await.unwrap();
     let cell = wake.views("flotilla").await.unwrap();
     let view = &cell.get().unwrap().convoys;
-    let replicas = backend.including_replicas::<Convoy>("flotilla");
     let before = view.materialized_objects();
     let reads = counted.read_snapshot();
     let started = std::time::Instant::now();
+    let other = team_one_request(1);
     for index in 0..20 {
-        // Each event is the remote coder's next promise, heard here as that home's log arrives.
-        let before_event = replicas.get(&launches[0]).await.expect("the replica").object.metadata.resource_version;
-        eprintln!("replica before event {index}: {before_event}");
-        let changed = remote.view(&elsewhere, &launches[0]).await;
-        let operation =
-            PromiseOperation::Declare { id: format!("event-{index}"), kind: PromiseKind::DecisionLedger, source: PromiseSource::Crew };
-        remote.engine().promise(&changed, "work", "coder", &operation, Actor::Crew).await.expect("the remote coder's promise");
-        flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", home.service());
-        let heard = replicas.get(&launches[0]).await.expect("the replica").object.metadata.resource_version;
-        let caught = tokio::time::timeout(Duration::from_secs(2), async {
-            while !view.shared_named(&launches[0]).await.unwrap().iter().any(|read| read.object.metadata.resource_version == heard) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        if caught.is_err() {
-            let held = view.shared_named(&launches[0]).await.unwrap();
-            let held = held
-                .iter()
-                .map(|read| (read.object.metadata.resource_version.clone(), format!("{:?}", read.provenance)))
-                .collect::<Vec<_>>();
-            panic!("the leaf's view hears the remote event {index}: replica at {heard}, view at {held:?}");
+        // Each event is an edge on the remote's first launch: an operator links a change request,
+        // or unlinks it.
+        let changed = remote.view(&remote_backend, &launches[0]).await;
+        if index % 2 == 0 {
+            remote.engine().link(&changed, &other, SubjectDiscoverySource::Operator, "operator").await.unwrap();
+        } else {
+            remote.engine().unlink(&changed, &other, "operator").await.unwrap();
         }
+        flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", home.service());
         assert!(wake.local_convoys("flotilla").await.unwrap().is_empty());
     }
     let copied = view.materialized_objects() - before;
     eprintln!("replica leaf: bodies/event={}, elapsed/event={:?}", copied / 20, started.elapsed() / 20);
     counted.read_snapshot().since(&reads).assert_zero("replica leaf event");
     assert_eq!(copied, 0, "replicas must never materialize owned inventory bodies");
+    let listed = replicas.list().await.unwrap().items;
+    let heard = listed.into_iter().find(|source| source.object.metadata.name == launches[0]).expect("the first launch").object;
+    assert!(heard.status.unwrap().unlinked_subjects.contains(&other), "the last event is heard here");
 }
 
-// A keyed change derives only that launch's standing rows. An empty selection
+// A keyed change derives only that Convoy's standing rows. An empty selection
 // does nothing, and a deleted key prunes without re-evaluating other parents.
 #[tokio::test]
 async fn row_sync_evaluates_only_selected_convoys() {

@@ -7,7 +7,7 @@ use super::{ConvoyEnd, ConvoyJoins, ConvoyNotes, ConvoyRecord, CrewNotes, SeatRe
 use crate::{
     convoy::{
         admission::AdmissionDocument,
-        promises::{Promise, PromiseKind, PromiseSource, PromiseState},
+        promises::{Promise, PromiseKind, PromiseSource, PromiseState, Submission, SubmissionVerdict},
         view::VesselReading,
         ConvoyAttention, ConvoyPhase, CrewWorkPhase, WorkPhase, WorkflowSnapshot,
     },
@@ -204,4 +204,86 @@ fn a_launch_reads_its_verdicts_and_how_it_ended() {
     assert_eq!((status.phase, status.disposition.as_deref(), status.finished_at), (ConvoyPhase::Landed, Some("landed"), Some(at(300))));
     assert_eq!(status.work["work"].phase, WorkPhase::Complete);
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
+}
+
+// Behaviour (#3108 Q1): a crew's declared stall is the home's open stall note, at the operator
+// rung with no AwaitingReply about the seat. The seat reads Stalled with the crew's own report,
+// which the judge's diagnostics on the note's evidence do not change; once the note is cleared
+// the seat works again.
+#[test]
+fn a_stall_note_stalls_its_seat_at_any_rung() {
+    let record = record(PromiseState::Open);
+    let live = BTreeSet::from([seat("work", "coder")]);
+    let working = record.working(&live, None);
+    let view = |notes: &ConvoyNotes| {
+        record.read_view("flotilla", ConvoyJoins { works: &ready(), working: &working, notes: Some(notes) }).status.expect("status")
+    };
+    let mut notes = ConvoyNotes::default();
+    let declare = crate::external_patches::mark_crew_stalled(
+        "fix-it#7".into(),
+        "work".into(),
+        "coder".into(),
+        at(150),
+        crate::StallReason::Other,
+        None,
+        "needs decision".into(),
+    );
+    notes.apply(&view(&notes), &declare);
+    notes.stall.as_mut().expect("the stall note").evidence.push_str("; supervisor delivery failed: gone");
+
+    let status = view(&notes);
+    let coder = &status.crew_work["work"]["coder"];
+    assert_eq!(notes.stall.as_ref().map(|stall| stall.rung), Some(crate::StallRung::Operator));
+    assert_eq!((coder.phase, coder.message.as_deref()), (CrewWorkPhase::Stalled, Some("needs decision")));
+    assert_eq!(status.work["work"].phase, WorkPhase::Stalled);
+
+    notes.apply(&status, &crate::ConvoyStatusPatch::SetStalled { condition: None });
+    let status = view(&notes);
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working, "the cleared note stalls nothing");
+    assert_eq!(status.crew_work["work"]["coder"].message, None);
+}
+
+fn submitted(reference: &str, kept_at: Option<DateTime<Utc>>) -> Submission {
+    Submission {
+        reference: reference.into(),
+        metadata: BTreeMap::new(),
+        submitted_at: at(140),
+        verdict: kept_at.map(|at| SubmissionVerdict { accepted: true, who: "engine".into(), at, why: "kept".into() }),
+    }
+}
+
+// Behaviour (#3108 Q5): a seat's claim is derived from its promises. Once all are settled, the
+// seat reads finished when the last was kept, with the decision ledger it submitted; while one
+// is still unsettled it has no claim.
+#[test]
+fn a_seat_claims_when_its_last_promise_is_kept() {
+    let mut record = record(PromiseState::Kept);
+    let promises = record.promises.get_mut("work").and_then(|roles| roles.get_mut("coder")).expect("coder's promises");
+    promises[0].submissions = vec![submitted("https://github.com/o/r/pull/1", Some(at(150)))];
+    let mut ledger = promise("coder", PromiseState::Submitted);
+    ledger.id = "template/decision-ledger".into();
+    ledger.kind = PromiseKind::DecisionLedger;
+    ledger.submissions = vec![submitted("decision-ledger-fix-it-7", None)];
+    promises.push(ledger);
+    let kept_at = |at| {
+        BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), SeatRecord { kept_at: Some(at), ..SeatRecord::default() })]))])
+    };
+    record.seats = kept_at(at(150));
+    let none = BTreeSet::new();
+
+    let status = record.read_view("flotilla", ConvoyJoins { works: &ready(), working: &none, notes: None }).status.expect("status");
+    let coder = &status.crew_work["work"]["coder"];
+    assert_ne!(coder.phase, CrewWorkPhase::Done);
+    assert_eq!((coder.finished_at, coder.decision_ledger_ref.as_deref()), (None, None), "no claim while the ledger is unsettled");
+
+    let ledger = &mut record.promises.get_mut("work").and_then(|roles| roles.get_mut("coder")).expect("coder's promises")[1];
+    ledger.state = PromiseState::Kept;
+    ledger.submissions = vec![submitted("decision-ledger-fix-it-7", Some(at(170)))];
+    record.seats = kept_at(at(170));
+    let status = record.read_view("flotilla", ConvoyJoins { works: &ready(), working: &none, notes: None }).status.expect("status");
+    let coder = &status.crew_work["work"]["coder"];
+    assert_eq!(coder.phase, CrewWorkPhase::Done);
+    assert_eq!(coder.finished_at, Some(at(170)), "claimed when the last promise was kept");
+    assert_eq!(coder.decision_ledger_ref.as_deref(), Some("decision-ledger-fix-it-7"));
+    assert_eq!(status.phase, ConvoyPhase::Landing);
 }
