@@ -799,10 +799,17 @@ struct ReplicaTurnSetup<'a> {
     observer: &'a ResourceBackend,
     name: &'a str,
     id: uuid::Uuid,
-    observed_at: Option<DateTime<Utc>>,
+    /// When set, the observation is older than the placeholder yet newer than this instant.
+    older_than_placeholder_after: Option<DateTime<Utc>>,
 }
 
 impl ReplicaTurnSetup<'_> {
+    /// Called once the placeholder exists, so a midpoint is older than it.
+    fn observed_at(&self) -> DateTime<Utc> {
+        let now = Utc::now();
+        self.older_than_placeholder_after.map_or(now, |after| after + (now - after) / 2)
+    }
+
     async fn observe_issue(&self, issues: &IssueRefresher) -> DateTime<Utc> {
         let home = self.home;
         let observer = self.observer;
@@ -814,7 +821,7 @@ impl ReplicaTurnSetup<'_> {
         )
         .unwrap();
         let mut spec = demand_placeholder_spec::<Issue>(home, name, issues.demand(id, key, None)).await;
-        let observed_at = self.observed_at.unwrap_or_else(Utc::now);
+        let observed_at = self.observed_at();
         spec.observing_authority = "observer".into();
         let observed = publish_remote_observation::<Issue>(
             home,
@@ -846,7 +853,7 @@ impl ReplicaTurnSetup<'_> {
         )
         .unwrap();
         let mut spec = demand_placeholder_spec::<ChangeRequest>(home, name, refresher.demand(id, key, None)).await;
-        let observed_at = self.observed_at.unwrap_or_else(Utc::now);
+        let observed_at = self.observed_at();
         spec.observing_authority = "observer".into();
         let observed = publish_remote_observation::<ChangeRequest>(
             home,
@@ -996,12 +1003,16 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
                 let status = convoys.get(launch).await.unwrap().status.unwrap();
                 assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
             }
+            // A launch starts, and its coder claims, when admitted: evidence older than that is
+            // never a turn, so an older-than-placeholder observation still follows it.
+            let status = convoys.get(launch).await.unwrap().status.unwrap();
+            let judged = status.crew_work["work"]["coder"].finished_at.or(status.started_at).expect("launch started");
             let setup = ReplicaTurnSetup {
                 home: &home,
                 observer: &observer,
                 name: &name,
                 id,
-                observed_at: newer_placeholder.then_some(base + chrono::Duration::seconds(1)),
+                older_than_placeholder_after: newer_placeholder.then_some(judged),
             };
             let (kind, observed_at) = if is_issue {
                 (ObjectKind::Issue, setup.observe_issue(&issues).await)

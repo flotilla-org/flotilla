@@ -191,7 +191,7 @@ impl EngineHome {
         let convoy = self.view(backend, launch).await;
         let engine = self.engine();
         match phase {
-            ConvoyPhase::Landed => engine.deliver(&convoy).await,
+            ConvoyPhase::Landed => engine.deliver(&convoy, "claim").await,
             ConvoyPhase::Failed => engine.fail(&convoy, "operator", "failed").await,
             ConvoyPhase::Abandoned => engine.abandon(&convoy, "operator", "abandoned").await,
             other => panic!("{other:?} is no ending"),

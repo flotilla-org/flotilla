@@ -1817,6 +1817,7 @@ fn engine_table(
 }
 
 mod change_request_authority;
+mod interrupted_stalls;
 mod settlement;
 #[cfg(any())]
 mod stalls_supervision;

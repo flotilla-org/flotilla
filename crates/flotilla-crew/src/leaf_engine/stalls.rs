@@ -355,6 +355,19 @@ pub(super) fn is_merged_settlement_probe(leaf: &Leaf) -> bool {
         && leaf.literal == "merged"
 }
 
+/// The launch has not ended: its crews work, including while a vessel is interrupted.
+pub(super) fn launch_underway(phase: ConvoyPhase) -> bool {
+    matches!(phase, ConvoyPhase::Active | ConvoyPhase::Interrupted)
+}
+
+/// Whether `role`'s own session in work `vessel` stopped. Every seat of an interrupted vessel reads
+/// Interrupted; the Vessel names the roles whose sessions stopped.
+fn seat_interrupted(vessels: &BTreeMap<String, ResourceObject<flotilla_resources::Vessel>>, vessel: &str, role: &str) -> bool {
+    vessels.values().any(|object| {
+        object.spec.vessel_name == vessel && object.status.as_ref().is_some_and(|status| status.interrupted_roles.contains(role))
+    })
+}
+
 /// Workflow-declared checks, review and merged settlement rules run during active crew work too,
 /// including custom rules. Merged settlement also resumes stalled crews so they
 /// can resolve remaining promises and claim completion; conflict probes retain
@@ -381,7 +394,7 @@ pub(super) fn is_active_change_request_probe(
         || is_merged_settlement_probe(leaf)
         || (matches!(leaf.address, LeafAddress::ChangeRequest { .. })
             && matches!(leaf.field_path.as_str(), ".checks" | ".review.actionable-at-head"));
-    status.phase == ConvoyPhase::Active
+    launch_underway(status.phase)
         && active_field
         && status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role)).is_some_and(|work| {
             work.finished_at.is_none()
@@ -679,12 +692,12 @@ impl ReconcilerWake {
             && !retry_exhausted
             && !able
             && !progress_changed
-            && status.phase == ConvoyPhase::Active
+            && launch_underway(status.phase)
             && actionable_rows > 0
         {
             return Ok(());
         }
-        let next = if holding && !able && !unknown && (status.phase != ConvoyPhase::Active || actionable_rows > 0) {
+        let next = if holding && !able && !unknown && (!launch_underway(status.phase) || actionable_rows > 0) {
             let condition = self
                 .next_stall_condition(tick, convoy, status, &selected_sessions, &mut obligations, unable.as_ref(), &policy, retry_exhausted)
                 .await?;
@@ -697,7 +710,7 @@ impl ReconcilerWake {
                     // The Convoy controller owns a capacity wait: it sets and
                     // clears it as the host's slots change (#4038).
                     stalled.cause == Some(flotilla_resources::StallCause::Capacity)
-                        || (status.phase == ConvoyPhase::Active
+                        || (launch_underway(status.phase)
                             && actionable_rows > 0
                             && (stalled.supervisor.is_some()
                                 || (stalled.rung == StallRung::Operator
@@ -721,7 +734,7 @@ impl ReconcilerWake {
         let StallTick { namespace, .. } = tick;
         let (selected_sessions, selected_vessels) = self.observe_crew_progress(tick, convoy).await?;
         let mut obligations = status.nudge_obligations.clone();
-        let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing);
+        let holding = launch_underway(status.phase) || status.phase == ConvoyPhase::Landing;
         if holding {
             self.observe_turn_hook_health(tick, convoy, status, &selected_sessions).await?;
         }
@@ -845,7 +858,7 @@ impl ReconcilerWake {
         let mut selected_checkouts: Option<BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>> = None;
         let convoy_rows = rows.iter().filter(|row| {
                 row.namespace == namespace
-                    && (status.phase != ConvoyPhase::Active || !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }))
+                    && (!launch_underway(status.phase) || !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }))
                     && matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy: name } | LeafWatcher::TurnDelivery { convoy: name, .. } if name == &convoy.metadata.name)
             }).collect::<Vec<_>>();
         obligations.retain(|obligation| match &obligation.maker {
@@ -880,6 +893,13 @@ impl ReconcilerWake {
                 })
             }) {
                 continue;
+            }
+            // A seat whose own session stopped is interrupted, not stalled: its relaunch is its
+            // path. Live seats of the same launch are still judged.
+            if let LeafMaker::Actor { vessel, role } = &row.maker {
+                if seat_interrupted(selected_vessels, vessel, role) {
+                    continue;
+                }
             }
             actionable_rows += 1;
             let judgement = match &row.maker {

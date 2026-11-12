@@ -41,10 +41,6 @@ use super::{
 /// The role a decider outside the convoy is named by in an edge's `by`.
 const OPERATOR: &str = "operator";
 
-/// The disposition of a delivery the old convoy's landing drives: the old
-/// path records no more than that it landed.
-const DELIVERED: &str = "landed";
-
 /// This home's engine-first Convoy writer, in the old shape.
 pub struct ConvoyEngine {
     convoys: Arc<Convoys>,
@@ -428,10 +424,15 @@ impl EngineConvoys for ConvoyEngine {
         .await
     }
 
-    async fn deliver(&self, convoy: &ResourceObject<OldConvoy>) -> Result<(), String> {
-        self.edit(convoy, |current, _| {
+    async fn deliver(&self, convoy: &ResourceObject<OldConvoy>, disposition: &str) -> Result<(), String> {
+        let disposition = disposition.to_owned();
+        self.edit(convoy, move |current, _| {
             Ok((
-                if current.label() == ConvoyLabel::Delivered { Vec::new() } else { vec![Deliver { disposition: DELIVERED.into() }.into()] },
+                if current.label() == ConvoyLabel::Delivered {
+                    Vec::new()
+                } else {
+                    vec![Deliver { disposition: disposition.clone() }.into()]
+                },
                 (),
             ))
         })
