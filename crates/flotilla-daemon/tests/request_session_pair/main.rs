@@ -4561,19 +4561,21 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
     });
     terminals.ready(&launch, "capabilities-terminal", &Default::default());
     if remote {
-        // The leader routes by the owner's launches, which reach it with the owner's log.
-        flotilla_provisioning_testkit::replicate_home(
-            &topology.follower.decided_store().expect("owner decided store"),
-            topology.follower.node_id().as_str(),
-            &topology.leader.decided_store().expect("leader decided store"),
-        );
+        // The leader routes by the owner's launches, which reach it with the owner's log over the
+        // topology's own change streams. A copy sent beside them races their rounds: a round
+        // staged before the launch installs after it and resets the home without it.
+        let sessions = topology.leader.resource_backend().including_replicas::<TerminalSession>("flotilla");
+        eventually(Duration::from_secs(5), Duration::from_millis(10), "the owner's session should replicate to the leader", || async {
+            sessions.get("capabilities-terminal").await.is_ok_and(|read| matches!(read.provenance, ResourceProvenance::Replica { .. }))
+        })
+        .await;
         apply_convoy_replica_feed(&topology.follower, "flotilla", &convoy, topology.leader_host.clone()).await;
         // The convoy reaches the owner with the leader's log.
-        flotilla_provisioning_testkit::replicate_home(
-            &topology.leader.decided_store().expect("leader decided store"),
-            topology.leader.node_id().as_str(),
-            &topology.follower.decided_store().expect("owner decided store"),
-        );
+        let convoys = topology.follower.resource_backend().including_replicas::<Convoy>("flotilla");
+        eventually(Duration::from_secs(5), Duration::from_millis(10), "the convoy should replicate to the owner", || async {
+            convoys.get(&convoy).await.is_ok()
+        })
+        .await;
     }
     let context = CrewCommandContext::builder()
         .namespace("flotilla".into())
