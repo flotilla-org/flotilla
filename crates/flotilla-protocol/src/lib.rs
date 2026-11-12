@@ -290,7 +290,7 @@ pub use commands::{
     ConvoyExplanation, ConvoyNaming, ConvoyStartIntent, CrewSupervisionAction, DispatchPromiseRequest, EvidenceFreshness,
     ExplainedAccessDelivery, ExplainedAccountBinding, ExplainedAccountProvision, ExplainedArtifact, ExplainedChangeRequest,
     ExplainedCheckout, ExplainedClone, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedDeliveredNeed,
-    ExplainedDeliveryRetry, ExplainedLeafFiring, ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription,
+    ExplainedDeliveryRetry, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription,
     ExplainedTerminalCondition, ExplainedUnclaimedWork, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PromiseOwner,
     RepoSelector, ResourceCursor, ResourceDigest, ResourceDigestQuery, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
     ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition, StallReason, StepStatus, TurnDeliveryRung,

@@ -1635,17 +1635,6 @@ impl ReadProjections<'_> {
             .collect::<Vec<_>>();
         crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));
 
-        let lifecycle_mutations = convoy
-            .status
-            .as_ref()
-            .into_iter()
-            .flat_map(|status| &status.lifecycle_mutations)
-            .map(|mutation| flotilla_protocol::ExplainedLifecycleMutation {
-                action: mutation.action.clone(),
-                caller: mutation.caller.clone(),
-                at: mutation.at.to_rfc3339(),
-            })
-            .collect();
         let pinned_workflow = self
             .backend
             .definitions::<WorkflowTemplate>(namespace)
@@ -1837,7 +1826,6 @@ impl ReadProjections<'_> {
             decision_ledgers,
             artifacts,
             settlement,
-            lifecycle_mutations,
             account_bindings: account_binding_evidence(self.accounts, namespace, &convoy.metadata.name).await?,
             access_deliveries: access_delivery_evidence(self.backend, self.lifecycles, namespace, &convoy.metadata.name).await?,
         };

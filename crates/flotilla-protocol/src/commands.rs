@@ -500,8 +500,6 @@ pub struct ConvoyExplanation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ExplainedArtifact>,
     pub settlement: ExplainedSettlement,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lifecycle_mutations: Vec<ExplainedLifecycleMutation>,
 }
 
 /// One requester's account binding (#3907): which managed credential and account it selected,
@@ -607,13 +605,6 @@ pub struct ExplainedArtifact {
     pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view_url: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExplainedLifecycleMutation {
-    pub action: String,
-    pub caller: crate::CommandCaller,
-    pub at: String,
 }
 
 /// Filters for reading a daemon's host-local structured log.

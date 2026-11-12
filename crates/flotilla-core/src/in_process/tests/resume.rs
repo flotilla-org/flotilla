@@ -445,14 +445,12 @@ async fn claimed_resume_command_reports_outcome_and_audits_explicit_reopen() {
             // reopens a kept promise, so the kept work stays Landing; the audit is a log line.
             assert!(status.crew_work["work"]["coder"].resume_brief_id.is_some());
             assert_eq!(status.phase, flotilla_resources::ConvoyPhase::Landing);
-            assert!(status.lifecycle_mutations.is_empty());
         } else {
             assert_eq!(
                 result,
                 CommandValue::ConvoyBriefInformational { message: "crew already claimed; delivered without reopening".into() }
             );
             assert_eq!(status.phase, flotilla_resources::ConvoyPhase::Landing);
-            assert!(status.lifecycle_mutations.is_empty());
         }
     }
 }

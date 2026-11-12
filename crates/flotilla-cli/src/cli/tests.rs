@@ -204,7 +204,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         cascade: None,
         environment_observations: Default::default(),
         stalled: None,
-        lifecycle_mutations: Vec::new(),
         namespace: "flotilla".into(),
         convoy: "ledger".into(),
         phase: "Landing".into(),
@@ -548,7 +547,6 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         decision_ledgers: Vec::new(),
         artifacts: Vec::new(),
         settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
-        lifecycle_mutations: Vec::new(),
         account_bindings: Vec::new(),
         access_deliveries: Vec::new(),
     };

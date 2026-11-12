@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{
-    CommandCaller, IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef, Relationship, Subject,
-};
+use flotilla_protocol::{IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef, Relationship, Subject};
 pub use flotilla_protocol::{StallProposedDisposition, StallReason, StallRung, TurnDeliveryRung};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -1110,9 +1108,6 @@ pub struct ConvoyStatus {
     pub turn_deliveries: BTreeMap<String, TurnDeliveryStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<ConvoyAttention>,
-    /// Mutating lifecycle requests retained for operator explanation.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lifecycle_mutations: Vec<LifecycleMutation>,
 }
 
 // Keep one serde field definition while allowing decode-time lifecycle repair.
@@ -1311,13 +1306,6 @@ pub struct StalledCondition {
     pub proposed_disposition: Option<StallProposedDisposition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nudge_history: Vec<StallNudge>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LifecycleMutation {
-    pub action: String,
-    pub caller: CommandCaller,
-    pub at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -1870,9 +1858,6 @@ pub enum ConvoyStatusPatch {
     SetTeardownWait {
         message: String,
     },
-    RecordLifecycleMutation {
-        mutation: LifecycleMutation,
-    },
     SetPlacementDecision {
         placement_decision: PlacementDecision,
     },
@@ -2103,7 +2088,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::SetStalled { .. } => "SetStalled",
             Self::SetNudgeObligations { .. } => "SetNudgeObligations",
             Self::SetTeardownWait { .. } => "SetTeardownWait",
-            Self::RecordLifecycleMutation { .. } => "RecordLifecycleMutation",
             Self::SetPlacementDecision { .. } => "SetPlacementDecision",
             Self::Bootstrap { .. } => "Bootstrap",
             Self::BackfillCrewWork { .. } => "BackfillCrewWork",
@@ -2144,13 +2128,12 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
         // Optimistic retry can reapply a patch computed from an older phase.
         // Terminal outcomes reject stale and duplicate patches. An explicit
         // abandon may override a terminal outcome only when its caller saw
-        // that exact phase. Mutation audit records remain appendable, and
+        // that exact phase. Landing events remain appendable, and
         // SetStalled and queued-turn observations may clear stale attention.
         if status.phase.is_terminal()
             && !matches!(
                 self,
                 Self::RecordLandingEvent { .. }
-                    | Self::RecordLifecycleMutation { .. }
                     | Self::SetStalled { .. }
                     | Self::SetTeardownWait { .. }
                     | Self::ObserveQueuedTurnDeliveries { .. }
@@ -2224,13 +2207,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::SetNudgeObligations { obligations } => status.nudge_obligations = obligations.clone(),
             Self::SetTeardownWait { message } => status.message = Some(message.clone()),
-            Self::RecordLifecycleMutation { mutation } => {
-                const RETAINED_MUTATIONS: usize = 32;
-                status.lifecycle_mutations.push(mutation.clone());
-                if status.lifecycle_mutations.len() > RETAINED_MUTATIONS {
-                    status.lifecycle_mutations.remove(0);
-                }
-            }
             Self::SetPlacementDecision { placement_decision } => {
                 status.placement_decision.get_or_insert_with(|| placement_decision.clone());
             }

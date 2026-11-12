@@ -956,9 +956,6 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     for hold in &explanation.holds {
         let _ = writeln!(output, "Turn delivery: {} held since={}: {}", hold.source, hold.raised_at, hold.reason);
     }
-    for mutation in &explanation.lifecycle_mutations {
-        let _ = writeln!(output, "{} by {} at {}", mutation.action, mutation.caller, mutation.at);
-    }
     if let Some(message) = explanation.message.as_deref() {
         let _ = writeln!(output, "Message: {message}");
     }

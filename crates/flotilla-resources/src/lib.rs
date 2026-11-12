@@ -140,7 +140,7 @@ pub use convoy::{
     ConvoyAttention, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
     CrewCompletionOverride, CrewCompletionRefusal, CrewCompletionRefusalCause, CrewWorkPhase, CrewWorkState, DeclaredSubject,
     DiscoveredSubject, InputValue, InstantiatedExit, InstantiatedExitEntry, InstantiatedTurnDelivery, IssueSnapshot, LandingClaim,
-    LandingEntry, LandingTurn, LeafMaker, LifecycleMutation, NudgeObligation, PendingBrief, PendingSupervisorTurn, PlacementStatus,
+    LandingEntry, LandingTurn, LeafMaker, NudgeObligation, PendingBrief, PendingSupervisorTurn, PlacementStatus,
     QueuedTurnObservation, ResumeIntent, SettlementEvaluation, SettlementMode, SettlementSubject, StallCause, StallEvidenceSource,
     StallNudge, StallProposedDisposition, StallReason, StallRung, StallSupervisor, StalledCondition, SubjectDiscovery,
     SubjectDiscoverySource, SupersededCrewClaim, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryFailure, TurnDeliveryFailureKind,
