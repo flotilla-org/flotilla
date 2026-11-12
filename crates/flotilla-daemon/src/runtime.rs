@@ -35,9 +35,7 @@ use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
-use flotilla_resources::{
-    host_direct_environment_name, Convoy, Forge, Host, Repository, Resource, ResourceError, TerminalSession, Vessel,
-};
+use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Host, Repository, Resource, ResourceError, TerminalSession, Vessel};
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::task::AbortOnDropHandle;

@@ -2291,8 +2291,9 @@ async fn convoy_create_carries_project_ref() {
         .next()
         .expect("convoy");
     // Creation reports the launch it admitted, by its address in the linked project.
-    let address = flotilla_resources::convoy::engine::launch_address(&"project:my-project".parse().expect("project"), &convoy.metadata.name)
-        .expect("launch address");
+    let address =
+        flotilla_resources::convoy::engine::launch_address(&"project:my-project".parse().expect("project"), &convoy.metadata.name)
+            .expect("launch address");
     assert_eq!(created, CommandValue::ConvoyCreated { name: address.to_string() });
     assert_eq!(convoy.spec.project_ref.as_deref(), Some("my-project"));
     assert_eq!(convoy.spec.repositories.len(), 1);

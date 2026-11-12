@@ -559,11 +559,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
             .build()])
         .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "checkout-b".to_string())]))
         .build();
-    let convoy_name = admit_convoy(
-        &authority_daemon,
-        flotilla_engine_convoys_testkit::convoy(NAMESPACE, "cross-host", spec, status),
-    )
-    .await;
+    let convoy_name = admit_convoy(&authority_daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, "cross-host", spec, status)).await;
     // Its branch's change request is linked and its work done: it lands once evidence settles it.
     let convoys = authority_daemon.resource_backend().using::<Convoy>(NAMESPACE);
     let engine_path = authority_daemon.convoy_engine_path();
@@ -720,7 +716,12 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     assert_eq!(convoys.get(&convoy_name).await.expect("settled convoy").status.expect("convoy status").phase, ConvoyPhase::Landed);
     {
         assert!(
-            authority_daemon.lifecycle_reads().checkouts().and_then(|checkouts| checkouts.here()).expect("authority-local checkouts").is_empty(),
+            authority_daemon
+                .lifecycle_reads()
+                .checkouts()
+                .and_then(|checkouts| checkouts.here())
+                .expect("authority-local checkouts")
+                .is_empty(),
             "convoy authority A must not re-author or write the replicated checkout",
         );
     }

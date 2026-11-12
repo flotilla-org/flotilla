@@ -243,7 +243,10 @@ async fn single_crew_acts_through_the_forward() {
     .await;
     assert!(matches!(ok_response(artifact, 3), Response::ArtifactPut { .. }));
     let artifacts = fixture.daemon.resource_backend().using::<flotilla_resources::Artifact>("flotilla").list().await.expect("artifacts");
-    assert!(artifacts.items.iter().any(|artifact| artifact.spec.convoy == current_launch(&fixture.daemon, OWN.convoy) && artifact.spec.kind == "review-round"));
+    assert!(artifacts
+        .items
+        .iter()
+        .any(|artifact| artifact.spec.convoy == current_launch(&fixture.daemon, OWN.convoy) && artifact.spec.kind == "review-round"));
 
     non_crew_requests_refused(&fixture, &fixture.guest).await.expect("not crew-scoped requests are refused");
     drop(session);

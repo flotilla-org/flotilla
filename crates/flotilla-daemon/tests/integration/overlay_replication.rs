@@ -661,9 +661,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
     })
     .await
     .expect("other host receives convoy replica");
-    kiwi.discover_convoy_branch_subjects("flotilla", &convoy, "fix/crew-branch")
-        .await
-        .expect("replica host skips home-only discovery");
+    kiwi.discover_convoy_branch_subjects("flotilla", &convoy, "fix/crew-branch").await.expect("replica host skips home-only discovery");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let replica = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get(&convoy).await;
@@ -1607,7 +1605,12 @@ async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
     spec.project_ref = Some("flotilla".to_string());
     let convoy = crate::admit_convoy(
         &kiwi,
-        flotilla_engine_convoys_testkit::convoy("flotilla", "convoy-homed-on-kiwi", spec, flotilla_engine_convoys_testkit::single_agent("coder")),
+        flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "convoy-homed-on-kiwi",
+            spec,
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        ),
     )
     .await;
     // The crew runs on feta: its session is feta's engine launch, held for feta's launch of work

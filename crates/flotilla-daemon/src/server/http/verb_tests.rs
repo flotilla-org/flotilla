@@ -482,7 +482,8 @@ async fn convoy_explain_finds_a_convoy_by_its_record_name_or_role() {
     let namespace = daemon.provisioning_namespace().await;
     let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), "fix-3774".to_owned()), (PROJECT_LABEL.to_owned(), "flotilla".to_owned())]);
     let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role("fix-3774".into()).build();
-    let mut convoy = flotilla_engine_convoys_testkit::convoy(&namespace, "convoy-0123", spec, flotilla_engine_convoys_testkit::single_agent("coder"));
+    let mut convoy =
+        flotilla_engine_convoys_testkit::convoy(&namespace, "convoy-0123", spec, flotilla_engine_convoys_testkit::single_agent("coder"));
     convoy.metadata.labels = labels;
     let launch = admit_convoy(&daemon, convoy).await;
     let router =

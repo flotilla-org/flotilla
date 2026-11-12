@@ -690,22 +690,27 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     // The convoy is the engine's launch, its work `coder` running.
     let convoy_a = admit_convoy(
         &daemon,
-        flotilla_engine_convoys_testkit::convoy("flotilla", "convoy-a", convoy_spec("scratch"), ConvoyStatus {
-            phase: ResourceConvoyPhase::Active,
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement::builder()
-                    .name("coder".to_string())
-                    .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
-                    .build()],
-            }),
-            work: BTreeMap::from([("coder".to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
-            ..Default::default()
-        }),
+        flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "convoy-a",
+            convoy_spec("scratch"),
+            ConvoyStatus {
+                phase: ResourceConvoyPhase::Active,
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder()
+                        .name("coder".to_string())
+                        .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                        .build()],
+                }),
+                work: BTreeMap::from([("coder".to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+                ..Default::default()
+            },
+        ),
     )
     .await;
     // The sessions are the engine's launches, written at the daemon's home before its runtime
@@ -1117,9 +1122,7 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
             )
             .await
             .expect("workflow");
-        daemon
-            .set_repository_inspector(Arc::new(ConflictCheckoutInspector { daemon: Arc::downgrade(&daemon) }))
-            .await;
+        daemon.set_repository_inspector(Arc::new(ConflictCheckoutInspector { daemon: Arc::downgrade(&daemon) })).await;
         let result = cleanup_command_result(
             &daemon,
             CommandAction::ConvoyCreate {

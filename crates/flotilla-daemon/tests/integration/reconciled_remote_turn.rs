@@ -19,9 +19,9 @@ use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
-    ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, EnvironmentSpec,
-    ExitDeclaration, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Message,
-    MessageExpectation, Selector, TerminalSession, Vessel, VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
+    ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, EnvironmentSpec, ExitDeclaration, FulfilmentKind,
+    FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Message, MessageExpectation, Selector,
+    TerminalSession, Vessel, VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use flotilla_store::ResourceBackend;
 use futures::StreamExt;

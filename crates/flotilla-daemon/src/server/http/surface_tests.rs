@@ -536,7 +536,8 @@ impl Daemon {
     /// Admits a launch of convoy `name`, returning the launch.
     async fn convoy(&self, name: &str) -> String {
         let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
-        let convoy = flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, flotilla_engine_convoys_testkit::single_agent("coder"));
+        let convoy =
+            flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, flotilla_engine_convoys_testkit::single_agent("coder"));
         admit_convoy(&self.daemon, convoy).await
     }
 

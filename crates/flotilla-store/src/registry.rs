@@ -1011,7 +1011,11 @@ fn unknown_kind(kind: &str) -> ResourceError {
 }
 
 /// [`query_resource_kind`]'s document for a kind the engine serves.
-async fn query_engine_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, query: &crate::StoreQuery) -> Result<Value, ResourceError> {
+async fn query_engine_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    query: &crate::StoreQuery,
+) -> Result<Value, ResourceError> {
     let listed = backend.query_declared::<T>(namespace, query).await?;
     let items = listed
         .items

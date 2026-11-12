@@ -151,10 +151,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     let result = daemon
         .execute_query(
             Command::builder()
-                .action(CommandAction::QueryExplainConvoy {
-                    namespace: Some(NAMESPACE.to_string()),
-                    name: convoy.clone(),
-                })
+                .action(CommandAction::QueryExplainConvoy { namespace: Some(NAMESPACE.to_string()), name: convoy.clone() })
                 .build(),
             uuid::Uuid::new_v4(),
         )

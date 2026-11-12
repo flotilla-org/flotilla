@@ -1439,11 +1439,8 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             ..Default::default()
         };
         let spec = ConvoySpec::builder().workflow_ref("hook-test".into()).build();
-        let convoy_name = admit_convoy(
-            &daemon,
-            flotilla_engine_convoys_testkit::convoy("flotilla", &format!("hook-{harness_name}"), spec, status),
-        )
-        .await;
+        let convoy_name =
+            admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy("flotilla", &format!("hook-{harness_name}"), spec, status)).await;
         let name = format!("terminal-{harness_name}");
         let vessel = install_engine(&daemon).vessels.request(&convoy_name, "work", daemon.local_host_id().expect("local host").as_str());
         // The crew's vessel stands ready, so its convoy is active.
@@ -5115,8 +5112,8 @@ impl flotilla_discovery_api::Factory for GatedStartupEnvironmentFactory {
 #[tokio::test]
 async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() {
     use flotilla_resources::{
-        ConvoyStatus, CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
-        CredentialSpec, CredentialSpecSpec, VesselRequirement, WorkflowSnapshot,
+        ConvoyStatus, CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
+        CredentialSpecSpec, VesselRequirement, WorkflowSnapshot,
     };
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -5215,11 +5212,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
                 content: "test".into(),
                 copies: Vec::new(),
             },
-            context: Box::new(TerminalCrewContext {
-                namespace: "flotilla".into(),
-                convoy: convoy.clone(),
-                vessel_ref: vessel,
-            }),
+            context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: convoy.clone(), vessel_ref: vessel }),
         },
     };
     let terminals = runtime_terminals(&daemon);
@@ -5551,8 +5544,8 @@ async fn failed_connection_tasks_are_reaped() {
     assert!(tasks.is_empty());
 }
 
-use crate::testkits::engine::{admit_convoy, current_launch, engine as install_engine};
 pub(super) use crate::testkits::engine::engine_environments;
+use crate::testkits::engine::{admit_convoy, current_launch, engine as install_engine};
 
 pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     let (_tmp, daemon) = empty_daemon().await;

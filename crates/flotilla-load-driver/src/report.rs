@@ -326,7 +326,8 @@ impl LoadReport {
                 );
             }
             if let Some(decided) = &home.decided_store {
-                let _ = writeln!(out, "| Decided store writes | {} ({:.1}/s) |", latency(&decided.write_execution), decided.writes_per_second);
+                let _ =
+                    writeln!(out, "| Decided store writes | {} ({:.1}/s) |", latency(&decided.write_execution), decided.writes_per_second);
             }
             let _ = writeln!(out, "| Turn delivery (created → receipt) | {} |", latency(&home.turn_delivery));
             let replication = &home.replication;

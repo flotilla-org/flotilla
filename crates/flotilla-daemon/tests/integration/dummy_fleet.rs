@@ -35,9 +35,7 @@ fn in_phase(name: &str, phase: ConvoyPhase) -> impl Fn(&ResourceObject<Convoy>) 
 /// A crew stall a supervisor can act on: the crew's work and the convoy's
 /// stall condition, both published by the crew and maintained by the leaf engine.
 fn stalled(name: &str) -> impl Fn(&ResourceObject<Convoy>) -> bool + '_ {
-    convoy(name, |status| {
-        status.stalled.is_some()
-    })
+    convoy(name, |status| status.stalled.is_some())
 }
 
 /// The promises of `vessel`'s `role` in convoy `name`, as explain reads them: the engine's.
