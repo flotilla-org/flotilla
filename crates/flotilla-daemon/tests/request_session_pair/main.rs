@@ -30,6 +30,7 @@ use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_w
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_caller_and_blob_store;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_surface;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_with_replication_kinds;
+use flotilla_daemon_testkit::server::InMemoryRequestMesh;
 use flotilla_daemon_testkit::server::InMemoryRequestTopology;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_testkit::fake_discovery;
@@ -689,6 +690,12 @@ fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
             ));
         }
     });
+}
+
+async fn spawn_tombstone_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
+    // This scenario authors only sample records. Keep their real routed origin and
+    // relay watches, without unrelated resource-watch fanout on every restart.
+    spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(&[Sample::API_PATHS.kind])).await
 }
 
 #[hegel::test]
