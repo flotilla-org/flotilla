@@ -867,7 +867,7 @@ async fn capped_ssh_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
     let chosen = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind).expect("chosen candidate");
     assert_eq!((chosen.free_vessel_slots, chosen.max_vessels, chosen.available), (Some(0), Some(1), false), "{allocation:?}");
 
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
         .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
         .with_convoys(backend.including_replicas::<ResourceConvoy>("flotilla"))
         .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
@@ -1047,7 +1047,7 @@ async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order()
             .await
             .expect("admitted placement");
     }
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
         .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
         .with_convoys(backend.including_replicas::<ResourceConvoy>("flotilla"))
         .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
@@ -1194,7 +1194,7 @@ async fn all_candidates_full_means_the_convoy_waits() {
     assert!(allocation.candidates.iter().all(|candidate| !candidate.available), "{allocation:?}");
     // Equal candidates break ties by name, so the Docker host's gate is the one under test.
     assert_eq!(third.kind, "docker-feta");
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
         .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
         .with_convoys(backend.including_replicas::<ResourceConvoy>("flotilla"))
         .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));

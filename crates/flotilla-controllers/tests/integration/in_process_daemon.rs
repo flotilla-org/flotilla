@@ -10022,9 +10022,7 @@ async fn convoy_resume_milliseconds_after_complete_still_lands() {
     assert_eq!(convoys.get(&launch).await.unwrap().status.unwrap(), claimed);
     // The convoy reconciler delivers it, one edge a pass as the controller runs it.
     use flotilla_store::controller::Reconciler;
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
-        .with_engine(daemon.convoy_engine_path())
-        .with_lifecycle_reads(daemon.lifecycle_reads());
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(daemon.lifecycle_reads()).with_engine(daemon.convoy_engine_path());
     for _ in 0..3 {
         let current = convoys.get(&launch).await.unwrap();
         reconciler.prepare(&current).await.unwrap();

@@ -832,10 +832,9 @@ fn spawn_controller_loops(
                 }
                 (
                     secondaries,
-                    ConvoyReconciler::new()
+                    ConvoyReconciler::new(daemon.lifecycle_reads())
                         .with_engine(daemon.convoy_engine_path())
                         .with_messages(daemon.crew_message_path())
-                        .with_lifecycle_reads(daemon.lifecycle_reads())
                         .with_hosts(backend.including_replicas::<Host>(&namespace_string))
                         .with_convoys(backend.including_replicas::<Convoy>(&namespace_string))
                         .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))

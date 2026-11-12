@@ -2061,9 +2061,8 @@ async fn artifact_environment_reference_contract() {
         // contract. Drive the real convoy reconciler after transferring evidence.
         use flotilla_store::controller::Reconciler;
         let backend = leader.resource_backend();
-        let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
+        let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(leader.lifecycle_reads())
             .with_engine(leader.convoy_engine_path())
-            .with_lifecycle_reads(leader.lifecycle_reads())
             .with_artifacts(backend.including_replicas::<Artifact>(namespace));
         // The reconciler observes the ledger and keeps its promise on the engine, one edge a pass.
         for _ in 0..16 {
@@ -2796,10 +2795,9 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
     let controller = ControllerLoop {
         primary: placement.using::<Convoy>(namespace),
         secondaries: Vec::new(),
-        reconciler: ConvoyReconciler::new()
+        reconciler: ConvoyReconciler::new(topology.follower.lifecycle_reads())
             .with_hosts(placement.including_replicas::<Host>(namespace))
-            .with_vessels(placement.including_replicas::<Vessel>(namespace))
-            .with_lifecycle_reads(topology.follower.lifecycle_reads()),
+            .with_vessels(placement.including_replicas::<Vessel>(namespace)),
         backend: placement.clone(),
     };
     let controller_task = tokio::spawn(controller.run());

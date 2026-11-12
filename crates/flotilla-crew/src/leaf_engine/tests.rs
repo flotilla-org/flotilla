@@ -1156,8 +1156,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                 // Primary status watches drive completion rollup; use the
                 // explicit merged observation rather than a network refresher.
                 secondaries: Vec::new(),
-                reconciler: ConvoyReconciler::new()
-                    .with_lifecycle_reads(home.reads())
+                reconciler: ConvoyReconciler::new(home.reads())
                     .with_engine(home.path())
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(60)),
                 backend: backend.clone(),
@@ -1343,7 +1342,7 @@ fn convoy_controller(
     table: &LeafSubscriptionTable,
     stale_after: Option<Duration>,
 ) -> tokio::task::JoinHandle<Result<(), ResourceError>> {
-    let reconciler = ConvoyReconciler::new().with_lifecycle_reads(home.reads()).with_engine(home.path());
+    let reconciler = ConvoyReconciler::new(home.reads()).with_engine(home.path());
     let reconciler = match stale_after {
         Some(stale_after) => reconciler.with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), stale_after),
         None => reconciler,

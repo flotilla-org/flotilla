@@ -51,14 +51,9 @@ pub struct ConvoyPass {
     requeue_after: Option<std::time::Duration>,
 }
 
-impl Default for ConvoyReconciler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ConvoyReconciler {
-    pub fn new() -> Self {
+    /// Reads the engine's lifecycle readings of vessels, sessions and checkouts through `lifecycle_reads`.
+    pub fn new(lifecycle_reads: Arc<dyn lifecycle_reads::LifecycleReads>) -> Self {
         Self {
             vessels: None,
             terminal_sessions: None,
@@ -73,7 +68,7 @@ impl ConvoyReconciler {
             prepared_snapshot_gc: None,
             engine: EngineConvoyPath::default(),
             messages: crate::ports::MessagePath::default(),
-            lifecycle_reads: Arc::new(lifecycle_reads::NoLifecycleReads),
+            lifecycle_reads,
         }
     }
 
@@ -86,12 +81,6 @@ impl ConvoyReconciler {
     /// The `[primitives]` switch's Message path, set at startup when it is on.
     pub fn with_messages(mut self, messages: crate::ports::MessagePath) -> Self {
         self.messages = messages;
-        self
-    }
-
-    /// The engine's lifecycle readings of vessels, sessions and checkouts.
-    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn lifecycle_reads::LifecycleReads>) -> Self {
-        self.lifecycle_reads = reads;
         self
     }
 

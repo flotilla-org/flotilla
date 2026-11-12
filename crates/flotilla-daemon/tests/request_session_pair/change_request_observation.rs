@@ -270,9 +270,8 @@ async fn remote_change_request_scenario(late_watcher: bool) {
     owner_observer.refresh_demanded_owned().await.unwrap();
     // The producer's convoy reconciler observes the merged record and keeps the promise on the
     // engine, one edge a pass.
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(requester.lifecycle_reads())
         .with_engine(requester.convoy_engine_path())
-        .with_lifecycle_reads(requester.lifecycle_reads())
         .with_change_requests(requester.resource_backend().including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180));
     eventually(Duration::from_secs(5), Duration::from_millis(10), "merged observation keeps promise", || async {
         use flotilla_store::controller::Reconciler;

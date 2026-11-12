@@ -173,13 +173,19 @@ async fn ledger_convoy(backend: &ResourceBackend) -> ResourceObject<Convoy> {
 }
 
 fn reconciler(backend: &ResourceBackend, engine: Arc<Recording>) -> ConvoyReconciler {
+    reconciler_reading(backend, engine, flotilla_provisioning_testkit::CheckoutFixture::default().reads)
+}
+
+/// [`reconciler`], reading the engine's lifecycle readings through `reads`.
+fn reconciler_reading(
+    backend: &ResourceBackend,
+    engine: Arc<Recording>,
+    reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+) -> ConvoyReconciler {
     let path: EngineConvoyPath = Arc::new(OnceLock::new());
     let engine: Arc<dyn EngineConvoys> = engine;
     assert!(path.set(engine).is_ok());
-    ConvoyReconciler::new()
-        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
-        .with_artifacts(backend.including_replicas::<Artifact>(NAMESPACE))
-        .with_engine(path)
+    ConvoyReconciler::new(reads).with_artifacts(backend.including_replicas::<Artifact>(NAMESPACE)).with_engine(path)
 }
 
 // Behaviour: the observed ledger is the engine's Submit by an observer, and the controller writes
@@ -638,10 +644,9 @@ async fn an_undelivered_turn_holds_delivery() {
         let turns: Arc<dyn flotilla_messaging::EngineMessages> = Arc::new(Turns { backend: backend.clone(), held_until });
         assert!(messages.set(turns).is_ok());
         let engine = Arc::new(Recording { holds: true, ..Default::default() });
-        let reconciler = reconciler(&backend, Arc::clone(&engine))
+        let reconciler = reconciler_reading(&backend, Arc::clone(&engine), fixture.reads.clone())
             .with_terminal_sessions(sessions)
-            .with_messages(messages)
-            .with_lifecycle_reads(fixture.reads.clone());
+            .with_messages(messages);
         let prepared = reconciler.prepare(&convoy).await.expect("prepare");
         let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
         let delivered = *engine.deliveries.lock().expect("deliveries") == 1;

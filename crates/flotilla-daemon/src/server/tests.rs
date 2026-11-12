@@ -2244,10 +2244,9 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     let controller = ControllerLoop {
         primary: placed.using::<Convoy>("flotilla"),
         secondaries: Vec::new(),
-        reconciler: flotilla_crew::convoy::ConvoyReconciler::new()
+        reconciler: flotilla_crew::convoy::ConvoyReconciler::new(remote_daemon.lifecycle_reads())
             .with_hosts(placed.including_replicas::<Host>("flotilla"))
-            .with_vessels(placed.including_replicas::<Vessel>("flotilla"))
-            .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
+            .with_vessels(placed.including_replicas::<Vessel>("flotilla")),
         backend: placed.clone(),
     };
     let controller_task = tokio::spawn(controller.run());
