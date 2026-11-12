@@ -549,6 +549,59 @@ async fn four_part_addresses_select_the_role_within_a_shared_vessel() {
     assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/absent").await.unwrap().is_none());
 }
 
+// A relaunched vessel's earlier session stays listed, ended, beside its successor's: the live one
+// holds the role. With every launch ended, the newest launch's session does, so a sender learns
+// why it ended rather than meeting two holders.
+#[tokio::test]
+async fn an_ended_launchs_session_yields_its_role_to_the_relaunch() {
+    use std::collections::BTreeMap;
+
+    use flotilla_messaging::resolve_message_receiver;
+    use flotilla_resources::{
+        Convoy, ConvoySpec, TerminalSession, TerminalSessionPhase, TerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+        VESSEL_REF_LABEL,
+    };
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("convoy".into()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build(),
+        )
+        .await
+        .unwrap();
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    for (name, launch, phase) in [("aide-1", 1, TerminalSessionPhase::Failed), ("aide-2", 2, TerminalSessionPhase::Running)] {
+        let mut intent = holder_spec("convoy");
+        intent.role = "aide".into();
+        let created = sessions
+            .create(
+                &InputMeta::builder()
+                    .name(name.into())
+                    .labels(BTreeMap::from([
+                        (CONVOY_LABEL.into(), "convoy".into()),
+                        (VESSEL_LABEL.into(), "assist".into()),
+                        (ROLE_LABEL.into(), "aide".into()),
+                        (VESSEL_REF_LABEL.into(), format!("convoy-assist#{launch}")),
+                    ]))
+                    .build(),
+                &intent,
+            )
+            .await
+            .unwrap();
+        let status = TerminalSessionStatus { phase, ..Default::default() };
+        sessions.update_status(name, &created.metadata.resource_version, &status).await.unwrap();
+    }
+    let holder = resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/assist/aide").await.unwrap().expect("holder");
+    assert_eq!(holder.object.metadata.name, "aide-2");
+
+    let relaunched = sessions.get("aide-2").await.unwrap();
+    let status = TerminalSessionStatus { phase: TerminalSessionPhase::Failed, ..Default::default() };
+    sessions.update_status("aide-2", &relaunched.metadata.resource_version, &status).await.unwrap();
+    let holder = resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/assist/aide").await.unwrap().expect("holder");
+    assert_eq!(holder.object.metadata.name, "aide-2");
+}
+
 // A snapshot is stable within its batch and a new batch sees holder changes.
 // Repeated pure resolutions, including non-agent and invalid addresses, do no reads.
 #[hegel::test]

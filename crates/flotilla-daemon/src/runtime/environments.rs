@@ -124,6 +124,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     let mut reconciliations = Vec::new();
     for (environment, container_id) in environments {
         let instance = state.provider_address(&environment.name, &environment.spec, None).await?;
+        let receives_host_tools = state.environment_providers.get(&instance)?.receives_host_tools();
         if !inventories.contains_key(&instance) {
             let provider = state.environment_providers.get(&instance)?;
             let handles = provider
@@ -148,25 +149,27 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
                 .cloned()?;
             handles.remove(&key)
         });
-        reconciliations.push((environment, env_id, container_id, handle));
+        reconciliations.push((environment, env_id, container_id, handle, receives_host_tools));
     }
-    let results = futures::future::join_all(reconciliations.into_iter().map(|(environment, env_id, container_id, handle)| {
-        let state = Arc::clone(state);
-        async move {
-            match tokio::time::timeout(
-                ENVIRONMENT_ADOPTION_TIMEOUT,
-                reconcile_provisioned_environment(&state, environment, env_id.clone(), container_id, handle),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    Err(format!("environment {env_id} adoption timed out after {}s; will retry", ENVIRONMENT_ADOPTION_TIMEOUT.as_secs()))
+    let results =
+        futures::future::join_all(reconciliations.into_iter().map(|(environment, env_id, container_id, handle, receives_host_tools)| {
+            let state = Arc::clone(state);
+            async move {
+                match tokio::time::timeout(
+                    ENVIRONMENT_ADOPTION_TIMEOUT,
+                    reconcile_provisioned_environment(&state, environment, env_id.clone(), container_id, handle, receives_host_tools),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(format!(
+                        "environment {env_id} adoption timed out after {}s; will retry",
+                        ENVIRONMENT_ADOPTION_TIMEOUT.as_secs()
+                    )),
                 }
             }
-        }
-    }))
-    .await;
+        }))
+        .await;
     // Cloud uncertainty must not suppress the successful Docker inventory
     // barrier used by standing-convoy teardown.
     if results.iter().all(Result::is_ok) {
@@ -253,6 +256,7 @@ pub(super) async fn reconcile_provisioned_environment(
     env_id: EnvironmentId,
     container_id: Option<String>,
     handle: Option<EnvironmentHandle>,
+    receives_host_tools: bool,
 ) -> Result<(), String> {
     let spec = environment.spec.docker.as_ref().expect("candidate filtering requires a local Docker spec");
     let Some(container_id) = container_id else {
@@ -305,9 +309,11 @@ pub(super) async fn reconcile_provisioned_environment(
     }
 
     // A container whose agent did not answer adoption keeps its tools until it does.
+    // Adoption delivers only what provisioning did: a provider that takes no host
+    // tools got neither tools nor a crew socket.
     let agent = handle.agent();
     let agent_ready = agent.ready().await.is_ok();
-    if agent_ready {
+    if agent_ready && receives_host_tools {
         let context = super::docker::DockerToolContext { state, host_ref: &spec.host_ref, jobs: tokio::sync::OnceCell::new() };
         let tools = state.environment_tools.prepare(crate::environment_tools::DOCKER_PROVIDER_KIND, env_id.as_str(), &context).await?;
         agent.push_tools(&tools).await?;
@@ -315,7 +321,7 @@ pub(super) async fn reconcile_provisioned_environment(
 
     // Retry the socket even when the interior registry was already adopted.
     // A bind failure must not become a permanently skipped reconciliation step.
-    if let Some(sockets) = &state.environment_sockets {
+    if let Some(sockets) = state.environment_sockets.as_ref().filter(|_| receives_host_tools) {
         sockets.prepare(env_id.clone()).await?;
     }
     // Restores the forward a restarted flotillad lost, so running crews' HTTP hooks resume.

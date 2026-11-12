@@ -468,3 +468,31 @@ async fn message_delivery_runs_on_events_not_a_timer() {
     assert!(!task.is_finished(), "delivery stays live");
     task.abort();
 }
+
+// A launch in an environment this daemon has not registered (as after a restart, before the
+// environment's adoption) waits for it: its try is retried once the registration returns, rather
+// than giving up and leaving an ended session beside the vessel's next launch.
+#[tokio::test(start_paused = true)]
+async fn a_launch_waits_for_its_environments_registration() {
+    use flotilla_provisioning::engine::terminal_actuator::TerminalProvider;
+
+    let crew = engine_crew("codex", lossy_pool()).await;
+    let runtime = TerminalControllerRuntime { state: Arc::clone(&crew.state) };
+    let reads = crew.daemon.lifecycle_reads();
+    let record = |launch: &str| reads.terminals().expect("terminals").get(launch, None).expect("read launch").expect("launch held");
+    assert_eq!(runtime.launch_waits_for(&record(&crew.launch)).await, Ok(None), "the host's own environment is registered");
+
+    let held = record(&crew.launch);
+    let unadopted = engine(&crew.daemon).terminals.request(&flotilla_resources::terminal_records::TerminalLaunchRequest {
+        session: "unadopted".into(),
+        environment: "env-unadopted".into(),
+        vessel: held.vessel.clone(),
+        role: "coder".into(),
+        pool: "turn-probe".into(),
+        cwd: "/workspace".into(),
+        env: Default::default(),
+        source: flotilla_resources::terminal_records::TerminalLaunchSource::Tool { command: "sleep infinity".into() },
+    });
+    let waits = runtime.launch_waits_for(&record(&unadopted)).await.expect("readiness");
+    assert_eq!(waits.as_deref(), Some("environment env-unadopted is not registered on this host yet"));
+}

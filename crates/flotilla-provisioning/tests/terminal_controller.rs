@@ -71,8 +71,8 @@ impl RecordingProvider {
 
 #[async_trait]
 impl TerminalProvider for RecordingProvider {
-    async fn brief_ready(&self, _: &TerminalRecord) -> Result<bool, String> {
-        Ok(!self.asked().brief_missing)
+    async fn launch_waits_for(&self, _: &TerminalRecord) -> Result<Option<String>, String> {
+        Ok(self.asked().brief_missing.then(|| "its brief artifact is not on this host yet".into()))
     }
 
     async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, String> {

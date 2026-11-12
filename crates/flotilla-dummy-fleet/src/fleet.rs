@@ -300,7 +300,12 @@ impl DaemonCommandPort {
                     // A lagged listener loses results; their crews time out
                     // and report the command as lost rather than hanging.
                     Err(RecvError::Lagged(skipped)) => tracing::warn!(skipped, "dummy fleet command listener lagged"),
-                    Err(RecvError::Closed) => return,
+                    // The daemon stopped: its commands' results are lost now, as a closed socket
+                    // tells a client at once, rather than when their wait times out.
+                    Err(RecvError::Closed) => {
+                        lock(&slots).clear();
+                        return;
+                    }
                 }
             }
         });

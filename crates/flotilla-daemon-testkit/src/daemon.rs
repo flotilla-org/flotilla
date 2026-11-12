@@ -638,6 +638,11 @@ impl TestDaemon {
         self.fleet.snapshot()
     }
 
+    /// The first refusals the crews' commands met, as the fleet kept them.
+    pub fn command_error_samples(&self) -> Vec<String> {
+        self.fleet.command_error_samples()
+    }
+
     /// The dummy catalog, applied as an operator applies one: a Fleet project
     /// and its designation, the forge, repository, kinds and workflows.
     async fn seed(&self) {

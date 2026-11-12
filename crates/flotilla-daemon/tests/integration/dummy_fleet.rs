@@ -543,6 +543,24 @@ async fn a_daemon_restart_restores_an_active_convoy_and_lands() {
     assert_eq!(fleet.counts().sessions_launched, 1, "the surviving process is adopted");
 }
 
+// A daemon restart in the middle of a long runner's exchange, with the crews' processes
+// surviving as a real harness's do, keeps one holder of each role: the crews' turns to each other
+// deliver after it without a refused command.
+#[tokio::test(start_paused = true)]
+async fn a_long_runner_exchange_survives_a_daemon_restart() {
+    let fleet = TestDaemon::builder().settings("host_name = \"restart-proof\"\n").start().await;
+    let name = fleet.dispatch(CrewMix::LongRunner, DUMMY_FULFILMENT_KIND).await;
+    fleet
+        .wait("both crews launched and exchanging turns", |found: &ResourceObject<TerminalSession>| {
+            found.spec.role == "aide" && fleet.counts().sessions_launched == 2 && fleet.counts().turns_received >= 2
+        })
+        .await;
+    let fleet = fleet.restart().await;
+    fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
+    let counts = fleet.counts();
+    assert_eq!(counts.command_errors, 0, "{counts:?}: {:?}", fleet.command_error_samples());
+}
+
 /// Wall time moved forward by however much a test skips, so retry backoff passes at once.
 #[derive(Default)]
 struct SkippingClock(std::sync::Mutex<chrono::Duration>, tokio::sync::watch::Sender<()>);

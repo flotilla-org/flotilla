@@ -510,6 +510,37 @@ impl MessageReceiverSnapshot {
                 && matches!(object.spec.source, TerminalSessionSource::Agent { .. })
             })
             .collect::<Vec<_>>();
+        // Each vessel launch has its own session, and an ended one stays listed: a
+        // relaunched vessel's earlier session, Failed or Lost, sits beside its
+        // successor's. A live launch holds the role; with none live, the newest
+        // vessel launch's session does, as the vessel's single session did before
+        // launches, so a refusal can still name why it ended.
+        if holders.len() > 1 {
+            let ended = |holder: &&crate::ReadResourceObject<TerminalSession>| {
+                holder.object.status.as_ref().is_some_and(|status| {
+                    matches!(
+                        status.phase,
+                        crate::TerminalSessionPhase::Lost | crate::TerminalSessionPhase::Stopped | crate::TerminalSessionPhase::Failed
+                    )
+                })
+            };
+            if holders.iter().any(|holder| !ended(holder)) {
+                holders.retain(|holder| !ended(holder));
+            } else {
+                let launch = |holder: &&crate::ReadResourceObject<TerminalSession>| {
+                    holder
+                        .object
+                        .metadata
+                        .labels
+                        .get(VESSEL_REF_LABEL)
+                        .and_then(|vessel| flotilla_resources::convoy::engine::split_launch(vessel))
+                        .map(|(_, number)| number)
+                };
+                if let Some(newest) = holders.iter().map(launch).max().flatten() {
+                    holders.retain(|holder| launch(holder) == Some(newest));
+                }
+            }
+        }
         // Local authority shadows a self-origin replica; the read resolver already
         // deduplicates that pair. Multiple independent holders are not a guess.
         match holders.len() {

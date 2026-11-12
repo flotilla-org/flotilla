@@ -2,17 +2,17 @@
 //! a daemon as `flotillad` composes one and touches only what an operator, a
 //! crew or the environment vendor touches.
 
-use flotilla_daemon_testkit::daemon::TestDaemon;
+use flotilla_daemon_testkit::daemon::{TestDaemon, NAMESPACE};
 use flotilla_dummy_fleet::{
     catalog::{CrewMix, DUMMY_CLOUD_FULFILMENT_KIND, DUMMY_FULFILMENT_KIND},
     DummyVendor,
 };
 use flotilla_protocol::{
-    commands::{AttachMode, CommandValue},
+    commands::{AttachMode, CommandValue, CrewSupervisionAction},
     table::Row,
     AgentActivity, AgentSessionReading, CommandAction, QueryId, ResultSet,
 };
-use flotilla_resources::{Convoy, ConvoyPhase, ResourceObject};
+use flotilla_resources::{Convoy, ConvoyPhase, ResourceObject, TerminalSession};
 
 fn text<'a>(row: &'a Row, column: &str) -> &'a str {
     row.get(column).and_then(serde_json::Value::as_str).unwrap_or_default()
@@ -99,6 +99,61 @@ async fn a_lost_environment_withdraws_its_sessions_attach() {
     let CommandValue::Error { message } = &refused else { panic!("attach to {session} on a lost environment: {refused:?}") };
     assert!(message.contains(&lost), "{message}");
     daemon.wait_query(QueryId::Convoys { scope: None }, |set| vessel_row(set).is_some_and(|vessel| vessel.materialize.is_none())).await;
+}
+
+// A vessel whose backing the vendor deletes mid-exchange is relaunched, and its role passes to
+// the new launch's session, so the governor's turns reach the new aide and the convoy lands. The
+// governor's handoffs in the gap are refused until the next launch replaces the lost one, so it
+// stalls, and the operator resumes it once the new aide runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relaunched_vessels_role_passes_to_its_new_session() {
+    the_aides_role_passes_to_its_relaunch(false).await;
+}
+
+// As above, with the daemon restarting just after the loss, as b0's did: the restarted daemon
+// finds the backing gone at adoption and relaunches the vessel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vessel_lost_across_a_restart_passes_its_role_to_its_relaunch() {
+    the_aides_role_passes_to_its_relaunch(true).await;
+}
+
+async fn the_aides_role_passes_to_its_relaunch(restart: bool) {
+    let daemon = TestDaemon::builder().start().await;
+    let convoy = daemon.dispatch(CrewMix::LongRunner, DUMMY_FULFILMENT_KIND).await;
+    daemon
+        .wait("both crews exchanging turns", |_: &ResourceObject<TerminalSession>| {
+            daemon.counts().sessions_launched == 2 && daemon.counts().turns_received >= 2
+        })
+        .await;
+    let assist = |row: &Row| of_convoy(&convoy, "Realised")(row) && text(row, "holder").contains("-assist#");
+    let ready = daemon.wait_row("the aide's Realised environment", "environment", "", assist).await;
+    let name = text(&ready, "resource.name").to_owned();
+    assert!(DummyVendor::vanish(daemon.vendor(), &name), "{ready:?}");
+    let daemon = if restart { daemon.restart().await } else { daemon };
+    // A lost launch is replaced only after the provisioning backoff, 30 s of wall time.
+    let waiting = daemon
+        .wait("the aide relaunched", |found: &ResourceObject<Convoy>| {
+            found.metadata.name == convoy
+                && found.status.as_ref().is_some_and(|status| status.stalled.is_some() || status.phase == ConvoyPhase::Landed)
+                && daemon.counts().sessions_launched == 3
+        })
+        .within(std::time::Duration::from_secs(120))
+        .await;
+    if waiting.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed) {
+        return;
+    }
+    let resume = CommandAction::CrewSupervise {
+        namespace: Some(NAMESPACE.into()),
+        convoy: convoy.clone(),
+        vessel: "govern".into(),
+        role: "governor".into(),
+        operation: CrewSupervisionAction::Resume,
+        message: "The aide is back.".into(),
+        actor_crew_id: None,
+    };
+    let resumed = daemon.execute(resume).await;
+    assert!(!matches!(resumed, CommandValue::Error { .. }), "{resumed:?}");
+    daemon.wait("Landed", in_phase(&convoy, ConvoyPhase::Landed)).await;
 }
 
 // A crew member's row shows its AgentSession as the decided store holds it (#3108), joined by

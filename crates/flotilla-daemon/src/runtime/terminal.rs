@@ -964,9 +964,18 @@ impl TerminalControllerRuntime {
 
 #[async_trait]
 impl TerminalProvider for TerminalControllerRuntime {
-    async fn brief_ready(&self, launch: &TerminalRecord) -> Result<bool, String> {
+    async fn launch_waits_for(&self, launch: &TerminalRecord) -> Result<Option<String>, String> {
         let view = self.session_view(launch).await?;
-        self.brief_ready_for((&view).into()).await
+        let spec: TerminalSessionTarget<'_> = (&view).into();
+        if !self.brief_ready_for(spec).await? {
+            return Ok(Some("its brief artifact is not in this host's blob store yet".into()));
+        }
+        // After a restart an environment's registration returns only with its adoption: a launch
+        // before then waits for it rather than giving up.
+        if !self.state.ssh_host.contains_key(&spec.env_ref) && self.registry_for_env(&spec.env_ref).is_err() {
+            return Ok(Some(format!("environment {} is not registered on this host yet", spec.env_ref)));
+        }
+        Ok(None)
     }
 
     async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, String> {

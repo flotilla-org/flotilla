@@ -96,8 +96,9 @@ pub struct ScreenReading {
 /// This host's terminal pools and agent harnesses, as the TerminalSession controller uses them.
 #[async_trait]
 pub trait TerminalProvider: Send + Sync {
-    /// Whether the brief `launch` starts with is on this host.
-    async fn brief_ready(&self, launch: &TerminalRecord) -> Result<bool, String>;
+    /// What `launch` still waits for on this host before it can start, such as its brief's
+    /// artifact or its environment's adoption; none once it can start.
+    async fn launch_waits_for(&self, launch: &TerminalRecord) -> Result<Option<String>, String>;
     /// Starts `launch`'s process: its harness prepared, its credentials delivered, its brief
     /// written.
     async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, String>;
@@ -155,8 +156,9 @@ async fn ended<P: TerminalProvider + ?Sized>(provider: &P, record: &TerminalReco
     Ok(None)
 }
 
-/// The launches whose last try found their brief's artifact missing, in memory: the probe looks
-/// for each artifact and asks for the next try once it has arrived.
+/// The launches whose last try found something they wait for missing (their brief's artifact,
+/// their environment's adoption), in memory: the probe looks again and asks for the next try once
+/// nothing is missing.
 #[derive(Clone, Default)]
 pub struct AwaitedBriefs(Arc<Mutex<BTreeSet<String>>>);
 
@@ -241,11 +243,11 @@ where
 
     async fn realise(&self, name: &str, _: &TerminalSessionRequest) -> Result<String, ProviderFailure> {
         let record = self.record(name).map_err(|cause| ProviderFailure::new(cause, true))?;
-        match self.provider.brief_ready(&record).await {
-            Ok(true) => self.briefs.arrived(name),
-            Ok(false) => {
+        match self.provider.launch_waits_for(&record).await {
+            Ok(None) => self.briefs.arrived(name),
+            Ok(Some(missing)) => {
                 self.briefs.await_brief(name);
-                return Err(ProviderFailure::new(transient("its brief artifact is not in this host's blob store yet"), true));
+                return Err(ProviderFailure::new(transient(missing), true));
             }
             Err(message) => return Err(ProviderFailure::new(transient(message), true)),
         }
@@ -343,7 +345,7 @@ pub const TERMINAL_PROBE_EVERY: Duration = Duration::from_secs(5);
 /// This home's probe of its running launches: it pushes each launch it finds ended to the
 /// controller, and records what it observes of the rest (attention, the screen, the seat, the
 /// crew's path back to the daemon) in memory, and their new output as crew progress. It also looks
-/// for the briefs launches wait on, and asks the controller to try each again once it is here.
+/// again at what waiting launches lack, and asks the controller to try each again once nothing is.
 pub struct TerminalProbe<P: ?Sized> {
     provider: Arc<P>,
     records: Arc<dyn TerminalRecords>,
@@ -398,15 +400,15 @@ where
         };
         if let Some((briefs, rechecks)) = &self.briefs {
             for record in records.iter().filter(|record| briefs.awaited().contains(&record.name)) {
-                match self.provider.brief_ready(record).await {
-                    Ok(true) => {
+                match self.provider.launch_waits_for(record).await {
+                    Ok(None) => {
                         briefs.arrived(&record.name);
                         if rechecks.send(record.name.clone()).await.is_err() {
                             return false;
                         }
                     }
-                    Ok(false) => {}
-                    Err(error) => debug!(launch = %record.name, %error, "terminal probe could not look for the brief"),
+                    Ok(Some(_)) => {}
+                    Err(error) => debug!(launch = %record.name, %error, "terminal probe could not look for what the launch waits on"),
                 }
             }
         }
