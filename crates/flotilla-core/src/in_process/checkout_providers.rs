@@ -301,44 +301,32 @@ impl InProcessDaemon {
         Ok(Arc::new(registry))
     }
 
-    /// Retires cached checkout providers as the discovered checkouts or the namespace change.
-    pub(super) fn spawn_checkout_provider_retirement(self: &Arc<Self>) {
-        let weak = Arc::downgrade(self);
+    /// Retires cached checkout providers as the discovered checkouts, the namespace or the
+    /// engine's checkouts change (#3108): a released, lost or newly launched checkout ends the
+    /// lifetime its provider belonged to. Started when the engine's readings are installed, since
+    /// every retirement reads them; one pass at the start covers changes before then.
+    pub(super) fn follow_checkout_provider_lifetimes(&self) -> Result<(), String> {
+        let mut engine_changes = self.lifecycle_reads.checkouts()?.changes();
         let mut discovered = self.discovered_checkouts.changes();
         let mut namespace_changes = self.checkout_namespace_changes.subscribe();
+        let weak = self.self_weak.clone();
         tokio::spawn(async move {
             loop {
+                let Some(daemon) = weak.upgrade() else { return };
+                if let Err(error) = daemon.retire_checkout_providers().await {
+                    warn!(%error, "retire checkout providers failed");
+                }
+                drop(daemon);
                 tokio::select! {
+                    change = engine_changes.recv() => {
+                        if let Err(tokio::sync::broadcast::error::RecvError::Closed) = change { return; }
+                    }
                     change = discovered.recv() => {
                         if let Err(tokio::sync::broadcast::error::RecvError::Closed) = change { return; }
                     }
                     changed = namespace_changes.changed() => {
                         if changed.is_err() { return; }
                     }
-                }
-                let Some(daemon) = weak.upgrade() else { return };
-                if let Err(error) = daemon.retire_checkout_providers().await {
-                    warn!(%error, "retire checkout providers failed");
-                }
-            }
-        });
-    }
-
-    /// Retires cached checkout providers as the engine's checkouts change (#3108): a released,
-    /// lost or newly launched checkout ends the lifetime its provider belonged to. Started by
-    /// composition once the engine's readings are installed.
-    pub fn follow_checkout_provider_lifetimes(self: &Arc<Self>) -> Result<(), String> {
-        let mut changes = self.lifecycle_reads.checkouts()?.changes();
-        let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            loop {
-                match changes.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
-                let Some(daemon) = weak.upgrade() else { return };
-                if let Err(error) = daemon.retire_checkout_providers().await {
-                    warn!(%error, "retire checkout providers failed");
                 }
             }
         });
@@ -349,6 +337,7 @@ impl InProcessDaemon {
 #[cfg(test)]
 mod lifecycle_contract {
     use super::*;
+    use crate::in_process::tests::{discover_checkout, test_engine};
     use crate::testkits::discovery::fake_discovery;
     use flotilla_provisioning_testkit::{CheckoutFixture, Ending};
     use flotilla_resources::CheckoutWorktreeSpec;
@@ -393,5 +382,59 @@ mod lifecycle_contract {
         assert!(daemon.checkout_providers.checkout_provider_facts("flotilla").await.expect("lost").is_empty());
         engine.poison();
         assert!(daemon.checkout_providers.checkout_provider_facts("flotilla").await.expect_err("checked read").contains("poisoned"));
+    }
+
+    // Startup: a daemon's composition observes checkouts before its runtime installs the engine's
+    // readings. Retirement reads them, so nothing retires before then and no retirement fails;
+    // the follower starts with the readings.
+    #[tokio::test]
+    async fn checkouts_discovered_before_the_engine_readings_fail_no_retirement() {
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lines").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish());
+        let temp = tempfile::tempdir().expect("config");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"provider-startup\"\n").expect("config");
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            fake_discovery(false),
+            flotilla_protocol::HostName::new("local"),
+            ResourceBackend::new(InMemoryBackend::default()),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        let observed = |path: &str| {
+            flotilla_resources::ObservedCheckoutSpec::builder()
+                .r#ref("main".into())
+                .path(path.into())
+                .repo_ref(RepositoryKey("github.com/org/repo".into()))
+                .host_ref(daemon.environment_manager.local_host_id().to_string())
+                .is_main(true)
+                .build()
+        };
+        discover_checkout(&daemon, "early", observed("/early"));
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        test_engine(&daemon);
+        discover_checkout(&daemon, "later", observed("/later"));
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let logged = String::from_utf8(lines.0.lock().expect("lines").clone()).expect("utf8");
+        assert!(!logged.contains("retire checkout providers failed"), "{logged}");
     }
 }

@@ -1488,8 +1488,6 @@ impl InProcessDaemon {
         crew.set_checkout_inspector(Arc::new(CheckoutInspector(Arc::downgrade(&daemon))));
         crew.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) })).await;
 
-        daemon.spawn_checkout_provider_retirement();
-
         let weak = Arc::downgrade(&daemon);
         let mut namespace_changes = daemon.checkout_namespace_changes.subscribe();
         tokio::spawn(async move {
@@ -2319,7 +2317,7 @@ impl InProcessDaemon {
     /// Installs the engine's provisioning readings during composition (#3629 layer 4). Their
     /// AgentSessions are this daemon's own, read from its decided store with what it has seen
     /// of its crews' progress (#3108), and so are its Convoys once the engine's Convoy path is
-    /// installed.
+    /// installed. Cached checkout providers then follow the checkout lifetimes they read.
     pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_projections::ports::LifecycleReads>) -> Result<(), String> {
         let reads: Arc<dyn flotilla_projections::ports::LifecycleReads> = match self.decided_store() {
             Ok(service) => {
@@ -2345,7 +2343,13 @@ impl InProcessDaemon {
             DEFAULT_PROVISIONING_NAMESPACE,
             Arc::clone(&reads),
         )));
-        self.resource_backend.install_engine_records(Arc::new(flotilla_store::ConvoyViews::new(DEFAULT_PROVISIONING_NAMESPACE, reads)));
+        self.resource_backend
+            .install_engine_records(Arc::new(flotilla_store::ConvoyViews::new(DEFAULT_PROVISIONING_NAMESPACE, Arc::clone(&reads))));
+        // A port serving no checkouts holds no checkout lifetimes to follow; the follower runs on
+        // the runtime composing this daemon.
+        if reads.checkouts().is_ok() && tokio::runtime::Handle::try_current().is_ok() {
+            self.follow_checkout_provider_lifetimes()?;
+        }
         Ok(())
     }
 

@@ -1378,8 +1378,6 @@ async fn open_provisioning_lifecycles(
             .with_terminals(terminals as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>)
             .with_vessels(vessels as Arc<dyn flotilla_resources::vessel_records::VesselRecords>),
     ))?;
-    // Cached checkout providers end with the checkout launches they belong to.
-    daemon.follow_checkout_provider_lifetimes()?;
     Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes, terminal_changes, vessel_changes]))
 }
 
