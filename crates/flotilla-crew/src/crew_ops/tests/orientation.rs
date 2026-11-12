@@ -176,14 +176,11 @@ impl flotilla_resources::vessel_seats::VesselSeats for FixedSeats {
     }
 }
 
-// Behaviour (#3629 layer 8): `crew list` asks which seats the vessel serves through one read port:
-// the session labels until the engine's answer is installed, and that answer afterwards.
+// Behaviour (#3629 layer 8): `crew list` asks which seats the vessel serves through one read port.
 #[tokio::test]
 async fn crew_list_reads_a_vessels_seats_through_one_port() {
-    let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
+    let (mut crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
     let context = CrewCommandContext::builder().convoy(held.launch.clone()).vessel_ref(held.vessel.clone()).role("coder".into()).build();
-    let labelled = crew.crew_list_internal(&context).await.expect("crew state");
-    assert_ne!(labelled.members[0].state, "stopped", "the labels' session, before the port is installed");
 
     // The port's answer: another session serving the seat, stopped.
     let mut session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
@@ -194,7 +191,7 @@ async fn crew_list_reads_a_vessels_seats_through_one_port() {
         "coder".to_owned(),
         flotilla_resources::ReadResourceObject { object: session, provenance: flotilla_resources::ResourceProvenance::Local },
     )]);
-    crew.vessel_seats.set(Arc::new(FixedSeats(seats))).map_err(|_| "installed twice").expect("install");
+    Arc::get_mut(&mut crew).expect("unique service").vessel_seats = Arc::new(FixedSeats(seats));
     let served = crew.crew_list_internal(&context).await.expect("crew state");
     assert_eq!(served.members[0].state, "stopped", "the port's answer");
 }

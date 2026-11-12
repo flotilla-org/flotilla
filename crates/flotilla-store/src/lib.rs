@@ -29,7 +29,7 @@ mod terminal_views;
 mod vessel_views;
 pub use convoy_views::ConvoyViews;
 pub use lifecycle_views::LifecycleViews;
-pub use terminal_views::TerminalViews;
+pub use terminal_views::{EngineVesselSeats, TerminalViews};
 pub use vessel_views::VesselViews;
 pub mod message_query;
 pub use message_query::*;

@@ -3,14 +3,10 @@
 //! One read port, so the access relation that will record who uses a vessel
 //! (decided with #2914) can replace it without touching its callers. Until
 //! then a seat is named by its role, and a vessel serves the roles whose
-//! terminal sessions run in it. With `[primitives]` on the engine answers from
-//! its TerminalSession index by vessel; absent ([`VesselSeatsPath`] unset),
-//! callers keep their label lookup.
+//! terminal sessions run in it. The engine answers from its TerminalSession
+//! index by vessel.
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, OnceLock},
-};
+use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 
@@ -22,6 +18,3 @@ pub trait VesselSeats: Send + Sync {
     /// `vessel_ref`'s seats, by role: the session record serving each.
     async fn seats(&self, namespace: &str, vessel_ref: &str) -> Result<BTreeMap<String, ReadResourceObject<TerminalSession>>, String>;
 }
-
-/// The engine's answer, installed once at composition; empty while the switch is off.
-pub type VesselSeatsPath = Arc<OnceLock<Arc<dyn VesselSeats>>>;

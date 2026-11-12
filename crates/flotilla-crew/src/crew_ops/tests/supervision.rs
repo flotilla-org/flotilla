@@ -465,6 +465,7 @@ async fn lost_vessel_resume_explains_rehydration() {
         .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())))
         .leaf_subscriptions(crew.leaf_subscriptions.clone())
         .lifecycle_reads(held.engine.reads())
+        .vessel_seats(Arc::clone(&crew.vessel_seats))
         .work_credential_reconciler(RwLock::new(Some(probe.clone() as Arc<dyn WorkCredentialReconciler>)))
         .clock(crew.clock.clone())
         .provisioning_namespace(crew.provisioning_namespace.clone())

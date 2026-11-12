@@ -23,6 +23,7 @@ use flotilla_resources::{
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{newest_launches, TerminalChange, TerminalHolderView, TerminalRecord, TerminalRecords},
     vessel_records::VesselChange,
+    vessel_seats::VesselSeats,
     ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance, TerminalSession,
 };
 
@@ -508,5 +509,35 @@ impl EngineRecords for TerminalViews {
         streams.extend(self.reads.environments().ok().map(|environments| ticks(environments.changes())));
         streams.extend(self.reads.vessels().ok().map(|vessels| ticks(vessels.changes())));
         Ok(futures::stream::select_all(streams).boxed())
+    }
+}
+
+/// Which seats a vessel serves (#3629 layer 8): the newest launch of each session the engine holds
+/// for it, by role. A role launched at more than one home (a vessel placed anew) is served by its
+/// most recently requested launch.
+pub struct EngineVesselSeats {
+    reads: Arc<dyn LifecycleReads>,
+}
+
+impl EngineVesselSeats {
+    pub fn new(reads: Arc<dyn LifecycleReads>) -> Self {
+        Self { reads }
+    }
+}
+
+#[async_trait::async_trait]
+impl VesselSeats for EngineVesselSeats {
+    async fn seats(&self, namespace: &str, vessel_ref: &str) -> Result<BTreeMap<String, ReadResourceObject<TerminalSession>>, String> {
+        let views = TerminalViews::new(namespace, Arc::clone(&self.reads));
+        let mut seats = BTreeMap::<String, ReadResourceObject<TerminalSession>>::new();
+        for view in views.of_vessel(vessel_ref).await.map_err(|error| error.to_string())? {
+            let newer = seats
+                .get(&view.object.spec.role)
+                .is_none_or(|held| held.object.metadata.creation_timestamp < view.object.metadata.creation_timestamp);
+            if newer {
+                seats.insert(view.object.spec.role.clone(), view);
+            }
+        }
+        Ok(seats)
     }
 }

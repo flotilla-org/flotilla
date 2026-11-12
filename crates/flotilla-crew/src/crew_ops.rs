@@ -138,10 +138,8 @@ pub struct CrewService {
     /// the engine decides each convoy it holds; empty while the switch is off.
     #[builder(default)]
     pub(crate) convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
-    /// Which seats a vessel serves (#3629 layer 8): the engine's answer once
-    /// `[primitives]` installs it, else the session labels.
-    #[builder(default)]
-    pub(crate) vessel_seats: flotilla_resources::vessel_seats::VesselSeatsPath,
+    /// Which seats a vessel serves (#3629 layer 8).
+    pub(crate) vessel_seats: Arc<dyn flotilla_resources::vessel_seats::VesselSeats>,
     #[builder(default)]
     resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn ResourceIntentPublisher>>>,
     leaf_subscriptions: LeafSubscriptionTable,
@@ -906,24 +904,7 @@ impl CrewService {
         namespace: &str,
         vessel_ref: &str,
     ) -> Result<BTreeMap<String, flotilla_resources::ReadResourceObject<ResourceTerminalSession>>, String> {
-        let sources = if let Some(seats) = self.vessel_seats.get() {
-            seats.seats(namespace, vessel_ref).await?
-        } else {
-            self.resource_backend
-                .including_replicas::<ResourceTerminalSession>(namespace)
-                .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), vessel_ref.to_owned())]))
-                .await
-                .map_err(|error| error.to_string())?
-                .items
-                .into_iter()
-                .map(|source| (source.object.spec.role.clone(), source))
-                .collect()
-        };
-        let mut selected = BTreeMap::new();
-        for (role, source) in sources {
-            selected.insert(role, source);
-        }
-        Ok(selected)
+        self.vessel_seats.seats(namespace, vessel_ref).await
     }
 
     /// The engine's terminal sessions (#3108).

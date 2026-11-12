@@ -16,7 +16,7 @@ async fn a_vessels_seats_are_the_newest_launches_it_holds() {
     let reviewer = terminals.request(&TerminalsFixture::agent("vessel-a", "reviewer", "env-a"));
     terminals.request(&TerminalsFixture::agent("vessel-b", "coder", "env-a"));
 
-    let seats = EngineVesselSeats { reads: terminals.reads.clone() };
+    let seats = flotilla_store::EngineVesselSeats::new(terminals.reads.clone());
     let served: BTreeMap<String, Option<String>> = seats
         .seats(NAMESPACE, "vessel-a")
         .await

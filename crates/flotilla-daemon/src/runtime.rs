@@ -1289,7 +1289,6 @@ async fn open_provisioning_lifecycles(
     };
     let store = daemon.decided_store()?.store();
     let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
-    daemon.install_vessel_seats(Arc::new(EngineVesselSeats { reads: daemon.lifecycle_reads() }))?;
     let opened = Arc::clone(&store);
     let service = daemon.decided_store()?;
     let lifecycles = tokio::task::spawn_blocking(move || {
@@ -1364,35 +1363,6 @@ async fn open_provisioning_lifecycles(
     // Cached checkout providers end with the checkout launches they belong to.
     daemon.follow_checkout_provider_lifetimes()?;
     Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes, terminal_changes, vessel_changes]))
-}
-
-/// Which seats a vessel serves (#3629 layer 8): the newest launch of each session the engine holds
-/// for it, by role. A role launched at more than one home (a vessel placed anew) is served by its
-/// most recently requested launch.
-struct EngineVesselSeats {
-    reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
-}
-
-#[async_trait::async_trait]
-impl flotilla_resources::vessel_seats::VesselSeats for EngineVesselSeats {
-    async fn seats(
-        &self,
-        namespace: &str,
-        vessel_ref: &str,
-    ) -> Result<std::collections::BTreeMap<String, flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>>, String>
-    {
-        let views = flotilla_store::TerminalViews::new(namespace, Arc::clone(&self.reads));
-        let mut seats = std::collections::BTreeMap::<String, flotilla_resources::ReadResourceObject<_>>::new();
-        for view in views.of_vessel(vessel_ref).await.map_err(|error| error.to_string())? {
-            let newer = seats
-                .get(&view.object.spec.role)
-                .is_none_or(|held| held.object.metadata.creation_timestamp < view.object.metadata.creation_timestamp);
-            if newer {
-                seats.insert(view.object.spec.role.clone(), view);
-            }
-        }
-        Ok(seats)
-    }
 }
 
 /// Daemon-owned image build state: the owned builder's Buildx state, build

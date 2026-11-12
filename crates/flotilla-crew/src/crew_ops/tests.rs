@@ -298,6 +298,7 @@ async fn build_fixture(
             .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())))
             .leaf_subscriptions(subscriptions)
             .lifecycle_reads(engine.reads())
+            .vessel_seats(Arc::new(flotilla_store::EngineVesselSeats::new(engine.reads())))
             .work_credential_reconciler(RwLock::new(Some(reconciler)))
             .clock(Arc::new(SystemClock))
             .provisioning_namespace(namespace)

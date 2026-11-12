@@ -781,8 +781,6 @@ pub struct InProcessDaemon {
     engine_convoys: std::sync::OnceLock<Arc<Convoys>>,
     /// The engine's convoys as their readers read them, once the Convoy path is installed.
     convoy_records: std::sync::OnceLock<Arc<EngineConvoyRecords>>,
-    /// Which seats a vessel serves, the engine's answer behind `[primitives]` (#3629 layer 8).
-    vessel_seats_path: flotilla_resources::vessel_seats::VesselSeatsPath,
     message_receivers: projection_ports::MessageReceivers,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
     /// Unique identity for this daemon instance, generated at startup.
@@ -1317,7 +1315,6 @@ impl InProcessDaemon {
         let message_path = flotilla_engine_messages::MessagePath::default();
         let crew_message_path = flotilla_crew::ports::MessagePath::default();
         let convoy_engine_path = flotilla_resources::convoy::engine::EngineConvoyPath::default();
-        let vessel_seats_path = flotilla_resources::vessel_seats::VesselSeatsPath::default();
         let lifecycle_reads = Arc::new(flotilla_resources::lifecycle_reads::LateLifecycleReads::default());
         let change_request_observer = change_request_refresher.clone();
         let issue_observer = issue_refresher.clone();
@@ -1359,7 +1356,9 @@ impl InProcessDaemon {
                 .message_inboxes(Arc::clone(&message_inboxes))
                 .message_path(Arc::clone(&crew_message_path))
                 .convoy_engine(Arc::clone(&convoy_engine_path))
-                .vessel_seats(Arc::clone(&vessel_seats_path))
+                .vessel_seats(Arc::new(flotilla_store::EngineVesselSeats::new(
+                    lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>
+                )))
                 .capability_cards(flotilla_crew::crew_capabilities::CapabilityCardTracker::with_message_path(Arc::clone(
                     &crew_message_path,
                 )))
@@ -1436,7 +1435,6 @@ impl InProcessDaemon {
             convoy_engine_path,
             engine_convoys: std::sync::OnceLock::new(),
             convoy_records: Default::default(),
-            vessel_seats_path,
             brief_artifact_writer: Arc::clone(&brief_artifact_writer),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
@@ -2465,11 +2463,6 @@ impl InProcessDaemon {
             Arc::new(ConvoyEngine::new(convoys, self.resource_backend(), self.clock_for_scenarios()));
         self.convoy_engine_path.set(engine).map_err(|_| "the Convoy path is already installed".to_owned())?;
         Ok(records)
-    }
-
-    /// Installs the engine's answer to which seats a vessel serves (#3629 layer 8).
-    pub fn install_vessel_seats(&self, seats: Arc<dyn flotilla_resources::vessel_seats::VesselSeats>) -> Result<(), String> {
-        self.vessel_seats_path.set(seats).map_err(|_| "the vessel seats port is already installed".to_owned())
     }
 
     /// The crew's `[primitives]` Message path: empty until the switch's primitives are installed.
