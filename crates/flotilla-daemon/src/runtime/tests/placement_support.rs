@@ -251,8 +251,9 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         )
         .await
         .expect("convoy create command should start");
-    assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "remote-placement@remote-placement".to_string() });
+    let created = wait_for_command_result(&mut rx, create_id).await;
     let convoy_name = convoy_record_name(&kiwi.resource_backend(), "remote-placement").await;
+    assert_eq!(created, created_launch("remote-placement", &convoy_name));
     let convoys = kiwi.resource_backend().using::<Convoy>(NAMESPACE);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

@@ -1466,10 +1466,12 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
         )
         .await
         .expect("convoy create");
-    assert_eq!(
-        await_command_result(&mut rx, convoy_id).await,
-        CommandValue::ConvoyCreated { name: "identity-migrated@github-com-flotilla-org-andamento".into() }
-    );
+    let created = await_command_result(&mut rx, convoy_id).await;
+    let CommandValue::ConvoyCreated { name } = created else { panic!("convoy create: {created:?}") };
+    // Creation reports the launch it admitted under the migrated project, by its address.
+    let address = name.parse::<flotilla_address::Address>().expect("launch address");
+    assert_eq!(address.parent().map(|project| project.to_string()).as_deref(), Some("project:github-com-flotilla-org-andamento"));
+    assert_eq!(address.kind(), flotilla_address::Kind::Convoy);
 }
 
 #[tokio::test]
@@ -2288,7 +2290,7 @@ async fn convoy_create_carries_project_ref() {
         )
         .await
         .expect("execute");
-    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "linked@my-project".into() });
+    let created = await_command_result(&mut rx, id).await;
     let convoy = backend
         .using::<Convoy>("flotilla")
         .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "linked".to_string())]))
@@ -2298,6 +2300,10 @@ async fn convoy_create_carries_project_ref() {
         .into_iter()
         .next()
         .expect("convoy");
+    // Creation reports the launch it admitted, by its address in the linked project.
+    let address = flotilla_resources::convoy::engine::launch_address(&"project:my-project".parse().expect("project"), &convoy.metadata.name)
+        .expect("launch address");
+    assert_eq!(created, CommandValue::ConvoyCreated { name: address.to_string() });
     assert_eq!(convoy.spec.project_ref.as_deref(), Some("my-project"));
     assert_eq!(convoy.spec.repositories.len(), 1);
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");

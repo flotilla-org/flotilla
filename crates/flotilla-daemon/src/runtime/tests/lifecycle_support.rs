@@ -168,8 +168,9 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         )
         .await
         .expect("convoy create command should start");
-    assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "convoy-a".to_string() });
+    let created = wait_for_command_result(&mut rx, create_id).await;
     let convoy_name = convoy_record_name(&backend, "convoy-a").await;
+    assert_eq!(created, created_launch(NAMESPACE, &convoy_name));
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let run_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -387,6 +388,14 @@ pub(super) async fn record_successful_empty_branch_scan(daemon: &InProcessDaemon
     )
     .await
     .expect("record empty branch discovery for test provider");
+}
+
+/// What creation reports for `launch` admitted in `project`: the launch's address.
+pub(super) fn created_launch(project: &str, launch: &str) -> CommandValue {
+    let project = flotilla_address::Address::project(project).expect("project address");
+    CommandValue::ConvoyCreated {
+        name: flotilla_resources::convoy::engine::launch_address(&project, launch).expect("launch address").to_string(),
+    }
 }
 
 pub(super) async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {

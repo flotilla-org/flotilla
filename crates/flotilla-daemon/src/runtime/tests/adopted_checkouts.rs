@@ -74,7 +74,8 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         )
         .await
         .expect("convoy create command should start");
-    assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
+    let created = wait_for_command_result(&mut rx, create_id).await;
+    assert_eq!(created, created_launch(NAMESPACE, &convoy_record_name(&backend, "convoy-adopted").await));
 
     // The checkouts the engine holds here, and the ones this host observes.
     let checkout_count = || async {

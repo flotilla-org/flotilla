@@ -1563,11 +1563,15 @@ async fn convoy_creation_attribution_scenario() {
         )
         .await
         .expect("dispatch convoy creation");
-    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated { name: "alice-dispatch".to_string() });
+    let created = await_command_result(&mut events, command_id).await;
 
     let backend = leader.resource_backend();
-    let convoy =
-        backend.using::<Convoy>("flotilla").get(&convoy_record_name(&backend, "alice-dispatch").await).await.expect("created convoy");
+    let launch = convoy_record_name(&backend, "alice-dispatch").await;
+    // Creation reports the launch it admitted, by its address.
+    let address = flotilla_resources::convoy::engine::launch_address(&"project:flotilla".parse().expect("project address"), &launch)
+        .expect("launch address");
+    assert_eq!(created, CommandValue::ConvoyCreated { name: address.to_string() });
+    let convoy = backend.using::<Convoy>("flotilla").get(&launch).await.expect("created convoy");
     assert_eq!(convoy.spec.dispatching_principal_ref, principal_ref);
 }
 

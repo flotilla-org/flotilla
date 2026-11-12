@@ -98,10 +98,11 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         )
         .await
         .expect("create crew convoy");
-    assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "crew-convoy".to_string() });
+    let created = wait_for_command_result(&mut rx, create_id).await;
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let crew_record = convoy_record_name(&backend, "crew-convoy").await;
+    assert_eq!(created, created_launch(NAMESPACE, &crew_record));
     wait_until(|| {
         let convoys = convoys.clone();
         let crew_record = crew_record.clone();

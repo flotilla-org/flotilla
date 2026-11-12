@@ -1518,7 +1518,14 @@ impl ConvoyAdmission {
             vessel_placements,
             image_builds,
         } = request;
-        let address = convoy_address(role, project_ref.as_deref());
+        // The caller is told the launch it admitted, by its address.
+        let address = match flotilla_address::Address::project(project_ref.as_deref().unwrap_or(namespace))
+            .map_err(|error| error.to_string())
+            .and_then(|project| flotilla_resources::convoy::engine::launch_address(&project, name))
+        {
+            Ok(address) => address.to_string(),
+            Err(message) => return CommandValue::Error { message },
+        };
         let spec = ConvoySpec {
             continuation: None,
             workflow_ref: workflow_ref.to_string(),
