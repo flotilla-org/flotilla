@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
@@ -14,7 +14,8 @@ use crate::{
     resource::ResourceObject,
     vessel::Vessel,
     workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ExitDeclaration},
-    ChangeRequest, ChangeRequestLeafSubject, ForgeSpec, InputValue, ObservedChangeRequestState, ThreeValue, ENSURED_FROM_ANNOTATION,
+    ChangeRequest, ChangeRequestLeafSubject, ForgeSpec, InputValue, ObservedChangeRequestState, RepositoryKey, ThreeValue,
+    ENSURED_FROM_ANNOTATION,
 };
 
 pub fn is_ensured(convoy: &ResourceObject<Convoy>) -> bool {
@@ -245,7 +246,8 @@ fn evaluate_exit_with_disposition(
     }
     let observed_digest = evaluate_observed_digest_anchor(convoy, checkouts, landing_evidence_stale_after, now);
     let expected = expected_checkout_refs(convoy, checkouts.keys().map(String::as_str));
-    let discovery_pending = !expected.is_empty()
+    let unheld = unheld_declared_repositories(convoy, checkouts);
+    let discovery_pending = !(expected.is_empty() && unheld.is_empty())
         && convoy.status.as_ref().is_some_and(|status| {
             status.branch_subject_scan_at.is_none()
                 && status
@@ -294,7 +296,11 @@ fn evaluate_exit_with_disposition(
             };
         }
         // A table with no bound subject, over no expected checkout, is the claim exit.
-        InstantiatedExit::Table(entries) if !(expected.is_empty() && entries.iter().all(|entry| entry.leaves.is_empty())) => entries,
+        InstantiatedExit::Table(entries)
+            if !(expected.is_empty() && unheld.is_empty() && entries.iter().all(|entry| entry.leaves.is_empty())) =>
+        {
+            entries
+        }
         InstantiatedExit::Claim | InstantiatedExit::Table(_) => {
             return LandingSettlement {
                 evaluation: SettlementEvaluation::builder().mode(SettlementMode::ClaimExit).satisfied(true).unmet(Vec::new()).build(),
@@ -389,13 +395,21 @@ fn evaluate_exit_with_disposition(
     }
 
     let mut unmet = if disposition.is_some() { Vec::new() } else { table_unmet };
-    // The exit table evaluates bound and observed change requests. A present
-    // checkout without one is context, so its landed condition cannot block settlement.
-    // A held checkout stays readable after it ends, so only an adopted one can be missing.
+    // The exit table evaluates bound and observed change requests. A checkout whose inspection
+    // was read is context, so its landed condition cannot block settlement. One never read (never
+    // held, or held but never inspected, whether or not it has since ended) is not evidence of
+    // anything and holds settlement; a held checkout's last reading stands after it ends.
     for name in expected {
-        if !checkouts.contains_key(&name) {
-            unmet.push(UnmetSettlementExpectation::MissingCheckout { checkout: name });
+        match checkouts.get(&name) {
+            None => unmet.push(UnmetSettlementExpectation::MissingCheckout { checkout: name }),
+            Some(checkout) if checkout.inspection().is_none() => {
+                unmet.push(UnmetSettlementExpectation::MissingCheckoutStatus { checkout: name })
+            }
+            Some(_) => {}
         }
+    }
+    for repository in unheld {
+        unmet.push(UnmetSettlementExpectation::MissingCheckout { checkout: repository.to_string() });
     }
 
     let subjects: Vec<_> = addresses
@@ -490,6 +504,28 @@ fn evaluate_observed_digest_anchor(
         evaluation: SettlementEvaluation::builder().mode(SettlementMode::ObservedDigest).satisfied(satisfied).unmet(unmet).build(),
         disposition: satisfied.then(|| "observed-digest".to_string()),
     })
+}
+
+/// The repositories `convoy`'s frozen vessels declare a checkout of (a vessel's own scope, or every
+/// repository of the convoy) that neither an adopted ref nor a checkout in `held` stands for yet. A
+/// checkout's name is chosen only when its vessel is placed, so until then the declaration is all
+/// that says one is expected.
+fn unheld_declared_repositories(convoy: &ResourceObject<Convoy>, held: &BTreeMap<String, CheckoutRecord>) -> BTreeSet<RepositoryKey> {
+    let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else { return BTreeSet::new() };
+    let mut declared = BTreeSet::new();
+    for vessel in &snapshot.vessels {
+        match &vessel.repository_refs {
+            Some(scope) => declared.extend(scope.iter().cloned()),
+            None => declared.extend(convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone())),
+        }
+    }
+    for repository in convoy.spec.adopted_checkout_refs.keys() {
+        declared.remove(repository);
+    }
+    for checkout in held.values() {
+        declared.remove(checkout.spec.repo_ref());
+    }
+    declared
 }
 
 /// The vessel serving `work`: its newest launch, by when it was requested. Each launch is read
