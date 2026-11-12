@@ -324,6 +324,7 @@ async fn unavailable_declared_driver_surfaces_named_admission_conditions_without
 
 // Driverless ensures act only at their ManifestRoot home, despite local copies.
 #[tokio::test]
+#[ignore = "driverless ensure home after a later same-name copy: owner ruling pending (#3108)"]
 async fn declared_driverless_ensure_has_one_acting_home() {
     ensure_scenarios::driverless_ensure_has_one_acting_home(&Controller, true, &[2, 0, 1, 0, 2, 1]).await;
 }

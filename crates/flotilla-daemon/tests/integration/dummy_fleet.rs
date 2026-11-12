@@ -340,10 +340,17 @@ async fn a_standing_ensure_readmits_after_abandon() {
         .placement_policy(DUMMY_FULFILMENT_KIND.into())
         .repositories(vec![repository.key()])
         .build();
+    // Project operations' stamps, as they materialise an ensure: on the engine a definition keeps
+    // only the stamps of its origin, so a source commit alone reads back as an operator's.
+    let source = repository.key().to_string();
     apply_annotated::<ConvoyEnsure>(
         &fleet,
         "engine-standing",
-        &[(flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION, "fixture")],
+        &[
+            (flotilla_charter::ops_entry::MATERIALIZED_PROJECT_ANNOTATION, "fleet"),
+            (flotilla_charter::ops_entry::SOURCE_REPOSITORY_ANNOTATION, source.as_str()),
+            (flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION, "fixture"),
+        ],
         ensure,
     )
     .await;

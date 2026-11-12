@@ -85,6 +85,10 @@ pub fn declares(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String
 
 /// The origin a writer stamped as `labels` and `annotations`. Stamps naming an origin without all
 /// of its fields are refused with the missing key named.
+///
+/// A ProjectOps origin does not hold the `manifest-reconciler-root` that project operations stamp
+/// for a bound ops root, so an engine read of such a definition carries no root. Its home is still
+/// the binding host: project operations materialise from a bound root only on that host.
 pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, String>) -> Result<DefinitionOrigin, String> {
     let annotation = |key: &str| annotations.get(key).cloned().ok_or_else(|| format!("no `{key}` annotation"));
     let managed_by = labels.get(MANAGED_BY_LABEL).map(String::as_str);

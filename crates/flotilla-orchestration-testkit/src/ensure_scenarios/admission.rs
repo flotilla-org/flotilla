@@ -885,27 +885,21 @@ pub async fn driverless_ensure_home_case(
     let acting_backend = &hosts[acting_home].1;
     let ensures = home_backend.definitions::<ConvoyEnsure>("flotilla");
     let mut ensure = ensures.get("quartermaster").await.expect("home ensure");
-    let mut declared_stamps = BTreeMap::new();
     if declared {
         let declaration =
             RootDeclaration { host: "feta".into(), path: "/ops".into(), source: "project-map".into(), binding: None, ops: false };
         hosts[acting_home].0.manifest_roots().declare("flotilla", "declaring-root", declaration).await.expect("declaring root");
-        declared_stamps = BTreeMap::from([
-            ("flotilla.work/manifest-reconciler-root".to_owned(), if legacy { "feta" } else { "declaring-root" }.to_owned()),
-            ("flotilla.work/manifest-source".to_owned(), "project-map".to_owned()),
-            ("flotilla.work/manifest-path".to_owned(), "ensures/quartermaster.yaml".to_owned()),
-            ("flotilla.work/manifest-revision".to_owned(), "rev-1".to_owned()),
-        ]);
         let mut meta = InputMeta::from(&ensure.metadata);
-        meta.annotations.extend(declared_stamps.clone());
+        meta.annotations.insert("flotilla.work/manifest-reconciler-root".into(), if legacy { "feta" } else { "declaring-root" }.into());
+        meta.annotations.insert("flotilla.work/manifest-source".into(), "project-map".into());
+        meta.annotations.insert("flotilla.work/manifest-path".into(), "ensures/quartermaster.yaml".into());
+        meta.annotations.insert("flotilla.work/manifest-revision".into(), "rev-1".into());
         ensure = ensures.apply(&meta, &ensure.spec).await.expect("declared ensure");
     }
     if refused {
         let mut spec = ensure.spec.clone();
         spec.workflow_ref = "missing-workflow".into();
-        let mut meta = InputMeta::from(&ensure.metadata);
-        meta.annotations.extend(declared_stamps.clone());
-        ensures.apply(&meta, &spec).await.expect("refused ensure config");
+        ensures.apply(&InputMeta::from(&ensure.metadata), &spec).await.expect("refused ensure config");
     }
     let project = home_backend.definitions::<Project>("flotilla").get("standing-project").await.expect("home project");
     for peer in [&peer_a, &peer_b] {
@@ -923,9 +917,6 @@ pub async fn driverless_ensure_home_case(
         );
         let copy = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("replicated ensure");
         let mut meta = InputMeta::from(&copy.metadata);
-        // A peer that does not hold the declaring root reads the copy without its source and
-        // path, so its own manifest pass stamps them again.
-        meta.annotations.extend(declared_stamps.clone());
         meta.labels.insert("local-copy".into(), peer.0.node_id().to_string());
         backend.definitions::<ConvoyEnsure>("flotilla").apply(&meta, &copy.spec).await.expect("local definition copy does not confer home");
     }
