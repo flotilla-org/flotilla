@@ -127,17 +127,11 @@ pub async fn declared_driver_derives_bounded_backoff_from_its_homed_generations(
     let driver_id = driver.local_host_id().expect("driver host identity").to_string();
     set_ensure_driver(&authority_backend, &driver_id).await;
 
-    // The authority's Project reaches the others through its log; its ConvoyEnsure through the
-    // old store's replication.
+    // The authority's Project and ConvoyEnsure reach the others through its log.
     let authority_root = authority.node_id().clone();
     let decided = |daemon: &InProcessDaemon| daemon.decided_store().expect("decided store");
-    for (backend, daemon) in [(&driver_backend, &driver), (&other_backend, &other)] {
+    for daemon in [&driver, &other] {
         flotilla_provisioning_testkit::replicate_home(&decided(&authority), authority_root.as_str(), &decided(daemon));
-        backend
-            .replica_writer::<ConvoyEnsure>(authority_root.clone(), "flotilla")
-            .replace(&authority_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("authority ensures"), Utc::now())
-            .await
-            .expect("replicate ensures");
     }
 
     // The driver publishes its own Host, ready, and every root hears it.

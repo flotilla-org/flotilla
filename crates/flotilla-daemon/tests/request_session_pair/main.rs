@@ -2862,7 +2862,10 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
     .await;
     controller_task.abort();
     assert!(kiwi_requests.sync_once(Utc::now()).await.expect("kiwi vessel requests").requested.is_empty());
-    assert!(VesselRecords::every(engine(&topology.leader).vessels.vessels.as_ref()).expect("kiwi launches").is_empty());
+    // Kiwi follows feta's log, so feta's launch may already read here: only kiwi's own count.
+    let kiwi_home = topology.leader.decided_store().expect("kiwi home").home().to_owned();
+    let kiwi_launches = VesselRecords::every(engine(&topology.leader).vessels.vessels.as_ref()).expect("kiwi launches");
+    assert!(kiwi_launches.iter().all(|launch| launch.home != kiwi_home), "kiwi launches nothing: {kiwi_launches:?}");
 }
 
 #[tokio::test]
@@ -3814,11 +3817,6 @@ async fn seed_governor_subscription(a: &InProcessDaemon, b: &InProcessDaemon) {
         )
         .await
         .expect("presence");
-    a_backend
-        .replica_writer::<ConvoyEnsure>(b.node_id().clone(), "flotilla")
-        .replace(&ensures.list().await.expect("ensure"), Utc::now())
-        .await
-        .expect("replicate presence");
 }
 
 /// One escalation pass at `a`, checked at the governor's home `b`.
@@ -4368,13 +4366,15 @@ async fn run_message_role_waiting_home_case(remote: bool, admitted: bool) {
         admit_convoy(home, standing).await;
     }
     if remote {
-        topology
-            .leader
-            .resource_backend()
-            .replica_writer::<ConvoyEnsure>(home.node_id().clone(), "flotilla")
-            .replace(&declarations.list().await.expect("declaration feed"), Utc::now())
-            .await
-            .expect("replicate declaration origin");
+        // The declaration reaches the caller through its home's log.
+        let caller = topology.leader.resource_backend().definitions::<ConvoyEnsure>("flotilla");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while caller.get("waiting-governor").await.is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the caller follows the declaration from its home");
     }
     for (name, intent) in [
         (

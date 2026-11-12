@@ -210,24 +210,16 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         daemon.message_creation_origin("flotilla", &document("flotilla/governor")).await.expect("declared absent holder must wait"),
         Some(daemon.node_id().clone())
     );
-    let remote = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("remote-holder-home"));
-    remote
-        .using::<flotilla_resources::ConvoyEnsure>("flotilla")
-        .create(
-            &test_meta("waiting-reviewer"),
-            &flotilla_resources::ConvoyEnsureSpec::builder()
-                .project_ref("flotilla".into())
-                .role("reviewer".into())
-                .repositories(Vec::new())
-                .build(),
-        )
-        .await
-        .expect("remote absent holder declaration");
-    backend
-        .replica_writer::<flotilla_resources::ConvoyEnsure>(NodeId::new("remote-holder-home"), "flotilla")
-        .replace(&remote.using::<flotilla_resources::ConvoyEnsure>("flotilla").list().await.expect("declaration feed"), Utc::now())
-        .await
-        .expect("replicated declaration");
+    // The reviewer is declared at another home and reaches this daemon through that home's log.
+    let decided = daemon.decided_store().expect("decided store");
+    let remote = flotilla_provisioning_testkit::other_home_for(&decided, "remote-holder-home");
+    let reviewer = flotilla_resources::ConvoyEnsureSpec::builder()
+        .project_ref("flotilla".into())
+        .role("reviewer".into())
+        .repositories(Vec::new())
+        .build();
+    remote.definition("ConvoyEnsure", "waiting-reviewer", serde_json::to_value(&reviewer).expect("declaration")).await;
+    remote.replicate_to(&decided);
     assert_eq!(
         daemon.message_creation_origin("flotilla", &document("flotilla/reviewer")).await.expect("remote declared absent holder"),
         Some(NodeId::new("remote-holder-home"))

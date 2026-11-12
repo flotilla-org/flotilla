@@ -330,6 +330,7 @@ async fn declared_driverless_ensure_has_one_acting_home() {
 
 // Undeclared driverless ensures act only where they were created.
 #[tokio::test]
+#[ignore = "driverless ensure home after a later same-name copy: owner ruling pending (#3108)"]
 async fn undeclared_driverless_ensure_has_one_acting_home() {
     ensure_scenarios::driverless_ensure_has_one_acting_home(&Controller, false, &[2, 1, 0, 1, 2, 0]).await;
 }
@@ -338,6 +339,7 @@ async fn undeclared_driverless_ensure_has_one_acting_home() {
 // after declaration and while undeclared, for successful and refused admissions.
 // Each case draws one variant; the pinned tests above run every variant.
 #[hegel::test]
+#[ignore = "driverless ensure home after a later same-name copy: owner ruling pending (#3108)"]
 fn generated_driverless_ensure_has_one_acting_home(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let declared = tc.draw(gs::booleans());

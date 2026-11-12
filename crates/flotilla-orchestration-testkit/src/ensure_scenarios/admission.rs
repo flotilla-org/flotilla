@@ -418,16 +418,10 @@ pub async fn replicated_ensure_is_not_reconciled_away_from_its_project_home(fact
     backend.using::<ConvoyEnsure>("flotilla").delete("quartermaster").await.expect("remove local ensure");
     backend.using::<Project>("flotilla").delete("standing-project").await.expect("remove local project");
 
-    let remote_root = NodeId::new("remote-root");
-    let origin = ResourceBackend::new(InMemoryBackend::default()).with_local_root(remote_root.clone());
-    // The Project is homed at the remote root and reaches this daemon through that home's log.
-    project_at_other_home(&daemon, remote_root.as_str(), &project).await;
-    origin.using::<ConvoyEnsure>("flotilla").create(&InputMeta::from(&ensure.metadata), &ensure.spec).await.expect("remote ensure");
-    backend
-        .replica_writer::<ConvoyEnsure>(remote_root, "flotilla")
-        .replace(&origin.using::<ConvoyEnsure>("flotilla").list().await.expect("remote ensures"), Utc::now())
-        .await
-        .expect("replicate ensure");
+    // The Project and the ensure are homed at the remote root and reach this daemon through that home's log.
+    let spec = serde_json::to_value(&ensure.spec).expect("ensure spec");
+    other_home(&daemon, "remote-root").stamped_definition("ConvoyEnsure", "quartermaster", &ensure.metadata.annotations, spec).await;
+    project_at_other_home(&daemon, "remote-root", &project).await;
 
     assert!(backend.definitions::<Project>("flotilla").get("standing-project").await.is_ok(), "replicated project should be visible");
     assert!(backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.is_ok(), "replicated ensure should be visible");
@@ -535,7 +529,6 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         .expect("root B host resource");
     create_host_direct_placement((&*daemon).into(), "host-direct-root-b-vessels", "root-b-vessels").await;
     create_standing_agent_placement(&daemon).await;
-    let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     let repository_spec = RepositorySpec::remote("https://github.com/acme/cross-root").expect("repository spec");
     let repository_key = repository_spec.key();
     // Root A's Repository and Project are homed there, and reach root B through its log.
@@ -585,41 +578,27 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         )
         .await
         .expect("driver-local workflow");
-    source
-        .definitions::<ConvoyEnsure>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("cross-root".to_string())
-                .annotations(BTreeMap::from([
-                    (MATERIALIZED_PROJECT_ANNOTATION.to_string(), "cross-root-project".to_string()),
-                    (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository_key.to_string()),
-                    (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
-                    (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), "ops/cross-root.md".to_string()),
-                ]))
-                .build(),
-            &ConvoyEnsureSpec {
-                project_ref: "cross-root-project".to_string(),
-                role: "quartermaster".to_string(),
-                driver_ref: Some(driver_ref),
-                workflow_ref: "cross-root-workflow".to_string(),
-                // Its agent seat is placed where a harness is.
-                placement_policy: Some("standing-agent".to_string()),
-                escalation_reason: None,
-                repositories: vec![repository_key.clone()],
-                presents_as: None,
-                agent_overrides: Vec::new(),
-            },
-        )
-        .await
-        .expect("source ensure");
-
-    let origin = NodeId::new("root-a");
+    // Root A declares the ensure too; it reaches root B through root A's log.
+    let ensure = ConvoyEnsureSpec {
+        project_ref: "cross-root-project".to_string(),
+        role: "quartermaster".to_string(),
+        driver_ref: Some(driver_ref),
+        workflow_ref: "cross-root-workflow".to_string(),
+        // Its agent seat is placed where a harness is.
+        placement_policy: Some("standing-agent".to_string()),
+        escalation_reason: None,
+        repositories: vec![repository_key.clone()],
+        presents_as: None,
+        agent_overrides: Vec::new(),
+    };
+    let stamps = BTreeMap::from([
+        (MATERIALIZED_PROJECT_ANNOTATION.to_string(), "cross-root-project".to_string()),
+        (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository_key.to_string()),
+        (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
+        (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), "ops/cross-root.md".to_string()),
+    ]);
+    root_a.stamped_definition("ConvoyEnsure", "cross-root", &stamps, serde_json::to_value(&ensure).expect("ensure spec")).await;
     replicate_other_home(&daemon, "root-a");
-    target
-        .replica_writer::<ConvoyEnsure>(origin, "flotilla")
-        .replace(&source.using::<ConvoyEnsure>("flotilla").list().await.expect("source ensures"), Utc::now())
-        .await
-        .expect("replicate ensures");
 
     assert_eq!(
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("cross-root ensure admission"),
@@ -906,19 +885,27 @@ pub async fn driverless_ensure_home_case(
     let acting_backend = &hosts[acting_home].1;
     let ensures = home_backend.definitions::<ConvoyEnsure>("flotilla");
     let mut ensure = ensures.get("quartermaster").await.expect("home ensure");
+    let mut declared_stamps = BTreeMap::new();
     if declared {
         let declaration =
             RootDeclaration { host: "feta".into(), path: "/ops".into(), source: "project-map".into(), binding: None, ops: false };
         hosts[acting_home].0.manifest_roots().declare("flotilla", "declaring-root", declaration).await.expect("declaring root");
+        declared_stamps = BTreeMap::from([
+            ("flotilla.work/manifest-reconciler-root".to_owned(), if legacy { "feta" } else { "declaring-root" }.to_owned()),
+            ("flotilla.work/manifest-source".to_owned(), "project-map".to_owned()),
+            ("flotilla.work/manifest-path".to_owned(), "ensures/quartermaster.yaml".to_owned()),
+            ("flotilla.work/manifest-revision".to_owned(), "rev-1".to_owned()),
+        ]);
         let mut meta = InputMeta::from(&ensure.metadata);
-        meta.annotations.insert("flotilla.work/manifest-reconciler-root".into(), if legacy { "feta" } else { "declaring-root" }.into());
-        meta.annotations.insert("flotilla.work/manifest-source".into(), "project-map".into());
+        meta.annotations.extend(declared_stamps.clone());
         ensure = ensures.apply(&meta, &ensure.spec).await.expect("declared ensure");
     }
     if refused {
         let mut spec = ensure.spec.clone();
         spec.workflow_ref = "missing-workflow".into();
-        ensures.apply(&InputMeta::from(&ensure.metadata), &spec).await.expect("refused ensure config");
+        let mut meta = InputMeta::from(&ensure.metadata);
+        meta.annotations.extend(declared_stamps.clone());
+        ensures.apply(&meta, &spec).await.expect("refused ensure config");
     }
     let project = home_backend.definitions::<Project>("flotilla").get("standing-project").await.expect("home project");
     for peer in [&peer_a, &peer_b] {
@@ -928,13 +915,17 @@ pub async fn driverless_ensure_home_case(
             .create(&InputMeta::from(&project.metadata), &project.spec)
             .await
             .expect("each host registers its own Project copy");
-        backend
-            .replica_writer::<ConvoyEnsure>(home.0.node_id().clone(), "flotilla")
-            .replace(&home_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("ensure snapshot"), Utc::now())
-            .await
-            .expect("replicate ensure");
+        // The home's ensure reaches each peer through the home's log.
+        flotilla_provisioning_testkit::replicate_home(
+            &home.0.decided_store().expect("home decided store"),
+            home.0.node_id().as_str(),
+            &peer.0.decided_store().expect("peer decided store"),
+        );
         let copy = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("replicated ensure");
         let mut meta = InputMeta::from(&copy.metadata);
+        // A peer that does not hold the declaring root reads the copy without its source and
+        // path, so its own manifest pass stamps them again.
+        meta.annotations.extend(declared_stamps.clone());
         meta.labels.insert("local-copy".into(), peer.0.node_id().to_string());
         backend.definitions::<ConvoyEnsure>("flotilla").apply(&meta, &copy.spec).await.expect("local definition copy does not confer home");
     }

@@ -295,8 +295,10 @@ impl EnsurePass<'_> {
     }
 
     /// Definitions reads merge every host's copy, so local presence does not
-    /// establish home. ManifestRoots are home-bound; undeclared definitions
-    /// belong to their earliest creation, before later local reapplications.
+    /// establish home. ManifestRoots are home-bound; an undeclared definition
+    /// belongs to the home whose copy sorts first by origin, since every engine
+    /// copy reads its creation time as the epoch. A later same-name copy at a
+    /// lower-sorting home also acts; owner question open (#3108).
     async fn driverless_ensure_is_home(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<bool, ResourceError> {
         if let Some(root) = ensure.metadata.annotations.get("flotilla.work/manifest-reconciler-root") {
             if let Some(root) = self.manifest_roots.root(namespace, root).await.map_err(ResourceError::other)? {
@@ -320,8 +322,8 @@ impl EnsurePass<'_> {
             .resource_backend
             .query_declared::<ConvoyEnsure>(namespace, &StoreQuery::names([ensure.metadata.name.clone()], true))
             .await?;
-        // Replication preserves each origin's creation_timestamp; it never
-        // substitutes the replica's arrival time. Reapplications create later sources.
+        // The engine keeps no creation time (every copy reads as the epoch), so the origin
+        // tie-break alone decides which home's copy is first.
         let first = sources.items.into_iter().filter(|source| source.object.metadata.deletion_timestamp.is_none()).min_by_key(|source| {
             let origin = match &source.provenance {
                 ResourceProvenance::Local => &local_root,
