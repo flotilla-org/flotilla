@@ -227,6 +227,7 @@ workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 flotilla-daemon-testkit = { path = "crates/flotilla-daemon-testkit" }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
+flotilla-engine-convoys-testkit = { path = "crates/flotilla-engine-convoys-testkit" }
 
 # rigging-http-wire speaks the stack CBOR profile through rigging's copy of
 # flotilla-cbor; resolve it to this workspace's copy so the daemon links one profile.

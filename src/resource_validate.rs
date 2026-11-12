@@ -749,8 +749,7 @@ mod tests {
     use flotilla_config::ConfigStore;
     use flotilla_daemon::server::DaemonServer;
     use flotilla_discovery_testkit::fake_discovery;
-    use flotilla_protocol::NodeId;
-    use flotilla_resources::{Convoy, ConvoySpec, ConvoyStatus, InputMeta, Project, ProjectSpec};
+    use flotilla_resources::{ConvoySpec, ConvoyStatus, InputMeta, Project, ProjectSpec};
     use flotilla_store::validate_resource_document;
     use flotilla_test_support::TestSocketDir;
     use serde_json::Value;
@@ -1335,14 +1334,17 @@ mod tests {
             )
             .await
             .expect("create project");
-        backend
-            .using::<Convoy>("flotilla")
-            .create(
-                &InputMeta::builder().name("sample-convoy".to_string()).build(),
-                &ConvoySpec::builder().workflow_ref("default".to_string()).build(),
-            )
-            .await
-            .expect("create convoy");
+        // Convoys are admitted on the engine, not written to the store; validation only reads them.
+        flotilla_daemon_testkit::engine::admit_convoy(
+            &server.daemon(),
+            flotilla_engine_convoys_testkit::convoy(
+                "flotilla",
+                "sample-convoy",
+                ConvoySpec::builder().workflow_ref("default".to_string()).build(),
+                flotilla_engine_convoys_testkit::single_agent("coder"),
+            ),
+        )
+        .await;
         backend
             .using::<Project>("ops")
             .create(
@@ -1363,22 +1365,8 @@ mod tests {
             .apply(&InputMeta::builder().name("default".into()).build(), &flotilla_resources::WorkflowTemplateSpec::builder().build())
             .await
             .expect("satisfiable pending workflow");
-        let replicas = backend.using::<Convoy>("flotilla");
-        replicas
-            .create(
-                &InputMeta::builder().name("replica-only".to_string()).build(),
-                &ConvoySpec::builder().workflow_ref("default".to_string()).build(),
-            )
-            .await
-            .expect("create replica source");
-        let mut source = replicas.list().await.expect("list replica source");
-        source.items.retain(|convoy| convoy.metadata.name == "replica-only");
-        backend
-            .replica_writer::<Convoy>(NodeId::new("other-root"), "flotilla")
-            .replace(&source, chrono::Utc::now())
-            .await
-            .expect("write replica source");
-        replicas.delete("replica-only").await.expect("remove local replica source");
+        // Validation over another home's launch is not covered: the engine's convoys come from
+        // their homes' records, and the testkit cannot yet seed another home's records at a daemon.
         let charter_dir = tempfile::tempdir().expect("local bound charter");
         let charter_file = charter_dir.path().join("policy.yaml");
         let charter_text =

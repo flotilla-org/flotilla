@@ -1496,6 +1496,7 @@ dependencies = [
  "flotilla-daemon-api",
  "flotilla-daemon-testkit",
  "flotilla-discovery-testkit",
+ "flotilla-engine-convoys-testkit",
  "flotilla-environment",
  "flotilla-manifest",
  "flotilla-paths",
