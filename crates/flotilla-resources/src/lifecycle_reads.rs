@@ -27,12 +27,6 @@ pub enum ProvisioningKind {
 /// impl LifecycleReads for Incomplete {}
 /// ```
 pub trait LifecycleReads: Send + Sync {
-    /// No home is configured, so consumers can preserve the no-engine path without
-    /// dispatching a blocking read. Active adapters default to checked reads.
-    fn is_disabled(&self) -> bool {
-        false
-    }
-
     /// A read failure is distinct from an unheld resource and must not select legacy status.
     fn try_reading(
         &self,
@@ -105,22 +99,17 @@ pub trait LifecycleReads: Send + Sync {
     }
 }
 
-/// No engine: every view reads the old status.
+/// Readings of an engine that holds nothing.
 pub struct NoLifecycleReads;
 
 impl LifecycleReads for NoLifecycleReads {
-    fn is_disabled(&self) -> bool {
-        true
-    }
-
     fn try_reading(&self, _: ProvisioningKind, _: &str, _: Option<&str>) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
         Ok(None)
     }
 }
 
-/// Readings installed once, after composition opens the decided store; none before.
-/// With the engine enabled, runtime composition installs these before starting lifecycle controllers.
-/// An uninstalled port intentionally selects the no-engine path when the switch is off.
+/// Readings installed once, after composition opens the decided store, before any lifecycle
+/// controller starts; a read before then is refused.
 #[derive(Default)]
 pub struct LateLifecycleReads {
     installed: std::sync::OnceLock<std::sync::Arc<dyn LifecycleReads>>,
@@ -139,10 +128,6 @@ impl LateLifecycleReads {
 }
 
 impl LifecycleReads for LateLifecycleReads {
-    fn is_disabled(&self) -> bool {
-        self.installed.get().is_none_or(|reads| reads.is_disabled())
-    }
-
     fn environments(&self) -> Result<&dyn crate::environment_records::EnvironmentRecords, String> {
         self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.environments()
     }
@@ -181,7 +166,7 @@ impl LifecycleReads for LateLifecycleReads {
         name: &str,
         origin: Option<&str>,
     ) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
-        self.installed.get().map_or(Ok(None), |reads| reads.try_reading(kind, name, origin))
+        self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.try_reading(kind, name, origin)
     }
 }
 
@@ -189,13 +174,13 @@ impl LifecycleReads for LateLifecycleReads {
 mod tests {
     use super::*;
 
-    // No-engine operation remains available before installation; engine-enabled startup requires it.
+    // A read before installation is refused; startup requires the port.
     // Once installed, the port remains installed and a duplicate install is refused.
     #[test]
     fn engine_startup_requires_the_late_read_port() {
         let reads = LateLifecycleReads::default();
         assert!(reads.require_installed().is_err());
-        assert_eq!(reads.try_reading(ProvisioningKind::Checkout, "checkout", None), Ok(None));
+        assert!(reads.try_reading(ProvisioningKind::Checkout, "checkout", None).is_err());
         reads.install(std::sync::Arc::new(NoLifecycleReads)).expect("install");
         reads.require_installed().expect("installed");
         assert_eq!(reads.try_reading(ProvisioningKind::Checkout, "checkout", None), Ok(None));

@@ -406,9 +406,6 @@ pub fn engine_vessel(
     obj: &ResourceObject<Vessel>,
     origin: Option<&str>,
 ) -> Result<Option<VesselRecord>, String> {
-    if reads.is_disabled() {
-        return Ok(None);
-    }
     reads.vessels()?.get(&obj.metadata.name, origin)
 }
 

@@ -65,10 +65,6 @@ struct Held {
 }
 
 impl LifecycleReads for Held {
-    fn is_disabled(&self) -> bool {
-        self.reads.is_disabled()
-    }
-
     fn try_reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Result<Option<LifecycleReading>, String> {
         self.reads.try_reading(kind, name, origin)
     }

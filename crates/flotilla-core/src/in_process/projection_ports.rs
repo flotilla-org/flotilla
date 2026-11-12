@@ -213,10 +213,6 @@ pub(super) struct DecidedReads {
 }
 
 impl flotilla_resources::lifecycle_reads::LifecycleReads for DecidedReads {
-    fn is_disabled(&self) -> bool {
-        self.reads.is_disabled()
-    }
-
     fn try_reading(
         &self,
         kind: flotilla_resources::lifecycle_reads::ProvisioningKind,
