@@ -345,6 +345,16 @@ impl Case {
         caught_up(wake, &self.convoy().await).await;
     }
 
+    /// Every launch as it reads, keyed for a judge, once `wake`'s views have heard each of them:
+    /// the judge finds a supervisor in those views, and skips a launch whose view lags.
+    async fn heard(&self, wake: &ReconcilerWake) -> HashMap<String, ResourceObject<Convoy>> {
+        let convoys = self.backend.using::<Convoy>("flotilla").list().await.expect("convoys").items;
+        for convoy in &convoys {
+            caught_up(wake, convoy).await;
+        }
+        convoys.into_iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect()
+    }
+
     /// `wake` judges the work's launch at `now`, once its views have heard the launch as it reads.
     async fn judge(&self, wake: &ReconcilerWake, now: DateTime<Utc>) {
         let convoy = self.convoy().await;
@@ -608,7 +618,6 @@ async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restart
     // A governor whose workflow crews no governor seat is a governor without its crew.
     let first = admit_governor(&case, "governor", 1, if crewed { "governor" } else { "deputy" }).await;
     let delivery = case.delivery.clone();
-    let convoys = case.backend.using::<Convoy>("flotilla");
     let mut wake = case.wake.clone();
     match unavailable {
         GovernorUnavailable::DeliveryError => delivery.unavailable.store(true, Ordering::SeqCst),
@@ -623,8 +632,7 @@ async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restart
         if *restart {
             wake = case.restarted_wake().await;
         }
-        let objects =
-            convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+        let objects = case.heard(&wake).await;
         wake.sync_rows("flotilla", &objects).await.expect("rebuild rows");
         wake.judge_stalls_at("flotilla", &objects, now).await.expect("judge unavailable governor");
         let stalled = case.status().await.stalled.expect("stall");
@@ -665,8 +673,7 @@ async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restart
     };
     delivery.unavailable.store(false, Ordering::SeqCst);
     for _ in 0..2 {
-        let objects =
-            convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+        let objects = case.heard(&wake).await;
         wake.sync_rows("flotilla", &objects).await.expect("rebuild rows");
         wake.judge_stalls_at("flotilla", &objects, now).await.expect("judge reachable governor");
         let stalled = case.status().await.stalled.expect("stall");
