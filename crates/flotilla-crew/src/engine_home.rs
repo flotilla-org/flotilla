@@ -119,12 +119,12 @@ impl EngineHome {
     }
 
     /// The session `request` asks for, realised; returns its launch, which is its crew's id. An
-    /// agent's launch resolves to its adapter's harness (`claude` when it names none).
+    /// agent's launch resolves to its adapter's harness (`claude-code` when it names none).
     pub fn launch_session(&self, request: &TerminalLaunchRequest) -> String {
         let launch = self.engine.terminals.request(request);
         let agent = match &request.source {
             TerminalLaunchSource::Agent { adapter, model, .. } => Some(AgentLaunch {
-                adapter: adapter.clone().unwrap_or_else(|| "claude".to_owned()),
+                adapter: adapter.clone().unwrap_or_else(|| "claude-code".to_owned()),
                 model: model.clone(),
                 stance: "trusted-implicit".to_owned(),
             }),
