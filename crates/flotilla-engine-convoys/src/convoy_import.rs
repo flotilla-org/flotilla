@@ -130,7 +130,35 @@ pub struct ImportedConvoy {
 pub enum ImportOutcome {
     Imported(Box<ImportedConvoy>),
     /// Not the import's: ended or not yet bootstrapped.
-    StaysOld(String),
+    StaysOld(StaysOldReason),
+}
+
+/// Why an old convoy is not the import's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StaysOldReason {
+    /// No workflow snapshot yet: a new convoy is admitted at bootstrap.
+    NotBootstrapped,
+    /// Ended in this phase: read as stored.
+    Ended(ConvoyPhase),
+}
+
+impl StaysOldReason {
+    /// The reason's name, the same for every ended phase.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotBootstrapped => "never bootstrapped",
+            Self::Ended(_) => "ended",
+        }
+    }
+}
+
+impl std::fmt::Display for StaysOldReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotBootstrapped => f.write_str("not bootstrapped: admitted at bootstrap"),
+            Self::Ended(phase) => write!(f, "ended ({phase:?}): read as stored"),
+        }
+    }
 }
 
 /// What the import reads beyond one record.
@@ -159,10 +187,10 @@ pub fn import_convoy(
     let name = convoy.metadata.name.clone();
     let refuse = |reason: String| ConvoyImportRefusal::Unmappable { convoy: name.clone(), reason };
     let Some(status) = convoy.status.as_ref().filter(|status| status.workflow_snapshot.is_some()) else {
-        return Ok(ImportOutcome::StaysOld("not bootstrapped: admitted at bootstrap".into()));
+        return Ok(ImportOutcome::StaysOld(StaysOldReason::NotBootstrapped));
     };
     if matches!(status.phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Abandoned) {
-        return Ok(ImportOutcome::StaysOld(format!("ended ({:?}): read as stored", status.phase)));
+        return Ok(ImportOutcome::StaysOld(StaysOldReason::Ended(status.phase)));
     }
     let standing = is_ensured(convoy);
     let crews = Crews::of(status);
@@ -653,7 +681,7 @@ pub fn rehearse(imported: &[ImportedConvoy]) -> Vec<RehearsalRefusal> {
 #[derive(Debug, Default, PartialEq)]
 pub struct RehearsalReport {
     pub imported: Vec<ImportedConvoy>,
-    pub stays_old: Vec<(String, String)>,
+    pub stays_old: Vec<(String, StaysOldReason)>,
     pub refused: Vec<ConvoyImportRefusal>,
     pub rehearsal: Vec<RehearsalRefusal>,
 }

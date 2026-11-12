@@ -53,12 +53,13 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
                     report.notes.push(format!("Convoy `{}`: an open stall is not recorded: {reason}", convoy.resource.name()));
                 }
             }
-            if !mapped.stays_old.is_empty() {
-                report.drop_rows(
-                    KIND,
-                    "ended or never bootstrapped: dropped by the import; the old resources.sqlite stays on disk",
-                    mapped.stays_old.len(),
-                );
+            // Dropped by the import; the old resources.sqlite stays on disk.
+            let mut stays_old = BTreeMap::<&'static str, usize>::new();
+            for (_, reason) in &mapped.stays_old {
+                *stays_old.entry(reason.label()).or_default() += 1;
+            }
+            for (reason, count) in stays_old {
+                report.drop_rows(KIND, reason, count);
             }
             for refusal in &mapped.refused {
                 report.refused.push(ImportRefusal { kind: KIND, record: refused_name(refusal), reason: refusal.to_string() });

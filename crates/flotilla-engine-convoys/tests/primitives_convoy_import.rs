@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use chrono::Utc;
 use flotilla_engine_convoys::convoy_import::{
-    check, import_convoy, rehearse, rehearse_all, ConvoyImportRefusal, ConvoyImportWorld, ImportOutcome, ImportedConvoy,
+    check, import_convoy, rehearse, rehearse_all, ConvoyImportRefusal, ConvoyImportWorld, ImportOutcome, ImportedConvoy, StaysOldReason,
 };
 use flotilla_resources::{
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict},
@@ -200,10 +200,10 @@ fn unfinished_convoys_without_promises_are_refused_by_name() {
     status.crew_work.get_mut("work").and_then(|crew| crew.get_mut("reviewer")).expect("reviewer").phase = CrewWorkPhase::Done;
     assert_eq!(import_convoy(&idle, HOME, &[], &WORLD), Err(ConvoyImportRefusal::NoObligations { convoy: "idle".into() }));
     let landed = convoy("landed", ConvoyPhase::Landed, vec![agent("reviewer", false)]);
-    assert!(matches!(import_convoy(&landed, HOME, &[], &WORLD), Ok(ImportOutcome::StaysOld(_))));
+    assert_eq!(import_convoy(&landed, HOME, &[], &WORLD), Ok(ImportOutcome::StaysOld(StaysOldReason::Ended(ConvoyPhase::Landed))));
     let mut fresh = convoy("fresh", ConvoyPhase::Pending, vec![agent("coder", true)]);
     fresh.status.as_mut().expect("status").workflow_snapshot = None;
-    assert!(matches!(import_convoy(&fresh, HOME, &[], &WORLD), Ok(ImportOutcome::StaysOld(_))));
+    assert_eq!(import_convoy(&fresh, HOME, &[], &WORLD), Ok(ImportOutcome::StaysOld(StaysOldReason::NotBootstrapped)));
 }
 
 // Behaviour (owner ruling, #3108): an agent seat bootstrapped before the default ledger existed, and
