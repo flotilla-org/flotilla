@@ -1173,6 +1173,31 @@ fn dropped_daemon_releases_its_stores() {
     assert!(decided.upgrade().is_none(), "the dropped daemon's decided store is still held");
 }
 
+/// The engine a test installs into its daemon goes with the daemon, and with it the decided store.
+#[test]
+fn dropped_daemon_releases_the_engine_a_test_installed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(tmp.path().join("config"));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    let decided = runtime.block_on(async {
+        let daemon = InProcessDaemon::new(
+            vec![],
+            config,
+            fake_discovery(false),
+            HostName::local(),
+            Arc::new(crate::peer::HostPeerOverlay::default()),
+        )
+        .await;
+        let engine = Arc::downgrade(&install_engine(&daemon));
+        assert!(engine.upgrade().is_some(), "the daemon holds the engine installed in it");
+        Arc::downgrade(&daemon.decided_store().expect("decided store"))
+    });
+    // The engine's followers run on the test's runtime and end with it.
+    drop(runtime);
+
+    assert!(decided.upgrade().is_none(), "the dropped daemon's decided store is still held");
+}
+
 #[tokio::test]
 async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
     let tmp = tempfile::tempdir().expect("tempdir");

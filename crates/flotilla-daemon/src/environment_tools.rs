@@ -1212,6 +1212,9 @@ dependency = { path = "../dependency" }
             command
                 .args(["build", "--offline", "--manifest-path", repo.join("Cargo.toml").to_str().expect("UTF-8 manifest")])
                 .current_dir(&repo)
+                // An empty value disables a host's configured wrapper (such as sccache),
+                // which cannot identify the probe as rustc.
+                .env("RUSTC_WRAPPER", "")
                 .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
                 .env("RUSTC", &compiler_probe)
                 .env("FLOTILLA_RUSTC_ARG_LOG", &compiler_log)
