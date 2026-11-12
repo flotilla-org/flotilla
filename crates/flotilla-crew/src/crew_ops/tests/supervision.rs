@@ -597,6 +597,8 @@ struct Delivery {
     launch: String,
     reachable: bool,
     conflict: bool,
+    /// Resume the coder at the publication boundary, as a concurrent operator would.
+    resume_coder: bool,
 }
 #[async_trait]
 impl TurnDeliveryActuator for Delivery {
@@ -650,6 +652,23 @@ impl TurnDeliveryActuator for Delivery {
             let source = convoys.get(&self.launch).await.expect("source authority");
             let engine = self.path.get().expect("the Convoy path");
             engine.fail_seat(&source, "work", "coder", "operator", "concurrent ruling").await.expect("concurrent ruling");
+        }
+        if self.resume_coder {
+            flotilla_store::note_convoy(
+                &self.path,
+                &convoys,
+                &self.launch,
+                &convoy_external_patches::resume_crew_work(
+                    "work".into(),
+                    "coder".into(),
+                    Utc::now(),
+                    "concurrent resume".into(),
+                    None,
+                    ResumeIntent::Reopen,
+                ),
+            )
+            .await
+            .expect("concurrent resume");
         }
         Ok(CrewTurnAdmission {
             new_turn: true,
@@ -707,6 +726,7 @@ async fn run_escalation_scenarios(
             launch: held.launch.clone(),
             reachable,
             conflict,
+            resume_coder: false,
         }))
         .await;
         let bosun = seed_escalation_stall(&held, &backend, cursor, operator).await;
@@ -776,6 +796,43 @@ async fn run_escalation_scenarios(
         } else {
             assert_escalation_refused(&result, &after, &before, &records, operator, collocated);
         }
+    }
+}
+
+// A collocated deputy's activation clears the coder's stall, which the seat's view derives its
+// Stalled phase from; a concurrent change to the coder's seat still refuses the transfer.
+#[tokio::test]
+async fn collocated_escalation_refuses_a_concurrent_change_to_the_seat() {
+    for (conflict, resume_coder) in [(true, false), (false, true)] {
+        let (crew, backend, _, held) =
+            old_store_prelude_fixture(CrewWorkPhase::Working, &[], |snapshot, _| escalation_shape(snapshot, false, true, true, "")).await;
+        crew.set_turn_delivery_actuator(Arc::new(Delivery {
+            backend: backend.clone(),
+            path: held.engine.path(),
+            launch: held.launch.clone(),
+            reachable: true,
+            conflict,
+            resume_coder,
+        }))
+        .await;
+        let bosun = seed_escalation_stall(&held, &backend, true, false).await;
+        held.crew_session("deputy", "deputy-session");
+        let result = crew
+            .supervise(CrewSupervisionRequest {
+                namespace: "flotilla",
+                convoy_name: &held.launch,
+                vessel: "work",
+                role: "coder",
+                operation: flotilla_protocol::CrewSupervisionAction::Escalate,
+                message: "please handle this",
+                actor_crew_id: Some(&bosun),
+                principal: None,
+            })
+            .await;
+        let error = result.expect_err("a concurrent change to the coder's seat refuses the transfer");
+        assert!(error.contains("stall changed during escalation"), "{error}");
+        let status = held.convoy(&backend).await.status.expect("status");
+        assert!(status.stalled.as_ref().is_none_or(|stall| stall.supervisor.as_ref().is_none_or(|owner| owner.role != "deputy")));
     }
 }
 

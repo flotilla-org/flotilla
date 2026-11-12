@@ -1528,8 +1528,20 @@ impl CrewService {
                                 .is_some_and(|message| work.resume_brief_id.as_deref() == Some(message.name.as_str()))
                     })
             });
-        let obligation_unchanged =
-            updated.crew_work.get(vessel).and_then(|crew| crew.get(role)) == status.crew_work.get(vessel).and_then(|crew| crew.get(role));
+        /// The seat without what its convoy's stall derives: a Stalled phase reads Working, and the
+        /// stall report goes. The stall is compared separately, so clearing it does not also
+        /// change the seat; a per-seat stall record would replace this.
+        fn without_stall(state: Option<&flotilla_resources::CrewWorkState>) -> Option<flotilla_resources::CrewWorkState> {
+            state.cloned().map(|mut state| {
+                if state.phase == CrewWorkPhase::Stalled {
+                    state.phase = CrewWorkPhase::Working;
+                    state.message = None;
+                }
+                state
+            })
+        }
+        let obligation_unchanged = without_stall(updated.crew_work.get(vessel).and_then(|crew| crew.get(role)))
+            == without_stall(status.crew_work.get(vessel).and_then(|crew| crew.get(role)));
         if updated.phase.is_terminal() || !obligation_unchanged || (updated.stalled != status.stalled && !local_activation) {
             return Err(
                 "stall changed during escalation; the current ruling was preserved; the next receiver may already have been notified"
