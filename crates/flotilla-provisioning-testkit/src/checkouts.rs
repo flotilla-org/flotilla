@@ -4,6 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use flotilla_engine_store::{open_home_with, StoreLog};
+use flotilla_protocol::PrincipalRef;
 use flotilla_provisioning::{
     engine::{
         checkouts::EngineCheckouts,
@@ -16,7 +17,7 @@ use flotilla_provisioning::{
 use flotilla_resources::{
     checkout_records::{CheckoutHolder, CheckoutRecord, CheckoutRecords},
     lifecycle_reads::LifecycleReads,
-    CheckoutSpec,
+    AdmissionDocument, CheckoutSpec, WorkflowSnapshot,
 };
 use flotilla_schema::{Address, ChangeItem, Frozen, Identity, Kind, Timestamp};
 use flotilla_schema_sqlite::Store;
@@ -55,6 +56,42 @@ pub struct CheckoutFixture {
 const PROJECT: &str = "p";
 const AUTHORITY: &str = "yes";
 const DUTY: DutyId = DutyId(1);
+
+/// An admission document with no crew or vessels: what a fixture convoy froze, so the daemon's
+/// convoy views decode it like any other launch.
+fn empty_admission() -> Vec<u8> {
+    AdmissionDocument {
+        workflow_snapshot: WorkflowSnapshot {
+            cascade: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+            vessels: Vec::new(),
+        },
+        placement_decision: None,
+        placement_policy: None,
+        role: String::new(),
+        ensure_admission: None,
+        naming: None,
+        dispatching_principal_ref: PrincipalRef { namespace: "flotilla".into(), name: "operator".into() },
+        continuation: None,
+        inputs: Default::default(),
+        repositories: Vec::new(),
+        r#ref: None,
+        adopted_checkout_refs: Default::default(),
+        subjects: Vec::new(),
+        instruction: None,
+        workflow_template: None,
+        placement_snapshot: None,
+        vessel_placements: Default::default(),
+        brief_artifacts: false,
+        adopted_checkout: None,
+        provenance: Default::default(),
+    }
+    .encode()
+    .expect("encode admission")
+}
 
 fn convoy_world() -> MemoryConvoyWorld {
     let mut world = MemoryConvoyWorld::default().with_project(&Address::project(PROJECT).expect("project"));
@@ -141,7 +178,7 @@ impl CheckoutFixture {
         let request = ConvoyRequest {
             launch_of: name.into(),
             workflow_ref: "w".into(),
-            admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
+            admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(empty_admission())).expect("freeze"),
             project: Address::project(PROJECT).expect("project"),
             promises: Default::default(),
             duties: [(DUTY, Duty { owner: lead(), scope: DutyScope::Lifetime, terms: Terms::default() })].into_iter().collect(),
