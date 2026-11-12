@@ -889,6 +889,35 @@ async fn seed_escalation_stall(held: &Held, backend: &ResourceBackend, cursor: b
     bosun
 }
 
+// A stall's recorded escalation that no read reaches leaves the supervisor's Resume unlinked
+// rather than refused.
+#[tokio::test]
+async fn resume_with_an_unreadable_recorded_escalation_goes_unlinked() {
+    let (crew, backend, probe, held) =
+        shaped_fixture(CrewWorkPhase::Working, |snapshot| escalation_shape(snapshot, false, false, true, "principal:operator")).await;
+    probe.fail.store(false, Ordering::SeqCst);
+    let bosun = seed_escalation_stall(&held, &backend, true, false).await;
+    held.stall(&backend, |stall| {
+        stall.supervision_message =
+            Some(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "escalation-never-sent"));
+    })
+    .await;
+    crew.supervise(CrewSupervisionRequest {
+        namespace: "flotilla",
+        convoy_name: &held.launch,
+        vessel: "work",
+        role: "coder",
+        operation: flotilla_protocol::CrewSupervisionAction::Resume,
+        message: "carry on",
+        actor_crew_id: Some(&bosun),
+        principal: None,
+    })
+    .await
+    .expect("the ruling is admitted without its link");
+    let records = held.messages().messages().views("flotilla").await.expect("messages");
+    assert_ruling_unlinked(&records.into_iter().map(|record| record.object).collect::<Vec<_>>(), &held);
+}
+
 // Glue: resolution errors retain their command-error channel rather than claiming
 // a receiver is absent. The shared resolver validates this address before admission.
 #[tokio::test]

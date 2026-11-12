@@ -1436,7 +1436,12 @@ impl CrewService {
         actor_crew_id: Option<&str>,
     ) -> Result<Option<String>, String> {
         if let Some(reference) = &stalled.supervision_message {
-            return Ok(Some(reference.name.clone()));
+            // The stall recorded the escalation it sent; a real daemon always holds or reaches it.
+            let linked = self.reply_link(namespace, sender, receiver, &reference.name).await;
+            if linked.is_none() {
+                tracing::warn!(message = %reference.name, "a stall's recorded escalation did not resolve; its ruling goes unlinked");
+            }
+            return Ok(linked);
         }
         // The escalation runs the other way: from the crew to this ruling's sender, its parties
         // spelled as the messages read back spell them.
@@ -1477,21 +1482,27 @@ impl CrewService {
             receiver,
             &turn_message_producer_key(&supervision_message_source(convoy_name, index), &stalled.began_at.timestamp_micros().to_string()),
         );
+        Ok(self.reply_link(namespace, sender, receiver, &name).await)
+    }
+
+    /// `escalation` when a ruling from `sender` to `receiver` can reply to it, read as the ruling's
+    /// admission reads it; otherwise the ruling goes unlinked.
+    async fn reply_link(&self, namespace: &str, sender: &str, receiver: &str, escalation: &str) -> Option<String> {
         let ruling = flotilla_resources::MessageSpec::builder()
             .sender(sender.to_owned())
             .receiver(receiver.to_owned())
             .relation(flotilla_resources::MessageRelation::Supervisor)
             .body(String::new())
-            .in_reply_to(name.clone())
+            .in_reply_to(escalation.to_owned())
             .build();
-        Ok(match self.resolve_in_reply_to(namespace, &ruling).await {
-            flotilla_messaging::MessageResolution::Found => Some(name),
+        match self.resolve_in_reply_to(namespace, &ruling).await {
+            flotilla_messaging::MessageResolution::Found => Some(escalation.to_owned()),
             flotilla_messaging::MessageResolution::Absent => None,
             flotilla_messaging::MessageResolution::Unknown(error) => {
-                tracing::warn!(message = %name, %error, "supervision ruling sent unlinked: its escalation could not be read");
+                tracing::warn!(message = %escalation, %error, "supervision ruling sent unlinked: its escalation could not be read");
                 None
             }
-        })
+        }
     }
 
     /// Records an admitted escalation's next stall condition, refused when the stall changed
