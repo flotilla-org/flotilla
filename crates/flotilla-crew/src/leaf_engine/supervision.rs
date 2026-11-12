@@ -1,13 +1,21 @@
 use super::stalls::{crew_role_address, stalled_source_actor};
+use flotilla_messaging::MessageReceiverSnapshot;
 use flotilla_resources::{
     Convoy, ConvoyEnsure, Project, ReadResourceObject, ResourceObject, StallRung, StalledCondition, SupervisionTarget,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::CascadeDeclarations;
 use std::borrow::Borrow;
 
-pub(super) async fn supervision_policy(
-    read_backend: &ResourceBackend,
-    namespace: &str,
+/// What supervision routing reads, read once for a pass over many convoys: the declared
+/// cascades and the current receivers.
+#[derive(Clone, Copy)]
+pub(super) struct SupervisionRoutes<'a> {
+    pub(super) declarations: &'a CascadeDeclarations,
+    pub(super) receivers: &'a MessageReceiverSnapshot,
+}
+
+pub(super) fn supervision_policy(
+    routes: SupervisionRoutes<'_>,
     convoy: &ResourceObject<Convoy>,
     projects: &[impl Borrow<ReadResourceObject<Project>>],
 ) -> Result<Vec<SupervisionTarget>, String> {
@@ -33,8 +41,8 @@ pub(super) async fn supervision_policy(
             .and_then(stalled_source_actor)
             .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
             .unwrap_or_else(|| format!("{project}/{}", convoy.spec.role));
-        let path =
-            flotilla_messaging::supervision_path(read_backend, namespace, project, &sender).await.map_err(|error| error.to_string())?;
+        let path = flotilla_messaging::supervision_path(routes.declarations, routes.receivers, project, &sender)
+            .map_err(|error| error.to_string())?;
         if !path.is_empty() {
             // Explicit convoy supervision remains first; Project and fleet
             // routing comes from subscriptions, not role-name guesses.
@@ -48,9 +56,8 @@ pub(super) async fn supervision_policy(
 // One resolution seam for command-time escalation and asynchronous stall judgment.
 type SupervisorCandidate = (String, String, String, StallRung);
 
-pub(super) async fn resolve_target(
-    read_backend: &ResourceBackend,
-    namespace: &str,
+pub(super) fn resolve_target(
+    receivers: &MessageReceiverSnapshot,
     convoy: &ResourceObject<Convoy>,
     condition: &mut StalledCondition,
     target: &SupervisionTarget,
@@ -123,18 +130,15 @@ pub(super) async fn resolve_target(
         SupervisionTarget::Address { address } if address.starts_with("principal:") => {
             Some((convoy.metadata.name.clone(), String::new(), address.clone(), StallRung::Operator))
         }
-        SupervisionTarget::Address { address } => flotilla_messaging::resolve_message_receiver(read_backend, namespace, address)
-            .await
-            .map_err(|error| error.to_string())?
-            .map(|holder| {
-                let labels = &holder.object.metadata.labels;
-                (
-                    labels.get(flotilla_resources::CONVOY_LABEL).cloned().unwrap_or_else(|| convoy.metadata.name.clone()),
-                    labels.get(flotilla_resources::VESSEL_LABEL).cloned().unwrap_or_default(),
-                    labels.get(flotilla_resources::ROLE_LABEL).cloned().unwrap_or_else(|| holder.object.spec.role.clone()),
-                    StallRung::Governor,
-                )
-            }),
+        SupervisionTarget::Address { address } => receivers.resolve(address).map_err(|error| error.to_string())?.map(|holder| {
+            let labels = &holder.object.metadata.labels;
+            (
+                labels.get(flotilla_resources::CONVOY_LABEL).cloned().unwrap_or_else(|| convoy.metadata.name.clone()),
+                labels.get(flotilla_resources::VESSEL_LABEL).cloned().unwrap_or_default(),
+                labels.get(flotilla_resources::ROLE_LABEL).cloned().unwrap_or_else(|| holder.object.spec.role.clone()),
+                StallRung::Governor,
+            )
+        }),
         SupervisionTarget::Operator => None,
     };
     Ok(candidate)
@@ -166,7 +170,9 @@ impl super::LeafSubscriptionTable {
         let projects = backend.including_replicas::<Project>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let convoys = backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let ensures = backend.including_replicas::<ConvoyEnsure>(namespace).list().await.map_err(|error| error.to_string())?.items;
-        let policy = supervision_policy(backend, namespace, convoy, &projects).await?;
+        let declarations = CascadeDeclarations::load(backend, namespace).await.map_err(|error| error.to_string())?;
+        let receivers = MessageReceiverSnapshot::load(backend, namespace).await.map_err(|error| error.to_string())?;
+        let policy = supervision_policy(SupervisionRoutes { declarations: &declarations, receivers: &receivers }, convoy, &projects)?;
         let stalled = convoy.status.as_ref().and_then(|status| status.stalled.as_ref()).ok_or("crew is not stalled")?;
         let mut condition = stalled.clone();
         let mut start = stalled.supervision_index.map_or(0, |index| index.saturating_add(1));
@@ -174,9 +180,7 @@ impl super::LeafSubscriptionTable {
         // changes may also shift indices. Find the current owner in today's path.
         for (index, target) in policy.iter().enumerate() {
             let mut probe = stalled.clone();
-            if let Some((target_convoy, vessel, role, _)) =
-                resolve_target(backend, namespace, convoy, &mut probe, target, &convoys, &ensures).await?
-            {
+            if let Some((target_convoy, vessel, role, _)) = resolve_target(&receivers, convoy, &mut probe, target, &convoys, &ensures)? {
                 if stalled
                     .supervisor
                     .as_ref()
@@ -190,7 +194,7 @@ impl super::LeafSubscriptionTable {
         let mut missing_rung = StallRung::Operator;
         for (index, target) in policy.iter().enumerate().skip(start) {
             missing_rung = target_rung(target);
-            let candidate = resolve_target(backend, namespace, convoy, &mut condition, target, &convoys, &ensures).await?;
+            let candidate = resolve_target(&receivers, convoy, &mut condition, target, &convoys, &ensures)?;
             let Some((target_convoy, vessel, role, rung)) = candidate else {
                 continue;
             };
@@ -216,7 +220,7 @@ impl super::LeafSubscriptionTable {
             // A declared crew state is not a receiver binding. Turn admission
             // can queue an unbound role, so check the binding before calling it.
             if !receiver.starts_with("principal:") {
-                match flotilla_messaging::resolve_message_receiver(backend, namespace, &receiver).await {
+                match receivers.resolve(&receiver) {
                     Ok(Some(_)) => {}
                     Ok(None) => {
                         return Ok(EscalationAdmission::Refused(Box::new(CommandValue::CrewEscalationRefused {
