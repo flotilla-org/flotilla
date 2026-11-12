@@ -15,11 +15,6 @@ declaration a later root resolves to, so a hoisted catalog would be stale. The p
 task lists Repositories only to (re)establish its watch after a namespace change or watch failure."""
 
 [[allow]]
-path = "crates/flotilla-core/src/in_process/checkout_providers.rs"
-function = "watch_checkout_provider_lifetimes"
-reason = "List-then-watch subscription: the loop relists only to resubscribe after a namespace change or watch failure."
-
-[[allow]]
 path = "crates/flotilla-daemon/src/charter_delegation.rs"
 function = "expand_registered_charters"
 reason = "Memoized per namespace in `registration_catalogs`: the Project catalog is listed only when that namespace is first delegated."
