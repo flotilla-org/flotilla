@@ -18,7 +18,11 @@ use flotilla_daemon_testkit::{
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_provisioning::stored::{artifact::ArtifactRecord, repository::RepositoryRecord};
-use flotilla_resources::{Artifact, InputMeta, Repository, RepositorySpec, Resource, TerminalSession};
+use flotilla_resources::{
+    definition_provenance::SOURCE_COMMIT_ANNOTATION,
+    definitions::{origin, DefinitionOrigin},
+    Artifact, ConvoyEnsure, InputMeta, Repository, RepositorySpec, Resource, TerminalSession,
+};
 use flotilla_schema::Kind;
 use flotilla_schema_sqlite::Snapshot;
 use flotilla_store::{ResourceBackend, ResourceKind};
@@ -247,6 +251,42 @@ struct ReadBack {
     old_store: std::collections::BTreeSet<&'static str>,
     /// The access deliveries whose access key names a convoy no launch here is named.
     stranded_deliveries: usize,
+    /// The old store's ConvoyEnsures by origin: its own, and other homes' replicas.
+    ensures_before_here: EnsureOrigins,
+    ensures_before_elsewhere: EnsureOrigins,
+    /// The ConvoyEnsures the daemon serves after the import, by origin.
+    ensures_after: EnsureOrigins,
+}
+
+/// How many ConvoyEnsures read as each origin through [`origin`], and how many hold no source
+/// commit, which admission refuses to launch from whatever the origin.
+#[derive(Default)]
+struct EnsureOrigins {
+    by_origin: BTreeMap<&'static str, usize>,
+    without_source_commit: usize,
+}
+
+impl EnsureOrigins {
+    fn count(&mut self, labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, String>) {
+        let origin = match origin(labels, annotations) {
+            Ok(DefinitionOrigin::ProjectOps { .. }) => "ProjectOps",
+            Ok(DefinitionOrigin::Manifest { .. }) => "Manifest",
+            Ok(DefinitionOrigin::Operator) => "Operator",
+            Ok(_) => "other",
+            Err(_) => "unreadable",
+        };
+        *self.by_origin.entry(origin).or_default() += 1;
+        self.without_source_commit += usize::from(!annotations.contains_key(SOURCE_COMMIT_ANNOTATION));
+    }
+}
+
+impl std::fmt::Display for EnsureOrigins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for origin in ["ProjectOps", "Manifest", "Operator", "other", "unreadable"] {
+            write!(f, "{origin} {}, ", self.by_origin.get(origin).copied().unwrap_or_default())?;
+        }
+        write!(f, "without source commit {}", self.without_source_commit)
+    }
 }
 
 /// Whether every kind the daemon reached the old resource store for is one the registry still
@@ -262,6 +302,20 @@ fn only_old_kinds(reached: &std::collections::BTreeSet<&'static str>) -> bool {
 /// the start.
 async fn read_back(store: &Path) -> ReadBack {
     let own_host = Source::read(store, "local").expect("read the old store").own_daemon_host("local");
+    let (mut ensures_before_here, mut ensures_before_elsewhere) = (EnsureOrigins::default(), EnsureOrigins::default());
+    for row in
+        flotilla_store_sqlite::read_stored_rows(store).expect("read the old store").into_iter().filter(|row| row.kind == "ConvoyEnsure")
+    {
+        let counts = if row.origin_root.is_none() { &mut ensures_before_here } else { &mut ensures_before_elsewhere };
+        let metadata = |field: &str| -> Option<BTreeMap<String, String>> {
+            let document: Value = serde_json::from_str(&row.body).ok()?;
+            serde_json::from_value(document.pointer(&format!("/metadata/{field}")).cloned().unwrap_or_else(|| json!({}))).ok()
+        };
+        match (metadata("labels"), metadata("annotations")) {
+            (Some(labels), Some(annotations)) => counts.count(&labels, &annotations),
+            _ => *counts.by_origin.entry("unreadable").or_default() += 1,
+        }
+    }
     let daemon = TestDaemon::builder()
         .old_store(OldStoreMode::Recording)
         .import(OldStoreImport { store: store.to_path_buf(), host_id: own_host })
@@ -296,6 +350,10 @@ async fn read_back(store: &Path) -> ReadBack {
             created.insert(kind, imported.len());
         }
     }
+    let mut ensures_after = EnsureOrigins::default();
+    for ensure in daemon.list::<ConvoyEnsure>().await {
+        ensures_after.count(&ensure.metadata.labels, &ensure.metadata.annotations);
+    }
     let old_store = daemon.old_store_kinds();
     let mut written = BTreeMap::<String, usize>::new();
     for (kind, counts) in report["kinds"].as_object().expect("kinds") {
@@ -314,7 +372,17 @@ async fn read_back(store: &Path) -> ReadBack {
             (imported != read).then(|| format!("{kind}: the report says {imported} imported, the daemon's log created {read}"))
         })
         .collect();
-    ReadBack { report, created, held, differences, old_store, stranded_deliveries }
+    ReadBack {
+        report,
+        created,
+        held,
+        differences,
+        old_store,
+        stranded_deliveries,
+        ensures_before_here,
+        ensures_before_elsewhere,
+        ensures_after,
+    }
 }
 
 /// The kinds whose old rows do not add up to imported, dropped and another home's.
@@ -387,6 +455,9 @@ async fn a_daemon_started_over_a_real_old_store_reads_back_what_it_imported() {
         println!("differs {difference}");
     }
     println!("old store reached for: {:?}", read.old_store);
+    println!("ensure origins before import here: {}", read.ensures_before_here);
+    println!("ensure origins before import other homes: {}", read.ensures_before_elsewhere);
+    println!("ensure origins after import here: {}", read.ensures_after);
     assert!(unaccounted(&read.report).is_empty(), "rows not accounted for");
     assert!(unexplained_drops(&read.report).is_empty(), "dropped rows without a reason");
     assert!(read.differences.is_empty(), "read back differs from the report");
