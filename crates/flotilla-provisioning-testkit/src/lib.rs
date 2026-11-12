@@ -47,25 +47,37 @@ impl EngineFixture {
 
     /// An engine over `store`, whose home is `home`: a daemon's decided store, say.
     pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
-        Self::with_terminals(home, Arc::clone(&store), TerminalsFixture::over(home, Arc::clone(&store)), VesselsFixture::over(home, store))
+        Self::with_terminals(
+            home,
+            Arc::clone(&store),
+            image_build::ImageBuildFixture::over(home, Arc::clone(&store)),
+            TerminalsFixture::over(home, Arc::clone(&store)),
+            VesselsFixture::over(home, store),
+        )
     }
 
-    /// An engine over a daemon's decided store `service`, whose terminal sessions are read at every
-    /// home it holds: another daemon's arrive as its log is replicated in.
+    /// An engine over a daemon's decided store `service`, whose terminal sessions and builder hosts
+    /// are read at every home it holds: another daemon's arrive as its log is replicated in.
     pub fn over_service(service: &Arc<flotilla_schema_sqlite::stream::Service>) -> Self {
         Self::with_terminals(
             service.home(),
             service.store(),
+            image_build::ImageBuildFixture::over_service(service),
             TerminalsFixture::over_service(service),
             VesselsFixture::over_service(service),
         )
     }
 
-    fn with_terminals(home: &str, store: Arc<Mutex<Store>>, mut terminals: TerminalsFixture, mut vessels: VesselsFixture) -> Self {
+    fn with_terminals(
+        home: &str,
+        store: Arc<Mutex<Store>>,
+        mut image_builds: image_build::ImageBuildFixture,
+        mut terminals: TerminalsFixture,
+        mut vessels: VesselsFixture,
+    ) -> Self {
         let mut environments = EnvironmentFixture::over(home, Arc::clone(&store));
         let mut clones = CloneFixture::over(home, Arc::clone(&store));
         let mut checkouts = CheckoutFixture::over(home, Arc::clone(&store));
-        let mut image_builds = image_build::ImageBuildFixture::over(home, Arc::clone(&store));
         let reads: Arc<dyn LifecycleReads> = Arc::new(
             LifecycleReadPort::new(StoreReads::new(store), home.to_owned())
                 .with_environments(Arc::clone(&environments.environments) as Arc<dyn EnvironmentRecords>)

@@ -459,10 +459,22 @@ impl ImageBuildFixture {
 
     /// A fixture over `store`, whose home is `home`.
     pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
+        let only = home.to_owned();
+        Self::over_homes(home, store, move || vec![only.clone()])
+    }
+
+    /// A fixture over a daemon's decided store `service`, whose builder hosts are found at every
+    /// home it holds, as the daemon's runtime finds them: another home's Host arrives as its log
+    /// is replicated in.
+    pub fn over_service(service: &Arc<Service>) -> Self {
+        let homes = Arc::clone(service);
+        Self::over_homes(service.home(), service.store(), move || homes.homes())
+    }
+
+    fn over_homes(home: &str, store: Arc<Mutex<Store>>, homes: impl Fn() -> Vec<String> + Send + Sync + 'static) -> Self {
         let lifecycles: Arc<dyn Lifecycles<ImageBuildKind>> =
             Arc::new(LifecycleHome::new(home, open_home(StoreLog::new(Arc::clone(&store))).expect("image builds")));
-        let only = home.to_owned();
-        let builds = Arc::new(EngineImageBuilds::new(Arc::clone(&lifecycles), Arc::clone(&store), move || vec![only.clone()]));
+        let builds = Arc::new(EngineImageBuilds::new(Arc::clone(&lifecycles), Arc::clone(&store), homes));
         let reads: Arc<dyn LifecycleReads> = Arc::new(
             LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), home.to_owned())
                 .with_image_builds(Arc::clone(&builds) as Arc<dyn ImageBuildRecords>),

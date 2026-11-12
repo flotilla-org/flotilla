@@ -79,7 +79,7 @@ async fn fixture(layers: Vec<ImageLayerSpec>, image: Option<ImageSelection>) -> 
     let mut kind = kinds.get("crew-policy").await.expect("kind");
     kind.spec.realisation = FulfilmentRealisation::DockerPerVessel { image: None };
     kinds.update(&test_meta("crew-policy"), &kind.metadata.resource_version, &kind.spec).await.expect("composed kind");
-    set_architecture(&daemon, &engine, "host-a", "x86_64", None).await;
+    set_architecture(&daemon, "host-a", "x86_64", None).await;
     for spec in layers {
         backend.definitions::<ImageLayer>(NS).apply(&test_meta(&spec.resource_name()), &spec.into()).await.expect("layer");
     }
@@ -92,9 +92,10 @@ async fn fixture(layers: Vec<ImageLayerSpec>, image: Option<ImageSelection>) -> 
 }
 
 /// Host `name` as its home describes it: running `arch`, and building images when `capacity` is
-/// given. Its Host record is written on the engine too, so a build can be demanded of it.
-async fn set_architecture(daemon: &InProcessDaemon, engine: &TestEngine, name: &str, arch: &str, capacity: Option<ImageBuildCapacity>) {
-    engine.image_builds.host(name, arch);
+/// given. The engine reads builder hosts at every home of the daemon's decided store, so this one
+/// record is what a build is demanded of; a capacity-less copy at the daemon's own home would
+/// shadow it.
+async fn set_architecture(daemon: &InProcessDaemon, name: &str, arch: &str, capacity: Option<ImageBuildCapacity>) {
     let held = daemon.resource_backend().including_replicas::<Host>(NS).get(name).await.ok().map(|held| held.object);
     let mut spec = held.as_ref().map(|host| host.spec.clone()).unwrap_or_default();
     if capacity.is_some() {
@@ -286,9 +287,9 @@ async fn registry_delivery_uses_the_deterministic_builder() {
     let local = build_for(&fixture, &local);
     assert_eq!(local.delivery, ImageDelivery::Local);
     assert!(local.resource_name().ends_with("-host-a"), "local builds carry their builder: {}", local.resource_name());
-    set_architecture(&fixture.daemon, &fixture.engine, "udder", "x86_64", builder(1)).await;
-    set_architecture(&fixture.daemon, &fixture.engine, "feta", "x86_64", builder(2)).await;
-    set_architecture(&fixture.daemon, &fixture.engine, "arm", "aarch64", None).await;
+    set_architecture(&fixture.daemon, "udder", "x86_64", builder(1)).await;
+    set_architecture(&fixture.daemon, "feta", "x86_64", builder(2)).await;
+    set_architecture(&fixture.daemon, "arm", "aarch64", None).await;
     fixture
         .backend
         .definitions::<FleetDesignation>(NS)
@@ -352,13 +353,13 @@ async fn declare_image_cache(backend: &ResourceBackend) {
 async fn cloud_composed_image_builds_for_amd64_through_the_image_cache() {
     let fixture = fixture(catalogue(), None).await;
     make_cloud(&fixture).await;
-    set_architecture(&fixture.daemon, &fixture.engine, "host-a", "aarch64", None).await;
+    set_architecture(&fixture.daemon, "host-a", "aarch64", None).await;
     let amd64_builder = ImageBuildCapacity::Builder {
         architecture: "amd64".into(),
         slots: 1,
         reservation: ImageBuildReservation { cpu: 2, disk_bytes: 1 << 30 },
     };
-    set_architecture(&fixture.daemon, &fixture.engine, "kiwi", "aarch64", Some(amd64_builder)).await;
+    set_architecture(&fixture.daemon, "kiwi", "aarch64", Some(amd64_builder)).await;
     declare_image_cache(&fixture.backend).await;
     let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", vec![agent("coder", "codex")], &[])]).build();
     let (image, pins) = admit(&fixture, &workflow).await.expect("admit");
