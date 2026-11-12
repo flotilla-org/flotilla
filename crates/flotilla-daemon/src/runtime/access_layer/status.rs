@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 
 use flotilla_resources::{
-    access_delivery::{DeliveredNeed, DeliveryMechanism, DeliveryRetry},
+    access_delivery::{record_name, DeliveredNeed, DeliveryMechanism, DeliveryRetry},
     account_access::{requester_convoy_dir, REQUESTER_HOME_DIR, REQUESTER_MATERIAL_DIR},
     AccessDelivery, AccessDeliverySpec, Convoy, InputMeta, ResourceError, ResourceObject, CONVOY_LABEL,
 };
@@ -162,14 +162,6 @@ pub(in crate::runtime) async fn record_push(
         .await
         .map_err(|error| format!("record access delivery `{}`: {error}", record.metadata.name))?;
     Ok(spec.retry.filter(|retry| retry.need == need && retry.attempts < limit).map(|retry| retry.next_at))
-}
-
-/// One record per (access, place). The access is opaque and may hold any character, so
-/// the name is a digest of the pair.
-pub(in crate::runtime) fn record_name(access: &str, place: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::new().chain_update(access.as_bytes()).chain_update([0]).chain_update(place.as_bytes()).finalize();
-    format!("access-{}", &format!("{digest:x}")[..16])
 }
 
 fn delivery_mechanism(mechanism: Mechanism) -> DeliveryMechanism {

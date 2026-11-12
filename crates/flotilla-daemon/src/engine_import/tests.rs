@@ -58,6 +58,20 @@ fn holds<K: Kind>(store: &mut flotilla_schema_sqlite::Store, name: &str, home: &
     read.resolve(K::CODE, name, home).expect("resolve").is_some()
 }
 
+/// The access deliveries `store` holds at [`HERE`], by name, in place order.
+fn held_deliveries(store: &mut flotilla_schema_sqlite::Store) -> Vec<(String, flotilla_resources::AccessDeliverySpec)> {
+    let mut read = store.read().expect("read");
+    let page = read.scan::<flotilla_resources::AccessDeliverySpec>(HERE, None, 64).expect("scan");
+    let mut held: Vec<_> = page
+        .ids
+        .into_iter()
+        .filter_map(|id| read.load::<flotilla_resources::AccessDeliverySpec>(id).expect("load"))
+        .map(|loaded| (loaded.name, loaded.value))
+        .collect();
+    held.sort_by(|(_, a), (_, b)| a.place.cmp(&b.place));
+    held
+}
+
 /// Whether `store` holds a launch of `of` at `home`, by the kind's launch index.
 fn holds_launch<K: flotilla_provisioning::stored::Launches>(store: &mut flotilla_schema_sqlite::Store, of: &str, home: &str) -> bool {
     let mut read = store.read().expect("read");
@@ -111,7 +125,11 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
         json!({"imported": 1, "dropped": 0, "refused": 0}),
         "an adopted (observed) checkout imports as an adopted launch: {report:#}"
     );
-    assert_eq!(kinds["Convoy"], json!({"imported": 0, "dropped": 1, "refused": 0}), "an unbootstrapped convoy stays old");
+    assert_eq!(
+        kinds["Convoy"],
+        json!({"imported": 1, "dropped": 1, "refused": 0}),
+        "the live convoy imports and an unbootstrapped one stays old: {report:#}"
+    );
     assert!(kinds.get("Forge").is_none(), "another host's records are not this host's to count: {report:#}");
     every_row_accounted(&report);
     assert_eq!(report["rows"]["Forge"]["other_home"], 1, "another host's record is counted as that home's: {report:#}");
@@ -126,8 +144,13 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
         holds_launch::<flotilla_provisioning::stored::checkout::CheckoutKind>(&mut store, "observed-a", HERE),
         "an adopted checkout is imported as a launch"
     );
-    for name in ["access-delivered", "access-failed"] {
-        assert!(holds::<flotilla_resources::AccessDeliverySpec>(&mut store, name, HERE), "{name}");
+    let deliveries = held_deliveries(&mut store);
+    assert_eq!(deliveries.iter().map(|(_, spec)| spec.place.as_str()).collect::<Vec<_>>(), ["env-a", "env-b"]);
+    for (name, spec) in &deliveries {
+        let convoy = flotilla_resources::access_delivery::convoy_of_access(&spec.access).expect("a convoy");
+        assert!(convoy.starts_with("demo#"), "the key names the launch its convoy imported as: {}", spec.access);
+        assert!(holds::<flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy>>(&mut store, &convoy, HERE));
+        assert_eq!(*name, flotilla_resources::access_delivery::record_name(&spec.access, &spec.place), "named for its key");
     }
     for home in [HERE, THERE] {
         assert!(!holds::<flotilla_resources::AccessDeliverySpec>(&mut store, "access-theirs", home), "{home}");

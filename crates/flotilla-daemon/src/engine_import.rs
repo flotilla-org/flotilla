@@ -228,13 +228,13 @@ pub const STEPS: &[Step] = &[
     Step { name: "fulfilment kinds", kinds: &records::PLACEMENT_KINDS, run: records::placement },
     Step { name: "artifacts", kinds: &["artifacts"], run: records::artifacts },
     Step { name: "forge observations", kinds: &observations::KINDS, run: observations::observations },
-    Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },
     Step { name: "accounts", kinds: &records::ACCOUNT_KINDS, run: records::accounts },
     Step { name: "vessels", kinds: &["vessels"], run: lifecycle::vessels },
     Step { name: "terminal sessions", kinds: &["terminalsessions"], run: lifecycle::terminal_sessions },
     Step { name: "messages", kinds: &["messages"], run: messages::messages },
     Step { name: "attentions", kinds: &["demands"], run: attentions::attentions },
     Step { name: "convoys", kinds: &["convoys"], run: convoys::convoys },
+    Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },
     Step { name: "lifecycles", kinds: &lifecycle::KINDS, run: lifecycle::lifecycles },
 ];
 

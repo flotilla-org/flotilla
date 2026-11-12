@@ -56,7 +56,8 @@ pub fn artifact(name: &str) -> Value {
 }
 
 /// An access delivery as r974's access layer wrote it: the digest-named record, two needs, and for
-/// a failed delivery a permanent retry.
+/// a failed delivery a permanent retry. `demo`'s coder has one record per place: a delivered one at
+/// `env-a` and a failed one at `env-b`.
 pub fn access_delivery(name: &str, failed: bool) -> Value {
     let retry = if failed {
         json!({"need": "account", "attempts": 3, "error": "permanent, not retried: authority refused", "next_at": i64::MAX})
@@ -66,7 +67,8 @@ pub fn access_delivery(name: &str, failed: bool) -> Value {
     document(
         "AccessDelivery",
         name,
-        json!({"access": "flotilla/demo/implement/coder", "place": "env-a", "harness": "claude-code", "home": "/home/crew/.claude",
+        json!({"access": "flotilla/demo/implement/coder", "place": if failed { "env-b" } else { "env-a" }, "harness": "claude-code",
+            "home": "/home/crew/.claude",
             "needs": {
                 "home": {"mechanism": "agent-push", "digest": "ab12", "at": 1_790_000_000_000_000_i64},
                 "skills": {"mechanism": "host-path-read-only-live", "digest": "cd34", "at": 1_790_000_001_000_000_i64},
@@ -74,6 +76,42 @@ pub fn access_delivery(name: &str, failed: bool) -> Value {
             "retry": retry}),
         Value::Null,
     )
+}
+
+/// A bootstrapped, active convoy whose `implement` vessel holds an agent `coder`, owing what its
+/// admission declared: one the import carries onto the engine as a launch.
+pub fn live_convoy(name: &str) -> Value {
+    use flotilla_resources::{
+        promises, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Selector, VesselRequirement,
+        WorkflowSnapshot,
+    };
+    let crew = CrewSpec::builder()
+        .role("coder".to_owned())
+        .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
+        .deliverer(true)
+        .build();
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(WorkflowSnapshot {
+            cascade: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+            vessels: vec![VesselRequirement::builder().name("implement".to_owned()).crew(vec![crew]).build()],
+        }),
+        crew_work: [(
+            "implement".to_owned(),
+            [("coder".to_owned(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())].into(),
+        )]
+        .into(),
+        ..Default::default()
+    };
+    for (vessel, role, operation) in promises::admitted_declarations(&[], &status, false) {
+        promises::apply(&mut status, &vessel, &role, &operation);
+    }
+    let spec = ConvoySpec::builder().workflow_ref("w".to_owned()).project_ref("flotilla".to_owned()).build();
+    document("Convoy", name, serde_json::to_value(spec).expect("spec"), serde_json::to_value(status).expect("status"))
 }
 
 pub fn clone(name: &str) -> Value {
@@ -138,6 +176,7 @@ pub async fn populated(dir: &Path) -> SqliteBackend {
     own::<Message>(&backend, message("waiting")).await;
     own::<Artifact>(&backend, artifact("ours")).await;
     own::<CloneResource>(&backend, clone("clone-a")).await;
+    own::<Convoy>(&backend, live_convoy("demo")).await;
     own::<AccessDelivery>(&backend, access_delivery("access-delivered", false)).await;
     own::<AccessDelivery>(&backend, access_delivery("access-failed", true)).await;
     own::<Checkout>(

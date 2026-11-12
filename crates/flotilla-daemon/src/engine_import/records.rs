@@ -99,11 +99,13 @@ pub(super) fn accounts(source: &Source, target: &mut Import, _: &mut Carried, re
 }
 
 /// Every namespace's at once: the engine has no namespaces.
-pub(super) fn access_deliveries(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
+/// Each delivery under the launch its convoy imported as at the delivery's home.
+pub(super) fn access_deliveries(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
     let copies: Vec<_> = source
         .owned::<AccessDelivery>("accessdeliveries", None, "AccessDelivery", target, report)
         .into_iter()
         .map(|copy| AccessDeliveryCopy { namespace: copy.namespace, object: copy.object, home: copy.home })
         .collect();
-    import_access_deliveries(&copies, target, report);
+    let launch = |home: &str, convoy: &str| carried.convoys.get(&(home.to_owned(), convoy.to_owned())).map(|(launch, _)| launch.clone());
+    import_access_deliveries(&copies, launch, target, report);
 }
