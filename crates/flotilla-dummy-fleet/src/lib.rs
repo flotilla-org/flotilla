@@ -28,6 +28,7 @@ mod fleet;
 mod forge;
 mod guard;
 mod shared_forge;
+mod stand_in;
 mod terminal;
 mod vcs;
 
@@ -59,6 +60,8 @@ impl DummyFleet {
             .into_iter()
             .map(|factory| guard::GuardedFactory::wrap(factory, guard::NoPushVcs::guard))
             .collect();
+        factories.environment_providers =
+            std::mem::take(&mut factories.environment_providers).into_iter().map(stand_in::DockerStoodIn::wrap).collect();
         let environment = &self.config.environment;
         let weak = Arc::downgrade(self);
         // Every install comes from this same fleet Arc. Retain its first weak
