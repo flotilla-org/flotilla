@@ -80,7 +80,7 @@ fn candidate<R: Resource>(
     };
     if let Some(skip) = skip.as_ref().filter(|_| target.imports(&copy.home)) {
         *report.dropped.entry((kind, skip.label())).or_default() += 1;
-        report.rows(kind, if matches!(skip, Skip::Elsewhere) { RowOutcome::OtherHome } else { RowOutcome::Dropped }, 1);
+        report.rows(kind, if matches!(skip, Skip::Elsewhere) { RowOutcome::OtherHome } else { RowOutcome::Dropped(skip.label()) }, 1);
         if matches!(skip, Skip::NoObserver) {
             let note = format!("{kind} of {}/{} not imported: no Project declares its source", source.service, source.scope);
             if !report.notes.contains(&note) {
@@ -125,10 +125,11 @@ impl Candidates {
     /// homed, and one homed elsewhere only in the ledger.
     fn account(self, kind: &'static str, report: &mut ImportReport) {
         let (stale_here, stale_elsewhere) = (self.here - self.chosen_here, self.elsewhere - self.chosen_elsewhere);
+        const STALER: &str = "a staler copy of an imported subject";
         if stale_here > 0 {
-            report.drop_rows(kind, "a staler copy of an imported subject", stale_here);
+            report.drop_rows(kind, STALER, stale_here);
         }
-        report.rows(kind, RowOutcome::CopyDropped, stale_elsewhere);
+        report.rows(kind, RowOutcome::CopyDropped(STALER), stale_elsewhere);
     }
 }
 

@@ -328,6 +328,17 @@ fn unaccounted(report: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The kinds whose dropped rows do not add up to their drops by reason.
+fn unexplained_drops(report: &Value) -> Vec<String> {
+    report["rows"]
+        .as_object()
+        .expect("rows")
+        .iter()
+        .filter(|(_, rows)| rows["drops"].as_object().expect("drops").values().filter_map(Value::as_u64).sum::<u64>() != rows["dropped"])
+        .map(|(kind, rows)| format!("{kind}: {rows}"))
+        .collect()
+}
+
 // Behaviour (#3108 rehearsal): a daemon started engine-only over an old store imports it at its
 // first start, accounts for every old row, and reads back through its tables exactly what the
 // report says it imported.
@@ -338,6 +349,7 @@ async fn a_daemon_started_over_an_old_store_reads_back_what_it_imported() {
     let read = read_back(&dir.path().join(OLD_STORE)).await;
     assert_eq!(read.report["outcome"], "imported", "{:#}", read.report);
     assert!(unaccounted(&read.report).is_empty(), "{:#}", read.report);
+    assert!(unexplained_drops(&read.report).is_empty(), "{:#}", read.report);
     assert!(read.differences.is_empty(), "{:?}; created {:?}", read.differences, read.created);
     assert_eq!(read.stranded_deliveries, 0, "each imported delivery names its convoy's launch");
     assert_eq!(read.created.get("AccessDelivery"), Some(&2));
@@ -356,6 +368,9 @@ async fn a_daemon_started_over_a_real_old_store_reads_back_what_it_imported() {
     println!("started: yes; outcome: {}", read.report["outcome"]);
     for (kind, rows) in read.report["rows"].as_object().expect("rows") {
         println!("rows {kind}: {rows}");
+        for (reason, count) in rows["drops"].as_object().expect("drops") {
+            println!("dropped {count} {kind}: {reason}");
+        }
     }
     let mut reasons = BTreeMap::<(String, String), usize>::new();
     for refusal in read.report["refusals"].as_array().expect("refusals") {
@@ -373,6 +388,7 @@ async fn a_daemon_started_over_a_real_old_store_reads_back_what_it_imported() {
     }
     println!("old store reached for: {:?}", read.old_store);
     assert!(unaccounted(&read.report).is_empty(), "rows not accounted for");
+    assert!(unexplained_drops(&read.report).is_empty(), "dropped rows without a reason");
     assert!(read.differences.is_empty(), "read back differs from the report");
     println!("access deliveries naming no convoy held here: {}", read.stranded_deliveries);
     // A delivery whose access key names no held convoy is retired as its convoy's end, and its

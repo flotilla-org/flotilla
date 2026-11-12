@@ -430,13 +430,11 @@ pub fn fake_discovery_with_runner(_legacy_mode: bool, runner: std::sync::Arc<dyn
 
 /// Build a `DiscoveryRuntime` that allows real git commands while still
 /// avoiding ambient host-tool probes like gh, Codex, Claude, or cmux.
-/// The simulated host owns its blocking-probe budget, shared by its runner's Git config guard,
-/// so concurrent tests in one process cannot exhaust each other's.
+/// The simulated host owns its blocking-probe budget, so concurrent tests in one
+/// process cannot exhaust each other's.
 pub fn git_process_discovery(_legacy_mode: bool) -> flotilla_discovery::DiscoveryRuntime {
-    let probe = flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated();
-    let runner = flotilla_provider_runtime::process_runner_within(probe.clone());
-    let mut discovery = minimal_discovery_runtime(std::sync::Arc::new(runner));
-    discovery.blocking_probe = probe;
+    let mut discovery = minimal_discovery_runtime(std::sync::Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
+    discovery.blocking_probe = flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated();
     discovery
 }
 

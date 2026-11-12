@@ -285,7 +285,8 @@ pub fn import_hosts(copies: &HostCopies, target: &mut impl ImportTarget, report:
             Ok(Imported::Dropped(reason)) => {
                 *report.dropped.entry((HOST, reason)).or_default() += 1;
                 // Another daemon's Host is imported at that daemon's home.
-                let outcome = if [ANOTHER_DAEMONS, ANOTHER_OWNERS].contains(&reason) { RowOutcome::OtherHome } else { RowOutcome::Dropped };
+                let outcome =
+                    if [ANOTHER_DAEMONS, ANOTHER_OWNERS].contains(&reason) { RowOutcome::OtherHome } else { RowOutcome::Dropped(reason) };
                 report.rows(HOST, outcome, 1);
             }
             Ok(Imported::Records { host, observation, dropped }) => importing.push((copy, Ok((host, observation, dropped)))),
