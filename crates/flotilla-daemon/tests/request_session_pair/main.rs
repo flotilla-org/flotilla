@@ -30,7 +30,6 @@ use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_w
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_caller_and_blob_store;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_surface;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_with_replication_kinds;
-use flotilla_daemon_testkit::server::InMemoryRequestMesh;
 use flotilla_daemon_testkit::server::InMemoryRequestTopology;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_testkit::fake_discovery;
@@ -443,25 +442,6 @@ async fn wait_for_host_resource_visibility(hosts: &[Arc<InProcessDaemon>], name:
     .await;
 }
 
-/// A ConvoyEnsure no reconciler acts on in these daemons: an old-store record to follow.
-fn unrelated_ensure() -> flotilla_resources::ConvoyEnsureSpec {
-    flotilla_resources::ConvoyEnsureSpec::builder().project_ref("flotilla".into()).role("unrelated".into()).repositories(Vec::new()).build()
-}
-
-#[tokio::test]
-async fn finalizer_oracle_detects_a_stuck_registered_resource() {
-    let host = empty_daemon_named("orphaned-finalizer").await;
-    let hosts = vec![Arc::clone(&host)];
-    // ConvoyEnsure is a kind the old store still holds, so finalizers still apply to it. Convoy
-    // and the engine-served kinds keep no finalizers (#3108).
-    let resources = host.resource_backend().using::<flotilla_resources::ConvoyEnsure>("flotilla");
-    let meta = InputMeta::builder().name("stuck".to_string()).finalizers(vec!["test/stuck".to_string()]).build();
-    resources.create(&meta, &unrelated_ensure()).await.expect("create resource with finalizer");
-    resources.delete("stuck").await.expect("mark deleting");
-    let detected = tokio::spawn(async move { assert_no_orphaned_finalizers(&hosts).await }).await;
-    assert!(detected.is_err_and(|error| error.is_panic()), "orphaned finalizer escaped registry scan");
-}
-
 // Placement scenarios author Host capacity, a FulfilmentKind, the admitted Convoy, and a sample
 // record they delete through the router. Replicating only those keeps each rebuilt generated mesh
 // off unrelated watch fanout.
@@ -709,44 +689,6 @@ fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
             ));
         }
     });
-}
-
-async fn spawn_tombstone_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
-    // This scenario authors only sample records. Keep their real routed origin and
-    // relay watches, without unrelated resource-watch fanout on every restart.
-    spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(&[Sample::API_PATHS.kind])).await
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn tombstone_mesh_replicates_hosts_without_unrelated_watch_commands() {
-    // The focused fixture must replicate its selected kind through the real
-    // router, while leaving unrelated kinds local. The default mesh stays broad.
-    for focused in [true, false] {
-        let hosts = vec![empty_daemon_named("scope-home").await, empty_daemon_named("scope-peer").await];
-        let mesh = if focused { spawn_tombstone_mesh(hosts.clone()).await } else { spawn_in_memory_request_mesh(hosts.clone()).await }
-            .expect("scope mesh");
-        // An old-store kind: Convoy, FulfilmentKind and the other engine-held or engine-served
-        // kinds travel the engine's change stream, which no replication kind selects (#3108).
-        hosts[0]
-            .resource_backend()
-            .using::<flotilla_resources::ConvoyEnsure>("flotilla")
-            .create(&InputMeta::builder().name("unrelated".to_string()).build(), &unrelated_ensure())
-            .await
-            .expect("create unrelated kind");
-        create_sample(&hosts[0], "selected").await.expect("create selected kind");
-        wait_for_host_resource_visibility(&hosts, "selected", true).await;
-        let unrelated = hosts[1].resource_backend().including_replicas::<flotilla_resources::ConvoyEnsure>("flotilla");
-        if focused {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            assert!(matches!(unrelated.get("unrelated").await, Err(ResourceError::NotFound { .. })));
-        } else {
-            eventually(Duration::from_secs(5), Duration::from_millis(10), "default mesh replicates unrelated kinds", || async {
-                unrelated.get("unrelated").await.is_ok()
-            })
-            .await;
-        }
-        drop(mesh);
-    }
 }
 
 #[hegel::test]

@@ -1,6 +1,6 @@
 //! The declared definition kinds' records (#3824 layer 2b-ii): Forge, FleetDesignation,
-//! CredentialSpec, CredentialGrant, CrewDefaults, ImageLayer and WorkflowTemplate, and Project
-//! (layer 3b).
+//! CredentialSpec, CredentialGrant, CrewDefaults, ImageLayer, WorkflowTemplate and ConvoyEnsure,
+//! and Project (layer 3b).
 //!
 //! On the engine each is a plain record at the home that declared it, holding only its own fields:
 //! why it was written is its change's (#4024), never a column of its row. [`DefinitionOrigin`] is
@@ -23,8 +23,8 @@ use crate::{
 };
 
 /// The kinds the engine's definition records serve, by their resource kind names.
-pub const DEFINITION_KINDS: [&str; 7] =
-    ["Forge", "FleetDesignation", "CredentialSpec", "CredentialGrant", "CrewDefaults", "ImageLayer", "WorkflowTemplate"];
+pub const DEFINITION_KINDS: [&str; 8] =
+    ["Forge", "FleetDesignation", "CredentialSpec", "CredentialGrant", "CrewDefaults", "ImageLayer", "WorkflowTemplate", "ConvoyEnsure"];
 
 /// Whether `kind` is one of [`DEFINITION_KINDS`].
 pub fn is_definition_kind(kind: &str) -> bool {
