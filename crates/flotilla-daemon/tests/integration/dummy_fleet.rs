@@ -941,9 +941,10 @@ macro_rules! replication_kinds {
 // Each kind the stalled crew and the fixtures make. Clone and Environment are home-local by
 // design (ReplicationClass::None): checked to stay home. Not here, as no stalled dummy crew makes
 // them: AccountBinding and AccountProvision (written only by the account controllers),
-// ManifestRoot (only by a home's manifest reconciler) and Checkout, whose engine records the
-// resource commands do not yet read. Message's log following is engine_only's
-// `messages_reach_a_peer_by_log_following`.
+// ManifestRoot (only by a home's manifest reconciler), and Checkout and ImageBuild, whose engine
+// records the resource commands do not yet read. Message's log following is engine_only's
+// `messages_reach_a_peer_by_log_following`; a build demanded at another home is provisioning's
+// `a_build_demanded_at_another_home_is_built_and_read_at_its_builder`.
 replication_kinds!(
     AccessDelivery,
     Artifact,
@@ -959,7 +960,6 @@ replication_kinds!(
     Forge,
     FulfilmentKind,
     Host,
-    ImageBuild,
     ImageLayer,
     Issue,
     Project,
@@ -972,11 +972,11 @@ replication_kinds!(
 /// One record of each kind the stalled convoy does not make that an operator
 /// can apply; the controllers then keep them as they keep any. The account
 /// controllers and a home's manifest reconciler alone write AccountBinding,
-/// AccountProvision's binding and ManifestRoot, so none is applied here.
+/// AccountProvision's binding and ManifestRoot, so none is applied here. An
+/// ImageBuild is a demand admission writes, not a record applied here.
 async fn apply_transport_fixtures(fleet: &TestDaemon, host: &str) {
     use flotilla_resources::{
-        AccessDelivery, AccessDeliverySpec, ChangeRequest, ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, ImageBuild,
-        ImageLayer, Issue,
+        AccessDelivery, AccessDeliverySpec, ChangeRequest, ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, ImageLayer, Issue,
     };
     let local = fleet.list::<Host>().await.into_iter().next().expect("local host").metadata.name;
     let place = flotilla_resources::host_direct_environment_name(&local);
@@ -989,8 +989,7 @@ async fn apply_transport_fixtures(fleet: &TestDaemon, host: &str) {
     let grant = serde_json::json!({"credentials": [credential], "selector": {"projects": ["fleet"]}});
     apply_json::<CredentialGrant>(fleet, &format!("{host}-grant"), grant).await;
     apply_json::<CrewDefaults>(fleet, &format!("{host}-defaults"), serde_json::json!({})).await;
-    let layer = builtin::<ImageLayer>();
-    apply_json::<ImageLayer>(fleet, &format!("{host}-layer"), layer.clone()).await;
+    apply_json::<ImageLayer>(fleet, &format!("{host}-layer"), builtin::<ImageLayer>()).await;
     apply_json::<WorkflowTemplate>(fleet, &format!("{host}-template"), builtin::<WorkflowTemplate>()).await;
     let access = format!("{host}-access");
     let delivery = AccessDeliverySpec {
@@ -1007,18 +1006,6 @@ async fn apply_transport_fixtures(fleet: &TestDaemon, host: &str) {
     apply_json::<Issue>(fleet, &format!("{host}-issue"), observed(2)).await;
     let ensure = serde_json::json!({"project_ref": "fleet", "role": format!("{host}-standing"), "workflow_ref": CrewMix::Coder.workflow_name(), "repositories": []});
     apply_json::<ConvoyEnsure>(fleet, &format!("{host}-ensure"), ensure).await;
-    let layers: Vec<flotilla_resources::ImageLayerSpec> = vec![serde_json::from_value(layer).expect("a current layer")];
-    let identity = flotilla_resources::image_identity(&layers);
-    let name = flotilla_resources::image_build_name(&identity, "amd64", &flotilla_resources::ImageDelivery::Local, &local);
-    let build = serde_json::json!({
-        "identity": identity,
-        "architecture": "amd64",
-        "layers": layers,
-        "host_ref": local,
-        "delivery": {"kind": "local"},
-        "reservation": {"cpu": 1, "disk_bytes": 1},
-    });
-    apply_json::<ImageBuild>(fleet, &name, build).await;
 }
 
 // Both peer runtimes consume the real change stream. What each host made is
