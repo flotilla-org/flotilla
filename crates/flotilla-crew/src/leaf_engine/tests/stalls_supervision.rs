@@ -535,12 +535,20 @@ async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
 // #3108: a stall whose governor cannot be reached tells the operator why, once however often it is
 // judged: one attention for the stalled seat, naming the failed delivery or the missing governor.
 #[tokio::test]
-#[ignore = "attentions to a project with no Project definition are written but never read back: person_inboxes reads only defined projects"]
 async fn unavailable_governor_tells_the_operator_once() {
     for unavailable in GovernorUnavailable::ALL {
         let case = project_supervision_case(&[]).await;
-        let _messages = EngineMessagesHome::open("test-host", "flotilla", &case.backend);
+        let messages = EngineMessagesHome::open("test-host", "flotilla", &case.backend);
         designate_fleet(&case.backend, "flotilla").await;
+        // The stalled convoy's project is defined, so its operator inbox is a person's inbox.
+        case.backend
+            .definitions::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name("wheelhouse".into()).build(),
+                &flotilla_resources::ProjectSpec::builder().display_name("wheelhouse".into()).build(),
+            )
+            .await
+            .expect("project");
         let governor = admit_governor(
             &case,
             "governor",
@@ -567,6 +575,13 @@ async fn unavailable_governor_tells_the_operator_once() {
         assert_eq!(attention.subject, Subject::ConvoyRole { convoy: case.work.clone(), role: "coder".into() });
         let why = if matches!(unavailable, GovernorUnavailable::DeliveryError) { "supervisor delivery failed" } else { "no live governor" };
         assert!(attention.reason.contains(why), "{unavailable:?}: {}", attention.reason);
+        // Telling the same stall again stores nothing new.
+        let fact = flotilla_resources::attentions::Fact::Stalled { convoy: case.work.clone(), role: "coder".into() };
+        let again = flotilla_resources::attentions::Attention::new(fact, attention.reason.clone(), stall.began_at);
+        case.backend.attentions().raise("flotilla", &again).await.expect("raise again");
+        let stored = messages.primitives().messages().expect("stored messages");
+        let told = stored.iter().filter(|(_, message)| message.spec().sender.to_string().ends_with("/role:stall-judge")).count();
+        assert_eq!(told, 1, "{unavailable:?}");
     }
 }
 
