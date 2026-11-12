@@ -1211,40 +1211,38 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
     assert!(backend.durable_local());
     assert!(config.state_dir().as_path().join("resources.sqlite").exists());
 
+    use flotilla_resources::{
+        CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
+    };
+
     backend
-        .using::<Convoy>("flotilla")
+        .definitions::<CredentialSpec>("flotilla")
         .create(
             &InputMeta::builder().name("persisted".to_string()).build(),
-            &ConvoySpec {
-                continuation: None,
-                subjects: Vec::new(),
-                role: String::new(),
-                generation: 1,
-                workflow_ref: "scratch".to_string(),
-                dispatching_principal_ref: Default::default(),
-                inputs: Default::default(),
-                placement_policy: None,
-                repositories: Vec::new(),
-                r#ref: None,
-                project_ref: None,
-                adopted_checkout_refs: BTreeMap::new(),
-                issues: Vec::new(),
-                change_request: None,
-                instruction: None,
-                promises: Vec::new(),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::Claude,
+                source: CredentialSource::Env { name: "PERSISTED_TOKEN".into() },
+                lifecycle: CredentialLifecycle::Issued,
+                placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
-        .expect("convoy create should succeed");
+        .expect("credential declaration should succeed");
     drop(server);
 
     let restarted = DaemonServer::new(Vec::new(), config, fake_discovery(false), socket_path, StdDuration::from_secs(30))
         .await
         .expect("server should restart");
-    let fetched =
-        restarted.daemon().resource_backend().using::<Convoy>("flotilla").get("persisted").await.expect("convoy should survive restart");
+    let fetched = restarted
+        .daemon()
+        .resource_backend()
+        .definitions::<CredentialSpec>("flotilla")
+        .get("persisted")
+        .await
+        .expect("credential declaration should survive restart");
 
-    assert_eq!(fetched.spec.workflow_ref, "scratch");
+    assert_eq!(fetched.spec.source, CredentialSource::Env { name: "PERSISTED_TOKEN".into() });
 }
 
 #[test]
@@ -5184,27 +5182,18 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
     let server =
         DaemonServer::new(Vec::new(), config.clone(), discovery, socket_path.clone(), StdDuration::from_secs(60)).await.expect("server");
     let daemon = server.daemon();
-    // Match feta's stored convoy count without making wall time the slow-work oracle.
+    // Match feta's stored convoy count without making wall time the slow-work oracle: landed
+    // launches on the engine, which the runtime's restoration reads.
+    let path = daemon.convoy_engine_path();
     for index in 0..143 {
-        let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
-        let convoy = convoys
-            .create(
-                &InputMeta::builder().name(format!("stored-{index}")).build(),
-                &ConvoySpec::builder().workflow_ref("finished-workflow".to_string()).build(),
-            )
-            .await
-            .expect("stored convoy");
-        convoys
-            .update_status(
-                &convoy.metadata.name,
-                &convoy.metadata.resource_version,
-                &flotilla_resources::ConvoyStatus {
-                    phase: flotilla_resources::ConvoyPhase::Landed,
-                    ..flotilla_resources::ConvoyStatus::default()
-                },
-            )
-            .await
-            .expect("settled stored convoy");
+        let mut convoy = flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            &format!("stored-{index}"),
+            ConvoySpec::builder().workflow_ref("finished-workflow".to_string()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        );
+        convoy.metadata.name = flotilla_engine_convoys_testkit::launch(&path, convoy.clone()).await;
+        flotilla_engine_convoys_testkit::land(&path, &convoy).await;
     }
     let backend = daemon.resource_backend();
     let env_ref = format!("host-direct-{}", daemon.local_host_id().expect("local host"));

@@ -265,7 +265,10 @@ async fn build_embedded_resource_backend(
         .await
         .map(|store| {
             let metrics = store.load_metrics();
-            (ResourceBackend::new(store), metrics)
+            // The durable store is the engine's home: it holds none of the kinds the engine holds.
+            let backend = ResourceBackend::new(store);
+            backend.compose_as_engine_home();
+            (backend, metrics)
         })
         .map_err(|err| format!("open embedded resource store {}: {err}", path.display()))
 }

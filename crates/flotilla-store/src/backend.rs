@@ -37,6 +37,9 @@ struct EngineSlots {
     /// The engine keeps no namespaces: its records read in whichever namespace is asked, and carry
     /// this daemon's one, as a scan for the namespaces holding a kind it serves answers.
     namespace: Option<String>,
+    /// Whether this backend is the engine's home: a kind the engine holds is then refused until
+    /// its port is installed, never served from the old store.
+    home: bool,
     /// Each kind's shared listing while any watcher holds it.
     feeds: std::collections::BTreeMap<&'static str, std::sync::Weak<crate::engine_feed::EngineFeed>>,
 }
@@ -116,9 +119,25 @@ impl ResourceBackend {
         self.engine_records(kind).is_some()
     }
 
-    /// The engine port serving `kind`, when one is installed.
+    /// Marks this backend as the engine's home: until its port is installed, every read and write
+    /// of a kind the engine holds is refused. Other backends (observed, HTTP, tests) serve every
+    /// kind with no port installed from their store.
+    pub fn compose_as_engine_home(&self) {
+        self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner).home = true;
+    }
+
+    /// The engine port serving `kind`, when one is installed; on the engine's home, a refusing
+    /// port for a kind the engine holds before its port is installed.
     pub(crate) fn engine_records(&self, kind: &str) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>> {
-        self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).ports.get(kind).cloned()
+        let engines = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(port) = engines.ports.get(kind) {
+            return Some(std::sync::Arc::clone(port));
+        }
+        let held = crate::REGISTERED_RESOURCE_KINDS.iter().any(|registered| registered.engine_held && registered.kind == kind);
+        (engines.home && held).then(|| {
+            std::sync::Arc::new(crate::uncomposed_records::Uncomposed { kind: kind.to_owned() })
+                as std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>
+        })
     }
 
     /// The shared listing of `kind`'s engine records, started for the first watcher; `None` unless

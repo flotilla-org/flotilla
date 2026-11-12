@@ -60,6 +60,7 @@ pub mod query;
 pub use query::*;
 mod store;
 pub use store::*;
+mod uncomposed_records;
 
 #[cfg(test)]
 #[allow(dead_code)]
