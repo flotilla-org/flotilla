@@ -248,8 +248,10 @@ mod signal_forward {
     }
 
     /// The handler state is process-global, so only one attach child may be
-    /// supervised at a time; concurrent guards would clobber each other.
-    pub struct Guard([libc::sighandler_t; 2]);
+    /// supervised at a time: a guard holds `SUPERVISING` until it is dropped.
+    pub struct Guard([libc::sighandler_t; 2], #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    static SUPERVISING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl Guard {
         pub fn terminated(&self) -> bool {
@@ -267,6 +269,7 @@ mod signal_forward {
     }
 
     pub fn install() -> Guard {
+        let supervising = SUPERVISING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         CHILD.store(0, Ordering::SeqCst);
         TERMINATED.store(false, Ordering::SeqCst);
         let mut previous = [libc::SIG_DFL; 2];
@@ -274,7 +277,7 @@ mod signal_forward {
             // SAFETY: installing a handler that only calls async-signal-safe kill.
             *slot = unsafe { libc::signal(signal, forward as extern "C" fn(libc::c_int) as libc::sighandler_t) };
         }
-        Guard(previous)
+        Guard(previous, supervising)
     }
 
     impl Drop for Guard {
