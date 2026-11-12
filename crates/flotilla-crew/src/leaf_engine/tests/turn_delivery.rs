@@ -231,7 +231,7 @@ async fn a_restart_starts_the_turn_clock_at_the_restart() {
     let restart = start + chrono::Duration::minutes(20);
     // The restarted daemon keeps the subscriptions, with its own readings.
     let running = std::mem::replace(&mut case.wake, supervision_wake(&case.backend, &case.home));
-    let wake = ReconcilerWake::new(running.subscriptions.with_lifecycle_reads(case.home.restarted_reads(restart)));
+    let wake = ReconcilerWake::new(running.subscriptions.restarted_with(case.home.restarted_reads(restart)));
     assert!(stalled_at(&case, &wake, restart + chrono::Duration::seconds(899)).await.is_none(), "35 minutes in, 14:59 after the restart");
     let stall = stalled_at(&case, &wake, restart + chrono::Duration::seconds(900)).await.expect("15 minutes after the restart");
     assert!(stall.evidence.contains("turn inactivity bound"), "{}", stall.evidence);

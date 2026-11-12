@@ -153,10 +153,11 @@ enum UnableEvidenceKey {
 }
 
 impl LeafSubscriptionTable {
-    /// Configure the read port before cloning or registering subscriptions, like the other
-    /// composition setters. An unconfigured table intentionally serves the primitives-off path.
-    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>) -> Self {
-        Arc::get_mut(&mut self.inner).expect("configure lifecycle reads before sharing subscriptions").lifecycle_reads = reads;
+    /// A restarted daemon's table: these subscriptions, read through the restarted daemon's
+    /// `reads`. Before the table is shared.
+    #[cfg(test)]
+    pub(crate) fn restarted_with(mut self, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>) -> Self {
+        Arc::get_mut(&mut self.inner).expect("restart before sharing subscriptions").lifecycle_reads = reads;
         self
     }
 
@@ -190,19 +191,25 @@ impl LeafSubscriptionTable {
         self
     }
 
-    pub fn new(backend: ResourceBackend, event_sink: Arc<dyn EventSink>, change_requests: ChangeRequestRefresher) -> Self {
-        Self::with_episode_limit(backend, event_sink, change_requests, 3)
+    pub fn new(
+        backend: ResourceBackend,
+        event_sink: Arc<dyn EventSink>,
+        change_requests: ChangeRequestRefresher,
+        lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+    ) -> Self {
+        Self::with_episode_limit(backend, event_sink, change_requests, lifecycle_reads, 3)
     }
 
     pub fn with_episode_limit(
         backend: ResourceBackend,
         event_sink: Arc<dyn EventSink>,
         change_requests: ChangeRequestRefresher,
+        lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
         episode_limit: u32,
     ) -> Self {
         let issues =
             IssueRefresher::new(backend.clone(), "unavailable".into(), Arc::new(UnavailableIssues), IssueRefreshCadence::default());
-        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, episode_limit)
+        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, lifecycle_reads, episode_limit)
     }
 
     pub fn with_issues(
@@ -210,8 +217,9 @@ impl LeafSubscriptionTable {
         event_sink: Arc<dyn EventSink>,
         change_requests: ChangeRequestRefresher,
         issues: IssueRefresher,
+        lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     ) -> Self {
-        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, 3)
+        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, lifecycle_reads, 3)
     }
 
     fn with_issues_and_episode_limit(
@@ -219,6 +227,7 @@ impl LeafSubscriptionTable {
         event_sink: Arc<dyn EventSink>,
         change_requests: ChangeRequestRefresher,
         issues: IssueRefresher,
+        lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
         episode_limit: u32,
     ) -> Self {
         // The limit judges the latest run of retained episodes (at most limit+1).
@@ -229,7 +238,7 @@ impl LeafSubscriptionTable {
         let (reconciler_tx, _) = broadcast::channel(32);
         Self {
             inner: Arc::new(LeafSubscriptionTableInner {
-                lifecycle_reads: Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+                lifecycle_reads,
                 clock: Arc::new(flotilla_resources::SystemClock),
                 backend,
                 watch_views: Default::default(),

@@ -6,10 +6,7 @@ use tracing::Instrument;
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_resources::convoy_address::convoy_address;
 use flotilla_resources::ResumeIntent;
-use flotilla_resources::{
-    lifecycle_reads::{LifecycleReads, NoLifecycleReads},
-    vessel_records::engine_vessel,
-};
+use flotilla_resources::{lifecycle_reads::LifecycleReads, vessel_records::engine_vessel};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -121,7 +118,6 @@ enum SupervisorRuling {
 #[derive(bon::Builder)]
 pub struct CrewService {
     pub(crate) resource_backend: ResourceBackend,
-    #[builder(default = Arc::new(NoLifecycleReads))]
     lifecycle_reads: Arc<dyn LifecycleReads>,
     /// The account kinds' records: the capability card reads the requester's bindings.
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,

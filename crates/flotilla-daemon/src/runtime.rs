@@ -793,7 +793,7 @@ fn spawn_controller_loops(
             let decided = state.daemon.decided_store().ok();
             move |_: ResourceBackend, _: String| {
                 let forge_default_branch_resolver = forge_default_branch_resolver.clone();
-                let mut reconciler = RepositoryReconciler::new(discovered.clone()).with_lifecycle_reads(lifecycle_reads.clone());
+                let mut reconciler = RepositoryReconciler::new(discovered.clone(), lifecycle_reads.clone());
                 if let Some(resolver) = forge_default_branch_resolver {
                     reconciler = reconciler.with_forge_default_branch_resolver(resolver);
                 }

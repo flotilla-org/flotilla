@@ -368,6 +368,7 @@ mod tests {
                 backend.clone(),
                 Arc::clone(&event_sink),
                 refresher,
+                Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
             ));
             let fleet = FleetService::new(AggregatorProjectionState::new(), host_name.clone(), None);
             let accounts = flotilla_store::OldStoreAccounts::new(backend.clone());

@@ -909,10 +909,12 @@ pub trait SshHostVesselAccess: Send + Sync {
 #[async_trait]
 impl StandingConvoyBackingInspector for InProcessDaemon {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
-        flotilla_admission::convoy_ensure::ResourceStandingConvoyBackingInspector::new(self.resource_backend.clone())
-            .with_lifecycle_reads(self.lifecycle_reads())
-            .verify_backing_dead(convoy)
-            .await
+        flotilla_admission::convoy_ensure::ResourceStandingConvoyBackingInspector::new(
+            self.resource_backend.clone(),
+            self.lifecycle_reads(),
+        )
+        .verify_backing_dead(convoy)
+        .await
     }
 }
 
@@ -1318,17 +1320,21 @@ impl InProcessDaemon {
         let lifecycle_reads = Arc::new(flotilla_resources::lifecycle_reads::LateLifecycleReads::default());
         let change_request_observer = change_request_refresher.clone();
         let issue_observer = issue_refresher.clone();
-        let leaf_subscriptions =
-            LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher)
-                .with_clock(Arc::clone(&clock))
-                .with_lifecycle_reads(lifecycle_reads.clone())
-                .with_message_inboxes(Arc::clone(&message_inboxes))
-                .with_message_path(Arc::clone(&crew_message_path))
-                .with_convoy_engine(Arc::clone(&convoy_engine_path))
-                .with_charter_brief_renderer(Arc::new(flotilla_crew::charter_notifications::LiveCharterBriefRenderer::new(
-                    resource_backend.clone(),
-                    Arc::clone(&config),
-                )));
+        let leaf_subscriptions = LeafSubscriptionTable::with_issues(
+            resource_backend.clone(),
+            event_sink.clone(),
+            change_request_refresher,
+            issue_refresher,
+            lifecycle_reads.clone(),
+        )
+        .with_clock(Arc::clone(&clock))
+        .with_message_inboxes(Arc::clone(&message_inboxes))
+        .with_message_path(Arc::clone(&crew_message_path))
+        .with_convoy_engine(Arc::clone(&convoy_engine_path))
+        .with_charter_brief_renderer(Arc::new(flotilla_crew::charter_notifications::LiveCharterBriefRenderer::new(
+            resource_backend.clone(),
+            Arc::clone(&config),
+        )));
         let admission_free_space_path = config.state_dir().as_path().to_path_buf();
         let aggregator_projection_state = AggregatorProjectionState::new();
         let repository_change_requests = Arc::new(RwLock::new(HashMap::new()));

@@ -281,8 +281,7 @@ async fn build_fixture(
     let engine = EngineHome::install(&backend, "flotilla", "host");
     let refresher =
         ChangeRequestRefresher::new(backend.clone(), "host".into(), Arc::new(UnusedForge), ChangeRequestRefreshCadence::default());
-    let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::new(RecordingEventSink::default()), refresher)
-        .with_lifecycle_reads(engine.reads())
+    let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::new(RecordingEventSink::default()), refresher, engine.reads())
         .with_message_path(message_path.clone())
         .with_convoy_engine(engine.path());
     let probe = Arc::new(StagingProbe {

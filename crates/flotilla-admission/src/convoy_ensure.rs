@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_protocol::CanonicalHostId;
-use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
+use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{Convoy as ResourceConvoy, ConvoyEnsure, ConvoyProvisioningState, ReadResourceObject, ResourceObject};
 
 use crate::convoy_admission::PreparedConvoyAdmission;
@@ -90,13 +90,8 @@ pub struct ResourceStandingConvoyBackingInspector {
 }
 
 impl ResourceStandingConvoyBackingInspector {
-    pub fn new(resource_backend: flotilla_store::ResourceBackend) -> Self {
-        Self { resource_backend, lifecycle_reads: Arc::new(NoLifecycleReads) }
-    }
-
-    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
-        self.lifecycle_reads = reads;
-        self
+    pub fn new(resource_backend: flotilla_store::ResourceBackend, lifecycle_reads: Arc<dyn LifecycleReads>) -> Self {
+        Self { resource_backend, lifecycle_reads }
     }
 }
 
@@ -178,7 +173,7 @@ mod tests {
             let convoy = convoys.update_status("convoy", &created.metadata.resource_version, &status).await.expect("snapshot");
             let engine = EngineFixture::default();
             let fixture = &engine.environments;
-            let inspector = ResourceStandingConvoyBackingInspector::new(backend).with_lifecycle_reads(engine.reads());
+            let inspector = ResourceStandingConvoyBackingInspector::new(backend, engine.reads());
             assert!(inspector.verify_backing_dead(&convoy).await.is_ok(), "a convoy that launched no vessel never provisioned");
             let spec = EnvironmentSpec {
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),

@@ -279,8 +279,7 @@ fn supervision_wake_over(backend: &ResourceBackend, home: &EngineHome, reads: Ar
         flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     ReconcilerWake::new(
-        LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, limit)
-            .with_lifecycle_reads(reads)
+        LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, reads, limit)
             .with_convoy_engine(home.path()),
     )
 }
@@ -1813,7 +1812,7 @@ fn served_table(
     event_sink: Arc<dyn super::EventSink>,
     change_requests: ChangeRequestRefresher,
 ) -> LeafSubscriptionTable {
-    LeafSubscriptionTable::new(backend, event_sink, change_requests).with_lifecycle_reads(agent_reads())
+    LeafSubscriptionTable::new(backend, event_sink, change_requests, agent_reads())
 }
 
 /// A subscription table over `home`'s engine, as a daemon serving it builds one.
@@ -1823,7 +1822,7 @@ fn engine_table(
     event_sink: Arc<dyn super::EventSink>,
     change_requests: ChangeRequestRefresher,
 ) -> LeafSubscriptionTable {
-    LeafSubscriptionTable::new(backend, event_sink, change_requests).with_lifecycle_reads(home.reads()).with_convoy_engine(home.path())
+    LeafSubscriptionTable::new(backend, event_sink, change_requests, home.reads()).with_convoy_engine(home.path())
 }
 
 mod change_request_authority;

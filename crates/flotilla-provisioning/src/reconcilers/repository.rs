@@ -5,10 +5,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::checkout_records::latest_launches;
 use flotilla_resources::{
-    discovered_checkouts::DiscoveredCheckouts,
-    lifecycle_reads::{LifecycleReads, NoLifecycleReads},
-    resolve_default_branch, CheckoutSpec, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, LifecycleAuthority, Repository,
-    RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch, ResourceError, ResourceObject,
+    discovered_checkouts::DiscoveredCheckouts, lifecycle_reads::LifecycleReads, resolve_default_branch, CheckoutSpec,
+    DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, LifecycleAuthority, Repository, RepositoryCheckoutRef, RepositoryKey,
+    RepositoryStatus, RepositoryStatusPatch, ResourceError, ResourceObject,
 };
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
@@ -31,13 +30,8 @@ pub struct RepositoryReconciler {
 }
 
 impl RepositoryReconciler {
-    pub fn new(discovered: DiscoveredCheckouts) -> Self {
-        Self { discovered, lifecycle_reads: Arc::new(NoLifecycleReads), forge_default_branch_resolver: None }
-    }
-
-    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
-        self.lifecycle_reads = reads;
-        self
+    pub fn new(discovered: DiscoveredCheckouts, lifecycle_reads: Arc<dyn LifecycleReads>) -> Self {
+        Self { discovered, lifecycle_reads, forge_default_branch_resolver: None }
     }
 
     pub fn with_forge_default_branch_resolver(mut self, resolver: Arc<dyn ForgeDefaultBranchResolver>) -> Self {

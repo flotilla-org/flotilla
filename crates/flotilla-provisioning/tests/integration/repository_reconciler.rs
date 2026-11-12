@@ -99,8 +99,7 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
         Some("main"),
     );
 
-    let reconciler = RepositoryReconciler::new(discovered)
-        .with_lifecycle_reads(checkouts.reads.clone())
+    let reconciler = RepositoryReconciler::new(discovered, checkouts.reads.clone())
         .with_forge_default_branch_resolver(Arc::new(FixedForgeDefaultBranch("stable")));
     let status = reconciler.prepare(&repository).await.expect("status projection");
 
@@ -126,7 +125,7 @@ async fn repository_with_no_checkouts_projects_empty_status_without_deletion() {
     let clones = flotilla_provisioning_testkit::CloneFixture::over("home", Arc::clone(&store));
     let checkouts = flotilla_provisioning_testkit::CheckoutFixture::over("home", Arc::clone(&store))
         .serving(Arc::clone(&environments.environments) as _, Arc::clone(&clones.clones) as _);
-    let reconciler = RepositoryReconciler::new(discovered).with_lifecycle_reads(checkouts.reads.clone());
+    let reconciler = RepositoryReconciler::new(discovered, checkouts.reads.clone());
     let status = reconciler.prepare(&repository).await.expect("status projection");
 
     assert!(status.checkouts_by_host.is_empty());

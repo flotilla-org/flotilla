@@ -573,9 +573,11 @@ mod chained_default_branch_tests {
             .await
             .expect("repository");
         // No clone holds a default branch, so the forge's answer decides.
-        let reconciler = flotilla_provisioning::reconcilers::RepositoryReconciler::new(Default::default())
-            .with_lifecycle_reads(flotilla_provisioning_testkit::EngineFixture::default().reads())
-            .with_forge_default_branch_resolver(Arc::new(GhForgeDefaultBranchResolver::new(runner.clone())));
+        let reconciler = flotilla_provisioning::reconcilers::RepositoryReconciler::new(
+            Default::default(),
+            flotilla_provisioning_testkit::EngineFixture::default().reads(),
+        )
+        .with_forge_default_branch_resolver(Arc::new(GhForgeDefaultBranchResolver::new(runner.clone())));
         (runner, reconciler, repository)
     }
     // #3710: reconciliation resync and repeated prepares reuse six-hour successes.

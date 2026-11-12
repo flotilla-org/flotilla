@@ -14,7 +14,7 @@ use flotilla_protocol::EnvironmentId;
 use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::checkout_records::latest_launches;
 use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
-use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
+use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Repository, RepositoryKey, ResourceObject,
 };
@@ -58,7 +58,6 @@ pub(super) struct CheckoutProviders {
     environment_manager: Arc<flotilla_discovery::environment_manager::EnvironmentManager>,
     local_environment_id: EnvironmentId,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
-    #[builder(default = Arc::new(NoLifecycleReads))]
     lifecycle_reads: Arc<dyn LifecycleReads>,
     #[builder(default)]
     checkout_vcs: tokio::sync::Mutex<CheckoutVcsCache>,

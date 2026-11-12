@@ -109,7 +109,6 @@ pub struct ConvoyAdmission {
     backend: ResourceBackend,
     /// The checkouts this host's refresh discovered.
     discovered_checkouts: DiscoveredCheckouts,
-    #[builder(default = Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))]
     lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     /// The account kinds' records: the old store's, or the engine's behind `[primitives]`.
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
