@@ -6821,7 +6821,10 @@ mod tests {
                 let backend = ResourceBackend::new(InMemoryBackend::default());
                 let convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(phase).call();
                 let (events, _) = broadcast::channel(128);
-                let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events);
+                // The engine holds no launch of this vessel, so its stored status is read.
+                let engine = flotilla_provisioning_testkit::VesselsFixture::at(OWN_HOME);
+                let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events)
+                    .with_lifecycle_reads(engine.reads.clone());
                 let provenance = if remote {
                     let origin = flotilla_protocol::NodeId::new("remote-origin");
                     aggregator.origin_hosts.insert(origin.clone(), HostName::new("kiwi"));
@@ -7670,8 +7673,11 @@ mod tests {
         for (target, machine) in [("host-b1", "b1"), ("host-udder", "udder")] {
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let (events, _) = broadcast::channel(128);
+            // The engine holds no launch of this vessel, so its stored status is read.
+            let engine = flotilla_provisioning_testkit::VesselsFixture::at(OWN_HOME);
             let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events)
-                .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node", "udder")));
+                .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node", "udder")))
+                .with_lifecycle_reads(engine.reads.clone());
             let origin = flotilla_protocol::NodeId::new("udder-node");
             aggregator.origin_hosts.insert(origin.clone(), HostName::new("udder"));
             let provenance = ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() };
