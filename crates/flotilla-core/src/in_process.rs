@@ -730,8 +730,8 @@ pub struct InProcessDaemon {
     lifecycle_reads: Arc<flotilla_projections::ports::LateLifecycleReads>,
     /// The account kinds' records (#3824 layer 1): the old store's, or the engine's once
     /// installed behind `[primitives]`.
-    accounts: Arc<flotilla_store::SwitchedAccounts>,
-    manifest_roots: Arc<flotilla_store::SwitchedManifestRoots>,
+    accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
+    manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
     /// The forge observers, which the engine's observation records switch to observer-only writes.
     change_request_observer: flotilla_observation::change_request_observer::ChangeRequestRefresher,
     issue_observer: flotilla_observation::issue_observer::IssueRefresher,
@@ -1341,8 +1341,8 @@ impl InProcessDaemon {
         let brief_artifact_writer = Arc::new(RwLock::new(None));
         let admission_free_space_path = Arc::new(std::sync::RwLock::new(admission_free_space_path));
         let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
-        let accounts = Arc::new(flotilla_store::SwitchedAccounts::new(resource_backend.clone()));
-        let manifest_roots = Arc::new(flotilla_store::SwitchedManifestRoots::new(resource_backend.clone()));
+        let accounts = Arc::clone(&engine.accounts);
+        let manifest_roots = Arc::clone(&engine.manifest_roots);
         let checkout_providers = Arc::new(
             CheckoutProviders::builder()
                 .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
@@ -1488,8 +1488,6 @@ impl InProcessDaemon {
             .set(engine.change_request_branches)
             .map_err(|_| "the change request branches are already installed".to_owned())?;
         daemon.change_request_observer.install_branch_probe(Arc::new(ForgeBranchProbe(Arc::downgrade(&daemon))))?;
-        daemon.install_account_records(engine.accounts)?;
-        daemon.install_manifest_roots(engine.manifest_roots)?;
         crew.set_checkout_inspector(Arc::new(CheckoutInspector(Arc::downgrade(&daemon))));
         crew.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) })).await;
 
@@ -2354,17 +2352,12 @@ impl InProcessDaemon {
         Ok(())
     }
 
-    /// Installs the engine's account records during composition (#3824 layer 1).
-    pub fn install_account_records(&self, records: Arc<dyn flotilla_resources::account_access::AccountRecords>) -> Result<(), String> {
-        self.accounts.install(records)
-    }
-
     /// The attentions: the engine's once its Message path is installed, the old store's before.
     pub fn attentions(&self) -> Arc<dyn flotilla_resources::attentions::Attentions> {
         self.resource_backend.attentions()
     }
 
-    /// The account kinds' records: the engine's once installed, the old store's before.
+    /// The account kinds' records: the engine's.
     pub fn account_records(&self) -> Arc<dyn flotilla_resources::account_access::AccountRecords> {
         self.accounts.clone()
     }
@@ -2394,12 +2387,7 @@ impl InProcessDaemon {
         Ok(())
     }
 
-    /// Installs the engine's ManifestRoots during composition (#3824 layer 2c).
-    pub fn install_manifest_roots(&self, roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>) -> Result<(), String> {
-        self.manifest_roots.install(roots)
-    }
-
-    /// The ManifestRoots: the engine's once installed, the old store's before.
+    /// The ManifestRoots: the engine's.
     pub fn manifest_roots(&self) -> Arc<dyn flotilla_resources::manifest_roots::ManifestRoots> {
         self.manifest_roots.clone()
     }
