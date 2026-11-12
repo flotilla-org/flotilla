@@ -353,17 +353,31 @@ async fn diagnostics_retain_the_last_firing_for_an_armed_reconciler_row() {
 }
 
 // #2654: each subscription key logs its ineligible-to-eligible transition;
-// duplicate ticks with different crew phases but the same decision stay quiet.
+// repeated syncs with the same decision stay quiet. One launch's coder waits,
+// then works.
 #[test]
 fn unchanged_subscription_decisions_log_once() {
     let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
     let subscriber = captured_subscriber(logs.clone(), tracing::Level::DEBUG);
     tracing::subscriber::with_default(subscriber, || {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(active_checks_scenario(
-            &[true],
-            false,
-            "coder",
-        ));
+        tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(async {
+            let (backend, home) = engine_backend();
+            let wake = supervision_wake(&backend, &home);
+            let status = ConvoyStatus { workflow_snapshot: Some(stock_snapshot("single-agent")), ..Default::default() };
+            let launch = home.admit("checks-wake", ConvoySpec::builder().workflow_ref("single-agent".into()).build(), status).await;
+            let vessel = home.vessel(&launch, "work", "env");
+            let convoy = home.view(&backend, &launch).await;
+            home.engine().link(&convoy, &produced_pr(), SubjectDiscoverySource::Claim, "crew").await.expect("the crew claims its PR");
+            let sync = async || {
+                let current = backend.using::<Convoy>("flotilla").get(&launch).await.expect("launch");
+                wake.sync_rows("flotilla", &HashMap::from([(launch.clone(), current)])).await.expect("subscriptions");
+            };
+            sync().await;
+            sync().await;
+            home.seat(&backend, &launch, (&vessel, "work"), ("coder", "checks-wake-coder"), CrewWorkPhase::Working).await;
+            sync().await;
+            sync().await;
+        });
     });
     let output = String::from_utf8(logs.lock().expect("tracing scenario").clone()).expect("tracing scenario");
     let decisions = output

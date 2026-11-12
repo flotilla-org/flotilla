@@ -975,9 +975,12 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
     if stalled {
         use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, Submission};
         let engine = home.engine();
-        let mut operations = vec![
+        // The launch owes the workflow's promises: the crew submits its PR to the PR promise, and
+        // without an open ledger an operator waives the ledger promise.
+        let mut operations = vec![(
+            Actor::Crew,
             PromiseOperation::Submit {
-                id: "implementation-pr".into(),
+                id: "template/pr".into(),
                 kind: PromiseKind::Pr,
                 source: PromiseSource::Crew,
                 submission: Submission {
@@ -987,18 +990,16 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                     verdict: None,
                 },
             },
-            PromiseOperation::Declare {
-                id: "settlement-ledger".into(),
-                kind: PromiseKind::DecisionLedger,
-                source: if open_ledger { PromiseSource::Template } else { PromiseSource::Crew },
-            },
-        ];
+        )];
         if !open_ledger {
-            operations.push(PromiseOperation::Retract { id: "settlement-ledger".into(), reason: "not required in this scenario".into() });
+            operations.push((
+                Actor::Operator { principal: "operator".into() },
+                PromiseOperation::Retract { id: "template/decision-ledger".into(), reason: "not required in this scenario".into() },
+            ));
         }
-        for operation in &operations {
+        for (actor, operation) in operations {
             let convoy = convoys.get(launch).await.expect("convoy");
-            engine.promise(&convoy, "work", "coder", operation, Actor::Crew).await.expect("the crew's promise");
+            engine.promise(&convoy, "work", "coder", &operation, actor).await.expect("the promise edit");
         }
         let status = home
             .note(&backend, launch, |status| {
@@ -1047,10 +1048,23 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
         let status = convoys.get(launch).await.expect("convoy").status.expect("status");
         let submitted = flotilla_resources::promises::owned(&status, "work", "coder")
             .iter()
-            .find(|promise| promise.id == "implementation-pr")
+            .find(|promise| promise.id == "template/pr")
             .expect("submitted promise")
             .state;
         assert_eq!(submitted, flotilla_resources::promises::PromiseState::Kept);
+        if !open_ledger {
+            // With the ledger waived, the merge keeps the last promise the crew owed: that is its
+            // claim, so the launch lands and no merged-unclaimed turn is armed.
+            assert_eq!(status.phase, ConvoyPhase::Landing);
+            let objects = HashMap::from([(launch.to_owned(), convoys.get(launch).await.expect("convoy"))]);
+            wake.sync_rows("flotilla", &objects).await.expect("subscriptions");
+            assert!(!table
+                .rows()
+                .await
+                .iter()
+                .any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source == "merged-unclaimed")));
+            return;
+        }
     }
     for _ in 0..repeats {
         let objects = HashMap::from([(launch.to_owned(), convoys.get(launch).await.expect("convoy"))]);
@@ -1109,8 +1123,8 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
         assert!(!brief.contains("Resolve these non-terminal promises"));
     }
     if stalled {
-        assert_eq!(brief.contains("- `settlement-ledger` (decision-ledger)"), open_ledger);
-        assert!(!brief.contains("- `implementation-pr`"));
+        assert_eq!(brief.contains("- `template/decision-ledger` (decision-ledger)"), open_ledger);
+        assert!(!brief.contains("- `template/pr`"));
         let current = convoys.get(launch).await.expect("resumed");
         assert_eq!(current.status.as_ref().expect("status").crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     }
@@ -1681,7 +1695,9 @@ async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
     let launch = home.admit("wake-turn", convoy_spec, status).await;
     let launch = launch.as_str();
     let vessel = home.vessel(launch, "work", "env");
-    home.seat(&backend, launch, (&vessel, "work"), ("coder", "wake-turn-coder"), CrewWorkPhase::Done).await;
+    home.seat(&backend, launch, (&vessel, "work"), ("coder", "wake-turn-coder"), CrewWorkPhase::Working).await;
+    submit_ledger(&home, &backend, launch, "https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1", base).await;
+    home.keep(&backend, launch, "work", "coder").await;
     assert_eq!(convoys.get(launch).await.expect("convoy").status.expect("status").phase, ConvoyPhase::Landing);
     let cr_name = cr_name("github.com", "flotilla-org/flotilla", 1392);
     let records = backend.clone().using::<ChangeRequest>("flotilla");
@@ -1793,7 +1809,10 @@ async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
     );
     assert!(first_brief.contains("feature/wake"));
     assert!(first_brief.contains(&format!("Durable convoy record: `flotilla/{launch}`")));
-    assert!(first_brief.contains("Decision ledger: https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1"));
+    // The ledger the brief names is the kept ledger promise's artifact record, not the reference
+    // the coder submitted.
+    let ledger = flotilla_resources::address::artifact_slot_record_name(launch, "coder", "decision-ledger", launch).expect("ledger slot");
+    assert!(first_brief.contains(&format!("Decision ledger: {ledger}")), "{first_brief}");
 }
 
 /// A subscription table whose readings serve no held checkouts; a test that holds checkouts gives
