@@ -87,6 +87,14 @@ impl EngineHome {
         self.convoys.launch(flotilla_engine_convoys_testkit::convoy(&self.namespace, name, spec, status)).await
     }
 
+    /// Admits convoy `name` as [`Self::admit`] does, as a generation of the standing role ensured
+    /// from `ensure`; returns the launch.
+    pub async fn admit_ensured(&self, name: &str, ensure: &str, spec: ConvoySpec, status: ConvoyStatus) -> String {
+        let mut convoy = flotilla_engine_convoys_testkit::convoy(&self.namespace, name, spec, status);
+        convoy.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.to_owned(), ensure.to_owned());
+        self.convoys.launch(convoy).await
+    }
+
     /// Reserves the next launch of `name`, as admission does before it writes anything keyed by
     /// the launch; returns the launch, which [`Self::admit_reserved`] admits.
     pub async fn reserve(&self, name: &str) -> String {

@@ -1,7 +1,7 @@
 use super::stalls::{crew_role_address, stalled_source_actor};
 use flotilla_messaging::MessageReceiverSnapshot;
 use flotilla_resources::{
-    Convoy, ConvoyEnsure, Project, ReadResourceObject, ResourceObject, StallRung, StalledCondition, SupervisionTarget,
+    Convoy, Project, ReadResourceObject, ResourceObject, StallRung, StalledCondition, SupervisionTarget, ENSURED_FROM_ANNOTATION,
 };
 use flotilla_store::CascadeDeclarations;
 use std::borrow::Borrow;
@@ -62,7 +62,6 @@ pub(super) fn resolve_target(
     condition: &mut StalledCondition,
     target: &SupervisionTarget,
     available_convoys: &[impl Borrow<ReadResourceObject<Convoy>>],
-    available_ensures: &[impl Borrow<ReadResourceObject<ConvoyEnsure>>],
 ) -> Result<Option<SupervisorCandidate>, String> {
     let status = convoy.status.as_ref().ok_or("convoy has no status")?;
     let candidate = match target {
@@ -71,14 +70,8 @@ pub(super) fn resolve_target(
             found.map(|(name, _)| (convoy.metadata.name.clone(), name.clone(), role.clone(), StallRung::Bosun))
         }
         SupervisionTarget::ProjectCrew { convoy_role, vessel, role } => {
-            let owned = available_ensures
-                .iter()
-                .map(|source| &source.borrow().object)
-                .find(|ensure| {
-                    Some(ensure.spec.project_ref.as_str()) == convoy.spec.project_ref.as_deref() && ensure.spec.role == *convoy_role
-                })
-                .and_then(|ensure| ensure.status.as_ref())
-                .and_then(|status| status.convoy_ref.as_deref());
+            // The standing role's newest live generation holds the role ahead of any other live
+            // convoy of it.
             let candidate = available_convoys
                 .iter()
                 .map(|source| &source.borrow().object)
@@ -90,7 +83,11 @@ pub(super) fn resolve_target(
                         && candidate.status.as_ref().is_some_and(|status| !status.phase.is_terminal())
                 })
                 .max_by_key(|candidate| {
-                    (Some(candidate.metadata.name.as_str()) == owned, candidate.spec.generation, &candidate.metadata.name)
+                    (
+                        candidate.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION),
+                        candidate.spec.generation,
+                        &candidate.metadata.name,
+                    )
                 });
             let supervisor = candidate.and_then(|candidate| {
                 candidate.status.as_ref().and_then(|status| {
@@ -169,7 +166,6 @@ impl super::LeafSubscriptionTable {
         let backend = &self.inner.backend;
         let projects = backend.including_replicas::<Project>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let convoys = backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?.items;
-        let ensures = backend.including_replicas::<ConvoyEnsure>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let declarations = CascadeDeclarations::load(backend, namespace).await.map_err(|error| error.to_string())?;
         let receivers = MessageReceiverSnapshot::load(backend, namespace).await.map_err(|error| error.to_string())?;
         let policy = supervision_policy(SupervisionRoutes { declarations: &declarations, receivers: &receivers }, convoy, &projects)?;
@@ -180,7 +176,7 @@ impl super::LeafSubscriptionTable {
         // changes may also shift indices. Find the current owner in today's path.
         for (index, target) in policy.iter().enumerate() {
             let mut probe = stalled.clone();
-            if let Some((target_convoy, vessel, role, _)) = resolve_target(&receivers, convoy, &mut probe, target, &convoys, &ensures)? {
+            if let Some((target_convoy, vessel, role, _)) = resolve_target(&receivers, convoy, &mut probe, target, &convoys)? {
                 if stalled
                     .supervisor
                     .as_ref()
@@ -194,7 +190,7 @@ impl super::LeafSubscriptionTable {
         let mut missing_rung = StallRung::Operator;
         for (index, target) in policy.iter().enumerate().skip(start) {
             missing_rung = target_rung(target);
-            let candidate = resolve_target(&receivers, convoy, &mut condition, target, &convoys, &ensures)?;
+            let candidate = resolve_target(&receivers, convoy, &mut condition, target, &convoys)?;
             let Some((target_convoy, vessel, role, rung)) = candidate else {
                 continue;
             };

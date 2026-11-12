@@ -363,7 +363,9 @@ async fn addresses_resolve_current_holders_after_replication() {
     let holder = resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/coder").await.expect("resolve").expect("holder");
     assert_eq!(holder.object.metadata.name, "terminal");
     assert!(matches!(holder.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == NodeId::new("remote")));
-    // The role's current generation: its newest live convoy fulfilling the declaration.
+    // A role with no live standing generation has no holder.
+    assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/coder").await.expect("role without generation").is_none());
+    // The role's current generation: its newest live convoy ensured from the role's declaration.
     convoys
         .create(
             &InputMeta::builder()
@@ -394,20 +396,6 @@ async fn addresses_resolve_current_holders_after_replication() {
         )
         .await
         .expect("new holder");
-    assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/coder").await.expect("undeclared role").is_none());
-    let declarations = backend.using::<flotilla_resources::ConvoyEnsure>("flotilla");
-    declarations
-        .create(
-            &InputMeta::builder().name("coder-holder".into()).build(),
-            &flotilla_resources::ConvoyEnsureSpec::builder()
-                .project_ref("flotilla".into())
-                .role("coder".into())
-                .workflow_ref("workflow".into())
-                .repositories(Vec::new())
-                .build(),
-        )
-        .await
-        .expect("holder declaration");
     let holder = resolve_message_receiver(&backend, "flotilla", "flotilla/coder").await.expect("project role").expect("holder");
     assert_eq!(holder.object.metadata.name, "new-terminal");
 }
@@ -916,16 +904,6 @@ async fn routing_holder(backend: &ResourceBackend, project: &str, generation: &s
         )
         .await
         .expect("terminal");
-    let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
-    if ensures.get(&ensure).await.is_err() {
-        ensures
-            .create(
-                &InputMeta::builder().name(ensure).build(),
-                &ConvoyEnsureSpec::builder().project_ref(project.into()).role("guide".into()).repositories(Vec::new()).build(),
-            )
-            .await
-            .expect("ensure");
-    }
 }
 
 // Supervision skips unoccupied parent levels, stops at the nearest subscribed
@@ -968,9 +946,11 @@ fn subscription_supervision_follows_live_parent_chain(tc: hegel::TestCase) {
         // Every presence combination shares one local-plus-replica snapshot,
         // even when supervision and peer contacts resolve several addresses.
         let calls = memory.read_snapshot().since(&before).calls_by_kind();
-        for kind in ["Convoy", "TerminalSession", "ConvoyEnsure"] {
+        for kind in ["Convoy", "TerminalSession"] {
             assert_eq!(calls.get(kind).copied().unwrap_or_default(), 2, "one snapshot for {kind}");
         }
+        // The standing roles' holders come from the convoys alone.
+        assert_eq!(calls.get("ConvoyEnsure").copied().unwrap_or_default(), 0, "no ConvoyEnsure reads");
         routing_holder(&backend, "root", "two").await;
         let next = crew_address_book(&backend, "flotilla", "child/task/work/coder").await.expect("refreshed contacts");
         assert_eq!(next.supervision.last().expect("root").terminal.as_deref(), Some("terminal-root-two"));
@@ -1304,7 +1284,8 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
         }
         let batch = backend.read_snapshot().since(&before);
         batch.assert_no_lists("receiver batch");
-        assert_eq!(kinds(&batch), [(1, 1), (1, 1), (1, 1), (0, 0)]);
+        // A standing role's holder is its newest live generation: no ConvoyEnsure is read.
+        assert_eq!(kinds(&batch), [(1, 1), (1, 1), (0, 0), (0, 0)]);
         // A four-part address selects its crew, even when the named convoy
         // contains other sessions. It does not need standing-role holders.
         backend
