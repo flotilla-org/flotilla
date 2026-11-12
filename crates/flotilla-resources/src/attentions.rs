@@ -21,10 +21,11 @@ pub enum Sender {
     Teardown,
     Capabilities,
     TurnRules,
+    StallJudge,
 }
 
 impl Sender {
-    pub const ALL: [Sender; 4] = [Sender::Standing, Sender::Teardown, Sender::Capabilities, Sender::TurnRules];
+    pub const ALL: [Sender; 5] = [Sender::Standing, Sender::Teardown, Sender::Capabilities, Sender::TurnRules, Sender::StallJudge];
 
     /// The fleet role's name.
     pub fn role(self) -> &'static str {
@@ -33,6 +34,7 @@ impl Sender {
             Sender::Teardown => "teardown",
             Sender::Capabilities => "capabilities",
             Sender::TurnRules => "turn-rules",
+            Sender::StallJudge => "stall-judge",
         }
     }
 
@@ -89,6 +91,8 @@ pub enum Fact {
     CredentialRefresh { convoy: String, vessel: String, failures: BTreeMap<String, String> },
     /// Turns to a crew session's convoy role are held until a person rules.
     DeliveryHeld { session: String, convoy: String, role: String },
+    /// A convoy role's stall reached the operator with no person named to supervise it.
+    Stalled { convoy: String, role: String },
 }
 
 impl Fact {
@@ -98,6 +102,7 @@ impl Fact {
             Fact::ReclaimRefused { .. } => Sender::Teardown,
             Fact::CredentialRefresh { .. } => Sender::Capabilities,
             Fact::DeliveryHeld { .. } => Sender::TurnRules,
+            Fact::Stalled { .. } => Sender::StallJudge,
         }
     }
 
@@ -106,7 +111,9 @@ impl Fact {
             Fact::Hold { convoy, .. } | Fact::ReclaimRefused { convoy } => Subject::convoy(convoy.clone()),
             Fact::Drift { project, role, .. } => Subject::StandingRole { project: project.clone(), role: role.clone() },
             Fact::CredentialRefresh { convoy, vessel, .. } => Subject::Vessel { convoy: convoy.clone(), vessel: vessel.clone() },
-            Fact::DeliveryHeld { convoy, role, .. } => Subject::ConvoyRole { convoy: convoy.clone(), role: role.clone() },
+            Fact::DeliveryHeld { convoy, role, .. } | Fact::Stalled { convoy, role } => {
+                Subject::ConvoyRole { convoy: convoy.clone(), role: role.clone() }
+            }
         }
     }
 
@@ -117,7 +124,8 @@ impl Fact {
             | Fact::Drift { convoy, .. }
             | Fact::ReclaimRefused { convoy }
             | Fact::CredentialRefresh { convoy, .. }
-            | Fact::DeliveryHeld { convoy, .. } => convoy,
+            | Fact::DeliveryHeld { convoy, .. }
+            | Fact::Stalled { convoy, .. } => convoy,
         }
     }
 }

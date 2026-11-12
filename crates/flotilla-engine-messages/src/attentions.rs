@@ -196,6 +196,9 @@ impl MessagePrimitives {
             Fact::DeliveryHeld { role, .. } => {
                 Cause::DeliveryHeld { role: Read { address: child(&held.address, Kind::Role, role)?, revision: held.revision } }
             }
+            Fact::Stalled { role, .. } => {
+                Cause::Stalled { role: Read { address: child(&held.address, Kind::Role, role)?, revision: held.revision } }
+            }
         };
         Ok((cause, inbox))
     }
