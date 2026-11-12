@@ -7,8 +7,8 @@ use std::{collections::BTreeMap, time::Duration};
 
 use common::{bootstrapped_convoy_status, convoy_meta, convoy_object, task_provisioning_convoy_spec, timestamp, valid_convoy_spec};
 use flotilla_resources::{
-    evaluate_landing_settlement, external_patches, implement_review_workflow_spec, BoundChangeRequest,
-    ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, CheckoutSpec, Convoy, ConvoyPhase, ConvoyStatus,
+    evaluate_landing_settlement, external_patches, implement_review_workflow_spec, BoundChangeRequest, ChangeRequest,
+    ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, CheckoutSpec, Convoy, ConvoyPhase, ConvoyStatus,
     ConvoyStatusPatch, CrewWorkPhase, InputMeta, Observation, ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks,
     ObservedMergeability, OwnerReference, RepositoryKey, ReviewRefPair, SettlementClaimEvidence, StatusPatch, UnmetSettlementExpectation,
     Vessel, VesselSpec, WorkPhase, WorkflowSnapshot,
@@ -97,12 +97,6 @@ async fn reconcile_with_observed_change_request(
             member.phase = CrewWorkPhase::Done;
         }
     }
-    status.work.get_mut("implement").expect("implement work").placement = Some(flotilla_resources::PlacementStatus {
-        fields: BTreeMap::from([(
-            "checkout_refs".to_string(),
-            serde_json::json!(BTreeMap::from([(RepositoryKey("repo-a".to_string()), "checkout-a".to_string())])),
-        )]),
-    });
     let mut spec = valid_convoy_spec();
     spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
         .url("https://github.com/example/repo-a".to_string())
@@ -423,15 +417,7 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
         })
         .collect();
     let evaluate = |records: &BTreeMap<_, _>| {
-        evaluate_landing_settlement(
-            &convoy,
-            &BTreeMap::new(),
-            records,
-            &[],
-            Duration::from_secs(180),
-            Duration::from_secs(180),
-            now,
-        )
+        evaluate_landing_settlement(&convoy, &BTreeMap::new(), records, &[], Duration::from_secs(180), Duration::from_secs(180), now)
     };
     let evaluation = evaluate(&records);
     assert!(evaluation.satisfied, "old merged observations must settle: {:?}", evaluation.unmet);
@@ -454,15 +440,8 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
     {
         entries.retain(|disposition, _| disposition == "closed-unmerged");
     }
-    let unmatched = evaluate_landing_settlement(
-        &closed_only,
-        &BTreeMap::new(),
-        &records,
-        &[],
-        Duration::from_secs(180),
-        Duration::from_secs(180),
-        now,
-    );
+    let unmatched =
+        evaluate_landing_settlement(&closed_only, &BTreeMap::new(), &records, &[], Duration::from_secs(180), Duration::from_secs(180), now);
     assert!(!unmatched.satisfied);
     assert_eq!(unmatched.unmet.len(), count);
     assert!(unmatched.unmet.iter().all(|unmet| matches!(unmet, UnmetSettlementExpectation::ChangeRequestConditionFalse { .. })));
@@ -540,15 +519,7 @@ fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
         );
     }
     let evaluate = |records: &BTreeMap<_, _>| {
-        evaluate_landing_settlement(
-            &convoy,
-            &BTreeMap::new(),
-            records,
-            &[],
-            Duration::from_secs(180),
-            Duration::from_secs(180),
-            now,
-        )
+        evaluate_landing_settlement(&convoy, &BTreeMap::new(), records, &[], Duration::from_secs(180), Duration::from_secs(180), now)
     };
     let evaluation = evaluate(&records);
     assert!(evaluation.satisfied, "mixed merged and closed subjects are all terminal");
@@ -657,16 +628,20 @@ async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let convoys = backend.clone().using::<Convoy>("flotilla");
         let requests = backend.clone().using::<ChangeRequest>("flotilla");
+        let checkouts = engine_checkouts("host-a", "stale-scan");
         let mut spec = task_provisioning_convoy_spec();
         spec.repositories[0].url = "https://github.com/flotilla-org/flotilla".into();
         let mut status = bootstrapped_convoy_status();
+        status.engine_launch = Some(checkouts.launch("stale-scan"));
         status.phase = ConvoyPhase::Landing;
-        status.work.get_mut("implement").expect("work").placement = Some(flotilla_resources::PlacementStatus {
-            fields: BTreeMap::from([(
-                "checkout_refs".into(),
-                serde_json::json!(BTreeMap::from([(spec.repositories[0].repo_ref.clone(), "checkout-a")])),
-            )]),
-        });
+        // The launch holds its checkout, not yet inspected as landed.
+        put_inspected(
+            &checkouts,
+            "stale-scan",
+            "checkout-a",
+            (&spec.repositories[0].repo_ref, "feature/stale-scan", "/tmp/checkout-a"),
+            Inspection::default(),
+        );
         status.workflow_snapshot.as_mut().expect("snapshot").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
         status.branch_subject_scan_at = None;
         status.branch_subject_scan_error = Some("lookup exceeded 10 pages".into());
@@ -716,7 +691,7 @@ async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
             .await
             .expect("merged");
         let current = convoys.get("stale-scan").await.expect("convoy");
-        let settlement = landing_judgement(&backend, &current, &CheckoutFixture::default(), timestamp(40)).await;
+        let settlement = landing_judgement(&backend, &current, &checkouts, timestamp(40)).await;
         let discovery_pending =
             settlement.evaluation.unmet.iter().any(|unmet| matches!(unmet, UnmetSettlementExpectation::SubjectDiscoveryPending { .. }));
         if known_subject {
@@ -840,7 +815,8 @@ async fn landing_on_a_different_target_records_a_fact_and_still_becomes_landed()
 
 #[tokio::test]
 async fn landing_without_checkout_evidence_stays_landing() {
-    let settlement = reconcile_with_observed_change_request(ConvoyPhase::Landing, None, None, false).await;
+    // The launch holds its checkout, whose inspection has no landing evidence.
+    let settlement = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(None), None, false).await;
 
     assert_eq!(settlement.disposition, None);
 }
@@ -884,13 +860,6 @@ async fn reconcile_terminal_bound_change_request(
             member.phase = CrewWorkPhase::Done;
         }
     }
-    status.work.get_mut("implement").expect("implement work").placement = Some(flotilla_resources::PlacementStatus {
-        fields: BTreeMap::from([(
-            "checkout_refs".to_string(),
-            serde_json::json!(BTreeMap::from([(repo_ref.clone(), "checkout-a".to_string())])),
-        )]),
-    });
-
     let mut spec = valid_convoy_spec();
     spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
         .url("https://github.com/example/repo-a".to_string())
@@ -905,19 +874,12 @@ async fn reconcile_terminal_bound_change_request(
         spec.repositories.push(
             flotilla_resources::ConvoyRepositorySpec::builder()
                 .url("https://example.com/repo-context".to_string())
-                .repo_ref(context_repo_ref.clone())
+                .repo_ref(context_repo_ref)
                 .source_ref("main".to_string())
                 .target_ref("main".to_string())
                 .workspace_slug("repo-context".to_string())
                 .subpaths(Vec::new())
                 .build(),
-        );
-        status.work.get_mut("implement").expect("implement work").placement.as_mut().expect("placement").fields.insert(
-            "checkout_refs".to_string(),
-            serde_json::json!(BTreeMap::from([
-                (repo_ref.clone(), "checkout-a".to_string()),
-                (context_repo_ref, "checkout-context".to_string()),
-            ])),
         );
     }
     spec.change_request = Some(
@@ -1030,11 +992,17 @@ async fn terminal_bound_change_request_discharges_missing_checkout_after_vessel_
     assert_eq!(settlement.disposition.as_deref(), Some("merged"));
 }
 
+// A held checkout stays readable after it ends, so it is never missing: the bound change
+// request settles the launch while its vessel is still live.
 #[tokio::test]
-async fn terminal_bound_change_request_keeps_missing_checkout_expectation_for_live_vessel() {
-    let TerminalChangeRequestReconcile { settlement, .. } = reconcile_terminal_bound_change_request(false, true, false).await;
+async fn terminal_bound_change_request_settles_with_an_ended_held_checkout_for_live_vessel() {
+    let TerminalChangeRequestReconcile { backend, checkouts, checkout_launch, .. } =
+        reconcile_terminal_bound_change_request(true, true, false).await;
+    checkouts.finish(&checkout_launch.expect("checkout launch"), Ending::Lost("gone"));
+    let current = backend.using::<Convoy>("flotilla").get("convoy-a").await.expect("convoy");
+    let settlement = landing_judgement(&backend, &current, &checkouts, timestamp(40)).await;
 
-    assert_eq!(settlement.disposition, None);
+    assert_eq!(settlement.disposition.as_deref(), Some("merged"), "{:?}", settlement.evaluation.unmet);
 }
 
 #[tokio::test]
