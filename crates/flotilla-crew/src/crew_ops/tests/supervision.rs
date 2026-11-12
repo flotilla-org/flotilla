@@ -759,12 +759,14 @@ async fn run_escalation_scenarios(
                 Some("concurrent ruling")
             );
             assert_eq!(records.len(), 2, "both admitted escalation and durable ruling survive the failed transfer");
+            assert_ruling_unlinked(&records, &held);
             continue;
         }
         let result = result.expect("typed outcome");
         let owner = if collocated { held.launch.clone() } else { next.clone().unwrap_or_default() };
         if bound && reachable && (!collocated || !missing_terminal) {
             assert_escalation_transferred(&result, &after, &records, &receiver, operator, &owner);
+            assert_ruling_unlinked(&records, &held);
             if collocated {
                 assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["work"]["deputy"].phase, CrewWorkPhase::Working);
                 continue;
@@ -833,6 +835,7 @@ async fn collocated_escalation_refuses_a_concurrent_change_to_the_seat() {
         assert!(error.contains("stall changed during escalation"), "{error}");
         let status = held.convoy(&backend).await.status.expect("status");
         assert!(status.stalled.as_ref().is_none_or(|stall| stall.supervisor.as_ref().is_none_or(|owner| owner.role != "deputy")));
+        assert_ruling_unlinked(&backend.using::<Message>("flotilla").list().await.expect("messages").items, &held);
     }
 }
 
@@ -930,6 +933,13 @@ fn assert_escalation_transferred(
     let escalation = records.iter().find(|record| record.spec.receiver == receiver).expect("next receiver Message");
     assert_eq!(escalation.spec.relation, MessageRelation::Supervisor);
     assert_eq!(escalation.spec.expectation, if operator { MessageExpectation::None } else { MessageExpectation::Reply });
+}
+
+// A legacy cursor (one an import carried) names an escalation that was never sent: the
+// supervisor's ruling is admitted without a link rather than refused.
+fn assert_ruling_unlinked(records: &[flotilla_resources::ResourceObject<Message>], held: &Held) {
+    let ruling = records.iter().find(|record| record.spec.receiver == held.receiver("work", "coder")).expect("the ruling to the coder");
+    assert_eq!(ruling.spec.in_reply_to, None);
 }
 
 // Receiver refusal preserves the existing owner and creates no notifications.

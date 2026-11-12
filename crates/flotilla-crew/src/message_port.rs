@@ -31,6 +31,22 @@ impl CrewService {
         }
     }
 
+    /// Where the Message `intent` replies to stands, read as its admission reads it.
+    pub(crate) async fn resolve_in_reply_to(&self, namespace: &str, intent: &MessageSpec) -> flotilla_messaging::MessageResolution {
+        use flotilla_messaging::MessageResolution;
+        match self.message_primitives() {
+            Some(primitives) => primitives.resolve_in_reply_to(namespace, intent).await,
+            None => {
+                let Some(original) = &intent.in_reply_to else { return MessageResolution::Absent };
+                match self.resource_backend.including_replicas::<Message>(namespace).get(original).await {
+                    Ok(_) => MessageResolution::Found,
+                    Err(ResourceError::NotFound { .. }) => MessageResolution::Absent,
+                    Err(error) => MessageResolution::Unknown(error.to_string()),
+                }
+            }
+        }
+    }
+
     /// One Message by name, local or replicated.
     pub(crate) async fn message_record(&self, namespace: &str, name: &str) -> Result<ReadResourceObject<Message>, ResourceError> {
         match self.message_primitives() {

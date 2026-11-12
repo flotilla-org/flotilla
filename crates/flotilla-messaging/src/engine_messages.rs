@@ -2,6 +2,17 @@
 
 use async_trait::async_trait;
 
+/// Where a message named by another stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageResolution {
+    /// Held in this home's replica or at its home.
+    Found,
+    /// Every home answered that it holds no such message.
+    Absent,
+    /// Unanswered: a home could not be reached, or the read failed.
+    Unknown(String),
+}
+
 /// The `[primitives]` switch's Message path, as crew code reads and admits
 /// Messages (#3317). Crew code never reaches the engine: it sees engine
 /// messages in the old shape through this port, which the composition root
@@ -36,6 +47,10 @@ pub trait EngineMessages: Send + Sync {
         namespace: &str,
         intent: &flotilla_resources::MessageSpec,
     ) -> Result<flotilla_resources::MessageSpec, flotilla_resources::ResourceError>;
+    /// Where the message `intent` replies to stands, read as its admission
+    /// reads it: in this home's replica, or at its home on a miss. With no
+    /// `in_reply_to` it is absent.
+    async fn resolve_in_reply_to(&self, namespace: &str, intent: &flotilla_resources::MessageSpec) -> MessageResolution;
     /// An operator withdraws a queued message homed here, on the convoy's authority.
     async fn withdraw(&self, namespace: &str, record: &str, convoy: &str) -> Result<(), String>;
     /// The home this path admits at: this daemon's.

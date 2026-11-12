@@ -1458,50 +1458,63 @@ impl CrewService {
         receiver: &str,
         actor_crew_id: Option<&str>,
     ) -> Result<Option<String>, String> {
-        let in_reply_to = if let Some(reference) = &stalled.supervision_message {
-            Some(reference.name.clone())
-        } else {
-            // The escalation runs the other way: from the crew to this ruling's sender, its
-            // parties spelled as the messages read back spell them.
-            let escalation = flotilla_resources::MessageSpec::builder()
-                .sender(receiver.to_owned())
-                .receiver(sender.to_owned())
-                .relation(flotilla_resources::MessageRelation::Supervisor)
-                .body(String::new())
-                .build();
-            let escalation = self.spelled_message_intent(namespace, &escalation).await.map_err(|error| error.to_string())?;
-            self.active_message_records(namespace, Some(&escalation.receiver))
-                .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter(|record| {
-                    record.object.spec.receiver == escalation.receiver
-                        && record.object.spec.sender == escalation.sender
-                        && record.object.spec.expectation == flotilla_resources::MessageExpectation::Reply
-                        && record.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
-                        && record.object.spec.references.iter().any(|reference| {
-                            matches!(reference, flotilla_resources::MessageReference::ControlRecord { resource, .. }
+        if let Some(reference) = &stalled.supervision_message {
+            return Ok(Some(reference.name.clone()));
+        }
+        // The escalation runs the other way: from the crew to this ruling's sender, its parties
+        // spelled as the messages read back spell them.
+        let escalation = flotilla_resources::MessageSpec::builder()
+            .sender(receiver.to_owned())
+            .receiver(sender.to_owned())
+            .relation(flotilla_resources::MessageRelation::Supervisor)
+            .body(String::new())
+            .build();
+        let escalation = self.spelled_message_intent(namespace, &escalation).await.map_err(|error| error.to_string())?;
+        let found = self
+            .active_message_records(namespace, Some(&escalation.receiver))
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|record| {
+                record.object.spec.receiver == escalation.receiver
+                    && record.object.spec.sender == escalation.sender
+                    && record.object.spec.expectation == flotilla_resources::MessageExpectation::Reply
+                    && record.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
+                    && record.object.spec.references.iter().any(|reference| {
+                        matches!(reference, flotilla_resources::MessageReference::ControlRecord { resource, .. }
                     if resource.kind == "Convoy" && resource.name == convoy_name && resource.namespace == namespace)
-                        })
-                })
-                .max_by_key(|record| record.object.metadata.creation_timestamp)
-                .map(|record| record.object.metadata.name)
-                .or_else(|| {
-                    stalled.supervision_index.filter(|_| actor_crew_id.is_some()).map(|index| {
-                        // The escalation is receiver-homed and may not have replicated
-                        // back to this authority. Use judge_stalls' immutable producer key.
-                        flotilla_resources::message_record_name(
-                            sender,
-                            receiver,
-                            &turn_message_producer_key(
-                                &supervision_message_source(convoy_name, index),
-                                &stalled.began_at.timestamp_micros().to_string(),
-                            ),
-                        )
                     })
-                })
-        };
-        Ok(in_reply_to)
+            })
+            .max_by_key(|record| record.object.metadata.creation_timestamp)
+            .map(|record| record.object.metadata.name);
+        if found.is_some() {
+            return Ok(found);
+        }
+        let Some(index) = stalled.supervision_index.filter(|_| actor_crew_id.is_some()) else { return Ok(None) };
+        // The escalation is receiver-homed and may not have replicated back to this authority. Use
+        // judge_stalls' immutable producer key, read at its home. A legacy cursor (one an import
+        // carried) may name an escalation that was never sent: the ruling then goes unlinked, as
+        // a supervisor's ruling never fails for want of its link.
+        let name = flotilla_resources::message_record_name(
+            sender,
+            receiver,
+            &turn_message_producer_key(&supervision_message_source(convoy_name, index), &stalled.began_at.timestamp_micros().to_string()),
+        );
+        let ruling = flotilla_resources::MessageSpec::builder()
+            .sender(sender.to_owned())
+            .receiver(receiver.to_owned())
+            .relation(flotilla_resources::MessageRelation::Supervisor)
+            .body(String::new())
+            .in_reply_to(name.clone())
+            .build();
+        Ok(match self.resolve_in_reply_to(namespace, &ruling).await {
+            flotilla_messaging::MessageResolution::Found => Some(name),
+            flotilla_messaging::MessageResolution::Absent => None,
+            flotilla_messaging::MessageResolution::Unknown(error) => {
+                tracing::warn!(message = %name, %error, "supervision ruling sent unlinked: its escalation could not be read");
+                None
+            }
+        })
     }
 
     /// Records an admitted escalation's next stall condition, refused when the stall changed

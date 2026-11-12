@@ -74,6 +74,14 @@ impl EngineMessages for RecordingMessages {
         // Admitted intents read back as admitted.
         Ok(intent.clone())
     }
+    async fn resolve_in_reply_to(&self, _namespace: &str, intent: &MessageSpec) -> flotilla_messaging::MessageResolution {
+        match &intent.in_reply_to {
+            Some(original) if self.admitted.lock().expect("admitted").contains_key(original) => {
+                flotilla_messaging::MessageResolution::Found
+            }
+            _ => flotilla_messaging::MessageResolution::Absent,
+        }
+    }
     async fn withdraw(&self, _namespace: &str, _record: &str, _convoy: &str) -> Result<(), String> {
         Ok(())
     }

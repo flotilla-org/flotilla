@@ -571,6 +571,9 @@ impl flotilla_messaging::EngineMessages for Turns {
     ) -> Result<flotilla_resources::MessageSpec, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler compares no parties")
     }
+    async fn resolve_in_reply_to(&self, _: &str, _: &flotilla_resources::MessageSpec) -> flotilla_messaging::MessageResolution {
+        unreachable!("the convoy reconciler links no replies")
+    }
     async fn withdraw(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
         unreachable!("the convoy reconciler withdraws nothing")
     }

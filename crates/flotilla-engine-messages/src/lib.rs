@@ -33,6 +33,7 @@ use self::{
 use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_engine_store::StoreLog;
 use flotilla_inbox::{sqlite::SqliteInbox, ConsumerLog, ConsumerPort, InboxBackend, Observations, ReceiptScope, Supervision};
+use flotilla_messaging::MessageResolution;
 use flotilla_resources::{
     address::{artifact_address, record_name as address_record_name, repository_address},
     Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, MessageSpec as OldSpec, Project,
@@ -1103,20 +1104,43 @@ impl MessagePrimitives {
     /// read at its home through [`ports::HomeReads`] and marked remote with
     /// its age. `inbox` is where it was sent, which names it at its home.
     pub async fn read_message(&self, record: &str, inbox: Option<Address>) -> Result<MessageRead, String> {
+        self.find_message(record, inbox).await?.ok_or_else(|| format!("message `{record}` is at no reachable home"))
+    }
+
+    /// [`Self::read_message`], with None when every home answered that it
+    /// holds no such message; an error when one could not be asked.
+    async fn find_message(&self, record: &str, inbox: Option<Address>) -> Result<Option<MessageRead>, String> {
         if let Some((id, home, version)) = self.locate_versioned(record)? {
-            return Ok(MessageRead { id, home, version, remote: false, age_micros: 0 });
+            return Ok(Some(MessageRead { id, home, version, remote: false, age_micros: 0 }));
         }
         let (Some(reads), Some(inbox)) = (self.home_reads.get(), inbox) else {
             return Err(format!("message `{record}` is not in this home's replica, and no home read can reach it"));
         };
         let id = Address::message(&inbox, record).map_err(|error| error.to_string())?.as_str().to_owned();
         let read = reads.find(Resource::<Message>::CODE, &id).await?;
-        match read.and_then(|read| read.value.map(|value| (value, read.remote, read.age_micros))) {
-            Some((value, remote, age_micros)) => {
-                tracing::info!(message = %id, home = %value.home, remote, age_micros, "replica miss read at the message's home");
-                Ok(MessageRead { id, home: value.home, version: value.version, remote, age_micros })
-            }
-            None => Err(format!("message `{record}` is at no reachable home")),
+        Ok(read.and_then(|read| read.value.map(|value| (value, read.remote, read.age_micros))).map(|(value, remote, age_micros)| {
+            tracing::info!(message = %id, home = %value.home, remote, age_micros, "replica miss read at the message's home");
+            MessageRead { id, home: value.home, version: value.version, remote, age_micros }
+        }))
+    }
+
+    /// Where the message `intent` replies to stands, read as its admission
+    /// reads it: in this replica, or at its home on a miss.
+    pub async fn resolve_in_reply_to(&self, namespace: &str, intent: &OldSpec) -> MessageResolution {
+        let Some(original) = &intent.in_reply_to else { return MessageResolution::Absent };
+        let inbox = async {
+            let roles = self.roles(namespace).await?;
+            let records = self.records(namespace).await.map_err(|error| error.to_string())?;
+            Conversion { roles: &roles, forges: &records.forges, records: &*records }.sender_of(intent)
+        };
+        let found = match inbox.await {
+            Ok(inbox) => self.find_message(original, Some(inbox)).await,
+            Err(error) => Err(error),
+        };
+        match found {
+            Ok(Some(_)) => MessageResolution::Found,
+            Ok(None) => MessageResolution::Absent,
+            Err(error) => MessageResolution::Unknown(error),
         }
     }
 
@@ -1491,6 +1515,9 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     }
     async fn spelled(&self, namespace: &str, intent: &OldSpec) -> Result<OldSpec, ResourceError> {
         MessagePrimitives::spelled(self, namespace, intent).await
+    }
+    async fn resolve_in_reply_to(&self, namespace: &str, intent: &OldSpec) -> MessageResolution {
+        MessagePrimitives::resolve_in_reply_to(self, namespace, intent).await
     }
     async fn withdraw(&self, namespace: &str, record: &str, convoy: &str) -> Result<(), String> {
         MessagePrimitives::withdraw(self, namespace, record, convoy).await

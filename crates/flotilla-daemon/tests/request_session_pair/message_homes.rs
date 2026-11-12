@@ -232,6 +232,11 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     assert_eq!(*replied.state(), MessageState::Pending, "nobody is bound to turn-rules yet");
     let read = engine_a.read_message(&request, Some(sent.spec().inbox.clone())).await.expect("routed read");
     assert!(read.remote && read.age_micros >= 0 && read.home == home_b, "{read:?}");
+    // A reply link resolves at the original's home; a name no home holds is absent, not unknown.
+    assert_eq!(engine_a.resolve_in_reply_to(NS, &answer).await, flotilla_messaging::MessageResolution::Found);
+    let unsent =
+        MessageSpec { in_reply_to: Some(flotilla_resources::message_record_name(&receiver, "system:turn-rules", "never")), ..answer };
+    assert_eq!(engine_a.resolve_in_reply_to(NS, &unsent).await, flotilla_messaging::MessageResolution::Absent);
 
     pump(&store_b, &home_b, &store_a, &mut b_to_a);
 
