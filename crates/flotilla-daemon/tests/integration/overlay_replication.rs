@@ -520,7 +520,17 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
     assert_eq!(binding.session, None);
     assert_eq!(binding.resource_ref(), None);
     assert!(serde_json::to_string(&checkout_attach.plan).expect("attach plan").contains("/srv/widgets"));
-    assert!(kiwi.resource_backend().including_replicas::<Checkout>("flotilla").list().await.expect("durable checkouts").items.is_empty());
+    // kiwi reads feta's checkout from the engine, homed on feta; kiwi holds none of its own.
+    let sources = kiwi.resource_backend().including_replicas::<Checkout>("flotilla").list().await.expect("checkout sources");
+    assert!(!sources.items.is_empty(), "kiwi reads feta's checkout");
+    assert!(
+        sources
+            .items
+            .iter()
+            .all(|source| matches!(&source.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == feta.node_id())),
+        "every checkout kiwi lists is homed on feta"
+    );
+    assert!(kiwi.resource_backend().using::<Checkout>("flotilla").list().await.expect("local checkouts").items.is_empty());
     checkouts.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
     flotilla_daemon_testkit::engine::engine(&feta).terminals.release(&independent);
     tokio::time::timeout(Duration::from_secs(5), async {

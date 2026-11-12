@@ -111,6 +111,96 @@ async fn the_resource_commands_read_clones_and_environments_from_the_engine() {
     }
 }
 
+// The resource commands read a crew's checkout from the engine's launches and refuse to write it,
+// naming where it is seen. Image builds have no resource view: every verb on them is refused,
+// naming `flotilla image check`. Neither kind reaches the old store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_resource_commands_read_checkouts_from_the_engine_and_refuse_image_builds() {
+    use flotilla_protocol::{CommandAction, CommandValue};
+    use flotilla_resources::Checkout;
+    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
+    daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    daemon.stage("lifecycle");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let checkouts = loop {
+        let checkouts = daemon.list::<Checkout>().await;
+        if !checkouts.is_empty() {
+            break checkouts;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the coder's checkout is listed");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let checkout = daemon.get::<Checkout>(&checkouts[0].metadata.name).await.expect("the listed checkout reads by name");
+    assert_eq!(checkout.spec, checkouts[0].spec);
+    assert!(checkout.metadata.labels.contains_key(flotilla_resources::CONVOY_LABEL), "its convoy is labelled: {checkout:?}");
+    let refused = |value: CommandValue, names: &str| match value {
+        CommandValue::Error { message } => assert!(message.contains(names), "{message}"),
+        other => panic!("not refused: {other:?}"),
+    };
+    let document = |kind: &str, name: &str, spec: serde_json::Value| CommandAction::ResourceApply {
+        namespace: "flotilla".into(),
+        document: serde_json::json!({
+            "apiVersion": "flotilla.work/v1", "kind": kind, "metadata": {"name": name, "namespace": "flotilla"}, "spec": spec,
+        }),
+    };
+    let spec = serde_json::to_value(&checkout.spec).expect("checkout spec");
+    refused(daemon.execute(document("Checkout", &checkout.metadata.name, spec)).await, "flotilla convoy explain");
+    let delete = |kind: &str, name: &str| CommandAction::ResourceDelete {
+        namespace: "flotilla".into(),
+        kind: kind.into(),
+        name: name.into(),
+        replica_origin: None,
+    };
+    refused(daemon.execute(delete("Checkout", &checkout.metadata.name)).await, "flotilla convoy explain");
+    let list = CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: "imagebuilds".into(), include_replicas: true };
+    refused(daemon.execute(list).await, "flotilla image check");
+    let get = CommandAction::QueryResourceGet { namespace: "flotilla".into(), kind: "ImageBuild".into(), name: "any".into() };
+    refused(daemon.execute(get).await, "flotilla image check");
+    refused(daemon.execute(document("ImageBuild", "any", serde_json::json!({}))).await, "flotilla image check");
+    refused(daemon.execute(delete("ImageBuild", "any")).await, "flotilla image check");
+    let report = daemon.old_store_report().expect("recorded");
+    let lifecycle = report.split("stage lifecycle:").nth(1).unwrap_or_default();
+    for kind in ["Checkout", "ImageBuild"] {
+        assert!(!lifecycle.contains(&format!("  {kind} ")), "{kind} reached the old store:\n{report}");
+    }
+}
+
+// No registered kind falls through to the old store by the generic resource verbs: each is served
+// by an engine port or refused there. A kind registered later without a port fails here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_registered_kind_is_served_by_the_engine_or_refused() {
+    use flotilla_protocol::CommandAction;
+    let daemon = TestDaemon::builder().old_store(OldStoreMode::Unavailable).start().await;
+    for registered in flotilla_store::REGISTERED_RESOURCE_KINDS {
+        let (kind, plural) = (registered.kind.to_owned(), registered.plural.to_owned());
+        let name = format!("no-fall-through-{plural}");
+        daemon.stage(&kind);
+        let actions = [
+            CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: plural.clone(), include_replicas: true },
+            CommandAction::QueryResourceGet { namespace: "flotilla".into(), kind: kind.clone(), name: name.clone() },
+            CommandAction::ResourceApply {
+                namespace: "flotilla".into(),
+                document: serde_json::json!({
+                    "apiVersion": "flotilla.work/v1", "kind": kind, "metadata": {"name": name, "namespace": "flotilla"}, "spec": {},
+                }),
+            },
+            CommandAction::ResourceStatusPatch {
+                expected_resource_version: None,
+                namespace: "flotilla".into(),
+                kind: kind.clone(),
+                name: name.clone(),
+                status: serde_json::json!({}),
+            },
+            CommandAction::ResourceDelete { namespace: "flotilla".into(), kind: kind.clone(), name: name.clone(), replica_origin: None },
+        ];
+        for action in actions {
+            // Served or refused, either is an answer; reaching the old store is not.
+            daemon.execute(action).await;
+            daemon.assert_old_store_untouched();
+        }
+    }
+}
+
 // The resource commands read a crew's messages from the engine. A message's state moves only
 // through its machine, so a delete is refused, naming the command that does change it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

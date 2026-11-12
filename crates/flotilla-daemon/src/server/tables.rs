@@ -440,10 +440,15 @@ pub(crate) struct Description {
     pub schema: Value,
     pub markdown: String,
 }
+/// The registered kinds read as tables: every one but `ImageBuild`, which the engine holds as
+/// demands and launches with no resource view, so its table could only refuse.
+fn resource_tables() -> impl Iterator<Item = &'static flotilla_store::RegisteredResourceKind> {
+    REGISTERED_RESOURCE_KINDS.iter().filter(|kind| kind.kind != "ImageBuild")
+}
+
 impl TableSource {
     pub(crate) async fn list(catalog: &Catalog) -> Result<Value, Failure> {
-        let mut kinds: Vec<_> =
-            REGISTERED_RESOURCE_KINDS.iter().map(|kind| json!({"kind":kind.kind,"root":kind.plural,"tables":[kind.plural]})).collect();
+        let mut kinds: Vec<_> = resource_tables().map(|kind| json!({"kind":kind.kind,"root":kind.plural,"tables":[kind.plural]})).collect();
         kinds.extend(catalog.derived.iter().map(|derived| {
             let names: Vec<_> = derived.set.tables.iter().map(|table| table.name.clone()).collect();
             json!({"kind":derived.set.kind,"root":names[0],"tables":names})
@@ -457,7 +462,7 @@ impl TableSource {
         Ok(json!({"kinds":kinds}))
     }
     pub(crate) fn open(name: String, catalog: &Catalog) -> Result<Self, Failure> {
-        if REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.plural == name) {
+        if resource_tables().any(|kind| kind.plural == name) {
             return Ok(Self::Resource { backend: catalog.backend.clone(), name });
         }
         if let Some(derived) = catalog.derived.iter().find(|derived| derived.table(&name).is_some()) {
