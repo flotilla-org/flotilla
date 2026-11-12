@@ -132,6 +132,8 @@ pub struct ImportReport {
     /// records written and of what was dropped, a row's or a field's, so this is the ledger that
     /// accounts for every row once.
     pub rows: BTreeMap<&'static str, RowCounts>,
+    /// The ledger's dropped rows, here and copies, by old kind and the reason they were dropped for.
+    pub row_drops: BTreeMap<(&'static str, &'static str), usize>,
 }
 
 /// One old kind's rows, by what became of them. A refused row is named in the refusals instead.
@@ -154,14 +156,14 @@ pub struct RowCounts {
     pub copies_dropped: usize,
 }
 
-/// What became of an old row.
+/// What became of an old row; a dropped row carries the reason it was dropped for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowOutcome {
     Imported,
-    Dropped,
+    Dropped(&'static str),
     OtherHome,
     CopyImported,
-    CopyDropped,
+    CopyDropped(&'static str),
 }
 
 impl ImportReport {
@@ -177,10 +179,16 @@ impl ImportReport {
         let rows = self.rows.entry(kind).or_default();
         match outcome {
             RowOutcome::Imported => rows.imported += count,
-            RowOutcome::Dropped => rows.dropped += count,
+            RowOutcome::Dropped(_) => rows.dropped += count,
             RowOutcome::OtherHome => rows.other_home += count,
             RowOutcome::CopyImported => rows.copies_imported += count,
-            RowOutcome::CopyDropped => rows.copies_dropped += count,
+            RowOutcome::CopyDropped(_) => rows.copies_dropped += count,
+        }
+        match outcome {
+            RowOutcome::Dropped(reason) | RowOutcome::CopyDropped(reason) if count > 0 => {
+                *self.row_drops.entry((kind, reason)).or_default() += count;
+            }
+            _ => {}
         }
     }
 
@@ -194,7 +202,7 @@ impl ImportReport {
     /// Counts `count` rows of `kind` dropped for `reason`, in the drops and in the ledger.
     pub fn drop_rows(&mut self, kind: &'static str, reason: &'static str, count: usize) {
         *self.dropped.entry((kind, reason)).or_default() += count;
-        self.rows(kind, RowOutcome::Dropped, count);
+        self.rows(kind, RowOutcome::Dropped(reason), count);
     }
 }
 

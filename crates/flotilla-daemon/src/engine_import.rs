@@ -264,6 +264,8 @@ pub struct Rows {
     /// Rows another home imports: its own records, and the copies held here of them.
     pub other_home: usize,
     pub unaccounted: i64,
+    /// The dropped rows by the reason they were dropped for, adding up to `dropped`.
+    pub drops: BTreeMap<String, usize>,
 }
 
 /// What an import did with the records homed at its store's home.
@@ -277,6 +279,8 @@ pub struct Summary {
     /// Imported, but on an assumption worth reading, or kept in the old store by design.
     pub notes: Vec<String>,
     ledger: BTreeMap<String, RowCounts>,
+    /// The ledger's dropped rows by old kind and reason.
+    drops: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
 impl Summary {
@@ -288,6 +292,9 @@ impl Summary {
             ledger.other_home += counts.other_home;
             ledger.copies_imported += counts.copies_imported;
             ledger.copies_dropped += counts.copies_dropped;
+        }
+        for ((kind, reason), count) in report.row_drops {
+            *self.drops.entry(kind.to_owned()).or_default().entry(reason.to_owned()).or_default() += count;
         }
         for ((kind, _), count) in report.imported {
             self.kinds.entry(kind.to_owned()).or_default().imported += count;
@@ -333,6 +340,7 @@ impl Summary {
                 dropped: ledger.dropped + ledger.copies_dropped,
                 other_home: ledger.other_home + elsewhere.saturating_sub(consumed),
                 unaccounted: 0,
+                drops: self.drops.get(&kind).cloned().unwrap_or_default(),
             };
             let carried = rows.imported + rows.dropped + rows.other_home;
             self.rows.insert(kind, Rows { unaccounted: rows.rows as i64 - carried as i64, ..rows });
@@ -349,9 +357,10 @@ fn plan_rows(source: &Source, target: &impl ImportTarget, summary: &mut Summary)
     for row in source.rows.iter().filter(|row| target.imports(&row.home)) {
         match plan::plan(&row.plural) {
             Some((_, Plan::Imported(_))) => {}
-            Some((kind, Plan::Retired(_))) => {
+            Some((kind, Plan::Retired(ruling))) => {
                 summary.kinds.entry(kind.to_owned()).or_default().dropped += 1;
                 summary.ledger.entry(kind.to_owned()).or_default().dropped += 1;
+                *summary.drops.entry(kind.to_owned()).or_default().entry(format!("retired: {ruling}")).or_default() += 1;
             }
             None => {
                 let unreadable =
