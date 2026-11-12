@@ -548,7 +548,6 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
                 &CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
                 Some("changes accepted".into()),
                 None,
-                None,
                 flotilla_protocol::PrincipalRef::implicit_for_namespace(NAMESPACE),
             )
             .await

@@ -4862,10 +4862,9 @@ impl InProcessDaemon {
         requested: &CrewCommandContext,
         message: Option<String>,
         disposition: Option<String>,
-        decision_ledger_ref: Option<String>,
         principal: PrincipalRef,
     ) -> Result<flotilla_protocol::CommandValue, String> {
-        self.crew.complete(requested, message, disposition, decision_ledger_ref, Some(principal)).await
+        self.crew.complete(requested, message, disposition, Some(principal)).await
     }
 
     pub async fn crew_fail_internal(

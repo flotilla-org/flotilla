@@ -9468,7 +9468,6 @@ async fn operator_forced_completion_settles_a_ledger_less_crew() {
                     },
                     message: Some("operator accepted the ledger-less claim".to_string()),
                     disposition: None,
-                    decision_ledger_ref: None,
                 })
                 .build(),
             Some(operator.clone()),

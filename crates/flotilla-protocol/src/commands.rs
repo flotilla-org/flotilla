@@ -1072,8 +1072,6 @@ pub enum CommandAction {
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disposition: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        decision_ledger_ref: Option<String>,
     },
     CrewFail {
         context: CrewCommandContext,
@@ -1892,7 +1890,6 @@ mod tests {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     message: Some("ready for review".into()),
                     disposition: Some("changes-pushed".into()),
-                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1#issuecomment-2".into()),
                 })
                 .build(),
             Command::builder()

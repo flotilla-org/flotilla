@@ -854,7 +854,6 @@ async fn a_failed_forced_completion_is_not_retried() {
             },
             message: Some("operator verdict".into()),
             disposition: None,
-            decision_ledger_ref: None,
         },
     };
     let mut run = Box::pin(super::run_command(&daemon, command.clone(), super::OutputFormat::Json));

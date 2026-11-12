@@ -1174,13 +1174,8 @@ impl CrewService {
         requested: &CrewCommandContext,
         message: Option<String>,
         disposition: Option<String>,
-        decision_ledger_ref: Option<String>,
         principal: Option<PrincipalRef>,
     ) -> Result<flotilla_protocol::CommandValue, String> {
-        if decision_ledger_ref.as_deref().is_some_and(|reference| !(reference.starts_with("https://") || reference.starts_with("http://")))
-        {
-            return Err("decision ledger reference must use an HTTP(S) URL".to_string());
-        }
         let routing = self.resolve_crew_routing_context(requested).await?;
         let namespace = routing.command_context.namespace.as_deref().expect("resolved crew routing context has a namespace");
         let convoy_name = routing.command_context.convoy.as_deref().expect("resolved crew routing context has a convoy");
@@ -1206,7 +1201,7 @@ impl CrewService {
         let scope =
             flotilla_resources::convoy::engine::VerdictScope { vessel: context.vessel.clone(), role: Some(context.caller_role.clone()) };
         let reason = message.unwrap_or_else(|| "operator forced completion".to_string());
-        tracing::info!(convoy = %convoy_name, vessel = %context.vessel, role = %context.caller_role, ?disposition, ?decision_ledger_ref,
+        tracing::info!(convoy = %convoy_name, vessel = %context.vessel, role = %context.caller_role, ?disposition,
             completed_while_crew_active, principal = %principal.name, "operator forced crew completion");
         engine.keep_by_verdict(&convoy, &scope, &principal.name, &reason).await?;
         Ok(CommandValue::Ok)

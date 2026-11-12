@@ -1982,7 +1982,6 @@ async fn crew_completion_to_an_unreachable_home_fails_and_queues_nothing() {
                 context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() },
                 message: Some("operator verdict".into()),
                 disposition: None,
-                decision_ledger_ref: None,
             })
             .build()
     };
@@ -2360,12 +2359,7 @@ async fn command_target_resolver_keeps_reads_local_and_routes_explicit_delivery(
 
     let unresolved = daemon
         .resolve_command_target(
-            &CommandAction::CrewComplete {
-                context: CrewCommandContext::default(),
-                message: None,
-                disposition: None,
-                decision_ledger_ref: None,
-            },
+            &CommandAction::CrewComplete { context: CrewCommandContext::default(), message: None, disposition: None },
             None,
         )
         .await

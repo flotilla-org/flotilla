@@ -331,12 +331,7 @@ mod tests {
             Request::ListRepos,
             Request::Execute {
                 command: flotilla_protocol::Command::builder()
-                    .action(CommandAction::CrewComplete {
-                        context: CrewCommandContext::default(),
-                        message: None,
-                        disposition: None,
-                        decision_ledger_ref: None,
-                    })
+                    .action(CommandAction::CrewComplete { context: CrewCommandContext::default(), message: None, disposition: None })
                     .build(),
             },
             Request::Execute {

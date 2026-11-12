@@ -142,14 +142,10 @@ impl CrewActions<'_> {
     ) -> Result<u64, String> {
         let caller = caller.clone();
         let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref } = &command.action {
+        if let CommandAction::CrewComplete { context, message, disposition } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let routing = Box::pin(self.crew.resolve_crew_routing_context(context)).await.ok();
-            let result = match self
-                .crew
-                .complete(context, message.clone(), disposition.clone(), decision_ledger_ref.clone(), dispatching_principal_ref.clone())
-                .await
-            {
+            let result = match self.crew.complete(context, message.clone(), disposition.clone(), dispatching_principal_ref.clone()).await {
                 Ok(value) => {
                     if let Some(resolved) = routing {
                         let namespace = resolved.command_context.namespace.as_deref().unwrap_or("flotilla");

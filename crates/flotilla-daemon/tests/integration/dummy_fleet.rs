@@ -204,8 +204,7 @@ async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
     assert_eq!(handed_off, CommandValue::Ok);
     // The artificial sender is HandedBack, a terminal phase excluded from
     // derived Done. Keep this legacy handoff fixture's explicit operator override.
-    let completed =
-        fleet.execute(CommandAction::CrewComplete { context, message: None, disposition: None, decision_ledger_ref: None }).await;
+    let completed = fleet.execute(CommandAction::CrewComplete { context, message: None, disposition: None }).await;
     assert_eq!(completed, CommandValue::Ok);
     let landed = fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
     assert_eq!(fleet.counts().turns_received, before.turns_received + 1, "the reopened governor receives the handoff turn");
