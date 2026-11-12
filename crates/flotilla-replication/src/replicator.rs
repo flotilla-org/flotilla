@@ -25,34 +25,6 @@ const REPLICATION_NAMESPACE: &str = "flotilla";
 const REPLICATION_RETRY: RetryBackoff =
     RetryBackoff { initial: Duration::from_millis(100), maximum: Duration::from_secs(30), reset_after: Duration::from_secs(60) };
 
-/// Observation replicas share the observed read view, separately from desired
-/// state. Its local generation is ephemeral; received replicas can be durable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplicationStore {
-    Durable,
-    Observed,
-}
-
-impl ReplicationStore {
-    fn backend(self, host: &ReplicationHost) -> ResourceBackend {
-        host.stores().backend(self).clone()
-    }
-
-    fn kind<T: Resource>(self) -> String {
-        match self {
-            Self::Durable => T::API_PATHS.plural.to_string(),
-            Self::Observed => format!("observed/{}", T::API_PATHS.plural),
-        }
-    }
-
-    fn health_kind<T: Resource>(self) -> String {
-        match self {
-            Self::Durable => T::API_PATHS.kind.to_string(),
-            Self::Observed => format!("observed/{}", T::API_PATHS.kind),
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 struct RetryBackoff {
     initial: Duration,
@@ -186,18 +158,8 @@ impl PeerReplicatorSupervisors {
             generation,
             &transport,
             &cancellation,
-            ReplicationStore::Durable,
             self.options.clone()
         );
-        spawn_kind::<flotilla_resources::TerminalSession>(
-            host,
-            &peer,
-            generation,
-            &transport,
-            &cancellation,
-            ReplicationStore::Observed,
-            self.options.clone(),
-        )
     }
 
     /// Cancel and drop a peer's resource replicators, but only if `generation`
@@ -268,7 +230,6 @@ fn spawn_kind<T: Resource>(
     generation: u64,
     transport: &ReplicationTransport,
     cancellation: &CancellationToken,
-    store: ReplicationStore,
     options: ReplicationOptions,
 ) {
     if !options.includes::<T>() {
@@ -278,7 +239,7 @@ fn spawn_kind<T: Resource>(
         return;
     }
     // An engine-served kind reaches this home by following the peer's log.
-    if host.stores().backend(store).engine_serves(T::API_PATHS.kind) {
+    if host.store().engine_serves(T::API_PATHS.kind) {
         return;
     }
     match transport.clone() {
@@ -292,7 +253,7 @@ fn spawn_kind<T: Resource>(
                 supervise_kind(
                     relay_peer,
                     generation,
-                    &store.health_kind::<T>(),
+                    T::API_PATHS.kind,
                     relay_cancellation,
                     REPLICATION_RETRY,
                     move || {
@@ -304,8 +265,8 @@ fn spawn_kind<T: Resource>(
                         let peer = run_peer.clone();
                         let connector = Arc::clone(&connector);
                         async move {
-                            let remote = connector.connect(&path, store)?;
-                            replicate_relay_direct::<T>(remote, &host, &peer, store).await
+                            let remote = connector.connect(&path)?;
+                            replicate_relay_direct::<T>(remote, &host, &peer).await
                         }
                     },
                 )
@@ -322,7 +283,7 @@ fn spawn_kind<T: Resource>(
                 supervise_kind(
                     relay_peer,
                     generation,
-                    &store.health_kind::<T>(),
+                    T::API_PATHS.kind,
                     relay_cancellation,
                     REPLICATION_RETRY,
                     || async { Ok(()) },
@@ -330,7 +291,7 @@ fn spawn_kind<T: Resource>(
                         let routed = Arc::clone(&routed);
                         let host = Arc::clone(&run_host);
                         let peer = run_peer.clone();
-                        async move { replicate_relay_over_routed_watch::<T>(&*routed, &host, &peer, store).await }
+                        async move { replicate_relay_over_routed_watch::<T>(&*routed, &host, &peer).await }
                     },
                 )
                 .await;
@@ -340,7 +301,7 @@ fn spawn_kind<T: Resource>(
     let host = Arc::clone(host);
     let peer = peer.clone();
     let transport = transport.clone();
-    let digest_control = options.digest_driver.map(|driver| driver.control(host.node_id(), &peer, &store.kind::<T>()));
+    let digest_control = options.digest_driver.map(|driver| driver.control(host.node_id(), &peer, T::API_PATHS.plural));
     let cancellation = cancellation.clone();
     tokio::spawn(async move {
         match transport {
@@ -350,7 +311,7 @@ fn spawn_kind<T: Resource>(
                 supervise_kind(
                     peer,
                     generation,
-                    &store.health_kind::<T>(),
+                    T::API_PATHS.kind,
                     cancellation,
                     REPLICATION_RETRY,
                     move || {
@@ -362,11 +323,11 @@ fn spawn_kind<T: Resource>(
                         let peer = run_peer.clone();
                         let connector = Arc::clone(&connector);
                         async move {
-                            let remote = connector.connect(&path, store)?;
-                            let result = replicate_kind_direct::<T>(remote, &host, &peer, store).await;
+                            let remote = connector.connect(&path)?;
+                            let result = replicate_kind_direct::<T>(remote, &host, &peer).await;
                             if let Err(error) = &result {
                                 host.metrics().stream_failures.increment();
-                                host.health().failure(&peer, &store.health_kind::<T>(), error).await;
+                                host.health().failure(&peer, T::API_PATHS.kind, error).await;
                             }
                             result
                         }
@@ -380,7 +341,7 @@ fn spawn_kind<T: Resource>(
                 supervise_kind(
                     peer,
                     generation,
-                    &store.health_kind::<T>(),
+                    T::API_PATHS.kind,
                     cancellation,
                     REPLICATION_RETRY,
                     || async { Ok(()) },
@@ -390,10 +351,10 @@ fn spawn_kind<T: Resource>(
                         let peer = run_peer.clone();
                         let digest_control = digest_control.clone();
                         async move {
-                            let result = replicate_kind_over_routed_watch::<T>(&*routed, &host, &peer, store, digest_control).await;
+                            let result = replicate_kind_over_routed_watch::<T>(&*routed, &host, &peer, digest_control).await;
                             if let Err(error) = &result {
                                 host.metrics().stream_failures.increment();
-                                host.health().failure(&peer, &store.health_kind::<T>(), error).await;
+                                host.health().failure(&peer, T::API_PATHS.kind, error).await;
                             }
                             result
                         }
@@ -409,12 +370,7 @@ fn spawn_kind<T: Resource>(
 ///
 /// Records whose origin root is this host or the peer itself are skipped: the
 /// direct log replicates the peer's own records. One attempt; no retry.
-pub async fn replicate_relay_direct<T: Resource>(
-    remote: ResourceBackend,
-    host: &ReplicationHost,
-    peer: &NodeId,
-    store: ReplicationStore,
-) -> Result<(), String> {
+pub async fn replicate_relay_direct<T: Resource>(remote: ResourceBackend, host: &ReplicationHost, peer: &NodeId) -> Result<(), String> {
     let mut watch = remote
         .watch_replica_sources_typed::<T>(REPLICATION_NAMESPACE)
         .await
@@ -444,8 +400,7 @@ pub async fn replicate_relay_direct<T: Resource>(
             batches.entry(origin_root).or_default().push((event, last_synced_at));
         }
         for (origin, batch) in batches {
-            store
-                .backend(host)
+            host.store()
                 .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
                 .apply_stamped_batch(&batch)
                 .await
@@ -524,21 +479,16 @@ impl OriginWatchFailure {
 /// Snapshots when no replica prefix is held, resumes the origin's log from the
 /// prefix, resnapshots once when the log cannot continue, and runs the
 /// periodic digest safety net. One attempt; no retry.
-pub async fn replicate_kind_direct<T: Resource>(
-    remote: ResourceBackend,
-    host: &ReplicationHost,
-    peer: &NodeId,
-    store: ReplicationStore,
-) -> Result<(), String> {
+pub async fn replicate_kind_direct<T: Resource>(remote: ResourceBackend, host: &ReplicationHost, peer: &NodeId) -> Result<(), String> {
     let remote = remote.using::<T>(REPLICATION_NAMESPACE);
-    let writer = store.backend(host).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    let writer = host.store().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut cursor = retry_store_read_for(ReadRetryConsumer::Replication, || writer.cursor()).await.map_err(|error| error.to_string())?;
     let mut repaired = false;
     loop {
         if cursor.is_none() {
             let listed = retry_store_read_for(ReadRetryConsumer::Replication, || remote.list()).await.map_err(|error| error.to_string())?;
             retry_store_read_for(ReadRetryConsumer::Replication, || async {
-                store.backend(host).including_replicas::<T>(REPLICATION_NAMESPACE).list().await
+                host.store().including_replicas::<T>(REPLICATION_NAMESPACE).list().await
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -555,7 +505,7 @@ pub async fn replicate_kind_direct<T: Resource>(
         };
         let result = match retry_store_read_for(ReadRetryConsumer::Replication, || remote.watch(start.clone())).await {
             Ok(watch) => {
-                host.health().healthy(peer, &store.health_kind::<T>()).await;
+                host.health().healthy(peer, T::API_PATHS.kind).await;
                 apply_direct_watch(watch, &writer, prefix.resource_version.clone(), &remote, peer, host.metrics()).await
             }
             Err(error) => Err(OriginWatchFailure::from_resource(error)),
@@ -714,15 +664,17 @@ where
     Ok(true)
 }
 
-async fn fetch_routed_digest<T: Resource>(
-    routed: &dyn RoutedPeer,
-    peer: &NodeId,
-    store: ReplicationStore,
-    query: DigestQuery,
-) -> Result<PartitionDigest, String> {
+async fn fetch_routed_digest<T: Resource>(routed: &dyn RoutedPeer, peer: &NodeId, query: DigestQuery) -> Result<PartitionDigest, String> {
     retry_store_read_for(ReadRetryConsumer::Replication, || async {
         routed
-            .digest(peer, RoutedDigestRequest { namespace: REPLICATION_NAMESPACE.into(), kind: store.kind::<T>(), query: query.clone() })
+            .digest(
+                peer,
+                RoutedDigestRequest {
+                    namespace: REPLICATION_NAMESPACE.into(),
+                    kind: T::API_PATHS.plural.to_string(),
+                    query: query.clone(),
+                },
+            )
             .await
             .map_err(ResourceError::other)
     })
@@ -756,19 +708,18 @@ async fn replicate_kind_over_routed_watch<T: Resource>(
     routed: &dyn RoutedPeer,
     host: &ReplicationHost,
     peer: &NodeId,
-    store: ReplicationStore,
     digest_control: Option<Arc<DigestControl>>,
 ) -> Result<(), String> {
     retry_store_read_for(ReadRetryConsumer::Replication, || async {
-        store.backend(host).including_replicas::<T>(REPLICATION_NAMESPACE).list().await
+        host.store().including_replicas::<T>(REPLICATION_NAMESPACE).list().await
     })
     .await
     .map_err(|error| error.to_string())?;
-    let writer = store.backend(host).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    let writer = host.store().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut cursor = retry_store_read_for(ReadRetryConsumer::Replication, || writer.cursor()).await.map_err(|error| error.to_string())?;
     let mut repaired = false;
     loop {
-        match run_routed_watch::<T>(routed, host, peer, store, cursor, digest_control.clone()).await {
+        match run_routed_watch::<T>(routed, host, peer, cursor, digest_control.clone()).await {
             Err(error)
                 if flotilla_resources::ResourceError::is_invalid_message(&error)
                     || error.contains("sequence gap")
@@ -792,7 +743,6 @@ async fn run_routed_watch<T: Resource>(
     routed: &dyn RoutedPeer,
     host: &ReplicationHost,
     peer: &NodeId,
-    store: ReplicationStore,
     prefix: Option<flotilla_resources::ReplicaCursor>,
     digest_control: Option<Arc<DigestControl>>,
 ) -> Result<(), String> {
@@ -801,7 +751,7 @@ async fn run_routed_watch<T: Resource>(
     }
     let request = RoutedWatchRequest {
         namespace: REPLICATION_NAMESPACE.to_string(),
-        kind: store.kind::<T>(),
+        kind: T::API_PATHS.plural.to_string(),
         replica_sources: false,
         cursor: prefix.clone(),
     };
@@ -810,8 +760,8 @@ async fn run_routed_watch<T: Resource>(
     })
     .await
     .map_err(|error| error.to_string())?;
-    host.health().healthy(peer, &store.health_kind::<T>()).await;
-    let writer = store.backend(host).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    host.health().healthy(peer, T::API_PATHS.kind).await;
+    let writer = host.store().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut initial = Vec::<ResourceObject<T>>::new();
     let mut initializing = prefix.is_none();
 
@@ -838,7 +788,7 @@ async fn run_routed_watch<T: Resource>(
             _ = digest_tick.tick(), if !initializing && digest_control.is_none() => { completion = None; None },
         };
         let Some(received) = received else {
-            let result = reconcile_digest::<T, _, _>(&writer, peer, |query| fetch_routed_digest::<T>(routed, peer, store, query)).await;
+            let result = reconcile_digest::<T, _, _>(&writer, peer, |query| fetch_routed_digest::<T>(routed, peer, query)).await;
             digest_failures.report::<T>(peer, &result);
             if matches!(result, Ok(true)) {
                 // Clear readiness before acknowledging repair so callers await
@@ -919,10 +869,13 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
     routed: &dyn RoutedPeer,
     host: &ReplicationHost,
     peer: &NodeId,
-    store: ReplicationStore,
 ) -> Result<(), String> {
-    let request =
-        RoutedWatchRequest { namespace: REPLICATION_NAMESPACE.to_string(), kind: store.kind::<T>(), replica_sources: true, cursor: None };
+    let request = RoutedWatchRequest {
+        namespace: REPLICATION_NAMESPACE.to_string(),
+        kind: T::API_PATHS.plural.to_string(),
+        replica_sources: true,
+        cursor: None,
+    };
     let mut events = retry_store_read_for(ReadRetryConsumer::Replication, || async {
         routed.watch(peer, request.clone()).await.map_err(ResourceError::other)
     })
@@ -932,7 +885,7 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
         match events.next().await {
             RoutedWatchItem::Response(response) => {
                 if response.resource_kind == T::API_PATHS.kind {
-                    apply_relay_response::<T>(host, peer, *response, store).await?;
+                    apply_relay_response::<T>(host, peer, *response).await?;
                 }
             }
             RoutedWatchItem::Finished(result) => {
@@ -952,12 +905,7 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
     }
 }
 
-async fn apply_relay_response<T: Resource>(
-    host: &ReplicationHost,
-    peer: &NodeId,
-    response: ResourceReadEnvelope,
-    store: ReplicationStore,
-) -> Result<(), String> {
+async fn apply_relay_response<T: Resource>(host: &ReplicationHost, peer: &NodeId, response: ResourceReadEnvelope) -> Result<(), String> {
     let mut batches = std::collections::BTreeMap::<NodeId, Vec<(WatchEvent<T>, chrono::DateTime<Utc>)>>::new();
     for record in response.records {
         let Some(event) = record_watch_event::<T>(record)? else {
@@ -1018,8 +966,7 @@ async fn apply_relay_response<T: Resource>(
         batches.entry(origin).or_default().push((event, synced_at));
     }
     for (origin, batch) in batches {
-        store
-            .backend(host)
+        host.store()
             .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
             .apply_stamped_batch(&batch)
             .await

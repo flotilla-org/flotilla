@@ -471,6 +471,8 @@ pub struct Committed<'a> {
     /// A home's state moved without entries to read (a snapshot cut, a replica reset), or a home
     /// is newly held here: every follower looks.
     pub rescan: bool,
+    /// How long the write ran, from its transaction's start through its commit.
+    pub took: std::time::Duration,
 }
 
 impl Committed<'_> {

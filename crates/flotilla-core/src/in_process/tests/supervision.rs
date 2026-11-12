@@ -7,10 +7,9 @@ use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, Selector,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL,
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, InputMeta, Selector, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use futures::{FutureExt, StreamExt};
@@ -191,42 +190,43 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     )
     .await;
     let convoys = home.clone().using::<ResourceConvoy>("flotilla");
-    let governor = convoys
-        .create(
-            &test_meta("governor-convoy"),
-            &ConvoySpec::builder().workflow_ref("governor".to_string()).role("governor".to_string()).build(),
-        )
-        .await
-        .expect("governor convoy");
     let existing_attention = flotilla_resources::ConvoyAttention {
         source: "existing-attention".to_string(),
         reason: "Existing concern".to_string(),
         raised_at: Utc::now(),
     };
-    convoys
-        .update_status(
-            &governor.metadata.name,
-            &governor.metadata.resource_version,
-            &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Active,
-                work: BTreeMap::from([(
-                    "govern".to_string(),
-                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-                )]),
-                crew_work: BTreeMap::from([(
-                    "govern".to_string(),
-                    BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                attention: Some(existing_attention.clone()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("running governor");
-    // The governor's session runs on the placement host, held for its work's launch there.
     test_engine(&daemon);
     let placement_engine = test_engine(&placement_daemon);
-    let vessel = placement_engine.vessels.request("governor-convoy", "govern", "placement");
+    // The governor convoy is admitted at home, its work `govern` crewed by the governor, and
+    // replicated to the placement host.
+    let governor = super::support::admit(
+        &daemon,
+        "governor-convoy",
+        ConvoySpec::builder().workflow_ref("governor".to_string()).role("governor".to_string()).build(),
+        ConvoyStatus {
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: None,
+                turn_delivery: Default::default(),
+                vessels: vec![flotilla_resources::VesselRequirement::builder()
+                    .name("govern".to_string())
+                    .crew(vec![flotilla_engine_convoys_testkit::agent("governor")])
+                    .build()],
+            }),
+            attention: Some(existing_attention.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    flotilla_provisioning_testkit::replicate_home(
+        &daemon.decided_store().expect("home store"),
+        daemon.node_id().as_str(),
+        &placement_daemon.decided_store().expect("placement store"),
+    );
+    // The governor's session runs on the placement host, held for its work's launch there.
+    let vessel = placement_engine.vessels.request(&governor, "govern", "placement");
     let governor_session = placement_engine.terminals.request(&TerminalLaunchRequest {
         session: "governor-terminal".to_string(),
         environment: "remote-env".to_string(),
@@ -250,7 +250,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     placement_engine.terminals.ready(&governor_session, "governor-sid", &Default::default());
     let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
-        .convoy("governor-convoy".to_string())
+        .convoy(governor.clone())
         .source("supervision-stalled-crew".to_string())
         .vessel("govern".to_string())
         .role("governor".to_string())
@@ -279,10 +279,10 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     daemon.deliver_standing_turn(&request).await.expect("remote governor intent accepted");
     let messages = placement.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver messages").items;
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].spec.receiver, "flotilla/governor-convoy/govern/governor");
+    assert_eq!(messages[0].spec.receiver, format!("flotilla/{governor}/govern/governor"));
     assert_eq!(messages[0].spec.relation, flotilla_resources::MessageRelation::Supervisor);
     assert_eq!(messages[0].spec.body, "Escalated from coder@work in graphql-budget@flotilla:\n\nSupervise the stalled crew");
     assert_eq!(messages[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Accepted);
     assert!(home.using::<flotilla_resources::Message>("flotilla").list().await.expect("sender messages").items.is_empty());
-    assert_eq!(convoys.get("governor-convoy").await.expect("governor").status.expect("status").attention, Some(existing_attention));
+    assert_eq!(convoys.get(&governor).await.expect("governor").status.expect("status").attention, Some(existing_attention));
 }

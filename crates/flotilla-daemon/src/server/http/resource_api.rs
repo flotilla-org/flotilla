@@ -94,17 +94,6 @@ pub(in crate::server) async fn respond(
         };
     }
 
-    let observed_path = path == "/observed" || path.starts_with("/observed/");
-    let additional_stores = if daemon.is_some() && !observed_path { vec!["/observed"] } else { Vec::new() };
-    let (path, backend) = if observed_path {
-        let path = path.strip_prefix("/observed").expect("observed store prefix");
-        let Some(daemon) = daemon else {
-            return Reply::error(404, "observed resource store unavailable");
-        };
-        (path, daemon.observed_resource_backend())
-    } else {
-        (path, backend)
-    };
     if path == "/apis/flotilla.work/v1" {
         let mut namespaces = match registered_resource_namespaces(&backend).await {
             Ok(namespaces) => namespaces,
@@ -112,7 +101,7 @@ pub(in crate::server) async fn respond(
         };
         // The engine holds manifest roots in the provisioning namespace; it is named when any is
         // held, so a candidate asks it for their bound charter inputs.
-        if let Some(daemon) = daemon.filter(|_| !observed_path) {
+        if let Some(daemon) = daemon {
             let namespace = daemon.provisioning_namespace().await;
             match daemon.manifest_roots().roots(&namespace).await {
                 Ok(roots) if !roots.is_empty() => {
@@ -127,7 +116,7 @@ pub(in crate::server) async fn respond(
         }
         return Reply::json(
             200,
-            serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>(), "namespaces": namespaces, "stores": additional_stores }),
+            serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>(), "namespaces": namespaces }),
         );
     }
     let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();

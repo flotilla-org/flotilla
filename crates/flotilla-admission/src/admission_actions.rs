@@ -611,6 +611,26 @@ impl AdmissionActions<'_> {
         }
         Err("ImageCheck action selected the wrong handler".to_string())
     }
+
+    pub async fn execute_action_image_build_retry(&self, id: u64, command: &Command) -> Result<u64, String> {
+        if let CommandAction::ImageBuildRetry { name } = &command.action {
+            let empty_identity = empty_repo_identity();
+            self.events.sink.emit(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.events.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let result = match self.port.image_build_retry(name).await {
+                Ok(launch) => CommandValue::ImageBuildRetried { launch },
+                Err(message) => CommandValue::Error { message },
+            };
+            self.events.finish(id, empty_identity, result);
+            return Ok(id);
+        }
+        Err("ImageBuildRetry action selected the wrong handler".to_string())
+    }
 }
 
 #[cfg(test)]

@@ -1065,6 +1065,8 @@ impl CrewService {
             return Err("cannot change promises after completion".into());
         }
         let promises = owned(status, &context.vessel, &context.caller_role);
+        // A submitted PR is a subject the convoy produces, linked as the claim's discovery.
+        let mut produced = None;
         let operation = match operation {
             Request::Promise { id, kind } => {
                 if id.trim().is_empty() {
@@ -1098,6 +1100,7 @@ impl CrewService {
                         return Err("PR reference must name one change request in the convoy's repositories".into());
                     };
                     metadata.insert("subject".into(), submission_subject_text(&subject_address(subject, &forges)?)?);
+                    produced = Some(subject.clone());
                 }
                 let submission = Submission { reference, metadata, submitted_at: self.clock.now(), verdict: None };
                 let reference = &submission.reference;
@@ -1164,7 +1167,13 @@ impl CrewService {
         // The engine decides (#3587 layer 6): its refusal is the answer.
         let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
             .ok_or_else(|| format!("convoy `{name}` is not held at this home"))?;
-        engine.promise(&convoy, &context.vessel, &context.caller_role, &operation, flotilla_resources::convoy::engine::Actor::Crew).await
+        engine.promise(&convoy, &context.vessel, &context.caller_role, &operation, flotilla_resources::convoy::engine::Actor::Crew).await?;
+        // An operator's unlink stands against a claim's rediscovery.
+        if let Some(subject) = produced.filter(|subject| !status.unlinked_subjects.contains(subject)) {
+            let principal = format!("crew:{}/{}", context.vessel, context.caller_role);
+            engine.link(&convoy, &subject, flotilla_resources::SubjectDiscoverySource::Claim, &principal).await?;
+        }
+        Ok(())
     }
 
     /// An operator's forced completion of the caller's part: a verdict keeping its open promises,
@@ -1604,7 +1613,7 @@ impl CrewService {
         if convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Abandoned) {
             return Ok(());
         }
-        let expected = flotilla_resources::expected_checkout_refs(convoy)?;
+        let expected = flotilla_resources::expected_checkout_refs(convoy, checkout_list.iter().map(CheckoutRecord::checkout_name));
         if expected.is_empty() {
             return Ok(());
         }
@@ -2057,8 +2066,9 @@ impl CrewService {
         let previous_status = convoy.status.clone().ok_or_else(|| format!("convoy `{}` has no status", context.convoy))?;
         let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
             .ok_or_else(|| format!("convoy `{}` is not held at this home", context.convoy))?;
-        // Handoff is the engine's `Reassign` of the sender's open promises (#3574 decision 3).
-        engine.reassign(&convoy, &context.vessel, &context.caller_role, target).await?;
+        // Handoff is the engine's `Reassign` of the sender's open promises (#3574 decision 3). An
+        // engine edge is not undone, so it is taken once the target's credentials are staged.
+        let reassign = || engine.reassign(&convoy, &context.vessel, &context.caller_role, target);
         // Admit the turn before reopening its recipient: the reopened crew's
         // derived Done waits on that turn's delivery (#3894).
         let admitted = self.publish_message_intent(&context.namespace, &message_name, &intent).await?;
@@ -2085,12 +2095,18 @@ impl CrewService {
                 return Err(format!("convoy `{}` became terminal during crew handoff", context.convoy));
             }
             if target_origin.is_some() {
+                if let Err(error) = reassign().await {
+                    return Err(self.restore_crew_work_after_delivery_failure(&context.convoy, &previous_status, error).await);
+                }
                 return match send().await {
                     Ok(_) => Ok(()),
                     Err(error) => Err(self.restore_crew_work_after_delivery_failure(&context.convoy, &previous_status, error).await),
                 };
             }
             self.reconcile_or_restore_crew_work(&context.namespace, &environment_ref, &context.convoy, previous_status.clone()).await?;
+            if let Err(error) = reassign().await {
+                return Err(self.restore_crew_work_after_delivery_failure(&context.convoy, &previous_status, error).await);
+            }
             let handoff_result: Result<(), String> = async {
                 match sessions.get(&terminal_name).await {
                     Ok(existing) if existing.spec.env_ref != environment_ref => {
@@ -2293,13 +2309,17 @@ impl CrewService {
             .iter()
             .flat_map(|(vessel, crew)| crew.iter().map(move |(role, state)| (vessel, role, state)))
             .filter(|(vessel, role, state)| {
-                matches!(
+                // A crew whose process exited reads Pending on the engine (Working is a live
+                // session): one named by vessel and role is resumable, and has its session.
+                let named = requested_vessel.is_some() && requested_role.is_some();
+                (matches!(
                     state.phase,
                     flotilla_resources::CrewWorkPhase::Working
                         | flotilla_resources::CrewWorkPhase::Interrupted
                         | flotilla_resources::CrewWorkPhase::Stalled
                         | flotilla_resources::CrewWorkPhase::Done
-                ) && requested_vessel.is_none_or(|requested| requested == vessel.as_str())
+                ) || (named && state.phase == flotilla_resources::CrewWorkPhase::Pending))
+                    && requested_vessel.is_none_or(|requested| requested == vessel.as_str())
                     && requested_role.is_none_or(|requested| requested == role.as_str())
             })
             .map(|(vessel, role, _)| (vessel.clone(), role.clone()))
@@ -3594,35 +3614,21 @@ impl CrewService {
         }
     }
 
-    pub async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        if force {
-            let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-            for attempt in 0..3 {
-                let convoy = convoys.get(name).await.map_err(|error| error.to_string())?;
-                let expected_checkout = flotilla_resources::expected_checkout_refs(&convoy).map_or(true, |refs| !refs.is_empty());
-                let observed_checkout = self
-                    .held_checkouts(&convoy)
-                    .await?
-                    .iter()
-                    .any(|checkout| !checkout.ended() && !matches!(checkout.spec, flotilla_resources::CheckoutSpec::Observed(_)));
-                let mut meta = InputMeta::from(&convoy.metadata);
-                if expected_checkout || observed_checkout {
-                    meta = meta.with_added_finalizer(flotilla_resources::CONVOY_TEARDOWN_FINALIZER);
-                }
-                meta.annotations.insert(flotilla_resources::FORCE_TEARDOWN_ANNOTATION.to_string(), "true".to_string());
-                if meta.annotations == convoy.metadata.annotations && meta.finalizers == convoy.metadata.finalizers {
-                    break;
-                }
-                match convoys.update(&meta, &convoy.metadata.resource_version, &convoy.spec).await {
-                    Ok(_) => break,
-                    Err(ResourceError::Conflict { .. }) if attempt < 2 => continue,
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-        }
+    /// A delete of convoy `name`. A convoy ends on the engine and is never deleted (#3108): once
+    /// its teardown gate passes (force skips it), a live convoy is abandoned by `principal`
+    /// ("operator" when the delete carries none) and an ended one has nothing left to end. Its
+    /// vessels, checkouts and sessions are released by their controllers once it has ended.
+    pub async fn reap(&self, namespace: &str, name: &str, force: bool, principal: Option<&PrincipalRef>) -> Result<(), String> {
         self.teardown(namespace, name, force).await?;
         self.cascade_convoy_children(namespace, name).await?;
-        self.resource_backend.clone().using::<ResourceConvoy>(namespace).delete(name).await.map_err(|error| error.to_string())
+        let convoy = self.resource_backend.clone().using::<ResourceConvoy>(namespace).get(name).await.map_err(|error| error.to_string())?;
+        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            return Ok(());
+        }
+        let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
+            .ok_or_else(|| format!("convoy `{name}` is not held at this home"))?;
+        let principal = principal.map_or("operator", |principal| principal.name.as_str());
+        engine.abandon(&convoy, principal, "deleted").await
     }
 }
 

@@ -74,13 +74,14 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         )
         .await
         .expect("convoy create command should start");
-    assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
+    let created = wait_for_command_result(&mut rx, create_id).await;
+    assert_eq!(created, created_launch(NAMESPACE, &convoy_record_name(&backend, "convoy-adopted").await));
 
     // The checkouts the engine holds here, and the ones this host observes.
     let checkout_count = || async {
         let reads = daemon.lifecycle_reads();
         let held = reads.checkouts().expect("checkouts").here().expect("held here").len();
-        let observed = daemon.observed_resource_backend().using::<ResourceCheckout>(NAMESPACE).list().await.expect("observed").items.len();
+        let observed = daemon.discovered_checkouts().all().len();
         (held, observed)
     };
     let checkout_count_before = checkout_count().await;
@@ -102,29 +103,18 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         .await
         .expect("duplicate convoy create command should start");
     // The live launch's generation is its home sequence (decision 147), whatever number that is.
-    let CommandValue::Error { message } = wait_for_command_result(&mut rx, duplicate_id).await else {
-        panic!("a duplicate is refused")
-    };
+    let CommandValue::Error { message } = wait_for_command_result(&mut rx, duplicate_id).await else { panic!("a duplicate is refused") };
     assert!(message.starts_with("live convoy convoy-adopted generation ") && message.ends_with(" already exists"), "{message}");
     assert_eq!(checkout_count().await, checkout_count_before, "a rejected duplicate must not persist an orphan adopted checkout");
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let adopted_record = convoy_record_name(&backend, "convoy-adopted").await;
-    wait_until(|| {
-        let convoys = convoys.clone();
-        let adopted_record = adopted_record.clone();
-        async move {
-            matches!(
-                convoys.get(&adopted_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
-                Some(status)
-                    if status.phase == ConvoyPhase::Active
-                        && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
-            )
-        }
+    wait_for_convoy(&convoys, &adopted_record, "running", |status| {
+        status.phase == ConvoyPhase::Active && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
     })
     .await;
 
-    record_successful_empty_branch_scan(&backend, &adopted_record).await;
+    record_successful_empty_branch_scan(&daemon, &adopted_record).await;
     let complete_id = daemon
         .execute(
             Command::builder()
@@ -139,17 +129,8 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         .expect("convoy completion command should start");
     assert_eq!(wait_for_command_result(&mut rx, complete_id).await, CommandValue::Ok);
 
-    wait_until(|| {
-        let convoys = convoys.clone();
-        let adopted_record = adopted_record.clone();
-        async move {
-            matches!(
-                convoys.get(&adopted_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
-                Some(status)
-                    if status.phase == ConvoyPhase::Landed
-                        && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
-            )
-        }
+    wait_for_convoy(&convoys, &adopted_record, "landed", |status| {
+        status.phase == ConvoyPhase::Landed && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
     })
     .await;
 

@@ -230,7 +230,14 @@ async fn try_launch_on_ssh_host(adapter: &str, grant_claude: bool) -> Result<Ssh
             artifacts: session.artifacts,
         }),
         Err(error) => {
-            let refused = SshHostLaunch { host, convoy: String::new(), env: Vec::new(), command: String::new(), deliveries: Vec::new(), artifacts: Vec::new() };
+            let refused = SshHostLaunch {
+                host,
+                convoy: String::new(),
+                env: Vec::new(),
+                command: String::new(),
+                deliveries: Vec::new(),
+                artifacts: Vec::new(),
+            };
             assert_host_harness_untouched(&refused);
             Err(error)
         }
@@ -572,7 +579,10 @@ async fn ssh_host_claude_crew_starts_in_a_prepared_flotilla_home() {
     // #3907: the vessel agent wrote the bound token into the requester's material directory
     // on the runtime base; the session environment carries no token of its own.
     assert_eq!(launch.value("CLAUDE_CODE_OAUTH_TOKEN"), None);
-    assert_eq!(launch.host.entry(format!("{}/.flotilla-oauth-token", bound_material(&launch.convoy))), Some(HostEntry::File("oauth-secret-material".into())));
+    assert_eq!(
+        launch.host.entry(format!("{}/.flotilla-oauth-token", bound_material(&launch.convoy))),
+        Some(HostEntry::File("oauth-secret-material".into()))
+    );
     assert!(!launch
         .host
         .files
@@ -1132,12 +1142,18 @@ async fn a_refreshed_token_is_pushed_into_the_bound_home_without_moving_the_bind
     let delivered = provision(&runtime.daemon).await.expect("provision recorded at launch");
     assert_eq!((delivered.place.as_str(), delivered.environment_kind.as_str()), (ENVIRONMENT, "ssh-host"));
     assert_eq!(delivered.home, bound_material(&runtime.convoy), "the provision records where the copy lies");
-    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), Some(HostEntry::File("generation-one".into())));
+    assert_eq!(
+        host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))),
+        Some(HostEntry::File("generation-one".into()))
+    );
 
     fs::write(&token, "generation-two\n").expect("refreshed token");
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
-    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), Some(HostEntry::File("generation-two".into())));
+    assert_eq!(
+        host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))),
+        Some(HostEntry::File("generation-two".into()))
+    );
     let pushed = provision(&runtime.daemon).await.expect("provision kept");
     let generation =
         |spec: &flotilla_resources::AccountProvisionSpec| spec.delivered.as_ref().map(|delivered| delivered.generation.clone());
@@ -1236,7 +1252,10 @@ async fn a_relaunch_moves_a_copy_recorded_in_the_old_home() {
     runtime.launch().await.expect("relaunch");
 
     assert_eq!(host.entry(format!("{old_home}/.flotilla-oauth-token")), None, "the old copy is deleted");
-    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(
+        host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))),
+        Some(HostEntry::File("box-a-token".into()))
+    );
     assert_eq!(provision(&runtime.daemon).await.expect("provision").home, bound_material(&runtime.convoy));
 }
 
@@ -1254,7 +1273,10 @@ async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
 
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
-    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(
+        host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))),
+        Some(HostEntry::File("box-a-token".into()))
+    );
     assert_eq!(provision(&runtime.daemon).await, Some(delivered));
     assert!(runtime.pool.killed.lock().await.is_empty(), "the session keeps running");
 }
@@ -1276,7 +1298,10 @@ async fn a_withdrawal_waits_for_a_delivery_in_progress() {
     let withdrawal = tokio::spawn(async move { reconcile_place_provisions(&state, NAMESPACE).await });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(!withdrawal.is_finished(), "the withdrawal waits for the delivery");
-    assert_eq!(host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))), Some(HostEntry::File("box-a-token".into())));
+    assert_eq!(
+        host.entry(format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy))),
+        Some(HostEntry::File("box-a-token".into()))
+    );
 
     drop(delivering);
     withdrawal.await.expect("join").expect("place pass");

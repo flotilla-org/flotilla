@@ -545,6 +545,7 @@ impl FleetTarget for InProcessFleet {
             .iter()
             .map(|home| HomeSample {
                 store: Some(home.store.load_metrics().snapshot()),
+                decided_store: Some(home.daemon.decided_store_metrics().snapshot()),
                 controllers: home.runtime.controller_metrics.snapshot(),
                 replication: home.replication.snapshot(),
                 replication_lag: home.view.replication_lag.snapshot(),
@@ -621,7 +622,8 @@ async fn load_driver_smoke() {
     }
     assert_eq!((report.window.failed, report.window.abandoned), (0, 0), "{:?}", report.window);
     let home = &report.home_metrics[0];
-    assert!(home.store.as_ref().is_some_and(|store| store.write_execution.count > 0), "the store records writes");
+    // Convoys, their launches and their crews' sessions are written to the decided store (#3108).
+    assert!(home.decided_store.as_ref().is_some_and(|store| store.write_execution.count > 0), "the store records writes");
     assert!(home.controllers.contains_key("Convoy"), "controller loops report: {:?}", home.controllers.keys().collect::<Vec<_>>());
     assert!(home.turn_delivery.count > 0, "turns are delivered and receipted");
 }

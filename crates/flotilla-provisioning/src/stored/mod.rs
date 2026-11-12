@@ -112,6 +112,7 @@ fn register_provisioning(registry: &mut KindRegistry) -> Result<(), RegistryErro
     registry.register::<Resource<environment::Environment>>()?;
     registry.register::<launch_facts::EnvironmentLaunchFacts>()?;
     registry.register::<Resource<image_build::ImageBuild>>()?;
+    registry.register::<image_build::ImageBuildDemand>()?;
     registry.register::<Resource<clone::Clone>>()?;
     registry.register::<clone::CloneFacts>()?;
     registry.register::<Resource<checkout::Checkout>>()?;

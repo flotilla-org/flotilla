@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
@@ -13,14 +13,13 @@ use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_protocol::EnvironmentId;
 use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::checkout_records::latest_launches;
+use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Repository, RepositoryKey, ResourceError,
-    ResourceObject, WatchEvent, WatchStart,
+    Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Repository, RepositoryKey, ResourceObject,
 };
 use flotilla_store::ResourceBackend;
-use futures::StreamExt;
-use tokio::sync::{watch, OnceCell};
+use tokio::sync::OnceCell;
 use tracing::warn;
 
 use super::{discover_vcs_for_checkout, InProcessDaemon};
@@ -47,12 +46,13 @@ pub(super) struct CheckoutLifetimeKey {
 pub(super) type CheckoutVcsCache = HashMap<CheckoutLifetimeKey, Arc<OnceCell<Arc<CheckoutProvider>>>>;
 
 /// Shares VCS lookup state between the daemon and CrewService.
-/// InProcessDaemon drives retirement through the observed-checkout watch;
+/// InProcessDaemon drives retirement as the discovered checkouts change;
 /// CrewService uses lookup leases for archive pushes.
 #[derive(bon::Builder)]
 pub(super) struct CheckoutProviders {
     resource_backend: ResourceBackend,
-    observed_resource_backend: ResourceBackend,
+    /// The checkouts this host's refresh discovered.
+    discovered_checkouts: DiscoveredCheckouts,
     config: Arc<ConfigStore>,
     discovery: Arc<super::DiscoveryRuntime>,
     environment_manager: Arc<flotilla_discovery::environment_manager::EnvironmentManager>,
@@ -166,10 +166,9 @@ impl CheckoutProviders {
         // release and a new launch. The engine's checkouts here take precedence.
         let checkout = match self.lifecycle_reads.checkouts()?.get(&key.name, None)? {
             Some(record) => record.read_view(),
-            None => match self.observed_resource_backend.clone().using::<ResourceCheckout>(namespace).get(&key.name).await {
-                Ok(checkout) => checkout,
-                Err(ResourceError::NotFound { .. }) => return Ok(None),
-                Err(error) => return Err(error.to_string()),
+            None => match self.discovered_checkouts.view(namespace, &key.name) {
+                Some(checkout) => checkout,
+                None => return Ok(None),
             },
         };
         Ok((self.checkout_lifetime_key(namespace, &checkout).as_ref() == Some(&key)).then_some(provider))
@@ -200,17 +199,12 @@ impl CheckoutProviders {
         namespace: &str,
     ) -> Result<Vec<(ResourceObject<ResourceCheckout>, CheckoutLifetimeKey)>, String> {
         let mut checkouts = self
-            .observed_resource_backend
-            .clone()
-            .using::<ResourceCheckout>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .items
+            .discovered_checkouts
+            .views(namespace)
             .into_iter()
             .map(|checkout| (checkout.metadata.name.clone(), checkout))
             .collect::<BTreeMap<_, _>>();
-        // The engine's checkouts here override ephemeral observations by name (#3108).
+        // The engine's checkouts here override the discovered ones by name (#3108).
         for (name, record) in latest_launches(self.lifecycle_reads.checkouts()?.here()?) {
             checkouts.insert(name, record.read_view());
         }
@@ -288,10 +282,6 @@ impl InProcessDaemon {
         self.checkout_providers.checkout_provider(env_id, path).await
     }
 
-    fn checkout_lifetime_key(&self, namespace: &str, checkout: &ResourceObject<ResourceCheckout>) -> Option<CheckoutLifetimeKey> {
-        self.checkout_providers.checkout_lifetime_key(namespace, checkout)
-    }
-
     pub(super) async fn retire_checkout_providers(&self) -> Result<(), String> {
         self.checkout_providers.retire_checkout_providers().await
     }
@@ -312,12 +302,27 @@ impl InProcessDaemon {
         Ok(Arc::new(registry))
     }
 
+    /// Retires cached checkout providers as the discovered checkouts or the namespace change.
     pub(super) fn spawn_checkout_provider_retirement(self: &Arc<Self>) {
-        tokio::spawn(Self::watch_checkout_provider_lifetimes(
-            Arc::downgrade(self),
-            self.observed_resource_backend.clone(),
-            self.checkout_namespace_changes.subscribe(),
-        ));
+        let weak = Arc::downgrade(self);
+        let mut discovered = self.discovered_checkouts.changes();
+        let mut namespace_changes = self.checkout_namespace_changes.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    change = discovered.recv() => {
+                        if let Err(tokio::sync::broadcast::error::RecvError::Closed) = change { return; }
+                    }
+                    changed = namespace_changes.changed() => {
+                        if changed.is_err() { return; }
+                    }
+                }
+                let Some(daemon) = weak.upgrade() else { return };
+                if let Err(error) = daemon.retire_checkout_providers().await {
+                    warn!(%error, "retire checkout providers failed");
+                }
+            }
+        });
     }
 
     /// Retires cached checkout providers as the engine's checkouts change (#3108): a released,
@@ -339,83 +344,6 @@ impl InProcessDaemon {
             }
         });
         Ok(())
-    }
-
-    async fn watch_checkout_provider_lifetimes(weak: Weak<Self>, backend: ResourceBackend, mut namespace_changes: watch::Receiver<()>) {
-        let mut restarts = super::resubscribe::Resubscribe::default();
-        while let Some(daemon) = weak.upgrade() {
-            // Mark the current notification before listing; changes during setup
-            // stay pending and immediately restart the subscription below.
-            namespace_changes.borrow_and_update();
-            let namespace = daemon.provisioning_namespace().await;
-            let checkouts = backend.clone().using::<ResourceCheckout>(&namespace);
-            let setup = async {
-                let listed = checkouts.list().await?;
-                let watch = checkouts.watch(WatchStart::resuming_from(&listed)).await?;
-                Ok::<_, ResourceError>((listed, watch))
-            }
-            .await;
-            let (listed, mut watch) = match setup {
-                Ok(setup) => setup,
-                Err(error) => {
-                    warn!(%error, "subscribe to checkout provider lifetimes failed");
-                    drop(daemon);
-                    if !restarts.after_failure(&mut namespace_changes, "checkout provider lifetimes").await {
-                        return;
-                    }
-                    continue;
-                }
-            };
-            let mut known: HashMap<_, _> = listed
-                .items
-                .iter()
-                .map(|checkout| (checkout.metadata.name.clone(), daemon.checkout_lifetime_key(&namespace, checkout)))
-                .collect();
-            if let Err(error) = daemon.retire_checkout_providers().await {
-                warn!(%error, "retire checkout providers failed");
-            }
-            drop(daemon);
-            let failed = loop {
-                let event = tokio::select! {
-                    event = watch.next() => match event {
-                        Some(Ok(event)) => { restarts.delivered(); event },
-                        Some(Err(error)) => { warn!(%error, "checkout provider lifetime watch failed"); break true; },
-                        None => break true,
-                    },
-                    changed = namespace_changes.changed() => {
-                        if changed.is_err() { return; }
-                        break false;
-                    }
-                };
-                let Some(daemon) = weak.upgrade() else {
-                    return;
-                };
-                let changed = match event {
-                    WatchEvent::Added(checkout) | WatchEvent::Modified(checkout) => {
-                        let key = daemon.checkout_lifetime_key(&namespace, &checkout);
-                        known.insert(checkout.metadata.name, key.clone()) != Some(key)
-                    }
-                    WatchEvent::Deleted(checkout) => {
-                        known.remove(&checkout.metadata.name);
-                        true
-                    }
-                    WatchEvent::DeletedByName(tombstone) => {
-                        known.remove(&tombstone.name);
-                        true
-                    }
-                };
-                // Status-only changes that leave the eligible instance unchanged
-                // cannot alter any cached capability and need no full inventory.
-                if changed {
-                    if let Err(error) = daemon.retire_checkout_providers().await {
-                        warn!(%error, "retire checkout providers failed");
-                    }
-                }
-            };
-            if failed && !restarts.after_failure(&mut namespace_changes, "checkout provider lifetimes").await {
-                return;
-            }
-        }
     }
 }
 

@@ -14,7 +14,7 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{create_docker_placement, create_identity_convoy, host_direct_kind, put_host, read_host, test_meta};
+use super::support::{create_docker_placement, create_identity_record, host_direct_kind, put_host, read_host, test_meta};
 use crate::in_process::{placement_target_host, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_admission::convoy_admission::refuse_live_convoy_in;
@@ -34,8 +34,8 @@ fn convoy_role_addresses_reject_malformed_values() {
 #[tokio::test]
 async fn convoy_role_resolution_can_disambiguate_a_projectless_convoy() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_identity_convoy(&backend, "convoy-one", "reviewer", None).await;
-    create_identity_convoy(&backend, "convoy-two", "reviewer", Some("beta")).await;
+    create_identity_record(&backend, "convoy-one", "reviewer", None).await;
+    create_identity_record(&backend, "convoy-two", "reviewer", Some("beta")).await;
 
     assert_eq!(
         resolve_local_convoy_name(&backend, "flotilla", "reviewer").await,
@@ -48,7 +48,7 @@ async fn convoy_role_resolution_can_disambiguate_a_projectless_convoy() {
 #[tokio::test]
 async fn convoy_resolution_falls_back_to_a_unique_terminal_generation() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_identity_convoy(&backend, "convoy-one", "reviewer", Some("flotilla")).await;
+    create_identity_record(&backend, "convoy-one", "reviewer", Some("flotilla")).await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys.get("convoy-one").await.expect("terminal convoy");
     convoys
@@ -66,8 +66,8 @@ async fn convoy_resolution_falls_back_to_a_unique_terminal_generation() {
 #[tokio::test]
 async fn convoy_resolution_refuses_multiple_terminal_generations() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_identity_convoy(&backend, "convoy-one", "reviewer", Some("flotilla")).await;
-    create_identity_convoy(&backend, "convoy-two", "reviewer", Some("flotilla")).await;
+    create_identity_record(&backend, "convoy-one", "reviewer", Some("flotilla")).await;
+    create_identity_record(&backend, "convoy-two", "reviewer", Some("flotilla")).await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     for name in ["convoy-one", "convoy-two"] {
         let created = convoys.get(name).await.expect("terminal convoy");

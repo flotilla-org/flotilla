@@ -146,6 +146,10 @@ fn crew_phases(facts: &ConvoyFacts<'_>) -> BTreeMap<String, BTreeMap<String, Cre
                         CrewWorkPhase::Done
                     } else if reading.handed_back {
                         CrewWorkPhase::HandedBack
+                    } else if facts.ended.is_some() {
+                        // The launch ended under a seat that had not finished: the seat did not
+                        // fail, it reads the end.
+                        CrewWorkPhase::Ended
                     } else if reading.stalled {
                         CrewWorkPhase::Stalled
                     } else if interrupted {

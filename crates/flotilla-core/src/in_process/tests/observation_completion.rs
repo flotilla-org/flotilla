@@ -1,5 +1,4 @@
 use flotilla_store_memory::InMemoryBackend;
-use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,11 +12,8 @@ use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::{CrewCommandContext, HostName};
 use flotilla_resources::{
-    BoundChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
-    CrewWorkState, InputMeta, Repository, RepositorySpec, Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselRequirement,
-    VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    BoundChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, CrewWorkPhase, Repository,
+    RepositorySpec, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, VesselRequirement,
 };
 use flotilla_store::ResourceBackend;
 
@@ -363,24 +359,6 @@ async fn pr_submission_observation_case(rate_limited: bool, missing_artifact: bo
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
     let repository_key = repository.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository).await.expect("repository");
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let convoy = convoys
-        .create(
-            &test_meta("refused-claim"),
-            &ConvoySpec::builder()
-                .workflow_ref("implement-review".to_string())
-                .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
-                    .url("https://github.com/flotilla-org/flotilla".to_string())
-                    .repo_ref(repository_key)
-                    .source_ref("2205/escalate".to_string())
-                    .target_ref("main".to_string())
-                    .workspace_slug("flotilla".to_string())
-                    .subpaths(Vec::new())
-                    .build()])
-                .build(),
-        )
-        .await
-        .expect("convoy");
     let ready = flotilla_resources::CrewCompletionExpectation::Condition(flotilla_resources::CompletionCondition::ChangeRequest {
         field_path: ".ready".to_string(),
         operator: flotilla_protocol::LeafOperator::Equal,
@@ -400,125 +378,86 @@ async fn pr_submission_observation_case(rate_limited: bool, missing_artifact: bo
         .source(CrewSource::Tool { command: "test".to_string() })
         .completion_conditions(conditions)
         .build();
-    let bosun = CrewSpec::builder().role("bosun".to_string()).source(CrewSource::Tool { command: "test".to_string() }).build();
-    convoys
-        .update_status(
-            "refused-claim",
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: indexmap::IndexMap::from([(
-                        "work/coder".to_string(),
-                        flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(0) },
-                    )]),
-                    supervision: Some(vec![flotilla_resources::SupervisionTarget::ConvoyCrew {
-                        vessel: "work".to_string(),
-                        role: "bosun".to_string(),
-                    }]),
-                    exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
-                    turn_delivery: indexmap::IndexMap::from([(
-                        "conflicting".to_string(),
-                        flotilla_resources::TurnDeliveryRule::builder()
-                            .on(flotilla_resources::parse_leaf_template("$cr.mergeable == conflicting").expect("conflict leaf"))
-                            .to(flotilla_resources::TurnDeliveryTarget::builder()
-                                .vessel("work".to_string())
-                                .role("coder".to_string())
-                                .build())
-                            .brief("Rebase onto the current base branch and continue shepherding the PR.".to_string())
-                            .hold(flotilla_resources::HoldAct::State)
-                            .build(),
-                    )]),
-                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![coder, bosun]).build()],
-                }),
-                work: BTreeMap::from([(
-                    "work".to_string(),
-                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-                )]),
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([
-                        ("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
-                        ("bosun".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
-                    ]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("active status");
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &test_meta("refused-claim-vessel"),
-            &VesselSpec {
-                convoy_ref: "refused-claim".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
-    let session = backend
-        .clone()
-        .using::<ResourceTerminalSession>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("refused-claim-session".to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "refused-claim".to_string()),
-                    (VESSEL_LABEL.to_string(), "work".to_string()),
-                    (ROLE_LABEL.to_string(), "coder".to_string()),
-                ]))
+    // The bosun owes a decision ledger, so the convoy owes something to be admitted.
+    let bosun = CrewSpec::builder()
+        .role("bosun".to_string())
+        .source(CrewSource::Tool { command: "test".to_string() })
+        .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("bosun")])
+        .build();
+    let snapshot = flotilla_resources::WorkflowSnapshot {
+        cascade: None,
+        stall_nudges: indexmap::IndexMap::from([(
+            "work/coder".to_string(),
+            flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(0) },
+        )]),
+        supervision: Some(vec![flotilla_resources::SupervisionTarget::ConvoyCrew {
+            vessel: "work".to_string(),
+            role: "bosun".to_string(),
+        }]),
+        exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
+        turn_delivery: indexmap::IndexMap::from([(
+            "conflicting".to_string(),
+            flotilla_resources::TurnDeliveryRule::builder()
+                .on(flotilla_resources::parse_leaf_template("$cr.mergeable == conflicting").expect("conflict leaf"))
+                .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".to_string()).role("coder".to_string()).build())
+                .brief("Rebase onto the current base branch and continue shepherding the PR.".to_string())
+                .hold(flotilla_resources::HoldAct::State)
                 .build(),
-            &ResourceTerminalSessionSpec {
-                env_ref: "env".to_string(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector { capability: "code".to_string(), adapter: None, model: None },
-                    brief: flotilla_resources::TerminalBrief {
-                        artifact_digest: None,
-                        path: "brief.md".to_string(),
-                        content: "work".to_string(),
-                        copies: vec![],
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".to_string(),
-                        convoy: "refused-claim".to_string(),
-                        vessel_ref: "refused-claim-vessel".to_string(),
-                    }),
-                },
-                cwd: "/repo".to_string(),
-                env: Default::default(),
-                pool: "passthrough".to_string(),
+        )]),
+        vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![coder, bosun]).build()],
+    };
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let refused = super::support::admit_snapshot(
+        &daemon,
+        "refused-claim",
+        ConvoySpec::builder()
+            .workflow_ref("implement-review".to_string())
+            .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
+                .url("https://github.com/flotilla-org/flotilla".to_string())
+                .repo_ref(repository_key)
+                .source_ref("2205/escalate".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("flotilla".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .build(),
+        snapshot,
+    )
+    .await;
+    // The coder's session runs in the convoy's work vessel, idle as its hook last reported.
+    let engine = super::support::test_engine(&daemon);
+    let vessel = super::support::ensure_vessel(&engine, &refused, "work");
+    let session = engine.terminals.request(&flotilla_resources::terminal_records::TerminalLaunchRequest {
+        session: "refused-claim-session".to_string(),
+        environment: "env".to_string(),
+        vessel: Some(vessel.clone()),
+        role: "coder".to_string(),
+        pool: "passthrough".to_string(),
+        cwd: "/repo".to_string(),
+        env: Default::default(),
+        source: flotilla_resources::terminal_records::TerminalLaunchSource::Agent {
+            capability: "code".to_string(),
+            adapter: None,
+            model: None,
+            brief: flotilla_resources::TerminalBrief {
+                artifact_digest: None,
+                path: "brief.md".to_string(),
+                content: "work".to_string(),
+                copies: vec![],
             },
-        )
-        .await
-        .expect("session");
-    backend
-        .using::<ResourceTerminalSession>("flotilla")
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &ResourceTerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                attention: Some(TerminalAttention {
-                    state: TerminalAttentionState::Idle,
-                    as_of: Utc::now(),
-                    source: TerminalAttentionSource::Hook,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("idle session");
+        },
+    });
+    engine.terminals.ready(&session, "refused-claim-pool-session", &Default::default());
+    super::support::observe_attention(
+        &engine,
+        &session,
+        TerminalAttention { state: TerminalAttentionState::Idle, as_of: Utc::now(), source: TerminalAttentionSource::Hook },
+    );
     let context = CrewCommandContext {
         crew_id: None,
         namespace: Some("flotilla".to_string()),
-        convoy: Some("refused-claim".to_string()),
-        vessel_ref: Some("refused-claim-vessel".to_string()),
+        convoy: Some(refused.clone()),
+        vessel_ref: Some(vessel),
         role: Some("coder".to_string()),
     };
     let submit = || {
@@ -541,7 +480,7 @@ async fn pr_submission_observation_case(rate_limited: bool, missing_artifact: bo
         submit().await.expect("submission succeeds");
     }
     assert_eq!(runner.calls.lock().unwrap().len(), calls, "a submission does not poll the forge");
-    let status = convoys.get("refused-claim").await.unwrap().status.unwrap();
+    let status = convoys.get(&refused).await.unwrap().status.unwrap();
     assert!(status.subjects.iter().any(|entry| entry.subject.id == "2200"));
     assert!(status.crew_work["work"]["coder"].completion_refusal.is_none());
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
@@ -560,7 +499,7 @@ async fn pr_submission_observation_case(rate_limited: bool, missing_artifact: bo
         )
         .await
         .expect("propose retraction");
-    let after = convoys.get("refused-claim").await.unwrap().status.unwrap();
+    let after = convoys.get(&refused).await.unwrap().status.unwrap();
     assert_eq!(flotilla_resources::promises::owned(&after, "work", "coder").iter().find(|p| p.id == promise.id), Some(promise));
     assert!(after.stalled.as_ref().unwrap().evidence.contains("retraction-proposed"));
 }

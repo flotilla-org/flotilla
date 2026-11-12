@@ -681,7 +681,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::server::tests::launch_of;
-    use crate::testkits::engine::engine as install_engine;
+    use crate::testkits::engine::{current_launch, engine as install_engine};
 
     use axum::{
         body::{to_bytes, Body},
@@ -958,7 +958,7 @@ mod tests {
     async fn async_crew_completion_is_scoped() {
         for cbor in [false, true] {
             let (temp, daemon) = supervisor_daemon().await;
-            let target = crate::testkits::engine::current_launch(&daemon, "target");
+            let target = current_launch(&daemon, "target");
             let h = Harness::from_daemon(temp, daemon);
             let caller =
                 CallerAuth::Environment { environment: flotilla_protocol::EnvironmentId::new("supervisor-environment"), peer: None };

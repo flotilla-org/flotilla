@@ -348,9 +348,22 @@ impl ConvoyRecord {
                     .iter()
                     .map(|(role, phase)| {
                         let noted = notes.crew.get(work).and_then(|roles| roles.get(role)).cloned().unwrap_or_default();
-                        let failed = self.seats.get(work).and_then(|seats| seats.get(role)).and_then(|seat| seat.failed.clone());
                         // A Done seat's claim is its settled promises; nothing of it is stored.
                         let (claimed_at, decision_ledger_ref) = self.claim(work, role).filter(|_| *phase == CrewWorkPhase::Done).unzip();
+                        // A failed seat says why it failed; a seat the end overtook says how the launch
+                        // ended; a stalled seat gives the report its crew made.
+                        let message = match phase {
+                            CrewWorkPhase::Ended => self.ended.as_ref().map(|(end, _)| match end {
+                                ConvoyEnd::Delivered { disposition } => disposition.clone(),
+                                ConvoyEnd::Failed { reason } | ConvoyEnd::Abandoned { reason } => reason.clone(),
+                            }),
+                            _ => self
+                                .seats
+                                .get(work)
+                                .and_then(|seats| seats.get(role))
+                                .and_then(|seat| seat.failed.clone())
+                                .or(noted.stall_report.filter(|_| *phase == CrewWorkPhase::Stalled)),
+                        };
                         let state = CrewWorkState::builder()
                             .task_assigned(noted.task_assigned)
                             .maybe_pending_follow_up(noted.pending_follow_up)
@@ -364,7 +377,7 @@ impl ConvoyRecord {
                             .maybe_resume_brief_id(noted.resume_brief_id)
                             .maybe_finished_at(claimed_at)
                             .maybe_decision_ledger_ref(decision_ledger_ref.flatten())
-                            .maybe_message(failed.or(noted.stall_report.filter(|_| *phase == CrewWorkPhase::Stalled)))
+                            .maybe_message(message)
                             .build();
                         (role.clone(), state)
                     })

@@ -287,3 +287,38 @@ fn a_seat_claims_when_its_last_promise_is_kept() {
     assert_eq!(coder.decision_ledger_ref.as_deref(), Some("decision-ledger-fix-it-7"));
     assert_eq!(status.phase, ConvoyPhase::Landing);
 }
+
+// Behaviour (#3108): a seat the launch's end overtook reads the end, with its disposition or
+// reason, never Working or Failed; a seat that finished before the end keeps its own reading.
+#[test]
+fn a_seat_the_end_overtook_reads_the_end() {
+    let none = BTreeSet::new();
+    // Delivered: the reviewer owed no promise and was never given its task.
+    let mut delivered = record(PromiseState::Kept);
+    delivered.ended = Some((ConvoyEnd::Delivered { disposition: "merged".into() }, at(300)));
+    let status = delivered.read_view("flotilla", ConvoyJoins { works: &ready(), working: &none, notes: None }).status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
+    assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Ended);
+    assert_eq!(status.crew_work["work"]["reviewer"].message.as_deref(), Some("merged"));
+
+    // Abandoned while the coder was working: it did not fail.
+    let mut abandoned = record(PromiseState::Open);
+    abandoned.ended = Some((ConvoyEnd::Abandoned { reason: "operator stopped it".into() }, at(300)));
+    let working = BTreeSet::from([seat("work", "coder")]);
+    let status = abandoned.read_view("flotilla", ConvoyJoins { works: &ready(), working: &working, notes: None }).status.expect("status");
+    assert_eq!(status.phase, ConvoyPhase::Abandoned);
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Ended);
+    assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("operator stopped it"));
+
+    // A seat that failed before the end stays Failed, with its own reason.
+    let mut failed = record(PromiseState::Open);
+    failed.seats = BTreeMap::from([(
+        "work".into(),
+        BTreeMap::from([("coder".into(), SeatRecord { failed: Some("it looped".into()), ..SeatRecord::default() })]),
+    )]);
+    failed.ended = Some((ConvoyEnd::Failed { reason: "coder failed".into() }, at(200)));
+    let status = failed.read_view("flotilla", ConvoyJoins { works: &ready(), working: &none, notes: None }).status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Failed);
+    assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("it looped"));
+    assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Ended);
+}

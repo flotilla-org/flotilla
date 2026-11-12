@@ -1158,8 +1158,8 @@ impl ReconcilerWake {
             if let Some(declared) = declared_stall(status, vessel, role) {
                 // The crew's own stall note, whichever rung it has reached: its report, not the
                 // diagnostics the judge added to the note's evidence.
-                let report = status.crew_work[vessel][role].message.clone().unwrap_or_else(|| declared.evidence.clone());
-                Err((report, StallEvidenceSource::Crew))
+                let report = status.crew_work.get(vessel).and_then(|crew| crew.get(role)).and_then(|work| work.message.clone());
+                Err((report.unwrap_or_else(|| declared.evidence.clone()), StallEvidenceSource::Crew))
             } else if status.phase == ConvoyPhase::Landing
                 && status.work.get(vessel).is_some_and(|work| work.phase == WorkPhase::Complete)
                 && session.is_none_or(|session| {
@@ -1515,11 +1515,13 @@ impl ReconcilerWake {
                 .and_then(|session| self.agent_view(session))
                 .filter(|agent| matches!(agent.live_activity(), Some(AgentActivity::Idle | AgentActivity::Interrupted)))
                 .and_then(|agent| agent.reading.activity_since);
+            // A crew that declared a stall has answered its resumed turn: a seat reads Working on
+            // the engine until its supervision opens a stall record, so the declaration says so.
             let resume_grace = status
                 .crew_work
                 .get(vessel)
                 .and_then(|crew| crew.get(role))
-                .filter(|work| work.phase == CrewWorkPhase::Working)
+                .filter(|work| work.phase == CrewWorkPhase::Working && declared.is_none())
                 .and_then(|work| work.resumed_at.zip(work.resume_brief_id.as_deref()))
                 .is_some_and(|(resumed_at, brief_id)| {
                     // A missing or recreated session must not suppress

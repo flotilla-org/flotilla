@@ -2,20 +2,17 @@
 //! ConvoyEnsure. A placed Vessel is its work's first launch, a lease granted on its pinned host;
 //! one never placed is noted, not stored. An Ensure is bound while the convoy it records is live.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_core::primitives::ensures::import_ensures;
 use flotilla_engine_store::{Import, ImportTarget};
-use flotilla_provisioning::engine::{
-    image_build::ImageBuildBinding,
-    import::{
-        import_checkouts, import_clones, import_environments, import_records, import_terminal_sessions, import_vessels, ImportRefusal,
-        ImportReport, RowOutcome,
-    },
+use flotilla_provisioning::engine::import::{
+    import_checkouts, import_clones, import_environments, import_image_builds, import_terminal_sessions, import_vessels, ImportRefusal,
+    ImportReport, RowOutcome,
 };
 use flotilla_resources::{
-    convoy::engine::engine_name, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure, Environment, ImageBuild, TerminalSession, Vessel,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    convoy::engine::engine_name, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure, Environment, Host, ImageBuild, TerminalSession,
+    Vessel, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
 use flotilla_schema::{Identity, Kind};
 use flotilla_state_machines::{machines::convoy::Convoy as EngineConvoy, Resource};
@@ -58,25 +55,53 @@ pub(super) fn lifecycles(source: &Source, target: &mut Import, carried: &mut Car
     }
 }
 
+/// The home of each host's daemon, from the source's Host records: a Host is homed with the
+/// daemon that describes it, so a host held at exactly one home is that home's.
+fn host_homes(source: &Source) -> BTreeMap<String, BTreeSet<String>> {
+    let mut homes = BTreeMap::<String, BTreeSet<String>>::new();
+    for host in source.context::<Host>("hosts", None) {
+        homes.entry(host.object.metadata.name).or_default().insert(host.home);
+    }
+    homes
+}
+
+fn host_home(homes: &BTreeMap<String, BTreeSet<String>>, host: &str) -> Result<String, String> {
+    match homes.get(host).map(|homes| homes.iter().collect::<Vec<_>>()).as_deref() {
+        Some([home]) => Ok((*home).clone()),
+        None | Some([]) => Err(format!("builder host `{host}` has no Host record in the source")),
+        Some(several) => Err(format!(
+            "builder host `{host}` is held at several homes: {}",
+            several.iter().map(|home| home.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
 fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, carried: &Carried, report: &mut ImportReport) {
     let namespace = Some(namespace);
-    macro_rules! records {
-        ($old:ty, $plural:literal, $kind:literal, $binding:ty) => {{
-            let records: Vec<_> = source
-                .owned::<$old>($plural, namespace, $kind, target, report)
-                .into_iter()
-                .map(|record| (record.object, record.home))
-                .collect();
-            import_records::<$binding>(&records, target, report);
-        }};
-    }
+    let hosts = host_homes(source);
+    // Each build's builder host, from any home's copy of the build, for the environments that
+    // name it.
+    let builders: BTreeMap<String, String> = source
+        .context::<ImageBuild>("imagebuilds", namespace)
+        .into_iter()
+        .filter_map(|build| Some((build.object.metadata.name.clone(), build.object.spec.current()?.host_ref.clone())))
+        .collect();
+    let build_home = |build: &str| {
+        let host = builders.get(build).ok_or_else(|| format!("image build `{build}` has no record in the source"))?;
+        host_home(&hosts, host)
+    };
     let environments: Vec<_> = source
         .owned::<Environment>("environments", namespace, "Environment", target, report)
         .into_iter()
         .map(|record| (record.object, record.home))
         .collect();
-    import_environments(&environments, &carried.vessels, target, report);
-    records!(ImageBuild, "imagebuilds", "ImageBuild", ImageBuildBinding);
+    import_environments(&environments, &carried.vessels, &build_home, target, report);
+    let builds: Vec<_> = source
+        .owned::<ImageBuild>("imagebuilds", namespace, "ImageBuild", target, report)
+        .into_iter()
+        .map(|record| (record.object, record.home))
+        .collect();
+    import_image_builds(&builds, &|host: &str| host_home(&hosts, host), target, report);
     let clones: Vec<_> = source
         .owned::<CloneResource>("clones", namespace, "Clone", target, report)
         .into_iter()

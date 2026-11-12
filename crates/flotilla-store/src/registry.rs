@@ -121,7 +121,7 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
         &["credentialspec", "credential_spec", "credential_specs", "credential-spec", "credential-specs"],
     ),
     kind::<CrewDefaults>(RegisteredResource::CrewDefaults, &["crew-defaults"]),
-    kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
+    engine_kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
     kind::<ImageLayer>(RegisteredResource::ImageLayer, &["image-layer"]),
     kind::<AccountBinding>(RegisteredResource::AccountBinding, &["account-binding"]),
     kind::<AccountProvision>(RegisteredResource::AccountProvision, &["account-provision"]),
@@ -1011,7 +1011,11 @@ fn unknown_kind(kind: &str) -> ResourceError {
 }
 
 /// [`query_resource_kind`]'s document for a kind the engine serves.
-async fn query_engine_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, query: &crate::StoreQuery) -> Result<Value, ResourceError> {
+async fn query_engine_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    query: &crate::StoreQuery,
+) -> Result<Value, ResourceError> {
     let listed = backend.query_declared::<T>(namespace, query).await?;
     let items = listed
         .items

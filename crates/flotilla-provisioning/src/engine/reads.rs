@@ -19,7 +19,6 @@ use crate::stored::{
     checkout::{CheckoutKind, CheckoutRequest},
     clone::CloneKind,
     environment::{EnvironmentKind, EnvironmentRequest},
-    image_build::ImageBuildKind,
     terminal_session::{TerminalSessionKind, TerminalSessionRequest},
     Holder, Launches,
 };
@@ -107,7 +106,6 @@ impl From<StoreError> for ReadError {
 /// The provisioning read port. Each method is one keyed or indexed read of the decided store.
 pub trait ProvisioningReads: Send + Sync {
     fn environment(&self, name: &str, home: &str) -> Result<Option<View<EnvironmentKind>>, ReadError>;
-    fn image_build(&self, name: &str, home: &str) -> Result<Option<View<ImageBuildKind>>, ReadError>;
     /// A clone launch by its name, or a clone's latest launch by the clone's name.
     fn repository_clone(&self, name: &str, home: &str) -> Result<Option<View<CloneKind>>, ReadError>;
     fn checkout(&self, name: &str, home: &str) -> Result<Option<View<CheckoutKind>>, ReadError>;
@@ -144,6 +142,7 @@ pub struct LifecycleReadPort {
     home: String,
     environments: Option<Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>>,
     clones: Option<Arc<dyn flotilla_resources::clone_records::CloneRecords>>,
+    image_builds: Option<Arc<dyn flotilla_resources::image_build_records::ImageBuildRecords>>,
     checkouts: Option<Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>>,
     agent_sessions: Option<Arc<dyn flotilla_resources::agent_activity::AgentSessionReads>>,
     terminals: Option<Arc<dyn flotilla_resources::terminal_records::TerminalRecords>>,
@@ -158,6 +157,7 @@ impl LifecycleReadPort {
             home,
             environments: None,
             clones: None,
+            image_builds: None,
             checkouts: None,
             agent_sessions: None,
             terminals: None,
@@ -190,6 +190,12 @@ impl LifecycleReadPort {
         self
     }
 
+    /// Serves `builds` as the engine's image builds.
+    pub fn with_image_builds(mut self, builds: Arc<dyn flotilla_resources::image_build_records::ImageBuildRecords>) -> Self {
+        self.image_builds = Some(builds);
+        self
+    }
+
     /// Serves `checkouts` as the engine's checkouts.
     pub fn with_checkouts(mut self, checkouts: Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>) -> Self {
         self.checkouts = Some(checkouts);
@@ -216,6 +222,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
 
     fn clones(&self) -> Result<&dyn flotilla_resources::clone_records::CloneRecords, String> {
         self.clones.as_deref().ok_or_else(|| "this read port serves no clones".to_owned())
+    }
+
+    fn image_builds(&self) -> Result<&dyn flotilla_resources::image_build_records::ImageBuildRecords, String> {
+        self.image_builds.as_deref().ok_or_else(|| "this read port serves no image builds".to_owned())
     }
 
     fn checkouts(&self) -> Result<&dyn flotilla_resources::checkout_records::CheckoutRecords, String> {
@@ -248,7 +258,6 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
         let home = origin.unwrap_or(&self.home);
         let judgement = match kind {
             ProvisioningKind::Environment => self.reads.environment(name, home).map(|view| view.map(|view| view.judgement)),
-            ProvisioningKind::ImageBuild => self.reads.image_build(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::Clone => self.reads.repository_clone(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::Checkout => self.reads.checkout(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::TerminalSession => self.reads.terminal_session(name, home).map(|view| view.map(|view| view.judgement)),
@@ -380,10 +389,6 @@ where
 
 impl ProvisioningReads for StoreReads {
     fn environment(&self, name: &str, home: &str) -> Result<Option<View<EnvironmentKind>>, ReadError> {
-        self.read(|read| keyed(read, name, home))
-    }
-
-    fn image_build(&self, name: &str, home: &str) -> Result<Option<View<ImageBuildKind>>, ReadError> {
         self.read(|read| keyed(read, name, home))
     }
 

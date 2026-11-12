@@ -1223,26 +1223,14 @@ impl SqliteBackend {
         }
         for (path, selection) in &query.field_matches_query {
             let source_kind = selection.kind(kind).expect("validated source kind");
-            let mut source = (*selection.query).clone();
-            if let Some(scope) = query.replica_shadowing.as_ref().filter(|_| source_kind.paths.kind == kind.paths.kind) {
-                source.replica_shadowing = Some(scope.clone());
-                source.replicas_only = query.replicas_only;
-            }
+            let source = &*selection.query;
             let mut projections = Vec::new();
             for source_replicas in [false, true] {
-                if (!source_replicas && source.replicas_only)
-                    || (source_replicas && (!source.include_replicas || source_kind.replication == crate::ReplicationClass::None))
-                {
+                if source_replicas && (!source.include_replicas || source_kind.replication == crate::ReplicationClass::None) {
                     continue;
                 }
-                let (sql, values) = Self::declared_sql(
-                    source_kind,
-                    namespace,
-                    &source,
-                    source_replicas,
-                    root,
-                    QueryColumns::Field(selection.field.clone()),
-                );
+                let (sql, values) =
+                    Self::declared_sql(source_kind, namespace, source, source_replicas, root, QueryColumns::Field(selection.field.clone()));
                 projections.push(format!("SELECT * FROM ({})", Self::shift_binds(&sql, args.len())));
                 args.extend(values);
             }
@@ -1253,7 +1241,6 @@ impl SqliteBackend {
             let mut alternatives = Vec::new();
             for alternative in queries {
                 let mut alternative = alternative.clone();
-                alternative.replica_shadowing = query.replica_shadowing.clone();
                 alternative.suppress_self_origin = query.suppress_self_origin;
                 let (sql, values) = Self::declared_sql(kind, namespace, &alternative, replicas, root, QueryColumns::Identity);
                 let shifted = Self::shift_binds(&sql, args.len());
@@ -1274,15 +1261,8 @@ impl SqliteBackend {
             predicates.push(format!("{candidate} IN (SELECT {columns} FROM {table}_owners l INDEXED BY {table}_owners_lookup WHERE l.group_name=?1 AND l.version=?2 AND l.kind=?3 AND l.namespace=?4 AND l.owner_key=?{}{origin})",args.len()));
         }
         if replicas && query.suppress_self_origin {
-            if let Some(scope) = &query.replica_shadowing {
-                args.push(SqlValue::Text(scope.origin_root.to_string()));
-                let root_arg = args.len();
-                args.push(SqlValue::Text(serde_json::json!(scope.local_names).to_string()));
-                predicates.push(format!("NOT (o.origin_root=?{root_arg} AND o.name IN (SELECT value FROM json_each(?{})))", args.len()));
-            } else {
-                args.push(SqlValue::Text(root.into()));
-                predicates.push(format!("NOT (o.origin_root=?{} AND EXISTS(SELECT 1 FROM resource_objects local WHERE local.group_name=o.group_name AND local.version=o.version AND local.kind=o.kind AND local.namespace=o.namespace AND local.name=o.name))",args.len()));
-            }
+            args.push(SqlValue::Text(root.into()));
+            predicates.push(format!("NOT (o.origin_root=?{} AND EXISTS(SELECT 1 FROM resource_objects local WHERE local.group_name=o.group_name AND local.version=o.version AND local.kind=o.kind AND local.namespace=o.namespace AND local.name=o.name))",args.len()));
         }
         // Specialized Message indexes are kept as the established exemplar.
         let index = if let Some(message) = &query.message {
@@ -3258,9 +3238,6 @@ impl SqliteBackend {
                 let tx = connection.transaction().map_err(|e| Self::map_sqlite(e, "begin query snapshot"))?;
                 let mut items = Vec::new();
                 for replicas in [false, true] {
-                    if !replicas && query.replicas_only {
-                        continue;
-                    }
                     if replicas && (!query.include_replicas || kind.replication == crate::ReplicationClass::None) {
                         continue;
                     }
@@ -3558,9 +3535,7 @@ impl Store for SqliteBackend {
         self.read_call("indexed field projection", move |connection| {
             let mut values = std::collections::BTreeSet::new();
             for replicas in [false, true] {
-                if (!replicas && query.replicas_only)
-                    || (replicas && (!query.include_replicas || kind.replication == crate::ReplicationClass::None))
-                {
+                if replicas && (!query.include_replicas || kind.replication == crate::ReplicationClass::None) {
                     continue;
                 }
                 let (sql, args) = Self::declared_sql(kind, &namespace, &query, replicas, &root, QueryColumns::Field(field.clone()));

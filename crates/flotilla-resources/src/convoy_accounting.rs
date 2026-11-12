@@ -44,6 +44,7 @@ mod tests {
             (CrewWorkPhase::Done, false),
             (CrewWorkPhase::HandedBack, false),
             (CrewWorkPhase::Failed, false),
+            (CrewWorkPhase::Ended, false),
         ] {
             let mut status = ConvoyStatus::default();
             status.crew_work.insert(

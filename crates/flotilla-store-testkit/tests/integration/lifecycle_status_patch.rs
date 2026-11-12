@@ -73,7 +73,6 @@ define_patch_kinds! {
     ConvoySetStalled => NONE,
     ConvoySetNudgeObligations => NONE,
     ConvoySetTeardownWait => NONE,
-    ConvoyRecordLifecycleMutation => NONE,
     ConvoySetPlacementDecision => NONE,
     ConvoyBootstrap => DUPLICATE,
     ConvoyBackfillCrewWork => NONE,
@@ -126,7 +125,6 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
         ConvoyStatusPatch::SetNudgeObligations { .. } => PatchKind::ConvoySetNudgeObligations,
         ConvoyStatusPatch::SetTeardownWait { .. } => PatchKind::ConvoySetTeardownWait,
-        ConvoyStatusPatch::RecordLifecycleMutation { .. } => PatchKind::ConvoyRecordLifecycleMutation,
         ConvoyStatusPatch::SetPlacementDecision { .. } => PatchKind::ConvoySetPlacementDecision,
         ConvoyStatusPatch::Bootstrap { .. } => PatchKind::ConvoyBootstrap,
         ConvoyStatusPatch::BackfillCrewWork { .. } => PatchKind::ConvoyBackfillCrewWork,
@@ -265,7 +263,6 @@ fn active_convoy_status() -> ConvoyStatus {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     }
 }
 

@@ -98,10 +98,11 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         )
         .await
         .expect("create crew convoy");
-    assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "crew-convoy".to_string() });
+    let created = wait_for_command_result(&mut rx, create_id).await;
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let crew_record = convoy_record_name(&backend, "crew-convoy").await;
+    assert_eq!(created, created_launch(NAMESPACE, &crew_record));
     wait_until(|| {
         let convoys = convoys.clone();
         let crew_record = crew_record.clone();
@@ -141,7 +142,16 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     let TerminalSessionSource::Agent { context, .. } = &coder.spec.source else { panic!("coder must be an agent") };
     let coder_id = coder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("coder identity").id.clone();
     assert_eq!(coder.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str()), Some("codex"));
-    assert!(terminals.list().await.expect("terminal list").items.iter().any(|session| session.spec.role == "watcher"));
+    // The tool crew is seated beside the coder, its session ensured in the pool.
+    wait_until(|| {
+        let terminals = terminals.clone();
+        let pool = Arc::clone(&pool);
+        async move {
+            terminals.list().await.is_ok_and(|sessions| sessions.items.iter().any(|session| session.spec.role == "watcher"))
+                && pool.ensured.lock().await.iter().any(|launch| launch.session_name.ends_with("-watcher"))
+        }
+    })
+    .await;
     assert!(terminals.list().await.expect("terminal list").items.iter().all(|session| session.spec.role != "reviewer"));
     let ensured = pool.ensured.lock().await;
     let coder_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-coder")).expect("coder launch");
@@ -202,7 +212,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     // never launched as working.
     assert_eq!(initial_status.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::Pending);
     assert_eq!(initial_status.crew_work["implement"]["reviewer"].started_at, None);
-    assert!(!initial_status.crew_work["implement"].contains_key("watcher"));
+    // The view lists every crew member of the work; the tool crew owes nothing.
+    assert!(initial_status.promises.get("implement").and_then(|roles| roles.get("watcher")).is_none_or(Vec::is_empty));
 
     let ledger_name = flotilla_resources::address::record_name(
         &flotilla_resources::address::artifact_address(&crew_record, "coder", "decision-ledger", &crew_record).expect("artifact address"),
@@ -381,9 +392,6 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         let _ = handle.await;
     }
     pool.remove_session(&coder.metadata.name).await;
-    let listed_before_restart = convoys.list().await.expect("convoys before daemon restart");
-    let mut convoy_watch =
-        convoys.watch(flotilla_resources::WatchStart::resuming_from(&listed_before_restart)).await.expect("watch convoy recovery");
     let (daemon, pool) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry after restart");
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile after restart");
@@ -444,22 +452,18 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         }
     })
     .await;
-    let mut saw_interrupted_work = false;
-    let mut saw_interrupted_convoy = false;
-    while !(saw_interrupted_work && saw_interrupted_convoy) {
-        let event = tokio::time::timeout(Duration::from_secs(1), convoy_watch.next())
-            .await
-            .expect("interruption should be durably observable")
-            .expect("convoy watch should remain open")
-            .expect("convoy watch event");
-        let convoy = match event {
-            flotilla_resources::WatchEvent::Added(convoy) | flotilla_resources::WatchEvent::Modified(convoy) => convoy,
-            flotilla_resources::WatchEvent::Deleted(_) | flotilla_resources::WatchEvent::DeletedByName(_) => continue,
-        };
-        let Some(status) = convoy.status else { continue };
-        saw_interrupted_work |= status.work.get("implement").is_some_and(|work| work.phase == WorkPhase::Interrupted);
-        saw_interrupted_convoy |= status.phase == ConvoyPhase::Interrupted;
-    }
+    // The lost session stays observable as its launch's history: the launch before the revived
+    // one ended lost.
+    let reads = daemon.lifecycle_reads();
+    let lost = reads
+        .terminals()
+        .and_then(|terminals| terminals.every())
+        .expect("terminal launches")
+        .into_iter()
+        .filter(|launch| launch.session_name() == coder.metadata.name)
+        .filter(|launch| matches!(launch.reading, flotilla_protocol::LifecycleReading::Lost { .. }))
+        .count();
+    assert!(lost >= 1, "the coder's lost launch should be durably observable");
     let revived_coder = terminals.get(&coder.metadata.name).await.expect("revived coder");
     let revived_coder_id = revived_coder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("revived identity").id.clone();
     let reviewer = terminals
@@ -472,7 +476,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .expect("reviewer session after restart");
     let reviewer_id = reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).expect("revived reviewer identity").id.clone();
 
-    let attach = daemon.resolve_attach_command_internal("crew-convoy/implement/coder").await.expect("attach coder");
+    let attach = daemon.resolve_attach_command_internal(&format!("{crew_record}/implement/coder")).await.expect("attach coder");
     let [flotilla_protocol::ResolvedAttachAction::Command(args)] = attach.plan.0.as_slice() else {
         panic!("expected one local attach command, got {:?}", attach.plan);
     };
@@ -539,7 +543,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
             )
             .expect("record observed absence of a change request");
     }
-    record_successful_empty_branch_scan(&backend, &crew_record).await;
+    record_successful_empty_branch_scan(&daemon, &crew_record).await;
     // This recovery fixture's reviewer has no promises, so only the operator's forced completion
     // ends its part.
     assert_eq!(
@@ -564,7 +568,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     .await;
     let completed = convoys.get(&crew_record).await.expect("completed convoy").status.expect("completed status");
     assert_eq!(completed.work["implement"].phase, WorkPhase::Complete);
-    assert!(completed.crew_work["implement"].values().all(|state| state.phase == flotilla_resources::CrewWorkPhase::Done));
+    // The crew that owed promises is done; the view derives the others' phases from their seats.
+    assert_eq!(completed.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
 
     backend
         .clone()

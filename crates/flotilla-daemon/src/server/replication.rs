@@ -1,7 +1,7 @@
 //! Daemon implementations of the `flotilla-replication` host ports.
 //!
 //! The engine lives in `flotilla-replication`. The daemon supplies its local
-//! stores, node identity and health from `InProcessDaemon`, opens direct peers
+//! store, node identity and health from `InProcessDaemon`, opens direct peers
 //! as resource HTTP stores at forwarded sockets, and carries routed watches
 //! over the remote command router and the daemon event stream.
 
@@ -11,8 +11,8 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, NodeId};
 use flotilla_replication::{
-    DirectPeerConnector, LocalStores, PeerSources, ReplicationHealth, ReplicationHost, ReplicationStore, RoutedDigestRequest, RoutedPeer,
-    RoutedWatch, RoutedWatchItem, RoutedWatchRequest,
+    DirectPeerConnector, PeerSources, ReplicationHealth, ReplicationHost, RoutedDigestRequest, RoutedPeer, RoutedWatch, RoutedWatchItem,
+    RoutedWatchRequest,
 };
 use flotilla_resources::PartitionDigest;
 use flotilla_store::ResourceBackend;
@@ -22,13 +22,9 @@ use tracing::debug;
 
 use super::remote_commands::RemoteCommandRouter;
 
-/// The daemon's local replication side: its stores, identity and health.
+/// The daemon's local replication side: its store, identity and health.
 pub(super) fn replication_host(daemon: &Arc<InProcessDaemon>) -> ReplicationHost {
-    ReplicationHost::new(
-        daemon.node_id().clone(),
-        LocalStores { durable: daemon.resource_backend(), observed: daemon.observed_resource_backend() },
-        Arc::new(DaemonReplicationHealth(Arc::clone(daemon))),
-    )
+    ReplicationHost::new(daemon.node_id().clone(), daemon.resource_backend(), Arc::new(DaemonReplicationHealth(Arc::clone(daemon))))
 }
 
 /// Direct peers over forwarded resource sockets; routed peers over the router.
@@ -53,17 +49,12 @@ impl ReplicationHealth for DaemonReplicationHealth {
     }
 }
 
-/// Opens a peer's resource HTTP API at a forwarded Unix socket. The observed
-/// read view is served under the `observed` path prefix.
+/// Opens a peer's resource HTTP API at a forwarded Unix socket.
 struct ResourceSocketConnector;
 
 impl DirectPeerConnector for ResourceSocketConnector {
-    fn connect(&self, socket: &Path, store: ReplicationStore) -> Result<ResourceBackend, String> {
-        let http = HttpBackend::from_unix_socket(socket).map_err(|error| error.to_string())?;
-        Ok(ResourceBackend::new(match store {
-            ReplicationStore::Durable => http,
-            ReplicationStore::Observed => http.with_path_prefix("observed"),
-        }))
+    fn connect(&self, socket: &Path) -> Result<ResourceBackend, String> {
+        Ok(ResourceBackend::new(HttpBackend::from_unix_socket(socket).map_err(|error| error.to_string())?))
     }
 }
 

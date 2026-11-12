@@ -5,10 +5,7 @@ use std::time::Duration;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
-use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository,
-    RepositorySpec,
-};
+use flotilla_resources::{ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec};
 use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
@@ -47,22 +44,17 @@ async fn checkout_vcs_discovery_is_cached_per_checkout() {
             .create(&test_meta(&repository.key().to_string()), &repository)
             .await
             .expect("repository");
-        daemon
-            .observed_resource_backend
-            .clone()
-            .using::<ResourceCheckout>("flotilla")
-            .create(
-                &test_meta(name),
-                &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                    r#ref: "main".into(),
-                    path: path.to_string_lossy().into(),
-                    repo_ref: repository.key(),
-                    host_ref: daemon.environment_manager.local_host_id().to_string(),
-                    is_main: true,
-                }),
-            )
-            .await
-            .expect("observed checkout");
+        super::discover_checkout(
+            &daemon,
+            name,
+            ResourceObservedCheckoutSpec {
+                r#ref: "main".into(),
+                path: path.to_string_lossy().into(),
+                repo_ref: repository.key(),
+                host_ref: daemon.environment_manager.local_host_id().to_string(),
+                is_main: true,
+            },
+        );
     }
 
     let first = daemon.local_vcs_for_checkout(&first_path).await.expect("first checkout VCS");
@@ -120,7 +112,8 @@ async fn checkout_vcs_discovery_names_the_repository_a_clone_is_for() {
     )
     .await;
     let repository = RepositorySpec::remote("https://forge.example/team/repo").expect("repository");
-    let clones = super::test_engine(&daemon).clones;
+    let fixture = super::test_engine(&daemon);
+    let clones = &fixture.clones;
     clones.put_named(
         "clone",
         &flotilla_resources::CloneSpec {

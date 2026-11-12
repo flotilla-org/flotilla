@@ -23,7 +23,7 @@ use flotilla_manifest::{
     wire::MetadataValue,
 };
 use flotilla_protocol::{
-    commands::{ExplainedSubjectFact, ExplainedSubjectObservation},
+    commands::{ExplainedDischarge, ExplainedEndedVessel, ExplainedSubjectFact, ExplainedSubjectObservation},
     ConvoyExplanation, DeclarationAttentionKind, DeclarationAttentionRow, DispatchQueueResponse, DispatchQueueRow, EnvironmentId,
     ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedClone, ExplainedCrewDelivery, ExplainedDecisionLedger,
     ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
@@ -1353,6 +1353,11 @@ impl ReadProjections<'_> {
             Some(holder) => self.lifecycles.checkouts()?.held(&holder).map(latest_launches)?,
             None => BTreeMap::new(),
         };
+        // Its vessel launches, ended or not: their ends discharge an unread checkout.
+        let launch_vessels = match &convoy.status {
+            Some(status) if status.engine_launch.is_some() => self.lifecycles.vessels()?.of_convoy(&convoy.metadata.name)?,
+            _ => Vec::new(),
+        };
         let vessel_sources = self
             .backend
             .query_declared::<Vessel>(
@@ -1363,7 +1368,7 @@ impl ReadProjections<'_> {
             .map_err(|error| error.to_string())?
             .items;
         let selected_vessels = flotilla_resources::select_convoy_children(&convoy, &vessel_sources);
-        let expected = expected_checkout_refs(&convoy).map_err(|error| format!("derive expected checkouts: {error}"))?;
+        let expected = expected_checkout_refs(&convoy, selected_checkouts.keys().map(String::as_str));
         let checkouts = expected
             .iter()
             .map(|checkout_name| {
@@ -1504,14 +1509,31 @@ impl ReadProjections<'_> {
 
         let evaluation = evaluate_landing_settlement(
             &convoy,
-            &selected_vessels,
             &selected_checkouts,
+            &launch_vessels,
             &change_request_objects,
             &forges,
             change_request_stale_after,
             LANDING_EVIDENCE_TTL,
             now,
         );
+        let discharged = evaluation
+            .discharged
+            .into_iter()
+            .map(|discharge| ExplainedDischarge {
+                expectation: explain_unmet_expectation(discharge.expectation),
+                ended_vessels: discharge
+                    .ended_vessels
+                    .into_iter()
+                    .map(|vessel| ExplainedEndedVessel {
+                        launch: vessel.launch,
+                        reading: vessel.reading,
+                        reason: vessel.reason,
+                        ended_at: vessel.ended_at.to_rfc3339(),
+                    })
+                    .collect(),
+            })
+            .collect();
         let mut unmet = evaluation.unmet.into_iter().map(explain_unmet_expectation).collect::<Vec<_>>();
         unmet.extend(observation_errors.iter().map(|(record, error)| ExplainedUnmetExpectation {
             reason: "observation_error".to_string(),
@@ -1528,6 +1550,7 @@ impl ReadProjections<'_> {
             .to_string(),
             satisfied: evaluation.satisfied,
             unmet,
+            discharged,
         };
 
         let subscriptions = self
@@ -1636,17 +1659,6 @@ impl ReadProjections<'_> {
             .collect::<Vec<_>>();
         crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));
 
-        let lifecycle_mutations = convoy
-            .status
-            .as_ref()
-            .into_iter()
-            .flat_map(|status| &status.lifecycle_mutations)
-            .map(|mutation| flotilla_protocol::ExplainedLifecycleMutation {
-                action: mutation.action.clone(),
-                caller: mutation.caller.clone(),
-                at: mutation.at.to_rfc3339(),
-            })
-            .collect();
         let pinned_workflow = self
             .backend
             .definitions::<WorkflowTemplate>(namespace)
@@ -1838,7 +1850,6 @@ impl ReadProjections<'_> {
             decision_ledgers,
             artifacts,
             settlement,
-            lifecycle_mutations,
             account_bindings: account_binding_evidence(self.accounts, namespace, &convoy.metadata.name).await?,
             access_deliveries: access_delivery_evidence(self.backend, self.lifecycles, namespace, &convoy.metadata.name).await?,
         };
@@ -1910,7 +1921,6 @@ pub fn explained_decision_ledgers(
                         projection_error: None,
                         comment_url: superseded.decision_ledger_ref.clone(),
                         missing: superseded.decision_ledger_ref.is_none(),
-                        override_principal: superseded.completion_override.as_ref().map(|override_| override_.principal.clone()),
                         completed_while_crew_active: superseded.completed_while_crew_active,
                         message: superseded.message.clone(),
                         superseded: true,
@@ -1954,7 +1964,6 @@ pub fn explained_decision_ledgers(
                         projection_error,
                         comment_url,
                         missing: artifact.is_none(),
-                        override_principal: claim.completion_override.as_ref().map(|override_| override_.principal.clone()),
                         completed_while_crew_active: claim.completed_while_crew_active,
                         message: claim.message.clone(),
                         superseded: false,

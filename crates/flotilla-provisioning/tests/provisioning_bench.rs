@@ -187,6 +187,8 @@ fn realised<K: LifecycleKind>(
 fn seed(homes: &mut Homes, home: &str, convoys: impl Iterator<Item = usize>) {
     for k in 0..BUILDS {
         let build = ImageBuildRequest {
+            launch_of: "image-feed-arm64".into(),
+            launch: 0,
             composition: format!("sha256:{k}"),
             architecture: Architecture::Amd64,
             layers: layers(),

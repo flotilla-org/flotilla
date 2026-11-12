@@ -10,10 +10,9 @@ use flotilla_resources::PartitionDigest;
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 
-use super::{PeerReplicatorSupervisors, ReplicationOptions, ReplicationStore};
+use super::{PeerReplicatorSupervisors, ReplicationOptions};
 use crate::ports::{
-    DirectPeerConnector, LocalStores, PeerSources, ReplicationHealth, ReplicationHost, RoutedDigestRequest, RoutedPeer, RoutedWatch,
-    RoutedWatchRequest,
+    DirectPeerConnector, PeerSources, ReplicationHealth, ReplicationHost, RoutedDigestRequest, RoutedPeer, RoutedWatch, RoutedWatchRequest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,25 +46,25 @@ impl ReplicationHealth for RecordingHealth {
     }
 }
 
-/// Direct peers keyed by socket path, each serving durable and observed stores.
+/// Direct peers keyed by socket path, each serving its store.
 #[derive(Default)]
 pub(super) struct InMemoryPeers {
-    peers: Mutex<Vec<(PathBuf, LocalStores)>>,
-    pub(super) connections: Mutex<Vec<(PathBuf, ReplicationStore)>>,
+    peers: Mutex<Vec<(PathBuf, ResourceBackend)>>,
+    pub(super) connections: Mutex<Vec<PathBuf>>,
 }
 
 impl InMemoryPeers {
-    pub(super) fn serve(&self, socket: impl Into<PathBuf>, stores: LocalStores) {
-        self.peers.lock().expect("peers").push((socket.into(), stores));
+    pub(super) fn serve(&self, socket: impl Into<PathBuf>, store: ResourceBackend) {
+        self.peers.lock().expect("peers").push((socket.into(), store));
     }
 }
 
 impl DirectPeerConnector for InMemoryPeers {
-    fn connect(&self, socket: &Path, store: ReplicationStore) -> Result<ResourceBackend, String> {
-        self.connections.lock().expect("connections").push((socket.to_path_buf(), store));
+    fn connect(&self, socket: &Path) -> Result<ResourceBackend, String> {
+        self.connections.lock().expect("connections").push(socket.to_path_buf());
         let peers = self.peers.lock().expect("peers");
-        let (_, stores) = peers.iter().find(|(path, _)| path == socket).ok_or_else(|| format!("no peer at {}", socket.display()))?;
-        Ok(stores.backend(store).clone())
+        let (_, store) = peers.iter().find(|(path, _)| path == socket).ok_or_else(|| format!("no peer at {}", socket.display()))?;
+        Ok(store.clone())
     }
 }
 
@@ -82,16 +81,13 @@ impl RoutedPeer for NoRoutedPeer {
     }
 }
 
-pub(super) fn stores(root: &NodeId) -> LocalStores {
-    LocalStores {
-        durable: ResourceBackend::new(InMemoryBackend::default()).with_local_root(root.clone()),
-        observed: ResourceBackend::new(InMemoryBackend::default()).with_local_root(root.clone()),
-    }
+pub(super) fn store(root: &NodeId) -> ResourceBackend {
+    ResourceBackend::new(InMemoryBackend::default()).with_local_root(root.clone())
 }
 
 pub(super) fn host(node: &str, health: Arc<RecordingHealth>) -> ReplicationHost {
     let node_id = NodeId::new(node);
-    ReplicationHost::new(node_id.clone(), stores(&node_id), health)
+    ReplicationHost::new(node_id.clone(), store(&node_id), health)
 }
 
 /// Supervisors whose replicators are never started by the calling test.

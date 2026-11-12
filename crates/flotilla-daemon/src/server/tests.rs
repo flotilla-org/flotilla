@@ -31,7 +31,7 @@ use flotilla_protocol::{
     RepoSelector, Request, ResourceCursor, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome,
     StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
-use flotilla_replication::{replicate_kind_direct, ReplicationStore};
+use flotilla_replication::replicate_kind_direct;
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, FulfilmentFacts, FulfilmentKind,
     FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
@@ -389,13 +389,8 @@ async fn http_replication_resnapshots_after_quarantined_history() {
     let holder_for_replication = Arc::clone(&holder);
     let origin_for_replication = origin_root.clone();
     let replicator = tokio::spawn(async move {
-        replicate_kind_direct::<Convoy>(
-            ResourceBackend::new(http),
-            &replication_host(&holder_for_replication),
-            &origin_for_replication,
-            ReplicationStore::Durable,
-        )
-        .await
+        replicate_kind_direct::<Convoy>(ResourceBackend::new(http), &replication_host(&holder_for_replication), &origin_for_replication)
+            .await
     });
 
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -513,13 +508,8 @@ async fn http_replicator_relists_after_an_origin_generation_change() {
     let holder_for_replication = Arc::clone(&holder);
     let origin_for_replication = origin_root.clone();
     let replicator = tokio::spawn(async move {
-        replicate_kind_direct::<Convoy>(
-            ResourceBackend::new(http),
-            &replication_host(&holder_for_replication),
-            &origin_for_replication,
-            ReplicationStore::Durable,
-        )
-        .await
+        replicate_kind_direct::<Convoy>(ResourceBackend::new(http), &replication_host(&holder_for_replication), &origin_for_replication)
+            .await
     });
 
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -657,13 +647,8 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
     let holder_for_replication = Arc::clone(&holder);
     let origin_for_replication = origin_root.clone();
     let replicator = tokio::spawn(async move {
-        replicate_kind_direct::<Convoy>(
-            ResourceBackend::new(http),
-            &replication_host(&holder_for_replication),
-            &origin_for_replication,
-            ReplicationStore::Durable,
-        )
-        .await
+        replicate_kind_direct::<Convoy>(ResourceBackend::new(http), &replication_host(&holder_for_replication), &origin_for_replication)
+            .await
     });
 
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -1454,11 +1439,8 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             ..Default::default()
         };
         let spec = ConvoySpec::builder().workflow_ref("hook-test".into()).build();
-        let convoy_name = admit_convoy(
-            &daemon,
-            flotilla_engine_convoys_testkit::convoy("flotilla", &format!("hook-{harness_name}"), spec, status),
-        )
-        .await;
+        let convoy_name =
+            admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy("flotilla", &format!("hook-{harness_name}"), spec, status)).await;
         let name = format!("terminal-{harness_name}");
         let vessel = install_engine(&daemon).vessels.request(&convoy_name, "work", daemon.local_host_id().expect("local host").as_str());
         // The crew's vessel stands ready, so its convoy is active.
@@ -1591,8 +1573,18 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                 flotilla_resources::TerminalAttentionSource::Hook
             };
             assert_eq!(attention.source, source);
-            daemon.reconcile_crew_stalls_once("flotilla").await.expect("observe actor hook");
-            let convoy_status = convoys.get(&convoy_name).await.expect("convoy").status.expect("status");
+            // The stall pass reads convoys from a watch of the engine's views, which hears a new
+            // launch a moment after its admission: pass until it judges this convoy.
+            let screen = source == flotilla_resources::TerminalAttentionSource::Screen;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let convoy_status = loop {
+                daemon.reconcile_crew_stalls_once("flotilla").await.expect("observe actor hook");
+                let status = convoys.get(&convoy_name).await.expect("convoy").status.expect("status");
+                if !screen || status.attention.is_some() || tokio::time::Instant::now() > deadline {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
             let hook_at = daemon.crew_progress().get(&name).hook_at;
             if source == flotilla_resources::TerminalAttentionSource::Hook {
                 assert!(hook_at.is_some(), "an attributed hook is seen");
@@ -1876,24 +1868,30 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
 async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause() {
     let (_tmp, daemon) = empty_daemon().await;
     let home = HostName::new("feta");
-    apply_convoy_replica_feed(&daemon, "flotilla", "stranded", home.clone()).await;
-    let replica_fixture = ResourceBackend::new(InMemoryBackend::default());
-    replica_fixture
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("stranded".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
-        )
-        .await
-        .expect("create replica fixture");
-    let replica_snapshot = replica_fixture.using::<Convoy>("flotilla").list().await.expect("list replica fixture");
-    let last_seen_at = chrono::DateTime::parse_from_rfc3339("2026-08-21T12:34:56Z").expect("fixed timestamp").with_timezone(&chrono::Utc);
-    daemon
-        .resource_backend()
-        .replica_writer::<Convoy>(node("feta"), "flotilla")
-        .replace(&replica_snapshot, last_seen_at)
-        .await
-        .expect("seed last-seen replica");
+    // Feta's launch, last seen when it was admitted there.
+    let decided = daemon.decided_store().expect("decided store");
+    let feta = flotilla_provisioning_testkit::other_home_for(&decided, "feta");
+    let feta_convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
+        feta.service(),
+        "flotilla",
+        &ResourceBackend::new(InMemoryBackend::default()),
+        Arc::new(flotilla_resources::SystemClock),
+        daemon.lifecycle_reads(),
+    );
+    let stranded = feta_convoys
+        .launch(flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "stranded",
+            ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        ))
+        .await;
+    feta.replicate_to(&decided);
+    apply_convoy_replica_feed(&daemon, "flotilla", &stranded, home.clone()).await;
+    let replica = daemon.resource_backend().including_replicas::<Convoy>("flotilla").get(&stranded).await.expect("feta's launch");
+    let flotilla_resources::ResourceProvenance::Replica { last_synced_at: last_seen_at, .. } = replica.provenance else {
+        panic!("feta's launch is a replica here")
+    };
     daemon
         .publish_peer_summary(
             HostSummary::builder()
@@ -1917,17 +1915,25 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
     let message = remote_command_router
         .dispatch_execute(
             Command::builder()
-                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: "stranded".to_string(), force: true })
+                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: stranded.clone(), force: true })
                 .build(),
         )
         .await
         .expect_err("failed peer send should reject dispatch");
 
+    // Last seen is when feta's launch reached here, whichever read of it the router made.
+    let (seen, rest) = message
+        .strip_prefix(&format!("convoy flotilla/{stranded} is homed at feta, last seen "))
+        .and_then(|rest| rest.split_once("; "))
+        .unwrap_or_else(|| panic!("{message}"));
+    let seen = chrono::DateTime::parse_from_rfc3339(seen).unwrap_or_else(|error| panic!("{message}: {error}"));
+    assert!((seen.with_timezone(&chrono::Utc) - last_seen_at).num_seconds().abs() < 5, "{message}");
     assert_eq!(
-        message,
-        "convoy flotilla/stranded is homed at feta, last seen 2026-08-21T12:34:56+00:00; home is unreachable: \
-         connect to feta at ssh://feta.example: outbound channel closed. Break glass: flotilla resource delete convoys stranded \
-         --namespace flotilla --host feta"
+        rest,
+        format!(
+            "home is unreachable: connect to feta at ssh://feta.example: outbound channel closed. Break glass: flotilla resource \
+             delete convoys {stranded} --namespace flotilla --host feta"
+        )
     );
 }
 
@@ -5100,8 +5106,8 @@ impl flotilla_discovery_api::Factory for GatedStartupEnvironmentFactory {
 #[tokio::test]
 async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() {
     use flotilla_resources::{
-        ConvoyPhase, ConvoyStatus, CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
-        CredentialSpec, CredentialSpecSpec, VesselRequirement, WorkflowSnapshot,
+        ConvoyStatus, CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
+        CredentialSpecSpec, VesselRequirement, WorkflowSnapshot,
     };
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -5200,11 +5206,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
                 content: "test".into(),
                 copies: Vec::new(),
             },
-            context: Box::new(TerminalCrewContext {
-                namespace: "flotilla".into(),
-                convoy: convoy.clone(),
-                vessel_ref: vessel,
-            }),
+            context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: convoy.clone(), vessel_ref: vessel }),
         },
     };
     let terminals = runtime_terminals(&daemon);
@@ -5536,8 +5538,8 @@ async fn failed_connection_tasks_are_reaped() {
     assert!(tasks.is_empty());
 }
 
-use crate::testkits::engine::{admit_convoy, current_launch, engine as install_engine};
 pub(super) use crate::testkits::engine::engine_environments;
+use crate::testkits::engine::{admit_convoy, current_launch, engine as install_engine};
 
 pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     let (_tmp, daemon) = empty_daemon().await;

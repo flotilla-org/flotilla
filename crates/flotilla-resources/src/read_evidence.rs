@@ -75,7 +75,7 @@ pub fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> Exp
         UnmetSettlementExpectation::MissingCheckoutStatus { checkout } => ExplainedUnmetExpectation {
             reason: "missing_status".to_string(),
             subject: format!("checkout/{checkout}"),
-            detail: "observed checkout has no status".to_string(),
+            detail: "no inspection of the checkout has been read".to_string(),
         },
         UnmetSettlementExpectation::CheckoutConditionFalse { checkout, condition } => ExplainedUnmetExpectation {
             reason: "false_condition".to_string(),

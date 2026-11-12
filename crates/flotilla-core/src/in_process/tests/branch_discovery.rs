@@ -10,8 +10,9 @@ use flotilla_resources::{
 use flotilla_store_testkit::cr_name;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
-use super::support::test_meta;
+use super::support::{admit, test_meta};
 use crate::testkits::discovery::FakeChangeRequest;
+use flotilla_engine_convoys_testkit::single_agent;
 use flotilla_protocol::ChangeRequest;
 
 // #2698: automatic branch discovery must not bind an already terminal PR
@@ -37,26 +38,26 @@ async fn branch_discovery_ignores_preexisting_terminal_request() {
         fixture.daemon.admission.repository_change_requests().write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
             provider;
         let convoys = fixture.daemon.resource_backend().using::<ResourceConvoy>("flotilla");
-        convoys
-            .create(
-                &test_meta("new-work"),
-                &ConvoySpec::builder()
-                    .workflow_ref("dev".into())
-                    .r#ref("reused".into())
-                    .repositories(vec![ConvoyRepositorySpec {
-                        url: "https://github.com/team/repo0".into(),
-                        repo_ref: fixture.keys[0].clone(),
-                        source_ref: "main".into(),
-                        target_ref: "main".into(),
-                        workspace_slug: "repo0".into(),
-                        subpaths: vec![],
-                    }])
-                    .build(),
-            )
-            .await
-            .expect("convoy");
-        fixture.daemon.discover_convoy_branch_subjects("flotilla", "new-work", "reused").await.expect("discovery");
-        let convoy = convoys.get("new-work").await.expect("convoy");
+        let new_work = admit(
+            &fixture.daemon,
+            "new-work",
+            ConvoySpec::builder()
+                .workflow_ref("dev".into())
+                .r#ref("reused".into())
+                .repositories(vec![ConvoyRepositorySpec {
+                    url: "https://github.com/team/repo0".into(),
+                    repo_ref: fixture.keys[0].clone(),
+                    source_ref: "main".into(),
+                    target_ref: "main".into(),
+                    workspace_slug: "repo0".into(),
+                    subpaths: vec![],
+                }])
+                .build(),
+            single_agent("coder"),
+        )
+        .await;
+        fixture.daemon.discover_convoy_branch_subjects("flotilla", &new_work, "reused").await.expect("discovery");
+        let convoy = convoys.get(&new_work).await.expect("convoy");
         let status = convoy.status.unwrap_or_default();
         assert!(status.subjects.is_empty(), "old terminal PR must not become produced work");
         // #3206: a convoy scanned before admission wrote its status still
@@ -75,26 +76,25 @@ async fn inspected_change_request_is_discovered_and_unlink_wins() {
     let engine = &fixture.engine.checkouts;
     let backend = fixture.daemon.resource_backend();
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    convoys
-        .create(
-            &test_meta("switch-work"),
-            &ConvoySpec::builder()
-                .workflow_ref("dev".into())
-                .r#ref("requested".into())
-                .adopted_checkout_refs(BTreeMap::from([(fixture.keys[0].clone(), "switch-checkout".into())]))
-                .repositories(vec![ConvoyRepositorySpec {
-                    url: "https://github.com/team/repo0".into(),
-                    repo_ref: fixture.keys[0].clone(),
-                    source_ref: "main".into(),
-                    target_ref: "main".into(),
-                    workspace_slug: "repo0".into(),
-                    subpaths: vec![],
-                }])
-                .build(),
-        )
-        .await
-        .expect("convoy");
-    super::support::admit_on_engine(&backend, engine, "switch-work").await;
+    let switch_work = admit(
+        &fixture.daemon,
+        "switch-work",
+        ConvoySpec::builder()
+            .workflow_ref("dev".into())
+            .r#ref("requested".into())
+            .adopted_checkout_refs(BTreeMap::from([(fixture.keys[0].clone(), "switch-checkout".into())]))
+            .repositories(vec![ConvoyRepositorySpec {
+                url: "https://github.com/team/repo0".into(),
+                repo_ref: fixture.keys[0].clone(),
+                source_ref: "main".into(),
+                target_ref: "main".into(),
+                workspace_slug: "repo0".into(),
+                subpaths: vec![],
+            }])
+            .build(),
+        single_agent("coder"),
+    )
+    .await;
     let launch = engine.put_ready(
         "switch-checkout",
         &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
@@ -104,7 +104,7 @@ async fn inspected_change_request_is_discovered_and_unlink_wins() {
             host_ref: "test-host".into(),
             is_main: false,
         }),
-        Some(&engine.holder("switch-work")),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(switch_work.clone())),
     );
     engine.checkouts.inspected(&launch, Inspection { change_request: Some(8), ..Default::default() }).expect("inspection");
     // The forge observation of #8 finds it open.
@@ -143,19 +143,19 @@ async fn inspected_change_request_is_discovered_and_unlink_wins() {
         )
         .await
         .expect("open observation");
-    fixture.daemon.discover_convoy_branch_subjects("flotilla", "switch-work", "requested").await.expect("discovery");
-    let convoy = convoys.get("switch-work").await.expect("convoy");
+    fixture.daemon.discover_convoy_branch_subjects("flotilla", &switch_work, "requested").await.expect("discovery");
+    let convoy = convoys.get(&switch_work).await.expect("convoy");
     assert_eq!(convoy.status.expect("subjects").subjects[0].subject.id, "8");
     // Repair an already persisted stale produces link, as in the operator's report.
-    fixture.daemon.link_convoy_subject("flotilla", "switch-work", "repo0!7").await.expect("stale link");
-    fixture.daemon.unlink_convoy_subject("flotilla", "switch-work", "repo0!7").await.expect("unlink stale merged subject");
-    fixture.daemon.discover_convoy_branch_subjects("flotilla", "switch-work", "requested").await.expect("repair discovery");
-    let repaired = convoys.get("switch-work").await.expect("convoy").status.expect("subjects");
+    fixture.daemon.link_convoy_subject("flotilla", &switch_work, "repo0!7").await.expect("stale link");
+    fixture.daemon.unlink_convoy_subject("flotilla", &switch_work, "repo0!7").await.expect("unlink stale merged subject");
+    fixture.daemon.discover_convoy_branch_subjects("flotilla", &switch_work, "requested").await.expect("repair discovery");
+    let repaired = convoys.get(&switch_work).await.expect("convoy").status.expect("subjects");
     assert_eq!(repaired.subjects.len(), 1);
     assert_eq!(repaired.subjects[0].subject.id, "8");
-    fixture.daemon.unlink_convoy_subject("flotilla", "switch-work", "repo0!8").await.expect("unlink");
-    fixture.daemon.discover_convoy_branch_subjects("flotilla", "switch-work", "requested").await.expect("repeat discovery");
-    assert!(convoys.get("switch-work").await.expect("convoy").status.expect("subjects").subjects.is_empty());
+    fixture.daemon.unlink_convoy_subject("flotilla", &switch_work, "repo0!8").await.expect("unlink");
+    fixture.daemon.discover_convoy_branch_subjects("flotilla", &switch_work, "requested").await.expect("repeat discovery");
+    assert!(convoys.get(&switch_work).await.expect("convoy").status.expect("subjects").subjects.is_empty());
 }
 
 // #2698: an earlier absence observation cannot authorize creation after a terminal PR appears

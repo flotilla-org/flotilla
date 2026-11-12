@@ -30,6 +30,9 @@ const VIEW_RESTART_BACKOFF: Duration = Duration::from_millis(100);
 #[async_trait]
 pub trait ViewSource<T: Resource>: Send + Sync {
     async fn list_and_watch(&self) -> Result<(ReadResourceList<T>, Events<T>), ResourceError>;
+    /// Returns once every change committed before the call is in the watch's queued events. A
+    /// source whose events are queued as its writes commit has nothing to wait for.
+    async fn catch_up(&self) {}
 }
 
 pub struct StoreViewSource<T: Resource> {
@@ -83,6 +86,13 @@ impl<T: Resource> ViewSource<T> for StoreViewSource<T> {
             .map(|event| event.map(ReadWatchEvent::local));
         let items = ReadResourceList { items: listed.into_typed()? };
         Ok((items, futures::stream::select(local, replicas).boxed()))
+    }
+    /// An engine kind's changes reach its watches through the shared listing, which is taken
+    /// after the write: wait for it.
+    async fn catch_up(&self) {
+        if let Some(feed) = self.backend.held_engine_feed(T::API_PATHS.kind) {
+            feed.catch_up().await;
+        }
     }
 }
 
@@ -338,9 +348,6 @@ impl<T: Resource> ViewState<T> {
         if query.message.is_some() {
             return Err(ResourceError::invalid("view queries support labels, declared fields and owners"));
         }
-        if query.replica_shadowing.is_some() {
-            return Err(ResourceError::invalid("view owns its replica shadowing scope"));
-        }
         let resolved = self.resolve_query(query)?;
         let query = &resolved;
         let (objects, index) = self.definitions.as_ref().map(|(objects, index)| (objects, index)).unwrap_or((&self.objects, &self.index));
@@ -349,9 +356,6 @@ impl<T: Resource> ViewState<T> {
             .into_iter()
             .filter_map(|key| objects.get(&key))
             .filter(|item| {
-                if query.replicas_only && matches!(item.provenance, ResourceProvenance::Local) {
-                    return false;
-                }
                 if !query.include_replicas && !matches!(item.provenance, ResourceProvenance::Local) {
                     return false;
                 }
@@ -545,6 +549,7 @@ impl<T: Resource> WatchView<T> {
                     }
                     request = flush_rx.recv() => {
                         let Some(request) = request else { break };
+                        source.catch_up().await;
                         let mut changed = false;
                         while let Some(event) = events.next().now_or_never() {
                             let local = event.as_ref().and_then(|event| event.as_ref().ok()).is_some_and(event_is_local);
@@ -568,7 +573,8 @@ impl<T: Resource> WatchView<T> {
         });
         Ok(Self { state, changes, task: Arc::new(ViewTask(task)), flush, materialized: Arc::default(), keys, local_keys })
     }
-    /// Drain queued events before reading, stopping at a fresh resync snapshot.
+    /// Drain queued events before reading, stopping at a fresh resync snapshot,
+    /// once the source has queued every change committed before the call.
     /// This avoids scheduler-dependent
     /// read-your-writes behavior, at the cost of a worker round-trip; reads wait
     /// behind event handling and resync rather than returning an incomplete view.

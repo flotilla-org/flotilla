@@ -2,8 +2,8 @@ use flotilla_change_request::observation::{ChangeRequestKey, ChangeRequestObserv
 use flotilla_observation::change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
-    promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
-    ChangeRequest, ChangeRequestLeafSubject, ChangeRequestStatus, ConvoyStatus, IssueSourceBindingSpec, LeafSubject, Observation,
+    promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
+    ChangeRequest, ChangeRequestLeafSubject, ChangeRequestStatus, IssueSourceBindingSpec, LeafSubject, Observation,
     ObservedChangeRequestState, ObservedChecks, Project, ProjectSpec,
 };
 use tokio_util::task::AbortOnDropHandle;
@@ -79,6 +79,44 @@ async fn change_request_homes(daemon: &InProcessDaemon, name: &str) -> Vec<Strin
             flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => origin_root.to_string(),
         })
         .collect()
+}
+
+/// Admits convoy `name` at `requester`'s engine, its coder having submitted change request 330
+/// of org/shared as the PR it promises. Returns the launch.
+async fn produce(requester: &InProcessDaemon, name: &str) -> String {
+    let launch =
+        admit_convoy(requester, engine_convoy(name, ConvoySpec::builder().workflow_ref("scratch".into()).build(), ConvoyStatus::default()))
+            .await;
+    let convoy = requester.resource_backend().using::<Convoy>("flotilla").get(&launch).await.expect("admitted convoy");
+    let submit = PromiseOperation::Submit {
+        id: "produced-pr".into(),
+        kind: PromiseKind::Pr,
+        source: PromiseSource::Crew,
+        submission: Submission {
+            reference: "cr/github.com/org/shared/330".into(),
+            metadata: BTreeMap::new(),
+            submitted_at: Utc::now(),
+            verdict: None,
+        },
+    };
+    let path = requester.convoy_engine_path();
+    let engine = path.get().expect("the Convoy path");
+    engine
+        .promise(&convoy, "work", "coder", &submit, flotilla_resources::convoy::engine::Actor::Crew)
+        .await
+        .expect("the coder submits its PR");
+    // The branch scan links the change request as what the convoy produces: a convoy's subjects
+    // are the engine's links, and the owner's demand follows them (#3108).
+    let produced = flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: IssueSource { service: "github.com".into(), scope: "org/shared".into() },
+        id: "330".into(),
+    };
+    engine
+        .link(&convoy, &produced, flotilla_resources::SubjectDiscoverySource::Branch, "branch-scan")
+        .await
+        .expect("the branch scan links it");
+    launch
 }
 
 async fn remote_change_request_scenario(late_watcher: bool) {
@@ -158,29 +196,8 @@ async fn remote_change_request_scenario(late_watcher: bool) {
     };
     let mut owner_demand_task = (!late_watcher).then(start_watcher);
     tokio::task::yield_now().await;
-    let mut status = ConvoyStatus::default();
-    promises::apply(
-        &mut status,
-        "work",
-        "coder",
-        &PromiseOperation::Submit {
-            id: "produced-pr".into(),
-            kind: PromiseKind::Pr,
-            source: PromiseSource::Crew,
-            submission: Submission {
-                reference: "cr/github.com/org/shared/330".into(),
-                metadata: BTreeMap::new(),
-                submitted_at: Utc::now(),
-                verdict: None,
-            },
-        },
-    );
     let convoys = requester.resource_backend().using::<Convoy>("flotilla");
-    let convoy = convoys
-        .create(&InputMeta::builder().name("producer".into()).build(), &ConvoySpec::builder().workflow_ref("scratch".into()).build())
-        .await
-        .unwrap();
-    convoys.update_status("producer", &convoy.metadata.resource_version, &status).await.unwrap();
+    let producer = produce(&requester, "producer").await;
     requester_observer.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.unwrap();
     assert!(
         !change_request_homes(&requester, &name).await.contains(&requester.node_id().to_string()),
@@ -188,7 +205,7 @@ async fn remote_change_request_scenario(late_watcher: bool) {
     );
     if late_watcher {
         eventually(Duration::from_secs(5), Duration::from_millis(10), "convoy replicated before observer startup", || async {
-            owner.resource_backend().including_replicas::<Convoy>("flotilla").get("producer").await.is_ok()
+            owner.resource_backend().including_replicas::<Convoy>("flotilla").get(&producer).await.is_ok()
         })
         .await;
         owner_demand_task = Some(start_watcher());
@@ -252,42 +269,49 @@ async fn remote_change_request_scenario(late_watcher: bool) {
     );
     *forge.0.lock().await = ObservedChangeRequestState::Merged;
     owner_observer.refresh_demanded_owned().await.unwrap();
+    // The producer's convoy reconciler observes the merged record and keeps the promise on the
+    // engine, one edge a pass.
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new()
+        .with_engine(requester.convoy_engine_path())
+        .with_lifecycle_reads(requester.lifecycle_reads())
+        .with_change_requests(requester.resource_backend().including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180));
     eventually(Duration::from_secs(5), Duration::from_millis(10), "merged observation keeps promise", || async {
-        let copies = requester.resource_backend().including_replicas::<ChangeRequest>("flotilla").list().await.unwrap();
-        let records = flotilla_resources::select_change_requests(copies.items.iter().map(|copy| &copy.object))
-            .into_values()
-            .map(|record| (name.clone(), record))
-            .collect();
-        let Some(patch) =
-            promises::next_observation(&status, "producer", &records, &BTreeMap::new(), &[], Utc::now(), Duration::from_secs(180))
-        else {
-            return false;
-        };
-        let kept = flotilla_store::apply_status_patch(&convoys, "producer", &patch).await.expect("persist observed promise verdict");
-        kept.status.expect("producer status").promises["work"]["coder"][0].state == PromiseState::Kept
+        use flotilla_store::controller::Reconciler;
+        let current = convoys.get(&producer).await.expect("producer");
+        reconciler.prepare(&current).await.expect("observe the producer's promise");
+        let kept = convoys.get(&producer).await.expect("producer");
+        kept.status.expect("producer status").promises["work"]["coder"].iter().any(|promise| promise.state == PromiseState::Kept)
     })
     .await;
-    // Duplicate convoy consumers share one observer demand. Removing one must
-    // preserve the other; removing the last releases the standing demand.
-    let duplicate =
-        convoys.create(&InputMeta::builder().name("second-producer".into()).build(), &convoy.spec).await.expect("second consumer");
-    convoys.update_status("second-producer", &duplicate.metadata.resource_version, &status).await.expect("second subject");
+    // Duplicate convoy consumers share one observer demand. Ending one must preserve the other;
+    // ending the last releases the standing demand. A convoy ends on the engine, never deleted (#3108).
+    let second = produce(&requester, "second-producer").await;
     eventually(Duration::from_secs(5), Duration::from_millis(10), "second consumer replicated", || async {
-        owner
-            .resource_backend()
-            .including_replicas::<Convoy>("flotilla")
-            .get("second-producer")
-            .await
-            .is_ok_and(|copy| copy.object.status.is_some())
+        owner.resource_backend().including_replicas::<Convoy>("flotilla").get(&second).await.is_ok_and(|copy| copy.object.status.is_some())
     })
     .await;
-    convoys.delete("producer").await.expect("remove first consumer");
-    eventually(Duration::from_secs(5), Duration::from_millis(10), "first consumer deletion replicated", || async {
-        owner.resource_backend().including_replicas::<Convoy>("flotilla").get("producer").await.is_err()
-    })
-    .await;
+    let end = |launch: String| {
+        let (convoys, path) = (convoys.clone(), requester.convoy_engine_path());
+        async move {
+            let convoy = convoys.get(&launch).await.expect("consumer");
+            path.get().expect("the Convoy path").abandon(&convoy, "operator", "consumer removed").await.expect("end the consumer");
+        }
+    };
+    end(producer.clone()).await;
+    let ended = |launch: String| {
+        let owner = Arc::clone(&owner);
+        async move {
+            owner
+                .resource_backend()
+                .including_replicas::<Convoy>("flotilla")
+                .get(&launch)
+                .await
+                .is_ok_and(|copy| copy.object.status.is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Abandoned))
+        }
+    };
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "first consumer's end replicated", || ended(producer.clone())).await;
     assert_eq!(owner_observer.demanded_owned().await.expect("remaining owner demand"), vec![subject]);
-    convoys.delete("second-producer").await.expect("remove last consumer");
+    end(second.clone()).await;
     eventually(Duration::from_secs(5), Duration::from_millis(10), "last consumer releases demand", || async {
         owner_observer.demanded_owned().await.is_ok_and(|subjects| subjects.is_empty())
     })

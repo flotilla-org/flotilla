@@ -165,7 +165,8 @@ async fn convoy_write_path_at_the_ceiling() {
 
     let started = Instant::now();
     for convoy in &local {
-        engine.deliver(convoy).await.expect("deliver");
+        // The kept promise is a merged PR, so settlement delivers as merged.
+        engine.deliver(convoy, "merged").await.expect("deliver");
     }
     report("deliver", started, local.len());
     println!("{:>36}: {} KiB", "peak resident (VmHWM)", peak_kib());

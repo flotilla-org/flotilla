@@ -103,9 +103,7 @@ impl ResourceBackend {
         kind: &'static str,
     ) -> Option<Result<std::sync::Arc<crate::engine_feed::EngineFeed>, ResourceError>> {
         let records = self.engine_records(kind)?;
-        if let Some(feed) =
-            self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).feeds.get(kind).and_then(std::sync::Weak::upgrade)
-        {
+        if let Some(feed) = self.held_engine_feed(kind) {
             return Some(Ok(feed));
         }
         let started = match crate::engine_feed::EngineFeed::start(std::sync::Arc::clone(&records), kind).await {
@@ -122,6 +120,11 @@ impl ResourceBackend {
         }
         engines.feeds.insert(kind, std::sync::Arc::downgrade(&started));
         Some(Ok(started))
+    }
+
+    /// The shared listing of `kind`'s engine records while any watcher holds it.
+    pub(crate) fn held_engine_feed(&self, kind: &str) -> Option<std::sync::Arc<crate::engine_feed::EngineFeed>> {
+        self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).feeds.get(kind).and_then(std::sync::Weak::upgrade)
     }
 
     /// Installs the engine's attentions behind `[primitives]`. A daemon runtime restarted over the

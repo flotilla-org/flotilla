@@ -244,6 +244,20 @@ impl<K: PlainKind> EngineRecords for PlainRecords<K> {
             .collect())
     }
 
+    /// Every home's record `name`, read from the resident map by name.
+    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        refuse_kind::<K>(kind)?;
+        let resident = self.refresh()?;
+        Ok(resident
+            .records
+            .range((name.to_owned(), String::new())..)
+            .take_while(|((held, _), _)| held == name)
+            .filter_map(|(_, held)| {
+                held.clone().map_err(|error| tracing::warn!(%error, kind = K::KIND, "skipping a record that does not encode")).ok()
+            })
+            .collect())
+    }
+
     async fn apply(
         &self,
         kind: &str,

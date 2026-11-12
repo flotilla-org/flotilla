@@ -102,7 +102,7 @@ impl AttachReadContext {
 
 pub(super) struct AttachResolver<'a> {
     pub(super) resource_backend: &'a ResourceBackend,
-    pub(super) observed_resource_backend: &'a ResourceBackend,
+    pub(super) discovered_checkouts: &'a flotilla_resources::discovered_checkouts::DiscoveredCheckouts,
     pub(super) aggregator_projection_state: &'a AggregatorProjectionState,
     pub(super) config: &'a ConfigStore,
     pub(super) host_registry: &'a flotilla_projections::host_registry::HostRegistry,
@@ -240,7 +240,7 @@ impl<'a> AttachResolver<'a> {
         let namespace = self.provisioning_namespace().await;
         let repository_key = flotilla_admission::repository_addressing::resolve_repository_with_lifecycle_reads(
             self.resource_backend,
-            self.observed_resource_backend,
+            self.discovered_checkouts,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
             selector,
@@ -511,14 +511,8 @@ impl<'a> AttachResolver<'a> {
             .await
             .map_err(|error| error.to_string())?
             .items;
-        let observed_sessions = self
-            .observed_resource_backend
-            .query_declared::<ResourceTerminalSession>(&namespace, &query)
-            .await
-            .map_err(|error| error.to_string())?
-            .items;
         let convoys = convoy_sources.clone();
-        let sessions = durable_sessions.iter().chain(&observed_sessions).cloned().collect();
+        let sessions = durable_sessions.clone();
         let convoy_addresses = convoy_sources
             .into_iter()
             .map(|source| {
@@ -533,33 +527,7 @@ impl<'a> AttachResolver<'a> {
                 ResourceProvenance::Local => {
                     sessions_by_name.insert(session.object.metadata.name.clone(), session.object);
                 }
-                ResourceProvenance::Replica { .. } => replicated_sessions.push((session, AttachSessionSource::Durable)),
-            }
-        }
-        let mut replica_keys = replicated_sessions
-            .iter()
-            .map(|(session, _)| {
-                (
-                    session.object.metadata.namespace.clone(),
-                    session.object.metadata.name.clone(),
-                    replica_origin(&session.provenance).cloned(),
-                )
-            })
-            .collect::<HashSet<_>>();
-        for session in observed_sessions {
-            match session.provenance {
-                ResourceProvenance::Local => {
-                    sessions_by_name.entry(session.object.metadata.name.clone()).or_insert(session.object);
-                }
-                ResourceProvenance::Replica { .. } => {
-                    if replica_keys.insert((
-                        session.object.metadata.namespace.clone(),
-                        session.object.metadata.name.clone(),
-                        replica_origin(&session.provenance).cloned(),
-                    )) {
-                        replicated_sessions.push((session, AttachSessionSource::Observed));
-                    }
-                }
+                ResourceProvenance::Replica { .. } => replicated_sessions.push(session),
             }
         }
         let mut candidates = Vec::new();
@@ -572,7 +540,7 @@ impl<'a> AttachResolver<'a> {
                 target: AttachTarget::Local(Box::new(session)),
             });
         }
-        for (replicated, source) in replicated_sessions {
+        for replicated in replicated_sessions {
             let session = replicated.object;
             let ResourceProvenance::Replica { origin_root, .. } = replicated.provenance else {
                 unreachable!("local durable sessions were partitioned above");
@@ -585,12 +553,6 @@ impl<'a> AttachResolver<'a> {
             let role = session.metadata.labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
             let crew = session.metadata.labels.get(VESSEL_LABEL).map_or_else(|| role.clone(), |vessel| format!("{vessel}/{role}"));
             let independent = !session.metadata.labels.contains_key(CONVOY_LABEL);
-            if independent
-                && matches!(source, AttachSessionSource::Observed)
-                && session.status.as_ref().is_none_or(|status| status.phase != flotilla_resources::TerminalSessionPhase::Running)
-            {
-                continue;
-            }
             let row = FleetListRow::builder()
                 .convoy(convoy_address.cloned().unwrap_or_else(|| convoy.clone()).replace("@", " @ "))
                 .maybe_convoy_ref((!independent).then_some(convoy))
@@ -1088,11 +1050,6 @@ fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>,
     }
 }
 
-enum AttachSessionSource {
-    Durable,
-    Observed,
-}
-
 type ConvoyAddresses = HashMap<(String, String, Option<flotilla_protocol::NodeId>), String>;
 
 fn session_convoy_address<'a>(
@@ -1420,11 +1377,11 @@ mod tests {
 
     use chrono::Utc;
     use flotilla_protocol::{Command, CommandAction, CommandValue};
-    use flotilla_resources::{ConvoyPhase, ConvoySpec, ConvoyStatus, Host as ResourceHost, HostSpec};
+    use flotilla_resources::{ConvoySpec, Host as ResourceHost, HostSpec};
 
     use super::*;
-    use crate::in_process::tests::create_identity_convoy;
     use crate::in_process::tests::test_meta;
+    use crate::in_process::tests::{convoy_engine, create_identity_convoy, identity_launch};
     use crate::in_process::tests::{create_running_session, ensure_vessel};
     use crate::in_process::tests::{create_test_environment, install_engine_messages, test_engine};
     use crate::in_process::InProcessDaemon;
@@ -2185,8 +2142,8 @@ mod tests {
     #[tokio::test]
     async fn attach_resolves_role_addresses_to_the_live_record_before_planning_the_hop() {
         let (daemon, backend, _temp) = attach_fixture().await;
-        create_identity_convoy(&backend, "convoy-andamento", "governor", Some("andamento")).await;
-        create_identity_convoy(&backend, "convoy-flotilla", "governor", Some("flotilla")).await;
+        let andamento = create_identity_convoy(&daemon, "convoy-andamento", "governor", Some("andamento")).await;
+        let flotilla = create_identity_convoy(&daemon, "convoy-flotilla", "governor", Some("flotilla")).await;
         let local_host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
@@ -2198,8 +2155,8 @@ mod tests {
             .expect("local host resource");
         let engine = test_engine(&daemon);
         let environment = create_test_environment(&engine.environments, "governor-env", &local_host);
-        create_running_session(&engine, &environment, "governor-session", "convoy-andamento", "governor").await;
-        create_running_session(&engine, &environment, "flotilla-governor-session", "convoy-flotilla", "governor").await;
+        create_running_session(&engine, &environment, "governor-session", &andamento, "governor").await;
+        create_running_session(&engine, &environment, "flotilla-governor-session", &flotilla, "governor").await;
 
         let resolver = daemon.attach_resolver();
 
@@ -2207,7 +2164,7 @@ mod tests {
             .resolve_attach("governor", None, false, AttachMode::Default, Some("andamento"))
             .await
             .expect("bare role resolves inside project context");
-        assert_eq!(contextual.binding.as_ref().and_then(|binding| binding.convoy.as_deref()), Some("convoy-andamento"));
+        assert_eq!(contextual.binding.as_ref().and_then(|binding| binding.convoy.as_deref()), Some(andamento.as_str()));
         assert!(matches!(contextual.plan.0.as_slice(), [ResolvedAttachAction::Command(_)]));
 
         let ambiguous = resolver
@@ -2220,7 +2177,7 @@ mod tests {
             .resolve_attach("governor@andamento", None, false, AttachMode::Default, None)
             .await
             .expect("qualified role resolves without project context");
-        assert_eq!(qualified.binding.as_ref().and_then(|binding| binding.convoy.as_deref()), Some("convoy-andamento"));
+        assert_eq!(qualified.binding.as_ref().and_then(|binding| binding.convoy.as_deref()), Some(andamento.as_str()));
 
         let from_untracked_repo = daemon
             .execute_query(
@@ -2252,7 +2209,7 @@ mod tests {
     #[tokio::test]
     async fn failed_convoy_with_live_session_remains_attachable_and_listed() {
         let (daemon, backend, _temp) = attach_fixture().await;
-        create_identity_convoy(&backend, "convoy-failed", "coder", Some("flotilla")).await;
+        let failed = create_identity_convoy(&daemon, "convoy-failed", "coder", Some("flotilla")).await;
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
@@ -2265,20 +2222,12 @@ mod tests {
         let _messages = install_engine_messages(&daemon);
         let engine = test_engine(&daemon);
         let environment = create_test_environment(&engine.environments, "coder-env", &host);
-        create_running_session(&engine, &environment, "coder-session", "convoy-failed", "coder").await;
-        let convoys = backend.using::<ResourceConvoy>("flotilla");
-        let convoy = convoys.get("convoy-failed").await.expect("convoy");
-        convoys
-            .update_status(
-                "convoy-failed",
-                &convoy.metadata.resource_version,
-                &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
-            )
-            .await
-            .expect("failed convoy status");
+        create_running_session(&engine, &environment, "coder-session", &failed, "coder").await;
+        let convoy = backend.using::<ResourceConvoy>("flotilla").get(&failed).await.expect("convoy");
+        convoy_engine(&daemon).fail(&convoy, "operator", "failed").await.expect("failed convoy");
 
         let resolver = daemon.attach_resolver();
-        for reference in ["coder", "coder@flotilla", "convoy-failed", "coder-session"] {
+        for reference in ["coder", "coder@flotilla", failed.as_str(), "coder-session"] {
             let resolved = resolver.resolve_attach(reference, None, false, AttachMode::Default, None).await.expect(reference);
             assert_eq!(resolved.binding.as_ref().and_then(|binding| binding.convoy_phase), Some(flotilla_protocol::ConvoyPhase::Failed));
             assert_eq!(serde_json::to_value(&resolved.binding).expect("binding JSON")["convoy_phase"], "failed");
@@ -2292,16 +2241,16 @@ mod tests {
         let rows = daemon.fleet_list_internal().await.expect("fleet list").rows;
         assert!(rows
             .iter()
-            .any(|row| row.convoy_ref.as_deref() == Some("convoy-failed") && row.session.as_deref() == Some("coder-session")));
+            .any(|row| row.convoy_ref.as_deref() == Some(failed.as_str()) && row.session.as_deref() == Some("coder-session")));
     }
 
     #[tokio::test]
     async fn bare_role_prefers_newest_connectable_generation() {
         let (daemon, backend, _temp) = attach_fixture().await;
-        create_identity_convoy(&backend, "convoy-old", "coder", Some("flotilla")).await;
+        let convoy_old = create_identity_convoy(&daemon, "convoy-old", "coder", Some("flotilla")).await;
         let mut successor = ConvoySpec::builder().workflow_ref("review".to_string()).role("coder".to_string()).generation(2).build();
         successor.project_ref = Some("flotilla".to_string());
-        backend.using::<ResourceConvoy>("flotilla").create(&test_meta("convoy-new"), &successor).await.expect("successor");
+        let convoy_new = identity_launch(&daemon, "convoy-new", successor.clone()).await;
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
@@ -2313,20 +2262,21 @@ mod tests {
             .expect("local host resource");
         let engine = test_engine(&daemon);
         let environment = create_test_environment(&engine.environments, "coder-env", &host);
-        create_running_session(&engine, &environment, "terminal-old", "convoy-old", "coder").await;
-        let newer = create_running_session(&engine, &environment, "terminal-new", "convoy-new", "coder").await;
+        create_running_session(&engine, &environment, "terminal-old", &convoy_old, "coder").await;
+        let newer = create_running_session(&engine, &environment, "terminal-new", &convoy_new, "coder").await;
 
         let resolver = daemon.attach_resolver();
         let resolved = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect("newest generation");
         assert_eq!(resolved.binding.and_then(|binding| binding.session), Some("terminal-new".to_string()));
-        let old = resolver.resolve_attach("convoy-old", None, false, AttachMode::Default, None).await.expect("explicit old generation");
+        let old = resolver.resolve_attach(&convoy_old, None, false, AttachMode::Default, None).await.expect("explicit old generation");
         assert_eq!(old.binding.and_then(|binding| binding.session), Some("terminal-old".to_string()));
 
-        backend.using::<ResourceConvoy>("flotilla").create(&test_meta("convoy-peer"), &successor).await.expect("peer generation");
-        let peer = create_running_session(&engine, &environment, "terminal-peer", "convoy-peer", "coder").await;
-        let error =
-            resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect_err("same generation is ambiguous");
-        assert!(error.contains("ambiguous"), "{error}");
+        let convoy_peer = identity_launch(&daemon, "convoy-peer", successor).await;
+        let peer = create_running_session(&engine, &environment, "terminal-peer", &convoy_peer, "coder").await;
+        // A launch's generation is its launch number, so no two launches at one home share one:
+        // the later launch is the newer generation.
+        let newest = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect("later launch");
+        assert_eq!(newest.binding.and_then(|binding| binding.session), Some("terminal-peer".to_string()));
 
         // The peer's launch ends; the newest generation's next launch runs in a pool nothing serves.
         engine.terminals.release(&peer);
@@ -2353,19 +2303,13 @@ mod tests {
     #[tokio::test]
     async fn attach_reads_ignore_unrelated_convoys_and_messages() {
         use flotilla_store_testkit::{assert_flat_reads, ReadBudget, ReadOperation, ReadSnapshot};
-        async fn attach_reads(reference: &str, unrelated: usize) -> (ReadSnapshot, ReadSnapshot) {
+        async fn attach_reads(reference: &str, unrelated: usize) -> ReadSnapshot {
             let (daemon, backend, _temp) = attach_fixture().await;
-            create_identity_convoy(&backend, "convoy-main", "coder", Some("flotilla")).await;
-            let convoys = backend.using::<ResourceConvoy>("flotilla");
-            let convoy = convoys.get("convoy-main").await.expect("convoy");
-            convoys
-                .update_status(
-                    "convoy-main",
-                    &convoy.metadata.resource_version,
-                    &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
-                )
-                .await
-                .expect("convoy phase");
+            let main = create_identity_convoy(&daemon, "convoy-main", "coder", Some("flotilla")).await;
+            // The record is a launch of `convoy-main`; it is attached by the launch's name.
+            let reference = if reference == "convoy-main" { main.as_str() } else { reference };
+            let convoy = backend.using::<ResourceConvoy>("flotilla").get(&main).await.expect("convoy");
+            convoy_engine(&daemon).fail(&convoy, "operator", "failed").await.expect("convoy phase");
             let host = daemon.local_host_id().expect("host").to_string();
             backend
                 .using::<ResourceHost>("flotilla")
@@ -2374,9 +2318,9 @@ mod tests {
                 .expect("host");
             let engine = test_engine(&daemon);
             let environment = create_test_environment(&engine.environments, "env-main", &host);
-            create_running_session(&engine, &environment, "terminal-main", "convoy-main", "coder").await;
+            create_running_session(&engine, &environment, "terminal-main", &main, "coder").await;
             for n in 0..unrelated {
-                create_identity_convoy(&backend, &format!("unrelated-{n}"), "other", Some("other")).await;
+                create_identity_convoy(&daemon, &format!("unrelated-{n}"), "other", Some("other")).await;
                 backend
                     .using::<flotilla_resources::Message>("flotilla")
                     .create(
@@ -2396,41 +2340,28 @@ mod tests {
             // the same data but retain separate, uncounted backend handles.
             let request_backend = backend.clone().with_read_counts();
             let mut resolver = daemon.attach_resolver();
-            let request_observations = resolver.observed_resource_backend.clone().with_read_counts();
             resolver.resource_backend = &request_backend;
-            resolver.observed_resource_backend = &request_observations;
             // A read through the daemon handle must not leak into the
             // request observer, even when it reads the same resource kind.
-            backend.using::<ResourceConvoy>("flotilla").get("convoy-main").await.expect("daemon read");
+            backend.using::<ResourceConvoy>("flotilla").get(&main).await.expect("daemon read");
             assert!(request_backend.read_snapshot().is_empty());
             let resolved = resolver.resolve_attach(reference, None, false, AttachMode::Default, None).await.expect("attach");
             let binding = resolved.binding.expect("binding");
             assert_eq!(binding.session.as_deref(), Some("terminal-main"));
             assert_eq!(binding.convoy_phase, Some(flotilla_protocol::ConvoyPhase::Failed));
             let reads = request_backend.read_snapshot();
-            // Direct session references select no Convoy candidates; one
-            // exact parent get restores phase without a namespace read.
-            let convoy_calls = if reference.starts_with("terminal-") { 2 } else { 1 };
-            assert_eq!(reads.calls_by_kind().get("Convoy"), Some(&convoy_calls));
-            assert_eq!(reads.objects_by_kind().get("Convoy"), Some(&1));
-            // Terminal sessions are read from the engine's launches through keyed reads, never
-            // from this counted store.
+            // Convoys and terminal sessions are read from the engine's launches through keyed
+            // reads, never from this counted store.
+            assert_eq!(reads.calls_by_kind().get("Convoy"), None);
             assert_eq!(reads.calls_by_kind().get("TerminalSession"), None);
             // #3078: reachability checks and final planning share one Host
             // catalog snapshot for this request. The store counts its local
             // and replica source lists separately.
             reads.assert_within(
-                &ReadBudget::new()
-                    .objects("Convoy", ReadOperation::Query, 1, 1)
-                    .objects("Convoy", ReadOperation::Get, 1, 1)
-                    .objects("Environment", ReadOperation::Get, 2, 2)
-                    .calls("Host", ReadOperation::List, 2),
+                &ReadBudget::new().objects("Environment", ReadOperation::Get, 2, 2).calls("Host", ReadOperation::List, 2),
                 reference,
             );
-            let observed = request_observations.read_snapshot();
-            assert_eq!(observed.calls_by_kind().get("TerminalSession"), Some(&1));
-            assert_eq!(observed.objects_by_kind().get("TerminalSession"), Some(&0));
-            (reads, observed)
+            reads
         }
         for reference in ["coder", "coder@flotilla", "convoy-main", "terminal-main", "terminal-ma"] {
             assert_flat_reads([0, 40], |unrelated| attach_reads(reference, unrelated)).await;
@@ -2440,9 +2371,9 @@ mod tests {
     // A known convoy without a terminal is still starting, not a deleted session.
     #[tokio::test]
     async fn unstarted_convoy_attach_never_claims_session_disappeared() {
-        let (daemon, backend, _temp) = attach_fixture().await;
-        create_identity_convoy(&backend, "convoy-starting", "coder", Some("flotilla")).await;
-        for reference in ["convoy-starting", "coder", "coder@flotilla"] {
+        let (daemon, _backend, _temp) = attach_fixture().await;
+        let starting = create_identity_convoy(&daemon, "convoy-starting", "coder", Some("flotilla")).await;
+        for reference in [starting.as_str(), "coder", "coder@flotilla"] {
             let error = daemon.attach_resolver().resolve_attach(reference, None, false, AttachMode::Default, None).await.unwrap_err();
             assert!(!error.contains("no longer exists"), "{error}");
             assert!(error.contains("not started yet"), "{error}");
@@ -2452,7 +2383,7 @@ mod tests {
     #[tokio::test]
     async fn deleted_terminal_session_is_named_in_attach_error() {
         let (daemon, backend, _temp) = attach_fixture().await;
-        create_identity_convoy(&backend, "convoy-gone", "coder", Some("flotilla")).await;
+        let convoy_gone = create_identity_convoy(&daemon, "convoy-gone", "coder", Some("flotilla")).await;
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
@@ -2464,7 +2395,7 @@ mod tests {
             .expect("local host resource");
         let engine = test_engine(&daemon);
         let environment = create_test_environment(&engine.environments, "coder-env", &host);
-        let gone = create_running_session(&engine, &environment, "terminal-gone", "convoy-gone", "coder").await;
+        let gone = create_running_session(&engine, &environment, "terminal-gone", &convoy_gone, "coder").await;
         // Its launch ended and was released.
         engine.terminals.release(&gone);
 
@@ -2472,7 +2403,7 @@ mod tests {
         let error = resolver.resolve_attach("terminal-gone", None, false, AttachMode::Default, None).await.expect_err("gone session");
         assert_eq!(error, format!("session terminal-gone no longer exists on {}", daemon.host_name));
         // The ended launch is kept, so the convoy and its role name the session that ended.
-        for reference in ["convoy-gone", "coder@flotilla"] {
+        for reference in [convoy_gone.as_str(), "coder@flotilla"] {
             let error = resolver.resolve_attach(reference, None, false, AttachMode::Default, None).await.expect_err(reference);
             assert_eq!(error, format!("session terminal-gone no longer exists on {}", daemon.host_name));
         }
