@@ -55,6 +55,9 @@ impl Exposition {
             "flotilla_store_read_contention_total" => "Busy read refusals returned to callers; each refusal counts once.",
             "flotilla_store_queue_wait_seconds" => "Time queued before a store read or write starts, in seconds.",
             "flotilla_store_execution_seconds" => "Store read or write execution time, excluding queue wait, in seconds.",
+            "flotilla_decided_store_write_seconds" => {
+                "Decided store write time, from its transaction's start through its commit, local or applied, in seconds."
+            }
             "flotilla_convoys_waiting_capacity" => "Convoys this home holds that wait for capacity on a host their placement chose.",
             "flotilla_dispatch_time_from_ready_seconds" => {
                 "Time from an issue entering the dispatch queue to its convoy's creation, in seconds."
@@ -98,6 +101,7 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
     }
     out.number("flotilla_store_reads_shed_total", "counter", "", store.reads_shed);
     out.number("flotilla_store_read_contention_total", "counter", "", store.read_contention);
+    out.histogram("flotilla_decided_store_write_seconds", "", &daemon.decided_store_metrics().snapshot().write_execution);
     if let Some(controllers) = metrics.controllers.get() {
         // Kinds are registered by the compiled controller set, never resource IDs.
         for (kind, snapshot) in controllers.snapshot() {

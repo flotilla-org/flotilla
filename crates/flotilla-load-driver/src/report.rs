@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, fmt::Write as _, time::Duration};
 
-use flotilla_store::load_metrics::{HistogramSnapshot, LatencySummary};
+use flotilla_store::load_metrics::{HistogramSnapshot, LatencySummary, StoreLoadSnapshot};
 use serde::Serialize;
 
 use crate::target::{HomeSample, TargetSample};
@@ -91,6 +91,7 @@ pub struct MixSummary {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HomeReport {
     pub store: Option<StoreReport>,
+    pub decided_store: Option<StoreReport>,
     pub controllers: BTreeMap<String, ControllerReport>,
     pub replication: ReplicationReport,
     pub turn_delivery: LatencySummary,
@@ -160,20 +161,24 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
         .enumerate()
         .map(|(index, end)| {
             let start = start.homes.get(index).unwrap_or(&empty);
-            let store = end.store.as_ref().map(|end| {
-                let phase = end.since(start.store.as_ref().unwrap_or(&Default::default()));
-                StoreReport {
-                    write_wait: phase.write_wait.summary(),
-                    write_execution: phase.write_execution.summary(),
-                    writes_per_second: per_second(phase.write_execution.count(), seconds),
-                    write_queue_peak: phase.write_queue_peak,
-                    read_wait: phase.read_wait.summary(),
-                    read_execution: phase.read_execution.summary(),
-                    reads_per_second: per_second(phase.read_execution.count(), seconds),
-                    read_queue_peak: phase.read_queue_peak,
-                    reads_shed: phase.reads_shed,
-                }
-            });
+            let store_report = |end: &Option<StoreLoadSnapshot>, start: &Option<StoreLoadSnapshot>| {
+                end.as_ref().map(|end| {
+                    let phase = end.since(start.as_ref().unwrap_or(&Default::default()));
+                    StoreReport {
+                        write_wait: phase.write_wait.summary(),
+                        write_execution: phase.write_execution.summary(),
+                        writes_per_second: per_second(phase.write_execution.count(), seconds),
+                        write_queue_peak: phase.write_queue_peak,
+                        read_wait: phase.read_wait.summary(),
+                        read_execution: phase.read_execution.summary(),
+                        reads_per_second: per_second(phase.read_execution.count(), seconds),
+                        read_queue_peak: phase.read_queue_peak,
+                        reads_shed: phase.reads_shed,
+                    }
+                })
+            };
+            let store = store_report(&end.store, &start.store);
+            let decided_store = store_report(&end.decided_store, &start.decided_store);
             let controllers = end
                 .controllers
                 .iter()
@@ -197,6 +202,7 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
             let replication = end.replication.since(&start.replication);
             HomeReport {
                 store,
+                decided_store,
                 controllers,
                 replication: ReplicationReport {
                     snapshots: replication.snapshots,
@@ -318,6 +324,9 @@ impl LoadReport {
                     store.reads_per_second,
                     store.reads_shed
                 );
+            }
+            if let Some(decided) = &home.decided_store {
+                let _ = writeln!(out, "| Decided store writes | {} ({:.1}/s) |", latency(&decided.write_execution), decided.writes_per_second);
             }
             let _ = writeln!(out, "| Turn delivery (created → receipt) | {} |", latency(&home.turn_delivery));
             let replication = &home.replication;

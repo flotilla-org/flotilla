@@ -325,7 +325,7 @@ impl Store {
     /// Begins an immediate write transaction; many writes may share it.
     pub fn write(&mut self) -> Result<Write<'_>, StoreError> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Ok(Write { tx, runtime: &mut self.runtime, pending: Pending::default() })
+        Ok(Write { tx, runtime: &mut self.runtime, pending: Pending::default(), began: std::time::Instant::now() })
     }
 
     /// Begins a deferred read transaction, for consistent loads across tables.
@@ -563,6 +563,8 @@ pub struct Write<'s> {
     tx: Transaction<'s>,
     runtime: &'s mut Runtime,
     pending: Pending,
+    /// When its transaction began, so a commit reports how long the write ran.
+    began: std::time::Instant,
 }
 
 impl Write<'_> {
@@ -914,6 +916,7 @@ impl Write<'_> {
 
     pub fn commit(self) -> Result<(), StoreError> {
         self.tx.commit()?;
+        let took = self.began.elapsed();
         let Pending { strings, identities, ids, watermarks, applied, kinds, moved, rescan, .. } = self.pending;
         let heard: BTreeSet<String> = watermarks.keys().cloned().collect();
         self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner).extend(watermarks);
@@ -932,7 +935,7 @@ impl Write<'_> {
             self.runtime.ids.insert(id, identity);
         }
         // Last, so a woken reader sees the new watermarks and interned names.
-        self.runtime.commits.committed(&crate::stream::Committed { kinds: &kinds, homes: &moved, heard: &heard, rescan });
+        self.runtime.commits.committed(&crate::stream::Committed { kinds: &kinds, homes: &moved, heard: &heard, rescan, took });
         Ok(())
     }
 }
