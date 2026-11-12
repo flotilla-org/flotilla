@@ -434,8 +434,19 @@ fn every_old_phase_imports_and_rehearses() {
         let mut target = rehearsal().expect("rehearsal");
         let mut found = ImportReport::default();
         import_image_builds(&[(demanded.clone(), HOME.to_owned())], &|_| Ok(builder.to_owned()), &mut target, &mut found);
+        // The row is carried once, whether as a demand alone or with its launch.
+        assert_eq!(found.rows["ImageBuild"].imported, 1, "built at {builder}");
         assert_eq!((found.refused, found.imported), (vec![], imported), "built at {builder}");
     }
+    let retired = ResourceObject::<flotilla_resources::ImageBuild> {
+        metadata: meta("image-stage"),
+        spec: ImageBuildResourceSpec::Retired,
+        status: None,
+    };
+    let mut found = ImportReport::default();
+    import_image_builds(&[(retired, HOME.to_owned())], &|_| Ok(HOME.to_owned()), &mut rehearsal().expect("rehearsal"), &mut found);
+    assert_eq!(found.dropped, BTreeMap::from([(("ImageBuild", "a retired per-stage build"), 1)]));
+    assert_eq!((found.rows["ImageBuild"].dropped, found.rows["ImageBuild"].imported), (1, 0), "the dropped row is counted");
     let mut found = ImportReport::default();
     import_image_builds(
         &[(demanded.clone(), HOME.to_owned())],

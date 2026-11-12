@@ -522,7 +522,7 @@ pub fn import_image_builds(
         }
         let name = &build.metadata.name;
         let Some(spec) = build.spec.current() else {
-            *report.dropped.entry((ImageBuildKind::NAME, "a retired per-stage build")).or_default() += 1;
+            report.drop_rows(ImageBuildKind::NAME, "a retired per-stage build", 1);
             continue;
         };
         let refuse = |reason: String| ImportRefusal { kind: ImageBuildKind::NAME, record: name.clone(), reason };
@@ -547,6 +547,8 @@ pub fn import_image_builds(
             }
         }
         if !projected && builder != *home {
+            // Carried as this home's demand alone: the builder home launches it.
+            report.rows(ImageBuildKind::NAME, RowOutcome::Imported, 1);
             continue;
         }
         let result = image_build_state(build).map_err(refuse).and_then(|state| {
