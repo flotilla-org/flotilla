@@ -127,6 +127,22 @@ pub fn replicate_home_at(from: &Service, home: &str, target: &Service, at: DateT
         .expect("receive home");
 }
 
+/// Sends `target` the entries `from`, homed at `home`, has written since `target` last heard it,
+/// heard now: a peer's next entries arriving, as a running daemon's follower receives them. A
+/// snapshot round, as [`replicate_home`] sends, makes every follower at `target` read again.
+pub fn replicate_home_tail(from: &Service, home: &str, target: &Service) {
+    let after = target.last_sequence(home).expect("the target's sequence for the home");
+    let mut frames = Vec::new();
+    from.serve(Some(after), Timestamp::from_datetime(&Utc::now()), |frame| {
+        frames.push(frame.to_vec());
+        Ok(())
+    })
+    .expect("serve home");
+    target
+        .with_store(|store| Follower::new(store).receive(home, |sink| frames.iter().try_for_each(|frame| sink(frame))))
+        .expect("receive home");
+}
+
 /// The other homes each target has been sent, by the target and the home: a home keeps its log, so
 /// a later write reaches the target as a peer's next entries would.
 type Homes = Mutex<Vec<(Weak<Service>, String, Arc<OtherHome>)>>;

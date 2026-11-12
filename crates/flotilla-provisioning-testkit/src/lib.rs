@@ -13,7 +13,9 @@ pub use checkouts::CheckoutFixture;
 pub use clones::CloneFixture;
 pub use environments::EnvironmentFixture;
 pub use memory_store::memory_store;
-pub use other_home::{other_home_for, put_host_at_its_home, put_host_at_its_home_heard, replicate_home, replicate_home_at, OtherHome};
+pub use other_home::{
+    other_home_for, put_host_at_its_home, put_host_at_its_home_heard, replicate_home, replicate_home_at, replicate_home_tail, OtherHome,
+};
 use std::sync::{Arc, Mutex};
 pub use terminals::TerminalsFixture;
 pub use vessels::VesselsFixture;
