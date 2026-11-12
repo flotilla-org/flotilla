@@ -1100,7 +1100,7 @@ async fn connector_partial_watch_failure_cancels_admitted_watches_before_retry()
 fn connector_clock_expires_landed_subjects_without_resource_updates() {
     let mut state = ConnectorState::default();
     let mut convoy = linked_subject_convoy();
-    convoy.phase = flotilla_protocol::result_set::ConvoyPhase::Landed;
+    convoy.phase = Some(flotilla_protocol::result_set::ConvoyPhase::Landed);
     convoy.finished_at = Some("2026-10-01T12:00:00Z".parse().expect("landing"));
     state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
         seq: 1,

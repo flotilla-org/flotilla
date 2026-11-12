@@ -242,7 +242,9 @@ impl BadgeState {
     }
 }
 
-pub fn convoy_badge(phase: ConvoyPhase, initializing: bool) -> Badge {
+/// `None` is an unreadable launch: its state is unknown and someone has to look.
+pub fn convoy_badge(phase: Option<ConvoyPhase>, initializing: bool) -> Badge {
+    let Some(phase) = phase else { return Badge { state: BadgeState::Waiting, attention: true } };
     if initializing {
         return Badge { state: BadgeState::Waiting, attention: false };
     }
@@ -527,7 +529,7 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
     let project = entity::project(&role.resource.namespace, project_name, "fleet");
     let attempts = standing_attempts(role, convoys);
     let latest = attempts.last().copied();
-    let live = attempts.iter().rev().copied().find(|convoy| !convoy.phase.is_terminal());
+    let live = attempts.iter().rev().copied().find(|convoy| convoy.is_live());
 
     // The primary target is the live attempt's only vessel. Multi-vessel
     // attempts have no single attach target yet and stay held.
@@ -574,7 +576,7 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
         facts.push((KEY_ROLE_HOLD, MetadataValue::text(hold.as_str())));
     }
     if let Some(convoy) = live {
-        facts.push((KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())));
+        facts.extend(convoy.phase.map(|phase| (KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str()))));
         facts.extend(surface_facts(convoy.surface_state));
         facts.extend(readiness_facts(&convoy.readiness(), attach.is_some()));
     }
@@ -612,7 +614,7 @@ fn mark_superseded_convoys(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
     let superseded = convoys
         .iter()
         .filter(|row| {
-            row.phase.is_terminal()
+            row.is_ended()
                 && match (&row.project_ref, &row.address_role) {
                     (Some(project), Some(role)) => {
                         latest.get(&(&row.resource.namespace, project, role)).is_some_and(|generation| *generation > row.generation)
@@ -708,8 +710,8 @@ fn awareness_node_entity(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Option<
                 (KEY_CONVOY_NAME, MetadataValue::text(semantic_label)),
                 (KEY_DISPLAY_LABEL, MetadataValue::text(node.label.clone())),
             ];
-            if let Some(row) = row {
-                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(row.phase.as_str())));
+            if let Some(phase) = row.and_then(|row| row.phase) {
+                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
             }
             facts.extend(label_tier_facts(semantic_label));
             Some((entity, facts))
@@ -787,8 +789,8 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
             let semantic_label = entry.annotations.get(KEY_CONVOY_NAME).map(String::as_str).unwrap_or(name);
             let mut facts =
                 vec![(KEY_CONVOY, MetadataValue::text(entity.id.clone())), (KEY_CONVOY_NAME, MetadataValue::text(semantic_label))];
-            if let Some(row) = row {
-                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(row.phase.as_str())));
+            if let Some(phase) = row.and_then(|row| row.phase) {
+                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
             }
             label = semantic_label.to_owned();
             facts.extend(label_tier_facts(semantic_label));
@@ -815,8 +817,8 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
                 (KEY_VESSEL, MetadataValue::text(entity.id.clone())),
                 (KEY_VESSEL_NAME, MetadataValue::text(label.clone())),
             ];
-            if let Some(row) = row {
-                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(row.phase.as_str())));
+            if let Some(phase) = row.and_then(|row| row.phase) {
+                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
             }
             facts.extend(label_tier_facts(&label));
             (entity, facts)
@@ -928,8 +930,8 @@ fn convoy_identity_facts(convoy: &ConvoyRow) -> Vec<(&'static str, MetadataValue
         (KEY_CONVOY, MetadataValue::text(target.id)),
         (KEY_CONVOY_NAME, MetadataValue::text(&convoy.name)),
         (KEY_DISPLAY_LABEL, MetadataValue::text(&convoy.name)),
-        (KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())),
     ];
+    facts.extend(convoy.phase.map(|phase| (KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str()))));
     facts.extend(label_tier_facts(&convoy.name));
     facts
 }
@@ -1026,10 +1028,13 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     if let Some(message) = &convoy.message {
         facts.push((KEY_CONVOY_MESSAGE, MetadataValue::text(message.clone())));
     }
-    if convoy.surface_state.needs_attention() {
+    // An unreadable launch's badge asks for attention: someone has to look at its record.
+    if convoy.surface_state.needs_attention() || (convoy.unreadable.is_some() && badge.attention) {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
-    if let Some(message) = &convoy.message {
+    if let Some(reason) = &convoy.unreadable {
+        facts.push((KEY_SUMMARY_TEXT, MetadataValue::text(format!("unreadable: {reason}"))));
+    } else if let Some(message) = &convoy.message {
         facts.push((KEY_SUMMARY_TEXT, MetadataValue::text(message.clone())));
     } else if !convoy.vessels.is_empty() {
         facts.push((KEY_SUMMARY_TEXT, MetadataValue::text(format!("{done}/{} vessels done", convoy.vessels.len()))));
@@ -1067,10 +1072,9 @@ fn project_vessel(
         facts.push((SEGMENT_REPO, MetadataValue::text(repo)));
         facts.push((KEY_REPO_NAME, MetadataValue::text(repo_label(repo))));
     }
+    facts.extend([(KEY_CONVOY, MetadataValue::text(convoy_entity.id)), (KEY_CONVOY_NAME, MetadataValue::text(convoy.name.clone()))]);
+    facts.extend(convoy.phase.map(|phase| (KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str()))));
     facts.extend([
-        (KEY_CONVOY, MetadataValue::text(convoy_entity.id)),
-        (KEY_CONVOY_NAME, MetadataValue::text(convoy.name.clone())),
-        (KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())),
         (KEY_VESSEL, MetadataValue::text(entity.id.clone())),
         (KEY_VESSEL_NAME, MetadataValue::text(vessel.name.clone())),
         (KEY_DISPLAY_LABEL, MetadataValue::text(vessel.name.clone())),

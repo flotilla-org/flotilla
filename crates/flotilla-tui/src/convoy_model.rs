@@ -178,7 +178,10 @@ pub struct ConvoySummary {
     pub workflow_ref: String,
     #[builder(default)]
     pub dispatching_principal_ref: PrincipalRef,
-    pub phase: ConvoyPhase,
+    /// `None` exactly when the launch is `unreadable`.
+    pub phase: Option<ConvoyPhase>,
+    /// Why this launch's record could not be read.
+    pub unreadable: Option<String>,
     pub placement_decision: Option<PlacementDecision>,
     pub message: Option<String>,
     pub disposition: Option<String>,
@@ -210,7 +213,8 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
             origin_host: row.resource.host.clone(),
             workflow_ref: row.workflow_ref.clone(),
             dispatching_principal_ref: row.dispatching_principal_ref.clone(),
-            phase: row.phase.into(),
+            phase: row.phase.map(Into::into),
+            unreadable: row.unreadable.clone(),
             placement_decision: row.placement_decision.clone(),
             message: row.message.clone(),
             disposition: row.disposition.clone(),
@@ -229,6 +233,16 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
 }
 
 impl ConvoySummary {
+    /// The launch has a known terminal phase.
+    pub fn is_ended(&self) -> bool {
+        self.phase.is_some_and(ConvoyPhase::is_terminal)
+    }
+
+    /// The phase as the surfaces label it; an unreadable launch has none.
+    pub fn phase_label(&self) -> &'static str {
+        self.phase.map_or("unreadable", ConvoyPhase::label)
+    }
+
     pub fn address(&self) -> String {
         self.project_ref.as_ref().map_or_else(|| self.name.clone(), |project| format!("{}@{project}", self.name))
     }

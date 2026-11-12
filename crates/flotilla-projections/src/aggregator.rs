@@ -2596,7 +2596,6 @@ impl Aggregator {
                 .unreadable(reason.clone())
                 .generation(convoy.spec.generation)
                 .workflow_ref(&convoy.spec.workflow_ref)
-                .phase(ConvoyPhase::Pending)
                 .maybe_project_ref(convoy.spec.project_ref.clone())
                 .build();
         }
@@ -5405,7 +5404,7 @@ mod tests {
         let result = state.result_set().await;
         let rows = result.rows.as_convoys().expect("convoy rows");
         assert!(
-            matches!(rows, [row] if row.name == "failed-convoy" && row.phase == ConvoyPhase::Failed),
+            matches!(rows, [row] if row.name == "failed-convoy" && row.phase == Some(ConvoyPhase::Failed)),
             "a terminal convoy must remain visible while its finalizers reap child resources: {rows:?}"
         );
 
@@ -5895,7 +5894,7 @@ mod tests {
             panic!("expected result delta");
         };
         let phase_row = &phase_delta.changes.as_convoys().expect("convoy changes")[0];
-        assert_eq!(phase_row.phase, ConvoyPhase::Landed);
+        assert_eq!(phase_row.phase, Some(ConvoyPhase::Landed));
         assert_eq!(phase_row.disposition.as_deref(), Some("shipped"));
         assert!(phase_row.subjects.is_empty());
 
@@ -6914,7 +6913,7 @@ mod tests {
                     aggregator.terminal_sessions.insert(session_key(&source), source);
                 }
                 let row = aggregator.summarize(&reference, &convoy);
-                assert_eq!(row.phase, ConvoyPhase::Active, "readiness must not rewrite lifecycle");
+                assert_eq!(row.phase, Some(ConvoyPhase::Active), "readiness must not rewrite lifecycle");
                 assert_eq!(row.readiness().state, expected, "operation {op}");
                 if op == 1 || op == 2 {
                     assert!(row.readiness().explanation().contains("Forgejo authentication refused"));
@@ -7456,7 +7455,7 @@ mod tests {
                     aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
                     let result = state.result_set().await;
                     let row = &result.rows.as_convoys().unwrap()[0];
-                    assert_eq!(row.phase, super::convoy_phase(convoy_phase));
+                    assert_eq!(row.phase, Some(super::convoy_phase(convoy_phase)));
                     assert_eq!(row.surface_state, SurfaceState::Available);
                     assert!(row.vessels.iter().all(|vessel| vessel.surface_state == SurfaceState::Available));
                 }
@@ -8497,7 +8496,7 @@ mod hold_attention_tests {
                         !phase.is_terminal() || source == Some("settlement"),
                         "{phase:?}, explicit={explicit_hold}, source={source:?}"
                     );
-                    assert_eq!(row.phase, convoy_phase(phase));
+                    assert_eq!(row.phase, Some(convoy_phase(phase)));
                     if phase.is_terminal() && source != Some("settlement") {
                         assert!(row.message.is_none(), "stale delivery reason must not label the terminal row");
                     }

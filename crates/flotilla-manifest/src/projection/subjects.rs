@@ -121,7 +121,7 @@ fn observe<T: PresentationValue>(
 
 pub(super) fn project_role_attempts(catalog: &mut Catalog, role: &StandingRoleRow, convoys: &[ConvoyRow]) {
     let attempts = standing_attempts(role, convoys);
-    let current = attempts.iter().rev().find(|convoy| !convoy.phase.is_terminal()).copied();
+    let current = attempts.iter().rev().find(|convoy| convoy.is_live()).copied();
     let convoy_ref =
         |convoy: &ConvoyRow| entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
     let mut facts = vec![
@@ -178,12 +178,13 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         }
         // A future finished_at from clock skew remains in the window until
         // the local clock catches up; it must not disappear prematurely.
-        let visible = !convoy.phase.is_terminal()
-            || (convoy.phase == ConvoyPhase::Landed
+        let landed_convoy = convoy.phase == Some(ConvoyPhase::Landed);
+        let visible = !convoy.is_ended()
+            || (landed_convoy
                 && convoy.finished_at.zip(observations.now).is_some_and(|(finished, now)| (now - finished).num_seconds() < 86_400));
         let mut forward: BTreeMap<Relationship, BTreeSet<EntityRef>> = BTreeMap::new();
         for entry in &convoy.subjects {
-            if convoy.phase == ConvoyPhase::Landed {
+            if landed_convoy {
                 landed.insert(entry.subject.clone());
             }
             if !visible {
@@ -218,7 +219,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         let role_ref = role_entity(role);
         projects.insert(role_ref.clone(), entity::project(&role.resource.namespace, super::role_project(role), "fleet").id);
         let attempts = standing_attempts(role, input.convoys);
-        let current = attempts.iter().rev().find(|convoy| !convoy.phase.is_terminal()).copied();
+        let current = attempts.iter().rev().find(|convoy| convoy.is_live()).copied();
         let mut facts = Vec::new();
         if let Some(convoy) = current {
             let target = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));

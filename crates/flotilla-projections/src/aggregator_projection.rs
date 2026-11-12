@@ -342,7 +342,7 @@ impl AggregatorProjectionState {
             .local_rows
             .values()
             .chain(convoys.replica_rows.values().flat_map(|rows| rows.values()))
-            .filter(|convoy| convoy_phase_represents_issues(convoy.phase))
+            .filter(|convoy| convoy.phase.is_some_and(convoy_phase_represents_issues))
             .flat_map(|convoy| convoy.issues.iter().map(|issue| issue.reference.clone()))
             .collect()
     }
@@ -756,7 +756,7 @@ mod tests {
         let mut rows = (0..4)
             .map(|index| {
                 let mut row = convoy_row("flotilla", &format!("terminal-{index}"), "roadmap");
-                row.phase = ConvoyPhase::Landed;
+                row.phase = Some(ConvoyPhase::Landed);
                 row
             })
             .collect::<Vec<_>>();
@@ -953,11 +953,11 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let active = convoy_row("flotilla", "active", "roadmap");
         let mut landing = convoy_row("flotilla", "landing", "roadmap");
-        landing.phase = ConvoyPhase::Landing;
+        landing.phase = Some(ConvoyPhase::Landing);
         let mut landed = convoy_row("flotilla", "landed", "roadmap");
-        landed.phase = ConvoyPhase::Landed;
+        landed.phase = Some(ConvoyPhase::Landed);
         let mut failed = convoy_row("flotilla", "failed", "roadmap");
-        failed.phase = ConvoyPhase::Failed;
+        failed.phase = Some(ConvoyPhase::Failed);
         {
             let mut convoys = state.write().await;
             convoys.local_rows = [active.clone(), landing.clone(), landed.clone(), failed.clone()]

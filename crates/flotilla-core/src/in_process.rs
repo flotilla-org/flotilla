@@ -2886,7 +2886,7 @@ impl InProcessDaemon {
                 record_name: &row.resource.name,
                 role: row.address_role.as_deref(),
                 project: row.project_ref.as_deref(),
-                terminal: row.phase.is_terminal(),
+                terminal: row.is_ended(),
             })
             .collect::<Vec<_>>();
         let selected = resolve_convoy_candidate_indices(&identities, name)?;

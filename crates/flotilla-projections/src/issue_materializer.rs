@@ -1822,7 +1822,7 @@ mod tests {
             vec!["WIDGET-809"]
         );
 
-        state.write().await.local_rows.get_mut(&resource).expect("represented convoy row").phase = ConvoyPhase::Landed;
+        state.write().await.local_rows.get_mut(&resource).expect("represented convoy row").phase = Some(ConvoyPhase::Landed);
         materializer.refilter_active_queries();
         let DaemonEvent::ResultSet(restored) = next_event(&mut events).await else { panic!("refilter must emit a result set") };
         assert_eq!(

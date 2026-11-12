@@ -394,7 +394,7 @@ impl ConnectorState {
         self.projection.expire_at(
             node.clone(),
             row.as_ref()
-                .filter(|row| row.phase == flotilla_protocol::result_set::ConvoyPhase::Landed)
+                .filter(|row| row.phase == Some(flotilla_protocol::result_set::ConvoyPhase::Landed))
                 .and_then(|row| row.finished_at)
                 .map(|at| at + chrono::Duration::hours(24)),
         );

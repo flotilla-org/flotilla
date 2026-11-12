@@ -480,9 +480,12 @@ pub struct ResourceReplicationFailure {
 }
 
 fn convoy_state_label(row: &ConvoyRow) -> String {
+    let Some(phase) = row.phase else {
+        return format!("unreadable: {}", row.unreadable.as_deref().unwrap_or("no reason recorded"));
+    };
     match row.message.as_deref().filter(|message| !message.trim().is_empty()) {
-        Some(message) => format!("{}: {message}", row.phase),
-        None => row.phase.to_string(),
+        Some(message) => format!("{phase}: {message}"),
+        None => phase.to_string(),
     }
 }
 
@@ -588,6 +591,21 @@ mod tests {
         assert_eq!(merged_rows[0].host, remote);
         // The retained convoy row carries its trigger after the crew is gone.
         assert_eq!(merged_rows[0].landing_reason.as_deref(), Some("landed: coder complete (#2973) after merged-unclaimed"));
+    }
+
+    #[test]
+    fn an_unreadable_crewless_convoy_reads_as_unreadable_not_pending() {
+        let convoy = ConvoyRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy"))
+            .name("convoy".to_string())
+            .workflow_ref("workflow".to_string())
+            .unreadable("admission document does not decode")
+            .build();
+        let result_sets = vec![ResultSet { seq: 1, rows: Rows::Convoys { scope: None, rows: vec![convoy] }, state: Default::default() }];
+
+        let mut merged_rows = Vec::new();
+        append_crewless_convoy_rows(&mut merged_rows, "flotilla", &result_sets, &HostName::new("local"), FleetStaleness::Local);
+        assert_eq!(merged_rows[0].crew_state, "unreadable: admission document does not decode");
     }
 
     #[test]

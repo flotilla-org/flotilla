@@ -906,11 +906,29 @@ fn catalog_diff_unsets_removed_entity_facts() {
 
 #[test]
 fn badges_preserve_normalized_status_and_attention() {
-    assert_eq!(convoy_badge(ConvoyPhase::Pending, false), Badge { state: BadgeState::Waiting, attention: false });
-    assert_eq!(convoy_badge(ConvoyPhase::Active, false), Badge { state: BadgeState::Active, attention: false });
-    assert_eq!(convoy_badge(ConvoyPhase::Failed, false), Badge { state: BadgeState::Failed, attention: true });
+    assert_eq!(convoy_badge(Some(ConvoyPhase::Pending), false), Badge { state: BadgeState::Waiting, attention: false });
+    assert_eq!(convoy_badge(Some(ConvoyPhase::Active), false), Badge { state: BadgeState::Active, attention: false });
+    assert_eq!(convoy_badge(Some(ConvoyPhase::Failed), false), Badge { state: BadgeState::Failed, attention: true });
+    assert_eq!(convoy_badge(None, false), Badge { state: BadgeState::Waiting, attention: true });
     assert_eq!(work_badge(WorkPhase::Ready), Badge { state: BadgeState::Waiting, attention: true });
     assert_eq!(session_badge(SessionPhase::Running), Badge { state: BadgeState::Active, attention: false });
+}
+
+#[test]
+fn an_unreadable_convoy_asks_for_attention_with_its_reason_and_no_phase() {
+    let unreadable = ConvoyRow::builder()
+        .resource(convoy_ref("dev", "broken"))
+        .name("broken")
+        .workflow_ref("implement")
+        .unreadable("admission document does not decode")
+        .build();
+    let patches = project_catalog(&catalog_input(&[unreadable]), &mint()).reassert_patches();
+    let patch = find_entity(&patches, &entity::convoy("dev", "broken", "kiwi"));
+
+    assert_eq!(text(patch, KEY_STATUS_STATE), "waiting");
+    assert_eq!(patch.set.get(KEY_STATUS_ATTENTION).map(|fact| &fact.value), Some(&MetadataValue::Bool(true)));
+    assert_eq!(text(patch, KEY_SUMMARY_TEXT), "unreadable: admission document does not decode");
+    assert!(!patch.set.contains_key(crate::keys::KEY_CONVOY_PHASE), "{patch:?}");
 }
 
 #[test]
@@ -1455,14 +1473,14 @@ fn live_role_carries_its_attempts_vessel_attention() {
     let quiet = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live)).reassert_patches();
     assert!(!find_entity(&quiet, &role_entity_for("p", "governor")).set.contains_key(KEY_STATUS_ATTENTION));
 
-    live.phase = ConvoyPhase::Interrupted;
+    live.phase = Some(ConvoyPhase::Interrupted);
     let interrupted = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live)).reassert_patches();
     let interrupted_role = find_entity(&interrupted, &role_entity_for("p", "governor"));
     let interrupted_convoy = find_entity(&interrupted, &entity::convoy("dev", "convoy-a", "kiwi"));
     assert!(!interrupted_role.set.contains_key(KEY_STATUS_ATTENTION));
     assert!(!interrupted_convoy.set.contains_key(KEY_STATUS_ATTENTION));
     assert_eq!(text(interrupted_role, KEY_STATUS_STATE), "waiting");
-    live.phase = ConvoyPhase::Active;
+    live.phase = Some(ConvoyPhase::Active);
 
     live.vessels[0].surface_state =
         flotilla_protocol::result_set::SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Nudge };
@@ -1655,7 +1673,7 @@ fn subject_window_and_successive_role_attempts_exclude_unlinked_records() {
     let mut current = old;
     current.resource = convoy_ref("flotilla", "new");
     current.name = "new".into();
-    current.phase = ConvoyPhase::Active;
+    current.phase = Some(ConvoyPhase::Active);
     current.generation = 2;
     let rows = [rows[0].clone(), current];
     let roles = [StandingRoleRow::builder()
@@ -1693,7 +1711,7 @@ fn standing_attempt_edges_and_crew_sessions_survive_re_admission() {
     assert_eq!(facts.set["flotilla.role.restart_count"].value, MetadataValue::Integer(2));
     assert_eq!(text(facts, "flotilla.role.desired_state"), "running");
     let mut old = live_old;
-    old.phase = ConvoyPhase::Failed;
+    old.phase = Some(ConvoyPhase::Failed);
     let new = attempt().name("new").role("governor").generation(2).phase(ConvoyPhase::Active).ensured_from("ensure-p-governor").call();
     let after = role_catalog(std::slice::from_ref(&role), &[new, old.clone()]);
     let diff = after.diff_patches(&before);
@@ -2864,9 +2882,9 @@ fn running_governor_survives_two_abandoned_namesakes(tc: hegel::TestCase) {
                     .kind(AwarenessKind::Convoy)
                     .label("governor".to_owned())
                     .refs(vec![row.resource.clone()])
-                    .phase(AwarenessPhase::Convoy(row.phase))
+                    .maybe_phase(row.phase.map(AwarenessPhase::Convoy))
                     .annotations(std::collections::HashMap::from([(KEY_CONVOY_NAME.to_owned(), row.name.clone())]))
-                    .state(if row.phase.is_terminal() { AwarenessState::Cancelled } else { AwarenessState::Active })
+                    .state(if row.is_ended() { AwarenessState::Cancelled } else { AwarenessState::Active })
                     .as_of(Timestamp::UNIX_EPOCH)
                     .build()
             })

@@ -609,9 +609,11 @@ async fn an_undecodable_launch_is_listed_and_the_daemon_serves_the_others() {
     let unreadable = row(&broken);
     assert!(unreadable.unreadable.as_deref().is_some_and(|reason| reason.contains("does not decode")), "{unreadable:?}");
     assert_eq!((&unreadable.message, &unreadable.started_at, unreadable.vessels.len()), (&None, &None, 0));
+    assert_eq!(unreadable.phase, None, "an unreadable launch has no phase: {unreadable:?}");
     for name in [&readable, &forged] {
         let row = row(name);
         assert_eq!(row.unreadable, None, "{row:?}");
+        assert!(row.phase.is_some(), "{row:?}");
         assert!(!row.vessels.is_empty(), "{name} reads whole: {row:?}");
     }
     let view = backend.clone().using::<Convoy>("flotilla").get(&forged).await.expect("the forged launch's view");

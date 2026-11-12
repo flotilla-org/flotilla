@@ -72,7 +72,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .kind(AwarenessKind::Convoy)
                 .label(convoy.name.clone())
                 .state(convoy_state(convoy.phase, convoy.initializing))
-                .phase(AwarenessPhase::Convoy(convoy.phase))
+                .maybe_phase(convoy.phase.map(AwarenessPhase::Convoy))
                 .as_of(as_of)
                 .refs(vec![convoy.resource.clone()])
                 .issue_refs(convoy.issues.iter().map(|issue| issue.reference.clone()).collect())
@@ -326,7 +326,9 @@ fn project_ref_key(default_namespace: &str, value: &str) -> GroupKey {
     GroupKey::scoped(QueryScope::new(default_namespace, value))
 }
 
-fn convoy_state(phase: ConvoyPhase, initializing: bool) -> AwarenessState {
+fn convoy_state(phase: Option<ConvoyPhase>, initializing: bool) -> AwarenessState {
+    // An unreadable launch's state is unknown.
+    let Some(phase) = phase else { return AwarenessState::Unknown };
     if initializing {
         return AwarenessState::Waiting;
     }
@@ -556,6 +558,22 @@ mod tests {
         assert_eq!(nodes[0].kind, AwarenessKind::Project);
         assert_eq!(nodes[0].scope.as_ref(), Some(&scope));
         assert_eq!(nodes[0].counts.convoys, 1);
+    }
+
+    #[test]
+    fn an_unreadable_launch_has_unknown_state_and_no_phase() {
+        let mut unreadable = convoy(Some("flotilla/platform"), "broken", ConvoyPhase::Pending);
+        unreadable.phase = None;
+        unreadable.unreadable = Some("admission document does not decode".into());
+        let (nodes, _) = project_awareness(AwarenessInput {
+            grouping: AwarenessGrouping::Convoy,
+            convoys: vec![unreadable],
+            ..AwarenessInput::default()
+        });
+
+        let entry = nodes.iter().flat_map(|node| &node.entries).find(|entry| entry.kind == AwarenessKind::Convoy).expect("convoy entry");
+        assert_eq!(entry.state, AwarenessState::Unknown);
+        assert_eq!(entry.phase, None);
     }
 
     #[test]

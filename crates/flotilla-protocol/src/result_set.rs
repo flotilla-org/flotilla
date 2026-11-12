@@ -1130,7 +1130,9 @@ pub struct ConvoyRow {
     #[builder(default)]
     #[serde(default)]
     pub dispatching_principal_ref: PrincipalRef,
-    pub phase: ConvoyPhase,
+    /// `None` exactly when the launch is `unreadable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ConvoyPhase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_decision: Option<crate::PlacementDecision>,
     /// The convoy has no workflow snapshot yet and is not terminal.
@@ -1270,8 +1272,18 @@ impl Readiness {
 }
 
 impl ConvoyRow {
+    /// The launch has a known phase that is not terminal.
+    pub fn is_live(&self) -> bool {
+        self.phase.is_some_and(|phase| !phase.is_terminal())
+    }
+
+    /// The launch has a known terminal phase.
+    pub fn is_ended(&self) -> bool {
+        self.phase.is_some_and(ConvoyPhase::is_terminal)
+    }
+
     pub fn readiness(&self) -> Readiness {
-        if !self.phase.is_terminal() && !self.admission_blockers.is_empty() {
+        if self.is_live() && !self.admission_blockers.is_empty() {
             let mut readiness = Readiness::aggregate(self.vessels.iter().map(|vessel| &vessel.readiness));
             readiness.state = readiness.state.max(ReadinessState::Blocked);
             for blocker in &self.admission_blockers {
@@ -1281,7 +1293,7 @@ impl ConvoyRow {
             }
             return readiness;
         }
-        if self.initializing && !self.phase.is_terminal() {
+        if self.initializing && self.is_live() {
             return Readiness {
                 state: ReadinessState::Provisioning,
                 blockers: vec![ReadinessBlocker {
