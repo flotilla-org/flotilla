@@ -137,6 +137,7 @@ struct LeafSubscriptionTableInner {
     pending_failures: turn_delivery::PendingFailureMap,
     decisions: crate::decision_log::DecisionLog,
     supervisor_context: Mutex<HashMap<(String, String), String>>,
+    operator_told: Mutex<stalls::OperatorTold>,
     #[cfg(test)]
     snapshot_loads: AtomicUsize,
     #[cfg(test)]
@@ -254,6 +255,7 @@ impl LeafSubscriptionTable {
                 pending_failures: Default::default(),
                 decisions: Default::default(),
                 supervisor_context: Default::default(),
+                operator_told: Default::default(),
                 #[cfg(test)]
                 snapshot_loads: AtomicUsize::new(0),
                 #[cfg(test)]
