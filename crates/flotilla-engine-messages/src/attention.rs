@@ -7,7 +7,7 @@ use flotilla_state_machines::machines::message::{MessageReference, MessageSpec, 
 
 use super::{
     convert::{body, UNBOUND_AFTER},
-    roles::{FleetRole, FleetRoles, CAPABILITIES, STANDING, TEARDOWN, TURN_RULES},
+    roles::{FleetRole, FleetRoles, CAPABILITIES, STALL_JUDGE, STANDING, TEARDOWN, TURN_RULES},
 };
 
 /// A record an attention names, at the revision its sender read.
@@ -30,6 +30,8 @@ pub enum Cause {
     CredentialRefresh { vessel: Read },
     /// Turns to a convoy role are held until a person rules.
     DeliveryHeld { role: Read },
+    /// A convoy role's stall reached the operator with no person named to supervise it.
+    Stalled { role: Read },
 }
 
 impl Cause {
@@ -40,6 +42,7 @@ impl Cause {
             Cause::ReclaimRefused { .. } => TEARDOWN,
             Cause::CredentialRefresh { .. } => CAPABILITIES,
             Cause::DeliveryHeld { .. } => TURN_RULES,
+            Cause::Stalled { .. } => STALL_JUDGE,
         }
     }
 
@@ -48,7 +51,7 @@ impl Cause {
             Cause::Hold { convoy } | Cause::ReclaimRefused { convoy } => convoy,
             Cause::Drift { role, .. } => role,
             Cause::CredentialRefresh { vessel } => vessel,
-            Cause::DeliveryHeld { role } => role,
+            Cause::DeliveryHeld { role } | Cause::Stalled { role } => role,
         }
     }
 
@@ -121,6 +124,11 @@ mod tests {
             (
                 Cause::DeliveryHeld { role: read("project:flotilla/convoy:demo/role:coder") },
                 "fleet:lab/role:turn-rules",
+                "project:flotilla/convoy:demo/role:coder",
+            ),
+            (
+                Cause::Stalled { role: read("project:flotilla/convoy:demo/role:coder") },
+                "fleet:lab/role:stall-judge",
                 "project:flotilla/convoy:demo/role:coder",
             ),
         ];

@@ -7,6 +7,7 @@ use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_protocol::{arg::shell_quote, AgentActivity, Leaf, LeafAddress, LeafOperator};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::agent_activity::AgentActivityView;
+use flotilla_resources::attentions::{Attention, Fact, Sender, Subject};
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, record_name},
@@ -327,11 +328,6 @@ pub(super) fn stall_supervision_brief(convoy: &ResourceObject<Convoy>, condition
         }
     }
     brief
-}
-
-// Keep each warning one event line while retaining copyable command text.
-pub(super) fn stall_supervision_log_brief(convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> String {
-    stall_supervision_brief(convoy, condition).replace('\n', " ")
 }
 
 pub(super) const DEFAULT_IDLE_GRACE_SECONDS: u32 = 180;
@@ -1541,16 +1537,9 @@ impl ReconcilerWake {
                                 }
                             }
                             Err(error) => {
-                                tracing::warn!(
-                                    convoy = %convoy.metadata.name,
-                                    target = %role,
-                                    %vessel,
-                                    reason = %error,
-                                    brief = %stall_supervision_log_brief(convoy, &condition),
-                                    "stall nudge fell back to operator"
-                                );
                                 condition.rung = StallRung::Operator;
                                 condition.evidence = format!("nudge delivery failed: {error}");
+                                self.tell_operator(namespace, convoy, &condition).await;
                             }
                         }
                     }
@@ -1774,21 +1763,14 @@ impl ReconcilerWake {
                 let admission = match self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await {
                     Ok(admission) => admission,
                     Err(error) => {
-                        if prior.is_none_or(|prior| {
+                        let fell_back = prior.is_none_or(|prior| {
                             prior.rung != StallRung::Operator || !prior.evidence.ends_with(&format!("supervisor delivery failed: {error}"))
-                        }) {
-                            tracing::warn!(
-                                convoy = %convoy.metadata.name,
-                                target = %target_convoy,
-                                %target_vessel,
-                                %target_role,
-                                reason = %error,
-                                brief = %stall_supervision_log_brief(convoy, &*condition),
-                                "stall escalation fell back to operator"
-                            );
-                        }
+                        });
                         condition.evidence.push_str(&format!("; supervisor delivery failed: {error}"));
                         condition.supervision_exhausted = false;
+                        if fell_back {
+                            self.tell_operator(namespace, convoy, &*condition).await;
+                        }
                         delivery_failed = true;
                         break;
                     }
@@ -1819,22 +1801,10 @@ impl ReconcilerWake {
             unavailable_target = Some(target);
         }
         if condition.supervisor.is_none() && !delivery_failed && !operator_delivered {
-            let target = unavailable_target.unwrap_or(&SupervisionTarget::Operator);
             if prior.is_none_or(|prior| {
                 prior.rung != condition.rung || prior.supervisor != condition.supervisor || prior.evidence != condition.evidence
             }) {
-                tracing::warn!(
-                    convoy = %convoy.metadata.name,
-                    ?target,
-                    reason = if unavailable_target.is_some() { "supervisor_lookup_failed" }
-                        else if start >= policy.len() { "supervision_policy_exhausted" }
-                        else { "operator_rung_selected" },
-                    supervision_start = start,
-                    supervision_policy_len = policy.len(),
-                    evidence = %condition.evidence,
-                    brief = %stall_supervision_log_brief(convoy, &*condition),
-                    "stall escalation fell back to operator"
-                );
+                self.tell_operator(namespace, convoy, &*condition).await;
             }
             if unavailable_target.is_some() {
                 self.subscriptions.inner.supervisor_context.lock().await.insert(context_key, context);
@@ -1847,6 +1817,22 @@ impl ReconcilerWake {
             }
         }
         Ok(())
+    }
+
+    /// Tells a person that `condition`'s seat stalled with no one named to supervise it: one
+    /// attention per stalled convoy role, sent to the convoy's dispatching principal and withdrawn
+    /// when the stall ends. A stall about no seat, or one no person can be told of, stays the
+    /// home's note.
+    async fn tell_operator(&self, namespace: &str, convoy: &ResourceObject<Convoy>, condition: &StalledCondition) {
+        let Some((_, role)) = stalled_source_actor(condition) else {
+            tracing::warn!(convoy = %convoy.metadata.name, evidence = %condition.evidence, "a stall about no seat reached the operator");
+            return;
+        };
+        let fact = Fact::Stalled { convoy: convoy.metadata.name.clone(), role: role.to_owned() };
+        let attention = Attention::new(fact, stall_supervision_brief(convoy, condition), condition.began_at);
+        if let Err(error) = self.subscriptions.inner.backend.attentions().raise(namespace, &attention).await {
+            tracing::warn!(convoy = %convoy.metadata.name, %role, %error, "a stall at the operator could not be told to a person");
+        }
     }
 
     /// Writes the convoy's nudge obligations and stall condition to its home's notes; the engine's
@@ -1880,12 +1866,37 @@ impl ReconcilerWake {
             )
             .await
             {
-                Ok(_) => self.end_settled_stalls(namespace, convoy, status, next.as_ref()).await,
+                Ok(_) => {
+                    self.withdraw_operator_attention(namespace, convoy, status.stalled.as_ref(), next.as_ref()).await;
+                    self.end_settled_stalls(namespace, convoy, status, next.as_ref()).await
+                }
                 Err(error) => tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "write stalled condition failed"),
             }
         } else {
             self.end_settled_stalls(namespace, convoy, status, next.as_ref()).await;
         }
         Ok(())
+    }
+
+    /// Withdraws the attention [`Self::tell_operator`] raised for `prior`'s seat once `next` no
+    /// longer holds that seat at the operator: the stall closed, or a supervisor took it.
+    async fn withdraw_operator_attention(
+        &self,
+        namespace: &str,
+        convoy: &ResourceObject<Convoy>,
+        prior: Option<&StalledCondition>,
+        next: Option<&StalledCondition>,
+    ) {
+        fn at_operator(stall: &StalledCondition) -> Option<&str> {
+            (stall.rung == StallRung::Operator && stall.supervisor.is_none()).then(|| stalled_source_actor(stall).map(|(_, role)| role))?
+        }
+        let Some(role) = prior.and_then(at_operator) else { return };
+        if next.and_then(at_operator) == Some(role) {
+            return;
+        }
+        let subject = Subject::ConvoyRole { convoy: convoy.metadata.name.clone(), role: role.to_owned() };
+        if let Err(error) = self.subscriptions.inner.backend.attentions().clear(namespace, Sender::StallJudge, &subject).await {
+            tracing::warn!(convoy = %convoy.metadata.name, %role, %error, "a closed stall's attention could not be withdrawn");
+        }
     }
 }
