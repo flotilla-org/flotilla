@@ -509,6 +509,10 @@ impl EngineRecords for EngineObservations {
         Ok(self.copies(kind_of(kind)?, None)?.into_iter().map(|(_, copy)| copy).collect())
     }
 
+    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        Ok(EngineObservations::copies(self, kind_of(kind)?, Some(name))?.into_iter().map(|(_, copy)| copy).collect())
+    }
+
     async fn apply(
         &self,
         kind: &str,

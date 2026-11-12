@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::aggregator_projection::AggregatorProjectionState;
 use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_protocol::{DaemonEvent, HostName};
-use flotilla_resources::{Checkout, Convoy, Project, Repository, ResourceError};
+use flotilla_resources::{Convoy, Project, Repository, ResourceError};
 use flotilla_store::ResourceBackend;
 use futures::future::BoxFuture;
 use tokio::sync::broadcast;
@@ -56,6 +56,7 @@ pub fn run(
         let aggregator = Aggregator::with_events(state, context.host_name, context.event_sink, context.events)
             .with_attach_resolver_arc(context.attach)
             .with_lifecycle_reads(context.lifecycles)
+            .with_discovered_checkouts(context.discovered, namespace)
             .with_agent_sessions(context.agent_sessions)
             .with_change_request_resolver_arc(context.change_requests)
             .with_issue_resolver_arc(context.issues)
@@ -76,8 +77,6 @@ pub fn run(
                     .durable_vessels(durable.including_replicas::<flotilla_resources::Vessel>(namespace))
                     .durable_hosts(durable.including_replicas::<flotilla_resources::Host>(namespace))
                     // Clone has no replication contract; remote failures arrive through Checkout status.
-                    .observed_sessions(observed.including_replicas::<flotilla_resources::TerminalSession>(namespace))
-                    .observed_checkouts(observed.using::<Checkout>(namespace))
                     .build(),
             )
             .await
@@ -88,6 +87,8 @@ pub fn run(
 pub struct AggregatorContext {
     pub durable: ResourceBackend,
     pub observed: ResourceBackend,
+    /// The checkouts this host's refresh discovered.
+    pub discovered: flotilla_resources::discovered_checkouts::DiscoveredCheckouts,
     pub host_name: HostName,
     pub event_sink: Arc<dyn EventSink>,
     pub events: broadcast::Receiver<DaemonEvent>,

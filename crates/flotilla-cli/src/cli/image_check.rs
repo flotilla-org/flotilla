@@ -129,9 +129,7 @@ where
 fn probe_label(probe: &ImageProbeReport) -> String {
     match probe {
         ImageProbeReport::Pending => "pending".into(),
-        ImageProbeReport::Passed => "passed".into(),
-        ImageProbeReport::Failed { reason } => format!("failed: {reason}"),
-        ImageProbeReport::NotRun => "not run".into(),
+        ImageProbeReport::InBuildLog => "in the build log".into(),
     }
 }
 
@@ -195,13 +193,13 @@ pub fn format_image_check_human(outcome: &ImageCheckOutcome) -> String {
         if build.phase == ImageBuildReportPhase::Failed && failure.class == "recipe" {
             out.push_str(&format!(
                 "hint: recipe failures are not retried for this identity; changing a layer changes the identity \
-                 (or delete ImageBuild {} to rebuild it)\n",
+                 (or `flotilla image retry {}` builds it again)\n",
                 build.name
             ));
         }
     }
     if let Some(log_ref) = &build.log_ref {
-        out.push_str(&format!("build log: {log_ref}\n"));
+        out.push_str(&format!("build logs: {log_ref}-<try>\n"));
     }
     out
 }
@@ -227,6 +225,7 @@ mod tests {
     fn build(phase: ImageBuildReportPhase, settled: bool, attempt: u32) -> ImageBuildReport {
         ImageBuildReport {
             name: "image-0123abcd-amd64".into(),
+            launch: None,
             identity: "sha256:0123abcd".into(),
             architecture: "amd64".into(),
             builder_host: "feta".into(),
@@ -258,15 +257,14 @@ mod tests {
 
     fn failed_build() -> ImageBuildReport {
         let mut failed = build(ImageBuildReportPhase::Failed, true, 1);
-        failed.layers = vec![
-            layer("base", "stdlib", ImageProbeReport::Passed),
-            layer("app-native", "project", ImageProbeReport::Failed { reason: "app: not found".into() }),
-        ];
+        failed.layers =
+            vec![layer("base", "stdlib", ImageProbeReport::InBuildLog), layer("app-native", "project", ImageProbeReport::InBuildLog)];
         failed.failure = Some(ImageBuildFailureReport {
             class: "recipe".into(),
             reason: "probe failed (owner: layer `app-native` 1.1 from project `app`)".into(),
         });
-        failed.log_ref = Some("artifact-build-log".into());
+        failed.launch = Some("image-0123abcd-amd64#1".into());
+        failed.log_ref = Some("image-build-log-image-0123abcd-amd64-1".into());
         failed
     }
 
@@ -286,15 +284,15 @@ mod tests {
         build: image-0123abcd-amd64 (amd64) on feta, registry registry.test/flotilla/crew-images; reused existing build
         phase: failed (attempt 1)
         digest: -
-        ┌────────────┬─────────┬─────────┬────────────────────────┐
-        │ Layer      ┆ Source  ┆ Version ┆ Probe                  │
-        ╞════════════╪═════════╪═════════╪════════════════════════╡
-        │ base       ┆ stdlib  ┆ 1.0     ┆ passed                 │
-        │ app-native ┆ project ┆ 1.0     ┆ failed: app: not found │
-        └────────────┴─────────┴─────────┴────────────────────────┘
+        ┌────────────┬─────────┬─────────┬──────────────────┐
+        │ Layer      ┆ Source  ┆ Version ┆ Probe            │
+        ╞════════════╪═════════╪═════════╪══════════════════╡
+        │ base       ┆ stdlib  ┆ 1.0     ┆ in the build log │
+        │ app-native ┆ project ┆ 1.0     ┆ in the build log │
+        └────────────┴─────────┴─────────┴──────────────────┘
         failure (recipe): probe failed (owner: layer `app-native` 1.1 from project `app`)
-        hint: recipe failures are not retried for this identity; changing a layer changes the identity (or delete ImageBuild image-0123abcd-amd64 to rebuild it)
-        build log: artifact-build-log
+        hint: recipe failures are not retried for this identity; changing a layer changes the identity (or `flotilla image retry image-0123abcd-amd64` builds it again)
+        build logs: image-build-log-image-0123abcd-amd64-1-<try>
         ");
     }
 
@@ -324,7 +322,7 @@ mod tests {
     fn json_report_round_trips() {
         let report = report(Some(failed_build()));
         let json = serde_json::to_value(&report).expect("encode");
-        assert_eq!(json["build"]["layers"][1]["probe"], serde_json::json!({ "outcome": "failed", "reason": "app: not found" }));
+        assert_eq!(json["build"]["layers"][1]["probe"], serde_json::json!({ "outcome": "in_build_log" }));
         assert_eq!(json["build"]["phase"], "failed");
         assert_eq!(json["agents_from"], "default_workflow");
         assert!(json.get("refusals").is_none() && json["build"].get("digest").is_none());

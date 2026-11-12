@@ -24,7 +24,9 @@ use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     ProviderData,
 };
-use flotilla_resources::{checkout_path::checkout_path, definition_provenance::WHOLE_REPOSITORY_PROJECT_MANAGER};
+use flotilla_resources::{
+    checkout_path::checkout_path, definition_provenance::WHOLE_REPOSITORY_PROJECT_MANAGER, discovered_checkouts::DiscoveredCheckouts,
+};
 use flotilla_resources::{
     normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyRepositorySpec,
     DeclarationRefusedCondition, Forge, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
@@ -200,7 +202,7 @@ fn project_target_syntax(target: &str) -> ProjectTargetSyntax {
 pub struct RepositoryIndex<'a> {
     pub lifecycle_reads: &'a dyn flotilla_resources::lifecycle_reads::LifecycleReads,
     pub backend: &'a ResourceBackend,
-    pub observed: &'a ResourceBackend,
+    pub discovered: &'a DiscoveredCheckouts,
     pub namespace: &'a std::sync::RwLock<String>,
     pub host: &'a str,
 }
@@ -216,9 +218,13 @@ impl RepositoryIndex<'_> {
     // candidates, require a unique main checkout without re-inspecting identity.
     async fn select_checkout(&self, key: &RepositoryKey) -> Result<CheckoutSelection, String> {
         let namespace = self.namespace.read().expect("namespace lock poisoned").clone();
-        let checkouts =
-            crate::repository_addressing::local_checkouts_with_lifecycle_reads(self.observed, &namespace, self.host, self.lifecycle_reads)
-                .await?;
+        let checkouts = crate::repository_addressing::local_checkouts_with_lifecycle_reads(
+            self.discovered,
+            &namespace,
+            self.host,
+            self.lifecycle_reads,
+        )
+        .await?;
         let mut candidates = checkouts.iter().filter(|checkout| checkout.spec.repo_ref() == key).collect::<Vec<_>>();
         if candidates.is_empty() {
             return Ok(CheckoutSelection::Unavailable);
@@ -241,7 +247,7 @@ impl RepositoryIndex<'_> {
 
     async fn paths_for(&self, key: &RepositoryKey) -> Result<Vec<PathBuf>, String> {
         let namespace = self.namespace.read().expect("namespace lock poisoned").clone();
-        Ok(crate::repository_addressing::local_checkouts_with_lifecycle_reads(self.observed, &namespace, self.host, self.lifecycle_reads)
+        Ok(crate::repository_addressing::local_checkouts_with_lifecycle_reads(self.discovered, &namespace, self.host, self.lifecycle_reads)
             .await?
             .into_iter()
             .filter(|checkout| checkout.spec.repo_ref() == key)
@@ -278,6 +284,8 @@ pub trait ProjectOperations: Send + Sync {
         &self,
         request: &flotilla_protocol::image_check::ImageCheckRequest,
     ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String>;
+    /// Launches given-up image build `name` again here, its builder, returning the launch.
+    async fn image_build_retry(&self, name: &str) -> Result<String, String>;
     async fn project_register(&self, target: &str) -> Result<(String, usize), String>;
     async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String>;
     fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool;
@@ -288,7 +296,7 @@ pub struct ProjectService<'a> {
     pub resource_backend: &'a ResourceBackend,
     /// The ops roots of this host's project charter bindings (#3824 layer 2c).
     pub manifest_roots: &'a dyn flotilla_resources::manifest_roots::ManifestRoots,
-    pub observed_resource_backend: &'a ResourceBackend,
+    pub discovered_checkouts: &'a DiscoveredCheckouts,
     pub clock: &'a Arc<dyn Clock>,
     pub namespace: &'a std::sync::RwLock<String>,
     pub repository_index: RepositoryIndex<'a>,
@@ -1403,7 +1411,7 @@ impl ProjectService<'_> {
         // refreshing one clone cannot erase a sibling clone's identity facts.
         let mut inspections = vec![inspection.clone()];
         for known in crate::repository_addressing::local_checkouts_with_lifecycle_reads(
-            self.observed_resource_backend,
+            self.discovered_checkouts,
             namespace,
             &inspection.checkout.host_ref,
             self.repository_index.lifecycle_reads,
@@ -1444,15 +1452,13 @@ impl ProjectService<'_> {
             }
         }
         flotilla_observation::observed_resources::reconcile_checkouts(
-            self.observed_resource_backend,
-            namespace,
+            self.discovered_checkouts,
             repository_key,
             &repository_spec.catalog_slug(),
             &providers,
             &inspection.checkout.host_ref,
-        )
-        .await
-        .map_err(|error| error.to_string())
+        );
+        Ok(())
     }
 }
 
@@ -1637,7 +1643,7 @@ mod registration_race;
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use flotilla_resources::SystemClock;
+    use flotilla_resources::{discovered_checkouts::DiscoveredCheckout, SystemClock};
     use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
@@ -1715,7 +1721,7 @@ mod tests {
             let inspector = Arc::new(CharterSourceInspector { runner, cache: cache.path().to_path_buf() });
             let operations = FakeProjectOperations::with_inspector(inspector.clone());
             let backend = ResourceBackend::new(InMemoryBackend::default());
-            let observed = ResourceBackend::new(InMemoryBackend::observed());
+            let discovered = DiscoveredCheckouts::default();
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let namespace = std::sync::RwLock::new("flotilla".to_string());
             let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
@@ -1723,13 +1729,13 @@ mod tests {
                 image_layer_refresh: Default::default(),
                 resource_backend: &backend,
                 manifest_roots: &roots,
-                observed_resource_backend: &observed,
+                discovered_checkouts: &discovered,
                 clock: &clock,
                 namespace: &namespace,
                 repository_index: RepositoryIndex {
                     lifecycle_reads: crate::test_support::no_held_checkouts().as_ref(),
                     backend: &backend,
-                    observed: &observed,
+                    discovered: &discovered,
                     namespace: &namespace,
                     host: "local-host",
                 },
@@ -1884,12 +1890,12 @@ mod tests {
             })),
             ..Default::default()
         };
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
+        let discovered = DiscoveredCheckouts::default();
         let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let backend = ResourceBackend::new(super::registration_race::RacingStore {
             inner: Arc::new(InMemoryBackend::default()),
             armed: Arc::clone(&armed),
-            observed: observed.clone(),
+            discovered: discovered.clone(),
             contention,
         });
         // The Repository was first seen through a transport alias, so registering its declared
@@ -1909,13 +1915,13 @@ mod tests {
             image_layer_refresh: Default::default(),
             resource_backend: &backend,
             manifest_roots: &roots,
-            observed_resource_backend: &observed,
+            discovered_checkouts: &discovered,
             clock: &clock,
             namespace: &namespace,
             repository_index: RepositoryIndex {
                 lifecycle_reads: crate::test_support::no_held_checkouts().as_ref(),
                 backend: &backend,
-                observed: &observed,
+                discovered: &discovered,
                 namespace: &namespace,
                 host: "local-host",
             },
@@ -1983,7 +1989,7 @@ mod tests {
     // candidates only a unique main is selectable, otherwise refuse ambiguity.
     #[hegel::test]
     fn checkout_selection_uses_local_facts_and_refuses_ambiguity(tc: hegel::TestCase) {
-        use flotilla_resources::{Checkout, CheckoutSpec, ObservedCheckoutSpec};
+        use flotilla_resources::ObservedCheckoutSpec;
         use hegel::generators as gs;
 
         // Generate 0–8 facts spanning both hosts, repository membership and main/
@@ -2007,26 +2013,26 @@ mod tests {
             let root = temp.path().canonicalize().expect("physical checkout paths");
             for facts in cases {
                 let backend = ResourceBackend::new(InMemoryBackend::default());
-                let observed = ResourceBackend::new(InMemoryBackend::observed());
+                let discovered = DiscoveredCheckouts::default();
                 let namespace = std::sync::RwLock::new("flotilla".to_string());
                 let key = RepositorySpec::remote("https://github.com/example/ops").expect("repository").key();
+                let mut found = BTreeMap::<RepositoryKey, Vec<_>>::new();
                 for (index, (local, main, member)) in facts.iter().enumerate() {
-                    observed
-                        .using::<Checkout>("flotilla")
-                        .create(
-                            &InputMeta::builder().name(format!("checkout-{index}")).build(),
-                            &CheckoutSpec::Observed(
-                                ObservedCheckoutSpec::builder()
-                                    .path(root.join(index.to_string()).to_string_lossy().into_owned())
-                                    .host_ref(if *local { "local-host" } else { "foreign-host" }.to_string())
-                                    .repo_ref(if *member { key.clone() } else { RepositoryKey("other-repository".into()) })
-                                    .r#ref(if *main { "main" } else { "convoy/work" }.to_string())
-                                    .is_main(*main)
-                                    .build(),
-                            ),
-                        )
-                        .await
-                        .expect("observed checkout");
+                    let repo_ref = if *member { key.clone() } else { RepositoryKey("other-repository".into()) };
+                    found.entry(repo_ref.clone()).or_default().push(DiscoveredCheckout {
+                        name: format!("checkout-{index}"),
+                        repo_slug: repo_ref.0.clone(),
+                        spec: ObservedCheckoutSpec::builder()
+                            .path(root.join(index.to_string()).to_string_lossy().into_owned())
+                            .host_ref(if *local { "local-host" } else { "foreign-host" }.to_string())
+                            .repo_ref(repo_ref)
+                            .r#ref(if *main { "main" } else { "convoy/work" }.to_string())
+                            .is_main(*main)
+                            .build(),
+                    });
+                }
+                for (repository, checkouts) in found {
+                    discovered.replace(&repository, checkouts);
                 }
                 let local = facts.iter().enumerate().filter(|(_, (local, _, member))| *local && *member).collect::<Vec<_>>();
                 let mains = local.iter().filter(|(_, (_, main, _))| *main).collect::<Vec<_>>();
@@ -2040,7 +2046,7 @@ mod tests {
                 let index = RepositoryIndex {
                     lifecycle_reads: crate::test_support::no_held_checkouts().as_ref(),
                     backend: &backend,
-                    observed: &observed,
+                    discovered: &discovered,
                     namespace: &namespace,
                     host: "local-host",
                 };

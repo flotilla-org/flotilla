@@ -1504,6 +1504,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
             image_check::format_image_check_human(&image_check::ImageCheckOutcome { report: (**report).clone(), timed_out: false })
         }
         CommandValue::ImageBuild(build) => format!("image build {}: {} (attempt {})\n", build.name, build.phase.as_str(), build.attempt),
+        CommandValue::ImageBuildRetried { launch } => format!("launched {launch}"),
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
         CommandValue::CrewStalls(stalls) => {
             if stalls.rows.is_empty() {

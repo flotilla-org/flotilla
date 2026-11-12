@@ -151,6 +151,8 @@ async fn validate_daemon_with_preview(
     for prefix in additional_stores {
         // Deliberately fail closed: admitting an unknown store would skip
         // persisted records that this candidate cannot inventory before a roll.
+        // Only the previous generation advertises `/observed`, its replicated
+        // observations; remove it one roll after #3108's observed store goes.
         if prefix != "/observed" {
             return Err(eyre!("unknown advertised resource store {prefix:?}"));
         }
@@ -1400,7 +1402,6 @@ mod tests {
             )
             .await
             .expect("bound root");
-        let observed = server.daemon().observed_resource_backend();
         let task = tokio::spawn(async move { server.run().await });
         for _ in 0..100 {
             if socket.exists() {
@@ -1416,7 +1417,7 @@ mod tests {
             .expect("raw ops endpoint");
         assert_eq!(inventory.status(), reqwest::StatusCode::OK);
         assert_eq!(inventory.json::<serde_json::Value>().await.expect("inventory")["entries"], serde_json::json!([]));
-        let primary_count = validate_daemon(&socket, Some(&[]), None).await.expect("validate primary store");
+        validate_daemon(&socket, Some(&[]), None).await.expect("validate primary store");
         // #2720: the candidate parses the current bound inputs, even before a
         // daemon applies them. A malformed new head must refuse the roll.
         let inputs = client
@@ -1431,30 +1432,6 @@ mod tests {
         assert!(validate_daemon(&socket, Some(&[]), None).await.is_err());
         std::fs::write(&charter_file, charter_text).expect("restore charter");
 
-        // Persisted observations in a replica-only namespace must participate
-        // in the candidate pre-roll gate alongside primary-store records.
-        let checkouts = observed.using::<flotilla_resources::Checkout>("observed-only");
-        checkouts
-            .create(
-                &InputMeta::builder().name("remote-checkout".to_string()).build(),
-                &flotilla_resources::CheckoutSpec::Observed(flotilla_resources::ObservedCheckoutSpec {
-                    repo_ref: flotilla_resources::RepositoryKey("widgets".into()),
-                    path: "/srv/widgets".into(),
-                    r#ref: "main".into(),
-                    host_ref: "remote".into(),
-                    is_main: true,
-                }),
-            )
-            .await
-            .expect("create observation source");
-        observed
-            .replica_writer::<flotilla_resources::Checkout>(NodeId::new("remote"), "observed-only")
-            .replace(&checkouts.list().await.expect("list observation source"), chrono::Utc::now())
-            .await
-            .expect("persist observation replica");
-        checkouts.delete("remote-checkout").await.expect("remove local observation");
-        let checked = validate_daemon(&socket, Some(&[]), None).await.expect("candidate decodes all served kinds and namespaces");
-        assert_eq!(checked, primary_count + 1, "the observed replica-only record must be validated");
         // Intended: schema compatibility alone cannot admit a Project whose
         // skill declaration is absent from the candidate's supply catalog.
         let catalog = root.join(".flotilla-skill-catalog.json");

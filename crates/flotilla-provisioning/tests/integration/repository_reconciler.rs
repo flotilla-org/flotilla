@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use common::meta;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::{
-    Checkout, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, EnvironmentSpec, ForgeIdentity, FreshCloneCheckoutSpec,
-    HostDirectEnvironmentSpec, LifecycleAuthority, ObservedCheckoutSpec, Repository, RepositoryCheckoutKind, RepositorySpec,
+    discovered_checkouts::{DiscoveredCheckout, DiscoveredCheckouts},
+    CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, EnvironmentSpec, ForgeIdentity, FreshCloneCheckoutSpec, HostDirectEnvironmentSpec,
+    LifecycleAuthority, ObservedCheckoutSpec, Repository, RepositoryCheckoutKind, RepositorySpec,
 };
 use flotilla_store::{controller::Reconciler, ResourceBackend};
 
@@ -25,7 +26,7 @@ impl ForgeDefaultBranchResolver for FixedForgeDefaultBranch {
 #[tokio::test]
 async fn repository_status_groups_typed_checkout_associations_by_explicit_host() {
     let durable = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let observed = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::observed());
+    let discovered = DiscoveredCheckouts::default();
     let repository_spec = RepositorySpec::remote("https://github.com/org/repo.git").expect("repository spec");
     let repository_key = repository_spec.key();
     let repository = durable
@@ -73,21 +74,20 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
         }),
         None,
     );
-    observed
-        .clone()
-        .using::<Checkout>(NAMESPACE)
-        .create(
-            &meta("observed-main").with_lifecycle_authority(LifecycleAuthority::Observed),
-            &CheckoutSpec::Observed(ObservedCheckoutSpec {
+    discovered.replace(
+        &repository_key,
+        vec![DiscoveredCheckout {
+            name: "observed-main".to_string(),
+            repo_slug: "org/repo".to_string(),
+            spec: ObservedCheckoutSpec {
                 repo_ref: repository_key.clone(),
                 host_ref: "host-b".to_string(),
                 r#ref: "trunk".to_string(),
                 path: "/work/repo".to_string(),
                 is_main: true,
-            }),
-        )
-        .await
-        .expect("observed checkout create");
+            },
+        }],
+    );
     clones.put_named_ready(
         "clone-a",
         &CloneSpec {
@@ -99,7 +99,7 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
         Some("main"),
     );
 
-    let reconciler = RepositoryReconciler::new(observed, NAMESPACE)
+    let reconciler = RepositoryReconciler::new(discovered)
         .with_lifecycle_reads(checkouts.reads.clone())
         .with_forge_default_branch_resolver(Arc::new(FixedForgeDefaultBranch("stable")));
     let status = reconciler.prepare(&repository).await.expect("status projection");
@@ -116,7 +116,7 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
 #[tokio::test]
 async fn repository_with_no_checkouts_projects_empty_status_without_deletion() {
     let durable = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let observed = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::observed());
+    let discovered = DiscoveredCheckouts::default();
     let spec = RepositorySpec::remote("https://github.com/org/empty.git").expect("repository spec");
     let repository =
         durable.clone().using::<Repository>(NAMESPACE).create(&meta(&spec.key().to_string()), &spec).await.expect("repository create");
@@ -126,7 +126,7 @@ async fn repository_with_no_checkouts_projects_empty_status_without_deletion() {
     let clones = flotilla_provisioning_testkit::CloneFixture::over("home", Arc::clone(&store));
     let checkouts = flotilla_provisioning_testkit::CheckoutFixture::over("home", Arc::clone(&store))
         .serving(Arc::clone(&environments.environments) as _, Arc::clone(&clones.clones) as _);
-    let reconciler = RepositoryReconciler::new(observed, NAMESPACE).with_lifecycle_reads(checkouts.reads.clone());
+    let reconciler = RepositoryReconciler::new(discovered).with_lifecycle_reads(checkouts.reads.clone());
     let status = reconciler.prepare(&repository).await.expect("status projection");
 
     assert!(status.checkouts_by_host.is_empty());

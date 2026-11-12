@@ -34,15 +34,16 @@ use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::convoy::engine::{split_launch, standing_name, EngineConvoyPath, EngineConvoys};
 use flotilla_resources::convoy::reconcile::{admitted_snapshot, SnapshotRefusal};
 use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
+use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
 use flotilla_resources::{
     capped_github_app_permissions, is_prepared_snapshot, normalize_issue_source, AllocationDecision, BoundChangeRequest, CapabilityNeed,
-    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, Clock, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource, CrewSpec, Forge,
-    FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host as ResourceHost, InputValue, IssueSnapshot,
-    IssueSourceResolution, IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, Platform, Project, ProjectSpec,
-    ReadResourceObject, Repository, RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff,
-    SupervisionTarget, TerminalCrewContext, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, BRIEF_ARTIFACTS_ANNOTATION,
-    CODEX_CENTRAL_LOGIN_CAPABILITY, GENERATION_LABEL, PLACEMENT_SNAPSHOT_KIND, PROJECT_LABEL, ROLE_LABEL,
+    ChangeRequest as ResourceChangeRequest, Clock, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec,
+    ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource, CrewSpec, Forge, FulfilmentGrant, FulfilmentKind,
+    FulfilmentKindSpec, FulfilmentRealisation, Host as ResourceHost, InputValue, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, Platform, Project, ProjectSpec, ReadResourceObject, Repository,
+    RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, TerminalCrewContext,
+    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, BRIEF_ARTIFACTS_ANNOTATION, CODEX_CENTRAL_LOGIN_CAPABILITY,
+    GENERATION_LABEL, PLACEMENT_SNAPSHOT_KIND, PROJECT_LABEL, ROLE_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{HoldAct, InputMeta, RepositorySpec, SystemClock};
@@ -106,7 +107,8 @@ pub struct ConvoyCreateAdmission<'a> {
 #[derive(bon::Builder)]
 pub struct ConvoyAdmission {
     backend: ResourceBackend,
-    observed_backend: ResourceBackend,
+    /// The checkouts this host's refresh discovered.
+    discovered_checkouts: DiscoveredCheckouts,
     #[builder(default = Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))]
     lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     /// The account kinds' records: the old store's, or the engine's behind `[primitives]`.
@@ -902,11 +904,11 @@ impl ConvoyAdmission {
                 serde_json::to_string(adopted).map_err(|error| error.to_string())?,
             );
         }
-        let created = crate::image_build::create_planned_builds(&self.backend, namespace, image_builds).await?;
+        let created = crate::image_build::demand_planned_builds(Arc::clone(&self.lifecycle_reads), image_builds).await?;
         let seed = ConvoyStatus { placement_decision, naming, ensure_admission: ensure.cloned(), ..ConvoyStatus::default() };
         let result = self.admit_launch(namespace, name, spec, workflow, seed, annotations).await;
         if result.is_err() {
-            crate::image_build::remove_created_builds(&self.backend, namespace, &created).await;
+            crate::image_build::withdraw_demanded_builds(Arc::clone(&self.lifecycle_reads), &created).await;
         }
         result
     }
@@ -1040,7 +1042,7 @@ impl ConvoyAdmission {
         spec: &ConvoySpec,
         workflow: &WorkflowTemplateSpec,
         evidence: BriefEvidence<'_>,
-    ) -> Result<(ResourceBackend, ResourceBackend), String> {
+    ) -> Result<ResourceBackend, String> {
         use flotilla_resources::TerminalSession as ResourceTerminalSession;
         use flotilla_resources::{CrewDefaults, FleetDesignation, ReadResourceList, FLEET_DESIGNATION_NAME};
         let read_source = evidence.definitions;
@@ -1052,37 +1054,6 @@ impl ConvoyAdmission {
             .collect::<BTreeSet<_>>();
         let repositories = read_source
             .query_declared::<Repository>(namespace, &StoreQuery::names(repository_names.clone(), false))
-            .await
-            .map_err(|error| error.to_string())?;
-        let local_host = self.environments.local_host_id().as_str();
-        // This host's direct environments, from the engine: this home holds them.
-        let local_environments = {
-            let reads = Arc::clone(&self.lifecycle_reads);
-            let local_host = local_host.to_owned();
-            tokio::task::spawn_blocking(move || {
-                let mut local = Vec::new();
-                for environment in reads.environments()?.live()? {
-                    if is_local_direct_environment(&environment.spec, &local_host)? {
-                        local.push(environment.name);
-                    }
-                }
-                Ok::<_, String>(local)
-            })
-            .await
-            .map_err(|error| format!("read local environments: {error}"))??
-        };
-        let local_checkout_query = StoreQuery {
-            field_values: BTreeMap::from([("spec.repo_ref".into(), repository_names.into_iter().collect())]),
-            any_of: Some(vec![
-                StoreQuery { fields: BTreeMap::from([("spec.host_ref".into(), local_host.into())]), ..Default::default() },
-                StoreQuery { field_values: BTreeMap::from([("spec.env_ref".into(), local_environments)]), ..Default::default() },
-            ]),
-            ..Default::default()
-        };
-        // The checkouts this host's refresh observed; the engine's are read through its port.
-        let observed = self
-            .observed_backend
-            .query_declared::<ResourceCheckout>(namespace, &local_checkout_query)
             .await
             .map_err(|error| error.to_string())?;
         let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, namespace)?;
@@ -1142,9 +1113,7 @@ impl ConvoyAdmission {
             snapshot.insert::<ResourceTerminalSession>(terminals)?;
             snapshot.insert::<ConvoyEnsure>(ensures)?;
         }
-        let mut observed_snapshot = flotilla_store::RequestSnapshot::new(&self.observed_backend, namespace)?;
-        observed_snapshot.insert::<ResourceCheckout>(observed)?;
-        Ok((snapshot.finish(), observed_snapshot.finish()))
+        Ok(snapshot.finish())
     }
 
     pub async fn write_admission_briefs(
@@ -1212,7 +1181,7 @@ impl ConvoyAdmission {
                 BriefEvidence { definitions: &definitions, convoys: &convoys }
             }
         };
-        let (reads, observed) = self.brief_read_inventory(namespace, name, spec, workflow, evidence).await?;
+        let reads = self.brief_read_inventory(namespace, name, spec, workflow, evidence).await?;
         let mut annotations = BTreeMap::new();
         if workflow.exit.is_none() {
             annotations.insert(flotilla_charter::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "standing".to_string());
@@ -1236,7 +1205,7 @@ impl ConvoyAdmission {
         let templates = CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path());
         let repositories = reads.clone().using::<Repository>(namespace);
         let local_checkouts = crate::repository_addressing::local_checkouts_with_lifecycle_reads(
-            &observed,
+            &self.discovered_checkouts,
             namespace,
             self.environments.local_host_id().as_str(),
             self.lifecycle_reads.as_ref(),
@@ -1741,22 +1710,6 @@ impl PlacementBuildJoiner<'_> {
     }
 }
 
-/// Whether `spec` is a direct environment of `local_host`: one its provider address places on
-/// the host, or, with no address, whose host reference names it.
-fn is_local_direct_environment(spec: &flotilla_resources::EnvironmentSpec, local_host: &str) -> Result<bool, String> {
-    if spec.host_direct.is_none() {
-        return Ok(false);
-    }
-    match &spec.provider_address {
-        Some(address) => {
-            let host_address =
-                flotilla_address::Address::root(flotilla_address::Kind::Host, local_host).map_err(|error| error.to_string())?;
-            Ok(address.to_string().starts_with(&format!("{host_address}/provider:")))
-        }
-        None => Ok(spec.host_direct.as_ref().is_some_and(|direct| direct.host_ref == local_host)),
-    }
-}
-
 /// Write composed images into the placement: the convoy-level kind carries
 /// the first vessel's image, and when vessels differ every vessel gets its own
 /// pinned snapshot (identical values share one snapshot by content).
@@ -2005,7 +1958,7 @@ impl AdmissionReadContext<'_> {
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<AdmissionReadContext<'a>, String> {
-        use flotilla_resources::{CrewDefaults, FleetDesignation, ImageBuild, ImageLayer, FLEET_DESIGNATION_NAME};
+        use flotilla_resources::{CrewDefaults, FleetDesignation, ImageLayer, FLEET_DESIGNATION_NAME};
         use flotilla_store::StoreQuery;
         let backend = &owner.backend;
         let project_ref = required_admission_value(&intent.project_ref, "project")?;
@@ -2118,13 +2071,9 @@ impl AdmissionReadContext<'_> {
             .query_declared::<CredentialSpec>(namespace, &StoreQuery::names(credential_names, true))
             .await
             .map_err(|error| error.to_string())?;
-        // Composed images resolve against every layer definition, and their
-        // placement cost reads the per-identity builds.
+        // Composed images resolve against every layer definition; their placement cost reads
+        // the per-identity builds from the engine.
         let image_layers = flotilla_store::read_definition_catalog::<ImageLayer>(backend, namespace).await?;
-        let builds = backend
-            .query_declared::<ImageBuild>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
-            .await
-            .map_err(|error| error.to_string())?;
         let mut snapshot = flotilla_store::RequestSnapshot::new(backend, namespace)?;
         snapshot.insert_definitions::<Project>(projects)?;
         snapshot.insert_definitions::<FleetDesignation>(fleet)?;
@@ -2143,7 +2092,6 @@ impl AdmissionReadContext<'_> {
             .map(|host| host.object.metadata.name.clone())
             .collect();
         let occupancy = host_occupancies(backend, namespace, &capped).await?;
-        snapshot.insert::<ImageBuild>(builds)?;
         snapshot.insert::<ResourceHost>(hosts)?;
         let mut reads = owner.reads(snapshot.finish());
         reads.occupancy = occupancy;
@@ -3955,8 +3903,8 @@ struct ConvoySnapshotBundle<'a> {
     pub placement: Option<&'a FulfilmentKindSpec>,
     pub placement_decision: Option<PlacementDecision>,
     pub vessel_placements: Option<&'a BTreeMap<String, (FulfilmentKindSpec, PlacementDecision)>>,
-    /// Composed images' builds, created only with the convoy (refusals before
-    /// this point never leave builds behind).
+    /// Composed images' builds, demanded only with the convoy (refusals before
+    /// this point never leave demands behind).
     pub image_builds: &'a [crate::image_build::PlannedImageBuild],
     /// The checkout the convoy adopts, recorded on it (#3108).
     pub adopted_checkout: Option<&'a flotilla_resources::ObservedCheckoutSpec>,
@@ -4802,7 +4750,7 @@ async fn image_placement_cost(
     lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
 ) -> Result<flotilla_resources::ImageAcquisitionCost, String> {
     use flotilla_resources::{
-        FleetDesignation, FulfilmentRealisation, ImageAcquisitionCost, ImageBuildPhase, PlacementImageSource, FLEET_DESIGNATION_NAME,
+        FleetDesignation, FulfilmentRealisation, ImageAcquisitionCost, PlacementImageSource, FLEET_DESIGNATION_NAME,
         IMAGE_DIGESTS_CAPABILITY,
     };
     let image = match realisation {
@@ -4826,20 +4774,11 @@ async fn image_placement_cost(
             let digest = match (&architecture, host) {
                 (Some(architecture), Some(host)) => {
                     let name = crate::image_build::expected_build_name(identity, architecture, image_cache.as_ref(), &host.metadata.name);
-                    match flotilla_store::read_image_build(backend, namespace, &name, Arc::clone(&lifecycle_reads)).await {
-                        Ok(reading) => match reading.lifecycle {
-                            Some(flotilla_protocol::LifecycleReading::Ready { identity }) => Some(identity),
-                            Some(_) => None,
-                            None => reading
-                                .build
-                                .object
-                                .status
-                                .filter(|status| status.phase == ImageBuildPhase::Built)
-                                .and_then(|status| status.digest),
-                        },
-                        Err(ResourceError::NotFound { .. }) => None,
-                        Err(error) => return Err(error.to_string()),
-                    }
+                    let reads = Arc::clone(&lifecycle_reads);
+                    tokio::task::spawn_blocking(move || reads.image_builds()?.get(&name))
+                        .await
+                        .map_err(|error| format!("read image build: {error}"))??
+                        .and_then(|build| build.digest().map(str::to_owned))
                 }
                 _ => None,
             };
@@ -4897,7 +4836,6 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         bag: flotilla_discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await,
     });
     let resource_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let observed_resource_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let provisioning_namespace = Arc::new(std::sync::RwLock::new("flotilla".into()));
     let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(FixtureQueries);
     let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(FixtureQueries);
@@ -4923,7 +4861,7 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         .backend(resource_backend.clone())
         .convoys(convoys)
         .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(resource_backend.clone())))
-        .observed_backend(observed_resource_backend.clone())
+        .discovered_checkouts(DiscoveredCheckouts::default())
         .config(Arc::clone(&config))
         .discovery(Arc::clone(&discovery))
         .environments(Arc::clone(&environments))
@@ -4941,13 +4879,7 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         // The engine's readings, as composition installs them; none is held here.
         .lifecycle_reads(Arc::clone(crate::test_support::no_held_checkouts()))
         .build();
-    HandlerContractFixture {
-        owner: admission,
-        backend: resource_backend,
-        observed: observed_resource_backend,
-        namespace: provisioning_namespace,
-        temp,
-    }
+    HandlerContractFixture { owner: admission, backend: resource_backend, namespace: provisioning_namespace, temp }
 }
 
 /// Registers a ready host advertising one host-direct provider and the
@@ -5002,7 +4934,6 @@ pub async fn register_host_direct_kind(backend: &ResourceBackend, host: &str) {
 pub struct HandlerContractFixture {
     pub owner: ConvoyAdmission,
     pub backend: ResourceBackend,
-    pub observed: ResourceBackend,
     pub namespace: Arc<std::sync::RwLock<String>>,
     pub temp: tempfile::TempDir,
 }
@@ -5111,46 +5042,6 @@ mod tests {
 
     use flotilla_discovery_testkit::FakeChangeRequest;
     use flotilla_protocol::ChangeRequest;
-
-    // WORKLOAD.md: admission must select only this host's direct environments,
-    // independently of the number of unrelated per-vessel environments.
-    #[hegel::test]
-    fn direct_environment_query_covers_only_local_current_and_legacy_records(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        // Escaped/case-sensitive hosts, both stored generations, missing direct
-        // inputs, and a conflicting legacy host alongside an explicit address.
-        let host = tc.draw(gs::text().alphabet("aZ09 /:%é").min_size(1).max_size(16));
-        let address = flotilla_address::Address::root(flotilla_address::Kind::Host, &host).expect("host address");
-        let mut selected = BTreeSet::new();
-        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(24));
-        let mut expected = BTreeSet::new();
-        for row in 0..count {
-            let local = tc.draw(gs::booleans());
-            let legacy = tc.draw(gs::booleans());
-            let direct = tc.draw(gs::booleans());
-            let target = if local { host.clone() } else { format!("{host}-other") };
-            let mut spec = serde_json::json!({});
-            if !legacy {
-                let place = flotilla_address::Address::root(flotilla_address::Kind::Host, &target).expect("place");
-                spec["provider_address"] = format!("{place}/provider:custom").into();
-            }
-            if direct {
-                spec["host_direct"] =
-                    serde_json::json!({"host_ref": if legacy { target.clone() } else { host.clone() }, "repo_default_dir":"/work"});
-            } else {
-                spec["docker"] = serde_json::json!({"host_ref": target, "image":"image"});
-            }
-            let name = format!("environment-{row}");
-            let spec = serde_json::from_value::<flotilla_resources::EnvironmentSpec>(spec).expect("environment spec");
-            if is_local_direct_environment(&spec, &host).expect("predicate") {
-                selected.insert(name.clone());
-            }
-            if local && direct {
-                expected.insert(name);
-            }
-            assert_eq!(selected, expected, "candidate cover after every insert at {address}");
-        }
-    }
 
     // Artifact storage is the process boundary; read inventories and rendering
     // use real collaborators. Multiple vessels must not reread a kind.
@@ -5827,13 +5718,12 @@ mod tests {
     }
 
     // ADR 0062: a composed placement costs Held when the host inventory holds
-    // the identity's Built digest, RegistryPull when the build was pushed,
-    // and Build while the build is absent or unfinished.
+    // the identity's built digest, RegistryPull when the build was pushed,
+    // and Build while the build is absent, unfinished or lost.
     #[tokio::test]
     async fn composed_image_cost_follows_the_identity_build() {
-        use flotilla_resources::{
-            ImageAcquisitionCost, ImageBuild, ImageBuildStatus, ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier,
-        };
+        use flotilla_provisioning_testkit::{image_build::ImageBuildFixture, Ending};
+        use flotilla_resources::{ImageAcquisitionCost, ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier};
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let hosts = backend.using::<ResourceHost>("test");
         let host =
@@ -5862,21 +5752,25 @@ mod tests {
             .probe("true".into())
             .build()];
         let identity = flotilla_resources::image_identity(&layers);
-        let name = flotilla_resources::image_build_name(&identity, "amd64", &ImageDelivery::Local, "host");
         let realisation = flotilla_resources::FulfilmentRealisation::DockerPerVessel { image: None };
-        let cost = || {
-            image_placement_cost(
-                &backend,
-                "test",
-                Some(&host),
-                Some("cache"),
-                &realisation,
-                Some(BTreeSet::from([identity.as_str()])),
-                Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
-            )
+        let fixture = ImageBuildFixture::at("home");
+        fixture.host("host", "amd64");
+        let cost = |host: ResourceObject<ResourceHost>| {
+            let (backend, realisation, reads, identity) = (&backend, &realisation, fixture.reads.clone(), identity.clone());
+            async move {
+                image_placement_cost(
+                    backend,
+                    "test",
+                    Some(&host),
+                    Some("cache"),
+                    realisation,
+                    Some(BTreeSet::from([identity.as_str()])),
+                    reads,
+                )
+                .await
+            }
         };
-        assert_eq!(cost().await.expect("cost"), ImageAcquisitionCost::Build, "no build yet");
-        let builds = backend.using::<ImageBuild>("test");
+        assert_eq!(cost(host.clone()).await.expect("cost"), ImageAcquisitionCost::Build, "no build yet");
         let spec = flotilla_resources::ImageBuildSpec::builder()
             .identity(identity.clone())
             .architecture("amd64".into())
@@ -5885,57 +5779,19 @@ mod tests {
             .delivery(ImageDelivery::Local)
             .reservation(flotilla_resources::ImageBuildReservation { cpu: 1, disk_bytes: 1 })
             .build();
-        let created = builds.create(&InputMeta::builder().name(name.clone()).build(), &spec.into()).await.expect("build");
-        assert_eq!(cost().await.expect("cost"), ImageAcquisitionCost::Build, "queued build");
-        let built = |digest: &str| ImageBuildStatus {
-            phase: flotilla_resources::ImageBuildPhase::Built,
-            digest: Some(digest.to_string()),
-            ..Default::default()
-        };
+        let name = fixture.put(&spec);
+        assert_eq!(cost(host.clone()).await.expect("cost"), ImageAcquisitionCost::Build, "unfinished build");
         let manifest = format!("sha256:{}", "2".repeat(64));
-        builds
-            .update_status(&name, &created.metadata.resource_version, &built(&format!("registry.test/crew@{manifest}")))
-            .await
-            .expect("pushed");
-        assert_eq!(cost().await.expect("cost"), ImageAcquisitionCost::RegistryPull);
+        fixture.finish(&name, Ending::Ready(&format!("registry.test/crew@{manifest}")));
+        assert_eq!(cost(host.clone()).await.expect("cost"), ImageAcquisitionCost::RegistryPull);
         status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), serde_json::json!({"cache": [local_id, manifest]}));
         hosts.update_status("host", &host.metadata.resource_version, &status).await.expect("pulled inventory");
         let host = hosts.get("host").await.expect("host");
-        let held = image_placement_cost(
-            &backend,
-            "test",
-            Some(&host),
-            Some("cache"),
-            &realisation,
-            Some(BTreeSet::from([identity.as_str()])),
-            Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
-        );
-        assert_eq!(held.await.expect("cost"), ImageAcquisitionCost::Held);
-
-        // A held engine judgement replaces the contradictory Built digest in placement costs.
-        use flotilla_provisioning::engine::image_build::ImageBuildBinding;
-        use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
-        let build = builds.get(&name).await.expect("build");
-        let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
-        fixture.request(&build);
-        let cost = || {
-            image_placement_cost(
-                &backend,
-                "test",
-                Some(&host),
-                Some("cache"),
-                &realisation,
-                Some(BTreeSet::from([identity.as_str()])),
-                fixture.reads.clone(),
-            )
-        };
-        assert_eq!(cost().await.expect("requested"), ImageAcquisitionCost::Build);
-        fixture.finish(&build, Ending::Ready(&manifest));
-        assert_eq!(cost().await.expect("ready"), ImageAcquisitionCost::Held);
-        fixture.finish(&build, Ending::Lost(&manifest));
-        assert_eq!(cost().await.expect("lost"), ImageAcquisitionCost::Build);
+        assert_eq!(cost(host.clone()).await.expect("cost"), ImageAcquisitionCost::Held);
+        fixture.finish(&name, Ending::Lost(&manifest));
+        assert_eq!(cost(host.clone()).await.expect("lost"), ImageAcquisitionCost::Build);
         fixture.poison();
-        assert!(cost().await.expect_err("checked read").contains("poisoned"));
+        assert!(cost(host).await.expect_err("checked read").contains("poisoned"));
     }
 
     #[test]

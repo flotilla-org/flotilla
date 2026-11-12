@@ -53,6 +53,7 @@ pub use image_layer::{
 pub mod delivery_hold;
 #[doc(hidden)]
 pub mod digest;
+pub mod discovered_checkouts;
 pub use digest::{digest_bucket, DigestQuery, PartitionDigest, DIGEST_FANOUT};
 pub mod clone_records;
 #[doc(hidden)]
@@ -71,6 +72,7 @@ mod forge;
 mod fulfilment_kind;
 #[doc(hidden)]
 pub mod host;
+pub mod image_build_records;
 mod issue;
 pub mod labels;
 mod leaf;

@@ -1,13 +1,6 @@
-//! Builder-side ImageBuild support (ADR 0062). Admission may author the
-//! per-identity ImageBuild on any root; the declared builder projects that
-//! demand into its own store so its build service writes execution evidence
-//! at its own authority, and replication returns the evidence to consumers.
-//! Projection is two-way: when the source demand is deleted (the operator
-//! retry), the builder's copy is deleted too. This module also holds the
-//! daemon's [`ImageBuildMaterials`]: the push credential and build secrets
-//! from the credential store, and build logs kept as Artifacts.
+//! The daemon's [`ImageBuildMaterials`] (ADR 0062): the push credential and build secrets from
+//! the credential store, and build logs kept as Artifacts.
 use std::{
-    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -16,8 +9,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_credentials::{BuildSecretError, CredentialStore};
 use flotilla_environment::environment::{image::SecretFile, RegistryAuth};
-use flotilla_protocol::NodeId;
-use flotilla_provisioning::reconcilers::ImageBuildMaterials;
+use flotilla_provisioning::engine::image_build_actuator::ImageBuildMaterials;
 use flotilla_resources::{
     Artifact, ArtifactSpec, FleetDesignation, HostImageAction, ImageBuildFailure, ImageBuildFailureClass, InputMeta, ResourceError,
     FLEET_DESIGNATION_NAME,
@@ -25,94 +17,6 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use crate::blob_store::BlobStore;
-
-/// Projects build demands at once and again at each change to an ImageBuild, local or replicated,
-/// never on a timer. A burst of changes during a projection costs one more. The watch ending is
-/// an error, so supervision restarts it.
-pub(crate) async fn run_build_projection(backend: &ResourceBackend, namespace: &str, host_ref: &str) -> Result<(), ResourceError> {
-    use futures::StreamExt;
-    let mut changes = backend.including_replicas::<flotilla_resources::ImageBuild>(namespace).watch().await?.ready_chunks(64);
-    loop {
-        project_builds(backend, namespace, host_ref).await?;
-        match changes.next().await {
-            Some(events) => {
-                for event in events {
-                    event?;
-                }
-            }
-            None => return Err(ResourceError::other("ImageBuild watch closed")),
-        }
-    }
-}
-
-/// Mirror build demands onto their builder host, following Vessel placement's
-/// projection convention, and delete projected copies whose demand is gone.
-/// Retired ADR 0053 records are never projected.
-pub(crate) async fn project_builds(backend: &ResourceBackend, namespace: &str, host_ref: &str) -> Result<(), ResourceError> {
-    use flotilla_resources::{ImageBuild, ResourceProvenance, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION};
-    let builds = backend.using::<ImageBuild>(namespace);
-    let mut demanded = BTreeSet::new();
-    for source in backend.including_replicas::<ImageBuild>(namespace).list().await?.items {
-        let ResourceProvenance::Replica { origin_root, .. } = source.provenance else {
-            continue;
-        };
-        let obj = source.object;
-        let Some(spec) = obj.spec.current() else { continue };
-        if spec.host_ref != host_ref
-            || obj.metadata.deletion_timestamp.is_some()
-            || obj.metadata.annotations.contains_key(ACTUATOR_SOURCE_ROOT_ANNOTATION)
-        {
-            continue;
-        }
-        demanded.insert((origin_root.to_string(), obj.metadata.name.clone()));
-        match builds.get(&obj.metadata.name).await {
-            Ok(current) => {
-                // Copies of one name may disagree under replication lag (a
-                // different reservation or delivery view); like
-                // `read_image_build`, keep the existing copy rather than
-                // failing, since it serves the same identity and architecture.
-                if current.spec != obj.spec {
-                    tracing::warn!(image_build = %obj.metadata.name, source_root = %origin_root, "image build demand disagrees with the projected copy; keeping the copy");
-                }
-            }
-            Err(ResourceError::NotFound { .. }) => {
-                let mut annotations = obj.metadata.annotations;
-                annotations.insert(ACTUATOR_HOST_REF_ANNOTATION.into(), host_ref.into());
-                annotations.insert(ACTUATOR_SOURCE_ROOT_ANNOTATION.into(), origin_root.to_string());
-                builds.create(&InputMeta::builder().name(obj.metadata.name).annotations(annotations).build(), &obj.spec).await?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    // A projected copy whose demand has left its source root's replica is
-    // withdrawn: deleting the demand is the operator retry, and a lingering
-    // Failed copy would replicate back and be reused. Only a replica with an
-    // established cursor attests absence; a replica awaiting its snapshot
-    // may merely lag, so its copies are kept.
-    for local in builds.list().await?.items {
-        let annotations = &local.metadata.annotations;
-        let (Some(origin), Some(projected_for)) =
-            (annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION), annotations.get(ACTUATOR_HOST_REF_ANNOTATION))
-        else {
-            continue;
-        };
-        if projected_for != host_ref
-            || local.metadata.deletion_timestamp.is_some()
-            || demanded.contains(&(origin.clone(), local.metadata.name.clone()))
-        {
-            continue;
-        }
-        if backend.replica_writer::<ImageBuild>(NodeId::new(origin.as_str()), namespace).cursor().await?.is_none() {
-            continue;
-        }
-        tracing::info!(image_build = %local.metadata.name, source_root = %origin, "image build demand withdrawn; deleting projected copy");
-        match builds.delete(&local.metadata.name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
 
 /// The daemon's build materials. The push credential is the fleet image
 /// cache's `push_credential` (the fleet names it `crew-image-registry-push`),
@@ -187,8 +91,8 @@ impl ImageBuildMaterials for DaemonImageBuildMaterials {
         Ok(SecretFile::new(path, owner))
     }
 
-    async fn keep_log(&self, build: &str, attempt: u32, log: &str) -> Result<String, String> {
-        let name = format!("image-build-log-{build}-{attempt}");
+    async fn keep_log(&self, build: &str, name: &str, log: &str) -> Result<String, String> {
+        let name = name.to_owned();
         let digest = self.blobs.put_with_media_type(log.as_bytes(), "text/plain").await?;
         let now = Utc::now();
         let artifact = ArtifactSpec::builder()
@@ -213,204 +117,11 @@ impl ImageBuildMaterials for DaemonImageBuildMaterials {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
-    use flotilla_protocol::NodeId;
-    use flotilla_resources::{
-        image_identity, ImageBuild, ImageBuildPhase, ImageBuildReservation, ImageBuildSpec, ImageBuildStatusPatch, ImageDelivery,
-        ImageLayerSource, ImageLayerSpec, ImageLayerTier,
-    };
-    use flotilla_store::{apply_status_patch, read_image_build};
+    use std::collections::BTreeSet;
+
+    use flotilla_resources::ImageBuildReservation;
 
     use super::*;
-
-    fn spec(host_ref: &str) -> ImageBuildSpec {
-        let layers = vec![ImageLayerSpec::builder()
-            .name("base".into())
-            .version("1".into())
-            .tier(ImageLayerTier::Base)
-            .source(ImageLayerSource::Stdlib)
-            .from(format!("ubuntu@sha256:{}", "1".repeat(64)))
-            .fragment("FROM ${BASE}\n".into())
-            .probe("true".into())
-            .build()];
-        ImageBuildSpec::builder()
-            .identity(image_identity(&layers))
-            .architecture("amd64".into())
-            .layers(layers)
-            .host_ref(host_ref.into())
-            .delivery(ImageDelivery::Local)
-            .reservation(ImageBuildReservation { cpu: 1, disk_bytes: 1 })
-            .build()
-    }
-
-    // A declared builder projects a remote demand only once, refuses a name
-    // that already holds a different spec, writes evidence at its own
-    // authority, and replication returns that evidence to admission.
-    #[tokio::test]
-    async fn declared_builder_projects_demand_and_returns_execution_evidence() {
-        let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
-        let builder = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("builder-root"));
-        let spec = spec("builder");
-        let name = spec.resource_name();
-        home.using::<ImageBuild>("test")
-            .create(&InputMeta::builder().name(name.clone()).build(), &spec.clone().into())
-            .await
-            .expect("demand");
-        builder
-            .replica_writer::<ImageBuild>(NodeId::new("home"), "test")
-            .replace(&home.using::<ImageBuild>("test").list().await.expect("demand snapshot"), Utc::now())
-            .await
-            .expect("replicate demand");
-        for _ in 0..2 {
-            project_builds(&builder, "test", "builder").await.expect("project");
-        }
-        let builds = builder.using::<ImageBuild>("test");
-        assert_eq!(builds.list().await.expect("list").items.len(), 1);
-        project_builds(&builder, "test", "elsewhere").await.expect("other hosts project nothing");
-        assert_eq!(builds.list().await.expect("list").items.len(), 1);
-        apply_status_patch(&builds, &name, &ImageBuildStatusPatch::Start { at: Utc::now(), attempt: 1 }).await.expect("start");
-        apply_status_patch(
-            &builds,
-            &name,
-            &ImageBuildStatusPatch::Built {
-                at: Utc::now(),
-                digest: format!("sha256:{}", "3".repeat(64)),
-                probes: Vec::new(),
-                log_ref: "log".into(),
-            },
-        )
-        .await
-        .expect("built");
-        home.replica_writer::<ImageBuild>(NodeId::new("builder-root"), "test")
-            .replace(&builds.list().await.expect("execution snapshot"), Utc::now())
-            .await
-            .expect("replicate evidence");
-        assert_eq!(
-            read_image_build(&home, "test", &name, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
-                .await
-                .expect("read execution")
-                .build
-                .object
-                .status
-                .expect("evidence")
-                .phase,
-            ImageBuildPhase::Built
-        );
-        assert!(home.using::<ImageBuild>("test").get(&name).await.expect("original demand").status.is_none());
-    }
-
-    // A local copy whose spec disagrees with a replicated demand of the same
-    // name is kept, not overwritten, matching `read_image_build`.
-    #[tokio::test]
-    async fn name_collisions_are_not_projected() {
-        let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
-        let builder = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("builder-root"));
-        let demand = spec("builder");
-        let name = demand.resource_name();
-        home.using::<ImageBuild>("test").create(&InputMeta::builder().name(name.clone()).build(), &demand.into()).await.expect("demand");
-        builder
-            .using::<ImageBuild>("test")
-            .create(
-                &InputMeta::builder().name(name.clone()).build(),
-                &ImageBuildSpec { reservation: ImageBuildReservation { cpu: 2, disk_bytes: 1 }, ..spec("builder") }.into(),
-            )
-            .await
-            .expect("existing");
-        builder
-            .replica_writer::<ImageBuild>(NodeId::new("home"), "test")
-            .replace(&home.using::<ImageBuild>("test").list().await.expect("demand snapshot"), Utc::now())
-            .await
-            .expect("replicate demand");
-        project_builds(&builder, "test", "builder").await.expect("project");
-        let local = builder.using::<ImageBuild>("test").get(&name).await.expect("local");
-        assert_eq!(local.spec.current().expect("current").reservation.cpu, 2);
-    }
-
-    // Projection is two-way: deleting the demand on its admitting root (the
-    // operator retry for a recipe failure) deletes the builder's copy once
-    // the builder's replica of that root attests the absence, so the Failed
-    // copy no longer replicates back. A replica that awaits its snapshot
-    // (no cursor) may merely lag, so copies survive it.
-    #[tokio::test]
-    async fn withdrawn_demand_deletes_the_projected_copy_only_on_a_current_replica() {
-        let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
-        let builder = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("builder-root"));
-        let demand = spec("builder");
-        let name = demand.resource_name();
-        let demands = home.using::<ImageBuild>("test");
-        demands.create(&InputMeta::builder().name(name.clone()).build(), &demand.into()).await.expect("demand");
-        let replica = builder.replica_writer::<ImageBuild>(NodeId::new("home"), "test");
-        replica.replace(&demands.list().await.expect("demand snapshot"), Utc::now()).await.expect("replicate demand");
-        project_builds(&builder, "test", "builder").await.expect("project");
-        let builds = builder.using::<ImageBuild>("test");
-        apply_status_patch(&builds, &name, &ImageBuildStatusPatch::Start { at: Utc::now(), attempt: 1 }).await.expect("start");
-        // A copy projected from a root whose replica has no snapshot yet, and
-        // an unannotated local build, are never withdrawn.
-        let lagging = spec("builder");
-        let mut lagging = lagging;
-        lagging.architecture = "arm64".into();
-        let lagging_name = lagging.resource_name();
-        let annotations = std::collections::BTreeMap::from([
-            (flotilla_resources::ACTUATOR_HOST_REF_ANNOTATION.to_string(), "builder".to_string()),
-            (flotilla_resources::ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "unsynced-root".to_string()),
-        ]);
-        builds
-            .create(&InputMeta::builder().name(lagging_name.clone()).annotations(annotations).build(), &lagging.into())
-            .await
-            .expect("lagging copy");
-        let mut own = spec("builder");
-        own.layers[0].version = "2".into();
-        own.identity = image_identity(&own.layers);
-        let own_name = own.resource_name();
-        builds.create(&InputMeta::builder().name(own_name.clone()).build(), &own.into()).await.expect("own build");
-
-        demands.delete(&name).await.expect("operator retry");
-        project_builds(&builder, "test", "builder").await.expect("project before the deletion replicates");
-        assert!(builds.get(&name).await.is_ok(), "the demand is still present in the replica");
-        replica.replace(&demands.list().await.expect("empty snapshot"), Utc::now()).await.expect("replicate deletion");
-        assert!(replica.cursor().await.expect("cursor").is_some(), "a snapshot establishes the replica");
-        project_builds(&builder, "test", "builder").await.expect("project withdrawal");
-        assert!(matches!(builds.get(&name).await, Err(flotilla_resources::ResourceError::NotFound { .. })));
-        assert!(builds.get(&own_name).await.is_ok());
-        assert!(builds.get(&lagging_name).await.is_ok(), "a root without a replica snapshot may merely lag");
-    }
-
-    // #3108: the running projection follows ImageBuild changes, with no timer: a replicated
-    // demand is projected, and its withdrawal deletes the copy.
-    #[tokio::test]
-    async fn the_running_projection_follows_demand_changes() {
-        let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
-        let builder = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("builder-root"));
-        let task = tokio::spawn({
-            let builder = builder.clone();
-            async move { run_build_projection(&builder, "test", "builder").await }
-        });
-        let demand = spec("builder");
-        let name = demand.resource_name();
-        let demands = home.using::<ImageBuild>("test");
-        demands.create(&InputMeta::builder().name(name.clone()).build(), &demand.into()).await.expect("demand");
-        let replica = builder.replica_writer::<ImageBuild>(NodeId::new("home"), "test");
-        replica.replace(&demands.list().await.expect("demand snapshot"), Utc::now()).await.expect("replicate demand");
-        let builds = builder.using::<ImageBuild>("test");
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while builds.get(&name).await.is_err() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the replicated demand is projected");
-        demands.delete(&name).await.expect("operator retry");
-        replica.replace(&demands.list().await.expect("empty snapshot"), Utc::now()).await.expect("replicate deletion");
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while builds.get(&name).await.is_ok() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the withdrawn demand's copy is deleted");
-        assert!(!task.is_finished());
-        task.abort();
-    }
 
     // Credential and command boundary: minting and staging never run a command.
     struct NoCommands;
@@ -563,7 +274,8 @@ mod tests {
         assert_eq!(refused.class, ImageBuildFailureClass::Recipe);
         assert!(refused.reason.contains("`forgejo-token`"));
 
-        let log_ref = materials.keep_log("image-abc-amd64", 2, "step 1\n").await.expect("log kept");
+        let log_ref = materials.keep_log("image-abc-amd64", "image-build-log-image-abc-amd64-3-2", "step 1\n").await.expect("log kept");
+        assert_eq!(log_ref, "image-build-log-image-abc-amd64-3-2");
         let artifact = backend.using::<Artifact>("test").get(&log_ref).await.expect("artifact");
         assert_eq!(artifact.spec.kind, "build-log");
         assert_eq!(artifact.spec.subject, "image-abc-amd64");

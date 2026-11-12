@@ -7738,8 +7738,7 @@ async fn associated_checkout_remote_move_updates_repository_in_place() {
         .expect("project add moved checkout");
     assert!(matches!(recv_command_finished(&mut events, command_id).await, CommandValue::ProjectAdded { .. }));
     assert_eq!(repositories.list().await.expect("repositories after project add").items.len(), 1);
-    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla").list().await.expect("observed checkouts");
-    assert!(observed.items.iter().all(|checkout| checkout.spec.repo_ref() == &original_key));
+    assert!(daemon.discovered_checkouts().all().iter().all(|checkout| checkout.spec.repo_ref == original_key));
 }
 
 #[tokio::test]
@@ -7774,26 +7773,20 @@ async fn associated_path_replaced_by_unrelated_repository_mints_new_identity() {
 
     let old_key = RepositorySpec::remote("https://github.com/owner/ghostty").expect("old spec").key();
     let unaffected_path = temp.path().join("ghostty-main");
-    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
-    observed
-        .create(
-            &InputMeta::builder()
-                .name("unaffected-old-checkout".to_string())
-                .labels(BTreeMap::from([(REPO_KEY_LABEL.to_string(), old_key.to_string())]))
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Observed),
-            &ResourceCheckoutSpec::Observed(
-                ObservedCheckoutSpec::builder()
-                    .r#ref("main".to_string())
-                    .path(unaffected_path.to_string_lossy().into_owned())
-                    .repo_ref(old_key.clone())
-                    .host_ref("other-host".to_string())
-                    .is_main(true)
-                    .build(),
-            ),
-        )
-        .await
-        .expect("create unaffected old checkout observation");
+    let mut old_checkouts =
+        daemon.discovered_checkouts().all().into_iter().filter(|checkout| checkout.spec.repo_ref == old_key).collect::<Vec<_>>();
+    old_checkouts.push(flotilla_resources::discovered_checkouts::DiscoveredCheckout {
+        name: "unaffected-old-checkout".to_string(),
+        repo_slug: old_key.to_string(),
+        spec: ObservedCheckoutSpec::builder()
+            .r#ref("main".to_string())
+            .path(unaffected_path.to_string_lossy().into_owned())
+            .repo_ref(old_key.clone())
+            .host_ref("other-host".to_string())
+            .is_main(true)
+            .build(),
+    });
+    daemon.discovered_checkouts().replace(&old_key, old_checkouts);
     *remote.write().expect("remote lock") = "ghostty-ops".to_string();
     let change = daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh replacement");
 
@@ -7805,7 +7798,7 @@ async fn associated_path_replaced_by_unrelated_repository_mints_new_identity() {
     let old = repositories.items.iter().find(|item| item.metadata.name == old_key.to_string()).expect("old Repository remains");
     assert_eq!(old.spec.remotes(), ["https://github.com/owner/ghostty"]);
     repositories.items.iter().find(|item| item.metadata.name == new_key.to_string()).expect("new Repository is materialized");
-    observed.get("unaffected-old-checkout").await.expect("unaffected old checkout observation remains");
+    assert!(daemon.discovered_checkouts().get("unaffected-old-checkout").is_some(), "unaffected old checkout observation remains");
 }
 
 async fn recv_event(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>) -> DaemonEvent {
@@ -9536,21 +9529,20 @@ fn repository_operations_without_tracked_roots(tc: hegel::TestCase) {
             .expect("declare alias");
         let path = physical_tempdir_path(&temp).join("checkout");
         if checkout {
-            daemon
-                .observed_resource_backend()
-                .using::<ResourceCheckout>("flotilla")
-                .create(
-                    &InputMeta::builder().name("identity-checkout".into()).build(),
-                    &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
+            daemon.discovered_checkouts().replace(
+                &key,
+                vec![flotilla_resources::discovered_checkouts::DiscoveredCheckout {
+                    name: "identity-checkout".into(),
+                    repo_slug: key.to_string(),
+                    spec: ObservedCheckoutSpec {
                         repo_ref: key.clone(),
                         host_ref: daemon.local_host_id().expect("Host").to_string(),
                         path: path.to_string_lossy().into_owned(),
                         r#ref: "main".into(),
                         is_main: true,
-                    }),
-                )
-                .await
-                .expect("checkout fact");
+                    },
+                }],
+            );
             install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("identity-repo".into()))).await;
         }
         let mut linked = false;
@@ -9912,17 +9904,7 @@ async fn startup_forgejo_ignores_work_credentials() {
             .err()
             .expect("no implicit work identity");
         assert_eq!(error, "no issue provider available for https://forgejo.lab.flotilla.work lab/repo");
-        assert_eq!(
-            daemon
-                .observed_resource_backend()
-                .using::<ResourceCheckout>("flotilla")
-                .list()
-                .await
-                .expect("list observed checkouts")
-                .items
-                .len(),
-            2
-        );
+        assert_eq!(daemon.discovered_checkouts().all().len(), 2);
     }
 }
 
@@ -9966,17 +9948,7 @@ async fn startup_forgejo_discovery_error_preserves_other_repositories() {
         assert!(failed.unmet_requirements.iter().any(|requirement| requirement.value.as_ref().is_some_and(|value| value.contains(name))));
         let healthy = status.repos.iter().find(|root| root.path != repo).expect("retain healthy repository in status");
         assert!(!healthy.unmet_requirements.iter().any(|requirement| requirement.factory == "repository discovery"));
-        assert_eq!(
-            daemon
-                .observed_resource_backend()
-                .using::<ResourceCheckout>("flotilla")
-                .list()
-                .await
-                .expect("list retained checkout facts")
-                .items
-                .len(),
-            2
-        );
+        assert_eq!(daemon.discovered_checkouts().all().len(), 2);
         assert!(daemon.discover_repo_for_environment_for_test(&repo, daemon.local_environment_id()).await.is_err());
     }
 }

@@ -81,7 +81,7 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
     let checkout_count = || async {
         let reads = daemon.lifecycle_reads();
         let held = reads.checkouts().expect("checkouts").here().expect("held here").len();
-        let observed = daemon.observed_resource_backend().using::<ResourceCheckout>(NAMESPACE).list().await.expect("observed").items.len();
+        let observed = daemon.discovered_checkouts().all().len();
         (held, observed)
     };
     let checkout_count_before = checkout_count().await;

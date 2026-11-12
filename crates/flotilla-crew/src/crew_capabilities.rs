@@ -8,13 +8,12 @@ use std::{
 use flotilla_agent::adapter::CAPABILITIES_HEADING;
 use flotilla_capability_contract::{credential_card, CredentialCapability, SessionCapabilitySource};
 use flotilla_messaging::MessageInbox;
-use flotilla_protocol::LifecycleReading;
 use flotilla_resources::account_access::AccountRecords;
-use flotilla_resources::lifecycle_reads::{LifecycleReads, ProvisioningKind};
+use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{
-    message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, ImageBuild, ImageBuildPhase,
-    InputMeta, Message, MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceProvenance, ResourceRef,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
+    message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, InputMeta, Message,
+    MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, Vessel,
 };
 use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
@@ -121,23 +120,12 @@ pub async fn session_card(
     if let Some(docker) = &environment.spec.docker {
         text.push_str(&reachable_paths(&docker.mounts));
         if let Some(build) = &docker.image_build_ref {
-            let selected = backend.including_replicas::<ImageBuild>(namespace).get(build).await.map_err(|error| error.to_string())?;
-            let origin = match selected.provenance {
-                ResourceProvenance::Local => None,
-                ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
-            };
-            let build = selected.object;
-            let name = build.metadata.name.clone();
-            let lifecycle = tokio::task::spawn_blocking(move || reads.try_reading(ProvisioningKind::ImageBuild, &name, origin.as_deref()))
+            let (reads, name) = (Arc::clone(&reads), build.clone());
+            let build = tokio::task::spawn_blocking(move || reads.image_builds()?.get(&name))
                 .await
-                .map_err(|error| format!("image capability lifecycle read: {error}"))??;
-            let verified = match lifecycle {
-                Some(LifecycleReading::Ready { .. }) => true,
-                Some(_) => false,
-                None => build.status.as_ref().is_some_and(|status| status.phase == ImageBuildPhase::Built),
-            };
-            // Only a realised image has passed every layer's probe.
-            if let Some(spec) = build.spec.current().filter(|_| verified) {
+                .map_err(|error| format!("image capability read: {error}"))??;
+            // Only a built image has passed every layer's probe.
+            if let Some(spec) = build.filter(|build| build.digest().is_some()).map(|build| build.spec) {
                 let provides = spec.layers.iter().flat_map(|layer| layer.provides.iter().cloned()).collect::<BTreeSet<_>>();
                 text.push_str(&format!("Verified tools and runtimes: {}.\n", provides.into_iter().collect::<Vec<_>>().join(", ")));
             }

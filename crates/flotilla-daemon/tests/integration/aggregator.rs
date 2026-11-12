@@ -33,7 +33,7 @@ use flotilla_protocol::TerminalStatus;
 use flotilla_protocol_testkit::TestIssue;
 use flotilla_resources::terminal_records::TerminalLaunchRequest;
 use flotilla_resources::{
-    Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment, EnvironmentSpec,
+    CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment, EnvironmentSpec,
     HostDirectEnvironmentSpec, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec,
     TerminalSessionSource, TerminalSessionSpec, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot,
 };
@@ -1089,11 +1089,15 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
             .is_main(false)
             .build(),
     );
-    let observed = daemon.observed_resource_backend().using::<Checkout>("flotilla");
-    observed
-        .create(&InputMeta::builder().name("unrelated".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Observed), &spec)
-        .await
-        .expect("unrelated observation");
+    let CheckoutSpec::Observed(unrelated) = spec.clone() else { unreachable!("an observation is observed") };
+    daemon.discovered_checkouts().replace(
+        &repository.key(),
+        vec![flotilla_resources::discovered_checkouts::DiscoveredCheckout {
+            name: "unrelated".to_string(),
+            repo_slug: repository.key().to_string(),
+            spec: unrelated,
+        }],
+    );
     let engine = flotilla_daemon_testkit::engine::runtime_checkouts(&daemon);
     if admission_conflict {
         std::fs::create_dir(tmp.path().join("checkout")).expect("checkout directory");
@@ -1134,8 +1138,8 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
         use flotilla_resources::checkout_records::CheckoutRecords as _;
         let held = engine.checkouts.here().expect("engine checkouts");
         assert!(held.is_empty(), "a refused admission must not hold an adopted checkout: {held:?}");
-        let remaining = observed.list().await.expect("observed checkouts").items;
-        assert!(matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated"), "{remaining:?}");
+        let remaining = daemon.discovered_checkouts().all();
+        assert!(matches!(remaining.as_slice(), [checkout] if checkout.name == "unrelated"), "{remaining:?}");
     } else {
         let launch = engine.put_ready("adopted", &spec, None);
         tokio::time::timeout(Duration::from_secs(5), async {

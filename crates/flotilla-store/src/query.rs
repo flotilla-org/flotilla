@@ -58,12 +58,6 @@ pub struct StoreQuery {
     pub message: Option<MessageQuery>,
     #[serde(default)]
     pub include_replicas: bool,
-    /// Internal source view used by stores with a separate durable replica store.
-    #[serde(default)]
-    pub replicas_only: bool,
-    /// Override which local names shadow replicas when composing two stores.
-    #[serde(default)]
-    pub replica_shadowing: Option<ReplicaShadowing>,
     #[serde(default = "suppress_default")]
     pub suppress_self_origin: bool,
 }
@@ -87,13 +81,6 @@ impl FieldQuery {
         }
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReplicaShadowing {
-    pub origin_root: flotilla_protocol::NodeId,
-    pub local_names: BTreeSet<String>,
-}
-
 /// Stable order across adapters: name, then local before replicas, then origin.
 pub fn sort_query_items(items: &mut [crate::ReadResourceObject<crate::SerializedResource>]) {
     sort_query_rows(items, |item| (item.object.metadata.name.as_str(), &item.provenance));
@@ -138,13 +125,11 @@ impl Default for StoreQuery {
             present: Vec::new(),
             label_prefixes: BTreeMap::new(),
             all_sources_for_matches: false,
-            replica_shadowing: None,
             any_of: None,
             merged_definitions: false,
             owner: None,
             message: None,
             include_replicas: false,
-            replicas_only: false,
             suppress_self_origin: true,
         }
     }
@@ -204,8 +189,6 @@ impl StoreQuery {
             all_sources_for_matches: _,
             message,
             include_replicas: _,
-            replicas_only: _,
-            replica_shadowing: _,
             suppress_self_origin: _,
         } = self;
         let selects = !labels.is_empty()
@@ -255,7 +238,6 @@ impl StoreQuery {
                 || depth > 0
                 || !self.include_replicas
                 || self.suppress_self_origin
-                || self.replicas_only
                 || !self.labels.is_empty()
                 || self.owner.is_some()
                 || self.message.is_some()

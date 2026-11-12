@@ -6,10 +6,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use flotilla_engine_store::{open_home, StoreLog};
 use flotilla_provisioning::{
-    engine::{clones::request_of, decide, LifecycleHome, Lifecycles, Step},
+    engine::{clones::request_of, LifecycleHome, Lifecycles, Step},
     stored::{self, clone::CloneKind},
 };
 use flotilla_resources::{Clone as OldClone, CloneSpec, ObjectMeta, ResourceObject};
@@ -84,40 +84,21 @@ fn engine_writes_survive_a_reopened_home() {
 }
 
 // Behaviour (#3729 review): a restart keeps every provisioning kind's engine state. Each kind is
-// requested and realised through `decide` over the store (an Environment through its port, as
-// its controller realises it), and a home reopened over the store holds it realised under the
+// requested and realised over the store (an Environment and a Checkout through their ports, as
+// their controllers realise them), and a home reopened over the store holds it realised under the
 // same identity.
 #[test]
 fn every_kind_survives_a_reopened_home() {
-    use flotilla_provisioning::engine::{image_build::ImageBuildBinding, Binding, Lifecycles};
+    use flotilla_provisioning::{
+        engine::image_builds::{demand_of, launch_of},
+        stored::image_build::ImageBuildKind,
+    };
     use flotilla_provisioning_testkit::{CheckoutFixture, EnvironmentFixture};
     use flotilla_resources::{
         environment_records::LaunchFacts, CheckoutSpec, CheckoutWorktreeSpec, EnvironmentSpec, HostDirectEnvironmentSpec,
-        ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageBuildStatusPatch, ImageDelivery,
+        ImageBuildReservation, ImageBuildSpec, ImageDelivery,
     };
-    fn reopened<B: Binding>(
-        store: &Arc<Mutex<Store>>,
-        obj: ResourceObject<B::Old>,
-        ready: <B::Old as flotilla_resources::Resource>::StatusPatch,
-        identity: &str,
-    ) where
-        <B::Kind as flotilla_state_machines::machines::lifecycle::LifecycleKind>::Request: Send + Sync + PartialEq + std::fmt::Debug,
-        StoreLog: flotilla_state_machines::Log<flotilla_state_machines::machines::lifecycle::Lifecycle<B::Kind>>,
-        flotilla_state_machines::Resource<flotilla_state_machines::machines::lifecycle::Lifecycle<B::Kind>>: flotilla_schema::Kind,
-    {
-        let open = || -> Arc<dyn Lifecycles<B::Kind>> {
-            Arc::new(LifecycleHome::new(HOME, open_home(StoreLog::new(Arc::clone(store))).expect("home")))
-        };
-        let home = open();
-        assert!(decide::<B>(home.as_ref(), &obj, Some(ready), Utc::now()).patch.is_some());
-        let restored = open().get(&obj.metadata.name).expect("restored");
-        assert_eq!(restored.state(), &LifecycleState::Realised { identity: identity.into() });
-        assert_eq!(restored.spec(), home.get(&obj.metadata.name).expect("held").spec());
-    }
     let store = store();
-    let meta = |name: &str| {
-        ResourceObject::<OldClone> { metadata: ObjectMeta { name: name.into(), ..clone_object().metadata }, ..clone_object() }.metadata
-    };
     let environment = EnvironmentSpec {
         provider_address: Some("host:feta/provider:host-direct".parse().expect("provider")),
         host_direct: Some(HostDirectEnvironmentSpec { host_ref: String::new(), repo_default_dir: "/work".into() }),
@@ -129,21 +110,24 @@ fn every_kind_survives_a_reopened_home() {
     let restored = EnvironmentFixture::over(HOME, Arc::clone(&store)).lifecycles.get("env-a").expect("restored");
     assert_eq!(restored.state(), &LifecycleState::Realised { identity: "/work".into() });
     assert_eq!(restored.spec(), environments.lifecycles.get("env-a").expect("held").spec());
-    let build = ResourceObject::<flotilla_resources::ImageBuild> {
-        metadata: meta("image-a"),
-        spec: ImageBuildResourceSpec::Current(Box::new(ImageBuildSpec {
-            identity: "sha256:feed".into(),
-            architecture: "arm64".into(),
-            layers: vec![],
-            host_ref: "feta".into(),
-            delivery: ImageDelivery::Local,
-            reservation: ImageBuildReservation { cpu: 1, disk_bytes: 1 },
-        })),
-        status: None,
+    let spec = ImageBuildSpec {
+        identity: "sha256:feed".into(),
+        architecture: "arm64".into(),
+        layers: vec![],
+        host_ref: "feta".into(),
+        delivery: ImageDelivery::Local,
+        reservation: ImageBuildReservation { cpu: 1, disk_bytes: 1 },
     };
-    let built =
-        ImageBuildStatusPatch::Built { at: DateTime::UNIX_EPOCH, digest: "sha256:beef".into(), probes: vec![], log_ref: "log".into() };
-    reopened::<ImageBuildBinding>(&store, build, built, "sha256:beef");
+    let builds = || -> Arc<dyn Lifecycles<ImageBuildKind>> {
+        Arc::new(LifecycleHome::new(HOME, open_home(StoreLog::new(Arc::clone(&store))).expect("image builds")))
+    };
+    let held = builds();
+    let request = launch_of("image-a", &demand_of(&spec, flotilla_schema::Ref::new("feta", HOME)).expect("demand"));
+    let launch = held.request("image-a", request, Timestamp(1)).expect("launched").name().to_owned();
+    held.step(&launch, &Step::Realised { identity: "sha256:beef".into() }, Timestamp(2)).expect("built");
+    let restored = builds().newest_launch("image-a").expect("restored");
+    assert_eq!(restored.state(), &LifecycleState::Realised { identity: "sha256:beef".into() });
+    assert_eq!(restored.spec(), held.get(&launch).expect("held").spec());
     // A checkout is requested and realised through its port, as its controller realises it (#3108).
     let checkouts = CheckoutFixture::over(HOME, Arc::clone(&store));
     let spec = CheckoutSpec::Worktree(CheckoutWorktreeSpec {

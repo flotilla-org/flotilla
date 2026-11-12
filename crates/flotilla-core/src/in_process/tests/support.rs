@@ -952,3 +952,21 @@ pub(in crate::in_process) fn install_engine_messages(
 pub(in crate::in_process) async fn designate_fleet(backend: &ResourceBackend) {
     flotilla_engine_messages_testkit::designate_fleet(backend, "flotilla").await;
 }
+
+/// Holds a checkout of `spec.repo_ref` named `name` among `daemon`'s discovered checkouts, beside
+/// the others of its repository, as this host's refresh would find it.
+pub(in crate::in_process) fn discover_checkout(daemon: &InProcessDaemon, name: &str, spec: flotilla_resources::ObservedCheckoutSpec) {
+    let repository = spec.repo_ref.clone();
+    let mut found = daemon
+        .discovered_checkouts
+        .all()
+        .into_iter()
+        .filter(|checkout| checkout.spec.repo_ref == repository && checkout.name != name)
+        .collect::<Vec<_>>();
+    found.push(flotilla_resources::discovered_checkouts::DiscoveredCheckout {
+        name: name.to_owned(),
+        repo_slug: repository.to_string(),
+        spec,
+    });
+    daemon.discovered_checkouts.replace(&repository, found);
+}

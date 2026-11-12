@@ -83,9 +83,11 @@ impl InProcessDaemon {
         let (mut reason, mut delivery) = match action {
             A::FleetPostInstall { .. } => (TargetReason::LocalMutation, RemoteDelivery::Command),
             // Any daemon may ask for a composed image: the check reads the
-            // project's repository and get-or-creates a replicated ImageBuild
-            // that its builder host executes.
+            // project's repository and demands the image build at this home,
+            // which its builder launches.
             A::ImageCheck { .. } => (TargetReason::LocalMutation, RemoteDelivery::Command),
+            // A build's launches are written only at its builder's home.
+            A::ImageBuildRetry { .. } => (TargetReason::RecordHome, RemoteDelivery::Command),
             A::ConvoyStart { .. } | A::ConvoyCreate { .. } => (TargetReason::Admission, RemoteDelivery::Command),
             A::ConvoyDelete { .. }
             | A::ConvoyLink { .. }
@@ -209,6 +211,22 @@ impl InProcessDaemon {
                 } else {
                     reason = TargetReason::LocalMutation;
                     TargetHost::Local
+                }
+            }
+            A::ImageBuildRetry { name } => {
+                let (reads, owned) = (self.lifecycle_reads(), name.clone());
+                let builder = off_frame(move || async move {
+                    tokio::task::spawn_blocking(move || reads.image_builds()?.builder_home(&owned))
+                        .await
+                        .map_err(|error| format!("find the builder of {name}: {error}"))?
+                })
+                .await
+                .map_err(TargetError::RecordHome)?
+                .ok_or_else(|| TargetError::RecordHome(format!("image build `{name}` is demanded at no home this daemon follows")))?;
+                if builder == self.node_id().as_str() {
+                    TargetHost::Local
+                } else {
+                    TargetHost::Node(NodeId::new(builder))
                 }
             }
             // A person's receipt is written at the message's home (#3938).

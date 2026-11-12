@@ -209,6 +209,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::FulfilmentList(_)
         | CommandValue::ImageCheck(_)
         | CommandValue::ImageBuild(_)
+        | CommandValue::ImageBuildRetried { .. }
         | CommandValue::FleetList(_)
         | CommandValue::CrewStalls(_)
         | CommandValue::CrewCapabilities { .. }

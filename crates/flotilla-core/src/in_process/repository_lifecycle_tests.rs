@@ -50,24 +50,18 @@ impl Factory for CountingVcsFactory {
     }
 }
 
-async fn observe(daemon: &InProcessDaemon, backend: &ResourceBackend, name: &str, path: &Path, key: &RepositoryKey) {
-    backend
-        .clone()
-        .using::<ResourceCheckout>(&daemon.provisioning_namespace().await)
-        .create(
-            &InputMeta::builder().name(name.to_string()).build(),
-            &ResourceCheckoutSpec::Observed(
-                flotilla_resources::ObservedCheckoutSpec::builder()
-                    .r#ref("main".into())
-                    .path(path.to_string_lossy().into_owned())
-                    .repo_ref(key.clone())
-                    .host_ref(daemon.environment_manager.local_host_id().to_string())
-                    .is_main(true)
-                    .build(),
-            ),
-        )
-        .await
-        .expect("observe checkout");
+fn observe(daemon: &InProcessDaemon, name: &str, path: &Path, key: &RepositoryKey) {
+    super::tests::discover_checkout(
+        daemon,
+        name,
+        flotilla_resources::ObservedCheckoutSpec::builder()
+            .r#ref("main".into())
+            .path(path.to_string_lossy().into_owned())
+            .repo_ref(key.clone())
+            .host_ref(daemon.environment_manager.local_host_id().to_string())
+            .is_main(true)
+            .build(),
+    );
 }
 
 // #1770: observation alone never constructs a provider. Concurrent demands
@@ -100,7 +94,6 @@ fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
         .await;
         // The engine's readings, which a running daemon always has.
         super::tests::test_engine(&daemon);
-        let backend = &daemon.observed_resource_backend;
         let repository = RepositorySpec::remote("https://github.com/example/lifetime").expect("repository");
         let key = repository.key();
         daemon
@@ -111,7 +104,7 @@ fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
             .expect("create repository");
         assert_eq!(probes.load(Ordering::SeqCst), 0);
         for cycle in 0..cycles {
-            observe(&daemon, backend, "lifetime", path, &key).await;
+            observe(&daemon, "lifetime", path, &key);
             assert_eq!(probes.load(Ordering::SeqCst), cycle * 2, "observation is not provider demand");
             let (first, concurrent) = tokio::time::timeout(Duration::from_secs(2), async {
                 tokio::join!(daemon.local_vcs_for_checkout(path), daemon.local_vcs_for_checkout(path))
@@ -125,10 +118,10 @@ fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
             }
             assert_eq!(probes.load(Ordering::SeqCst), cycle * 2 + 1, "one construction for this Checkout lifetime");
             let old = Arc::downgrade(&first);
-            backend.clone().using::<ResourceCheckout>("flotilla").delete("lifetime").await.expect("delete checkout");
+            daemon.discovered_checkouts.forget_path(&key, path);
             // Recreate before waiting for a watcher: instance identity must also
             // prevent stale reuse across a fast delete/create pair.
-            observe(&daemon, backend, "lifetime", path, &key).await;
+            observe(&daemon, "lifetime", path, &key);
             let replacement = daemon.local_vcs_for_checkout(path).await.expect("replacement demand");
             assert!(!Arc::ptr_eq(&first, &replacement));
             assert_eq!(probes.load(Ordering::SeqCst), cycle * 2 + 2);
@@ -143,7 +136,7 @@ fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
             let live = daemon.local_vcs_for_checkout(path).await.expect("live replacement");
             let retired = Arc::downgrade(&live);
             drop(live);
-            backend.clone().using::<ResourceCheckout>("flotilla").delete("lifetime").await.expect("retire replacement");
+            daemon.discovered_checkouts.forget_path(&key, path);
             tokio::time::timeout(Duration::from_secs(2), async {
                 while retired.upgrade().is_some() {
                     tokio::task::yield_now().await;
@@ -184,7 +177,7 @@ async fn generic_checkout_executes_without_presentation_roots() {
         .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
         .await
         .expect("declare Repository");
-    observe(&daemon, &daemon.observed_resource_backend, "commands", path, &key).await;
+    observe(&daemon, "commands", path, &key);
     assert!(daemon.list_repos().await.expect("presentation rows").is_empty());
     let mut events = daemon.subscribe();
     let id = daemon
@@ -306,7 +299,7 @@ async fn project_issue_binding_keeps_conditional_lease_after_checkout_removal() 
         .await
         .expect("Project binding");
     let path = Path::new("/checkouts/issues");
-    observe(&daemon, &daemon.observed_resource_backend, "issues", path, &key).await;
+    observe(&daemon, "issues", path, &key);
     let identity = flotilla_executor::action_support::repository_event_identity(&spec, None);
     let mut stale = ProviderRegistry::new();
     stale.issue_trackers.insert(
@@ -335,8 +328,8 @@ async fn project_issue_binding_keeps_conditional_lease_after_checkout_removal() 
     assert!(calls[1].1.contains(&"If-None-Match: \"issue-window\"".to_string()));
 }
 
-// Namespace changes retire idle providers immediately and move both resource
-// watchers to the new namespace; deletion there still needs no subsequent demand.
+// Namespace changes retire idle providers immediately; forgetting the checkout in the new
+// namespace still needs no subsequent demand.
 #[tokio::test]
 async fn checkout_provider_watch_follows_namespace_changes() {
     let temp = tempfile::tempdir().expect("config");
@@ -363,7 +356,7 @@ async fn checkout_provider_watch_follows_namespace_changes() {
         .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
         .await
         .expect("repository");
-    observe(&daemon, &daemon.observed_resource_backend, "namespace", path, &key).await;
+    observe(&daemon, "namespace", path, &key);
     let first = daemon.local_vcs_for_checkout(path).await.expect("first provider");
     let first_lifetime = Arc::downgrade(&first);
     // Let both in-memory watch subscriptions reach their pending receive before
@@ -378,20 +371,17 @@ async fn checkout_provider_watch_follows_namespace_changes() {
     })
     .await
     .expect("namespace change retires the previous cached lifetime without demand");
-    for backend in [&daemon.resource_backend, &daemon.observed_resource_backend] {
-        observe(&daemon, backend, "namespace", path, &key).await;
-        let provider = daemon.local_vcs_for_checkout(path).await.expect("new namespace provider");
-        let retired = Arc::downgrade(&provider);
-        drop(provider);
-        backend.using::<ResourceCheckout>("other").delete("namespace").await.expect("delete checkout");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while retired.upgrade().is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("watch in the new namespace retires the provider without demand");
-    }
+    let provider = daemon.local_vcs_for_checkout(path).await.expect("new namespace provider");
+    let retired = Arc::downgrade(&provider);
+    drop(provider);
+    daemon.discovered_checkouts.forget_path(&key, path);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while retired.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("forgetting the checkout in the new namespace retires the provider without demand");
 }
 
 // #1722 bindings select an issue source independently of the live checkout

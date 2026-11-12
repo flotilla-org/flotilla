@@ -1,32 +1,33 @@
 //! `flotilla image check --project X --ref <branch>` (ADR 0062 B3) through
 //! its seams: the store is in-memory, the branch's layer directory comes from
-//! a stand-in for the VCS read, and the builds it creates are executed by the
-//! real ImageBuild reconciler over the build-service stand-in.
+//! a stand-in for the VCS read, and the builds it demands are executed by the
+//! engine's image build launcher and controller at a builder over the
+//! build-service stand-in.
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{atomic::Ordering, Arc, Mutex},
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_admission::repository_inspection::RepositoryInspector;
 use flotilla_charter::charter_store::{LayerDirectorySnapshot, PROJECT_IMAGE_LAYER_PATH, PROJECT_IMAGE_MANAGER};
 use flotilla_core::in_process::check_image;
-use flotilla_core::in_process::image_build_report;
 use flotilla_core::in_process::ImageCheckSources;
 use flotilla_core::repository_inspection::GitRepositoryInspector;
 use flotilla_discovery_testkit::test_vcs_resolver;
 use flotilla_protocol::image_check::{ImageBuildReportPhase, ImageCheckAgentSource, ImageCheckReport, ImageCheckRequest, ImageProbeReport};
+use flotilla_protocol::{EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner, ProcessCommandRunner};
+use flotilla_provisioning::engine::image_build_actuator::build_log_name;
 use flotilla_resources::{
-    parse_layer_directory, resolve_image, CharterSource, ImageBuild, ImageBuildFailureClass, ImageLayer, ImageLayerSource, ImageLayerSpec,
-    ImageLayerTier, ImageProbeOutcome, ImageRequest, ImageSelection, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec,
-    ProjectSpec, Repository, RepositorySpec, RepositoryStatus, MANAGED_BY_LABEL,
+    image_build_records::ImageBuildRecords, parse_layer_directory, resolve_image, CharterSource, Host, HostSpec, HostStatus,
+    ImageBuildCapacity, ImageBuildFailureClass, ImageLayer, ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageProbeOutcome,
+    ImageRequest, ImageSelection, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository,
+    RepositorySpec, RepositoryStatus, MANAGED_BY_LABEL,
 };
 use flotilla_store::ResourceBackend;
-use flotilla_store_testkit::VirtualClock;
 
-use flotilla_provisioning_testkit::image_build::{builder, host, reconciler, settle, Behaviour, BuildService, Materials, HOST, NS};
+use flotilla_provisioning_testkit::image_build::{builder, Behaviour, BuildService, Builder, Materials, HOST, NS};
 
 const PROJECT: &str = "app";
 const REPO: &str = "https://github.com/example/app";
@@ -94,10 +95,32 @@ async fn apply_layer(backend: &ResourceBackend, layer: &ImageLayerSpec, labels: 
         .expect("layer");
 }
 
+/// The builder host as admission reads it: amd64, building locally.
+async fn host(backend: &ResourceBackend, architecture: &str, capacity: Option<ImageBuildCapacity>) {
+    let hosts = backend.using::<Host>(NS);
+    let obj = hosts
+        .create(&InputMeta::builder().name(HOST.into()).build(), &HostSpec { image_build_capacity: capacity, ..Default::default() })
+        .await
+        .expect("host");
+    let status = HostStatus::builder()
+        .capabilities(Default::default())
+        .ready(true)
+        .description(
+            HostSummary::builder()
+                .environment_id(EnvironmentId::new(HOST))
+                .node(NodeInfo::new(NodeId::new(HOST), HOST.to_string()))
+                .system(SystemInfo { arch: Some(architecture.into()), ..Default::default() })
+                .build(),
+        )
+        .build();
+    hosts.update_status(HOST, &obj.metadata.resource_version, &status).await.expect("host status");
+}
+
 /// A project whose primary repository's default branch carries layer 1.0
 /// (already synced), selecting `rust` over a stdlib catalogue with one
-/// harness, on a single amd64 host that builds locally.
-async fn fixture() -> (ResourceBackend, Arc<Branches>) {
+/// harness, on a single amd64 host that builds locally. Its builder is idle
+/// until a test runs it.
+async fn fixture() -> (ResourceBackend, Arc<Branches>, Builder) {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     host(&backend, "x86_64", builder(1)).await;
     let repository = RepositorySpec::remote(REPO).expect("repository");
@@ -141,29 +164,33 @@ async fn fixture() -> (ResourceBackend, Arc<Branches>) {
     apply_layer(&backend, &synced, BTreeMap::from([(MANAGED_BY_LABEL.to_string(), PROJECT_IMAGE_MANAGER.to_string())])).await;
     let branches = Arc::new(Branches::default());
     branches.layers.lock().expect("layers").insert("main".into(), main);
-    (backend, branches)
+    let builder = Builder::idle("amd64", builder(1), BuildService::new(Behaviour::Succeed), Arc::new(Materials::default()));
+    (backend, branches, builder)
 }
 
 fn request(git_ref: &str) -> ImageCheckRequest {
     ImageCheckRequest::builder().project(PROJECT.into()).git_ref(git_ref.into()).build()
 }
 
-async fn check(backend: &ResourceBackend, branches: &Branches, request: &ImageCheckRequest) -> ImageCheckReport {
-    check_image(backend, NS, HOST, branches, request, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads)).await.expect("check")
+async fn check(backend: &ResourceBackend, branches: &Branches, builder: &Builder, request: &ImageCheckRequest) -> ImageCheckReport {
+    check_image(backend, NS, HOST, branches, request, builder.reads.clone()).await.expect("check")
 }
 
-async fn build_names(backend: &ResourceBackend) -> Vec<String> {
-    backend.using::<ImageBuild>(NS).list().await.expect("builds").items.into_iter().map(|build| build.metadata.name).collect()
+/// Runs the builder over every build demanded so far and waits for `name` to settle.
+async fn execute(builder: &mut Builder, name: &str) -> ImageCheckBuild {
+    for demanded in builder.demands() {
+        let spec = builder.builds.demanded(&demanded).expect("read").expect("demanded");
+        builder.build_service.expect(&spec);
+    }
+    builder.run();
+    let settled = builder.settled(name).await;
+    let log = builder.materials.logs.lock().expect("logs").get(&build_log_name(&settled.launch, 1)).cloned().expect("first try's log");
+    ImageCheckBuild { launch: settled.launch, log }
 }
 
-/// Run the check's build to completion through the reconciler.
-async fn execute(backend: &ResourceBackend, service: &Arc<BuildService>, name: &str) {
-    let spec = backend.using::<ImageBuild>(NS).get(name).await.expect("build").spec.current().expect("current").clone();
-    service.expect(&spec);
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    let reconciler = reconciler(backend, service, &materials, &clock);
-    settle(backend, &reconciler, &clock, name).await;
+struct ImageCheckBuild {
+    launch: String,
+    log: String,
 }
 
 // The ref's project layer replaces the synced one: main reproduces the
@@ -172,10 +199,10 @@ async fn execute(backend: &ResourceBackend, service: &Arc<BuildService>, name: &
 // through the build service, reported per layer.
 #[tokio::test]
 async fn a_branch_layer_change_builds_a_new_identity() {
-    let (backend, branches) = fixture().await;
+    let (backend, branches, mut builder) = fixture().await;
     branches.layers.lock().expect("layers").insert("feature/native".into(), project_layer_files("1.1", "RUN app-install --native"));
 
-    let main = check(&backend, &branches, &request("main")).await;
+    let main = check(&backend, &branches, &builder, &request("main")).await;
     let admitted = resolve_image(
         &flotilla_admission::image_build::read_image_catalogue(&backend, NS).await.expect("catalogue"),
         &ImageRequest::builder()
@@ -189,7 +216,7 @@ async fn a_branch_layer_change_builds_a_new_identity() {
     assert_eq!(main_build.identity, admitted.identity, "checking the default branch reproduces admission's identity");
     assert_eq!((main.agents.as_slice(), main.agents_from), (["codex".to_string()].as_slice(), ImageCheckAgentSource::DefaultWorkflow));
 
-    let feature = check(&backend, &branches, &request("feature/native")).await;
+    let feature = check(&backend, &branches, &builder, &request("feature/native")).await;
     assert_eq!(
         branches.reads.lock().expect("reads").last(),
         Some(&CharterSource::Repository { repo: REPO.into(), branch: "feature/native".into(), path: PROJECT_IMAGE_LAYER_PATH.into() }),
@@ -199,17 +226,19 @@ async fn a_branch_layer_change_builds_a_new_identity() {
     assert!(!feature.reused);
     let build = feature.build.expect("feature build");
     assert_ne!(build.identity, main_build.identity, "a changed project layer is a new identity");
-    assert_eq!(build_names(&backend).await.len(), 2);
+    assert_eq!(builder.demands().len(), 2);
     assert_eq!((build.builder_host.as_str(), build.delivery.as_str(), build.architecture.as_str()), (HOST, "local", "amd64"));
+    assert_eq!((build.phase, build.launch.as_deref()), (ImageBuildReportPhase::Queued, None), "demanded, not yet launched");
     assert!(build.layers.iter().all(|layer| layer.probe == ImageProbeReport::Pending));
 
-    let service = BuildService::new(Behaviour::Succeed);
-    execute(&backend, &service, &build.name).await;
-    let built = image_build_report(&backend, NS, &build.name, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
-        .await
-        .expect("report");
+    let executed = execute(&mut builder, &build.name).await;
+    let built = check(&backend, &branches, &builder, &request("feature/native")).await;
+    assert!(built.reused);
+    let built = built.build.expect("feature build");
     assert_eq!((built.phase, built.settled), (ImageBuildReportPhase::Built, true));
-    assert!(built.digest.is_some() && built.log_ref.is_some());
+    assert_eq!(built.launch.as_ref(), Some(&executed.launch));
+    assert!(built.digest.is_some());
+    assert!(build_log_name(&executed.launch, 1).starts_with(built.log_ref.as_deref().expect("build logs")));
     let table = built.layers.iter().map(|layer| (layer.layer.as_str(), layer.source.as_str(), layer.version.as_str())).collect::<Vec<_>>();
     assert_eq!(
         table,
@@ -221,25 +250,28 @@ async fn a_branch_layer_change_builds_a_new_identity() {
             ("harness-codex", "installation", "1.0")
         ]
     );
-    assert!(built.layers.iter().all(|layer| layer.probe == ImageProbeReport::Passed));
+    assert!(built.layers.iter().all(|layer| layer.probe == ImageProbeReport::InBuildLog));
+    for (layer, _, _) in table {
+        assert!(executed.log.contains(&format!("probe {layer}: passed\n")), "{}", executed.log);
+    }
 
     // A ref without `.flotilla/image/` composes no project layer, even
     // though the default branch's layer is synced.
-    let bare = check(&backend, &branches, &request("no-layer")).await;
+    let bare = check(&backend, &branches, &builder, &request("no-layer")).await;
     assert_eq!(bare.project_layer, None);
     assert!(bare.build.expect("bare build").layers.iter().all(|layer| layer.layer != "app-native"));
 }
 
-// A recipe failure reports every layer's probe, naming the failing layer,
-// with the failure class, reason and build log. Re-checking the same
+// A recipe failure keeps every layer's probe in the build log and names the
+// failing layer, with the failure class and reason. Re-checking the same
 // identity reuses that build and its result: nothing is retried.
 #[tokio::test]
 async fn a_recipe_failure_is_reported_per_layer_and_reused_on_recheck() {
-    let (backend, branches) = fixture().await;
+    let (backend, branches, mut builder) = fixture().await;
     branches.layers.lock().expect("layers").insert("broken".into(), project_layer_files("1.2", "RUN false"));
-    let first = check(&backend, &branches, &request("broken")).await;
+    let first = check(&backend, &branches, &builder, &request("broken")).await;
     let name = first.build.expect("build").name;
-    let service = BuildService::new(Behaviour::Fail {
+    *builder.build_service.behaviour.lock().expect("behaviour") = Behaviour::Fail {
         class: ImageBuildFailureClass::Recipe,
         probes: vec![
             ImageProbeOutcome::Passed,
@@ -248,32 +280,31 @@ async fn a_recipe_failure_is_reported_per_layer_and_reused_on_recheck() {
             ImageProbeOutcome::NotRun,
         ],
         failed_step: None,
-    });
-    execute(&backend, &service, &name).await;
+    };
+    let executed = execute(&mut builder, &name).await;
 
-    let again = check(&backend, &branches, &request("broken")).await;
+    let again = check(&backend, &branches, &builder, &request("broken")).await;
     assert!(again.reused, "an identical identity reuses its build");
     assert!(again.failed());
     let report = again.build.expect("build");
     assert_eq!(report.name, name);
     assert_eq!((report.phase, report.settled), (ImageBuildReportPhase::Failed, true));
-    let probes = report.layers.iter().map(|layer| (layer.layer.as_str(), layer.probe.clone())).collect::<Vec<_>>();
-    assert_eq!(
-        probes,
-        [
-            ("base-ubuntu-24.04", ImageProbeReport::Passed),
-            ("rust", ImageProbeReport::Passed),
-            ("app-native", ImageProbeReport::Failed { reason: "app: not found".into() }),
-            ("crew-utilities", ImageProbeReport::NotRun),
-            ("harness-codex", ImageProbeReport::Passed),
-        ]
-    );
+    assert!(report.layers.iter().all(|layer| layer.probe == ImageProbeReport::InBuildLog));
+    for line in [
+        "probe base-ubuntu-24.04: passed\n",
+        "probe rust: passed\n",
+        "probe app-native: failed: app: not found\n",
+        "probe crew-utilities: not run\n",
+        "probe harness-codex: passed\n",
+    ] {
+        assert!(executed.log.contains(line), "{}", executed.log);
+    }
     let failure = report.failure.expect("failure");
     assert_eq!(failure.class, "recipe");
     assert!(failure.reason.contains("layer `app-native` 1.2 from project `app`"), "{}", failure.reason);
-    assert!(report.log_ref.is_some(), "the build log artifact is named");
-    assert_eq!(build_names(&backend).await, [name]);
-    assert_eq!(service.calls.load(Ordering::SeqCst), 1, "a re-check never retries a recipe failure");
+    assert!(report.log_ref.is_some(), "the build logs are named");
+    assert_eq!(builder.demands(), [name]);
+    assert_eq!(builder.build_service.calls.load(Ordering::SeqCst), 1, "a re-check never retries a recipe failure");
 }
 
 // Refusals name what they refuse and create no build: an unresolvable
@@ -281,7 +312,7 @@ async fn a_recipe_failure_is_reported_per_layer_and_reused_on_recheck() {
 // directory at the ref, and an unknown harness.
 #[tokio::test]
 async fn refusals_create_no_build() {
-    let (backend, branches) = fixture().await;
+    let (backend, branches, builder) = fixture().await;
     for name in ["dup-a", "dup-b"] {
         apply_layer(&backend, &shared(name, ImageLayerTier::Shared, &["toolchain:dup"]), BTreeMap::new()).await;
     }
@@ -301,16 +332,16 @@ async fn refusals_create_no_build() {
         (ImageCheckRequest { agents: vec!["claude".into()], ..request("main") }, &[], "unresolvable image need `harness:claude`"),
     ];
     for (request, layers, message) in cases {
-        let report = check(&backend, &branches, &request).await;
+        let report = check(&backend, &branches, &builder, &request).await;
         assert!(report.failed() && report.build.is_none(), "{report:?}");
         let refusal =
             report.refusals.iter().find(|refusal| refusal.message.contains(message)).unwrap_or_else(|| panic!("{message}: {report:?}"));
         assert_eq!(refusal.layers, layers.iter().map(|layer| layer.to_string()).collect::<Vec<_>>());
     }
-    assert!(build_names(&backend).await.is_empty(), "no refused check creates a build");
+    assert!(builder.demands().is_empty(), "no refused check demands a build");
 
     // A duplicate provider the composition does not touch is not its refusal.
-    let unrelated = check(&backend, &branches, &request("main")).await;
+    let unrelated = check(&backend, &branches, &builder, &request("main")).await;
     assert!(unrelated.refusals.is_empty() && unrelated.build.is_some(), "{unrelated:?}");
 }
 
@@ -318,19 +349,19 @@ async fn refusals_create_no_build() {
 // architecture is refused before anything is created.
 #[tokio::test]
 async fn another_architecture_needs_the_fleet_image_cache() {
-    let (backend, branches) = fixture().await;
+    let (backend, branches, builder) = fixture().await;
     let error = check_image(
         &backend,
         NS,
         HOST,
         &*branches,
         &ImageCheckRequest { architecture: Some("arm64".into()), ..request("main") },
-        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        builder.reads.clone(),
     )
     .await
     .expect_err("refused");
     assert!(error.contains("no fleet image cache") && error.contains("arm64"), "{error}");
-    assert!(build_names(&backend).await.is_empty());
+    assert!(builder.demands().is_empty());
 }
 
 /// The daemon's real layer read (`GitRepositoryInspector`, which fetches the
@@ -366,7 +397,7 @@ async fn fixture_git(root: &std::path::Path, args: &[&str]) {
 // fetch-and-read the daemon uses.
 #[tokio::test]
 async fn a_missing_ref_is_an_error_not_an_absent_layer() {
-    let (backend, _) = fixture().await;
+    let (backend, _, builder) = fixture().await;
     let repository = tempfile::tempdir().expect("repository");
     let cache = tempfile::tempdir().expect("cache");
     let root = repository.path();
@@ -387,31 +418,20 @@ async fn a_missing_ref_is_an_error_not_an_absent_layer() {
         repository: root.to_str().expect("repository path").to_string(),
     };
 
-    let main = check_image(&backend, NS, HOST, &sources, &request("main"), Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
-        .await
-        .expect("main");
+    let main = check_image(&backend, NS, HOST, &sources, &request("main"), builder.reads.clone()).await.expect("main");
     assert_eq!(main.project_layer.as_deref(), Some("app-native@1.0"));
     assert!(main.revision.is_some());
 
     let bare =
-        check_image(&backend, NS, HOST, &sources, &request("no-layer"), Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
-            .await
-            .expect("a branch without a layer");
+        check_image(&backend, NS, HOST, &sources, &request("no-layer"), builder.reads.clone()).await.expect("a branch without a layer");
     assert_eq!(bare.project_layer, None);
     assert!(bare.revision.is_none() && bare.refusals.is_empty() && bare.build.is_some(), "{bare:?}");
 
-    let builds = build_names(&backend).await;
-    let error = check_image(
-        &backend,
-        NS,
-        HOST,
-        &sources,
-        &request("no-such-branch"),
-        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
-    )
-    .await
-    .expect_err("a missing ref is an error");
+    let builds = builder.demands();
+    let error = check_image(&backend, NS, HOST, &sources, &request("no-such-branch"), builder.reads.clone())
+        .await
+        .expect_err("a missing ref is an error");
     assert!(error.contains(&format!("`{PROJECT_IMAGE_LAYER_PATH}/` at no-such-branch")), "{error}");
     assert!(error.contains("refs/heads/no-such-branch"), "the fetch failure is reported: {error}");
-    assert_eq!(build_names(&backend).await, builds, "a missing ref creates no build");
+    assert_eq!(builder.demands(), builds, "a missing ref demands no build");
 }

@@ -28,6 +28,18 @@ pub enum ImageVerb {
     /// through the build service (once per identity: an unchanged
     /// composition reuses its existing build and result).
     Check(ImageCheckArgs),
+    /// Build a given-up image build again, at its builder
+    ///
+    /// A recipe failure is not retried for its identity; once its cause is
+    /// fixed outside the layers (a granted build secret, say), this launches
+    /// the build again.
+    Retry(ImageRetryArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct ImageRetryArgs {
+    /// The image build, as `image check` names it
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -77,14 +89,12 @@ impl ImageCheckArgs {
 
 impl ImageNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
-        let ImageVerb::Check(args) = self.verb;
+        let action = match self.verb {
+            ImageVerb::Check(args) => CommandAction::ImageCheck { request: args.request() },
+            ImageVerb::Retry(args) => CommandAction::ImageBuildRetry { name: args.name },
+        };
         Ok(Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ImageCheck { request: args.request() },
-            },
+            command: Command { node_id: None, provisioning_target: None, context_repo: None, action },
             repo: RepoContext::None,
             host: HostResolution::Local,
         })
@@ -93,7 +103,10 @@ impl ImageNoun {
 
 impl fmt::Display for ImageNoun {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ImageVerb::Check(args) = &self.verb;
+        let args = match &self.verb {
+            ImageVerb::Check(args) => args,
+            ImageVerb::Retry(args) => return write!(f, "image retry {}", quote_value(&args.name)),
+        };
         write!(f, "image check --project {} --ref {}", quote_value(&args.project), quote_value(&args.git_ref))?;
         for need in &args.needs {
             write!(f, " --need {}", quote_value(need))?;
@@ -154,7 +167,7 @@ mod tests {
             "--arch",
             "amd64",
         ]);
-        let ImageVerb::Check(args) = &noun.verb;
+        let ImageVerb::Check(args) = &noun.verb else { panic!("a check") };
         assert_eq!(args.wait_for(), Some(Duration::from_secs(DEFAULT_IMAGE_CHECK_TIMEOUT_SECS)));
         crate::test_utils::assert_needs_context(
             noun.resolve().expect("resolve"),
@@ -175,7 +188,9 @@ mod tests {
     #[test]
     fn image_check_wait_flags_and_timeout() {
         let wait = |args: &[&str]| {
-            let ImageVerb::Check(args) = parse(&[&["image", "check", "--project", "p", "--ref", "main"], args].concat()).verb;
+            let ImageVerb::Check(args) = parse(&[&["image", "check", "--project", "p", "--ref", "main"], args].concat()).verb else {
+                panic!("a check")
+            };
             args.wait_for()
         };
         assert_eq!(wait(&["--no-wait"]), None);
@@ -186,9 +201,21 @@ mod tests {
         assert!(ImageNoun::try_parse_from(["image", "check", "--ref", "main"]).is_err(), "--project is required");
     }
 
+    // A retry is a daemon command naming the build; the daemon routes it to the builder.
+    #[test]
+    fn image_retry_resolves_to_a_command_naming_the_build() {
+        crate::test_utils::assert_needs_context(
+            parse(&["image", "retry", "image-0123-amd64"]).resolve().expect("resolve"),
+            CommandAction::ImageBuildRetry { name: "image-0123-amd64".into() },
+            RepoContext::None,
+            HostResolution::Local,
+        );
+    }
+
     #[test]
     fn command_shapes_round_trip() {
         assert_round_trip::<ImageNoun>(&["image", "check", "--project", "flotilla", "--ref", "main"]);
+        assert_round_trip::<ImageNoun>(&["image", "retry", "image-0123-amd64"]);
         assert_round_trip::<ImageNoun>(&[
             "image",
             "check",

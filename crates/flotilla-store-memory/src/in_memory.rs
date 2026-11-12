@@ -1,10 +1,10 @@
 #[path = "message_query.rs"]
 mod message_query;
+use crate::Store;
 use crate::{convert_read, ReadObserver, ReadOperation, ResourceKind, SerializedResource};
 use crate::{watch, DigestQuery, MessageQuery, PartitionDigest, ResourcePosition};
 use crate::{DecodedList, DecodedObject, DecodedReadObject};
 use crate::{SerializedReadWatchEvent, SerializedWatchEvent, SerializedWatchStream, WatchAction, WatchObject, WatchPayload};
-use crate::{Store, StoreExt};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
@@ -39,21 +39,10 @@ fn typed_value(kind: ResourceKind, value: &Value) -> Result<DecodedObject, Resou
     kind.decode_typed_value(value)
 }
 
-/// Declared-query rows and their provenance, before merging and sorting.
-type QueryRows<R> = Vec<(R, ResourceProvenance)>;
-
-/// The row shape of one declared query: decoding a stored tree, and the same
-/// query delegated to a composed durable replica store.
+/// The row shape of one declared query: decoding a stored tree.
 trait QueryRowForm {
     type Row: Send;
     fn decode(kind: ResourceKind, value: &Value) -> Result<Self::Row, ResourceError>;
-    fn name(row: &Self::Row) -> &str;
-    fn durable<'a>(
-        store: &'a dyn Store,
-        kind: ResourceKind,
-        namespace: &'a str,
-        query: &'a crate::StoreQuery,
-    ) -> futures::future::BoxFuture<'a, Result<QueryRows<Self::Row>, ResourceError>>;
 }
 struct SerializedRows;
 impl QueryRowForm for SerializedRows {
@@ -61,38 +50,12 @@ impl QueryRowForm for SerializedRows {
     fn decode(kind: ResourceKind, value: &Value) -> Result<Self::Row, ResourceError> {
         serialized_value(kind, value)
     }
-    fn name(row: &Self::Row) -> &str {
-        &row.metadata.name
-    }
-    fn durable<'a>(
-        store: &'a dyn Store,
-        kind: ResourceKind,
-        namespace: &'a str,
-        query: &'a crate::StoreQuery,
-    ) -> futures::future::BoxFuture<'a, Result<QueryRows<Self::Row>, ResourceError>> {
-        Box::pin(async move {
-            Ok(store.query_raw(kind, namespace, query).await?.items.into_iter().map(|item| (item.object, item.provenance)).collect())
-        })
-    }
 }
 struct TypedRows;
 impl QueryRowForm for TypedRows {
     type Row = DecodedObject;
     fn decode(kind: ResourceKind, value: &Value) -> Result<Self::Row, ResourceError> {
         typed_value(kind, value)
-    }
-    fn name(row: &Self::Row) -> &str {
-        row.name()
-    }
-    fn durable<'a>(
-        store: &'a dyn Store,
-        kind: ResourceKind,
-        namespace: &'a str,
-        query: &'a crate::StoreQuery,
-    ) -> futures::future::BoxFuture<'a, Result<QueryRows<Self::Row>, ResourceError>> {
-        Box::pin(async move {
-            Ok(store.query_decoded(kind, namespace, query).await?.items.into_iter().map(|item| (item.object, item.provenance)).collect())
-        })
     }
 }
 
@@ -102,7 +65,6 @@ pub struct InMemoryBackend {
     stores: Arc<Mutex<HashMap<StoreKey, ResourceStore>>>,
     read_observer: Option<Arc<dyn ReadObserver>>,
     replicas: Arc<Mutex<ReplicaState>>,
-    durable_replicas: Option<crate::ResourceBackend>,
     generation: Option<String>,
     event_retention: EventRetention,
     local_root: Option<NodeId>,
@@ -246,23 +208,19 @@ impl InMemoryBackend {
             }
         }
         if include_replicas {
-            if let Some(backend) = &self.durable_replicas {
-                items.extend(backend.query_message_replicas(namespace, query).await?);
-            } else {
-                let replicas = self.replicas.lock().await;
-                for ((origin_root, partition_key), partition) in &replicas.partitions {
-                    if partition_key != &key {
-                        continue;
-                    }
-                    for name in partition.messages.names(query) {
-                        items.push(ReadResourceObject {
-                            object: resource_kind.decode_typed_value(&partition.objects[&name])?.into_typed()?,
-                            provenance: ResourceProvenance::Replica {
-                                origin_root: origin_root.clone(),
-                                last_synced_at: partition.synced_at_by_name[&name],
-                            },
-                        });
-                    }
+            let replicas = self.replicas.lock().await;
+            for ((origin_root, partition_key), partition) in &replicas.partitions {
+                if partition_key != &key {
+                    continue;
+                }
+                for name in partition.messages.names(query) {
+                    items.push(ReadResourceObject {
+                        object: resource_kind.decode_typed_value(&partition.objects[&name])?.into_typed()?,
+                        provenance: ResourceProvenance::Replica {
+                            origin_root: origin_root.clone(),
+                            last_synced_at: partition.synced_at_by_name[&name],
+                        },
+                    });
                 }
             }
         }
@@ -275,7 +233,6 @@ impl InMemoryBackend {
             stores: Arc::default(),
             read_observer: None,
             replicas: Arc::default(),
-            durable_replicas: None,
             generation: Some(uuid::Uuid::new_v4().to_string()),
             event_retention: EventRetention::default(),
             local_root: None,
@@ -284,31 +241,11 @@ impl InMemoryBackend {
         }
     }
 
-    /// Local observations have a new generation per process, while received
-    /// facts remain durable across holder restarts (ADR 0016). Only the replica
-    /// operations use this store; local writes always remain in memory.
-    pub fn observed_with_durable_replicas(replicas: impl Into<crate::ResourceBackend>) -> Self {
-        Self { durable_replicas: Some(replicas.into()), ..Self::observed() }
-    }
-
-    pub async fn delete_decode_quarantine_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        name: &str,
-    ) -> Result<bool, ResourceError> {
-        match &self.durable_replicas {
-            Some(backend) => backend.delete_decode_quarantine_raw(resource_kind, namespace, name).await,
-            None => Ok(false),
-        }
-    }
-
     pub fn with_event_retention(event_retention: EventRetention) -> Self {
         Self {
             stores: Arc::default(),
             read_observer: None,
             replicas: Arc::default(),
-            durable_replicas: None,
             generation: None,
             event_retention,
             local_root: None,
@@ -322,7 +259,6 @@ impl InMemoryBackend {
             stores: Arc::default(),
             read_observer: None,
             replicas: Arc::default(),
-            durable_replicas: None,
             generation: Some(uuid::Uuid::new_v4().to_string()),
             event_retention,
             local_root: None,
@@ -332,9 +268,6 @@ impl InMemoryBackend {
     }
 
     pub(crate) fn with_local_root(mut self, local_root: NodeId) -> Self {
-        if let Some(backend) = self.durable_replicas.take() {
-            self.durable_replicas = Some(backend.with_local_root(local_root.clone()));
-        }
         self.local_root = Some(local_root);
         self
     }
@@ -355,11 +288,6 @@ impl InMemoryBackend {
         diagnostics.field_ownership_violations = violations.clone();
         diagnostics.replica_quarantines =
             self.replicas.lock().await.quarantines.values().map(|(_, diagnostic)| diagnostic.clone()).collect();
-        if let Some(backend) = &self.durable_replicas {
-            if let Some(durable) = backend.store().diagnostics().await? {
-                diagnostics.replica_quarantines.extend(durable.replica_quarantines);
-            }
-        }
         Ok(diagnostics)
     }
 
@@ -399,10 +327,6 @@ impl InMemoryBackend {
 
     pub async fn stored_namespaces_raw(&self, resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
         let mut namespaces = self.local_namespaces_raw(resource_kind).await?.into_iter().collect::<std::collections::BTreeSet<_>>();
-        if let Some(backend) = &self.durable_replicas {
-            namespaces.extend(backend.stored_namespaces_raw(resource_kind).await?);
-            return Ok(namespaces.into_iter().collect());
-        }
         let replicas = self.replicas.lock().await;
         for ((_, key), partition) in &replicas.partitions {
             if key.0 == resource_kind.paths.group
@@ -466,9 +390,6 @@ impl InMemoryBackend {
         resource_kind: ResourceKind,
         namespace: &str,
     ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.list_replicas_raw(resource_kind, namespace).await;
-        }
         let rows = self.list_replica_rows(resource_kind, namespace, serialized_value).await?;
         Ok(rows.into_iter().map(|(object, provenance)| ReadResourceObject { object, provenance }).collect())
     }
@@ -478,9 +399,6 @@ impl InMemoryBackend {
         resource_kind: ResourceKind,
         namespace: &str,
     ) -> Result<Vec<DecodedReadObject>, ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.store().list_replicas_decoded(resource_kind, namespace).await;
-        }
         let rows = self.list_replica_rows(resource_kind, namespace, typed_value).await?;
         Ok(rows.into_iter().map(|(object, provenance)| DecodedReadObject { object, provenance }).collect())
     }
@@ -520,9 +438,6 @@ impl InMemoryBackend {
         namespace: &str,
         name: &str,
     ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.get_replicas_raw(resource_kind, namespace, name).await;
-        }
         let rows = self.get_replica_rows(resource_kind, namespace, name, serialized_value).await?;
         Ok(rows.into_iter().map(|(object, provenance)| ReadResourceObject { object, provenance }).collect())
     }
@@ -533,9 +448,6 @@ impl InMemoryBackend {
         namespace: &str,
         name: &str,
     ) -> Result<Vec<DecodedReadObject>, ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.store().get_replicas_decoded(resource_kind, namespace, name).await;
-        }
         let rows = self.get_replica_rows(resource_kind, namespace, name, typed_value).await?;
         Ok(rows.into_iter().map(|(object, provenance)| DecodedReadObject { object, provenance }).collect())
     }
@@ -577,9 +489,6 @@ impl InMemoryBackend {
         resource_kind: ResourceKind,
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<SerializedReadWatchEvent, ResourceError>>, ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.watch_replicas_raw(resource_kind, namespace).await;
-        }
         let key = Self::store_key(resource_kind, namespace);
         let rx = self.replicas.lock().await.watchers.entry(key).or_default().subscribe(resource_kind.paths.kind, namespace);
         Ok(stream::unfold(rx, move |mut rx| async move {
@@ -637,9 +546,6 @@ impl InMemoryBackend {
         synced_at: chrono::DateTime<Utc>,
         bucket: Option<u8>,
     ) -> Result<(), ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.replace_replicas_raw(resource_kind, origin_root, namespace, listed, synced_at, bucket).await;
-        }
         let store_key = Self::store_key(resource_kind, namespace);
         let replica_key = (origin_root.clone(), store_key.clone());
         let encoded = listed.items.iter().map(|object| Self::encode_object(resource_kind, object)).collect::<Result<Vec<_>, _>>()?;
@@ -757,9 +663,6 @@ impl InMemoryBackend {
         object: &ResourceObject<SerializedResource>,
         synced_at: chrono::DateTime<Utc>,
     ) -> Result<(), ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.apply_replica_raw(resource_kind, origin_root, namespace, kind, object, synced_at).await;
-        }
         let store_key = Self::store_key(resource_kind, namespace);
         let replica_key = (origin_root.clone(), store_key.clone());
         let encoded = Self::encode_object(resource_kind, object)?;
@@ -828,9 +731,6 @@ impl InMemoryBackend {
         tombstone: &ResourceTombstone,
         synced_at: chrono::DateTime<Utc>,
     ) -> Result<(), ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.apply_replica_tombstone_raw(resource_kind, origin_root, namespace, tombstone, synced_at).await;
-        }
         let store_key = Self::store_key(resource_kind, namespace);
         let replica_key = (origin_root.clone(), store_key.clone());
         let encoded = Self::encode_tombstone(resource_kind, tombstone);
@@ -866,9 +766,6 @@ impl InMemoryBackend {
         origin_root: &NodeId,
         namespace: &str,
     ) -> Result<(), ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.invalidate_replica_cursor_raw(resource_kind, origin_root, namespace).await;
-        }
         let key = (origin_root.clone(), Self::store_key(resource_kind, namespace));
         if let Some(partition) = self.replicas.lock().await.partitions.get_mut(&key) {
             partition.cursor = None;
@@ -884,9 +781,6 @@ impl InMemoryBackend {
         previous: &ReplicaCursor,
         next: &str,
     ) -> Result<(), ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.advance_replica_cursor_raw(resource_kind, origin_root, namespace, previous, next).await;
-        }
         let key = (origin_root.clone(), Self::store_key(resource_kind, namespace));
         let mut replicas = self.replicas.lock().await;
         let partition = replicas.partitions.get_mut(&key).ok_or_else(|| ResourceError::invalid("replica prefix missing"))?;
@@ -903,9 +797,6 @@ impl InMemoryBackend {
         origin_root: &NodeId,
         namespace: &str,
     ) -> Result<Option<ReplicaCursor>, ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.replica_cursor_raw(resource_kind, origin_root, namespace).await;
-        }
         let key = (origin_root.clone(), Self::store_key(resource_kind, namespace));
         Ok(self.replicas.lock().await.partitions.get(&key).and_then(|partition| partition.cursor.clone()))
     }
@@ -940,37 +831,14 @@ impl InMemoryBackend {
         let mut items = Vec::new();
         let mut hydration_names = local.map(|store| store.queries.names(query)).unwrap_or_default();
         if query.all_sources_for_matches {
-            if let Some(durable) = &self.durable_replicas {
-                let mut selection = query.clone();
-                selection.replicas_only = true;
-                selection.any_of = Some(vec![
-                    crate::StoreQuery { all_sources_for_matches: false, ..query.clone() },
-                    crate::StoreQuery {
-                        field_values: BTreeMap::from([("metadata.name".into(), hydration_names.iter().cloned().collect())]),
-                        ..Default::default()
-                    },
-                ]);
-                selection.labels.clear();
-                selection.fields.clear();
-                selection.field_values.clear();
-                selection.present.clear();
-                selection.missing_fields.clear();
-                selection.field_matches_query.clear();
-                selection.field_prefixes.clear();
-                selection.label_prefixes.clear();
-                selection.owner = None;
-                items = F::durable(durable.store(), kind, namespace, &selection).await?;
-                hydration_names.extend(items.iter().map(|(row, _)| F::name(row).to_string()));
-            } else {
-                let replicas = self.replicas.lock().await;
-                for ((_, partition_key), partition) in &replicas.partitions {
-                    if partition_key == &key {
-                        hydration_names.extend(partition.queries.names(query));
-                    }
+            let replicas = self.replicas.lock().await;
+            for ((_, partition_key), partition) in &replicas.partitions {
+                if partition_key == &key {
+                    hydration_names.extend(partition.queries.names(query));
                 }
             }
         }
-        if let Some(store) = local.filter(|_| !query.replicas_only) {
+        if let Some(store) = local {
             let mut names = if query.all_sources_for_matches {
                 hydration_names.intersection(&store.objects.keys().cloned().collect()).cloned().collect()
             } else {
@@ -985,60 +853,41 @@ impl InMemoryBackend {
             }
         }
         if query.include_replicas && kind.replication != crate::ReplicationClass::None {
-            if let Some(durable) = &self.durable_replicas {
-                // The composing memory store defines shadowing, not the durable
-                // store's unrelated local rows. Pass names before any decoding.
-                let mut replica_query = query.clone();
-                replica_query.replicas_only = true;
-                replica_query.merged_definitions = false;
-                replica_query.replica_shadowing = Some(query.replica_shadowing.clone().unwrap_or_else(|| crate::ReplicaShadowing {
-                    origin_root: self.local_root(),
-                    local_names: local.map(|store| store.objects.keys().cloned().collect()).unwrap_or_default(),
-                }));
-                if !query.all_sources_for_matches {
-                    items.extend(F::durable(durable.store(), kind, namespace, &replica_query).await?);
+            let replicas = self.replicas.lock().await;
+            for ((origin, partition_key), partition) in &replicas.partitions {
+                if partition_key != &key {
+                    continue;
                 }
-            } else {
-                let replicas = self.replicas.lock().await;
-                for ((origin, partition_key), partition) in &replicas.partitions {
-                    if partition_key != &key {
+                let mut names = if query.all_sources_for_matches {
+                    hydration_names.intersection(&partition.objects.keys().cloned().collect()).cloned().collect()
+                } else {
+                    partition.queries.names(query)
+                };
+                if let Some(message) = &query.message {
+                    let message_names = partition.messages.names(message).into_iter().collect();
+                    names = names.intersection(&message_names).cloned().collect();
+                }
+                for name in names {
+                    let shadowed = origin == &self.local_root() && local.is_some_and(|store| store.objects.contains_key(&name));
+                    if query.suppress_self_origin && shadowed {
                         continue;
                     }
-                    let mut names = if query.all_sources_for_matches {
-                        hydration_names.intersection(&partition.objects.keys().cloned().collect()).cloned().collect()
-                    } else {
-                        partition.queries.names(query)
-                    };
-                    if let Some(message) = &query.message {
-                        let message_names = partition.messages.names(message).into_iter().collect();
-                        names = names.intersection(&message_names).cloned().collect();
-                    }
-                    for name in names {
-                        let shadowed = if let Some(scope) = &query.replica_shadowing {
-                            origin == &scope.origin_root && scope.local_names.contains(&name)
-                        } else {
-                            origin == &self.local_root() && local.is_some_and(|store| store.objects.contains_key(&name))
-                        };
-                        if query.suppress_self_origin && shadowed {
-                            continue;
-                        }
-                        items.push((
-                            F::decode(
-                                kind,
-                                partition
-                                    .objects
-                                    .get(&name)
-                                    .ok_or_else(|| ResourceError::other("query index references missing replica object"))?,
-                            )?,
-                            ResourceProvenance::Replica {
-                                origin_root: origin.clone(),
-                                last_synced_at: *partition
-                                    .synced_at_by_name
-                                    .get(&name)
-                                    .ok_or_else(|| ResourceError::other("replica query object has no sync timestamp"))?,
-                            },
-                        ));
-                    }
+                    items.push((
+                        F::decode(
+                            kind,
+                            partition
+                                .objects
+                                .get(&name)
+                                .ok_or_else(|| ResourceError::other("query index references missing replica object"))?,
+                        )?,
+                        ResourceProvenance::Replica {
+                            origin_root: origin.clone(),
+                            last_synced_at: *partition
+                                .synced_at_by_name
+                                .get(&name)
+                                .ok_or_else(|| ResourceError::other("replica query object has no sync timestamp"))?,
+                        },
+                    ));
                 }
             }
         }
@@ -1134,9 +983,6 @@ impl InMemoryBackend {
         proof: &crate::PartitionDigest,
         previous: &ReplicaCursor,
     ) -> Result<(), ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.confirm_replica_digest_raw(resource_kind, origin, namespace, proof, previous).await;
-        }
         let mut replicas = self.replicas.lock().await;
         let partition = replicas
             .partitions
@@ -1163,9 +1009,6 @@ impl InMemoryBackend {
         namespace: &str,
         generation: Option<String>,
     ) -> Result<crate::PartitionDigest, ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.replica_digest_raw(resource_kind, origin, namespace, generation).await;
-        }
         let replicas = self.replicas.lock().await;
         let empty = ReplicaPartition::default();
         let partition = replicas.partitions.get(&(origin.clone(), Self::store_key(resource_kind, namespace))).unwrap_or(&empty);
@@ -1649,32 +1492,20 @@ impl Store for InMemoryBackend {
         let stores = self.stores.lock().await;
         let local = stores.get(&key);
         let mut values = std::collections::BTreeSet::new();
-        if let Some(local) = local.filter(|_| !query.replicas_only) {
+        if let Some(local) = local {
             values.extend(local.queries.values(field, &local.queries.names(&query)));
         }
-        let shadowing = query.replica_shadowing.clone().unwrap_or_else(|| crate::ReplicaShadowing {
-            origin_root: self.local_root(),
-            local_names: local.map(|store| store.objects.keys().cloned().collect()).unwrap_or_default(),
-        });
         if query.include_replicas && kind.replication != crate::ReplicationClass::None {
-            if let Some(durable) = &self.durable_replicas {
-                let mut replica_query = query.clone();
-                replica_query.replicas_only = true;
-                replica_query.replica_shadowing = Some(shadowing);
-                drop(stores);
-                values.extend(durable.store().query_values_raw(kind, namespace, &replica_query, field).await?);
-            } else {
-                let replicas = self.replicas.lock().await;
-                for ((origin, partition_key), partition) in &replicas.partitions {
-                    if partition_key != &key {
-                        continue;
-                    }
-                    let mut names = partition.queries.names(&query);
-                    if query.suppress_self_origin && origin == &shadowing.origin_root {
-                        names.retain(|name| !shadowing.local_names.contains(name));
-                    }
-                    values.extend(partition.queries.values(field, &names));
+            let replicas = self.replicas.lock().await;
+            for ((origin, partition_key), partition) in &replicas.partitions {
+                if partition_key != &key {
+                    continue;
                 }
+                let mut names = partition.queries.names(&query);
+                if query.suppress_self_origin && origin == &self.local_root() {
+                    names.retain(|name| local.is_none_or(|store| !store.objects.contains_key(name)));
+                }
+                values.extend(partition.queries.values(field, &names));
             }
         }
         Ok(values)
@@ -1686,9 +1517,6 @@ impl Store for InMemoryBackend {
         include_replicas: bool,
     ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
         self.query_messages(namespace, query, include_replicas).await?.into_iter().map(convert_read).collect()
-    }
-    async fn delete_decode_quarantine_raw(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<bool, ResourceError> {
-        InMemoryBackend::delete_decode_quarantine_raw(self, resource_kind, namespace, name).await
     }
     async fn namespace_inventory(&self) -> Result<BTreeMap<String, Vec<String>>, ResourceError> {
         let mut inventory = crate::declared_resource_kinds()
@@ -1703,16 +1531,10 @@ impl Store for InMemoryBackend {
                 }
             }
         }
-        if let Some(backend) = &self.durable_replicas {
-            for (kind, namespaces) in backend.namespace_inventory().await? {
-                inventory.entry(kind).or_default().extend(namespaces);
-            }
-        } else {
-            let replicas = self.replicas.lock().await;
-            for ((_, key), _) in replicas.partitions.iter().filter(|(_, partition)| !partition.objects.is_empty()) {
-                if let Some(namespaces) = inventory.get_mut(&key.2) {
-                    namespaces.insert(key.3.clone());
-                }
+        let replicas = self.replicas.lock().await;
+        for ((_, key), _) in replicas.partitions.iter().filter(|(_, partition)| !partition.objects.is_empty()) {
+            if let Some(namespaces) = inventory.get_mut(&key.2) {
+                namespaces.insert(key.3.clone());
             }
         }
         Ok(inventory.into_iter().map(|(kind, namespaces)| (kind, namespaces.into_iter().collect())).collect())
@@ -1763,9 +1585,6 @@ impl Store for InMemoryBackend {
         namespace: &str,
         events: &[(crate::WatchEvent<SerializedResource>, chrono::DateTime<Utc>)],
     ) -> Result<(), ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.apply_replica_batch_raw(resource_kind, origin_root, namespace, events).await;
-        }
         for (event, synced_at) in events {
             match event {
                 crate::WatchEvent::Added(object) => {
@@ -1802,9 +1621,6 @@ impl Store for InMemoryBackend {
         resource_kind: ResourceKind,
         namespace: &str,
     ) -> Result<Vec<crate::replica::ReplicaDeletion>, ResourceError> {
-        if let Some(backend) = &self.durable_replicas {
-            return backend.list_replica_deletions_raw(resource_kind, namespace).await;
-        }
         let key = Self::store_key(resource_kind, namespace);
         let state = self.replicas.lock().await;
         let mut deleted = Vec::new();

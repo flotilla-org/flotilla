@@ -1,126 +1,38 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
-};
-
 use flotilla_protocol::{qualified_path::QualifiedPath, ProviderData};
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, RepositoryKey,
-    ResourceError, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
+    discovered_checkouts::{DiscoveredCheckout, DiscoveredCheckouts},
+    ObservedCheckoutSpec, RepositoryKey,
 };
-use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
 
-/// Publish the checkout facts discovered for one local repository into the
-/// daemon's ephemeral observed-resource store.
+/// Holds the checkouts discovered for one local repository as this host's discovered checkouts,
+/// replacing those it held for it.
 ///
-/// `ProviderData` is the on-demand provider interchange input. This projection
-/// publishes its checkout facts as resources for the Aggregator; it does not
-/// feed a separate provider snapshot pipeline.
-pub async fn reconcile_checkouts(
-    backend: &ResourceBackend,
-    namespace: &str,
+/// `ProviderData` is the on-demand provider interchange input; its checkout facts stay on this
+/// host, in memory, for its readers.
+pub fn reconcile_checkouts(
+    discovered: &DiscoveredCheckouts,
     repository_key: &RepositoryKey,
     repository_slug: &str,
     providers: &ProviderData,
     host_ref: &str,
-) -> Result<(), ResourceError> {
-    let scope = ObservedCheckoutScope { repo_key: repository_key.clone(), repo_slug: repository_slug.to_string() };
-    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
-    let selector = scope.selector();
-    let mut existing: HashMap<_, _> = checkouts
-        .list_matching_labels(&selector)
-        .await?
-        .items
-        .into_iter()
-        .map(|checkout| (checkout.metadata.name.clone(), checkout))
+) {
+    let found = providers
+        .checkouts
+        .iter()
+        .map(|(path, checkout)| DiscoveredCheckout {
+            name: observed_checkout_name(repository_key, path),
+            repo_slug: repository_slug.to_owned(),
+            spec: ObservedCheckoutSpec {
+                r#ref: checkout.branch.clone(),
+                path: path.path.to_string_lossy().into_owned(),
+                repo_ref: repository_key.clone(),
+                host_ref: host_ref.to_owned(),
+                is_main: checkout.is_main,
+            },
+        })
         .collect();
-
-    for (path, checkout) in &providers.checkouts {
-        let name = observed_checkout_name(&scope.repo_key, path);
-        let meta = observed_checkout_meta(&name, &scope.repo_key, &scope.repo_slug);
-        let spec = ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
-            r#ref: checkout.branch.clone(),
-            path: path.path.to_string_lossy().into_owned(),
-            repo_ref: scope.repo_key.clone(),
-            host_ref: host_ref.to_string(),
-            is_main: checkout.is_main,
-        });
-
-        match existing.remove(&name) {
-            Some(current) if current.spec == spec && current.metadata.labels == meta.labels => {}
-            Some(current) => {
-                checkouts.update(&meta, &current.metadata.resource_version, &spec).await?;
-            }
-            None => {
-                checkouts.create(&meta, &spec).await?;
-            }
-        }
-    }
-
-    for stale_name in existing.into_keys() {
-        checkouts.delete(&stale_name).await?;
-    }
-
-    Ok(())
-}
-
-/// Delete the Checkout facts previously published for one local repository.
-///
-/// Adopted and managed Checkouts are outside this projection's lifecycle, so
-/// cleanup is restricted to resources carrying the observed authority label.
-pub async fn delete_observed_checkouts(
-    backend: &ResourceBackend,
-    namespace: &str,
-    repository_key: &RepositoryKey,
-) -> Result<(), ResourceError> {
-    let scope = ObservedCheckoutScope { repo_key: repository_key.clone(), repo_slug: String::new() };
-    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
-    let selector = scope.selector();
-
-    for checkout in checkouts.list_matching_labels(&selector).await?.items {
-        checkouts.delete(&checkout.metadata.name).await?;
-    }
-
-    Ok(())
-}
-
-pub async fn delete_observed_checkout_at_path(
-    backend: &ResourceBackend,
-    namespace: &str,
-    repository_key: &RepositoryKey,
-    path: &Path,
-) -> Result<(), ResourceError> {
-    let scope = ObservedCheckoutScope { repo_key: repository_key.clone(), repo_slug: String::new() };
-    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
-    for checkout in checkouts.list_matching_labels(&scope.selector()).await?.items {
-        if matches!(&checkout.spec, ResourceCheckoutSpec::Observed(observed) if Path::new(&observed.path) == path) {
-            checkouts.delete(&checkout.metadata.name).await?;
-        }
-    }
-    Ok(())
-}
-
-struct ObservedCheckoutScope {
-    repo_key: RepositoryKey,
-    repo_slug: String,
-}
-
-impl ObservedCheckoutScope {
-    fn selector(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Observed.as_label_value().to_string()),
-            (REPO_KEY_LABEL.to_string(), self.repo_key.to_string()),
-        ])
-    }
-}
-
-fn observed_checkout_meta(name: &str, repo_key: &RepositoryKey, repo_slug: &str) -> InputMeta {
-    InputMeta::builder()
-        .name(name.to_string())
-        .labels(BTreeMap::from([(REPO_KEY_LABEL.to_string(), repo_key.to_string()), (REPO_LABEL.to_string(), repo_slug.to_string())]))
-        .build()
-        .with_lifecycle_authority(LifecycleAuthority::Observed)
+    discovered.replace(repository_key, found);
 }
 
 fn observed_checkout_name(repo_key: &RepositoryKey, path: &QualifiedPath) -> String {
@@ -139,9 +51,7 @@ mod tests {
         qualified_path::{HostId, QualifiedPath},
         Checkout, HostName, ProviderData,
     };
-    use flotilla_resources::{Checkout as ResourceCheckout, RepositoryKey};
-    use flotilla_store::ResourceBackend;
-    use flotilla_store_memory::InMemoryBackend;
+    use flotilla_resources::{discovered_checkouts::DiscoveredCheckouts, RepositoryKey};
 
     use super::{observed_checkout_name, reconcile_checkouts};
 
@@ -158,10 +68,9 @@ mod tests {
         assert!(first.len() <= 63);
     }
 
-    #[tokio::test]
-    async fn explicit_repository_identity_supports_remote_less_observations() {
-        let backend = ResourceBackend::new(InMemoryBackend::observed());
-        let checkouts = backend.using::<ResourceCheckout>("flotilla");
+    #[test]
+    fn explicit_repository_identity_supports_remote_less_observations() {
+        let discovered = DiscoveredCheckouts::default();
         let repository_key = RepositoryKey("local-repository".to_string());
         let path = QualifiedPath::host(HostId::new("host-01"), "/workspace/repo");
         let providers = ProviderData {
@@ -183,11 +92,8 @@ mod tests {
             ..ProviderData::default()
         };
 
-        reconcile_checkouts(&backend, "flotilla", &repository_key, "local-repo", &providers, "host-01")
-            .await
-            .expect("remote-less observation should reconcile");
+        reconcile_checkouts(&discovered, &repository_key, "local-repo", &providers, "host-01");
 
-        let stored = checkouts.list().await.expect("checkout list should succeed").items;
-        assert!(matches!(stored.as_slice(), [checkout] if checkout.spec.repo_ref() == &repository_key));
+        assert!(matches!(discovered.all().as_slice(), [checkout] if checkout.spec.repo_ref == repository_key));
     }
 }

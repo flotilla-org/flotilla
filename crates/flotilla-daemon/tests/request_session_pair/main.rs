@@ -72,8 +72,8 @@ use flotilla_resources::terminal_records::{
     AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords,
 };
 use flotilla_resources::{
-    Artifact, ArtifactSpec, ArtifactSubjectBinding, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec,
-    ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    Artifact, ArtifactSpec, ArtifactSubjectBinding, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus,
+    CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSource, CrewSpec,
     CrewWorkPhase, CrewWorkState, FulfilmentKind, FulfilmentKindSpec, Host, HostSpec, HostStatus, InputMeta, Message, RepositoryKey,
     Resource, ResourceError, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession,
@@ -4216,24 +4216,20 @@ async fn repository_identity_operations_scenario(alias: bool, observed: bool) {
     if observed {
         // #1770: generic checkout admission/execution uses observed resources
         // and discovered VCS capabilities, without a presentation root.
-        topology
-            .leader
-            .observed_resource_backend()
-            .using::<Checkout>("flotilla")
-            .create(
-                &InputMeta::builder().name("router-main".into()).build(),
-                &CheckoutSpec::Observed(
-                    flotilla_resources::ObservedCheckoutSpec::builder()
-                        .r#ref("main".into())
-                        .path(path.to_string_lossy().into_owned())
-                        .repo_ref(key.clone())
-                        .host_ref(topology.leader.local_host_id().expect("host").to_string())
-                        .is_main(true)
-                        .build(),
-                ),
-            )
-            .await
-            .expect("observe checkout");
+        topology.leader.discovered_checkouts().replace(
+            &key,
+            vec![flotilla_resources::discovered_checkouts::DiscoveredCheckout {
+                name: "router-main".into(),
+                repo_slug: key.to_string(),
+                spec: flotilla_resources::ObservedCheckoutSpec::builder()
+                    .r#ref("main".into())
+                    .path(path.to_string_lossy().into_owned())
+                    .repo_ref(key.clone())
+                    .host_ref(topology.leader.local_host_id().expect("host").to_string())
+                    .is_main(true)
+                    .build(),
+            }],
+        );
         let mut events = topology.client.subscribe();
         let id = topology
             .client

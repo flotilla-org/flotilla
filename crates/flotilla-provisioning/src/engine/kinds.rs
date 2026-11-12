@@ -342,6 +342,20 @@ impl EngineRecords for EngineKinds {
             .collect())
     }
 
+    /// Every home's record `name`, read from the resident map by name.
+    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        refuse_kind(kind)?;
+        let resident = self.refresh()?;
+        Ok(resident
+            .records
+            .range((name.to_owned(), String::new())..)
+            .take_while(|((held, _), _)| held == name)
+            .filter_map(|(_, held)| {
+                held.clone().map_err(|error| tracing::warn!(%error, "skipping a fulfilment kind that does not encode")).ok()
+            })
+            .collect())
+    }
+
     async fn apply(
         &self,
         kind: &str,
