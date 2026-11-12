@@ -470,6 +470,15 @@ fn format_issue_page_human(page: &flotilla_protocol::issue_query::IssueResultPag
     output
 }
 
+fn format_last_round(at: Option<DateTime<Utc>>) -> String {
+    match at {
+        Some(at) => {
+            format!("{} ({}s ago)", at.format("%Y-%m-%d %H:%M:%S UTC"), Utc::now().signed_duration_since(at).num_seconds().max(0))
+        }
+        None => "none yet".to_owned(),
+    }
+}
+
 fn format_host_status_human(response: &HostStatusResponse) -> String {
     let mut out = String::new();
     out.push_str(&format!("Host: {}\n", response.host_name));
@@ -479,8 +488,17 @@ fn format_host_status_human(response: &HostStatusResponse) -> String {
     out.push_str(&format!("Repositories: {}\n", response.repo_count));
     if let Some(stream) = &response.change_stream {
         out.push_str(&format!("Change stream: watermark {}, {} consecutive failures\n", stream.watermark, stream.consecutive_failures));
+        out.push_str(&format!("Change stream last round: {}\n", format_last_round(stream.followed_at)));
         if let Some(error) = &stream.last_error {
             out.push_str(&format!("Change stream error: {error}\n"));
+        }
+        for path in &stream.paths {
+            let route = path.via.as_ref().map_or_else(|| "direct".to_owned(), |via| format!("via {via}"));
+            out.push_str(&format!("Change stream path {route}: last round {}", format_last_round(path.followed_at)));
+            if let Some(error) = &path.last_error {
+                out.push_str(&format!(", {} consecutive failures: {error}", path.consecutive_failures));
+            }
+            out.push('\n');
         }
     }
     if let Some(sync) = &response.blob_sync {

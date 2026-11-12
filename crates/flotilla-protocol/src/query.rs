@@ -6,7 +6,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{EnvironmentInfo, HostName, HostSummary, IssueSource, NodeInfo, PeerConnectionState, RepositoryKey, ViewAddress};
+use crate::{EnvironmentInfo, HostName, HostSummary, IssueSource, NodeId, NodeInfo, PeerConnectionState, RepositoryKey, ViewAddress};
 
 /// Provider health across categories. Outer key: category (e.g. "vcs",
 /// "change_request"). Inner key: provider name. Value: healthy.
@@ -669,11 +669,30 @@ pub struct FleetReplicaStatus {
     pub message: Option<String>,
 }
 
-/// Committed decided-stream progress and the latest consecutive round failures.
+/// A home's committed decided-stream progress here, derived from each path that follows it.
 /// Query health only: this is not a stored resource schema.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeStreamStatus {
     pub watermark: u64,
+    /// The latest round any path completed. A followed home ends every round within the
+    /// producer's frame wait, so an old time means the home is not being followed.
+    #[serde(default)]
+    pub followed_at: Option<DateTime<Utc>>,
+    /// Set only when every path is failing; a failing path beside a healthy one is degraded.
+    pub last_error: Option<String>,
+    pub consecutive_failures: u64,
+    #[serde(default)]
+    pub paths: Vec<ChangeStreamPathStatus>,
+}
+
+/// One way this host follows a home's log: from the home itself, or through a peer passing it on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeStreamPathStatus {
+    /// The peer passing the home's log on; `None` when the home serves it directly.
+    #[serde(default)]
+    pub via: Option<NodeId>,
+    #[serde(default)]
+    pub followed_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub consecutive_failures: u64,
 }

@@ -608,6 +608,12 @@ mod tests {
             .expect("replicate host");
         fixture.fleet.report_change_stream(
             &NodeId::new("remote-node"),
+            None,
+            flotilla_projections::fleet::ChangeStreamUpdate::Healthy { watermark: 1, at: last_sync },
+        );
+        fixture.fleet.report_change_stream(
+            &NodeId::new("remote-node"),
+            None,
             flotilla_projections::fleet::ChangeStreamUpdate::Failure { watermark: None, message: "connection lost".into() },
         );
         let row = FleetListRow::builder()
@@ -635,13 +641,10 @@ mod tests {
 
         // A local source alarm stays visible in host status, but cannot create an
         // unreachable replica or replace a local row's Local staleness.
-        fixture.fleet.report_change_stream(
-            &fixture.node_id,
-            flotilla_projections::fleet::ChangeStreamUpdate::Failure {
-                watermark: Some(3),
-                message: "local/rs/large: resource exceeds assembly limit".into(),
-            },
-        );
+        fixture.fleet.report_serving(flotilla_projections::fleet::ChangeStreamUpdate::Failure {
+            watermark: Some(3),
+            message: "local/rs/large: resource exceeds assembly limit".into(),
+        });
         let local = FleetListRow::builder()
             .convoy("local-source")
             .vessel("work")
@@ -664,17 +667,44 @@ mod tests {
         use flotilla_projections::fleet::ChangeStreamUpdate;
         let fixture = ProjectionFixture::new();
         fixture.register_remote_host("healthy-node", "healthy", "healthy-id").await;
+        fixture.register_remote_host("routed-node", "routed", "routed-id").await;
+        fixture.register_remote_host("degraded-node", "degraded", "degraded-id").await;
         fixture.register_remote_host("failing-node", "failing", "failing-id").await;
-        fixture.fleet.report_change_stream(&NodeId::new("healthy-node"), ChangeStreamUpdate::Healthy(7));
-        fixture.fleet.report_change_stream(&NodeId::new("failing-node"), ChangeStreamUpdate::Healthy(3));
+        let healthy_at = Utc::now();
+        let failing_since = healthy_at - chrono::Duration::minutes(5);
+        let relay = NodeId::new("healthy-node");
+        let failure = |message: &str| ChangeStreamUpdate::Failure { watermark: None, message: message.into() };
+        fixture.fleet.report_change_stream(
+            &NodeId::new("healthy-node"),
+            None,
+            ChangeStreamUpdate::Healthy { watermark: 7, at: healthy_at },
+        );
+        // Reached only through healthy-node, which passes its log on.
+        fixture.fleet.report_change_stream(
+            &NodeId::new("routed-node"),
+            Some(&relay),
+            ChangeStreamUpdate::Healthy { watermark: 4, at: healthy_at },
+        );
+        // Followed directly while the path through healthy-node fails.
+        fixture.fleet.report_change_stream(
+            &NodeId::new("degraded-node"),
+            None,
+            ChangeStreamUpdate::Healthy { watermark: 5, at: healthy_at },
+        );
+        fixture.fleet.report_change_stream(&NodeId::new("degraded-node"), Some(&relay), failure("relay refused"));
+        // Every path fails.
         fixture.fleet.report_change_stream(
             &NodeId::new("failing-node"),
+            None,
+            ChangeStreamUpdate::Healthy { watermark: 3, at: failing_since },
+        );
+        fixture.fleet.report_change_stream(
+            &NodeId::new("failing-node"),
+            None,
             ChangeStreamUpdate::Failure { watermark: Some(3), message: "connection lost".into() },
         );
-        fixture.fleet.report_change_stream(
-            &NodeId::new("failing-node"),
-            ChangeStreamUpdate::Failure { watermark: None, message: "connection refused".into() },
-        );
+        fixture.fleet.report_change_stream(&NodeId::new("failing-node"), None, failure("connection refused"));
+        fixture.fleet.report_change_stream(&NodeId::new("failing-node"), Some(&relay), failure("relay lost"));
         let local = fixture.registry.local_host_summary().await;
         let status = |host_id: &'static str| {
             let projections = fixture.projections();
@@ -691,14 +721,40 @@ mod tests {
 
         let healthy = status("healthy-id").await;
         assert_eq!(healthy.watermark, 7);
+        assert_eq!(healthy.followed_at, Some(healthy_at));
         assert_eq!(healthy.consecutive_failures, 0);
         assert_eq!(healthy.last_error, None);
+        assert_eq!(healthy.paths.len(), 1);
+        assert_eq!(healthy.paths[0].via, None);
 
-        // A failing home keeps the prefix it applied and counts its failed rounds.
+        let routed = status("routed-id").await;
+        assert_eq!(routed.watermark, 4);
+        assert_eq!(routed.followed_at, Some(healthy_at));
+        assert_eq!(routed.last_error, None);
+        assert_eq!(routed.paths.len(), 1);
+        assert_eq!(routed.paths[0].via.as_ref(), Some(&relay));
+        assert_eq!(routed.paths[0].followed_at, Some(healthy_at));
+
+        // A failing path beside a followed one degrades the path, not the home.
+        let degraded = status("degraded-id").await;
+        assert_eq!(degraded.followed_at, Some(healthy_at));
+        assert_eq!(degraded.last_error, None);
+        assert_eq!(degraded.consecutive_failures, 0);
+        let failing_path = degraded.paths.iter().find(|path| path.via.as_ref() == Some(&relay)).expect("relayed path");
+        assert_eq!(failing_path.last_error.as_deref(), Some("relay refused"));
+        assert_eq!(failing_path.followed_at, None);
+        let direct = degraded.paths.iter().find(|path| path.via.is_none()).expect("direct path");
+        assert_eq!((direct.followed_at, direct.last_error.as_deref()), (Some(healthy_at), None));
+
+        // A home failing on every path keeps the prefix it applied and when its last round
+        // completed, and names each path's error.
         let failing = status("failing-id").await;
         assert_eq!(failing.watermark, 3);
-        assert_eq!(failing.consecutive_failures, 2);
-        assert_eq!(failing.last_error.as_deref(), Some("connection refused"));
+        assert_eq!(failing.followed_at, Some(failing_since));
+        assert_eq!(failing.consecutive_failures, 1);
+        assert_eq!(failing.last_error.as_deref(), Some("direct: connection refused; via healthy-node: relay lost"));
+        let direct = failing.paths.iter().find(|path| path.via.is_none()).expect("direct path");
+        assert_eq!((direct.followed_at, direct.consecutive_failures), (Some(failing_since), 2));
     }
 
     #[tokio::test]
@@ -716,6 +772,11 @@ mod tests {
             .replace(&remote_hosts.list().await.expect("remote hosts"), last_sync)
             .await
             .expect("replicate host");
+        fixture.fleet.report_change_stream(
+            &NodeId::new("remote-node"),
+            None,
+            flotilla_projections::fleet::ChangeStreamUpdate::Healthy { watermark: 1, at: last_sync },
+        );
         let row = FleetListRow::builder()
             .convoy("example")
             .vessel("work")
@@ -797,6 +858,13 @@ mod tests {
             .replace(&free_hosts.list().await.expect("free hosts"), now)
             .await
             .expect("replicate free host");
+        for (node, at) in [("remote-node", now - chrono::Duration::minutes(2)), ("free-node", now)] {
+            fixture.fleet.report_change_stream(
+                &NodeId::new(node),
+                None,
+                flotilla_projections::fleet::ChangeStreamUpdate::Healthy { watermark: 1, at },
+            );
+        }
 
         let list = fixture.projections().fleet_list("flotilla", Vec::new(), now).await.expect("fleet list");
         assert_eq!(list.replicas.len(), 3);
@@ -827,7 +895,7 @@ mod tests {
         let missing = health.hosts.iter().find(|row| row.host == HostName::new("missing")).expect("missing health");
         assert!(missing.protocol_fingerprint.is_none());
 
-        // A second origin with an older heartbeat but newer sync must win in both views.
+        // A second origin with an older heartbeat but a more recent followed round must win in both views.
         fixture.register_remote_host("mirror-node", "remote", "mirror-id").await;
         let mirror_backend = ResourceBackend::new(InMemoryBackend::default());
         let mirror_hosts = mirror_backend.using::<ResourceHost>("flotilla");
@@ -854,6 +922,11 @@ mod tests {
             .replace(&mirror_hosts.list().await.expect("mirror hosts"), now - chrono::Duration::minutes(1))
             .await
             .expect("replicate mirror host");
+        fixture.fleet.report_change_stream(
+            &NodeId::new("mirror-node"),
+            None,
+            flotilla_projections::fleet::ChangeStreamUpdate::Healthy { watermark: 1, at: now - chrono::Duration::minutes(1) },
+        );
         let list = fixture.projections().fleet_list("flotilla", Vec::new(), now).await.expect("fleet list with mirror");
         let remote = list.replicas.iter().find(|row| row.host == HostName::new("remote")).expect("remote mirror list");
         assert_eq!(remote.generation.as_deref(), Some("newer-sync"));
@@ -901,6 +974,11 @@ mod tests {
             .replace(&sessions.list().await.expect("unmapped sessions"), stale_sync)
             .await
             .expect("replicate unmapped session");
+        fixture.fleet.report_change_stream(
+            &NodeId::new("remote-node"),
+            None,
+            flotilla_projections::fleet::ChangeStreamUpdate::Healthy { watermark: 1, at: stale_sync },
+        );
 
         let engine = flotilla_provisioning_testkit::EnvironmentFixture::default();
         let merged_rows = fixture

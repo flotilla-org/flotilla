@@ -556,10 +556,13 @@ impl ReadProjections<'_> {
                 }
             }
         }
-        // All fleet views select the freshest self-report when multiple origins name one host.
-        for (host, report) in replicated_host_reports(&resource_hosts.items, self.host_registry, &configured_by_node).await {
+        // All fleet views select the most recently followed self-report when multiple origins name one host.
+        let streams = self.fleet.change_streams(now);
+        for (host, report) in replicated_host_reports(&resource_hosts.items, self.host_registry, &configured_by_node, &streams).await {
             host_refs.insert(report.host_id, host.clone());
-            host_syncs.insert(host.clone(), report.last_synced_at);
+            if let Some(followed_at) = report.followed_at {
+                host_syncs.insert(host.clone(), followed_at);
+            }
             if let Some(status) = report.status {
                 statuses.entry(host).or_insert(status);
             }
@@ -833,7 +836,11 @@ impl ReadProjections<'_> {
         if environment_id == &local_summary.environment_id && !self.host_registry.has_resource_description(environment_id).await {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
-        response.change_stream = self.fleet.change_streams().remove(&response.node.node_id);
+        response.change_stream = if &response.node.node_id == self.node_id {
+            self.fleet.serving()
+        } else {
+            self.fleet.change_streams(self.clock.now()).remove(&response.node.node_id)
+        };
         Ok(response)
     }
 
@@ -857,24 +864,20 @@ impl ReadProjections<'_> {
             .query_declared::<ResourceHost>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
             .await
             .map_err(|error| error.to_string())?;
-        let mut replicated_hosts = replicated_host_reports(&host_sources.items, self.host_registry, &HashMap::new())
+        let streams = self.fleet.change_streams(now);
+        let mut replicated_hosts = replicated_host_reports(&host_sources.items, self.host_registry, &HashMap::new(), &streams)
             .await
             .into_iter()
-            .map(|(host, report)| (host, (report.last_synced_at, report.status.and_then(|status| status.daemon_generation))))
+            .map(|(host, report)| (host, (report.followed_at, report.status.and_then(|status| status.daemon_generation))))
             .collect::<HashMap<_, _>>();
         let configured_hosts = self
             .config
             .load_hosts()
             .map(|hosts| hosts.hosts.into_iter().filter(|(_, host)| !host.ssh_host).collect::<HashMap<_, _>>())
             .unwrap_or_default();
-        let failures = self.fleet.replication_failures();
+        let failures = self.fleet.replication_failures(now);
         let mut replication_failures_by_host = HashMap::<HostName, Vec<ResourceReplicationFailure>>::new();
         for (peer, peer_failures) in failures {
-            // Source-local snapshot alarms belong to host status, not a remote
-            // replica row that would incorrectly mark this home's rows unreachable.
-            if &peer == self.node_id {
-                continue;
-            }
             let host = self.host_registry.host_name_for_node(&peer).await.unwrap_or_else(|| HostName::new(peer.as_str()));
             replication_failures_by_host
                 .entry(host)
@@ -885,14 +888,12 @@ impl ReadProjections<'_> {
             let host = HostName::new(remote.expected_host_name);
             let replication_failures = replication_failures_by_host.remove(&host).unwrap_or_default();
             let replication_error = format_resource_replication_failures(&replication_failures);
-            let source = replicated_hosts.remove(&host);
-            let (reachable, last_sync, generation, message) = match source {
-                Some((last_sync, generation)) => {
-                    (replica_sync_is_fresh(last_sync, now) && replication_error.is_none(), Some(last_sync), generation, replication_error)
-                }
+            let (last_sync, generation) = replicated_hosts.remove(&host).unwrap_or_default();
+            let (reachable, message) = match last_sync {
+                Some(last_sync) => (replica_sync_is_fresh(last_sync, now) && replication_error.is_none(), replication_error),
                 None => {
                     let unsynced = format!("replica source '{label}' has not synced yet");
-                    (false, None, None, join_replica_errors(Some(&unsynced), replication_error.as_deref()))
+                    (false, join_replica_errors(Some(&unsynced), replication_error.as_deref()))
                 }
             };
             replicas.push(FleetReplicaStatus { change_stream: None, host, reachable, last_sync, generation, message });
@@ -900,13 +901,17 @@ impl ReadProjections<'_> {
         for (host, (last_sync, generation)) in replicated_hosts {
             let replication_error =
                 replication_failures_by_host.remove(&host).and_then(|failures| format_resource_replication_failures(&failures));
+            let message = match last_sync {
+                Some(_) => replication_error,
+                None => join_replica_errors(Some("change stream not followed yet"), replication_error.as_deref()),
+            };
             replicas.push(FleetReplicaStatus {
                 change_stream: None,
                 host,
-                reachable: replica_sync_is_fresh(last_sync, now) && replication_error.is_none(),
-                last_sync: Some(last_sync),
+                reachable: last_sync.is_some_and(|last_sync| replica_sync_is_fresh(last_sync, now)) && message.is_none(),
+                last_sync,
                 generation,
-                message: replication_error,
+                message,
             });
         }
         for (host, failures) in replication_failures_by_host {
@@ -920,7 +925,7 @@ impl ReadProjections<'_> {
             });
         }
 
-        for (peer, state) in self.fleet.change_streams() {
+        for (peer, state) in streams {
             let host = self.host_registry.host_name_for_node(&peer).await.unwrap_or_else(|| HostName::new(peer.as_str()));
             // Health alone does not establish replica inventory or reachability.
             // Unmatched healthy homes retain resident health without creating a row.

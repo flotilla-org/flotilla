@@ -2285,11 +2285,11 @@ impl InProcessDaemon {
             return Err("decided store is already open".into());
         }
         let fleet = Arc::clone(&self.fleet);
-        let node = self.node_id.clone();
+        let clock = Arc::clone(&self.clock);
         service.observe_serving(Arc::new(move |result| {
             use flotilla_projections::fleet::ChangeStreamUpdate;
             let update = match result {
-                Ok(round) if round.snapshot => ChangeStreamUpdate::Healthy(round.watermark),
+                Ok(round) if round.snapshot => ChangeStreamUpdate::Healthy { watermark: round.watermark, at: clock.now() },
                 Ok(round) => ChangeStreamUpdate::Progress(round.watermark),
                 Err(error @ flotilla_schema_sqlite::StoreError::ResourceLimit { .. }) => {
                     ChangeStreamUpdate::Failure { watermark: None, message: error.to_string() }
@@ -2298,7 +2298,7 @@ impl InProcessDaemon {
                 // disconnects and transport errors are reported by each follower.
                 Err(_) => return,
             };
-            fleet.report_change_stream(&node, update);
+            fleet.report_serving(update);
         }))?;
         let metrics = Arc::clone(&self.decided_store_metrics);
         service.store().time_holds(Arc::new(move |hold: flotilla_schema_sqlite::Hold| {
@@ -2762,8 +2762,8 @@ impl InProcessDaemon {
             .await;
     }
 
-    pub fn report_change_stream(&self, peer: &NodeId, update: flotilla_projections::fleet::ChangeStreamUpdate) {
-        self.fleet.report_change_stream(peer, update);
+    pub fn report_change_stream(&self, home: &NodeId, via: Option<&NodeId>, update: flotilla_projections::fleet::ChangeStreamUpdate) {
+        self.fleet.report_change_stream(home, via, update);
     }
 
     /// Legacy presentation fixtures; production descriptions come from Host status.

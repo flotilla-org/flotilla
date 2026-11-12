@@ -758,8 +758,10 @@ fn blob_sync_diagnostics_render_in_host_list_and_status() {
     let status = flotilla_protocol::HostStatusResponse {
         change_stream: Some(flotilla_protocol::ChangeStreamStatus {
             watermark: 7,
+            followed_at: Some(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
             last_error: Some("home/rs/large: resource exceeds assembly limit".into()),
             consecutive_failures: 2,
+            paths: Vec::new(),
         }),
         environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("local")),
         host_name: HostName::new("local"),
@@ -774,9 +776,43 @@ fn blob_sync_diagnostics_render_in_host_list_and_status() {
     };
     let output = super::format_host_status_human(&status);
     assert!(output.contains("Change stream: watermark 7, 2 consecutive failures"));
+    // A failing home shows how long ago its last round completed.
+    assert!(output.contains("Change stream last round: 2023-11-14 22:13:20 UTC ("));
+    assert!(output.contains("s ago)"));
     assert!(output.contains("Change stream error: home/rs/large"));
     assert!(output.contains("Blob sync: 2 pending"));
     assert!(output.contains("Blob sync error: endpoint unavailable"));
+
+    // A peer home shows each path that follows it: a degraded path beside a followed one.
+    let followed_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let peer = flotilla_protocol::HostStatusResponse {
+        change_stream: Some(flotilla_protocol::ChangeStreamStatus {
+            watermark: 7,
+            followed_at: Some(followed_at),
+            last_error: None,
+            consecutive_failures: 0,
+            paths: vec![
+                flotilla_protocol::ChangeStreamPathStatus {
+                    via: None,
+                    followed_at: Some(followed_at),
+                    last_error: None,
+                    consecutive_failures: 0,
+                },
+                flotilla_protocol::ChangeStreamPathStatus {
+                    via: Some(NodeId::new("relay-node")),
+                    followed_at: None,
+                    last_error: Some("relay refused".into()),
+                    consecutive_failures: 3,
+                },
+            ],
+        }),
+        is_local: false,
+        ..status
+    };
+    let output = super::format_host_status_human(&peer);
+    assert!(!output.contains("Change stream error"));
+    assert!(output.contains("Change stream path direct: last round 2023-11-14 22:13:20 UTC ("));
+    assert!(output.contains("Change stream path via relay-node: last round none yet, 3 consecutive failures: relay refused\n"));
 }
 
 // Behaviour: convoy explain keeps the plural layout and shows differing states,

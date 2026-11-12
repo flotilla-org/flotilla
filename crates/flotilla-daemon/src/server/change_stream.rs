@@ -304,6 +304,23 @@ async fn routed_round(
     install_spool(service, home, peer != home, spool.into_std().await, holds).await
 }
 
+/// Records a round of `home`'s log, followed directly or through `via`, in the host's fleet health.
+fn report(
+    daemon: &flotilla_core::in_process::InProcessDaemon,
+    service: &Service,
+    home: &str,
+    via: Option<&flotilla_protocol::NodeId>,
+    result: &Result<Round, String>,
+) {
+    use flotilla_projections::fleet::ChangeStreamUpdate;
+    let watermark = service.watermark(home).expect("cached watermark").home_seq;
+    let update = match result {
+        Ok(_) => ChangeStreamUpdate::Healthy { watermark, at: daemon.clock().now() },
+        Err(error) => ChangeStreamUpdate::Failure { watermark: Some(watermark), message: error.clone() },
+    };
+    daemon.report_change_stream(&flotilla_protocol::NodeId::new(home), via, update);
+}
+
 /// Every reachable home is followed over its socket or command route. Dropping the
 /// returned task cancels this generation; failures retry from the last committed prefix.
 pub(super) fn follow(
@@ -321,11 +338,15 @@ pub(super) fn follow(
             Err(_) => return,
         };
         let peer = flotilla_protocol::NodeId::new(&home);
-        daemon.report_change_stream(&peer, ChangeStreamUpdate::Progress(service.watermark(&home).expect("cached watermark").home_seq));
+        daemon.report_change_stream(
+            &peer,
+            None,
+            ChangeStreamUpdate::Progress(service.watermark(&home).expect("cached watermark").home_seq),
+        );
         let client = match socket.as_deref().map(http_client).transpose() {
             Ok(client) => client,
             Err(error) => {
-                daemon.report_change_stream(&peer, ChangeStreamUpdate::Failure { watermark: None, message: error.clone() });
+                daemon.report_change_stream(&peer, None, ChangeStreamUpdate::Failure { watermark: None, message: error.clone() });
                 tracing::warn!(%home, %error, "home client unavailable");
                 return;
             }
@@ -340,13 +361,7 @@ pub(super) fn follow(
             holds.released(&home).await;
             let result = follow_round(Arc::clone(&service), &home, &home, client.as_ref(), &router, &holds).await;
             count(&metrics, &result);
-            let watermark = service.watermark(&home).expect("cached watermark").home_seq;
-            match &result {
-                Ok(_) => daemon.report_change_stream(&peer, ChangeStreamUpdate::Healthy(watermark)),
-                Err(error) => {
-                    daemon.report_change_stream(&peer, ChangeStreamUpdate::Failure { watermark: Some(watermark), message: error.clone() })
-                }
-            }
+            report(&daemon, &service, &home, None, &result);
             // The home holds each round open until its log advances, so the next round starts at
             // once. A failed round is retried at once from the committed prefix; a home that fails
             // every round in a row is given up until its link reconnects, which starts a new
@@ -357,6 +372,7 @@ pub(super) fn follow(
                     for other in round.homes {
                         if other != own && other != home && relayed.insert(other.clone()) {
                             relays.spawn(relay(
+                                Arc::clone(&daemon),
                                 Arc::clone(&service),
                                 home.clone(),
                                 other,
@@ -384,7 +400,9 @@ pub(super) fn follow(
 /// Follows `home`'s log through `peer`, which passes it on, until the peer's link ends (the
 /// caller drops this task) or every round fails in a row. Applying another home's entries is
 /// idempotent, so the same home followed through two peers converges.
+#[allow(clippy::too_many_arguments)]
 async fn relay(
+    daemon: Arc<flotilla_core::in_process::InProcessDaemon>,
     service: Arc<Service>,
     peer: String,
     home: String,
@@ -394,10 +412,12 @@ async fn relay(
     metrics: Arc<ReplicationLoadMetrics>,
 ) {
     let mut failures: u32 = 0;
+    let via = flotilla_protocol::NodeId::new(&peer);
     loop {
         holds.released(&home).await;
         let result = follow_round(Arc::clone(&service), &peer, &home, client.as_ref(), &router, &holds).await;
         count(&metrics, &result);
+        report(&daemon, &service, &home, Some(&via), &result);
         match result {
             Ok(_) => failures = 0,
             Err(error) => {
