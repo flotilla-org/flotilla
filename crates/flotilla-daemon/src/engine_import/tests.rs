@@ -110,7 +110,7 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
         "Artifact",
         "Clone",
         "Vessel",
-        "Ensure",
+        "ConvoyEnsure",
         "Repository",
         "Project",
         "CredentialSpec",
@@ -607,9 +607,10 @@ fn lifecycle_records_import_by_state_and_name_what_they_cannot_map() {
         "an adopted (observed) checkout imports at its path: {summary:?}"
     );
     assert_eq!(summary.kinds["Vessel"].imported, 1, "a placed vessel is its lease: {summary:?}");
-    assert_eq!(summary.kinds["Ensure"].imported, 2);
+    // A standing role's declaration imports as a definition; its status is derived on the engine.
+    assert_eq!(summary.kinds["ConvoyEnsure"].imported, 2);
     assert_eq!(refused(&summary), [("Clone", "broken-a")]);
-    for expected in ["`convoy-a-implement` is not placed yet", "`governor-9`, which is not held", "`governor-1`, which has no status yet"] {
+    for expected in ["`convoy-a-implement` is not placed yet", "2 ConvoyEnsure statuses not carried"] {
         assert!(summary.notes.iter().any(|note| note.contains(expected)), "{expected}: {:?}", summary.notes);
     }
 }
@@ -641,7 +642,7 @@ fn a_standing_convoys_generations_import_as_one_stable_identity() {
     ));
     let summary = rehearse(&rows(documents), HERE);
     assert!(summary.refusals.is_empty(), "{summary:?}");
-    assert_eq!(summary.kinds["Ensure"].imported, 1);
+    assert_eq!(summary.kinds["ConvoyEnsure"].imported, 1);
     for expected in ["2 standing convoy generations map to 1 stable identities (1 folded)", "Vessel `unlisted-vessel`"] {
         assert!(summary.notes.iter().any(|note| note.contains(expected)), "{expected}: {:?}", summary.notes);
     }

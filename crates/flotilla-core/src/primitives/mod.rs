@@ -2,5 +2,4 @@
 //! `flotilla_engine_messages` and the Convoy path `flotilla_engine_convoys`.
 
 pub mod demand_import;
-pub mod ensures;
 pub mod import;

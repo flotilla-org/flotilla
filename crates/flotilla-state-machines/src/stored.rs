@@ -27,8 +27,8 @@ use flotilla_schema::{
 
 use crate::{
     machines::{
-        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
-        service::Service, vessel::Vessel,
+        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, message::Message, person::Person, service::Service,
+        vessel::Vessel,
     },
     EdgeEventOf, EdgeKind, EdgePayload, Label, Machine, NoRecords, Resource, Version,
 };
@@ -39,14 +39,14 @@ use crate::{
 /// reused or moved; a kind declared elsewhere (a lifecycle kind's request beside
 /// its owner) registers into this registry under a new code. Test kinds are
 /// registered beside these, so the registry refuses any test kind that takes a
-/// production code.
+/// production code. Retired codes stay allocated: `en` was the Ensure's, whose standing role is
+/// derived from its convoy generations instead (#3108).
 pub fn kinds() -> Result<KindRegistry, RegistryError> {
     let mut registry = KindRegistry::new();
     registry.register::<Resource<Message>>()?;
     registry.register::<Resource<AgentSession>>()?;
     registry.register::<Resource<Convoy>>()?;
     registry.register::<Resource<Vessel>>()?;
-    registry.register::<Resource<Ensure>>()?;
     registry.register::<Resource<AwaitingReply>>()?;
     registry.register::<Resource<Person>>()?;
     registry.register::<Resource<Service>>()?;

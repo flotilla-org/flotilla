@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use flotilla_schema::{Address, IndexQuery, Kind, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{Cursor, Page, ResourceId, Store, StoreError, MAX_PAGE};
 use flotilla_state_machines::machines::{
+    awaiting_reply::{AwaitingReplySpec, AwaitingReplyState},
     convoy::{ConvoySpec, ConvoyState},
-    ensure::EnsureSpec,
     lifecycle::LifecycleState,
     message::{MessageSpec, MessageState},
 };
@@ -14,8 +14,8 @@ use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
 use crate::fixtures::{
-    convoy, ensure, message, origin, registry, store, terminal, terminal::TerminalRequest, AgentSession, Convoy, Ensure, Fixture, Message,
-    Pick, Referral, Resource, TerminalSession, Vessel, LOCAL,
+    awaiting_reply, convoy, message, origin, registry, store, terminal, terminal::TerminalRequest, AgentSession, AwaitingReply, Convoy,
+    Fixture, Message, Pick, Referral, Resource, TerminalSession, Vessel, LOCAL,
 };
 
 /// Every id of `query`, page by page with `limit`. Each page holds at most `limit` ids, a page
@@ -186,7 +186,7 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
             assert!(read.integer_index_keys(&query, home, i64::MAX, 1).unwrap().is_empty());
             assert_eq!(read.integer_index_keys(&query, home, i64::MIN, 1).unwrap()[0].1, 1);
             assert!(matches!(
-                read.integer_index_keys(&EnsureSpec::by_inbox(&project("inbox")), home, 0, 1),
+                read.integer_index_keys(&ConvoySpec::open_by_project(&project("inbox")), home, 0, 1),
                 Err(StoreError::IntegerIndex { .. })
             ));
             assert!(read.integer_index_keys(&query, "missing", 0, limit).unwrap().is_empty());
@@ -208,7 +208,7 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
             assert_eq!(read.integer_index_keys_before(&query, home, 7, 1).unwrap()[0].1, 6);
             assert!(read.integer_index_keys_before(&query, home, 1, 1).unwrap().is_empty());
             assert!(matches!(
-                read.integer_index_keys_before(&EnsureSpec::by_inbox(&project("inbox")), home, 0, 1),
+                read.integer_index_keys_before(&ConvoySpec::open_by_project(&project("inbox")), home, 0, 1),
                 Err(StoreError::IntegerIndex { .. })
             ));
         }
@@ -329,12 +329,13 @@ fn project(name: &str) -> Address {
 
 // Behaviour (DESIGN queries): the other engine kinds' indexes, an interned `eq` under a label
 // predicate (Convoy's open convoys of a project, a terminal session pool's live sessions), a
-// reference `eq` ordered by a spec column (a vessel's sessions) and a bare interned `eq` (an
-// Ensure's inbox), select and order as declared.
+// reference `eq` ordered by a spec column (a vessel's sessions), an interned address `eq` under a
+// label predicate (an AwaitingReply's open records of a sender) and a bare reference `eq` (an
+// AwaitingReply's message), select and order as declared.
 #[hegel::test(test_cases = 40)]
 fn other_fixture_indexes_match_the_model(tc: TestCase) {
     let mut store = store();
-    let (mut convoys, mut sessions, mut ensures) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+    let (mut convoys, mut sessions, mut records) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
     let pick = |names: &[&str]| tc.draw(gs::sampled_from(names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>()));
     let mut write = store.write().expect("write");
     for n in 0..tc.draw(gs::integers::<usize>().max_value(8)) {
@@ -354,9 +355,14 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
         sessions.insert(write.insert(&format!("t{n}"), &session, &origin()).expect("insert").id, session);
     }
     for n in 0..tc.draw(gs::integers::<usize>().max_value(6)) {
-        let ensure = ensure::generate(&tc, Pick::Draw);
-        let ensure = ensure.clone().with_spec(EnsureSpec { inbox: project(&pick(&["i0", "i1"])) });
-        ensures.insert(write.insert(&format!("e{n}"), &ensure, &origin()).expect("insert").id, ensure);
+        let record = awaiting_reply::generate(&tc, Pick::Draw);
+        let spec = AwaitingReplySpec {
+            sender: project(&pick(&["s0", "s1"])),
+            message: Ref::new(pick(&["m0", "m1"]), LOCAL),
+            ..record.spec().clone()
+        };
+        let record = record.clone().with_spec(spec);
+        records.insert(write.insert(&format!("a{n}"), &record, &origin()).expect("insert").id, record);
     }
     write.commit().expect("commit");
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
@@ -375,10 +381,15 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
         let want = expected(&sessions, |s: &TerminalSession| live(s) && s.spec().pool == pool, |_| ());
         assert_eq!(collect(&mut store, &TerminalRequest::live_by_pool(&pool.to_owned()), limit), want);
     }
-    for inbox in ["i0", "i1", "i2"] {
-        let inbox = project(inbox);
-        let want = expected(&ensures, |e: &Resource<Ensure>| e.spec().inbox == inbox, |_| ());
-        assert_eq!(collect(&mut store, &EnsureSpec::by_inbox(&inbox), limit), want);
+    for sender in ["s0", "s1", "s2"] {
+        let sender = project(sender);
+        let open = |a: &Resource<AwaitingReply>| matches!(a.state(), AwaitingReplyState::Open);
+        let want = expected(&records, |a: &Resource<AwaitingReply>| open(a) && a.spec().sender == sender, |_| ());
+        assert_eq!(collect(&mut store, &AwaitingReplySpec::open_by_sender(&sender), limit), want);
+    }
+    for message in ["m0", "m1", "m2"] {
+        let want = expected(&records, |a: &Resource<AwaitingReply>| a.spec().message.name == message, |_| ());
+        assert_eq!(collect(&mut store, &AwaitingReplySpec::by_message(&Ref::new(message, LOCAL)), limit), want);
     }
 }
 

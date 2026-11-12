@@ -110,8 +110,6 @@ fn the_enumeration_covers_every_kind_and_index() {
         "index awaiting_reply_open_by_subject after",
         "index awaiting_reply_by_message after",
         "index awaiting_reply_deadline first",
-        "ensure_recorded insert",
-        "ensure set bound",
         "terminal_session_labels select",
         "dossier_deliverables_evidence_metadata insert",
         "dossier_deliverables set state",
@@ -132,7 +130,6 @@ fn the_enumeration_covers_every_kind_and_index() {
         "index convoy_open_by_project first",
         "index convoy_by_launch first",
         "index convoy_by_launch integer keys before",
-        "index ensure_by_inbox after",
         "index terminal_session_by_vessel after",
         "index terminal_session_live_by_pool first",
         "index referral_by_reply after",
@@ -152,8 +149,8 @@ fn the_enumeration_covers_every_kind_and_index() {
     ] {
         assert!(labels.contains(&expected), "missing {expected}");
     }
-    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 18 + 2 * 5);
-    assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 12);
+    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 17 + 2 * 5);
+    assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 11);
     assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(
         !labels.iter().any(|label| label.starts_with("convoy_duties ") && label.ends_with(" last position")),

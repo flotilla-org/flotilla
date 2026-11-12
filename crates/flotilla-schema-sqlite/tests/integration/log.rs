@@ -15,8 +15,8 @@ use flotilla_state_machines::machines::message::MessageSpec;
 use crate::fixtures::{
     addr, carry_changes, message as messages, origin, registry, store,
     synthetic::{workflow, InputValue},
-    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource, Service, TerminalSession,
-    Ticket, Vessel, LOCAL,
+    AgentSession, AwaitingReply, Convoy, Dossier, Fixture, Message, Person, Pick, Referral, Resource, Service, TerminalSession, Ticket,
+    Vessel, LOCAL,
 };
 
 const REPLICA: &str = "replica";
@@ -107,7 +107,6 @@ fn slots() -> Vec<(KindCode, String)> {
         Resource::<Service>::CODE,
         Resource::<AwaitingReply>::CODE,
         Resource::<Convoy>::CODE,
-        Resource::<Ensure>::CODE,
         TerminalSession::CODE,
         Resource::<Vessel>::CODE,
         Ticket::CODE,
@@ -178,7 +177,6 @@ fn the_log_replays_into_another_store(tc: TestCase) {
             Resource::<Service>::CODE => step::<Resource<Service>>(&tc, &mut write, live, name, last),
             Resource::<AwaitingReply>::CODE => step::<Resource<AwaitingReply>>(&tc, &mut write, live, name, last),
             Resource::<Convoy>::CODE => step::<Resource<Convoy>>(&tc, &mut write, live, name, last),
-            Resource::<Ensure>::CODE => step::<Resource<Ensure>>(&tc, &mut write, live, name, last),
             Ticket::CODE => step::<Ticket>(&tc, &mut write, live, name, last),
             Referral::CODE => step::<Referral>(&tc, &mut write, live, name, last),
             Dossier::CODE => step::<Dossier>(&tc, &mut write, live, name, last),
@@ -488,11 +486,6 @@ fn a_snapshot_plus_its_tail_is_the_newest_snapshot_awaiting_reply(tc: TestCase) 
 #[hegel::test]
 fn a_snapshot_plus_its_tail_is_the_newest_snapshot_convoy(tc: TestCase) {
     snapshot_plus_tail::<Resource<Convoy>>(&tc);
-}
-
-#[hegel::test]
-fn a_snapshot_plus_its_tail_is_the_newest_snapshot_ensure(tc: TestCase) {
-    snapshot_plus_tail::<Resource<Ensure>>(&tc);
 }
 
 #[hegel::test]

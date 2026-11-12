@@ -445,22 +445,12 @@ impl DaemonRuntime {
 
         let controller_metrics = Arc::new(flotilla_store::load_metrics::ControllerMetricsRegistry::default());
         let mut controller_state = None;
-        // The engine's Ensure decides standing-convoy status (#3629 layer 7).
-        let ensure_engine = {
-            let store = daemon.decided_store()?.store();
-            let clock = daemon.clock_for_scenarios();
-            let path = tokio::task::spawn_blocking(move || flotilla_core::primitives::ensures::EngineEnsurePath::open(store, clock))
-                .await
-                .map_err(|error| error.to_string())??;
-            Some(Arc::new(path) as Arc<dyn flotilla_admission::convoy_ensure::EngineEnsures>)
-        };
         daemon
             .install_convoy_ensure_reconciler(Arc::new(
                 EnsureReconciler::builder()
                     .teardown(daemon.convoy_teardown())
                     .resource_backend(daemon.resource_backend())
                     .clock(daemon.clock_for_scenarios())
-                    .maybe_engine(ensure_engine)
                     .manifest_roots(daemon.manifest_roots())
                     .build(),
             ))
@@ -926,7 +916,7 @@ mod decided_kinds_tests {
     fn the_decided_store_holds_the_provisioning_kinds_with_their_diagrams() {
         let registry = super::decided_registry().expect("no code is held twice");
         let kinds: Vec<&str> = registry.iter().map(|set| set.kind.as_str()).collect();
-        for kind in ["Message", "AgentSession", "Environment", "ImageBuild", "Clone", "Checkout", "TerminalSession", "Vessel", "Ensure"] {
+        for kind in ["Message", "AgentSession", "Environment", "ImageBuild", "Clone", "Checkout", "TerminalSession", "Vessel"] {
             assert!(kinds.contains(&kind), "{kind} in {kinds:?}");
         }
         assert!(kinds.contains(&"AccountBinding") && kinds.contains(&"AccountProvision"), "{kinds:?}");

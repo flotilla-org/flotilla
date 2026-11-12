@@ -50,7 +50,7 @@ use std::collections::BTreeMap;
 
 use flotilla_schema::{IndexQuery, Kind, KindRegistry, RegistryError, Stored};
 use flotilla_state_machines::{
-    machines::{ensure::Ensure, lifecycle::LifecycleKind, vessel::Vessel},
+    machines::{lifecycle::LifecycleKind, vessel::Vessel},
     Diagram, Machine, Resource,
 };
 
@@ -149,12 +149,11 @@ pub fn registry() -> Result<KindRegistry, RegistryError> {
     Ok(registry)
 }
 
-/// The crew kinds (Track B): Vessel and Ensure, declared by the engine, and
-/// TerminalSession with its launch facts, for their DDL snapshot.
+/// The crew kinds (Track B): Vessel, declared by the engine, and TerminalSession with its launch
+/// facts, for their DDL snapshot.
 pub fn crew_registry() -> Result<KindRegistry, RegistryError> {
     let mut registry = KindRegistry::new();
     registry.register::<Resource<Vessel>>()?;
-    registry.register::<Resource<Ensure>>()?;
     registry.register::<Resource<terminal_session::TerminalSession>>()?;
     registry.register::<terminal_facts::TerminalLaunchFacts>()?;
     Ok(registry)
@@ -170,8 +169,8 @@ pub fn production_kinds() -> Result<KindRegistry, RegistryError> {
 }
 
 /// Every kind the daemon's decided store holds (ADR 0064, #3108): Message and AgentSession
-/// (#3317), the kinds registered by [`register`], and the engine's Vessel and Ensure (#3629),
-/// each under its production code.
+/// (#3317), the kinds registered by [`register`], and the engine's Vessel (#3629), each under its
+/// production code.
 pub fn decided_registry() -> Result<KindRegistry, RegistryError> {
     let mut registry = flotilla_engine_store::registry()?;
     register(&mut registry)?;

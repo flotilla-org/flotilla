@@ -1,5 +1,5 @@
-//! The crew kinds' stored shape (#3629 Track B layer 5): Vessel and Ensure, declared by the
-//! engine, and TerminalSession. Deterministic DDL and a readable view, checked in for the owner's
+//! The crew kinds' stored shape (#3629 Track B layer 5): Vessel, declared by the engine, and
+//! TerminalSession. Deterministic DDL and a readable view, checked in for the owner's
 //! schema look-over, the plans of their statements, and a session through the schema codec.
 
 use std::collections::BTreeMap;

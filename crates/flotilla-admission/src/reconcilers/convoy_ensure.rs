@@ -10,7 +10,6 @@ use std::{
 use crate::convoy_admission::PreparedConvoyAdmission;
 use crate::convoy_ensure::ConvoyEnsureAdmission;
 use crate::convoy_ensure::ConvoyEnsureReconciler;
-use crate::convoy_ensure::EngineEnsures;
 use crate::convoy_ensure::StandingConvoyBackingInspector;
 use crate::ports::ConvoyTeardown;
 use crate::standing::{self, Decision, Ending, Generation, HoldAttention, StandingReading};
@@ -117,8 +116,6 @@ pub struct EnsureReconciler {
     /// Per namespace, the earliest time the last pass deferred an ensure to.
     #[builder(skip)]
     next_due: StdMutex<HashMap<String, DateTime<Utc>>>,
-    /// The engine's Ensure behind `[primitives]` (#3629 layer 7); absent with the switch off.
-    engine: Option<Arc<dyn EngineEnsures>>,
     /// The daemon's ManifestRoots (#3824 layer 2c); the old store's when absent.
     manifest_roots: Option<Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>>,
 }
@@ -139,7 +136,6 @@ impl EnsureReconciler {
             .ensure_reconciliation(&self.ensure_reconciliation)
             .next_due(&self.next_due)
             .admission(admission)
-            .maybe_engine(self.engine.as_ref())
             .build()
     }
 }
@@ -176,7 +172,6 @@ struct EnsurePass<'a> {
     ensure_reconciliation: &'a Mutex<()>,
     next_due: &'a StdMutex<HashMap<String, DateTime<Utc>>>,
     admission: &'a dyn ConvoyEnsureAdmission,
-    engine: Option<&'a Arc<dyn EngineEnsures>>,
 }
 
 #[async_trait]
@@ -1147,21 +1142,6 @@ impl EnsurePass<'_> {
 
     async fn patch_convoy_ensure(&self, namespace: &str, name: &str, patch: ConvoyEnsureStatusPatch) -> Result<(), String> {
         let ensures = self.resource_backend.clone().using::<ConvoyEnsure>(namespace);
-        // Behind `[primitives]` the engine decides first; the old status takes its answer.
-        let patch = match self.engine {
-            Some(engine) => {
-                let ensure = match ensures.get(name).await {
-                    Ok(ensure) => ensure,
-                    Err(ResourceError::NotFound { .. }) => return Ok(()),
-                    Err(error) => return Err(error.to_string()),
-                };
-                match engine.decide(namespace, &ensure, patch).await? {
-                    Some(patch) => patch,
-                    None => return Ok(()),
-                }
-            }
-            None => patch,
-        };
         apply_resource_status_patch(&ensures, name, &patch).await.map(|_| ()).map_err(|error| error.to_string())
     }
 

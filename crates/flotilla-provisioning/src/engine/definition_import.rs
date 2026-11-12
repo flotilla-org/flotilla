@@ -32,8 +32,8 @@ use flotilla_protocol::NodeId;
 use flotilla_resources::{
     builtins::is_builtin,
     definitions::{declares, DefinitionOrigin},
-    CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, ObjectMeta, Project,
-    Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
+    ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, ObjectMeta,
+    Project, Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use flotilla_schema::{Kind, Timestamp};
 use flotilla_store::{definition_is_live, merge_definition_copies};
@@ -45,8 +45,8 @@ use super::{
 };
 use crate::stored::{
     definition::{
-        self as stored, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition,
-        ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
+        self as stored, ConvoyEnsureDefinition, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition,
+        FleetDesignationDefinition, ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
     },
     project::{self, ProjectDefinition},
 };
@@ -92,6 +92,7 @@ whole_definition!(
     CredentialSpec => CredentialSpecDefinition,
     CredentialGrant => CredentialGrantDefinition,
     CrewDefaults => CrewDefaultsDefinition,
+    ConvoyEnsure => ConvoyEnsureDefinition,
 );
 
 impl DefinitionKind for ImageLayerDefinition {
@@ -123,6 +124,9 @@ pub struct DefinitionCopies {
     pub crew_defaults: Vec<DefinitionCopy<CrewDefaults>>,
     pub image_layers: Vec<DefinitionCopy<ImageLayer>>,
     pub workflow_templates: Vec<DefinitionCopy<WorkflowTemplate>>,
+    /// A standing role's declaration (#3108). Its old status is not carried: the role's reading
+    /// is derived from its convoy generations and its hold attention.
+    pub convoy_ensures: Vec<DefinitionCopy<ConvoyEnsure>>,
     /// Project (layer 3b), with its ProjectOps records from the copies' statuses.
     pub projects: Vec<DefinitionCopy<Project>>,
 }
@@ -151,6 +155,7 @@ pub fn import_definitions(copies: &DefinitionCopies, target: &mut impl ImportTar
     write_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, target, report);
     write_kind::<ImageLayerDefinition>(&copies.image_layers, target, report);
     write_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, target, report);
+    write_kind::<ConvoyEnsureDefinition>(&copies.convoy_ensures, target, report);
     let projects = write_kind::<ProjectDefinition>(&copies.projects, target, report);
     write_project_ops(&copies.projects, &projects, target, report);
 }

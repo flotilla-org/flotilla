@@ -7,7 +7,7 @@ use hegel::{generators as gs, TestCase};
 
 use crate::fixtures::terminal::Terminal;
 use crate::fixtures::{
-    origin, store, AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource, Service,
+    origin, store, AgentSession, AwaitingReply, Convoy, Dossier, Fixture, Message, Person, Pick, Referral, Resource, Service,
     TerminalSession, Ticket, Vessel, LOCAL,
 };
 
@@ -108,11 +108,6 @@ fn convoy_evolves_by_edges_and_spec_edits(tc: TestCase) {
 }
 
 #[hegel::test]
-fn ensure_evolves_by_edges_and_spec_edits(tc: TestCase) {
-    drawn::<Resource<Ensure>>(&tc);
-}
-
-#[hegel::test]
 fn terminal_session_evolves_by_edges_and_spec_edits(tc: TestCase) {
     drawn::<TerminalSession>(&tc);
     drawn::<Resource<Vessel>>(&tc);
@@ -166,11 +161,6 @@ fn every_variant_round_trips_and_switches_through_writes_awaiting_reply(tc: Test
 #[hegel::test]
 fn every_variant_round_trips_and_switches_through_writes_convoy(tc: TestCase) {
     covering::<Resource<Convoy>>(&tc);
-}
-
-#[hegel::test]
-fn every_variant_round_trips_and_switches_through_writes_ensure(tc: TestCase) {
-    covering::<Resource<Ensure>>(&tc);
 }
 
 #[hegel::test]
@@ -244,11 +234,6 @@ fn engine_fixtures_reach_every_declared_edge_awaiting_reply(tc: TestCase) {
 #[hegel::test(test_cases = 5)]
 fn engine_fixtures_reach_every_declared_edge_convoy(tc: TestCase) {
     assert_eq!(edges_reached::<Convoy>(&tc), all_edges::<Convoy>());
-}
-
-#[hegel::test(test_cases = 5)]
-fn engine_fixtures_reach_every_declared_edge_ensure(tc: TestCase) {
-    assert_eq!(edges_reached::<Ensure>(&tc), all_edges::<Ensure>());
 }
 
 #[hegel::test(test_cases = 5)]

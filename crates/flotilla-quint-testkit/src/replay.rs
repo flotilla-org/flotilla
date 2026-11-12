@@ -10,7 +10,7 @@ pub const DELIVERY: &str = "project:still-wanted";
 pub const TURN_RULES: &str = "project:fleet/role:turn-rules";
 /// Microseconds per model clock tick (ten minutes).
 pub const UNIT: i64 = 600_000_000;
-/// The inbox every replayed message and Ensure names, as the world keys it:
+/// The inbox every replayed message names, as the world keys it:
 /// a canonical inbox address.
 pub const INBOX: &str = "project:replay/role:inbox";
 /// The authorised party, the superseding message and the outcome condition, as
