@@ -61,6 +61,12 @@ struct HeldViews {
     cursors: Option<Cursors>,
     /// This home's note changes not yet read into the views.
     notes: tokio::sync::broadcast::Receiver<String>,
+    /// The launches the cursors have passed whose views are not yet composed again. A read
+    /// dropped while it composes leaves them here for the next, since the cursors will not name
+    /// them again.
+    owed: BTreeSet<(String, String)>,
+    /// A read of every launch was begun and not finished.
+    refill_owed: bool,
 }
 
 /// Cursors over the changes of the records a convoy's view is composed from.
@@ -175,7 +181,7 @@ impl ConvoyViews {
             let wakes = self.wakes()?;
             let notes = self.convoys().map_err(ResourceError::other)?.memory().subscribe();
             let cursors = self.blocking(Cursors::start).await?;
-            let mut held = HeldViews { views: BTreeMap::new(), cursors, notes };
+            let mut held = HeldViews { views: BTreeMap::new(), cursors, notes, owed: BTreeSet::new(), refill_owed: false };
             self.refill(&mut held).await?;
             *state = Some(held);
             tokio::spawn(self.clone().follow(wakes));
@@ -234,38 +240,51 @@ impl ConvoyViews {
             })
             .await?;
         held.cursors = Some(cursors);
-        let Some(mut launches) = launches.map_err(ResourceError::other)? else { return self.refill(held).await };
+        let Some(launches) = launches.map_err(ResourceError::other)? else { return self.refill(held).await };
+        held.owed.extend(launches);
         let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
         loop {
             match held.notes.try_recv() {
-                Ok(name) => drop(launches.insert((here.clone(), name))),
+                Ok(name) => drop(held.owed.insert((here.clone(), name))),
                 Err(TryRecvError::Lagged(_)) => return self.refill(held).await,
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
         }
-        self.recompose(held, launches.into_iter().collect()).await
+        self.recompose(held).await
     }
 
-    /// Composes `launches` again from their records; one with no record leaves the views.
-    async fn recompose(&self, held: &mut HeldViews, launches: Vec<(String, String)>) -> Result<(), ResourceError> {
-        for (home, name) in launches {
+    /// Composes the launches owed again from their records; one with no record leaves the views.
+    /// Each stays owed until its view is held.
+    async fn recompose(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
+        if held.refill_owed {
+            return self.refill(held).await;
+        }
+        while let Some((home, name)) = held.owed.first().cloned() {
             let (key_home, key_name) = (home.clone(), name.clone());
             let record = self.blocking(move |reads| reads.convoys()?.get(&key_name, Some(&key_home))).await?;
-            held.remove(&(home.clone(), name.clone()));
-            if let Some(record) = record {
-                let composed = self.compose(vec![record]).await?;
+            let composed = match record {
+                Some(record) => Some(self.compose(vec![record]).await?),
+                None => None,
+            };
+            let key = (home, name);
+            held.remove(&key);
+            if let Some(composed) = composed {
                 held.insert(composed);
             }
+            held.owed.remove(&key);
         }
         Ok(())
     }
 
-    /// Reads every launch again.
+    /// Reads every launch again. Until it has, the whole views are owed.
     async fn refill(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
+        held.refill_owed = true;
         let records = self.blocking(|reads| reads.convoys()?.every()).await?;
         let composed = self.compose(records).await?;
         held.views.clear();
         held.insert(composed);
+        held.owed.clear();
+        held.refill_owed = false;
         Ok(())
     }
 

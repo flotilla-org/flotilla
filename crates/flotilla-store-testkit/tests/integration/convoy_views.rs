@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Condvar, Mutex,
     },
     time::Duration,
 };
@@ -129,11 +129,47 @@ impl<C> ChangeCursor<C> for Unchanging {
     }
 }
 
+/// A cursor that passes the changes a test writes into it, each once.
+struct Written(Arc<Mutex<Vec<ConvoyChange>>>);
+
+impl ChangeCursor<ConvoyChange> for Written {
+    fn pass(&mut self) -> Result<Vec<ConvoyChange>, String> {
+        Ok(std::mem::take(&mut *self.0.lock().expect("written changes")))
+    }
+}
+
 struct Convoys {
-    records: Vec<ConvoyRecord>,
+    records: Mutex<Vec<ConvoyRecord>>,
     memory: ConvoyMemory,
     /// How many times a launch's record was read.
     read: AtomicUsize,
+    /// The changes the cursor passes next; no follower is told of them, so only a read finds them.
+    written: Arc<Mutex<Vec<ConvoyChange>>>,
+    /// While closed, a launch's record read waits, after it tells `reading`.
+    gate: (Mutex<bool>, Condvar),
+    reading: tokio::sync::Notify,
+}
+
+impl Convoys {
+    fn new(records: Vec<ConvoyRecord>) -> Self {
+        Self {
+            records: Mutex::new(records),
+            memory: ConvoyMemory::default(),
+            read: AtomicUsize::new(0),
+            written: Arc::default(),
+            gate: (Mutex::new(false), Condvar::new()),
+            reading: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn records(&self) -> Vec<ConvoyRecord> {
+        self.records.lock().expect("records").clone()
+    }
+
+    fn set_gate(&self, closed: bool) {
+        *self.gate.0.lock().expect("gate") = closed;
+        self.gate.1.notify_all();
+    }
 }
 
 impl ConvoyRecords for Convoys {
@@ -142,25 +178,29 @@ impl ConvoyRecords for Convoys {
     }
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
         self.read.fetch_add(1, Ordering::SeqCst);
+        self.reading.notify_one();
+        let closed = self.gate.0.lock().expect("gate");
+        drop(self.gate.1.wait_while(closed, |closed| *closed).expect("gate"));
         let home = home.unwrap_or(HERE);
-        Ok(self.records.iter().find(|record| record.name == name && record.home == home).cloned())
+        Ok(self.records().into_iter().find(|record| record.name == name && record.home == home))
     }
     fn newest(&self, of: &str, _project: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
         let home = home.unwrap_or(HERE);
-        Ok(self.records.iter().filter(|record| record.launch_of == of && record.home == home).max_by_key(|record| record.launch).cloned())
+        Ok(self.records().into_iter().filter(|record| record.launch_of == of && record.home == home).max_by_key(|record| record.launch))
     }
     fn at(&self, home: &str) -> Result<Vec<ConvoyRecord>, String> {
-        Ok(self.records.iter().filter(|record| record.home == home).cloned().collect())
+        Ok(self.records().into_iter().filter(|record| record.home == home).collect())
     }
     fn every(&self) -> Result<Vec<ConvoyRecord>, String> {
-        self.read.fetch_add(self.records.len(), Ordering::SeqCst);
-        Ok(self.records.clone())
+        let records = self.records();
+        self.read.fetch_add(records.len(), Ordering::SeqCst);
+        Ok(records)
     }
     fn memory(&self) -> &ConvoyMemory {
         &self.memory
     }
     fn cursor(&self) -> Option<Box<dyn ChangeCursor<ConvoyChange>>> {
-        Some(Box::new(Unchanging))
+        Some(Box::new(Written(Arc::clone(&self.written))))
     }
 }
 
@@ -287,11 +327,7 @@ impl LifecycleReads for Reads {
 async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
     let vessel = ready_vessel("fix-it#1", "work");
     let reads = Arc::new(Reads {
-        convoys: Convoys {
-            records: vec![launch("fix-it#1", HERE), launch("other#1", "home-b")],
-            memory: ConvoyMemory::default(),
-            read: AtomicUsize::new(0),
-        },
+        convoys: Convoys::new(vec![launch("fix-it#1", HERE), launch("other#1", "home-b")]),
         terminals: Terminals {
             records: vec![
                 session(&vessel.name, "coder", LifecycleReading::Ready { identity: "s1".into() }),
@@ -343,7 +379,7 @@ async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
 #[tokio::test]
 async fn the_views_refuse_writes() {
     let reads = Arc::new(Reads {
-        convoys: Convoys { records: vec![launch("fix-it#1", HERE)], memory: ConvoyMemory::default(), read: AtomicUsize::new(0) },
+        convoys: Convoys::new(vec![launch("fix-it#1", HERE)]),
         terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
         vessels: Vessels { records: Vec::new() },
     });
@@ -353,4 +389,33 @@ async fn the_views_refuse_writes() {
     assert!(views.set_status("Convoy", "fix-it#1", serde_json::Value::Null).await.is_err());
     assert!(views.delete("Convoy", "fix-it#1").await.is_err());
     assert_eq!(EngineRecords::list(&views, "Convoy").await.expect("list").len(), 1);
+}
+
+// Behaviour: a read dropped while it composes a changed launch again leaves that launch owed. The
+// cursor has passed the change and will not name it again, so the next read composes it.
+#[tokio::test]
+async fn a_dropped_read_leaves_its_changes_for_the_next() {
+    let reads = Arc::new(Reads {
+        convoys: Convoys::new(vec![launch("fix-it#1", HERE)]),
+        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
+        vessels: Vessels { records: Vec::new() },
+    });
+    let views = ConvoyViews::new("flotilla", reads.clone());
+    views.get("fix-it#1").await.expect("held");
+
+    // The launch's record goes and the cursor names it; a read starts composing it and waits.
+    reads.convoys.set_gate(true);
+    reads.convoys.records.lock().expect("records").clear();
+    reads.convoys.written.lock().expect("written").push(ConvoyChange::Changed { name: "fix-it#1".into(), home: HERE.into() });
+    let reading = reads.convoys.reading.notified();
+    let dropped = tokio::spawn({
+        let views = views.clone();
+        async move { views.get("fix-it#1").await.map(drop) }
+    });
+    reading.await;
+    dropped.abort();
+    assert!(dropped.await.expect_err("dropped").is_cancelled());
+    reads.convoys.set_gate(false);
+
+    assert!(views.get("fix-it#1").await.is_err(), "the next read composes the launch the dropped one owed");
 }
