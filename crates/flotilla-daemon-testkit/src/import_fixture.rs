@@ -50,7 +50,7 @@ pub fn artifact(name: &str) -> Value {
         "Artifact",
         name,
         json!({"convoy": "demo", "producer": "coder", "kind": "brief", "subject": "demo", "summary": {"charter_commit": "abc"},
-            "digest": "ef37", "size": 1, "media_type": "text/markdown", "expires_at": "2026-11-19T00:00:00Z"}),
+            "digest": "ef37".repeat(16), "size": 1, "media_type": "text/markdown", "expires_at": "2026-11-19T00:00:00Z"}),
         Value::Null,
     )
 }

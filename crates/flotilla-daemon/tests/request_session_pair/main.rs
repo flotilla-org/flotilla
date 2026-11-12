@@ -394,7 +394,7 @@ fn sample_record(name: &str) -> (InputMeta, ArtifactSpec) {
         .producer("sample".to_string())
         .kind("note".to_string())
         .subject("a record replication follows".to_string())
-        .digest(format!("sha256:{}", "0".repeat(64)))
+        .digest("0".repeat(64))
         .size(0)
         .media_type("text/plain".to_string())
         .expires_at(at + chrono::Duration::days(365 * 1000))

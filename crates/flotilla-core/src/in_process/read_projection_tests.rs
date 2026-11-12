@@ -1311,7 +1311,7 @@ mod tests {
                         .kind("decision-ledger".into())
                         .subject(subject.into())
                         .summary(summary.clone())
-                        .digest("ledger".into())
+                        .digest(flotilla_resources::artifact::blob_digest_of(b"ledger"))
                         .size(1)
                         .media_type("text/markdown".into())
                         .expires_at(Utc::now() + ChronoDuration::days(1))
@@ -1351,7 +1351,7 @@ mod tests {
                 .producer("coder".into())
                 .kind("decision-ledger".into())
                 .subject("claimed".into())
-                .digest(if matching { "admitted" } else { "later-body" }.into())
+                .digest(flotilla_resources::artifact::blob_digest_of(if matching { "admitted" } else { "later-body" }.as_bytes()))
                 .size(1)
                 .media_type("text/markdown".into())
                 .expires_at(at + ChronoDuration::days(1))
@@ -1371,7 +1371,7 @@ mod tests {
             replica.object.spec.summary.insert("comment_url".into(), serde_json::json!("https://example.test/replica"));
             let artifacts = if replica_first { vec![replica, local] } else { vec![local, replica] };
             let mut claim = CrewWorkState::builder().phase(CrewWorkPhase::HandedBack).finished_at(at).build();
-            claim.decision_ledger_digest = known_digest.then(|| "admitted".into());
+            claim.decision_ledger_digest = known_digest.then(|| flotilla_resources::artifact::blob_digest_of(b"admitted"));
             let status = ConvoyStatus {
                 crew_work: BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), claim)]))]),
                 ..Default::default()

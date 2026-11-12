@@ -18,6 +18,13 @@ impl Resource for Artifact {
     const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name", "spec.convoy"];
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::HomeBoundRuntime;
 
+    fn validate_spec(_meta: &crate::InputMeta, spec: &ArtifactSpec) -> Result<(), ResourceError> {
+        if !is_blob_digest(&spec.digest) {
+            return Err(ResourceError::invalid(format!("artifact digest `{}` is not {BLOB_DIGEST_RULE}", spec.digest)));
+        }
+        Ok(())
+    }
+
     fn validate_spec_update(current: &ArtifactSpec, requested: &ArtifactSpec) -> Result<(), ResourceError> {
         validate_artifact_update(current, requested)
     }
@@ -48,6 +55,20 @@ impl StatusPatch<ArtifactStatus> for ArtifactStatusPatch {
     fn apply(&self, _: &mut ArtifactStatus) {
         match *self {}
     }
+}
+
+/// What a blob digest is, as a refusal names it.
+pub const BLOB_DIGEST_RULE: &str = "64 lowercase SHA-256 hex digits";
+
+/// The digest naming blob `bytes` by its content.
+pub fn blob_digest_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Whether `value` names a blob by its content: [`BLOB_DIGEST_RULE`].
+pub fn is_blob_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn validate_artifact_update(current: &ArtifactSpec, requested: &ArtifactSpec) -> Result<(), ResourceError> {
@@ -99,5 +120,26 @@ mod tests {
         });
         let decoded: ArtifactSpec = serde_json::from_value(old).expect("previous artifact spec");
         assert!(decoded.recorded_at.is_none());
+    }
+
+    #[test]
+    fn an_artifact_names_its_body_by_a_blob_digest() {
+        let spec = |digest: &str| {
+            ArtifactSpec::builder()
+                .convoy("demo".into())
+                .producer("coder".into())
+                .kind("decision-ledger".into())
+                .subject("demo".into())
+                .digest(digest.into())
+                .size(1)
+                .media_type("text/markdown".into())
+                .expires_at(Utc::now())
+                .build()
+        };
+        let meta = crate::InputMeta::builder().name("ledger".into()).build();
+        Artifact::validate_spec(&meta, &spec(&"a1".repeat(32))).expect("a SHA-256 hex digest");
+        for refused in ["dummy-script-finished", &"A1".repeat(32), &"a1".repeat(31), ""] {
+            assert!(Artifact::validate_spec(&meta, &spec(refused)).is_err(), "{refused:?}");
+        }
     }
 }

@@ -100,6 +100,9 @@ pub(super) async fn run_artifact_gc(backend: ResourceBackend, namespace: String,
         let service = crate::artifact::ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
         let collected = match service.reap_expired().await {
             Ok(reaped) => {
+                if !reaped.unreadable.is_empty() {
+                    warn!(skipped = reaped.unreadable.len(), "artifact retention skipped artifacts naming no blob");
+                }
                 let expires_in = reaped.next_expiry.map(|at| (at - Utc::now()).to_std().unwrap_or_default());
                 blobs.gc_unreferenced(&reaped.referenced, BLOB_GRACE).await.map(|grace| expires_in.into_iter().chain(grace).min())
             }

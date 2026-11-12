@@ -142,7 +142,7 @@ async fn prless_decision_ledger_promise_settles_without_a_claim() {
                     .producer(producer.into())
                     .kind("decision-ledger".into())
                     .subject(launch.clone())
-                    .digest("ledger".into())
+                    .digest(flotilla_resources::artifact::blob_digest_of(b"ledger"))
                     .size(1)
                     .media_type("text/markdown".into())
                     .expires_at(Utc::now() + chrono::Duration::days(1))

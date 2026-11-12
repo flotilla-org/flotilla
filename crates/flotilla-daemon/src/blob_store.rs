@@ -14,6 +14,7 @@ use flotilla_protocol::BlobSyncStatus;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::HttpClient;
 use flotilla_provider_runtime::ReqwestHttpClient;
+use flotilla_resources::artifact::{blob_digest_of, is_blob_digest, BLOB_DIGEST_RULE};
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -26,11 +27,11 @@ pub struct BlobDigest(String);
 
 impl BlobDigest {
     pub fn of(bytes: &[u8]) -> Self {
-        Self(format!("{:x}", Sha256::digest(bytes)))
+        Self(blob_digest_of(bytes))
     }
     pub fn parse(value: &str) -> Result<Self, String> {
-        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
-            return Err("blob digest must be 64 lowercase SHA-256 hex digits".into());
+        if !is_blob_digest(value) {
+            return Err(format!("blob digest must be {BLOB_DIGEST_RULE}"));
         }
         Ok(Self(value.to_string()))
     }

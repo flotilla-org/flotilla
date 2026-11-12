@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_resources::{
     address::{artifact_address, record_name},
+    artifact::blob_digest_of,
     convoy::engine::{Actor, EngineConvoyPath, EngineConvoys, OldPromises, VerdictScope},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState},
     Artifact, ArtifactSpec, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta,
@@ -161,7 +162,7 @@ async fn ledger_convoy(backend: &ResourceBackend) -> ResourceObject<Convoy> {
                 .producer("coder".to_string())
                 .kind("decision-ledger".to_string())
                 .subject("c".to_string())
-                .digest("sha256:test".to_string())
+                .digest(blob_digest_of(b"ledger"))
                 .size(1)
                 .media_type("text/markdown".to_string())
                 .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
@@ -486,7 +487,7 @@ async fn evidence_changes_wake_the_open_convoys() {
                 .producer("coder".to_string())
                 .kind("decision-ledger".to_string())
                 .subject("open".to_string())
-                .digest("sha256:test".to_string())
+                .digest(blob_digest_of(b"ledger"))
                 .size(1)
                 .media_type("text/markdown".to_string())
                 .expires_at(chrono::Utc::now() + chrono::Duration::days(1))

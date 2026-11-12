@@ -1321,7 +1321,10 @@ async fn artifact_rounds_at_one_head_hold_until_the_head_moves() {
     round("bbb", 6).await;
     assert_eq!((delivered(), holds()), (4, 1));
     assert_eq!(held(&convoys.get(launch).await.expect("convoy").status.expect("status")), (false, false));
-    assert_eq!(actuator.requests.lock().expect("requests").last().expect("new head turn").subject_revision, "bbb@round-6");
+    assert_eq!(
+        actuator.requests.lock().expect("requests").last().expect("new head turn").subject_revision,
+        format!("bbb@{}", flotilla_resources::artifact::blob_digest_of(b"round-6"))
+    );
 }
 
 async fn observe_review_head(backend: &ResourceBackend, head: &str) {
@@ -1365,7 +1368,7 @@ async fn publish_review_round(
         .kind("review-round".into())
         .subject(head.into())
         .summary(BTreeMap::from([("disposition".into(), serde_json::json!("changes-requested"))]))
-        .digest(format!("round-{round}"))
+        .digest(flotilla_resources::artifact::blob_digest_of(format!("round-{round}").as_bytes()))
         .size(1)
         .media_type("text/markdown".into())
         .recorded_at(claim_at + chrono::Duration::seconds(1))

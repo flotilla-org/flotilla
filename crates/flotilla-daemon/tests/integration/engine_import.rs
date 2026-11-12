@@ -128,7 +128,7 @@ impl Host {
 }
 
 fn artifact(name: &str) -> Value {
-    json!({"convoy": "demo", "producer": "coder", "kind": "brief", "subject": name, "summary": {}, "digest": "ef37", "size": 1,
+    json!({"convoy": "demo", "producer": "coder", "kind": "brief", "subject": name, "summary": {}, "digest": "ef37".repeat(16), "size": 1,
         "media_type": "text/markdown", "expires_at": "2026-11-19T00:00:00Z"})
 }
 

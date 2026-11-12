@@ -3104,7 +3104,7 @@ fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
                             .producer("coder".into())
                             .kind("decision-ledger".into())
                             .subject("inbox".into())
-                            .digest("digest".into())
+                            .digest(flotilla_resources::artifact::blob_digest_of(b"ledger"))
                             .size(1)
                             .media_type("text/markdown".into())
                             .recorded_at(at)

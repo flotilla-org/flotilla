@@ -65,7 +65,7 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
                         .producer("other".into())
                         .kind("explainer".into())
                         .subject("other".into())
-                        .digest("digest".into())
+                        .digest(flotilla_resources::artifact::blob_digest_of(b"unrelated"))
                         .size(0)
                         .media_type("text/markdown".into())
                         .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
@@ -179,7 +179,7 @@ async fn completion_advisory_does_not_write_claim_evidence() {
                 .producer("coder".into())
                 .kind("decision-ledger".into())
                 .subject(launch.into())
-                .digest("local-digest".into())
+                .digest(flotilla_resources::artifact::blob_digest_of(b"local"))
                 .size(0)
                 .media_type("text/markdown".into())
                 .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
@@ -188,7 +188,7 @@ async fn completion_advisory_does_not_write_claim_evidence() {
         .await
         .expect("local artifact");
     let mut replica = local;
-    replica.spec.digest = "replica-digest".into();
+    replica.spec.digest = flotilla_resources::artifact::blob_digest_of(b"replica");
     backend
         .replace_replicas_typed::<flotilla_resources::Artifact>(
             &flotilla_protocol::NodeId::new("remote"),

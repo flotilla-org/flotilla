@@ -17,6 +17,7 @@ use flotilla_resources::{
     TerminalSession, TerminalSessionSource,
 };
 use flotilla_store::ResourceBackend;
+use tracing::warn;
 
 use crate::blob_store::{BlobDigest, BlobStore, TieredBlobStore};
 
@@ -337,15 +338,30 @@ impl ArtifactService<'_> {
                 next_expiry = next_expiry.min(Some(artifact.spec.expires_at)).or(Some(artifact.spec.expires_at));
             }
         }
-        let refs = self.list(None, None, None).await?;
-        let referenced = refs.into_iter().map(|item| BlobDigest::parse(&item.spec.digest)).collect::<Result<_, _>>()?;
-        Ok(Reaped { referenced, next_expiry })
+        // A record stored before artifacts were refused a non-digest, here or at another home,
+        // names no blob: it is reported and the rest are still collected.
+        let mut referenced = HashSet::new();
+        let mut unreadable = Vec::new();
+        for item in self.list(None, None, None).await? {
+            match BlobDigest::parse(&item.spec.digest) {
+                Ok(digest) => {
+                    referenced.insert(digest);
+                }
+                Err(error) => {
+                    warn!(artifact = %item.metadata.name, %error, "artifact retention skips an artifact whose digest names no blob");
+                    unreadable.push(item.metadata.name);
+                }
+            }
+        }
+        Ok(Reaped { referenced, unreadable, next_expiry })
     }
 }
 
-/// What a reap left: the digests still referenced, and when the next unpinned artifact expires.
+/// What a reap left: the digests still referenced, the artifacts whose digest names no blob, and
+/// when the next unpinned artifact expires.
 pub struct Reaped {
     pub referenced: HashSet<BlobDigest>,
+    pub unreadable: Vec<String>,
     pub next_expiry: Option<chrono::DateTime<Utc>>,
 }
 
@@ -577,6 +593,69 @@ mod tests {
         resolver.create(&InputMeta::builder().name(pinned_name).build(), &expired).await.expect("create pinned artifact");
         assert_eq!(service.reap_expired().await.expect("reap pinned").referenced.len(), 1);
         assert_eq!(service.list(None, None, None).await.expect("list pinned").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retention_reports_an_artifact_naming_no_blob_and_collects_the_rest() {
+        let namespace = "flotilla";
+        let state = tempfile::tempdir().expect("blob state");
+        let blobs = TieredBlobStore::new(state.path(), Vec::new());
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("this-home"));
+        let spec = |subject: &str, digest: String| {
+            ArtifactSpec::builder()
+                .convoy("demo".into())
+                .producer("coder".into())
+                .kind("review-round".into())
+                .subject(subject.into())
+                .digest(digest)
+                .size(4)
+                .media_type("text/plain".into())
+                .expires_at(Utc::now() - Duration::days(1))
+                .build()
+        };
+        let name = |subject: &str| {
+            flotilla_resources::address::record_name(
+                &flotilla_resources::address::artifact_address("demo", "coder", "review-round", subject).expect("artifact address"),
+            )
+            .expect("record name")
+        };
+        let digest = blobs.put(b"body").await.expect("store the expired artifact's body");
+        backend
+            .using::<Artifact>(namespace)
+            .create(&InputMeta::builder().name(name("expired")).build(), &spec("expired", digest.as_str().to_owned()))
+            .await
+            .expect("expired artifact");
+        // Stored at another home before a non-digest was refused.
+        let mut stale = spec("stale", "dummy-script-finished".into());
+        stale.expires_at = Utc::now() + Duration::days(1);
+        let object = ResourceObject {
+            metadata: flotilla_resources::ObjectMeta {
+                name: name("stale"),
+                namespace: namespace.into(),
+                resource_version: "1".into(),
+                labels: Default::default(),
+                annotations: Default::default(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: Utc::now(),
+                merge: None,
+            },
+            spec: stale,
+            status: None,
+        };
+        backend
+            .replica_writer::<Artifact>(flotilla_protocol::NodeId::new("other-home"), namespace)
+            .apply(flotilla_resources::WatchEvent::Added(object), Utc::now())
+            .await
+            .expect("replicate the stale artifact");
+        let service = ArtifactService { backend: &backend, blobs: &blobs, namespace };
+
+        let reaped = service.reap_expired().await.expect("a sweep past an artifact naming no blob");
+        assert_eq!(reaped.unreadable, vec![name("stale")]);
+        assert!(reaped.referenced.is_empty());
+        blobs.gc_unreferenced(&reaped.referenced, std::time::Duration::ZERO).await.expect("collect");
+        assert!(!blobs.has(&digest).await.expect("blob lookup"), "the expired artifact's blob is collected");
     }
 
     #[tokio::test]

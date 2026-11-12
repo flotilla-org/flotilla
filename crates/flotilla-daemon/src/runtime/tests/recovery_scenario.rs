@@ -231,7 +231,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
                     "comment_url".to_string(),
                     serde_json::json!("https://github.com/flotilla-org/flotilla/pull/1875#issuecomment-coder"),
                 )]))
-                .digest("test-ledger-digest".to_string())
+                .digest(flotilla_resources::artifact::blob_digest_of(b"ledger"))
                 .size(1)
                 .media_type("text/markdown".to_string())
                 .expires_at(Utc::now() + chrono::Duration::days(1))
@@ -490,7 +490,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     let ledgers = backend.using::<flotilla_resources::Artifact>(NAMESPACE);
     let prior_ledger = ledgers.get(&ledger_name).await.expect("coder ledger");
     let mut revised_ledger = prior_ledger.spec.clone();
-    revised_ledger.digest = "test-ledger-revision".to_string();
+    revised_ledger.digest = flotilla_resources::artifact::blob_digest_of(b"test-ledger-revision");
     revised_ledger
         .summary
         .insert("comment_url".to_string(), serde_json::json!("https://github.com/flotilla-org/flotilla/pull/1875#issuecomment-recomplete"));

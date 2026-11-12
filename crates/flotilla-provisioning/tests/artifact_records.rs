@@ -34,12 +34,15 @@ async fn contract(backend: &ResourceBackend) {
     let artifacts = backend.using::<Artifact>(NS);
     let mut watch = watch_resource_kind_including_replicas(backend, NS, "Artifact").await.expect("watch");
 
+    // Each body's digest, as a put names it.
+    let [one, two, three, four] = ["1", "2", "3", "4"].map(|digit| digit.repeat(64));
+
     // A put creates the slot's record; every read finds it with its spec.
-    let created = artifacts.create(&InputMeta::builder().name("ledger".into()).build(), &spec("demo", "one")).await.expect("put");
-    artifacts.create(&InputMeta::builder().name("other".into()).build(), &spec("elsewhere", "two")).await.expect("put another");
+    let created = artifacts.create(&InputMeta::builder().name("ledger".into()).build(), &spec("demo", &one)).await.expect("put");
+    artifacts.create(&InputMeta::builder().name("other".into()).build(), &spec("elsewhere", &two)).await.expect("put another");
     tokio::time::timeout(Duration::from_secs(10), watch.stream.next()).await.expect("a watch event").expect("open").expect("event");
     let read = backend.including_replicas::<Artifact>(NS).get("ledger").await.expect("read").object;
-    assert_eq!(read.spec, spec("demo", "one"));
+    assert_eq!(read.spec, spec("demo", &one));
 
     // A convoy's artifacts are found by its name.
     let query = StoreQuery { fields: BTreeMap::from([("spec.convoy".into(), "demo".into())]), ..Default::default() };
@@ -47,16 +50,13 @@ async fn contract(backend: &ResourceBackend) {
     assert_eq!(found.items.iter().map(|item| item.object.metadata.name.as_str()).collect::<Vec<_>>(), ["ledger"]);
 
     // A later put publishes the latest body at the same address.
-    let replaced = artifacts.update(&InputMeta::from(&created.metadata), &created.metadata.resource_version, &spec("demo", "three")).await;
+    let replaced = artifacts.update(&InputMeta::from(&created.metadata), &created.metadata.resource_version, &spec("demo", &three)).await;
     let replaced = replaced.expect("replace");
-    assert_eq!(artifacts.get("ledger").await.expect("get").spec.digest, "three");
+    assert_eq!(artifacts.get("ledger").await.expect("get").spec.digest, three);
 
     // A put at a version that moved on, or one that changes the address, is refused.
-    assert!(artifacts
-        .update(&InputMeta::from(&created.metadata), &created.metadata.resource_version, &spec("demo", "four"))
-        .await
-        .is_err());
-    let mut moved = spec("demo", "four");
+    assert!(artifacts.update(&InputMeta::from(&created.metadata), &created.metadata.resource_version, &spec("demo", &four)).await.is_err());
+    let mut moved = spec("demo", &four);
     moved.subject = "another".into();
     assert!(artifacts.update(&InputMeta::from(&replaced.metadata), &replaced.metadata.resource_version, &moved).await.is_err());
 

@@ -428,6 +428,8 @@ impl Crew {
             self.fleet.count(Counter::CrewsCompleted);
             self.script_finished = true;
         }
+        // The envelope names its ledger by digest, as a real crew's does; the body itself is not stored.
+        let ledger = format!("## Decision ledger\n- {} finished its script\n", self.identity.role);
         self.persist(CommandAction::ResourceApply {
             namespace: self.identity.namespace.clone(),
             document: serde_json::json!({
@@ -435,7 +437,8 @@ impl Crew {
                 "spec": {
                     "convoy": self.identity.convoy, "producer": self.identity.role,
                     "kind": "decision-ledger", "subject": self.identity.convoy,
-                    "digest": "dummy-script-finished", "size": 0, "media_type": "text/markdown",
+                    "digest": flotilla_resources::artifact::blob_digest_of(ledger.as_bytes()),
+                    "size": ledger.len(), "media_type": "text/markdown",
                     "expires_at": chrono::Utc::now() + chrono::Duration::days(1),
                 }
             }),
