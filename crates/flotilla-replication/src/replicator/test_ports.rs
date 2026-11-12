@@ -50,7 +50,6 @@ impl ReplicationHealth for RecordingHealth {
 #[derive(Default)]
 pub(super) struct InMemoryPeers {
     peers: Mutex<Vec<(PathBuf, ResourceBackend)>>,
-    pub(super) connections: Mutex<Vec<PathBuf>>,
 }
 
 impl InMemoryPeers {
@@ -61,7 +60,6 @@ impl InMemoryPeers {
 
 impl DirectPeerConnector for InMemoryPeers {
     fn connect(&self, socket: &Path) -> Result<ResourceBackend, String> {
-        self.connections.lock().expect("connections").push(socket.to_path_buf());
         let peers = self.peers.lock().expect("peers");
         let (_, store) = peers.iter().find(|(path, _)| path == socket).ok_or_else(|| format!("no peer at {}", socket.display()))?;
         Ok(store.clone())

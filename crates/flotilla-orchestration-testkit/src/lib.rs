@@ -128,9 +128,6 @@ async fn assert_independent_placement_snapshots(factory: &dyn EnsureScenarioCont
             .await
             .expect("exchange placement snapshots");
     }
-    for store in [&first_store, &second_store] {
-        assert!(flotilla_store::home_bound_authorship_collisions(store, "flotilla").await.expect("diagnostics").is_empty());
-    }
     // A remote reference may still be in flight when the first origin releases
     // its convoy. The second admission must retain its own frozen placement.
     let first_convoy = first_store.using::<ResourceConvoy>("flotilla").list().await.expect("first convoys").items.remove(0);

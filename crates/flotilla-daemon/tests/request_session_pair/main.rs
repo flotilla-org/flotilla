@@ -81,7 +81,7 @@ use flotilla_resources::{
     WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, ROLE_LABEL,
 };
 use flotilla_store::off_frame;
-use flotilla_store::{controller::ControllerLoop, list_resource_kind, old_store_resource_kinds, ResourceBackend};
+use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use hegel::generators as gs;
 
 // A convoy's checkouts are the engine's, released at their home when the convoy ends (#3108):
@@ -383,26 +383,6 @@ where
     .unwrap_or_else(|_| panic!("{failure_message}"));
 }
 
-async fn assert_no_orphaned_finalizers(hosts: &[Arc<InProcessDaemon>]) {
-    for (host_index, host) in hosts.iter().enumerate() {
-        let backend = host.resource_backend();
-        for kind in old_store_resource_kinds() {
-            let listed = list_resource_kind(&backend, "flotilla", kind.plural).await.expect("list registered kind");
-            for item in listed.value["items"].as_array().expect("resource list items") {
-                let metadata = &item["metadata"];
-                let deleting = !metadata["deletionTimestamp"].is_null();
-                let finalizers = metadata["finalizers"].as_array();
-                assert!(
-                    !deleting || finalizers.is_none_or(Vec::is_empty),
-                    "orphaned finalizers on host {host_index}, {} {}: {metadata}",
-                    kind.kind,
-                    metadata["name"],
-                );
-            }
-        }
-    }
-}
-
 /// The home-bound kind the replication scenarios author to follow one record, and its deletion,
 /// through the router. Artifact is written at its home on the engine and reaches the other homes
 /// by log following.
@@ -591,7 +571,6 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
         trace.push(format!("remaining-convoys={}", remaining.items.len()));
     }
     wait_for_host_resource_visibility(&mesh.hosts, "pair-resource", false).await;
-    assert_no_orphaned_finalizers(&mesh.hosts).await;
     trace
 }
 
@@ -793,7 +772,6 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
             }
             wait_for_host_resource_visibility(&hosts, &step_name, false).await;
             wait_for_host_resource_visibility(&hosts, name, false).await;
-            assert_no_orphaned_finalizers(&hosts).await;
         }
         drop(mesh);
     })
@@ -946,7 +924,6 @@ async fn forced_convoy_teardown_from_another_host_finalizes_at_its_home() {
         convoy_phase(&mesh.hosts[0], convoy_name).await == Some(ResourceConvoyPhase::Abandoned)
     })
     .await;
-    assert_no_orphaned_finalizers(&mesh.hosts).await;
 }
 
 async fn codex_version_admission_row(issuer_index: usize, minor: u32) {
@@ -1186,7 +1163,6 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
             placement.resource_backend().using::<Sample>("flotilla").get(resource_name).await,
             Err(ResourceError::NotFound { .. })
         ));
-        assert_no_orphaned_finalizers(&mesh.hosts).await;
     })
 }
 

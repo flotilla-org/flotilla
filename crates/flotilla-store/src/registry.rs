@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use chrono::Utc;
 use flotilla_protocol::NodeId;
@@ -14,7 +14,7 @@ use crate::{
     CredentialGrant, CredentialSpec, CrewDefaults, Environment, FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild, ImageLayer,
     InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project, ReadResourceList, ReadWatchEvent, ReplicaCursor,
     ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
-    TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
 };
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
@@ -84,15 +84,6 @@ pub struct DynamicResourceDelete {
     pub already_deleted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
-pub struct HomeBoundAuthorshipCollision {
-    pub kind: String,
-    pub namespace: String,
-    pub name: String,
-    pub local_root: NodeId,
-    pub replica_root: NodeId,
-}
-
 #[derive(bon::Builder)]
 pub struct DynamicResourceWatch {
     pub kind: String,
@@ -105,45 +96,45 @@ pub struct DynamicResourceWatch {
 }
 
 pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
-    kind::<Artifact>(RegisteredResource::Artifact, &[]),
-    kind::<ChangeRequest>(RegisteredResource::ChangeRequest, &["cr", "change_request", "change-request"]),
-    kind::<Issue>(RegisteredResource::Issue, &[]),
+    engine_kind::<Artifact>(RegisteredResource::Artifact, &[]),
+    engine_kind::<ChangeRequest>(RegisteredResource::ChangeRequest, &["cr", "change_request", "change-request"]),
+    engine_kind::<Issue>(RegisteredResource::Issue, &[]),
     engine_kind::<Checkout>(RegisteredResource::Checkout, &[]),
     engine_kind::<CloneResource>(RegisteredResource::Clone, &[]),
     engine_kind::<Convoy>(RegisteredResource::Convoy, &[]),
-    kind::<ConvoyEnsure>(RegisteredResource::ConvoyEnsure, &["convoyensure", "convoy_ensure", "convoy-ensure"]),
-    kind::<CredentialGrant>(
+    engine_kind::<ConvoyEnsure>(RegisteredResource::ConvoyEnsure, &["convoyensure", "convoy_ensure", "convoy-ensure"]),
+    engine_kind::<CredentialGrant>(
         RegisteredResource::CredentialGrant,
         &["credentialgrant", "credential_grant", "credential_grants", "credential-grant", "credential-grants"],
     ),
-    kind::<CredentialSpec>(
+    engine_kind::<CredentialSpec>(
         RegisteredResource::CredentialSpec,
         &["credentialspec", "credential_spec", "credential_specs", "credential-spec", "credential-specs"],
     ),
-    kind::<CrewDefaults>(RegisteredResource::CrewDefaults, &["crew-defaults"]),
+    engine_kind::<CrewDefaults>(RegisteredResource::CrewDefaults, &["crew-defaults"]),
     engine_kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
-    kind::<ImageLayer>(RegisteredResource::ImageLayer, &["image-layer"]),
-    kind::<AccountBinding>(RegisteredResource::AccountBinding, &["account-binding"]),
-    kind::<AccountProvision>(RegisteredResource::AccountProvision, &["account-provision"]),
-    kind::<AccessDelivery>(RegisteredResource::AccessDelivery, &["access-delivery"]),
+    engine_kind::<ImageLayer>(RegisteredResource::ImageLayer, &["image-layer"]),
+    engine_kind::<AccountBinding>(RegisteredResource::AccountBinding, &["account-binding"]),
+    engine_kind::<AccountProvision>(RegisteredResource::AccountProvision, &["account-provision"]),
+    engine_kind::<AccessDelivery>(RegisteredResource::AccessDelivery, &["access-delivery"]),
     engine_kind::<Environment>(RegisteredResource::Environment, &[]),
-    kind::<FleetDesignation>(RegisteredResource::FleetDesignation, &["fleet-designation"]),
-    kind::<Forge>(RegisteredResource::Forge, &[]),
-    kind::<FulfilmentKind>(
+    engine_kind::<FleetDesignation>(RegisteredResource::FleetDesignation, &["fleet-designation"]),
+    engine_kind::<Forge>(RegisteredResource::Forge, &[]),
+    engine_kind::<FulfilmentKind>(
         RegisteredResource::FulfilmentKind,
         &["fulfilmentkind", "fulfilment_kind", "fulfilment_kinds", "fulfilment-kind", "fulfilment-kinds"],
     ),
-    kind::<Host>(RegisteredResource::Host, &[]),
-    kind::<ManifestRoot>(RegisteredResource::ManifestRoot, &["manifest-root", "manifest_root"]),
+    engine_kind::<Host>(RegisteredResource::Host, &[]),
+    engine_kind::<ManifestRoot>(RegisteredResource::ManifestRoot, &["manifest-root", "manifest_root"]),
     engine_kind::<Message>(RegisteredResource::Message, &[]),
-    kind::<Project>(RegisteredResource::Project, &[]),
-    kind::<Repository>(RegisteredResource::Repository, &[]),
+    engine_kind::<Project>(RegisteredResource::Project, &[]),
+    engine_kind::<Repository>(RegisteredResource::Repository, &[]),
     engine_kind::<TerminalSession>(
         RegisteredResource::TerminalSession,
         &["terminalsession", "terminal_session", "terminal_sessions", "terminal-session", "terminal-sessions"],
     ),
     engine_kind::<Vessel>(RegisteredResource::Vessel, &[]),
-    kind::<WorkflowTemplate>(
+    engine_kind::<WorkflowTemplate>(
         RegisteredResource::WorkflowTemplate,
         &["workflowtemplate", "workflow_template", "workflow_templates", "workflow-template", "workflow-templates"],
     ),
@@ -483,83 +474,6 @@ pub async fn replica_cursor_for_resource_kind(
     origin_root: &NodeId,
 ) -> Result<Option<ReplicaCursor>, ResourceError> {
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, replica_cursor_typed(backend, namespace, origin_root).await)
-}
-
-/// Find same-name records authored both locally and by another root for every
-/// single-home resource kind.
-///
-/// The collision is diagnostic only: callers must surface it rather than
-/// choosing either record as authoritative.
-pub async fn home_bound_authorship_collisions(
-    backend: &ResourceBackend,
-    namespace: &str,
-) -> Result<Vec<HomeBoundAuthorshipCollision>, ResourceError> {
-    let local_root = backend.local_root()?;
-    let mut collisions = Vec::new();
-    for registered in old_store_resource_kinds() {
-        if registered.replication_class != ReplicationClass::HomeBoundRuntime {
-            continue;
-        }
-        collisions.extend(dispatch_resource_kind!(
-            registered.resource,
-            home_bound_authorship_collisions_typed(backend, namespace, &local_root).await
-        )?);
-    }
-    collisions.sort_by(|left, right| {
-        (&left.kind, &left.namespace, &left.name, &left.replica_root).cmp(&(
-            &right.kind,
-            &right.namespace,
-            &right.name,
-            &right.replica_root,
-        ))
-    });
-    Ok(collisions)
-}
-
-async fn home_bound_authorship_collisions_typed<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    local_root: &NodeId,
-) -> Result<Vec<HomeBoundAuthorshipCollision>, ResourceError> {
-    let sources = backend.including_replicas::<T>(namespace).list_sources().await?;
-    let local_names = sources
-        .items
-        .iter()
-        .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
-        .map(|item| (item.object.metadata.name.as_str(), projected_vessel_source_root::<T>(&item.object)))
-        .collect::<HashMap<_, _>>();
-    Ok(sources
-        .items
-        .iter()
-        .filter_map(|item| {
-            let ResourceProvenance::Replica { origin_root, .. } = &item.provenance else {
-                return None;
-            };
-            let local_source_root = local_names.get(item.object.metadata.name.as_str())?;
-            let replica_source_root = projected_vessel_source_root::<T>(&item.object);
-            // A placed actuator is a local projection of the admitting Vessel.
-            // Match the marker to the counterpart root so an unrelated marker
-            // cannot suppress an independently authored collision.
-            if *local_source_root == Some(origin_root.as_str()) || replica_source_root == Some(local_root.as_str()) {
-                return None;
-            }
-            (origin_root != local_root).then(|| {
-                HomeBoundAuthorshipCollision::builder()
-                    .kind(T::API_PATHS.kind.to_string())
-                    .namespace(namespace.to_string())
-                    .name(item.object.metadata.name.clone())
-                    .local_root(local_root.clone())
-                    .replica_root(origin_root.clone())
-                    .build()
-            })
-        })
-        .collect())
-}
-
-fn projected_vessel_source_root<T: Resource>(object: &ResourceObject<T>) -> Option<&str> {
-    (T::API_PATHS.kind == Vessel::API_PATHS.kind)
-        .then(|| object.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map(String::as_str))
-        .flatten()
 }
 
 async fn replica_cursor_typed<T: Resource>(
