@@ -38,69 +38,56 @@ pub async fn convoy_routing_does_not_treat_a_legacy_display_name_as_role_identit
 }
 
 pub async fn convoy_explain_addresses_an_exact_terminal_pre_identity_record(factory: &dyn EnsureScenarioController) {
-    let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("pre-identity-record".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("review".to_string()).build(),
-        )
-        .await
-        .expect("pre-identity convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
-        )
-        .await
-        .expect("mark convoy terminal");
+    let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
+    let record = launch_convoy(
+        &daemon,
+        "pre-identity-record",
+        ConvoySpec::builder().workflow_ref("review".to_string()).build(),
+        ConvoyPhase::Failed,
+    )
+    .await;
 
-    let explanation = daemon.explain_convoy_internal(None, "pre-identity-record").await.expect("explain terminal record");
-    assert_eq!(explanation.convoy, "pre-identity-record");
+    let explanation = daemon.explain_convoy_internal(None, &record).await.expect("explain terminal record");
+    assert_eq!(explanation.convoy, record);
     assert_eq!(explanation.phase, "Failed");
 }
 
 // #2684: explain exposes the pending episode's durable age and live blocker,
 // including when the terminal has disappeared. Glue: one projection call-through.
 pub async fn convoy_explain_surfaces_queued_turn_age_and_blocker(factory: &dyn EnsureScenarioController) {
-    let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    let namespace = "queued-explain";
-    let convoys = backend.using::<ResourceConvoy>(namespace);
-    let convoy = convoys.create(&test_meta("queued"), &ConvoySpec::builder().workflow_ref("review".into()).build()).await.unwrap();
+    let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     let queued_at = daemon.clock_for_scenarios().now() - chrono::Duration::seconds(601);
-    convoys
-        .update_status(
-            "queued",
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                turn_deliveries: BTreeMap::from([(
-                    "review".into(),
-                    flotilla_resources::TurnDeliveryStatus {
-                        episodes: vec![flotilla_resources::TurnDeliveryEpisode {
-                            subject_revision: "head".into(),
-                            evidence_at: queued_at,
-                            judged_claim_at: queued_at,
-                            outcome: flotilla_resources::TurnDeliveryOutcome::Queued {
-                                rung: flotilla_resources::TurnDeliveryRung::WarmSession,
-                                queued_at,
-                                vessel: "work".into(),
-                                role: "coder".into(),
-                                message_id: "turn".into(),
-                                blocking_reason: "old readiness".into(),
-                            },
-                            sender: Default::default(),
-                        }],
-                        ..Default::default()
+    // The queued turn is the home's note on the convoy, which its launch keeps.
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        turn_deliveries: BTreeMap::from([(
+            "review".into(),
+            flotilla_resources::TurnDeliveryStatus {
+                episodes: vec![flotilla_resources::TurnDeliveryEpisode {
+                    subject_revision: "head".into(),
+                    evidence_at: queued_at,
+                    judged_claim_at: queued_at,
+                    outcome: flotilla_resources::TurnDeliveryOutcome::Queued {
+                        rung: flotilla_resources::TurnDeliveryRung::WarmSession,
+                        queued_at,
+                        vessel: "work".into(),
+                        role: "coder".into(),
+                        message_id: "turn".into(),
+                        blocking_reason: "old readiness".into(),
                     },
-                )]),
+                    sender: Default::default(),
+                }],
                 ..Default::default()
             },
-        )
-        .await
-        .unwrap();
-    let explanation = daemon.explain_convoy_internal(Some(namespace), "queued").await.unwrap();
+        )]),
+        ..flotilla_engine_convoys_testkit::single_agent("coder")
+    };
+    let queued = flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy("flotilla", "queued", ConvoySpec::builder().workflow_ref("review".into()).build(), status),
+    )
+    .await;
+    let explanation = daemon.explain_convoy_internal(Some("flotilla"), &queued).await.unwrap();
     let turns = explanation.queued_turns;
     assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].source, "review");
@@ -113,51 +100,43 @@ pub async fn convoy_explain_surfaces_queued_turn_age_and_blocker(factory: &dyn E
 }
 
 pub async fn convoy_explain_refuses_multiple_terminal_generations(factory: &dyn EnsureScenarioController) {
-    let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    create_identity_convoy(&backend, "convoy-one", "reviewer", Some("flotilla")).await;
-    create_identity_convoy(&backend, "convoy-two", "reviewer", Some("flotilla")).await;
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    for name in ["convoy-one", "convoy-two"] {
-        let created = convoys.get(name).await.expect("terminal convoy");
-        convoys
-            .update_status(
-                &created.metadata.name,
-                &created.metadata.resource_version,
-                &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
-            )
-            .await
-            .expect("mark convoy terminal");
+    let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
+    let one = create_identity_convoy(&daemon, "convoy-one", "reviewer", Some("flotilla")).await;
+    let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", Some("flotilla")).await;
+    for name in [&one, &two] {
+        land_convoy(&daemon, name).await;
     }
 
     assert_eq!(
         daemon.explain_convoy_internal(None, "reviewer@flotilla").await,
-        Err("convoy address `reviewer@flotilla` matches multiple terminal records; use an exact record name: convoy-one, convoy-two"
-            .to_string())
+        Err(format!("convoy address `reviewer@flotilla` matches multiple terminal records; use an exact record name: {one}, {two}"))
     );
 }
 
 pub async fn convoy_explain_rejects_projectless_and_project_bound_role_ambiguity(factory: &dyn EnsureScenarioController) {
-    let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    create_identity_convoy(&backend, "convoy-one", "reviewer", None).await;
-    create_identity_convoy(&backend, "convoy-two", "reviewer", Some("beta")).await;
+    let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
+    create_identity_convoy(&daemon, "convoy-one", "reviewer", None).await;
+    create_identity_convoy(&daemon, "convoy-two", "reviewer", Some("beta")).await;
 
     assert_eq!(
         daemon.explain_convoy_internal(None, "reviewer").await.expect_err("bare role must be ambiguous"),
-        "convoy role `reviewer` is ambiguous; use one of: reviewer@, reviewer@beta"
+        // A projectless convoy is held under its namespace's project on the engine.
+        "convoy role `reviewer` is ambiguous; use one of: reviewer@beta, reviewer@flotilla"
     );
 }
 
 pub async fn ensure_roll_targets_the_running_convoy_home_over_an_explicit_other_host(factory: &dyn EnsureScenarioController) {
     use flotilla_core::command_target::{RemoteDelivery, TargetHost, TargetReason};
-    let (driver, driver_backend, _clock, _temp) = standing_ensure_fixture(factory).await;
+    let (driver, _driver_backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     driver.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
-    let (observer, observer_backend, _observer_clock, _observer_temp) = standing_ensure_fixture_for(factory, "observer", false).await;
-    let driver_root = NodeId::new("driver-root");
-    observer_backend
-        .replica_writer::<ResourceConvoy>(driver_root.clone(), "flotilla")
-        .replace(&driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("driver convoys"), Utc::now())
-        .await
-        .expect("replicate driver history");
+    let (observer, _observer_backend, _observer_clock, _observer_temp) = standing_ensure_fixture_for(factory, "observer", false).await;
+    // The driver's history reaches the observer through the driver's log.
+    let driver_root = driver.node_id().clone();
+    flotilla_provisioning_testkit::replicate_home(
+        &driver.decided_store().expect("driver's decided store"),
+        driver_root.as_str(),
+        &observer.decided_store().expect("observer's decided store"),
+    );
     let target = observer
         .resolve_command_target(
             &CommandAction::ConvoyEnsureRoll { namespace: "flotilla".into(), name: "quartermaster".into() },

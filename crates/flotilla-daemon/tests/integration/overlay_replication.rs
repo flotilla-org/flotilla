@@ -13,7 +13,7 @@ use flotilla_resources::{
     terminal_records::{TerminalLaunchRequest, TerminalLaunchSource},
     Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, Host,
     HostSpec, HostStatus, InputMeta, IntegrationCondition, ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey, ResourceProvenance,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselSpec,
+    TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
 };
 use flotilla_store::{watch_resource_kind_replica_sources, ResourceBackend};
 use futures::StreamExt;
@@ -135,16 +135,19 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
         )
         .await
         .expect("publish feta heartbeat");
-    feta.resource_backend()
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("feta-convoy".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).role("feta-convoy".to_string()).build(),
-        )
-        .await
-        .expect("create feta convoy");
-    // The crew's session is feta's engine launch, held for feta's launch of the convoy's work.
-    let vessel = crate::engine(&feta).vessels.request("feta-convoy", "work", &feta_host_id);
+    // The convoy is feta's engine launch; the crew's session is feta's launch too, held for feta's
+    // launch of the convoy's work.
+    let convoy = crate::admit_convoy(
+        &feta,
+        flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "feta-convoy",
+            ConvoySpec::builder().workflow_ref("workflow".to_string()).role("feta-convoy".to_string()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        ),
+    )
+    .await;
+    let vessel = crate::engine(&feta).vessels.request(&convoy, "work", &feta_host_id);
     crate::engine(&feta).terminals.request(&TerminalLaunchRequest {
         session: "feta-session".to_string(),
         environment: "feta-environment".to_string(),
@@ -174,7 +177,7 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
     let row = list.rows.iter().find(|row| row.session.as_deref() == Some("feta-session")).expect("feta crew row");
     assert_eq!(row.host, HostName::new("feta"));
     assert_eq!(row.crew, "work/coder");
-    assert_eq!(row.convoy, "feta-convoy");
+    assert_eq!(row.convoy, convoy);
     assert!(matches!(row.staleness, FleetStaleness::Fresh { .. }));
     let health = kiwi.fleet_health_internal().await.expect("fleet health");
     let feta_health = health.hosts.iter().find(|row| row.host == HostName::new("feta")).expect("feta health");
@@ -184,13 +187,14 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
     // #742: the aliases formerly indexed from snapshot rows remain attachable.
     std::fs::write(kiwi.config_store().base_path().join("hosts.toml"), "[hosts.feta]\nhostname = 'feta.example'\n")
         .expect("attach hop config");
-    for reference in ["feta-session", "feta-convoy/work/coder", "work/coder", "work", "coder", "feta-environment"] {
+    let crew_path = format!("{convoy}/work/coder");
+    for reference in ["feta-session", crew_path.as_str(), "work/coder", "work", "coder", "feta-environment"] {
         let resolved =
             kiwi.resolve_attach_command_on_host_internal(reference, Some(&HostName::new("feta"))).await.expect("remote crew alias");
         let binding = resolved.binding.expect("crew binding");
         assert_eq!(binding.host, HostName::new("feta"));
         assert_eq!(binding.session.as_deref(), Some("feta-session"));
-        assert_eq!(binding.convoy.as_deref(), Some("feta-convoy"));
+        assert_eq!(binding.convoy.as_deref(), Some(convoy.as_str()));
         assert_eq!(binding.vessel.as_deref(), Some("work"));
         assert_eq!(binding.role.as_deref(), Some("coder"));
     }
@@ -552,11 +556,13 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
     .expect("start other host query projection");
     let repository_key = RepositoryKey("repo_flotilla".into());
     let home = feta.resource_backend();
-    let convoy = home
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("crew-convoy".to_string()).build(),
-            &ConvoySpec::builder()
+    // The convoy is feta's engine launch, active before any PR exists.
+    let convoy = crate::admit_convoy(
+        &feta,
+        flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "crew-convoy",
+            ConvoySpec::builder()
                 .workflow_ref("workflow".to_string())
                 .r#ref("fix/crew-branch".to_string())
                 .repositories(vec![ConvoyRepositorySpec {
@@ -569,21 +575,14 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
                 }])
                 .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "crew-checkout".to_string())]))
                 .build(),
-        )
-        .await
-        .expect("admit convoy before PR exists");
-    home.using::<Convoy>("flotilla")
-        .update_status(
-            "crew-convoy",
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
+            ConvoyStatus {
                 phase: flotilla_resources::ConvoyPhase::Active,
                 observed_workflow_ref: Some("workflow".into()),
-                ..Default::default()
+                ..flotilla_engine_convoys_testkit::single_agent("coder")
             },
-        )
-        .await
-        .expect("convoy is active before PR exists");
+        ),
+    )
+    .await;
     let _feta_runtime = DaemonRuntime::start_with_options(
         Arc::clone(&feta),
         feta.config_store(),
@@ -637,8 +636,6 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
         .expect("change request is open");
     use flotilla_resources::checkout_records::CheckoutRecords as _;
     let engine = flotilla_daemon_testkit::engine::runtime_checkouts(&feta);
-    let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
-    engine.admit_for(&home, "flotilla", &engine_convoy, &convoy.metadata.name).await;
     let launch = engine.put_ready(
         "crew-checkout",
         &CheckoutSpec::Observed(ObservedCheckoutSpec {
@@ -648,7 +645,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
             host_ref: "feta".into(),
             is_main: false,
         }),
-        Some(&engine.holder(&engine_convoy)),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy.clone())),
     );
     engine
         .checkouts
@@ -656,7 +653,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
         .expect("crew opens PR without changing convoy phase");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get("crew-convoy").await.is_ok() {
+            if kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get(&convoy).await.is_ok() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -664,12 +661,10 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
     })
     .await
     .expect("other host receives convoy replica");
-    kiwi.discover_convoy_branch_subjects("flotilla", "crew-convoy", "fix/crew-branch")
-        .await
-        .expect("replica host skips home-only discovery");
+    kiwi.discover_convoy_branch_subjects("flotilla", &convoy, "fix/crew-branch").await.expect("replica host skips home-only discovery");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let replica = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get("crew-convoy").await;
+            let replica = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get(&convoy).await;
             if replica.ok().and_then(|record| record.object.status).is_some_and(|status| {
                 status.subjects.iter().any(|entry| {
                     entry.subject.kind == SubjectKind::ChangeRequest
@@ -692,7 +687,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
                 .as_convoys()
                 .expect("convoy rows")
                 .iter()
-                .any(|row| row.resource.name == "crew-convoy" && row.subjects.iter().any(|entry| entry.subject.id == "2301"))
+                .any(|row| row.resource.name == convoy && row.subjects.iter().any(|entry| entry.subject.id == "2301"))
             {
                 break;
             }
@@ -848,8 +843,8 @@ async fn a_peer_relays_another_origins_home_bound_runtime_resource() {
     drop(feta_gouda);
 }
 
-// #742: another host's adopted checkouts reach checkout queries by following its log, and
-// independent attach targets through resource replication, including updates and removals.
+// #742: another host's adopted checkouts and independent attach targets reach it by following
+// its log, including updates and removals.
 #[tokio::test]
 async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hosts() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -864,7 +859,6 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
     .await
     .expect("start query projection");
     let checkouts = flotilla_daemon_testkit::engine::runtime_checkouts(&feta);
-    let sessions = feta.observed_resource_backend().using::<TerminalSession>("flotilla");
     let adopted = |branch: &str| {
         CheckoutSpec::Observed(ObservedCheckoutSpec {
             repo_ref: RepositoryKey("widgets".into()),
@@ -877,36 +871,27 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
     let spec = adopted("main");
     let mut launch = checkouts.put_ready("checkout", &spec, None);
     // Identical names on different origins remain distinct rows.
-    kiwi.observed_resource_backend()
-        .using::<Checkout>("flotilla")
-        .create(&InputMeta::builder().name("checkout".to_string()).build(), &spec)
-        .await
-        .expect("create local checkout");
-    let session = sessions
-        .create(
-            &InputMeta::builder().name("terminal-independent".to_string()).build(),
-            &TerminalSessionSpec::builder()
-                .env_ref("feta-env".to_string())
-                .role("shell".to_string())
-                .source(TerminalSessionSource::Tool { command: "sh".into() })
-                .cwd("/srv/widgets".to_string())
-                .pool("passthrough".to_string())
-                .build(),
-        )
-        .await
-        .expect("create independent");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("terminal-independent".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("running independent");
+    let CheckoutSpec::Observed(discovered) = spec.clone() else { unreachable!("adopted checkouts are observed") };
+    kiwi.discovered_checkouts().replace(
+        &discovered.repo_ref.clone(),
+        vec![flotilla_resources::discovered_checkouts::DiscoveredCheckout {
+            name: "checkout".to_string(),
+            repo_slug: "widgets".to_string(),
+            spec: discovered,
+        }],
+    );
+    let independent = flotilla_daemon_testkit::engine::run_session(
+        &feta,
+        "terminal-independent",
+        &TerminalSessionSpec::builder()
+            .env_ref(feta.local_environment_id().to_string())
+            .role("shell".to_string())
+            .source(TerminalSessionSource::Tool { command: "sh".into() })
+            .cwd("/srv/widgets".to_string())
+            .pool("passthrough".to_string())
+            .build(),
+        &Default::default(),
+    );
     let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect daemons");
     let state = kiwi.aggregator_projection_state().await;
     for branch in ["main", "feature", "main"] {
@@ -930,31 +915,18 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.path == "/srv/widgets" && row.resource.host.as_ref() == Some(&row.host)));
     }
-    tokio::time::timeout(Duration::from_secs(5), async {
+    std::fs::write(kiwi.config_store().base_path().join("hosts.toml"), "[hosts.feta]\nhostname = 'feta.example'\n")
+        .expect("attach hop config");
+    let resolved = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if kiwi
-                .observed_resource_backend()
-                .including_replicas::<TerminalSession>("flotilla")
-                .list()
-                .await
-                .expect("session replicas")
-                .items
-                .iter()
-                .any(|source| source.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running))
-            {
-                break;
+            if let Ok(resolved) = kiwi.resolve_attach_command_on_host_internal("terminal-independent", Some(&HostName::new("feta"))).await {
+                break resolved;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("independent replication");
-    std::fs::write(kiwi.config_store().base_path().join("hosts.toml"), "[hosts.feta]\nhostname = 'feta.example'\n")
-        .expect("attach hop config");
-    let resolved = kiwi
-        .resolve_attach_command_on_host_internal("terminal-independent", Some(&HostName::new("feta")))
-        .await
-        .expect("remote independent attach");
+    .expect("remote independent attach");
     assert_eq!(resolved.binding.as_ref().map(|binding| &binding.host), Some(&HostName::new("feta")));
     let checkout_attach =
         kiwi.resolve_transient_attach_command_internal("/srv/widgets", Some(&HostName::new("feta"))).await.expect("remote checkout attach");
@@ -968,14 +940,14 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
     assert!(serde_json::to_string(&checkout_attach.plan).expect("attach plan").contains("/srv/widgets"));
     assert!(kiwi.resource_backend().including_replicas::<Checkout>("flotilla").list().await.expect("durable checkouts").items.is_empty());
     checkouts.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
-    sessions.delete("terminal-independent").await.expect("delete independent");
+    flotilla_daemon_testkit::engine::engine(&feta).terminals.release(&independent);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let set = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout query");
             let rows = set.rows.as_checkouts().expect("checkout rows");
-            let remote_sessions =
-                kiwi.observed_resource_backend().including_replicas::<TerminalSession>("flotilla").list().await.expect("sessions");
-            if rows.len() == 1 && rows[0].host == HostName::new("kiwi") && remote_sessions.items.is_empty() {
+            let detached =
+                kiwi.resolve_attach_command_on_host_internal("terminal-independent", Some(&HostName::new("feta"))).await.is_err();
+            if rows.len() == 1 && rows[0].host == HostName::new("kiwi") && detached {
                 break;
             }
             tokio::task::yield_now().await;
@@ -983,7 +955,6 @@ async fn remote_checkout_queries_and_independent_attach_targets_follow_their_hos
     })
     .await
     .expect("remote observations removed");
-    assert!(kiwi.resolve_attach_command_on_host_internal("terminal-independent", Some(&HostName::new("feta"))).await.is_err());
     drop(topology);
 }
 
@@ -1632,15 +1603,20 @@ async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
     );
     let mut spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).role("coder".to_string()).build();
     spec.project_ref = Some("flotilla".to_string());
-    kiwi.resource_backend()
-        .using::<Convoy>("flotilla")
-        .create(&InputMeta::builder().name("convoy-homed-on-kiwi".to_string()).build(), &spec)
-        .await
-        .expect("create convoy on kiwi");
+    let convoy = crate::admit_convoy(
+        &kiwi,
+        flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "convoy-homed-on-kiwi",
+            spec,
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        ),
+    )
+    .await;
     // The crew runs on feta: its session is feta's engine launch, held for feta's launch of work
     // `work` in the convoy homed at kiwi.
     let vessel = crate::engine(&feta).vessels.request_for(&flotilla_resources::vessel_records::VesselLaunchRequest {
-        convoy: "convoy-homed-on-kiwi".to_string(),
+        convoy: convoy.clone(),
         convoy_home: kiwi.node_id().as_str().to_string(),
         work: "work".to_string(),
         host: feta_host_id.clone(),
@@ -1674,14 +1650,14 @@ async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
     .expect("replication");
 
     let feta_name = HostName::new("feta");
-    for reference in ["coder@flotilla", "convoy-homed-on-kiwi"] {
+    for reference in ["coder@flotilla", convoy.as_str()] {
         // From the Convoy's home, with and without an explicit session host.
         for host in [None, Some(&feta_name)] {
             let resolved =
                 kiwi.resolve_attach_command_on_host_internal(reference, host).await.unwrap_or_else(|e| panic!("{reference}: {e}"));
             let binding = resolved.binding.expect("binding");
             assert_eq!(binding.host, feta_name, "{reference}");
-            assert_eq!(binding.convoy.as_deref(), Some("convoy-homed-on-kiwi"));
+            assert_eq!(binding.convoy.as_deref(), Some(convoy.as_str()));
         }
         // From the session's own host the session is local.
         let resolved = feta.resolve_attach_command_internal(reference).await.unwrap_or_else(|e| panic!("{reference}: {e}"));
@@ -1762,8 +1738,10 @@ mod governor_relay {
     async fn governor_snapshot(daemon: &InProcessDaemon) -> (ResourceObject<Convoy>, WorkflowTemplateSpec) {
         let backend = daemon.resource_backend();
         let convoys = backend.using::<Convoy>("flotilla").list().await.expect("list admitted convoys");
-        assert_eq!(convoys.items.len(), 1);
-        let convoy = convoys.items.into_iter().next().expect("admitted governor");
+        // An ended launch stays on the engine, so the governor is the one live launch.
+        let mut live = convoys.items.into_iter().filter(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()));
+        let convoy = live.next().expect("admitted governor");
+        assert!(live.next().is_none(), "one live governor");
         let snapshot = backend
             .definitions::<WorkflowTemplate>("flotilla")
             .get(&convoy.metadata.annotations[WORKFLOW_SNAPSHOT_ANNOTATION])
@@ -1854,6 +1832,10 @@ mod governor_relay {
         let feta = &roots[0].0;
         let kiwi = &roots[1].0;
         let udder = &roots[2].0;
+        // Each root reads its convoys from the engine, as its runtime installs the readings.
+        for (root, ()) in &roots {
+            crate::engine(root);
+        }
         udder
             .resource_backend()
             .definitions::<Project>("flotilla")
@@ -1925,7 +1907,14 @@ mod governor_relay {
             await_template(root, "governor", &workflow).await;
         }
         assert_eq!(governor_snapshot(udder).await.1, first_snapshot, "relay must not rewrite an admitted snapshot");
-        udder.resource_backend().using::<Convoy>("flotilla").delete(&first_convoy.metadata.name).await.expect("retire first admission");
+        // A convoy ends on the engine and is never deleted: the first admission is retired by abandoning it.
+        udder
+            .convoy_engine_path()
+            .get()
+            .expect("udder's Convoy path")
+            .abandon(&first_convoy, "operator", "retire first admission")
+            .await
+            .expect("retire first admission");
         let result = admit_governor(udder).await;
         assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "re-admission failed: {result:?}");
         expected_snapshot = workflow.clone();

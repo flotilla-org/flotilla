@@ -2,12 +2,11 @@
 //! the events the design names, and reads the outcome from the engine's records.
 //!
 //! The scripted actuator keys each environment by its host-direct root. Its records live as
-//! ImageBuild lifecycles at the same home (a kind whose resources are not launches, so each is
-//! named as written): `input-<key>` is an input, `holder-<key>` ends the holder
-//! once Gone, `fact-<key>` reports the provider usable while Realised, and a live `served-<key>`
-//! holds its release back. An environment given holdings holds `hold-<key>-<i>` records, each
-//! requested only once the one before it is realised, as a vessel's later holdings need its
-//! earlier ones' facts.
+//! ImageBuild lifecycles at the same home, each the first launch of its name (`<name>#<n>`), read
+//! and followed by that name: `input-<key>` is an input, `holder-<key>` ends the holder once Gone,
+//! `fact-<key>` reports the provider usable while Realised, and a live `served-<key>` holds its
+//! release back. An environment given holdings holds `hold-<key>-<i>` records, each requested only
+//! once the one before it is realised, as a vessel's later holdings need its earlier ones' facts.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -31,7 +30,7 @@ use tokio::sync::{mpsc, Notify};
 
 use super::{Actuator, Backing, BackingEvent, Controller, Holding, Holdings, ProviderFailure, Usability};
 use crate::{
-    engine::{LifecycleHome, Lifecycles, Step},
+    engine::{environment_actuator::latest_state_of, LifecycleHome, Lifecycles, Step},
     stored::{
         environment::{EnvironmentKind, EnvironmentRequest, HostDirectRecipe, Recipe},
         image_build::{Architecture, Delivery, ImageBuildKind, ImageBuildRequest, Reservation},
@@ -72,6 +71,8 @@ fn record_request() -> ImageBuildRequest {
         .probe("true".into())
         .build();
     ImageBuildRequest {
+        launch_of: "image-feed-arm64".into(),
+        launch: 0,
         composition: "sha256:feed".into(),
         architecture: Architecture::Amd64,
         layers: Frozen::new(vec![layer]).expect("freeze"),
@@ -81,8 +82,7 @@ fn record_request() -> ImageBuildRequest {
 }
 
 fn state_of(read: &mut Read<'_>, name: &str) -> Result<Option<LifecycleState>, StoreError> {
-    let Some(id) = read.resolve(record_code(), name, HOME)? else { return Ok(None) };
-    Ok(read.load::<Resource<Lifecycle<ImageBuildKind>>>(id)?.map(|loaded| loaded.value.state().clone()))
+    latest_state_of::<ImageBuildKind>(read, name, HOME)
 }
 
 #[derive(Default)]
@@ -180,10 +180,12 @@ impl Actuator<EnvironmentKind> for Scripted {
         let mut held = Vec::new();
         for index in 0..count {
             let name = format!("hold-{key}-{index}");
-            if records.get(&name).is_none() {
-                records.request(&name, record_request(), World::now()).expect("request holding");
+            if records.newest_launch(&name).is_none() {
+                records
+                    .request(&name, ImageBuildRequest { launch_of: name.clone(), ..record_request() }, World::now())
+                    .expect("request holding");
             }
-            let usable = records.get(&name).is_some_and(|holding| holding.state().realised());
+            let usable = records.newest_launch(&name).is_some_and(|holding| holding.state().realised());
             held.push(Usability { fact: record(&name), usable });
             // The next holding is planned from this one's facts.
             if !usable {
@@ -252,11 +254,12 @@ impl World {
     }
 
     fn record(&self, name: &str) {
-        self.records.request(name, record_request(), Self::now()).expect("record");
+        self.records.request(name, ImageBuildRequest { launch_of: name.into(), ..record_request() }, Self::now()).expect("record");
     }
 
     fn record_step(&self, name: &str, step: Step) {
-        self.records.step(name, &step, Self::now()).expect("record step");
+        let launch = self.records.newest_launch(name).expect("recorded").name().to_owned();
+        self.records.step(&launch, &step, Self::now()).expect("record step");
     }
 
     fn state(&self, name: &str) -> LifecycleState {
@@ -307,7 +310,7 @@ async fn waiting_for_holdings_spends_no_tries() {
     world.request("a");
     for index in 0..3 {
         let holding = format!("hold-a-{index}");
-        world.until("the next holding requested", |world| world.records.get(&holding).is_some()).await;
+        world.until("the next holding requested", |world| world.records.newest_launch(&holding).is_some()).await;
         assert_eq!(failures(&world.state("a")), Some(0), "waiting is not a try");
         assert!(world.actuator.script().realised.is_empty(), "not tried before its holdings are realised");
         world.record_step(&holding, Step::Realised { identity: holding.clone() });

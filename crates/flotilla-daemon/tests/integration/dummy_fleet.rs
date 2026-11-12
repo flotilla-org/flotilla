@@ -35,14 +35,7 @@ fn in_phase(name: &str, phase: ConvoyPhase) -> impl Fn(&ResourceObject<Convoy>) 
 /// A crew stall a supervisor can act on: the crew's work and the convoy's
 /// stall condition, both published by the crew and maintained by the leaf engine.
 fn stalled(name: &str) -> impl Fn(&ResourceObject<Convoy>) -> bool + '_ {
-    convoy(name, |status| {
-        status.stalled.is_some()
-            && status
-                .crew_work
-                .get("implement")
-                .and_then(|roles| roles.get("coder"))
-                .is_some_and(|work| work.phase == CrewWorkPhase::Stalled)
-    })
+    convoy(name, |status| status.stalled.is_some())
 }
 
 /// The promises of `vessel`'s `role` in convoy `name`, as explain reads them: the engine's.
@@ -204,8 +197,7 @@ async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
     assert_eq!(handed_off, CommandValue::Ok);
     // The artificial sender is HandedBack, a terminal phase excluded from
     // derived Done. Keep this legacy handoff fixture's explicit operator override.
-    let completed =
-        fleet.execute(CommandAction::CrewComplete { context, message: None, disposition: None, decision_ledger_ref: None }).await;
+    let completed = fleet.execute(CommandAction::CrewComplete { context, message: None, disposition: None }).await;
     assert_eq!(completed, CommandValue::Ok);
     let landed = fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
     assert_eq!(fleet.counts().turns_received, before.turns_received + 1, "the reopened governor receives the handoff turn");
@@ -598,6 +590,9 @@ async fn acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
         presents_as: None,
         agent_overrides: Vec::new(),
     };
+    // Each generation fails before provisioning, as the vendor refuses it: a strike. An operator's
+    // abandon would not be one (decision 78(3)).
+    fleet.vendor().refuse_provisioning(true);
     apply_annotated::<ConvoyEnsure>(&fleet, "quartermaster", &annotations, ensure).await;
 
     let generations = || async {
@@ -618,28 +613,6 @@ async fn acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
             latest.as_ref().map(|convoy| (convoy.metadata.name.clone(), convoy.status.as_ref().map(|status| status.phase))),
             ensure().await
         );
-        // Each generation fails, as its convoy controller records a failure before provisioning:
-        // a strike. An operator's abandon would not be one (decision 78(3)), and a standing
-        // generation's failed vessel is retried in place until Convoy moves onto the engine.
-        // The write is conditional on what was read, as a controller's is; a conflict is retried
-        // on the next turn.
-        if let Some((convoy, status)) = latest.as_ref().and_then(|convoy| Some((convoy, convoy.status.as_ref()?))) {
-            if !status.phase.is_terminal() {
-                let mut status = status.clone();
-                let now = flotilla_resources::Clock::now(&*clock);
-                flotilla_resources::controller_patches::fail_init(ConvoyPhase::Failed, "the generation failed".into(), now)
-                    .apply(&mut status);
-                fleet
-                    .execute(CommandAction::ResourceStatusPatch {
-                        expected_resource_version: Some(convoy.metadata.resource_version.clone()),
-                        namespace: NAMESPACE.into(),
-                        kind: "Convoy".into(),
-                        name: convoy.metadata.name.clone(),
-                        status: serde_json::to_value(status).expect("status"),
-                    })
-                    .await;
-            }
-        }
         // Each ended generation waits out its backoff; skip just that.
         skip_to_retry(&clock, ensure().await.and_then(|status| status.retry_at));
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -665,6 +638,7 @@ async fn acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(generations().await.len(), 3, "the hold holds until a person acknowledges it");
 
+    fleet.vendor().refuse_provisioning(false);
     let acknowledged =
         fleet.execute(CommandAction::PersonAcknowledge { namespace: Some(NAMESPACE.into()), message: item.message.clone() }).await;
     assert_eq!(acknowledged, CommandValue::Ok);
@@ -713,6 +687,7 @@ async fn a_stall_past_every_supervisor_reaches_the_projects_operator_and_the_per
     let CommandValue::PersonInbox(listing) = fleet.execute(inbox.clone()).await else { panic!("a person inbox") };
     assert!(listing.items.iter().any(|left| left.message == item.message), "listing it is no receipt: {listing:?}");
 
+    fleet.vendor().refuse_provisioning(false);
     let acknowledged =
         fleet.execute(CommandAction::PersonAcknowledge { namespace: Some(NAMESPACE.into()), message: item.message.clone() }).await;
     assert_eq!(acknowledged, CommandValue::Ok);

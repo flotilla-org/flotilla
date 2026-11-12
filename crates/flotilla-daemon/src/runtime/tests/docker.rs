@@ -651,7 +651,7 @@ async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
         Arc::new(NoLaunchEnvironment),
     );
     actuator
-        .release("env-lost-status", &request_of(&spec, None, &fixture.home).expect("request"), None)
+        .release("env-lost-status", &request_of(&spec, None, |_| Ok(fixture.home.clone())).expect("request"), None)
         .await
         .expect("release without a recorded identity");
     assert!(destroyed.load(Ordering::SeqCst), "missing status must not leave the backing container running");

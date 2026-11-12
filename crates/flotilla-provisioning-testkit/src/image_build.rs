@@ -1,6 +1,7 @@
-//! In-process stand-ins for ImageBuild execution (ADR 0062): the build-service port, the host's
-//! materials, and a controller step over the real ImageBuild reconciler. Shared by provisioning's
-//! ImageBuild tests and core's image-check tests.
+//! In-process stand-ins for ImageBuild execution (ADR 0062, #3108): the build-service port, the
+//! host's materials, and a builder on a real decided store running the engine's image build
+//! launcher and controller over them. Shared by provisioning's ImageBuild tests and core's
+//! image-check tests.
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
@@ -12,49 +13,58 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use flotilla_engine_store::{open_home, StoreLog};
 use flotilla_environment::environment::{
     image::{BuiltImage, FailedImageBuild, ImageBuildRequest, ImageDeliveryTarget, SecretFile},
     registry_auth::{RegistryAuthMaterial, RegistryConfig},
     ImageBuildService, RegistryAuth,
 };
-use flotilla_protocol::{EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo};
-use flotilla_provisioning::reconcilers::{image_build::registry_build_cache, ImageBuildMaterials, ImageBuildReconciler};
-use flotilla_resources::{
-    image_identity, Host, HostImageAction, HostSpec, HostStatus, ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass,
-    ImageBuildPhase, ImageBuildReservation, ImageBuildSpec, ImageDelivery, ImageLayerProbe, ImageProbeOutcome, InputMeta,
-    IMAGE_BUILD_MAX_ATTEMPTS,
+use flotilla_protocol::LifecycleReading;
+
+use crate::Ending;
+use flotilla_provisioning::{
+    engine::{
+        controller::Controller,
+        image_build_actuator::{registry_build_cache, ImageBuildActuator, ImageBuildMaterials},
+        image_builds::{demand_of, launch_of, EngineImageBuilds, ImageBuildLauncher},
+        reads::{LifecycleReadPort, StoreReads},
+        LifecycleHome, Lifecycles, Step,
+    },
+    stored::{
+        decided_registry,
+        host::{HostObservation, HostRecord},
+        image_build::{ImageBuildDemand, ImageBuildKind},
+    },
 };
-use flotilla_store::{apply_status_patch, controller::Reconciler, ResourceBackend};
-use flotilla_store_testkit::VirtualClock;
-use tokio::sync::Notify;
+use flotilla_resources::{
+    image_build_records::{ImageBuildRecord, ImageBuildRecords},
+    image_identity,
+    lifecycle_reads::LifecycleReads,
+    Clock, HostImageAction, HostSpec, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass, ImageBuildReservation, ImageBuildSpec,
+    ImageDelivery, ImageLayerProbe, ImageProbeOutcome,
+};
+use flotilla_schema::{Kind, NewChange, Ref, Timestamp};
+use flotilla_schema_sqlite::{
+    stream::{CommitListener, Committed, Service},
+    Store,
+};
+use flotilla_state_machines::{
+    machines::lifecycle::{LifecycleState, VanishCause},
+    Cause, CauseCategory, Outcome,
+};
+use tokio::{sync::Notify, task::JoinHandle};
 
 pub const NS: &str = "test";
+/// The builder host.
 pub const HOST: &str = "builder";
+/// The builder's daemon: the home its launches are written at.
+pub const BUILDER_HOME: &str = "builder-node";
 pub const WRAPPER: &str = "flotilla_run_with_preludes exec \"$@\"";
 pub const REPOSITORY: &str = "registry.test/flotilla/crew-images";
 
 pub fn digest(fill: char) -> String {
     format!("sha256:{}", fill.to_string().repeat(64))
-}
-
-pub async fn host(backend: &ResourceBackend, architecture: &str, capacity: Option<ImageBuildCapacity>) {
-    let hosts = backend.using::<Host>(NS);
-    let obj = hosts
-        .create(&InputMeta::builder().name(HOST.into()).build(), &HostSpec { image_build_capacity: capacity, ..Default::default() })
-        .await
-        .expect("host");
-    let status = HostStatus::builder()
-        .capabilities(Default::default())
-        .ready(true)
-        .description(
-            HostSummary::builder()
-                .environment_id(EnvironmentId::new(HOST))
-                .node(NodeInfo::new(NodeId::new(HOST), HOST.to_string()))
-                .system(SystemInfo { arch: Some(architecture.into()), ..Default::default() })
-                .build(),
-        )
-        .build();
-    hosts.update_status(HOST, &obj.metadata.resource_version, &status).await.expect("host status");
 }
 
 pub fn builder(slots: u32) -> Option<ImageBuildCapacity> {
@@ -210,53 +220,333 @@ impl ImageBuildMaterials for Materials {
             Err(ImageBuildFailure { class: ImageBuildFailureClass::Recipe, reason: format!("build secret `{name}` is not granted") })
         }
     }
-    async fn keep_log(&self, build: &str, attempt: u32, log: &str) -> Result<String, String> {
-        let reference = format!("image-build-log-{build}-{attempt}");
-        self.logs.lock().expect("logs").insert(reference.clone(), log.to_string());
-        Ok(reference)
+    async fn keep_log(&self, _build: &str, name: &str, log: &str) -> Result<String, String> {
+        self.logs.lock().expect("logs").insert(name.to_owned(), log.to_owned());
+        Ok(name.to_owned())
     }
 }
 
-pub fn reconciler(
-    backend: &ResourceBackend,
-    service: &Arc<BuildService>,
-    materials: &Arc<Materials>,
-    clock: &Arc<VirtualClock>,
-) -> ImageBuildReconciler {
-    ImageBuildReconciler::new(
-        Some(Arc::clone(service) as Arc<dyn ImageBuildService>),
-        Arc::clone(materials) as Arc<dyn ImageBuildMaterials>,
-        backend,
-        NS,
-        HOST,
-        WRAPPER,
-    )
-    .with_clock(Arc::clone(clock) as Arc<dyn flotilla_resources::Clock>)
-    .with_liveness_interval(Duration::from_millis(5))
+/// A clock that elapses with tokio's, so a paused test runtime skips the build backoff.
+struct TokioClock {
+    base: DateTime<Utc>,
+    start: tokio::time::Instant,
 }
 
-/// One controller step for `name`, as the controller loop performs it.
-pub async fn tick(backend: &ResourceBackend, reconciler: &ImageBuildReconciler, clock: &VirtualClock, name: &str) {
-    let builds = backend.using::<ImageBuild>(NS);
-    let Ok(obj) = builds.get(name).await else { return };
-    let prepared = reconciler.prepare(&obj).await.expect("prepare");
-    let outcome = reconciler.reconcile(&obj, &prepared, flotilla_resources::Clock::now(clock));
-    if let Some(patch) = outcome.patch {
-        apply_status_patch(&builds, name, &patch).await.expect("status patch");
+impl Clock for TokioClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.base + chrono::Duration::from_std(self.start.elapsed()).unwrap_or_default()
     }
 }
 
-/// Step until `name` settles (Built, or Failed with no retry pending) or a
-/// step budget runs out, letting background jobs run between steps.
-pub async fn settle(backend: &ResourceBackend, reconciler: &ImageBuildReconciler, clock: &VirtualClock, name: &str) {
-    for _ in 0..200 {
-        tick(backend, reconciler, clock, name).await;
-        let status = backend.using::<ImageBuild>(NS).get(name).await.expect("build").status.unwrap_or_default();
-        let retrying = status.failure.as_ref().is_some_and(|failure| failure.class == ImageBuildFailureClass::Infrastructure)
-            && status.attempt < IMAGE_BUILD_MAX_ATTEMPTS;
-        if status.phase == ImageBuildPhase::Built || (status.phase == ImageBuildPhase::Failed && !retrying) {
-            return;
+/// A builder on a real decided store: its Host record and observation, the image build port, the
+/// launcher and the ImageBuild controller over [`BuildService`] and [`Materials`].
+pub struct Builder {
+    pub service: Arc<Service>,
+    pub lifecycles: Arc<dyn Lifecycles<ImageBuildKind>>,
+    pub builds: Arc<EngineImageBuilds>,
+    /// The engine's readings, serving [`Self::builds`].
+    pub reads: Arc<dyn LifecycleReads>,
+    pub build_service: Arc<BuildService>,
+    pub materials: Arc<Materials>,
+    commits: Arc<Notify>,
+    _listener: Arc<CommitListener>,
+    tasks: Vec<JoinHandle<()>>,
+    _directory: tempfile::TempDir,
+}
+
+impl Drop for Builder {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+impl Builder {
+    /// A builder of `architecture` offering `capacity`, building through `build_service` with
+    /// `materials`. Its launcher and controller run until it drops.
+    pub fn start(
+        architecture: &str,
+        capacity: Option<ImageBuildCapacity>,
+        build_service: Arc<BuildService>,
+        materials: Arc<Materials>,
+    ) -> Self {
+        let mut builder = Self::idle(architecture, capacity, build_service, materials);
+        builder.run();
+        builder
+    }
+
+    /// [`Self::start`] with neither its launcher nor its controller running until [`Self::run`]:
+    /// what is demanded meanwhile waits.
+    pub fn idle(
+        architecture: &str,
+        capacity: Option<ImageBuildCapacity>,
+        build_service: Arc<BuildService>,
+        materials: Arc<Materials>,
+    ) -> Self {
+        let directory = tempfile::tempdir().expect("directory");
+        let service = Arc::new(
+            Service::open(&directory.path().join("decided.sqlite"), BUILDER_HOME, decided_registry().expect("registry")).expect("store"),
+        );
+        let commits = Arc::new(Notify::new());
+        let listener: Arc<CommitListener> = {
+            let commits = Arc::clone(&commits);
+            Arc::new(move |_: &Committed<'_>| commits.notify_waiters())
+        };
+        service.on_commit(Arc::downgrade(&listener));
+        let lifecycles: Arc<dyn Lifecycles<ImageBuildKind>> =
+            Arc::new(LifecycleHome::new(BUILDER_HOME, open_home(StoreLog::new(service.store())).expect("image builds")));
+        let builds = Arc::new(EngineImageBuilds::over(Arc::clone(&lifecycles), Arc::clone(&service)));
+        let reads: Arc<dyn LifecycleReads> = Arc::new(
+            LifecycleReadPort::new(StoreReads::new(service.store()), BUILDER_HOME.to_owned())
+                .with_image_builds(Arc::clone(&builds) as Arc<dyn ImageBuildRecords>),
+        );
+        let builder = Self {
+            service,
+            lifecycles,
+            builds,
+            reads,
+            build_service,
+            materials,
+            commits,
+            _listener: listener,
+            tasks: Vec::new(),
+            _directory: directory,
+        };
+        builder.host(architecture, capacity);
+        builder
+    }
+
+    /// Starts this builder's launcher and controller. Must be called within a Tokio runtime.
+    pub fn run(&mut self) {
+        let launcher = ImageBuildLauncher::start(Arc::clone(&self.lifecycles), Arc::clone(&self.service), HOST).expect("launcher");
+        let actuator = Arc::new(ImageBuildActuator::new(
+            Arc::clone(&self.build_service) as Arc<dyn ImageBuildService>,
+            Arc::clone(&self.materials) as Arc<dyn ImageBuildMaterials>,
+            Arc::clone(&self.service),
+            HOST,
+            WRAPPER,
+        ));
+        let clock = Arc::new(TokioClock { base: Utc::now(), start: tokio::time::Instant::now() });
+        let controller = Controller::start(Arc::clone(&self.lifecycles), actuator, clock, Arc::clone(&self.service)).expect("controller");
+        let (backing, backings) = tokio::sync::mpsc::channel(1);
+        self.tasks.push(tokio::spawn(launcher.run()));
+        // The sender is kept by the controller's task: a build's backing is never pushed.
+        self.tasks.push(tokio::spawn(async move {
+            let _backing = backing;
+            controller.run(backings).await;
+        }));
+    }
+
+    /// Writes this builder's Host record, offering `capacity`, and its observed `architecture`.
+    pub fn host(&self, architecture: &str, capacity: Option<ImageBuildCapacity>) {
+        write_host(&self.service.store(), BUILDER_HOME, HOST, architecture, capacity);
+    }
+
+    /// Demands `spec` here, as admission does, returning the build's name.
+    pub fn demand(&self, spec: &ImageBuildSpec) -> String {
+        self.build_service.expect(spec);
+        let name = spec.resource_name();
+        self.builds.demand(&name, spec).expect("demand");
+        name
+    }
+
+    /// The builds this home demands, by name.
+    pub fn demands(&self) -> Vec<String> {
+        demands_at(self.service.store(), BUILDER_HOME)
+    }
+
+    /// Build `name`'s newest launch as its readers see it.
+    pub fn record(&self, name: &str) -> Option<ImageBuildRecord> {
+        self.builds.get(name).expect("read")
+    }
+
+    /// Waits for `holds`, rechecked at each commit and every 100 ms.
+    pub async fn until(&self, what: &str, holds: impl Fn(&Self) -> bool) {
+        let wait = async {
+            loop {
+                let committed = self.commits.notified();
+                tokio::pin!(committed);
+                committed.as_mut().enable();
+                if holds(self) {
+                    return;
+                }
+                tokio::select! {
+                    () = committed => {}
+                    () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        };
+        // Long enough for every try's backoff, which a paused runtime skips.
+        tokio::time::timeout(Duration::from_secs(24 * 3600), wait).await.unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    /// Waits for build `name`'s newest launch to settle: built, or given up.
+    pub async fn settled(&self, name: &str) -> ImageBuildRecord {
+        self.until(&format!("{name} to settle"), |builder| {
+            builder
+                .record(name)
+                .is_some_and(|record| matches!(record.reading, LifecycleReading::Ready { .. } | LifecycleReading::GaveUp { .. }))
+        })
+        .await;
+        self.record(name).expect("settled")
+    }
+}
+
+/// The builds `home` demands, by name.
+pub fn demands_at(store: Arc<Mutex<Store>>, home: &str) -> Vec<String> {
+    let mut store = store.lock().expect("store");
+    let mut read = store.read().expect("read");
+    let mut names = Vec::new();
+    let mut after = None;
+    loop {
+        let page = read.scan::<ImageBuildDemand>(home, after, 64).expect("demands");
+        for id in page.ids {
+            names.extend(read.load::<ImageBuildDemand>(id).expect("demand").map(|loaded| loaded.name));
+        }
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return names,
+        }
+    }
+}
+
+/// Writes host `host`'s Host record at `home`, offering `capacity`, and its observed `architecture`.
+pub fn write_host(store: &Mutex<Store>, home: &str, host: &str, architecture: &str, capacity: Option<ImageBuildCapacity>) {
+    let record = HostRecord::new(&HostSpec { image_build_capacity: capacity, ..Default::default() });
+    let observation = HostObservation { architecture: Some(architecture.to_owned()), ..Default::default() };
+    let mut store = store.lock().expect("store");
+    let mut write = store.write().expect("write");
+    let change = write.open_change(&NewChange::new("probe", Timestamp::from_datetime(&Utc::now()))).expect("change");
+    match write.resolve(<HostRecord as Kind>::CODE, host, home).expect("resolve") {
+        Some(id) => {
+            let current = write.load::<HostRecord>(id).expect("load").expect("held");
+            write.update(&current, &record, change).expect("update host");
+        }
+        None => {
+            write.insert(host, &record, change).expect("insert host");
+        }
+    }
+    match write.resolve(<HostObservation as Kind>::CODE, host, home).expect("resolve") {
+        Some(id) => {
+            let current = write.load::<HostObservation>(id).expect("load").expect("held");
+            write.update(&current, &observation, change).expect("update observation");
+        }
+        None => {
+            write.insert(host, &observation, change).expect("insert observation");
+        }
+    }
+    write.commit().expect("commit");
+}
+
+/// One home's image builds on a decided store, for the tests of their readers: each is demanded
+/// and launched at this home, as its own builder, and stepped as the ImageBuild controller would
+/// step it.
+pub struct ImageBuildFixture {
+    pub home: String,
+    pub store: Arc<Mutex<Store>>,
+    pub lifecycles: Arc<dyn Lifecycles<ImageBuildKind>>,
+    pub builds: Arc<EngineImageBuilds>,
+    /// The engine's readings, serving [`Self::builds`].
+    pub reads: Arc<dyn LifecycleReads>,
+}
+
+impl ImageBuildFixture {
+    /// A fixture whose builds are demanded and built at `home`.
+    pub fn at(home: &str) -> Self {
+        Self::over(home, Arc::new(Mutex::new(crate::memory_store(home))))
+    }
+
+    /// A fixture over `store`, whose home is `home`.
+    pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
+        let only = home.to_owned();
+        Self::over_homes(home, store, move || vec![only.clone()])
+    }
+
+    /// A fixture over a daemon's decided store `service`, whose builder hosts are found at every
+    /// home it holds, as the daemon's runtime finds them: another home's Host arrives as its log
+    /// is replicated in.
+    pub fn over_service(service: &Arc<Service>) -> Self {
+        let homes = Arc::clone(service);
+        Self::over_homes(service.home(), service.store(), move || homes.homes())
+    }
+
+    fn over_homes(home: &str, store: Arc<Mutex<Store>>, homes: impl Fn() -> Vec<String> + Send + Sync + 'static) -> Self {
+        let lifecycles: Arc<dyn Lifecycles<ImageBuildKind>> =
+            Arc::new(LifecycleHome::new(home, open_home(StoreLog::new(Arc::clone(&store))).expect("image builds")));
+        let builds = Arc::new(EngineImageBuilds::new(Arc::clone(&lifecycles), Arc::clone(&store), homes));
+        let reads: Arc<dyn LifecycleReads> = Arc::new(
+            LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), home.to_owned())
+                .with_image_builds(Arc::clone(&builds) as Arc<dyn ImageBuildRecords>),
+        );
+        Self { home: home.to_owned(), store, lifecycles, builds, reads }
+    }
+
+    /// Writes host `host`'s Host record here, so a build can be demanded of it.
+    pub fn host(&self, host: &str, architecture: &str) {
+        write_host(&self.store, &self.home, host, architecture, None);
+    }
+
+    /// Demands `spec` here, as admission does, returning the build.
+    pub fn demand(&self, spec: &ImageBuildSpec) -> String {
+        let name = spec.resource_name();
+        self.builds.demand(&name, spec).expect("demand");
+        name
+    }
+
+    /// The builds this home demands, by name.
+    pub fn demands(&self) -> Vec<String> {
+        demands_at(Arc::clone(&self.store), &self.home)
+    }
+
+    /// Launches demanded build `name` here, as its builder's launcher would.
+    pub fn launch(&self, name: &str) {
+        let spec = self.builds.demanded(name).expect("read").expect("demanded");
+        let demand = demand_of(&spec, Ref::new(spec.host_ref.clone(), self.home.clone())).expect("demand");
+        self.lifecycles.request(name, launch_of(name, &demand), Timestamp::from_datetime(&Utc::now())).expect("launch");
+    }
+
+    /// Demands `spec` and launches it here, returning the build.
+    pub fn put(&self, spec: &ImageBuildSpec) -> String {
+        let name = self.demand(spec);
+        self.launch(&name);
+        name
+    }
+
+    /// Ends build `name`'s newest launch as `ending` says, building it first where the ending
+    /// needs a built image.
+    pub fn finish(&self, name: &str, ending: Ending<'_>) {
+        let launch = self.lifecycles.newest_launch(name).expect("launched");
+        let realised = matches!(launch.state(), LifecycleState::Realised { .. });
+        let launch = launch.name().to_owned();
+        let realise = |identity: &str| {
+            if !realised {
+                self.step(&launch, Step::Realised { identity: identity.to_owned() });
+            }
+        };
+        match ending {
+            Ending::Ready(identity) => self.step(&launch, Step::Realised { identity: identity.to_owned() }),
+            Ending::Lost(identity) => {
+                realise(identity);
+                self.step(&launch, Step::Vanished { cause: VanishCause::lost() });
+            }
+            Ending::Failed(reason) => {
+                realise("built");
+                self.step(&launch, Step::Vanished { cause: VanishCause::Failed { reason: reason.into() } });
+            }
+            Ending::Released => self.step(&launch, Step::Released),
+            Ending::GaveUp(cause) => {
+                self.step(&launch, Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Refused, cause), retryable: false }))
+            }
+        }
+    }
+
+    /// Poisons the store's lock, so every read through it fails.
+    pub fn poison(&self) {
+        flotilla_store_testkit::poison_mutex(Arc::clone(&self.store));
+    }
+
+    fn step(&self, launch: &str, step: Step) {
+        self.lifecycles.step(launch, &step, Timestamp::from_datetime(&Utc::now())).expect("image build step");
     }
 }

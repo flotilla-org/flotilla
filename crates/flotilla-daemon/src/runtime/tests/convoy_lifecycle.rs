@@ -1,5 +1,5 @@
 use super::*;
-use crate::testkits::engine::engine;
+use crate::testkits::engine::{admit_convoy, engine};
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 
@@ -511,8 +511,8 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     let temp = TempDir::new().expect("tempdir");
     let authority_root = flotilla_protocol::NodeId::new("authority-root");
     let checkout_root = flotilla_protocol::NodeId::new("checkout-root");
-    let authority = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(authority_root.clone());
-    let checkout_host = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(checkout_root.clone());
+    let authority = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(authority_root);
+    let checkout_host = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(checkout_root);
     let authority_config_base = temp.path().join("authority-config");
     fs::create_dir_all(&authority_config_base).expect("config directory");
     fs::write(authority_config_base.join("daemon.toml"), "machine_id = \"checkout-authority-evidence-test\"\n").expect("daemon config");
@@ -520,69 +520,88 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     let authority_daemon = daemon_with_backend(Vec::new(), config, authority.clone()).await;
     let repository_key = flotilla_resources::RepositoryKey("repo-a".to_string());
 
-    let convoys = authority.clone().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(
-            &flotilla_resources::InputMeta::builder().name("cross-host".to_string()).build(),
-            &ConvoySpec::builder()
-                .workflow_ref("review-and-fix".to_string())
-                .repositories(vec![ConvoyRepositorySpec::builder()
-                    .url("https://github.com/flotilla-org/flotilla".to_string())
-                    .repo_ref(repository_key.clone())
-                    .source_ref("feature/cross-host".to_string())
-                    .target_ref("main".to_string())
-                    .workspace_slug("flotilla".to_string())
-                    .subpaths(Vec::new())
-                    .build()])
-                .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "checkout-b".to_string())]))
-                .build(),
-        )
-        .await
-        .expect("create authority convoy");
-    // The engine holds the adopted checkout for the convoy at checkout host B; the convoy
-    // authority A reads B's records as B's log reaches it (one store here).
-    let at_checkout_host = flotilla_provisioning_testkit::CheckoutFixture::at("checkout-root");
-    let at_authority = flotilla_provisioning_testkit::CheckoutFixture::over("authority-root", Arc::clone(&at_checkout_host.store));
-    authority_daemon.install_lifecycle_reads(at_authority.reads.clone()).expect("authority engine reads");
-    let launch = at_checkout_host.open_convoy("cross-host");
-    let mut landing_status = ConvoyStatus {
-        phase: ConvoyPhase::Landing,
-        engine_launch: Some(launch),
+    // A's engine readings, which read every home's records in its decided store.
+    engine(&authority_daemon);
+    // Checkout host B is another home of A's decided store: each home's log reaches the other.
+    let decided = authority_daemon.decided_store().expect("authority decided store");
+    let checkout_home = flotilla_provisioning_testkit::other_home_for(&decided, "checkout-root");
+    let at_checkout_host = flotilla_provisioning_testkit::CheckoutFixture::over("checkout-root", checkout_home.service().store());
+
+    // The convoy, admitted at authority A, its coder owing a decision ledger.
+    let status = ConvoyStatus {
         workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
             cascade: None,
             stall_nudges: Default::default(),
             supervision: None,
             exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
             turn_delivery: Default::default(),
-            vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
+            vessels: vec![VesselRequirement::builder()
+                .name("work".to_string())
+                .crew(vec![CrewSpec::builder()
+                    .role("coder".to_string())
+                    .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("coder")])
+                    .source(CrewSource::Tool { command: "true".to_string() })
+                    .build()])
+                .build()],
         }),
-        work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),
         observed_workflow_ref: Some("review-and-fix".to_string()),
         ..Default::default()
     };
-    landing_status.branch_subject_scan_at = Some(chrono::Utc::now());
-    landing_status.discover_subject(
-        flotilla_protocol::Subject {
-            kind: flotilla_protocol::SubjectKind::ChangeRequest,
-            source: flotilla_protocol::provider_data::IssueSource {
-                service: "github.com".to_string(),
-                scope: "flotilla-org/flotilla".to_string(),
+    let spec = ConvoySpec::builder()
+        .workflow_ref("review-and-fix".to_string())
+        .repositories(vec![ConvoyRepositorySpec::builder()
+            .url("https://github.com/flotilla-org/flotilla".to_string())
+            .repo_ref(repository_key.clone())
+            .source_ref("feature/cross-host".to_string())
+            .target_ref("main".to_string())
+            .workspace_slug("flotilla".to_string())
+            .subpaths(Vec::new())
+            .build()])
+        .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "checkout-b".to_string())]))
+        .build();
+    let convoy_name = admit_convoy(&authority_daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, "cross-host", spec, status)).await;
+    // Its branch's change request is linked and its work done: it lands once evidence settles it.
+    let convoys = authority_daemon.resource_backend().using::<Convoy>(NAMESPACE);
+    let engine_path = authority_daemon.convoy_engine_path();
+    let engine = engine_path.get().expect("the authority's engine convoys");
+    let admitted = convoys.get(&convoy_name).await.expect("admitted convoy");
+
+    engine
+        .link(
+            &admitted,
+            &flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: flotilla_protocol::provider_data::IssueSource {
+                    service: "github.com".to_string(),
+                    scope: "flotilla-org/flotilla".to_string(),
+                },
+                id: "1367".to_string(),
             },
-            id: "1367".to_string(),
-        },
-        flotilla_protocol::Relationship::Produces,
-        flotilla_resources::SubjectDiscoverySource::Branch,
-        chrono::Utc::now(),
-    );
-    convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &landing_status)
+            flotilla_resources::SubjectDiscoverySource::Branch,
+            "operator",
+        )
         .await
-        .expect("mark authority convoy Landing");
-    checkout_host
-        .replica_writer::<Convoy>(authority_root, NAMESPACE)
-        .replace(&convoys.list().await.expect("list authority convoys"), chrono::Utc::now())
+        .expect("link the branch's change request");
+    engine
+        .keep_by_verdict(
+            &admitted,
+            &flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None },
+            "operator",
+            "done",
+        )
         .await
-        .expect("replicate Landing convoy to checkout host");
+        .expect("work done");
+    flotilla_store::note_convoy(
+        &engine_path,
+        &convoys,
+        &convoy_name,
+        &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: chrono::Utc::now() },
+    )
+    .await
+    .expect("branch scanned");
+    assert_eq!(convoys.get(&convoy_name).await.expect("landing convoy").status.expect("status").phase, ConvoyPhase::Landing);
+    // A's launch reaches B, which holds its adopted checkout for it.
+    flotilla_provisioning_testkit::replicate_home(&decided, decided.home(), checkout_home.service());
 
     let git_repo = TestGitRepo::init(temp.path().join("checkout")).with_initial_commit();
     let spec = CheckoutSpec::Observed(ResourceObservedCheckoutSpec {
@@ -592,7 +611,11 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
         host_ref: "checkout-host".to_string(),
         is_main: false,
     });
-    let launch = at_checkout_host.put_ready("checkout-b", &spec, Some(&at_checkout_host.holder("cross-host")));
+    let launch = at_checkout_host.put_ready(
+        "checkout-b",
+        &spec,
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy_name.clone())),
+    );
 
     // #3710: the PR observation is replicated before checkout inspection; gh
     // supplies only merge time/base metadata, never the landing state or SHA.
@@ -639,8 +662,6 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     // convoy authority as that home's log does.
     {
         use flotilla_resources::engine_records::EngineRecords;
-        let target = authority_daemon.decided_store().expect("authority decided store");
-        let checkout_home = flotilla_provisioning_testkit::other_home_for(&target, "checkout-root");
         let observations = flotilla_provisioning::engine::observations::EngineObservations::open(
             Arc::clone(checkout_home.service()),
             Arc::new(flotilla_resources::SystemClock),
@@ -661,23 +682,46 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
             let status = serde_json::to_value(record.status.expect("CR status")).expect("CR status value");
             observations.set_status("ChangeRequest", name, status).await.expect("CR status at its home");
         }
-        checkout_home.replicate_to(&target);
     }
-    let current = convoys.get("cross-host").await.expect("get Landing convoy");
-    let reconciler = ConvoyReconciler::new().with_lifecycle_reads(at_authority.reads.clone()).with_change_requests(
-        authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
-        authority_daemon.change_request_stale_after(),
-    );
-    let dependencies = reconciler.prepare(&current).await.expect("consume replicated checkout evidence");
-    let outcome = reconciler.reconcile(&current, &dependencies, chrono::Utc::now());
-    let patch = outcome.patch.expect("fresh replicated evidence should settle the convoy");
-    flotilla_store::apply_status_patch(&convoys, "cross-host", &patch).await.expect("persist Landed phase");
-
-    assert_eq!(convoys.get("cross-host").await.expect("settled convoy").status.expect("convoy status").phase, ConvoyPhase::Landed,);
+    // B's checkout and its observations reach A as B's log does.
+    checkout_home.replicate_to(&decided);
+    let reconciler = ConvoyReconciler::new()
+        .with_engine(Arc::clone(&engine_path))
+        .with_lifecycle_reads(authority_daemon.lifecycle_reads())
+        .with_change_requests(
+            authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
+            authority_daemon.change_request_stale_after(),
+        );
+    // Fresh replicated evidence settles it: the reconciler observes the branch's change request,
+    // one edge a pass as the controller runs it, then delivers the launch.
+    let mut current = convoys.get(&convoy_name).await.expect("get Landing convoy");
+    for _ in 0..4 {
+        reconciler.prepare(&current).await.expect("consume replicated checkout evidence");
+        current = convoys.get(&convoy_name).await.expect("get convoy");
+        if engine.delivered(&current).is_some() {
+            break;
+        }
+    }
+    if engine.delivered(&current).is_none() {
+        let explained = authority_daemon
+            .execute_query(
+                Command::builder()
+                    .action(CommandAction::QueryExplainConvoy { namespace: Some(NAMESPACE.to_string()), name: convoy_name.clone() })
+                    .build(),
+                uuid::Uuid::new_v4(),
+            )
+            .await;
+        panic!("fresh replicated evidence should deliver the convoy: {explained:?}");
+    }
+    assert_eq!(convoys.get(&convoy_name).await.expect("settled convoy").status.expect("convoy status").phase, ConvoyPhase::Landed);
     {
-        use flotilla_resources::checkout_records::CheckoutRecords as _;
         assert!(
-            at_authority.checkouts.here().expect("authority-local checkouts").is_empty(),
+            authority_daemon
+                .lifecycle_reads()
+                .checkouts()
+                .and_then(|checkouts| checkouts.here())
+                .expect("authority-local checkouts")
+                .is_empty(),
             "convoy authority A must not re-author or write the replicated checkout",
         );
     }
@@ -731,6 +775,29 @@ async fn sqlite_stage4a_flow_reaches_running_and_completes_convoy() {
     )
     .await;
     run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::Retain).await;
+}
+
+#[tokio::test]
+async fn deleting_a_live_convoy_ends_it_and_releases_its_vessel_checkout_and_sessions() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_default_dir = temp.path().join("flotilla-repos");
+    let git_repo =
+        TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
+    let repo = git_repo.path().to_path_buf();
+    let config_base = temp.path().join("config");
+    fs::create_dir_all(&config_base).expect("config directory");
+    fs::write(config_base.join("daemon.toml"), "machine_id = \"delete-live-convoy-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(config_base));
+    config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
+    let daemon = daemon_with_backend_runner_and_change_requests(
+        vec![repo.clone()],
+        Arc::clone(&config),
+        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        Arc::new(Stage4aGitRunner { inner: Arc::new(NoPrProcessRunner), upstream: repo.clone() }),
+        Some(Arc::new(FakeChangeRequest::new())),
+    )
+    .await;
+    run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::DeleteLive).await;
 }
 
 #[tokio::test]

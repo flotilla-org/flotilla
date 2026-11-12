@@ -5,15 +5,14 @@ use flotilla_resources::{
     RepositorySpec,
 };
 
-// Every own-reconciler shape follows the same engine sequence while old phase remains stale; an
-// Environment and a Clone have no old status, and their readers see the engine's reading through
-// their ports.
-// Draw all kinds, every old phase, success/loss/release and empty/Unicode refusal causes.
+// A Clone, a Checkout and an Environment follow the same engine sequence, and their readers see the
+// engine's reading through their ports. (ImageBuild's sequence is the controller's, in
+// `image_build.rs`.)
+// Draw all kinds, success/loss/release and empty/Unicode refusal causes.
 #[hegel::test]
 fn lifecycle_phases_and_endings_override_old_status(tc: hegel::TestCase) {
     use hegel::generators as gs;
-    let kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
-    let phase = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+    let kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
     let ending = match tc.draw(gs::integers::<usize>().min_value(0).max_value(4)) {
         0 => Ending::Ready("/work"),
         1 => Ending::Lost("/work"),
@@ -25,19 +24,7 @@ fn lifecycle_phases_and_endings_override_old_status(tc: hegel::TestCase) {
         match kind {
             0 => assert_clone_lifecycle(ending),
             1 => assert_checkout_lifecycle(ending),
-            2 => assert_environment_lifecycle(ending),
-            _ => {
-                super::image_build::assert_image_lifecycle(
-                    [
-                        flotilla_resources::ImageBuildPhase::Queued,
-                        flotilla_resources::ImageBuildPhase::Building,
-                        flotilla_resources::ImageBuildPhase::Built,
-                        flotilla_resources::ImageBuildPhase::Failed,
-                    ][phase % 4],
-                    ending,
-                )
-                .await
-            }
+            _ => assert_environment_lifecycle(ending),
         }
     });
 }

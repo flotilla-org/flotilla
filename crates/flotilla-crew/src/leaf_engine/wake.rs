@@ -15,9 +15,11 @@ use flotilla_resources::{
     address::{leaf_address, leaf_for, record_name, subject_address},
     checkout_records::{latest_launches, CheckoutChange, CheckoutRecord},
     clone_records::{launched, CloneChange, CloneRecord},
-    instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest, CheckoutSpec,
-    ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyPhase, CrewWorkPhase, Forge, InstantiatedExit, LeafMaker, ResourceError,
-    ResourceObject, RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
+    instantiate_exit, instantiate_turn_delivery,
+    promises::{PromiseKind, PromiseState},
+    select_convoy_children, subject_relationship_conflicts, ChangeRequest, CheckoutSpec, ControllerRetry, ControllerRetryDisposition,
+    Convoy, ConvoyPhase, CrewWorkPhase, Forge, InstantiatedExit, LeafMaker, ResourceError, ResourceObject, RetryCeiling, StatusPatch,
+    TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
 };
 use flotilla_store::{
     controller::{SecondaryWatch, WorkQueueSender},
@@ -745,6 +747,39 @@ impl ReconcilerWake {
                         episode_key: EpisodeKeyFields::default(),
                     });
                 }
+                // A submitted PR promise is kept or broken by its record's state:
+                // that record's change wakes the controller to observe it.
+                for submission in status
+                    .promises
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .flatten()
+                    .filter(|promise| promise.kind == PromiseKind::Pr && promise.state == PromiseState::Submitted)
+                    .filter_map(|promise| promise.submissions.last())
+                {
+                    let Some(address) = submission.subject_address(&forges).ok() else { continue };
+                    let Some(leaf_address @ LeafAddress::ChangeRequest { .. }) = leaf_for(&address).ok() else { continue };
+                    if let Some(name) = record_name(&address) {
+                        inputs.insert(name);
+                    }
+                    for literal in ["merged", "closed"] {
+                        desired.push(LeafSubscriptionRow {
+                            id: uuid::Uuid::nil(),
+                            namespace: namespace.to_string(),
+                            leaves: vec![Leaf {
+                                address: leaf_address.clone(),
+                                field_path: ".state".into(),
+                                operator: LeafOperator::Equal,
+                                literal: literal.into(),
+                            }],
+                            watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
+                            maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
+                            freshness_demand: None,
+                            created_at: Utc::now(),
+                            episode_key: EpisodeKeyFields::default(),
+                        });
+                    }
+                }
                 continue;
             }
             // Instantiation failure disables caching, but settlement still runs
@@ -763,12 +798,21 @@ impl ReconcilerWake {
             } else {
                 #[cfg(test)]
                 views.settlement_evaluations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The launch's vessel records, whose ends discharge an unread checkout.
+                let launch_vessels = if status.engine_launch.is_some() {
+                    let (reads, name) = (Arc::clone(&self.subscriptions.inner.lifecycle_reads), convoy.metadata.name.clone());
+                    tokio::task::spawn_blocking(move || reads.vessels()?.of_convoy(&name))
+                        .await
+                        .map_err(|error| format!("vessel readings: {error}"))??
+                } else {
+                    Vec::new()
+                };
                 // Use the same evaluator as the controller. Reuse the child
                 // selections above without cloning their resource bodies again.
                 let settlement = flotilla_resources::evaluate_landing_settlement(
                     convoy,
-                    &convoy_vessels,
                     &checkouts,
+                    &launch_vessels,
                     &observed_change_requests,
                     &forges,
                     self.subscriptions.change_request_stale_after(),

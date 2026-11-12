@@ -45,9 +45,6 @@ pub struct CrewNoun {
     /// Machine-readable settlement answer declared by the brief
     #[arg(long)]
     pub disposition: Option<String>,
-    /// Previous-generation completion pointer; accepted only for pinned legacy snapshots.
-    #[arg(long = "decision-ledger-ref", hide = true)]
-    pub decision_ledger_ref: Option<String>,
     /// Admit a ledger-less completion or failure as the connected operator principal
     #[arg(long)]
     pub force: bool,
@@ -141,7 +138,7 @@ impl CrewNoun {
         {
             return Err("promise options require crew promise, submit or retract".into());
         }
-        if promise_command && (self.force || self.message.is_some() || self.disposition.is_some() || self.decision_ledger_ref.is_some()) {
+        if promise_command && (self.force || self.message.is_some() || self.disposition.is_some()) {
             return Err("promise operations do not accept completion options".into());
         }
         if promise_command && subject.value != "retract" && self.reason.is_some() {
@@ -185,13 +182,7 @@ impl CrewNoun {
                 if stalls_scope_requested {
                     return Err("`flotilla crew stalls` is fleet-wide and does not accept crew selectors".to_string());
                 }
-                if self.message.is_some()
-                    || self.reason.is_some()
-                    || self.propose.is_some()
-                    || self.disposition.is_some()
-                    || self.decision_ledger_ref.is_some()
-                    || self.force
-                {
+                if self.message.is_some() || self.reason.is_some() || self.propose.is_some() || self.disposition.is_some() || self.force {
                     return Err("`flotilla crew stalls` does not accept completion options".to_string());
                 }
                 CommandAction::QueryCrewStalls { full: self.full }
@@ -201,7 +192,6 @@ impl CrewNoun {
                     && self.reason.is_none()
                     && self.propose.is_none()
                     && self.disposition.is_none()
-                    && self.decision_ledger_ref.is_none()
                     && !self.force =>
             {
                 if subject.value == "capabilities" {
@@ -226,22 +216,10 @@ impl CrewNoun {
                 if self.propose.is_some() {
                     return Err("--propose is only valid with `flotilla crew stall`".to_string());
                 }
-                if self
-                    .decision_ledger_ref
-                    .as_deref()
-                    .is_some_and(|reference| !(reference.starts_with("https://") || reference.starts_with("http://")))
-                {
-                    return Err("--decision-ledger-ref must use an HTTP(S) URL".to_string());
-                }
-                CommandAction::CrewComplete {
-                    context,
-                    message: self.message,
-                    disposition: self.disposition,
-                    decision_ledger_ref: self.decision_ledger_ref,
-                }
+                CommandAction::CrewComplete { context, message: self.message, disposition: self.disposition }
             }
             ("fail", SubjectInterpretation::Ordinary, None)
-                if self.reason.is_some() || self.propose.is_some() || self.disposition.is_some() || self.decision_ledger_ref.is_some() =>
+                if self.reason.is_some() || self.propose.is_some() || self.disposition.is_some() =>
             {
                 return Err("`flotilla crew fail` does not accept completion options".to_string());
             }
@@ -251,7 +229,7 @@ impl CrewNoun {
                 force: self.force,
             },
             ("stall", SubjectInterpretation::Ordinary, None) => {
-                if self.disposition.is_some() || self.decision_ledger_ref.is_some() || self.force {
+                if self.disposition.is_some() || self.force {
                     return Err("`flotilla crew stall` does not accept completion options".to_string());
                 }
                 let reason = self.reason.ok_or_else(|| "`flotilla crew stall` requires --reason".to_string())?;
@@ -352,9 +330,6 @@ impl std::fmt::Display for CrewNoun {
         }
         if let Some(disposition) = &self.disposition {
             write!(f, " --disposition {}", quote_value(disposition))?;
-        }
-        if let Some(reference) = &self.decision_ledger_ref {
-            write!(f, " --decision-ledger-ref {}", quote_value(reference))?;
         }
         if self.full {
             write!(f, " --full")?;
@@ -590,7 +565,6 @@ mod tests {
                 context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                 message: Some("ready for review".into()),
                 disposition: None,
-                decision_ledger_ref: None,
             }
         );
     }
@@ -606,44 +580,16 @@ mod tests {
                 context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                 message: Some("ready for review".into()),
                 disposition: Some("changes-pushed".into()),
-                decision_ledger_ref: None,
             }
         );
     }
 
     #[test]
-    fn complete_preserves_decision_ledger_pointer() {
+    fn complete_no_longer_takes_a_decision_ledger_pointer() {
         let url = "https://github.com/flotilla-org/flotilla/pull/1#issuecomment-2";
-        let noun = CrewNoun::try_parse_from(["crew", "complete", "--force", "--decision-ledger-ref", url]).expect("parse ledger pointer");
-        assert_eq!(
-            action(noun, Some("crew-123")),
-            CommandAction::CrewComplete {
-                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-                message: None,
-                disposition: None,
-                decision_ledger_ref: Some(url.into()),
-            }
-        );
-    }
-
-    #[test]
-    fn decision_ledger_pointer_must_be_a_comment_url() {
-        let noun = CrewNoun::try_parse_from(["crew", "complete", "--force", "--decision-ledger-ref", "not-a-url"])
-            .expect("parse invalid ledger pointer");
-        assert_eq!(
-            noun.resolve_with_crew_id(Some("crew-123".into())).expect_err("invalid pointer should fail"),
-            "--decision-ledger-ref must use an HTTP(S) URL"
-        );
-    }
-
-    #[test]
-    fn unsupported_verb_error_precedes_decision_ledger_url_validation() {
-        let noun =
-            CrewNoun::try_parse_from(["crew", "list", "--decision-ledger-ref", "not-a-url"]).expect("parse unsupported ledger pointer");
-        assert_eq!(
-            noun.resolve_with_crew_id(Some("crew-123".into())).expect_err("list should reject pointer"),
-            "`flotilla crew list` does not accept completion options"
-        );
+        let error = CrewNoun::try_parse_from(["crew", "complete", "--force", "--decision-ledger-ref", url])
+            .expect_err("the ledger pointer argument is gone");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     // Completion is only ever an operator's forced verdict; a crew reports its PR with `crew submit`.

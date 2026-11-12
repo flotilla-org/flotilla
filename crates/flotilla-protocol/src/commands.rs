@@ -11,7 +11,7 @@ use crate::{
         FulfilmentListResponse, HostListResponse, HostProvidersResponse, HostStatusResponse, PersonInboxResponse, ProjectListResponse,
         RepoProvidersResponse,
     },
-    IssueRef, PlacementDecision, PrincipalRef, RepoIdentity,
+    IssueRef, PlacementDecision, RepoIdentity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,8 +381,6 @@ pub struct ExplainedDecisionLedger {
     /// Historical ledger comment only; remove at the next wire-format change.
     pub comment_url: Option<String>,
     pub missing: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub override_principal: Option<PrincipalRef>,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub completed_while_crew_active: bool,
@@ -397,6 +395,24 @@ pub struct ExplainedUnmetExpectation {
     pub reason: String,
     pub subject: String,
     pub detail: String,
+}
+
+/// An unread checkout expectation settlement dropped rather than met, and the ended vessels that
+/// let it: no vessel left could read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedDischarge {
+    pub expectation: ExplainedUnmetExpectation,
+    pub ended_vessels: Vec<ExplainedEndedVessel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedEndedVessel {
+    pub launch: String,
+    pub reading: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// RFC 3339.
+    pub ended_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +430,8 @@ pub struct ExplainedSettlement {
     pub satisfied: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmet: Vec<ExplainedUnmetExpectation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discharged: Vec<ExplainedDischarge>,
 }
 
 /// Provenance of the admitted convoy name only. Branch generation is independent.
@@ -500,8 +518,6 @@ pub struct ConvoyExplanation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ExplainedArtifact>,
     pub settlement: ExplainedSettlement,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lifecycle_mutations: Vec<ExplainedLifecycleMutation>,
 }
 
 /// One requester's account binding (#3907): which managed credential and account it selected,
@@ -607,13 +623,6 @@ pub struct ExplainedArtifact {
     pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view_url: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExplainedLifecycleMutation {
-    pub action: String,
-    pub caller: crate::CommandCaller,
-    pub at: String,
 }
 
 /// Filters for reading a daemon's host-local structured log.
@@ -1072,8 +1081,6 @@ pub enum CommandAction {
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disposition: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        decision_ledger_ref: Option<String>,
     },
     CrewFail {
         context: CrewCommandContext,
@@ -1139,10 +1146,14 @@ pub enum CommandAction {
     ProjectRefresh {
         name: String,
     },
-    /// Resolve a branch's composed image and get-or-create its ImageBuild
+    /// Resolve a branch's composed image and demand its image build
     /// (`flotilla image check`).
     ImageCheck {
         request: crate::image_check::ImageCheckRequest,
+    },
+    /// Launch a given-up image build again, at its builder (`flotilla image retry`).
+    ImageBuildRetry {
+        name: String,
     },
 
     TrackRepoPath {
@@ -1441,6 +1452,7 @@ impl Command {
             CommandAction::QueryFulfilmentList {} => "query fulfilment list",
             CommandAction::QueryImageBuild { .. } => "query image build",
             CommandAction::ImageCheck { .. } => "Checking composed image...",
+            CommandAction::ImageBuildRetry { .. } => "Retrying image build...",
             CommandAction::QueryFleetList { .. } => "query fleet list",
             CommandAction::QueryCrewStalls { .. } => "query crew stalls",
             CommandAction::QueryCrewCapabilities { .. } => "query crew capabilities",
@@ -1624,6 +1636,10 @@ pub enum CommandValue {
     FulfilmentList(Box<FulfilmentListResponse>),
     ImageCheck(Box<crate::image_check::ImageCheckReport>),
     ImageBuild(Box<crate::image_check::ImageBuildReport>),
+    /// The launch an image build retry made.
+    ImageBuildRetried {
+        launch: String,
+    },
     FleetList(Box<FleetListResponse>),
     CrewStalls(Box<CrewStallsResponse>),
     CrewCapabilities {
@@ -1892,7 +1908,6 @@ mod tests {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     message: Some("ready for review".into()),
                     disposition: Some("changes-pushed".into()),
-                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1#issuecomment-2".into()),
                 })
                 .build(),
             Command::builder()

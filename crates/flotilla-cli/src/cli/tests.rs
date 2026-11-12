@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use flotilla_protocol::{
-    commands::{ExplainedSubjectFact, ExplainedSubjectObservation},
+    commands::{ExplainedDischarge, ExplainedEndedVessel, ExplainedSubjectFact, ExplainedSubjectObservation},
     result_set::ConvoySubjectRow,
     CanonicalHostId, CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, EvidenceFreshness, ExplainedDecisionLedger,
-    ExplainedSettlement, ExplainedUnclaimedWork, FulfilmentAllocation, HostName, HostSnapshot, HostSummary, IssueSource, NodeId, NodeInfo,
-    PeerConnectionState, PlacementDecision, PlacementTargetHost, Relationship, StreamKey, Subject, SubjectKind, TopologyResponse,
-    TopologyRoute,
+    ExplainedSettlement, ExplainedUnclaimedWork, ExplainedUnmetExpectation, FulfilmentAllocation, HostName, HostSnapshot, HostSummary,
+    IssueSource, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementTargetHost, Relationship, StreamKey, Subject,
+    SubjectKind, TopologyResponse, TopologyRoute,
 };
 
 use super::{event_stream_seq, format_command_result, format_convoy_explanation_human, format_event_human, format_topology_dot};
@@ -204,7 +204,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         cascade: None,
         environment_observations: Default::default(),
         stalled: None,
-        lifecycle_mutations: Vec::new(),
         namespace: "flotilla".into(),
         convoy: "ledger".into(),
         phase: "Landing".into(),
@@ -240,7 +239,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T11:59:00Z".into()),
                 comment_url: Some("https://example.test/pull/1#prior".into()),
                 missing: false,
-                override_principal: None,
                 completed_while_crew_active: false,
                 message: Some("first turn complete".into()),
                 superseded: true,
@@ -254,7 +252,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T12:00:00Z".into()),
                 comment_url: Some("https://example.test/pull/1#comment-2".into()),
                 missing: false,
-                override_principal: None,
                 completed_while_crew_active: false,
                 message: None,
                 superseded: false,
@@ -268,7 +265,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T12:01:00Z".into()),
                 comment_url: Some("https://example.test/pull/1#orphaned".into()),
                 missing: true,
-                override_principal: None,
                 completed_while_crew_active: false,
                 message: None,
                 superseded: false,
@@ -282,13 +278,12 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T12:02:00Z".into()),
                 comment_url: None,
                 missing: true,
-                override_principal: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
                 completed_while_crew_active: true,
                 message: None,
                 superseded: false,
             },
         ],
-        settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
+        settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new(), discharged: Vec::new() },
         account_bindings: Vec::new(),
         access_deliveries: Vec::new(),
     };
@@ -409,7 +404,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         .contains("work/coder claimed_at=2026-08-21T12:00:00Z artifact=artifact/ledger comment=https://example.test/pull/1#comment-2"));
     assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (PR comment exists, decision-ledger artifact not found) comment=https://example.test/pull/1#orphaned"));
     assert!(output.contains(
-        "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (completed by flotilla/operator with --force) — completed while crew active"
+        "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (decision-ledger artifact not found) — completed while crew active"
     ));
     // #2677: the human display names durable artifact evidence with no PR comment;
     // a failed bound projection is a separate flag, never a missing ledger.
@@ -547,13 +542,33 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         unclaimed_work: Vec::new(),
         decision_ledgers: Vec::new(),
         artifacts: Vec::new(),
-        settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
-        lifecycle_mutations: Vec::new(),
+        settlement: ExplainedSettlement {
+            mode: "world_terminal".into(),
+            satisfied: true,
+            unmet: Vec::new(),
+            discharged: vec![ExplainedDischarge {
+                expectation: ExplainedUnmetExpectation {
+                    reason: "missing_status".into(),
+                    subject: "checkout/checkout-dead".into(),
+                    detail: "no inspection of the checkout has been read".into(),
+                },
+                ended_vessels: vec![ExplainedEndedVessel {
+                    launch: "triage-label-work#1".into(),
+                    reading: "Released".into(),
+                    reason: Some("released".into()),
+                    ended_at: "2026-11-12T00:00:00+00:00".into(),
+                }],
+            }],
+        },
         account_bindings: Vec::new(),
         access_deliveries: Vec::new(),
     };
 
     let output = format_convoy_explanation_human(&explanation);
+    // An unread checkout dropped rather than met is named with the vessel whose end dropped it.
+    assert!(output.contains("Discharged unread (no vessel left to read them):"), "{output}");
+    assert!(output.contains("  - missing_status: checkout/checkout-dead — no inspection of the checkout has been read"), "{output}");
+    assert!(output.contains("      triage-label-work#1 Released (released) at 2026-11-12T00:00:00+00:00"), "{output}");
     // Glue: both human surfaces print the admission diagnostic verbatim.
     assert!(output.contains(&format!("Warning: {}", explanation.warnings[0])));
     let started = super::format_command_result(&flotilla_protocol::CommandValue::ConvoyStarted {
@@ -854,7 +869,6 @@ async fn a_failed_forced_completion_is_not_retried() {
             },
             message: Some("operator verdict".into()),
             disposition: None,
-            decision_ledger_ref: None,
         },
     };
     let mut run = Box::pin(super::run_command(&daemon, command.clone(), super::OutputFormat::Json));

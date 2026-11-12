@@ -516,6 +516,8 @@ FROM "environment";
 CREATE TABLE "image_build" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "composition" TEXT NOT NULL,
   "architecture" TEXT NOT NULL CHECK ("architecture" IN ('a6', 'r6')),
   "layers" BLOB NOT NULL REFERENCES "objects" ("hash"),
@@ -603,6 +605,7 @@ CREATE TABLE "image_build" (
       END)
 ) STRICT;
 CREATE INDEX "image_build_by_composition" ON "image_build" ("composition");
+CREATE INDEX "image_build_by_launch" ON "image_build" ("launch_of", "launch");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ib', 'architecture', 'a6', 'Amd64'),
   ('ib', 'architecture', 'r6', 'Arm64'),
@@ -637,6 +640,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "image_build_view" AS SELECT
   "image_build"."id",
   "image_build"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "image_build"."launch_of") AS "launch_of",
+  "image_build"."launch",
   "image_build"."composition",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ib' AND "field" = 'architecture' AND "code" = "image_build"."architecture") AS "architecture",
   "image_build"."layers",
@@ -657,6 +662,43 @@ CREATE VIEW "image_build_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'ib' AND "field" = 'cause_category' AND "code" = "image_build"."cause_category") AS "cause_category",
   "image_build"."cause_detail"
 FROM "image_build";
+CREATE TABLE "image_build_demand" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "composition" TEXT NOT NULL,
+  "architecture" TEXT NOT NULL CHECK ("architecture" IN ('a6', 'r6')),
+  "layers" BLOB NOT NULL REFERENCES "objects" ("hash"),
+  "builder" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
+  "delivery" TEXT NOT NULL CHECK ("delivery" IN ('lo', 'rg')),
+  "delivery_repository" TEXT,
+  "reservation_cpu" INTEGER NOT NULL,
+  "reservation_disk_bytes" INTEGER NOT NULL,
+  CHECK (CASE WHEN "delivery" = 'rg'
+      THEN "delivery_repository" IS NOT NULL
+      END),
+  CHECK (CASE WHEN "delivery" = 'lo'
+      THEN "delivery_repository" IS NULL
+      END)
+) STRICT;
+CREATE INDEX "image_build_demand_by_builder" ON "image_build_demand" ("builder");
+CREATE INDEX "image_build_demand_by_composition" ON "image_build_demand" ("composition");
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('iq', 'architecture', 'a6', 'Amd64'),
+  ('iq', 'architecture', 'r6', 'Arm64'),
+  ('iq', 'delivery', 'lo', 'Local'),
+  ('iq', 'delivery', 'rg', 'Registry');
+CREATE VIEW "image_build_demand_view" AS SELECT
+  "image_build_demand"."id",
+  "image_build_demand"."version",
+  "image_build_demand"."composition",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'iq' AND "field" = 'architecture' AND "code" = "image_build_demand"."architecture") AS "architecture",
+  "image_build_demand"."layers",
+  "image_build_demand"."builder",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'iq' AND "field" = 'delivery' AND "code" = "image_build_demand"."delivery") AS "delivery",
+  "image_build_demand"."delivery_repository",
+  "image_build_demand"."reservation_cpu",
+  "image_build_demand"."reservation_disk_bytes"
+FROM "image_build_demand";
 CREATE TABLE "checkout_facts" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

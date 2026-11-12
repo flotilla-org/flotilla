@@ -37,6 +37,20 @@ struct LaunchProgress {
     since: DateTime<Utc>,
 }
 
+/// The seats this home told a person of at the unnamed operator rung, by namespace and launch.
+/// After a start it is rebuilt once per namespace from the open stall-judge attentions, which
+/// are the durable record of those stalls (#3108).
+#[derive(Default)]
+pub(super) struct OperatorTold {
+    reseeded: HashSet<String>,
+    seats: HashMap<(String, String), String>,
+}
+
+/// The seat role `stall` holds at the unnamed operator rung, if it does.
+fn at_operator(stall: &StalledCondition) -> Option<&str> {
+    (stall.rung == StallRung::Operator && stall.supervisor.is_none()).then(|| stalled_source_actor(stall).map(|(_, role)| role))?
+}
+
 struct LaunchAttention<'a> {
     attention: Option<ConvoyAttention>,
     expected_crew: &'a BTreeMap<String, BTreeMap<String, flotilla_resources::CrewWorkState>>,
@@ -566,7 +580,20 @@ impl ReconcilerWake {
             rows: &rows,
             controller_queue: controller_queue.as_ref(),
         };
+        let reseeded = self.reseed_operator_stalls(tick, convoys).await;
+        // A launch no longer judged here has ended: its seat holds no stall.
+        let gone: Vec<_> = (self.subscriptions.inner.operator_told.lock().await.seats.keys())
+            .filter(|(ns, name)| ns == namespace && !convoys.contains_key(name))
+            .map(|(_, name)| name.clone())
+            .collect();
+        for name in gone {
+            self.settle_operator_attention(namespace, &name, None).await;
+        }
         for convoy in convoys.values().map(ConvoyRead::convoy) {
+            // A stall noted again from its attention is judged from the next tick's snapshot.
+            if reseeded.contains(&convoy.metadata.name) {
+                continue;
+            }
             // Rows belong to the caller's convoy revision. A judge tick can win
             // the select before its convoy-watch wake; do not publish a new
             // episode from that stale revision. The watch will rebuild the rows.
@@ -669,6 +696,8 @@ impl ReconcilerWake {
         let StallTick { namespace, .. } = tick;
         let projects = &tick.inputs.projects;
         let Some(status) = &convoy.status else { return Ok(()) };
+        // A new turn or the launch's end may have closed a told stall since the last tick.
+        self.settle_operator_attention(namespace, &convoy.metadata.name, status.stalled.as_ref()).await;
         let Some(crew) = self.observe_convoy_crew(tick, convoy, status).await? else { return Ok(()) };
         let ConvoyCrew { sessions: selected_sessions, vessels: selected_vessels, mut obligations, holding } = crew;
         let verdict = self.judge_convoy_rows(tick, convoy, status, &selected_sessions, &selected_vessels, &mut obligations).await?;
@@ -1137,8 +1166,8 @@ impl ReconcilerWake {
             if let Some(declared) = declared_stall(status, vessel, role) {
                 // The crew's own stall note, whichever rung it has reached: its report, not the
                 // diagnostics the judge added to the note's evidence.
-                let report = status.crew_work[vessel][role].message.clone().unwrap_or_else(|| declared.evidence.clone());
-                Err((report, StallEvidenceSource::Crew))
+                let report = status.crew_work.get(vessel).and_then(|crew| crew.get(role)).and_then(|work| work.message.clone());
+                Err((report.unwrap_or_else(|| declared.evidence.clone()), StallEvidenceSource::Crew))
             } else if status.phase == ConvoyPhase::Landing
                 && status.work.get(vessel).is_some_and(|work| work.phase == WorkPhase::Complete)
                 && session.is_none_or(|session| {
@@ -1494,11 +1523,13 @@ impl ReconcilerWake {
                 .and_then(|session| self.agent_view(session))
                 .filter(|agent| matches!(agent.live_activity(), Some(AgentActivity::Idle | AgentActivity::Interrupted)))
                 .and_then(|agent| agent.reading.activity_since);
+            // A crew that declared a stall has answered its resumed turn: a seat reads Working on
+            // the engine until its supervision opens a stall record, so the declaration says so.
             let resume_grace = status
                 .crew_work
                 .get(vessel)
                 .and_then(|crew| crew.get(role))
-                .filter(|work| work.phase == CrewWorkPhase::Working)
+                .filter(|work| work.phase == CrewWorkPhase::Working && declared.is_none())
                 .and_then(|work| work.resumed_at.zip(work.resume_brief_id.as_deref()))
                 .is_some_and(|(resumed_at, brief_id)| {
                     // A missing or recreated session must not suppress
@@ -1828,9 +1859,97 @@ impl ReconcilerWake {
         };
         let fact = Fact::Stalled { convoy: convoy.metadata.name.clone(), role: role.to_owned() };
         let attention = Attention::new(fact, stall_supervision_brief(convoy, condition), condition.began_at);
-        if let Err(error) = self.subscriptions.inner.backend.attentions().raise(namespace, &attention).await {
-            tracing::warn!(convoy = %convoy.metadata.name, %role, %error, "a stall at the operator could not be told to a person");
+        match self.subscriptions.inner.backend.attentions().raise(namespace, &attention).await {
+            Ok(()) => {
+                let key = (namespace.to_owned(), convoy.metadata.name.clone());
+                self.subscriptions.inner.operator_told.lock().await.seats.insert(key, role.to_owned());
+            }
+            Err(error) => {
+                tracing::warn!(convoy = %convoy.metadata.name, %role, %error, "a stall at the operator could not be told to a person")
+            }
         }
+    }
+
+    /// Notes again, once per namespace after a start, each seat an open stall-judge attention
+    /// names: the home's notes are memory, and the attention is the stall's durable record. The
+    /// seat reads Stalled at the operator rung with the attention's text as its report, its ladder
+    /// consumed, until a new turn closes it. Returns the launches noted, whose snapshot this tick
+    /// predates the note.
+    async fn reseed_operator_stalls(&self, tick: StallTick<'_>, convoys: &HashMap<String, impl ConvoyRead>) -> HashSet<String> {
+        let StallTick { namespace, .. } = tick;
+        let mut reseeded = HashSet::new();
+        if self.subscriptions.inner.operator_told.lock().await.reseeded.contains(namespace) {
+            return reseeded;
+        }
+        let backend = &self.subscriptions.inner.backend;
+        let open = match backend.attentions().open(namespace, Some(Sender::StallJudge), None).await {
+            Ok(open) => open,
+            Err(error) => {
+                tracing::warn!(namespace, %error, "told stalls could not be read; reading them again next tick");
+                return reseeded;
+            }
+        };
+        for attention in open {
+            // Only a launch judged here is this home's to note and, later, to withdraw.
+            let Subject::ConvoyRole { convoy: name, role } = attention.subject else { continue };
+            let local =
+                tick.inputs.available_convoys.items.iter().any(|current| {
+                    current.provenance == flotilla_resources::ResourceProvenance::Local && current.object.metadata.name == name
+                });
+            let Some(convoy) = convoys.get(&name).map(ConvoyRead::convoy).filter(|_| local) else { continue };
+            self.subscriptions.inner.operator_told.lock().await.seats.insert((namespace.to_owned(), name.clone()), role.clone());
+            let Some(status) = convoy.status.as_ref().filter(|status| status.stalled.is_none()) else { continue };
+            let works: Vec<_> = status.crew_work.iter().filter(|(_, roles)| roles.contains_key(&role)).map(|(work, _)| work).collect();
+            let [work] = works.as_slice() else {
+                tracing::warn!(namespace, convoy = %name, %role, works = works.len(), "a told stall names no single seat; not noted again");
+                continue;
+            };
+            let projects = &tick.inputs.projects.items;
+            let policy = match super::supervision::supervision_policy(&tick.inputs.read_backend, namespace, convoy, projects).await {
+                Ok(policy) => policy,
+                Err(error) => {
+                    tracing::warn!(namespace, convoy = %name, %error, "a told stall's supervision could not be read; not noted again");
+                    continue;
+                }
+            };
+            let condition = StalledCondition {
+                leaves: vec![Leaf {
+                    address: LeafAddress::Work { convoy: name.clone(), work: (*work).clone() },
+                    field_path: format!(".crew.{role}.phase"),
+                    operator: LeafOperator::Equal,
+                    literal: "Done".into(),
+                }],
+                maker: Some(LeafMaker::Actor { vessel: (*work).clone(), role: role.clone() }),
+                evidence: attention.reason,
+                source: StallEvidenceSource::Crew,
+                cause: None,
+                began_at: attention.raised_at,
+                rung: StallRung::Operator,
+                supervisor: None,
+                supervision_message: None,
+                supervision_index: Some(policy.len()),
+                supervision_exhausted: true,
+                reason: None,
+                proposed_disposition: None,
+                nudge_history: Vec::new(),
+            };
+            let noted = flotilla_store::note_convoy(
+                &self.subscriptions.inner.convoy_engine,
+                &backend.clone().using::<Convoy>(namespace),
+                &name,
+                &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: Some(condition) },
+            )
+            .await;
+            match noted {
+                Ok(_) => {
+                    tracing::info!(namespace, convoy = %name, %role, "a told stall noted again after a start");
+                    reseeded.insert(name);
+                }
+                Err(error) => tracing::warn!(namespace, convoy = %name, %error, "a told stall could not be noted again"),
+            }
+        }
+        self.subscriptions.inner.operator_told.lock().await.reseeded.insert(namespace.to_owned());
+        reseeded
     }
 
     /// Writes the convoy's nudge obligations and stall condition to its home's notes; the engine's
@@ -1865,7 +1984,7 @@ impl ReconcilerWake {
             .await
             {
                 Ok(_) => {
-                    self.withdraw_operator_attention(namespace, convoy, status.stalled.as_ref(), next.as_ref()).await;
+                    self.settle_operator_attention(namespace, &convoy.metadata.name, next.as_ref()).await;
                     self.end_settled_stalls(namespace, convoy, status, next.as_ref()).await
                 }
                 Err(error) => tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "write stalled condition failed"),
@@ -1876,25 +1995,24 @@ impl ReconcilerWake {
         Ok(())
     }
 
-    /// Withdraws the attention [`Self::tell_operator`] raised for `prior`'s seat once `next` no
-    /// longer holds that seat at the operator: the stall closed, or a supervisor took it.
-    async fn withdraw_operator_attention(
-        &self,
-        namespace: &str,
-        convoy: &ResourceObject<Convoy>,
-        prior: Option<&StalledCondition>,
-        next: Option<&StalledCondition>,
-    ) {
-        fn at_operator(stall: &StalledCondition) -> Option<&str> {
-            (stall.rung == StallRung::Operator && stall.supervisor.is_none()).then(|| stalled_source_actor(stall).map(|(_, role)| role))?
-        }
-        let Some(role) = prior.and_then(at_operator) else { return };
-        if next.and_then(at_operator) == Some(role) {
-            return;
-        }
-        let subject = Subject::ConvoyRole { convoy: convoy.metadata.name.clone(), role: role.to_owned() };
-        if let Err(error) = self.subscriptions.inner.backend.attentions().clear(namespace, Sender::StallJudge, &subject).await {
-            tracing::warn!(convoy = %convoy.metadata.name, %role, %error, "a closed stall's attention could not be withdrawn");
+    /// Withdraws the attention [`Self::tell_operator`] raised for launch `name`'s seat once
+    /// `current` no longer holds that seat at the operator: the stall closed, a supervisor took
+    /// it, or the launch ended. One that could not be withdrawn is tried again next tick.
+    async fn settle_operator_attention(&self, namespace: &str, name: &str, current: Option<&StalledCondition>) {
+        let key = (namespace.to_owned(), name.to_owned());
+        let role = match self.subscriptions.inner.operator_told.lock().await.seats.get(&key) {
+            Some(role) if current.and_then(at_operator) != Some(role.as_str()) => role.clone(),
+            _ => return,
+        };
+        let subject = Subject::ConvoyRole { convoy: name.to_owned(), role: role.clone() };
+        match self.subscriptions.inner.backend.attentions().clear(namespace, Sender::StallJudge, &subject).await {
+            Ok(()) => {
+                let mut told = self.subscriptions.inner.operator_told.lock().await;
+                if told.seats.get(&key) == Some(&role) {
+                    told.seats.remove(&key);
+                }
+            }
+            Err(error) => tracing::warn!(convoy = %name, %role, %error, "a closed stall's attention could not be withdrawn"),
         }
     }
 }

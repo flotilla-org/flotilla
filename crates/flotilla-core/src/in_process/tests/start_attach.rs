@@ -3,11 +3,11 @@ use std::time::Duration;
 
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
-use flotilla_resources::{Convoy, ConvoyPhase, ConvoyStatus};
+use flotilla_resources::Convoy;
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 
-use super::support::create_identity_convoy;
+use super::support::{convoy_engine, create_identity_convoy};
 use crate::in_process::{InProcessDaemon, CONVOY_ATTACH_WAIT};
 use crate::testkits::discovery::fake_discovery;
 
@@ -31,10 +31,12 @@ async fn fixture() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir)
 // still-starting notice. A subsequently recorded failure remains an error.
 #[tokio::test(start_paused = true)]
 async fn slow_start_attach_does_not_fail() {
+    use super::support::test_engine;
+    use flotilla_resources::vessel_records::VesselStep;
     let (daemon, backend, _temp) = fixture().await;
-    create_identity_convoy(&backend, "convoy-slow", "coder", Some("flotilla")).await;
+    let slow = create_identity_convoy(&daemon, "convoy-slow", "coder", Some("flotilla")).await;
     let start = tokio::time::Instant::now();
-    let result = daemon.wait_for_convoy_attach("flotilla", "convoy-slow", "coder@flotilla").await;
+    let result = daemon.wait_for_convoy_attach("flotilla", &slow, "coder@flotilla").await;
     assert!(result.is_ok(), "healthy slow provisioning failed: {result:?}");
     assert!(start.elapsed() >= CONVOY_ATTACH_WAIT);
 
@@ -44,26 +46,17 @@ async fn slow_start_attach_does_not_fail() {
     assert!(notice.unwrap().contains("flotilla attach coder@flotilla"));
 
     let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys.get("convoy-slow").await.unwrap();
-    convoys
-        .update_status(
-            "convoy-slow",
-            &convoy.metadata.resource_version,
-            &ConvoyStatus { phase: ConvoyPhase::Failed, message: Some("placement refused".into()), ..Default::default() },
-        )
-        .await
-        .unwrap();
-    let error = daemon.wait_for_convoy_attach("flotilla", "convoy-slow", "coder@flotilla").await.unwrap_err();
+    let convoy = convoys.get(&slow).await.unwrap();
+    convoy_engine(&daemon).fail(&convoy, "operator", "placement refused").await.unwrap();
+    let error = daemon.wait_for_convoy_attach("flotilla", &slow, "coder@flotilla").await.unwrap_err();
     assert!(error.contains("placement refused"), "{error}");
-    // A failed work item must remain an error even before convoy phase rollup.
-    let convoy = convoys.get("convoy-slow").await.unwrap();
-    let mut status = ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() };
-    status.work.insert(
-        "work".into(),
-        flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Failed).message("checkout failed".into()).build(),
-    );
-    convoys.update_status("convoy-slow", &convoy.metadata.resource_version, &status).await.unwrap();
-    let error = daemon.wait_for_convoy_attach("flotilla", "convoy-slow", "coder@flotilla").await.unwrap_err();
+    // A failed work item is an error with its own message: the next launch's vessel fails, which
+    // fails its work, and so its convoy.
+    let next = create_identity_convoy(&daemon, "convoy-slow", "coder", Some("flotilla")).await;
+    let engine = test_engine(&daemon);
+    let vessel = engine.vessels.request(&next, "work", "local");
+    engine.vessels.step(&vessel, VesselStep::Failed { cause: "checkout failed".into(), retryable: false });
+    let error = daemon.wait_for_convoy_attach("flotilla", &next, "coder@flotilla").await.unwrap_err();
     assert!(error.contains("checkout failed"), "{error}");
 }
 
@@ -77,11 +70,12 @@ fn start_attach_lifecycle(tc: hegel::TestCase) {
 
     let boundary = CONVOY_ATTACH_WAIT.as_secs();
     let delay = tc.draw(gs::integers::<u64>().min_value(boundary - 1).max_value(boundary + 1));
-    let outcome = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
+    // A convoy ends on the engine and is never deleted, so the wait sees a session or a failure.
+    let outcome = tc.draw(gs::integers::<u8>().min_value(0).max_value(1));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
     runtime.block_on(async {
         let (daemon, backend, _temp) = fixture().await;
-        create_identity_convoy(&backend, "convoy-slow", "coder", Some("flotilla")).await;
+        let slow = create_identity_convoy(&daemon, "convoy-slow", "coder", Some("flotilla")).await;
         let host = daemon.local_host_id().unwrap().to_string();
         backend.using::<Host>("flotilla").create(&test_meta(&host), &HostSpec::default()).await.unwrap();
         let engine = test_engine(&daemon);
@@ -89,27 +83,14 @@ fn start_attach_lifecycle(tc: hegel::TestCase) {
         let actor = async {
             tokio::time::sleep(Duration::from_secs(delay)).await;
             let convoys = backend.using::<Convoy>("flotilla");
-            match outcome {
-                0 => {
-                    create_running_session(&engine, &env, "terminal-slow", "convoy-slow", "coder").await;
-                }
-                1 => {
-                    let convoy = convoys.get("convoy-slow").await.unwrap();
-                    convoys
-                        .update_status(
-                            "convoy-slow",
-                            &convoy.metadata.resource_version,
-                            &ConvoyStatus { phase: ConvoyPhase::Failed, message: Some("placement refused".into()), ..Default::default() },
-                        )
-                        .await
-                        .unwrap();
-                }
-                _ => {
-                    convoys.delete("convoy-slow").await.unwrap();
-                }
+            if outcome == 0 {
+                create_running_session(&engine, &env, "terminal-slow", &slow, "coder").await;
+            } else {
+                let convoy = convoys.get(&slow).await.unwrap();
+                convoy_engine(&daemon).fail(&convoy, "operator", "placement refused").await.unwrap();
             }
         };
-        let (result, ()) = tokio::join!(daemon.wait_for_convoy_attach("flotilla", "convoy-slow", "coder@flotilla"), actor);
+        let (result, ()) = tokio::join!(daemon.wait_for_convoy_attach("flotilla", &slow, "coder@flotilla"), actor);
         if delay > boundary {
             // The wait successfully yields before the later terminal/failure event.
             assert!(result.as_ref().unwrap().1.as_deref().unwrap().contains("still starting"));
@@ -120,21 +101,17 @@ fn start_attach_lifecycle(tc: hegel::TestCase) {
                 assert!(result.unwrap().0.is_some());
             }
         } else {
-            // A failure/deletion published before the deadline must remain an error.
+            // A failure published before the deadline must remain an error.
             // At exactly 60 seconds the timeout may legitimately be observed first.
             if delay < boundary {
                 assert!(result.is_err(), "{result:?}");
             }
         }
         // After the event, the same daemon resolution/wait seams must reflect reality.
-        match outcome {
-            0 => assert!(daemon.resolve_attach_command_internal("convoy-slow").await.is_ok()),
-            1 => assert!(daemon
-                .wait_for_convoy_attach("flotilla", "convoy-slow", "coder@flotilla")
-                .await
-                .unwrap_err()
-                .contains("placement refused")),
-            _ => assert!(daemon.resolve_attach_command_internal("convoy-slow").await.is_err()),
+        if outcome == 0 {
+            assert!(daemon.resolve_attach_command_internal(&slow).await.is_ok());
+        } else {
+            assert!(daemon.wait_for_convoy_attach("flotilla", &slow, "coder@flotilla").await.unwrap_err().contains("placement refused"));
         }
     });
 }
@@ -147,13 +124,13 @@ async fn start_attach_stage_uses_vessel_status() {
     use flotilla_resources::vessel_records::VesselStep;
     let (daemon, backend, _temp) = fixture().await;
     let engine = test_engine(&daemon);
-    create_identity_convoy(&backend, "convoy-slow", "coder", Some("flotilla")).await;
-    let convoy = backend.using::<Convoy>("flotilla").get("convoy-slow").await.unwrap();
+    let slow = create_identity_convoy(&daemon, "convoy-slow", "coder", Some("flotilla")).await;
+    let convoy = backend.using::<Convoy>("flotilla").get(&slow).await.unwrap();
     // Unrelated vessel failures must not contaminate this convoy's start.
     let unrelated = engine.vessels.request("other", "work", "local");
     engine.vessels.step(&unrelated, VesselStep::Failed { cause: "other refused".into(), retryable: false });
-    let launch = engine.vessels.request("convoy-slow", "work", "local");
-    let relaunch = || engine.vessels.request("convoy-slow", "work", "local");
+    let launch = engine.vessels.request(&slow, "work", "local");
+    let relaunch = || engine.vessels.request(&slow, "work", "local");
     // The engine has no Pending reading: a launch is requested in progress. Interrupted is read
     // from the crew's terminals (vessel_records' tests), which this identity convoy has none of.
     // An ended launch reads its reason, so Lost shows the reason written.
@@ -172,12 +149,16 @@ async fn start_attach_stage_uses_vessel_status() {
             let current = if failed { relaunch() } else { launch.clone() };
             engine.vessels.step(&current, step);
         }
-        let stage = daemon.convoy_start_stage("flotilla", &convoy).await;
         if failed {
-            assert!(stage.unwrap_err().contains(expected));
-        } else {
-            let stage = stage.unwrap();
-            assert!(stage.contains("pending") && stage.contains("vessel work") && stage.contains(expected), "{stage}");
+            // A failed vessel fails its work and so its convoy, and an ended convoy's vessels are
+            // listed no more: the start reads the failure, with the vessel's reason, from the convoy.
+            let status = backend.using::<Convoy>("flotilla").get(&slow).await.unwrap().status.unwrap();
+            assert_eq!(status.phase, flotilla_resources::ConvoyPhase::Failed);
+            assert!(status.work["work"].message.as_deref().is_some_and(|message| message.contains(expected)), "{status:?}");
+            continue;
         }
+        let stage = daemon.convoy_start_stage("flotilla", &convoy).await.unwrap();
+        // An admitted convoy whose work is ready to start reads Active.
+        assert!(stage.starts_with("active;") && stage.contains("vessel work") && stage.contains(expected), "{stage}");
     }
 }

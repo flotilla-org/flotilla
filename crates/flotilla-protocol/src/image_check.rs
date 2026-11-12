@@ -109,10 +109,13 @@ impl ImageBuildReportPhase {
     }
 }
 
-/// One ImageBuild as a check reports it.
+/// One image build as a check reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageBuildReport {
     pub name: String,
+    /// The newest launch at the builder, `<name>#<n>`; none while only demanded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<String>,
     pub identity: String,
     pub architecture: String,
     pub builder_host: String,
@@ -122,13 +125,15 @@ pub struct ImageBuildReport {
     /// No further change is coming without an operator: built, a recipe
     /// failure, or an infrastructure failure with no attempts left.
     pub settled: bool,
+    /// The failed tries of the launch while it is still trying.
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     pub layers: Vec<ImageLayerReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<ImageBuildFailureReport>,
-    /// The build-log artifact.
+    /// The build logs of the launch, one artifact per try: `<log_ref>-<try>`, from 1. Each
+    /// layer's probe outcome is a line of its try's log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_ref: Option<String>,
 }
@@ -145,18 +150,16 @@ pub struct ImageLayerReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ImageProbeReport {
-    /// The build has not reported this layer's probe yet.
+    /// The build has not tried this layer's probe yet.
     Pending,
-    Passed,
-    Failed {
-        reason: String,
-    },
-    NotRun,
+    /// The outcome is a line of the try's build log.
+    InBuildLog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageBuildFailureReport {
-    /// `infrastructure` or `recipe` for an actuator failure; `lifecycle` for an engine cause or ending.
+    /// `recipe` for a build that gave up, `infrastructure` while retrying or once exhausted, and
+    /// `lifecycle` for a launch that ended otherwise.
     pub class: String,
     pub reason: String,
 }

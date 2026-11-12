@@ -142,14 +142,10 @@ impl CrewActions<'_> {
     ) -> Result<u64, String> {
         let caller = caller.clone();
         let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref } = &command.action {
+        if let CommandAction::CrewComplete { context, message, disposition } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let routing = Box::pin(self.crew.resolve_crew_routing_context(context)).await.ok();
-            let result = match self
-                .crew
-                .complete(context, message.clone(), disposition.clone(), decision_ledger_ref.clone(), dispatching_principal_ref.clone())
-                .await
-            {
+            let result = match self.crew.complete(context, message.clone(), disposition.clone(), dispatching_principal_ref.clone()).await {
                 Ok(value) => {
                     if let Some(resolved) = routing {
                         let namespace = resolved.command_context.namespace.as_deref().unwrap_or("flotilla");
@@ -278,8 +274,15 @@ impl CrewActions<'_> {
         Err("ConvoyUnlink action selected the wrong handler".to_string())
     }
 
-    pub async fn execute_action_convoy_delete(&self, id: u64, command: &Command, caller: &Option<CommandCaller>) -> Result<u64, String> {
+    pub async fn execute_action_convoy_delete(
+        &self,
+        id: u64,
+        command: &Command,
+        caller: &Option<CommandCaller>,
+        dispatching_principal_ref: &Option<PrincipalRef>,
+    ) -> Result<u64, String> {
         let caller = caller.clone();
+        let dispatching_principal_ref = dispatching_principal_ref.clone();
         if let CommandAction::ConvoyDelete { namespace, name, force } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let namespace = match namespace {
@@ -287,10 +290,8 @@ impl CrewActions<'_> {
                 None => self.crew.provisioning_namespace().await,
             };
             let result = match resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
-                Ok(record_name) => match self.crew.reap(&namespace, &record_name, *force).await {
+                Ok(record_name) => match self.crew.reap(&namespace, &record_name, *force, dispatching_principal_ref.as_ref()).await {
                     Ok(()) => {
-                        // Finalizers retain an explainable convoy after delete; a fully
-                        // removed convoy has no remaining status to annotate.
                         self.crew.record_lifecycle_mutation(&namespace, &record_name, "convoy_delete", caller.as_ref());
                         CommandValue::Ok
                     }

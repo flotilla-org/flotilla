@@ -36,8 +36,8 @@ use flotilla_protocol::{
     commands::RepositoryIdentityChange, AgentOverride, Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector,
 };
 use flotilla_resources::{
-    Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectRepositoryRole,
-    ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
+    CheckoutSpec, Convoy, ConvoyEnsure, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectRepositoryRole, ProjectSpec,
+    Repository, RepositoryKey, RepositorySpec, RepositoryStatus, WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use tracing::instrument::WithSubscriber;
@@ -615,9 +615,9 @@ async fn project_refresh_accepts_every_declared_lab_forge_url_for_an_observed_ch
         assert!(matches!(result, CommandValue::ProjectRegistered { .. } | CommandValue::ProjectRefreshed { .. }), "{result:?}");
         // Each spelling describes the same physical main checkout, so refresh
         // must never see two bootstrap candidates for the aliased directory.
-        let checkouts = daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("observed checkouts");
-        assert_eq!(checkouts.items.len(), 1);
-        let CheckoutSpec::Observed(observed) = &checkouts.items[0].spec else { panic!("observed checkout") };
+        let checkouts = daemon.discovered_checkouts().all();
+        assert_eq!(checkouts.len(), 1);
+        let observed = &checkouts[0].spec;
         assert_eq!(Path::new(&observed.path), checkout.canonicalize().expect("physical checkout"));
         assert!(observed.is_main);
         let project = backend.definitions::<Project>("flotilla").get("ghostty").await.expect("project");
@@ -733,7 +733,8 @@ async fn ops_entries_materialization_scenario() {
     .expect("write scoped workflow");
     std::fs::write(
         tmp.path().join("all-code.entry"),
-        "---\nkind: workflow_template\nname: all-code\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo check\n",
+        // A crew owes a promise to be admitted on the engine, so the tool crew keeps a decision ledger.
+        "---\nkind: workflow_template\nname: all-code\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo check\n        promises:\n          - kind: decision-ledger\n            owner: verify\n",
     )
     .expect("write default-scoped workflow");
     std::fs::write(
@@ -905,8 +906,11 @@ async fn ops_entries_materialization_scenario() {
         }
     );
     assert!(matches!(ensures.get(&ensure_name).await, Err(flotilla_resources::ResourceError::NotFound { .. })));
-    assert!(
-        matches!(convoys.get(&ensured_convoy_ref).await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+    // A convoy ends on the engine and is never deleted: the torn-down standing convoy reads Abandoned.
+    let ended = convoys.get(&ensured_convoy_ref).await.expect("the ended standing convoy");
+    assert_eq!(
+        ended.status.map(|status| status.phase),
+        Some(flotilla_resources::ConvoyPhase::Abandoned),
         "removing the ops entry must tear down its live standing convoy"
     );
 
@@ -1450,7 +1454,8 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
                 .action(CommandAction::ConvoyCreate {
                     name: "identity-migrated".into(),
                     workflow_ref: "scratch".into(),
-                    inputs: Vec::new(),
+                    // Admission freezes the workflow, so its declared input is given up front.
+                    inputs: vec![("topic".into(), "identity-migrated".into())],
                     repository_url: None,
                     r#ref: None,
                     project_ref: Some("github-com-flotilla-org-andamento".into()),
@@ -1461,10 +1466,12 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
         )
         .await
         .expect("convoy create");
-    assert_eq!(
-        await_command_result(&mut rx, convoy_id).await,
-        CommandValue::ConvoyCreated { name: "identity-migrated@github-com-flotilla-org-andamento".into() }
-    );
+    let created = await_command_result(&mut rx, convoy_id).await;
+    let CommandValue::ConvoyCreated { name } = created else { panic!("convoy create: {created:?}") };
+    // Creation reports the launch it admitted under the migrated project, by its address.
+    let address = name.parse::<flotilla_address::Address>().expect("launch address");
+    assert_eq!(address.parent().map(|project| project.to_string()).as_deref(), Some("project:github-com-flotilla-org-andamento"));
+    assert_eq!(address.kind(), flotilla_address::Kind::Convoy);
 }
 
 #[tokio::test]
@@ -1923,8 +1930,7 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
         backend.clone().using::<Repository>("flotilla").get(&repository_key.to_string()).await.expect("repository should exist");
     assert_eq!(repository.spec, repository_spec);
     repository.spec.verify_key(&repository_key).expect("repository key should verify");
-    let checkouts = daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("checkout list");
-    assert_eq!(checkouts.items.len(), 1);
+    assert_eq!(daemon.discovered_checkouts().all().len(), 1);
     let project = backend.using::<Project>("flotilla").get("my-project").await.expect("project should exist");
     assert_eq!(project.spec.display_name, "My Project");
     // #2719: generated Projects leave workflow choice to the cascade.
@@ -2002,16 +2008,8 @@ async fn project_checkout_set_with_store_history(tmp: &tempfile::TempDir, with_h
         CommandValue::ProjectAdded { name: "view-only".into() }
     );
     assert!(daemon.tracked_repo_paths().await.is_empty(), "project materialization must not depend on Plane-A tracking");
-    let mut specs = daemon
-        .observed_resource_backend()
-        .using::<Checkout>("flotilla")
-        .list()
-        .await
-        .expect("checkout list")
-        .items
-        .into_iter()
-        .map(|checkout| checkout.spec)
-        .collect::<Vec<_>>();
+    let mut specs =
+        daemon.discovered_checkouts().all().into_iter().map(|checkout| CheckoutSpec::Observed(checkout.spec)).collect::<Vec<_>>();
     specs.sort_by_key(|spec| spec.target_path().map(str::to_string));
     specs
 }
@@ -2051,19 +2049,18 @@ async fn repeated_project_materialization_updates_and_retracts_worktree_observat
     checkouts.write().expect("checkout inspection lock should not be poisoned")[1].git_ref = "renamed-feature".to_string();
     execute_project_add(&daemon, &mut rx, main_path.to_string_lossy().into_owned(), None, None).await;
 
-    let observed = daemon.observed_resource_backend().using::<Checkout>("flotilla");
-    let after_update = observed.list().await.expect("updated checkout list").items;
+    let after_update = daemon.discovered_checkouts().all();
     assert_eq!(after_update.len(), 2);
-    assert!(after_update.iter().any(|checkout| {
-        matches!(&checkout.spec, CheckoutSpec::Observed(spec) if spec.path == worktree_path.to_string_lossy() && spec.r#ref == "renamed-feature")
-    }));
+    assert!(after_update
+        .iter()
+        .any(|checkout| checkout.spec.path == worktree_path.to_string_lossy() && checkout.spec.r#ref == "renamed-feature"));
 
     checkouts.write().expect("checkout inspection lock should not be poisoned").pop();
     execute_project_add(&daemon, &mut rx, main_path.to_string_lossy().into_owned(), None, None).await;
 
-    let after_removal = observed.list().await.expect("checkout list after removal").items;
+    let after_removal = daemon.discovered_checkouts().all();
     assert_eq!(after_removal.len(), 1);
-    assert!(matches!(&after_removal[0].spec, CheckoutSpec::Observed(spec) if spec.path == main_path.to_string_lossy()));
+    assert_eq!(after_removal[0].spec.path, main_path.to_string_lossy());
 }
 
 #[tokio::test]
@@ -2082,7 +2079,7 @@ async fn project_add_catalog_slug_needs_no_local_checkout() {
     let result = execute_project_add(&daemon, &mut rx, "catalog-only".to_string(), None, None).await;
 
     assert_eq!(result, CommandValue::ProjectAdded { name: "catalog-only".into() });
-    assert!(daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("checkout list").items.is_empty());
+    assert!(daemon.discovered_checkouts().all().is_empty());
     let project = backend.using::<Project>("flotilla").get("catalog-only").await.expect("project should exist");
     assert_eq!(project.spec.repositories[0].repo, key);
 }
@@ -2271,7 +2268,8 @@ async fn convoy_create_carries_project_ref() {
                 .action(CommandAction::ConvoyCreate {
                     name: "linked".into(),
                     workflow_ref: "scratch".into(),
-                    inputs: vec![],
+                    // Admission freezes the workflow, so its declared input is given up front.
+                    inputs: vec![("topic".into(), "linked".into())],
                     repository_url: None,
                     r#ref: None,
                     project_ref: Some("my-project".into()),
@@ -2282,7 +2280,7 @@ async fn convoy_create_carries_project_ref() {
         )
         .await
         .expect("execute");
-    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "linked@my-project".into() });
+    let created = await_command_result(&mut rx, id).await;
     let convoy = backend
         .using::<Convoy>("flotilla")
         .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "linked".to_string())]))
@@ -2292,6 +2290,11 @@ async fn convoy_create_carries_project_ref() {
         .into_iter()
         .next()
         .expect("convoy");
+    // Creation reports the launch it admitted, by its address in the linked project.
+    let address =
+        flotilla_resources::convoy::engine::launch_address(&"project:my-project".parse().expect("project"), &convoy.metadata.name)
+            .expect("launch address");
+    assert_eq!(created, CommandValue::ConvoyCreated { name: address.to_string() });
     assert_eq!(convoy.spec.project_ref.as_deref(), Some("my-project"));
     assert_eq!(convoy.spec.repositories.len(), 1);
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");

@@ -1182,7 +1182,7 @@ impl MessagePrimitives {
                     Ok(read.identity(stored)?.map(|(_, version)| version))
                 })
                 .map_err(|error| error.to_string())?;
-            if let Some(version) = version {
+            if let Some(version) = version.filter(|version| held(*version)) {
                 return Ok(Some((id, home, version)));
             }
         }
@@ -1201,7 +1201,8 @@ impl MessagePrimitives {
             .with_store(|store| {
                 let mut read = store.read()?;
                 for home in self.service.homes() {
-                    if read.resolve(Resource::<Message>::CODE, &id, &home)?.is_some() {
+                    let Some(stored) = read.resolve(Resource::<Message>::CODE, &id, &home)? else { continue };
+                    if read.identity(stored)?.is_some_and(|(_, version)| held(version)) {
                         return Ok(Some(home));
                     }
                 }
@@ -1226,7 +1227,7 @@ impl MessagePrimitives {
                         let ids = read.identity_page(&home, Resource::<Message>::CODE, after, 256)?;
                         for id in &ids {
                             if let Some((identity, version)) = read.identity(*id)? {
-                                if identity.name.ends_with(&suffix) {
+                                if identity.name.ends_with(&suffix) && held(version) {
                                     return Ok(Some((identity.name, identity.home, version)));
                                 }
                             }
@@ -1819,6 +1820,12 @@ impl ViewLookups for OldStoreRecords {
 /// A receipt alone leaves a message pending with no receiver, and one dropped is not delivered.
 fn delivered_to(state: &MessageState, receiver: &Receiver) -> bool {
     matches!(state, MessageState::Awaiting { receiver: delivered } | MessageState::Settled { receiver: Some(delivered) } if delivered == receiver)
+}
+
+/// Whether a message identity at `version` is held here. Version 0 is a placeholder another
+/// record's reference interned (a reply's `in_reply_to`): no event about the message has arrived.
+fn held(version: u64) -> bool {
+    version > 0
 }
 
 /// The composition root's slot for the new path: set once, at startup,

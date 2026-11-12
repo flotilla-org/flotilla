@@ -44,6 +44,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryImageBuild { .. }
         // A check's report is a CLI wait loop with no TUI effect.
         | CommandAction::ImageCheck { .. }
+        | CommandAction::ImageBuildRetry { .. }
         | CommandAction::QueryFleetList { .. }
         | CommandAction::QueryCrewStalls { .. }
         | CommandAction::QueryCrewCapabilities { .. }

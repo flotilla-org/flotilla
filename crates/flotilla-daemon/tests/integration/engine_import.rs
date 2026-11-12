@@ -245,6 +245,8 @@ struct ReadBack {
     held: BTreeMap<String, usize>,
     differences: Vec<String>,
     old_store: std::collections::BTreeSet<&'static str>,
+    /// The access deliveries whose access key names a convoy no launch here is named.
+    stranded_deliveries: usize,
 }
 
 /// Whether every kind the daemon reached the old resource store for is one the registry still
@@ -268,7 +270,16 @@ async fn read_back(store: &Path) -> ReadBack {
     let report = daemon.import_report().expect("the first start imported");
     let last = report["last_sequence"].as_u64().expect("the import's last sequence");
     let (mut created, mut held) = (BTreeMap::new(), BTreeMap::new());
-    for (kind, root) in daemon.engine_tables().await {
+    let tables = daemon.engine_tables().await;
+    let column = |rows: Vec<flotilla_protocol::table::Row>, column: &str| -> Vec<String> {
+        rows.iter().map(|row| row.get(column).and_then(Value::as_str).unwrap_or_else(|| panic!("no {column}")).to_owned()).collect()
+    };
+    let convoys: std::collections::BTreeSet<_> = column(daemon.rows(&tables["Convoy"], "").await, "resource.name").into_iter().collect();
+    let stranded_deliveries = column(daemon.rows(&tables["AccessDelivery"], "").await, "access")
+        .iter()
+        .filter(|access| flotilla_resources::access_delivery::convoy_of_access(access).is_none_or(|convoy| !convoys.contains(&convoy)))
+        .count();
+    for (kind, root) in tables {
         let name = |row: &flotilla_protocol::table::Row, column: &str| row.get(column).and_then(Value::as_str).map(str::to_owned);
         let imported: std::collections::BTreeSet<_> = daemon
             .rows(&format!("{root}.log"), "")
@@ -303,7 +314,7 @@ async fn read_back(store: &Path) -> ReadBack {
             (imported != read).then(|| format!("{kind}: the report says {imported} imported, the daemon's log created {read}"))
         })
         .collect();
-    ReadBack { report, created, held, differences, old_store }
+    ReadBack { report, created, held, differences, old_store, stranded_deliveries }
 }
 
 /// The kinds whose old rows do not add up to imported, dropped and another home's.
@@ -328,6 +339,9 @@ async fn a_daemon_started_over_an_old_store_reads_back_what_it_imported() {
     assert_eq!(read.report["outcome"], "imported", "{:#}", read.report);
     assert!(unaccounted(&read.report).is_empty(), "{:#}", read.report);
     assert!(read.differences.is_empty(), "{:?}; created {:?}", read.differences, read.created);
+    assert_eq!(read.stranded_deliveries, 0, "each imported delivery names its convoy's launch");
+    assert_eq!(read.created.get("AccessDelivery"), Some(&2));
+    assert_eq!(read.held.get("AccessDelivery"), Some(&2), "a delivery whose place is not found is held, not retired");
     assert!(only_old_kinds(&read.old_store), "the old store was reached for {:?}", read.old_store);
 }
 
@@ -360,5 +374,10 @@ async fn a_daemon_started_over_a_real_old_store_reads_back_what_it_imported() {
     println!("old store reached for: {:?}", read.old_store);
     assert!(unaccounted(&read.report).is_empty(), "rows not accounted for");
     assert!(read.differences.is_empty(), "read back differs from the report");
+    println!("access deliveries naming no convoy held here: {}", read.stranded_deliveries);
+    // A delivery whose access key names no held convoy is retired as its convoy's end, and its
+    // requester state removed, while the crew still runs.
+    assert_eq!(read.stranded_deliveries, 0, "imported AccessDeliveries name convoys not held here");
+    assert_eq!(read.held.get("AccessDelivery"), read.created.get("AccessDelivery"), "imported AccessDeliveries were retired at start");
     assert!(only_old_kinds(&read.old_store), "the old store was reached for {:?}", read.old_store);
 }

@@ -6,7 +6,7 @@ use flotilla_config::ConfigStore;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_protocol::{CliListKind, Command, CommandAction, CommandValue, HostName, RepoIdentity};
 use flotilla_resources::{
-    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, ObservedChangeRequestState,
+    ChangeRequest as ResourceChangeRequest, CheckoutSpec as ResourceCheckoutSpec, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec,
 };
 use flotilla_store::ResourceBackend;
@@ -38,21 +38,17 @@ async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
     let repository = RepositorySpec::remote("https://github.com/team/repo.git").expect("repository");
     let key = repository.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository record");
-    daemon
-        .observed_resource_backend()
-        .using::<ResourceCheckout>("flotilla")
-        .create(
-            &test_meta("observed-checkout"),
-            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                r#ref: "feature".into(),
-                path: "/tmp/repo-feature".into(),
-                repo_ref: key,
-                host_ref: "local".into(),
-                is_main: false,
-            }),
-        )
-        .await
-        .expect("observed checkout");
+    super::discover_checkout(
+        &daemon,
+        "observed-checkout",
+        ResourceObservedCheckoutSpec {
+            r#ref: "feature".into(),
+            path: "/tmp/repo-feature".into(),
+            repo_ref: key,
+            host_ref: "local".into(),
+            is_main: false,
+        },
+    );
     let change_requests = backend.using::<ResourceChangeRequest>("flotilla");
     for (name, number, state) in [("open-pr", 42, ObservedChangeRequestState::Open), ("closed-pr", 43, ObservedChangeRequestState::Closed)]
     {
@@ -218,7 +214,8 @@ async fn cli_checkout_rows_follow_engine_checkouts() {
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    let engine = super::test_engine(&daemon).checkouts;
+    let fixture = super::test_engine(&daemon);
+    let engine = &fixture.checkouts;
     let repository = RepositorySpec::remote("https://github.com/org/repo").expect("repository spec");
     let key = repository.key();
     backend
@@ -229,35 +226,28 @@ async fn cli_checkout_rows_follow_engine_checkouts() {
     let mut last_convoy = None;
     for ending in ["ready", "lost"] {
         let name = format!("checkout-{ending}");
-        let convoy_name = format!("crew-{name}");
-        backend
-            .using::<flotilla_resources::Convoy>("flotilla")
-            .create(
-                &test_meta(&convoy_name),
-                &flotilla_resources::ConvoySpec::builder()
-                    .workflow_ref("workflow".into())
-                    .adopted_checkout_refs(std::collections::BTreeMap::from([(key.clone(), name.clone())]))
-                    .build(),
-            )
-            .await
-            .expect("convoy");
-        super::support::admit_on_engine(&backend, &engine, &convoy_name).await;
+        let convoy_name = super::admit(
+            &daemon,
+            &format!("crew-{name}"),
+            flotilla_resources::ConvoySpec::builder()
+                .workflow_ref("workflow".into())
+                .adopted_checkout_refs(std::collections::BTreeMap::from([(key.clone(), name.clone())]))
+                .build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        )
+        .await;
         last_convoy = Some(convoy_name.clone());
-        daemon
-            .observed_resource_backend()
-            .using::<ResourceCheckout>("flotilla")
-            .create(
-                &test_meta(&name),
-                &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                    repo_ref: key.clone(),
-                    r#ref: "stale-observation".into(),
-                    path: "/stale".into(),
-                    host_ref: "local".into(),
-                    is_main: false,
-                }),
-            )
-            .await
-            .expect("observed shadow");
+        super::discover_checkout(
+            &daemon,
+            &name,
+            ResourceObservedCheckoutSpec {
+                repo_ref: key.clone(),
+                r#ref: "stale-observation".into(),
+                path: "/stale".into(),
+                host_ref: "local".into(),
+                is_main: false,
+            },
+        );
         let launch = engine.request(
             &name,
             &ResourceCheckoutSpec::Worktree(CheckoutWorktreeSpec {
@@ -268,7 +258,7 @@ async fn cli_checkout_rows_follow_engine_checkouts() {
                 target_path: "/work".into(),
                 clone_ref: "source".into(),
             }),
-            Some(&engine.holder(&convoy_name)),
+            Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy_name.clone())),
         );
         let rows = daemon.list_cli_items_internal(CliListKind::Checkout).await.expect("progress");
         assert_eq!(rows.items.iter().find(|row| row.reference == name).expect("row").status, "pending");

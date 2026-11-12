@@ -58,6 +58,8 @@ pub struct InMemoryRequestTopology {
     pub shutdown_tx: watch::Sender<bool>,
     /// The homes whose change streams the leader holds back.
     pub leader_stream_holds: StreamHolds,
+    /// The homes whose change streams the follower holds back.
+    pub follower_stream_holds: StreamHolds,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -436,6 +438,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
     }
     let follower_remote_router = build_remote_command_router(&follower, &follower_peer_manager);
     let leader_stream_holds = StreamHolds::default();
+    let follower_stream_holds = StreamHolds::default();
 
     let (leader_runtime_handle, _leader_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
         PeerRuntime::new(
@@ -459,6 +462,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
             None,
         )
         .with_replication_kinds(replication_kinds)
+        .with_stream_holds(follower_stream_holds.clone())
         .spawn();
 
     // Spawn the server-side client session handler BEFORE the client handshake,
@@ -525,6 +529,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
         follower_host,
         shutdown_tx,
         leader_stream_holds,
+        follower_stream_holds,
         _tasks: vec![leader_runtime_handle, follower_runtime_handle, client_session_handle],
     })
 }

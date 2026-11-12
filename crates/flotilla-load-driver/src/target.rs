@@ -42,6 +42,8 @@ pub struct ConvoyObservation {
 pub struct HomeSample {
     /// `None` for a store without a single-writer queue (in-memory stores).
     pub store: Option<StoreLoadSnapshot>,
+    /// The decided (engine) store's writes; `None` for a target without one.
+    pub decided_store: Option<StoreLoadSnapshot>,
     pub controllers: BTreeMap<String, ControllerLoadSnapshot>,
     pub replication: ReplicationLoadSnapshot,
     /// Time from a convoy's admission at another home until it arrived here.

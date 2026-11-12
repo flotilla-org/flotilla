@@ -1,6 +1,6 @@
 //! Narrow ports the replication engine needs from its host.
 //!
-//! The engine writes replicas into the host's local stores, filters relayed
+//! The engine writes replicas into the host's local store, filters relayed
 //! records by the host's node identity, reports per-kind health, and reads
 //! peers through one of two peer sources: a direct peer store, or a routed
 //! resource watch supplied by the host's command transport.
@@ -11,20 +11,18 @@ use flotilla_protocol::{CommandValue, NodeId, ResourceReadEnvelope};
 use flotilla_resources::{DigestQuery, PartitionDigest, ReplicaCursor};
 use flotilla_store::{load_metrics::ReplicationLoadMetrics, ResourceBackend};
 
-use crate::ReplicationStore;
-
-/// The local side of replication: node identity, target stores and health.
+/// The local side of replication: node identity, target store and health.
 #[derive(Clone)]
 pub struct ReplicationHost {
     node_id: NodeId,
-    stores: LocalStores,
+    store: ResourceBackend,
     health: Arc<dyn ReplicationHealth>,
     metrics: Arc<ReplicationLoadMetrics>,
 }
 
 impl ReplicationHost {
-    pub fn new(node_id: NodeId, stores: LocalStores, health: Arc<dyn ReplicationHealth>) -> Self {
-        Self { node_id, stores, health, metrics: Arc::default() }
+    pub fn new(node_id: NodeId, store: ResourceBackend, health: Arc<dyn ReplicationHealth>) -> Self {
+        Self { node_id, store, health, metrics: Arc::default() }
     }
 
     /// Record snapshots, lag resets, stream failures and applied events into
@@ -43,8 +41,9 @@ impl ReplicationHost {
         &self.node_id
     }
 
-    pub fn stores(&self) -> &LocalStores {
-        &self.stores
+    /// The durable store that receives replicas.
+    pub fn store(&self) -> &ResourceBackend {
+        &self.store
     }
 
     pub fn health(&self) -> &dyn ReplicationHealth {
@@ -52,29 +51,9 @@ impl ReplicationHost {
     }
 }
 
-/// Local target stores that receive replicas.
-///
-/// Durable desired state and the observed read view replicate separately:
-/// see [`ReplicationStore`].
-#[derive(Clone, Debug)]
-pub struct LocalStores {
-    pub durable: ResourceBackend,
-    pub observed: ResourceBackend,
-}
-
-impl LocalStores {
-    pub fn backend(&self, store: ReplicationStore) -> &ResourceBackend {
-        match store {
-            ReplicationStore::Durable => &self.durable,
-            ReplicationStore::Observed => &self.observed,
-        }
-    }
-}
-
 /// Per-peer, per-kind replication health reported to the host.
 ///
-/// `kind` is the health key: the resource kind, prefixed with `observed/` for
-/// observed-store replication.
+/// `kind` is the health key: the resource kind.
 #[async_trait::async_trait]
 pub trait ReplicationHealth: Send + Sync {
     /// A new peer generation started; earlier failures for the peer are stale.
@@ -98,7 +77,7 @@ pub struct PeerSources {
 /// Opening is called after each retry backoff with the latest socket path, so
 /// it should be cheap and must not cache a dead connection.
 pub trait DirectPeerConnector: Send + Sync {
-    fn connect(&self, socket: &Path, store: ReplicationStore) -> Result<ResourceBackend, String>;
+    fn connect(&self, socket: &Path) -> Result<ResourceBackend, String>;
 }
 
 /// A routed peer reached through the host's command transport, used when no
@@ -117,7 +96,7 @@ pub trait RoutedPeer: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutedWatchRequest {
     pub namespace: String,
-    /// Store-qualified kind path, for example `convoys` or `observed/checkouts`.
+    /// Kind path, for example `convoys`.
     pub kind: String,
     /// Stream the peer's replica sources (relay) instead of its local log.
     pub replica_sources: bool,

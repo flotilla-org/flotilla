@@ -126,14 +126,28 @@ fn delivered() -> serde_json::Value {
 
 fn failed() -> serde_json::Value {
     let mut spec = delivered();
+    // One record per (access, place): the failed delivery is at another place.
+    spec["place"] = "env-b".into();
     spec["retry"] = serde_json::json!({"need": "account", "attempts": 7, "error": "permanent, not retried: refused", "next_at": i64::MAX});
     spec
 }
 
-// Behaviour (ADR 0047): every old record of this home imports, whatever it recorded, and reads
-// back from the engine as the old spec it was; another home's is left to that home.
+/// The launch `demo` imported as at `alpha`; no other convoy imported.
+fn demo_launch(home: &str, convoy: &str) -> Option<String> {
+    (home == "alpha" && convoy == "demo").then(|| "demo#4".to_owned())
+}
+
+/// The name of the imported record of `spec`, its key naming the launch `demo#4`.
+fn imported_name(spec: &serde_json::Value) -> String {
+    let access = access_delivery::with_convoy(spec["access"].as_str().expect("access"), "demo#4").expect("a key");
+    access_delivery::record_name(&access, spec["place"].as_str().expect("place"))
+}
+
+// Behaviour (ADR 0047, #3108): every old record of this home whose convoy imported is written
+// under that convoy's launch, named for its rewritten key, and reads back as the old spec it was
+// otherwise; another home's is left to that home.
 #[test]
-fn every_record_of_this_home_imports_and_reads_back() {
+fn every_record_of_this_home_imports_under_its_convoys_launch() {
     let mut report = ImportReport::default();
     let copies = [
         copy("flotilla", "access-a", "alpha", delivered()),
@@ -141,12 +155,39 @@ fn every_record_of_this_home_imports_and_reads_back() {
         copy("flotilla", "access-c", "beta", delivered()),
     ];
     let mut target = flotilla_engine_store::Import::in_memory("alpha", access_delivery::registry().expect("registry")).expect("target");
-    import_access_deliveries(&copies, &mut target, &mut report);
+    import_access_deliveries(&copies, demo_launch, &mut target, &mut report);
     assert!(report.refused.is_empty(), "{:?}", report.refused);
     assert_eq!(report.imported.get(&("AccessDelivery", "delivered")), Some(&1));
     assert_eq!(report.imported.get(&("AccessDelivery", "retrying")), Some(&1));
-    assert!(target.holds::<AccessDeliverySpec>("access-b", "alpha").expect("holds"));
+    let name = imported_name(&failed());
+    assert!(target.holds::<AccessDeliverySpec>(&name, "alpha").expect("holds"));
+    assert!(!target.holds::<AccessDeliverySpec>("access-b", "alpha").expect("holds"), "the old name is not written");
+    let mut read = target.store().read().expect("read");
+    let id = read.resolve(<AccessDeliverySpec as flotilla_schema::Kind>::CODE, &name, "alpha").expect("resolve").expect("held");
+    let held = read.load::<AccessDeliverySpec>(id).expect("load").expect("held").value;
+    let mut old: AccessDeliverySpec = serde_json::from_value(failed()).expect("spec");
+    old.access = "flotilla/demo#4/implement/coder".into();
+    assert_eq!(held, old);
+    assert_eq!(access_delivery::convoy_of_access(&held.access).as_deref(), Some("demo#4"));
+    drop(read);
     assert!(!target.holds::<AccessDeliverySpec>("access-c", "beta").expect("holds"));
+}
+
+// Behaviour (#3108): a delivery whose convoy did not import, or whose key names no convoy, is
+// dropped and counted by its reason: its controller would find no launch for it.
+#[test]
+fn a_delivery_whose_convoy_did_not_import_is_dropped() {
+    let mut elsewhere = delivered();
+    elsewhere["access"] = "flotilla/ended/implement/coder".into();
+    let mut keyless = delivered();
+    keyless["access"] = "opaque".into();
+    let copies = [copy("flotilla", "access-a", "alpha", elsewhere), copy("flotilla", "access-b", "alpha", keyless)];
+    let mut report = ImportReport::default();
+    let mut target = flotilla_engine_store::Import::in_memory("alpha", access_delivery::registry().expect("registry")).expect("target");
+    import_access_deliveries(&copies, demo_launch, &mut target, &mut report);
+    assert!(report.imported.is_empty() && report.refused.is_empty(), "{report:?}");
+    assert_eq!(report.dropped.get(&("AccessDelivery", "its convoy was not imported at its home")), Some(&1));
+    assert_eq!(report.dropped.get(&("AccessDelivery", "its access key names no convoy")), Some(&1));
 }
 
 // Behaviour: a deleted copy is dropped and counted, and a name one home holds in two namespaces,
@@ -155,11 +196,12 @@ fn every_record_of_this_home_imports_and_reads_back() {
 fn a_deleted_copy_is_dropped_and_a_name_in_two_namespaces_is_refused() {
     let mut deleted = copy("flotilla", "gone", "alpha", delivered());
     deleted.object.metadata.deletion_timestamp = Some(chrono::Utc::now());
-    let copies = [deleted, copy("one", "twice", "alpha", delivered()), copy("two", "twice", "alpha", failed())];
+    let copies = [deleted, copy("one", "twice", "alpha", delivered()), copy("two", "twice", "alpha", delivered())];
     let mut report = ImportReport::default();
     let mut target = flotilla_engine_store::Import::in_memory("alpha", access_delivery::registry().expect("registry")).expect("target");
-    import_access_deliveries(&copies, &mut target, &mut report);
+    import_access_deliveries(&copies, demo_launch, &mut target, &mut report);
     assert_eq!(report.dropped.get(&("AccessDelivery", "deleted")), Some(&1));
     assert!(report.imported.is_empty());
-    assert_eq!(report.refused.iter().map(|refusal| refusal.record.as_str()).collect::<Vec<_>>(), ["twice", "twice"]);
+    let twice = imported_name(&delivered());
+    assert_eq!(report.refused.iter().map(|refusal| refusal.record.as_str()).collect::<Vec<_>>(), [twice.as_str(), twice.as_str()]);
 }

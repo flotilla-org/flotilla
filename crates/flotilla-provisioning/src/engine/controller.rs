@@ -8,7 +8,9 @@
 //!   already there and loses one that is gone;
 //! - a commit of a resource of its kind here: a new request is realised;
 //! - a commit of a record a resource depends on ([`Actuator::dependencies`]): an input becoming
-//!   ready re-runs a failed attempt, and a holder ending releases the resource;
+//!   ready re-runs a failed attempt, and a holder ending releases the resource. A dependency named
+//!   `<of>` follows every launch `<of>#<n>`, so a resource can depend on a launch kind's newest
+//!   launch before it exists;
 //! - the facts a request waits on reporting it usable again ([`Actuator::usability`]): its
 //!   provider's readiness, an input's realisation;
 //! - a record blocking a release changing ([`Actuator::release_blockers`]), such as a checkout
@@ -445,7 +447,10 @@ where
             match followed {
                 Followed::Changed(identity) if identity.kind == self.code && identity.home == home => touch(&identity.name, Trigger::Own),
                 Followed::Changed(identity) => {
-                    for name in self.dependents.get(&identity).into_iter().flatten() {
+                    // A launch (`<of>#<n>`) also touches what depends on `<of>`: its newest launch.
+                    let of = Identity { name: super::launched(&identity.name).to_owned(), ..identity.clone() };
+                    let launch_of = (of != identity).then_some(&of);
+                    for name in [Some(&identity), launch_of].into_iter().flatten().filter_map(|key| self.dependents.get(key)).flatten() {
                         touch(name, Trigger::Dependency);
                     }
                 }

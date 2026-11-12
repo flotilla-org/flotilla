@@ -86,6 +86,11 @@ impl EngineRecords for MessageRecords {
         self.list(kind).await
     }
 
+    /// The one record `name` names, its receiver's home's.
+    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        Ok(self.get(kind, name).await?.into_iter().collect())
+    }
+
     async fn apply(
         &self,
         _kind: &str,

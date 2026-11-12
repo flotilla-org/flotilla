@@ -286,6 +286,7 @@ pub async fn build_plan(
         | CommandAction::QueryFulfilmentList {}
         | CommandAction::QueryImageBuild { .. }
         | CommandAction::ImageCheck { .. }
+        | CommandAction::ImageBuildRetry { .. }
         | CommandAction::QueryFleetList { .. }
         | CommandAction::QueryCrewStalls { .. }
         | CommandAction::QueryCrewCapabilities { .. }

@@ -1325,9 +1325,25 @@ async fn launch_at(backend: &ResourceBackend, home: &EngineHome, name: &str, sta
     launch
 }
 
-/// Admits `name` with `spec` and exit `exit`, its coder owing a decision ledger, starts the
-/// coder, and keeps its ledger: the launch is Landing. Returns the launch.
+/// [`landing_launch_with_vessel`], its vessel then released: the checkout it never made is
+/// discharged, so only the exit table decides settlement. Returns the launch.
 async fn landing_launch(backend: &ResourceBackend, home: &EngineHome, name: &str, spec: ConvoySpec, exit: ExitDeclaration) -> String {
+    let (launch, vessel) = landing_launch_with_vessel(backend, home, name, spec, exit).await;
+    home.engine.vessels.step(&vessel, VesselStep::Released);
+    assert_eq!(home.view(backend, &launch).await.status.expect("status").phase, ConvoyPhase::Landing);
+    launch
+}
+
+/// Admits `name` with `spec` and exit `exit`, its coder owing a decision ledger, starts the
+/// coder, and keeps its ledger: the launch is Landing, its vessel live. Returns the launch and
+/// its vessel.
+async fn landing_launch_with_vessel(
+    backend: &ResourceBackend,
+    home: &EngineHome,
+    name: &str,
+    spec: ConvoySpec,
+    exit: ExitDeclaration,
+) -> (String, String) {
     let mut status = ledger_owed();
     status.workflow_snapshot.as_mut().expect("workflow").exit = Some(exit);
     let launch = home.admit(name, spec, status).await;
@@ -1336,7 +1352,7 @@ async fn landing_launch(backend: &ResourceBackend, home: &EngineHome, name: &str
     home.seat(backend, &launch, (&vessel, "work"), ("coder", &session), CrewWorkPhase::Working).await;
     home.keep(backend, &launch, "work", "coder").await;
     assert_eq!(home.view(backend, &launch).await.status.expect("status").phase, ConvoyPhase::Landing);
-    launch
+    (launch, vessel)
 }
 
 /// The convoy reconciler over `home`'s engine, woken by `table`, observing change requests

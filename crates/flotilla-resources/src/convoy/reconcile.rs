@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
@@ -6,15 +6,17 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     expected_change_request_leaves, expected_checkout_refs, instantiate_exit, Convoy, ConvoyPhase, CrewCompletionRefusalCause,
-    InstantiatedExit, VesselRequirement, WorkPhase, WorkflowSnapshot,
+    InstantiatedExit, VesselRequirement, WorkflowSnapshot,
 };
 use crate::{
     address::leaf_record_name,
     checkout_records::CheckoutRecord,
     resource::ResourceObject,
-    vessel::{Vessel, VesselPhase},
+    vessel::Vessel,
+    vessel_records::VesselRecord,
     workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ExitDeclaration},
-    ChangeRequest, ChangeRequestLeafSubject, ForgeSpec, InputValue, ObservedChangeRequestState, ThreeValue, ENSURED_FROM_ANNOTATION,
+    ChangeRequest, ChangeRequestLeafSubject, ForgeSpec, InputValue, ObservedChangeRequestState, RepositoryKey, ThreeValue,
+    ENSURED_FROM_ANNOTATION,
 };
 
 pub fn is_ensured(convoy: &ResourceObject<Convoy>) -> bool {
@@ -144,6 +146,29 @@ pub struct SettlementEvaluation {
     pub mode: SettlementMode,
     pub satisfied: bool,
     pub unmet: Vec<UnmetSettlementExpectation>,
+    /// Unread checkout expectations dropped rather than met, each with the vessels whose end let
+    /// it be dropped. ADR 0047: remove the decoder default one roll after deployment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub discharged: Vec<DischargedExpectation>,
+}
+
+/// A missing checkout expectation settlement dropped: the work is complete and every vessel of the
+/// launch that could have made a checkout of its repository has ended, so none will be made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DischargedExpectation {
+    pub expectation: UnmetSettlementExpectation,
+    pub ended_vessels: Vec<EndedVessel>,
+}
+
+/// A vessel launch whose record reads ended, and since when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndedVessel {
+    pub launch: String,
+    /// Its reading's label: Released, Lost, Failed or GaveUp.
+    pub reading: String,
+    pub reason: Option<String>,
+    pub ended_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,12 +186,13 @@ pub struct LandingSettlement {
 /// Evaluate the exact Landing settlement condition and retain the evidence for
 /// every branch that held it false. Reconciliation and diagnostics share this
 /// function so an explanation cannot drift from the condition writer. Landed
-/// preserves its recognised terminal outcome after the supporting records expire.
+/// preserves its recognised terminal outcome after the supporting records expire. `vessels` are
+/// the launch's vessel launches, ended or not: their ends are what discharge an unread checkout.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_landing_settlement(
     convoy: &ResourceObject<Convoy>,
-    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     checkouts: &BTreeMap<String, CheckoutRecord>,
+    vessels: &[VesselRecord],
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     forges: &[ForgeSpec],
     change_request_stale_after: std::time::Duration,
@@ -175,8 +201,8 @@ pub fn evaluate_landing_settlement(
 ) -> SettlementEvaluation {
     evaluate_landing_settlement_with_disposition(
         convoy,
-        vessels,
         checkouts,
+        vessels,
         change_requests,
         forges,
         change_request_stale_after,
@@ -189,8 +215,8 @@ pub fn evaluate_landing_settlement(
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_landing_settlement_with_disposition(
     convoy: &ResourceObject<Convoy>,
-    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     checkouts: &BTreeMap<String, CheckoutRecord>,
+    vessels: &[VesselRecord],
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     forges: &[ForgeSpec],
     change_request_stale_after: std::time::Duration,
@@ -199,8 +225,8 @@ pub fn evaluate_landing_settlement_with_disposition(
 ) -> LandingSettlement {
     let mut result = evaluate_exit_with_disposition(
         convoy,
-        vessels,
         checkouts,
+        vessels,
         change_requests,
         forges,
         change_request_stale_after,
@@ -220,8 +246,8 @@ pub fn evaluate_landing_settlement_with_disposition(
 #[allow(clippy::too_many_arguments)]
 fn evaluate_exit_with_disposition(
     convoy: &ResourceObject<Convoy>,
-    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     checkouts: &BTreeMap<String, CheckoutRecord>,
+    vessels: &[VesselRecord],
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     forges: &[ForgeSpec],
     change_request_stale_after: std::time::Duration,
@@ -249,20 +275,9 @@ fn evaluate_exit_with_disposition(
         };
     }
     let observed_digest = evaluate_observed_digest_anchor(convoy, checkouts, landing_evidence_stale_after, now);
-    let expected = match expected_checkout_refs(convoy) {
-        Ok(expected) => expected,
-        Err(message) => {
-            return LandingSettlement {
-                evaluation: SettlementEvaluation::builder()
-                    .mode(SettlementMode::WorldTerminal)
-                    .satisfied(false)
-                    .unmet(vec![UnmetSettlementExpectation::InvalidExpectedCheckouts { message }])
-                    .build(),
-                disposition: None,
-            };
-        }
-    };
-    let discovery_pending = !expected.is_empty()
+    let expected = expected_checkout_refs(convoy, checkouts.keys().map(String::as_str));
+    let unheld = unheld_declared_repositories(convoy, checkouts);
+    let discovery_pending = !(expected.is_empty() && unheld.is_empty())
         && convoy.status.as_ref().is_some_and(|status| {
             status.branch_subject_scan_at.is_none()
                 && status
@@ -310,13 +325,18 @@ fn evaluate_exit_with_disposition(
                 disposition: None,
             };
         }
-        InstantiatedExit::Claim => {
+        // A table with no bound subject, over no expected checkout, is the claim exit.
+        InstantiatedExit::Table(entries)
+            if !(expected.is_empty() && unheld.is_empty() && entries.iter().all(|entry| entry.leaves.is_empty())) =>
+        {
+            entries
+        }
+        InstantiatedExit::Claim | InstantiatedExit::Table(_) => {
             return LandingSettlement {
                 evaluation: SettlementEvaluation::builder().mode(SettlementMode::ClaimExit).satisfied(true).unmet(Vec::new()).build(),
                 disposition: Some("claim".to_string()),
             };
         }
-        InstantiatedExit::Table(entries) => entries,
     };
 
     let evaluate_terminal = |leaf: &Leaf| {
@@ -405,15 +425,35 @@ fn evaluate_exit_with_disposition(
     }
 
     let mut unmet = if disposition.is_some() { Vec::new() } else { table_unmet };
-    // The exit table evaluates bound and observed change requests. A present
-    // checkout without one is context, so its landed condition cannot block settlement.
+    // The exit table evaluates bound and observed change requests. A held checkout that has been
+    // realised is context, as a placed Checkout's object was on the old path, so its landed
+    // condition cannot block settlement; it stands after it ends. One not there yet (never held, or
+    // held and still being realised) holds settlement. Once the work is complete and every vessel
+    // that could have made it has ended, none will be: the expectation is discharged, and named as
+    // dropped rather than met.
+    let mut discharged = Vec::new();
+    let mut unread = |expectation: UnmetSettlementExpectation, repository: Option<&RepositoryKey>| {
+        let ended = repository.and_then(|repository| ended_readers(convoy, vessels, repository));
+        match ended {
+            Some(ended_vessels) => discharged.push(DischargedExpectation { expectation, ended_vessels }),
+            None => unmet.push(expectation),
+        }
+    };
     for name in expected {
-        if disposition.is_some() && !checkouts.contains_key(&name) && checkout_expectation_is_discharged(convoy, vessels, &name) {
-            continue;
+        match checkouts.get(&name) {
+            None => {
+                let adopted =
+                    convoy.spec.adopted_checkout_refs.iter().find(|(_, adopted)| **adopted == name).map(|(repository, _)| repository);
+                unread(UnmetSettlementExpectation::MissingCheckout { checkout: name }, adopted)
+            }
+            Some(checkout) if !checkout.is_ready() && !checkout.ended() => {
+                unread(UnmetSettlementExpectation::MissingCheckout { checkout: name }, Some(checkout.spec.repo_ref()))
+            }
+            Some(_) => {}
         }
-        if !checkouts.contains_key(&name) {
-            unmet.push(UnmetSettlementExpectation::MissingCheckout { checkout: name });
-        }
+    }
+    for repository in unheld {
+        unread(UnmetSettlementExpectation::MissingCheckout { checkout: repository.to_string() }, Some(&repository));
     }
 
     let subjects: Vec<_> = addresses
@@ -444,6 +484,7 @@ fn evaluate_exit_with_disposition(
             .mode(SettlementMode::WorldTerminal)
             .satisfied(satisfied)
             .unmet(unmet)
+            .discharged(discharged)
             .build(),
         disposition: satisfied.then_some(disposition).flatten(),
     }
@@ -510,35 +551,61 @@ fn evaluate_observed_digest_anchor(
     })
 }
 
-fn checkout_expectation_is_discharged(
-    convoy: &ResourceObject<Convoy>,
-    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-    checkout_name: &str,
-) -> bool {
-    if convoy.spec.adopted_checkout_refs.values().any(|name| name == checkout_name) {
-        return false;
-    }
-    let Some(status) = &convoy.status else { return false };
-    let mut owners = Vec::new();
-    for (work_name, work) in &status.work {
-        let Some(checkout_refs) = work.placement.as_ref().and_then(|placement| placement.fields.get("checkout_refs")) else {
-            continue;
-        };
-        let Ok(checkout_refs) = serde_json::from_value::<BTreeMap<crate::RepositoryKey, String>>(checkout_refs.clone()) else {
-            // The caller validates every placement before reaching this helper.
-            return false;
-        };
-        if checkout_refs.values().any(|name| name == checkout_name) {
-            owners.push((work_name, work));
+/// The repositories `convoy`'s frozen vessels declare a checkout of (a vessel's own scope, or every
+/// repository of the convoy) that neither an adopted ref nor a checkout in `held` stands for yet. A
+/// checkout's name is chosen only when its vessel is placed, so until then the declaration is all
+/// that says one is expected.
+fn unheld_declared_repositories(convoy: &ResourceObject<Convoy>, held: &BTreeMap<String, CheckoutRecord>) -> BTreeSet<RepositoryKey> {
+    let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else { return BTreeSet::new() };
+    let mut declared = BTreeSet::new();
+    for vessel in &snapshot.vessels {
+        match &vessel.repository_refs {
+            Some(scope) => declared.extend(scope.iter().cloned()),
+            None => declared.extend(convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone())),
         }
     }
-    !owners.is_empty()
-        && owners.into_iter().all(|(work_name, work)| {
-            work.phase == WorkPhase::Complete
-                && work_vessel(vessels, work_name).is_none_or(|vessel| {
-                    matches!(vessel.status.as_ref().map(|status| status.phase), Some(VesselPhase::Lost | VesselPhase::Failed))
-                })
+    for repository in convoy.spec.adopted_checkout_refs.keys() {
+        declared.remove(repository);
+    }
+    for checkout in held.values() {
+        declared.remove(checkout.spec.repo_ref());
+    }
+    declared
+}
+
+/// Every launch, among `vessels`, of each of `convoy`'s frozen vessels that could have read
+/// `repository` (its own scope, or every repository of the convoy), when the work is complete
+/// and each such vessel has launched and all its launches have ended; `None` otherwise. A vessel
+/// with no launch has not ended: it has not been created yet.
+fn ended_readers(convoy: &ResourceObject<Convoy>, vessels: &[VesselRecord], repository: &RepositoryKey) -> Option<Vec<EndedVessel>> {
+    let status = convoy.status.as_ref().filter(|status| status.phase == ConvoyPhase::Landing)?;
+    let snapshot = status.workflow_snapshot.as_ref()?;
+    let readers = snapshot
+        .vessels
+        .iter()
+        .filter(|vessel| match &vessel.repository_refs {
+            Some(scope) => scope.contains(repository),
+            None => convoy.spec.repositories.iter().any(|declared| &declared.repo_ref == repository),
         })
+        .map(|vessel| vessel.name.as_str())
+        .collect::<Vec<_>>();
+    if readers.is_empty() {
+        return None;
+    }
+    let mut ended = Vec::new();
+    for work in readers {
+        let launches = vessels.iter().filter(|vessel| vessel.convoy == convoy.metadata.name && vessel.work() == work).collect::<Vec<_>>();
+        if launches.is_empty() || !launches.iter().all(|launch| launch.ended()) {
+            return None;
+        }
+        ended.extend(launches.into_iter().map(|launch| EndedVessel {
+            launch: launch.name.clone(),
+            reading: launch.reading.label().to_owned(),
+            reason: launch.reading.reason(),
+            ended_at: launch.since,
+        }));
+    }
+    Some(ended)
 }
 
 /// The vessel serving `work`: its newest launch, by when it was requested. Each launch is read

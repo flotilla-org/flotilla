@@ -1,6 +1,6 @@
 use crate::StoreExt;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     marker::PhantomData,
     sync::Arc,
 };
@@ -22,9 +22,6 @@ use crate::{
 };
 
 const DELETION_FIELD: &str = "$deleted";
-
-/// Watch events an engine watch holds for a watcher that has not yet taken them.
-const ENGINE_WATCH_BUFFER: usize = 64;
 
 #[derive(Debug)]
 struct DefinitionSource<T: Resource> {
@@ -135,41 +132,36 @@ impl<T: Resource> DefinitionResolver<T> {
             Ok(feed) => feed,
             Err(error) => return Some(Err(error)),
         };
-        let (current, mut snapshots) = feed.subscribe();
+        let (current, snapshots) = feed.subscribe();
         let mut seen = SeenReads::<T>::default();
         let initial = match self.diff(&records.home(), &current, &mut seen) {
             Ok(_) => seen.reads.values().map(|(_, read)| clone_read(read)).collect(),
             Err(error) => return Some(Err(error)),
         };
-        // Driven by its own task, not by the watcher's polls, so the feed's listings are taken as
-        // they come and a slow watcher holds only its own events.
-        let resolver = Self::new(self.backend.clone(), self.namespace.clone());
-        let (events, received) = tokio::sync::mpsc::channel(ENGINE_WATCH_BUFFER);
-        tokio::spawn(async move {
-            let _feed = feed;
-            let home = records.home();
+        // Each poll converts the newest listing the watcher has not taken, so a listing published
+        // before a read is in the watcher's next events, and a slow watcher holds only its own reads.
+        let watch = EngineWatch {
+            _feed: feed,
+            snapshots,
+            seen,
+            pending: VecDeque::new(),
+            resolver: Self::new(self.backend.clone(), self.namespace.clone()),
+            home: records.home(),
+        };
+        let stream = futures::stream::unfold(watch, |mut watch| async move {
             loop {
-                let changed = tokio::select! {
-                    changed = snapshots.changed() => changed.is_ok(),
-                    () = events.closed() => false,
-                };
-                if !changed {
-                    return;
+                if let Some(event) = watch.pending.pop_front() {
+                    return Some((event, watch));
                 }
-                let snapshot = snapshots.borrow_and_update().clone();
-                let pending = match resolver.diff(&home, &snapshot, &mut seen) {
-                    Ok(pending) => pending.into_iter().map(Ok).collect(),
-                    Err(error) => vec![Err(error)],
-                };
-                for event in pending {
-                    if events.send(event).await.is_err() {
-                        return;
-                    }
+                watch.snapshots.changed().await.ok()?;
+                let snapshot = watch.snapshots.borrow_and_update().clone();
+                match watch.resolver.diff(&watch.home, &snapshot, &mut watch.seen) {
+                    Ok(events) => watch.pending.extend(events.into_iter().map(Ok)),
+                    Err(error) => watch.pending.push_back(Err(error)),
                 }
             }
-        });
-        let stream =
-            futures::stream::unfold(received, |mut received| async move { received.recv().await.map(|event| (event, received)) }).boxed();
+        })
+        .boxed();
         Some(Ok((initial, stream)))
     }
 
@@ -747,6 +739,17 @@ pub(crate) fn engine_object<T: Resource>(namespace: &str, record: EngineObject) 
 }
 
 /// What a watcher last read of each name, and the record it was read from; the built-ins have none.
+/// One watcher's place in its kind's engine listings: the reads it has converted and the events
+/// of the last listing it has not yet handed on.
+struct EngineWatch<T: Resource> {
+    _feed: std::sync::Arc<crate::engine_feed::EngineFeed>,
+    snapshots: tokio::sync::watch::Receiver<EngineSnapshot>,
+    seen: SeenReads<T>,
+    pending: VecDeque<Result<ReadWatchEvent<T>, ResourceError>>,
+    resolver: DefinitionResolver<T>,
+    home: String,
+}
+
 struct SeenReads<T: Resource> {
     reads: BTreeMap<String, (Option<RecordStamp>, ReadResourceObject<T>)>,
 }

@@ -72,12 +72,18 @@ fn ended(convoy: &ResourceObject<ResourceConvoy>) -> bool {
     convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())
 }
 
+/// When `convoy` was admitted. The engine's view says so as its start (#3108): the old store's
+/// object built from an engine record keeps no creation time and reads as the epoch.
+fn admitted_at(convoy: &ResourceObject<ResourceConvoy>) -> DateTime<Utc> {
+    convoy.status.as_ref().and_then(|status| status.started_at).unwrap_or(convoy.metadata.creation_timestamp)
+}
+
 /// A generation as [`standing::derive`] reads it: admitted at its creation, under `declared` when
 /// its admitted configuration is the role's now, and ended as its phase says, at its finish (its
 /// admission when none was recorded).
 fn generation(convoy: &ResourceObject<ResourceConvoy>, declared: &ConvoyEnsureSpec) -> Generation {
     let status = convoy.status.as_ref();
-    let admitted_at = convoy.metadata.creation_timestamp;
+    let admitted_at = admitted_at(convoy);
     let ending = status.and_then(|status| match status.phase {
         ConvoyPhase::Failed => Some(Ending::Failed),
         ConvoyPhase::Abandoned => Some(Ending::Operator),
@@ -657,7 +663,7 @@ impl EnsurePass<'_> {
                 if raise {
                     let latest = latest.expect("strikes need a generation");
                     let failure = restart_limit_reason(reading.strikes);
-                    self.raise_ensure_attention(ensure, latest, &failure, latest.metadata.creation_timestamp).await?;
+                    self.raise_ensure_attention(ensure, latest, &failure, admitted_at(latest)).await?;
                     return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
                 }
                 return Ok(None);

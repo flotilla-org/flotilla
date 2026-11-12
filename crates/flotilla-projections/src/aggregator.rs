@@ -32,20 +32,21 @@ use flotilla_protocol::{
 };
 use flotilla_resources::agent_activity::{self, AgentActivityView};
 use flotilla_resources::attentions::{Attentions, OpenAttention, Sender, Subject as AttentionSubject, HOLD_ESCALATES_AFTER};
+use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
 use flotilla_resources::environment_records::EnvironmentChange;
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
     FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError,
     ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement,
-    WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 #[cfg(test)]
-use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
-use flotilla_store::{
-    recover_local_view, recover_view, LocalViewSource as AggregatorWatchSource, ViewSource as AggregatorReplicaWatchSource,
-};
-use flotilla_store::{ReplicaReadResolver, TypedResolver};
+use flotilla_resources::{ReadResourceList, ResourceList, WatchEvent, WatchStart, WatchStream};
+#[cfg(test)]
+use flotilla_store::LocalViewSource as AggregatorWatchSource;
+use flotilla_store::ReplicaReadResolver;
+use flotilla_store::{recover_view, ViewSource as AggregatorReplicaWatchSource};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::{
     sync::{broadcast, mpsc},
@@ -87,8 +88,6 @@ pub struct AggregatorResolvers {
     durable_repositories: ReplicaReadResolver<Repository>,
     durable_vessels: ReplicaReadResolver<Vessel>,
     durable_hosts: ReplicaReadResolver<flotilla_resources::Host>,
-    observed_sessions: ReplicaReadResolver<TerminalSession>,
-    observed_checkouts: TypedResolver<Checkout>,
 }
 
 #[derive(bon::Builder)]
@@ -102,8 +101,6 @@ struct AggregatorSourceRefs<'a> {
     durable_repositories: &'a dyn AggregatorReplicaWatchSource<Repository>,
     durable_vessels: &'a dyn AggregatorReplicaWatchSource<Vessel>,
     durable_hosts: &'a dyn AggregatorReplicaWatchSource<flotilla_resources::Host>,
-    observed_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
-    observed_checkouts: &'a dyn AggregatorWatchSource<Checkout>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -212,7 +209,11 @@ pub struct Aggregator {
     convoy_ensures: BTreeMap<EnsureKey, ResourceObject<ConvoyEnsure>>,
     repositories: HashMap<RepositoryKey, ResourceObject<Repository>>,
     repository_sources: BTreeMap<RepositorySourceKey, ReadResourceObject<Repository>>,
-    observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
+    /// The checkouts this host's refresh discovered, as Checkouts in `discovered_namespace`.
+    #[builder(skip)]
+    discovered_checkouts: DiscoveredCheckouts,
+    #[builder(skip)]
+    discovered_namespace: String,
     #[builder(skip)]
     readiness_vessels: BTreeMap<RepositorySourceKey, ReadResourceObject<Vessel>>,
     /// Declared Host authority by resource name, which maps a vessel's
@@ -367,7 +368,8 @@ impl Aggregator {
             convoy_ensures: BTreeMap::new(),
             repositories: HashMap::new(),
             repository_sources: BTreeMap::new(),
-            observed_checkouts: HashMap::new(),
+            discovered_checkouts: DiscoveredCheckouts::default(),
+            discovered_namespace: String::new(),
             readiness_vessels: BTreeMap::new(),
             fulfilment_kinds: BTreeMap::new(),
             hosts: BTreeMap::new(),
@@ -415,6 +417,13 @@ impl Aggregator {
     /// Crew members show their AgentSessions, read from the decided store through `port`.
     pub fn with_agent_sessions(mut self, port: Arc<dyn crate::ports::AgentSessions>) -> Self {
         self.agent_session_port = port;
+        self
+    }
+
+    /// Checkout rows show the checkouts this host's refresh discovered, as Checkouts in `namespace`.
+    pub fn with_discovered_checkouts(mut self, discovered: DiscoveredCheckouts, namespace: &str) -> Self {
+        self.discovered_checkouts = discovered;
+        self.discovered_namespace = namespace.to_owned();
         self
     }
 
@@ -485,8 +494,6 @@ impl Aggregator {
             durable_repositories,
             durable_vessels,
             durable_hosts,
-            observed_sessions,
-            observed_checkouts,
         } = resolvers;
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(&durable_convoys)
@@ -504,8 +511,6 @@ impl Aggregator {
             .durable_repositories(&durable_repositories)
             .durable_vessels(&durable_vessels)
             .durable_hosts(&durable_hosts)
-            .observed_sessions(&observed_sessions)
-            .observed_checkouts(&observed_checkouts)
             .build();
         self.run_with_sources(sources).await
     }
@@ -521,8 +526,6 @@ impl Aggregator {
             durable_repositories,
             durable_vessels,
             durable_hosts,
-            observed_sessions,
-            observed_checkouts,
         } = sources;
         // Subscribe before any source bootstrap awaits so demand arriving
         // during recovery remains observable. Also consume the initial value
@@ -564,13 +567,14 @@ impl Aggregator {
         let mut durable_project_stream = self.recover_project_watch(durable_projects).await?;
         let mut durable_ensure_stream = self.recover_convoy_ensure_watch(durable_convoy_ensures).await?;
         let mut durable_repository_stream = self.recover_repository_watch(durable_repositories).await?;
-        let mut observed_session_stream = self.recover_observed_session_watch(observed_sessions).await?;
         // The engine's checkout commits, at every home, wake the checkout rows and readiness
         // (#3108); subscribed before the first read, so a commit between the two is not missed.
         let mut checkout_changes = self.lifecycle_reads.checkouts().ok().map(|checkouts| checkouts.changes());
         self.read_engine_checkouts();
         self.refresh_origin_hosts().await;
-        let mut observed_checkout_stream = self.recover_checkout_watch(observed_checkouts).await?;
+        // Subscribed before the first read, so a refresh between the two is not missed.
+        let mut discovered_changes = self.discovered_checkouts.changes();
+        self.rebuild_checkout_rows().await?;
         let (items, mut vessel_stream) = Self::recover_replica_watch(durable_vessels).await?;
         self.readiness_vessels = readiness_resources(items);
         let (items, mut host_stream) = Self::recover_replica_watch(durable_hosts).await?;
@@ -918,21 +922,10 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable repository watch ended")),
                 },
-                event = observed_session_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_session_read_event_from(LocalSource::Observed, event).await,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        observed_session_stream = self.recover_observed_session_watch(observed_sessions).await?;
-                    }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator observed terminal session watch ended")),
-                },
-                event = observed_checkout_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_checkout_event(event).await?,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        observed_checkout_stream = self.recover_checkout_watch(observed_checkouts).await?;
-                    }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator observed checkout watch ended")),
+                change = discovered_changes.recv() => match change {
+                    // A lagged receiver missed some changes; the rows read them all anyway.
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => self.discovered_checkouts_changed().await?,
+                    Err(broadcast::error::RecvError::Closed) => return Err(ResourceError::other("aggregator discovered checkouts ended")),
                 },
 
             }
@@ -945,15 +938,6 @@ impl Aggregator {
     ) -> Result<BoxStream<'static, Result<ReadWatchEvent<Convoy>, ResourceError>>, ResourceError> {
         let (items, watch) = Self::recover_replica_watch(resolver).await?;
         self.replace_replica_convoys(items).await;
-        Ok(watch)
-    }
-
-    async fn recover_observed_session_watch(
-        &mut self,
-        resolver: &dyn AggregatorReplicaWatchSource<TerminalSession>,
-    ) -> Result<BoxStream<'static, Result<ReadWatchEvent<TerminalSession>, ResourceError>>, ResourceError> {
-        let (items, watch) = Self::recover_replica_watch(resolver).await?;
-        self.replace_session_read_source(LocalSource::Observed, items).await;
         Ok(watch)
     }
 
@@ -1061,13 +1045,6 @@ impl Aggregator {
         }
     }
 
-    async fn recover_checkout_watch(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<Checkout>,
-    ) -> Result<WatchStream<Checkout>, ResourceError> {
-        self.list_and_watch_checkouts(resolver).await
-    }
-
     /// Reads the open attentions from the attention port, the engine's, and recomputes salience
     /// when they changed.
     async fn read_open_attentions(&mut self) {
@@ -1121,20 +1098,6 @@ impl Aggregator {
         if let Err(error) = self.rebuild_checkout_rows().await {
             debug!(%error, "could not refresh checkout orphan attention after convoy relist");
         }
-    }
-
-    async fn list_and_watch_checkouts(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<Checkout>,
-    ) -> Result<WatchStream<Checkout>, ResourceError> {
-        let (listed, watch) = recover_local_view(resolver).await?;
-        self.observed_checkouts = listed
-            .items
-            .into_iter()
-            .map(|checkout| (self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name), checkout))
-            .collect();
-        self.rebuild_checkout_rows().await?;
-        Ok(watch)
     }
 
     async fn apply_replica_convoy_event(&mut self, event: ReadWatchEvent<Convoy>) {
@@ -1959,21 +1922,7 @@ impl Aggregator {
         }
     }
 
-    async fn apply_checkout_event(&mut self, event: WatchEvent<Checkout>) -> Result<(), ResourceError> {
-        match event {
-            WatchEvent::Added(checkout) | WatchEvent::Modified(checkout) => {
-                let reference = self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name);
-                self.observed_checkouts.insert(reference, checkout);
-            }
-            WatchEvent::Deleted(checkout) => {
-                let reference = self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name);
-                self.observed_checkouts.remove(&reference);
-            }
-            WatchEvent::DeletedByName(tombstone) => {
-                let reference = self.checkout_ref(&tombstone.namespace, &tombstone.name);
-                self.observed_checkouts.remove(&reference);
-            }
-        }
+    async fn discovered_checkouts_changed(&mut self) -> Result<(), ResourceError> {
         self.rebuild_checkout_rows().await?;
         if self.rebuild_salience_projection().await {
             self.emit_awareness_result_sets().await;
@@ -2092,9 +2041,9 @@ impl Aggregator {
                 Some((view, host))
             })
             .collect::<Vec<_>>();
-        let sources = self
-            .observed_checkouts
-            .values()
+        let discovered = self.discovered_checkouts.views(&self.discovered_namespace);
+        let sources = discovered
+            .iter()
             .map(|checkout| (checkout, self.local_host.clone()))
             .chain(adopted.iter().map(|(checkout, host)| (checkout, host.clone())));
         for (checkout, host) in sources {
@@ -3262,9 +3211,10 @@ mod tests {
     use chrono::Utc;
     use flotilla_protocol::{result_set::Rows, PrincipalRef, Subject};
     use flotilla_resources::{
-        BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject, InputMeta, ObjectMeta, ObservedCheckoutSpec,
-        PlacementStatus, ProjectSpec, RepositorySpec, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
-        TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
+        discovered_checkouts::DiscoveredCheckout, BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject,
+        InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus, ProjectSpec, RepositorySpec, TerminalAttention,
+        TerminalAttentionSource, TerminalAttentionState, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+        VesselRequirement, WorkflowSnapshot,
     };
     use flotilla_store::ResourceBackend;
     use futures::stream;
@@ -4156,7 +4106,6 @@ mod tests {
     #[tokio::test]
     async fn run_bootstraps_materialization_and_subscribed_fleet_awareness() {
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement =
             Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
@@ -4202,7 +4151,7 @@ mod tests {
         let run = tokio::spawn(async move {
             Aggregator::new(run_state, HostName::new("kiwi"), event_tx)
                 .with_attach_resolver(attach_resolver)
-                .run(namespace_resolvers(&durable, &observed))
+                .run(namespace_resolvers(&durable))
                 .await
         });
 
@@ -4235,7 +4184,7 @@ mod tests {
         let _ = run.await;
     }
 
-    fn namespace_resolvers(durable: &ResourceBackend, observed: &ResourceBackend) -> AggregatorResolvers {
+    fn namespace_resolvers(durable: &ResourceBackend) -> AggregatorResolvers {
         AggregatorResolvers::builder()
             .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
             .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
@@ -4244,8 +4193,6 @@ mod tests {
             .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
             .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
             .durable_hosts(durable.including_replicas::<flotilla_resources::Host>("flotilla"))
-            .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
-            .observed_checkouts(observed.using::<Checkout>("flotilla"))
             .build()
     }
 
@@ -4268,8 +4215,7 @@ mod tests {
     async fn steady_state_delta_read_contract(definitions: bool) {
         use flotilla_store_testkit::ReadCountsBackendExt;
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
-        let (counted_durable, counted_observed) = (durable.clone().with_read_counts(), observed.clone().with_read_counts());
+        let counted_durable = durable.clone().with_read_counts();
         let convoys = durable.clone().using::<Convoy>("flotilla");
         let seed = convoy_with_vessel("convoy-a").await;
         let created = convoys.create(&InputMeta::builder().name("convoy-a".into()).build(), &seed.spec).await.expect("seed convoy");
@@ -4278,7 +4224,7 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(64);
         let run_state = state.clone();
-        let resolvers = namespace_resolvers(&counted_durable, &counted_observed);
+        let resolvers = namespace_resolvers(&counted_durable);
         let run = tokio::spawn(async move { Aggregator::new(run_state, HostName::new("kiwi"), event_tx).run(resolvers).await });
         async fn wait_for(receiver: &mut broadcast::Receiver<DaemonEvent>, name: &str) -> DaemonEvent {
             let names = |event: &DaemonEvent| match event {
@@ -4301,7 +4247,6 @@ mod tests {
         }
         wait_for(&mut event_rx, "convoy-a").await;
         let durable_bootstrap = counted_durable.read_snapshot();
-        let observed_bootstrap = counted_observed.read_snapshot();
         assert!(!durable_bootstrap.lists().is_empty(), "bootstrap lists each watched kind once");
 
         for index in 0..8 {
@@ -4348,7 +4293,6 @@ mod tests {
         // gets keep their separate zero-budget guard expected to fail.
         durable_reads.assert_no_lists("aggregator durable watches");
         durable_reads.assert_zero("aggregator durable delta emission");
-        counted_observed.read_snapshot().since(&observed_bootstrap).assert_zero("aggregator observed delta emission");
         assert!(!run.is_finished(), "the resource watches remain live");
         run.abort();
         let _ = run.await;
@@ -4856,8 +4800,6 @@ mod tests {
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(durable_convoys)
             .durable_sessions(&durable_sessions)
@@ -4866,8 +4808,6 @@ mod tests {
             .durable_repositories(&durable_repositories)
             .durable_vessels(&durable_vessels)
             .durable_hosts(&durable_hosts)
-            .observed_sessions(&observed_sessions)
-            .observed_checkouts(&observed_checkouts)
             .build();
         aggregator.run_with_sources(sources).await
     }
@@ -5245,6 +5185,24 @@ mod tests {
         aggregator.rebuild_checkout_rows().await.expect("checkout rows");
     }
 
+    /// Holds `checkouts` as this host's discovered checkouts in `flotilla`, as a refresh replaces them.
+    async fn discover_checkouts(aggregator: &mut Aggregator, checkouts: &[ResourceObject<Checkout>]) {
+        aggregator.discovered_namespace = "flotilla".to_owned();
+        let mut found = BTreeMap::<RepositoryKey, Vec<DiscoveredCheckout>>::new();
+        for checkout in checkouts {
+            let CheckoutSpec::Observed(spec) = &checkout.spec else { panic!("a discovered checkout is observed") };
+            found.entry(spec.repo_ref.clone()).or_default().push(DiscoveredCheckout {
+                name: checkout.metadata.name.clone(),
+                repo_slug: spec.repo_ref.to_string(),
+                spec: spec.clone(),
+            });
+        }
+        for (repository, found) in found {
+            aggregator.discovered_checkouts.replace(&repository, found);
+        }
+        aggregator.discovered_checkouts_changed().await.expect("checkout rows");
+    }
+
     async fn checkout_object(name: &str, path: &str, repo_ref: RepositoryKey) -> ResourceObject<Checkout> {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         backend
@@ -5305,11 +5263,14 @@ mod tests {
         let (event_tx, _) = broadcast::channel(1);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
         let repository = repository_object("https://github.com/flotilla-org/flotilla").await;
-        let mut checkout = checkout_object("orphan", "/work/orphan", repository.spec.key()).await;
-        checkout.metadata.labels.insert(CONVOY_LABEL.to_string(), "missing-convoy".to_string());
+        let checkout = checkout_object("orphan", "/work/orphan", repository.spec.key()).await;
         aggregator.apply_repository_event(WatchEvent::Added(repository)).await;
 
-        aggregator.apply_checkout_event(WatchEvent::Added(checkout)).await.expect("project orphan checkout");
+        // The engine adopted it for a convoy launch this host does not know.
+        let mut record = adopted_record("local-home", &checkout);
+        record.holder = Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy("missing-convoy#1".to_owned()));
+        aggregator.engine_namespace = "flotilla".to_owned();
+        hold_engine_checkouts(&mut aggregator, "local-home", vec![record]).await;
 
         let result = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout result set");
         let row = &result.rows.as_checkouts().expect("checkout rows")[0];
@@ -5418,13 +5379,12 @@ mod tests {
         for (_, _, repository) in &repositories {
             aggregator.apply_repository_event(WatchEvent::Added(repository.clone())).await;
         }
+        let mut checkouts = Vec::new();
         for (name, path, repository) in repositories {
             let Some(path) = path else { continue };
-            aggregator
-                .apply_checkout_event(WatchEvent::Added(checkout_object(name, path, repository.spec.key()).await))
-                .await
-                .expect("project checkout");
+            checkouts.push(checkout_object(name, path, repository.spec.key()).await);
         }
+        discover_checkouts(&mut aggregator, &checkouts).await;
         let mut reticulate_session = session_object("reticulate-scratch").await;
         reticulate_session.metadata.labels = BTreeMap::from([
             (REPO_KEY_LABEL.to_string(), reticulate_key.to_string()),
@@ -5753,8 +5713,6 @@ mod tests {
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(&durable_convoys)
             .durable_sessions(&durable_sessions)
@@ -5763,8 +5721,6 @@ mod tests {
             .durable_repositories(&durable_repositories)
             .durable_vessels(&durable_vessels)
             .durable_hosts(&durable_hosts)
-            .observed_sessions(&observed_sessions)
-            .observed_checkouts(&observed_checkouts)
             .build();
         let run = Aggregator::new(state, HostName::new("kiwi"), event_tx.clone())
             .with_attach_resolver(Arc::clone(&resolver))
@@ -6387,7 +6343,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_convoy_without_a_change_request_is_looked_up_again_when_the_records_change() {
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
         let template = convoy_with_branch("convoy-a").await;
         let convoys = durable.using::<Convoy>("flotilla");
         let created = convoys.create(&InputMeta::builder().name("convoy-a".to_string()).build(), &template.spec).await.expect("convoy");
@@ -6404,7 +6359,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(4096);
         let aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), tx)
             .with_change_request_resolver(Arc::clone(&resolver));
-        let task = tokio::spawn(aggregator.run(resource_resolvers(&durable, &observed)));
+        let task = tokio::spawn(aggregator.run(resource_resolvers(&durable)));
         let looked_up = |count: usize| {
             let resolver = Arc::clone(&resolver);
             async move {
@@ -7718,7 +7673,7 @@ mod tests {
             };
             let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attach_resolver(Arc::new(resolver));
             let object = checkout_object("same-name", "/srv/widgets", RepositoryKey("widgets".into())).await;
-            aggregator.apply_checkout_event(WatchEvent::Added(object.clone())).await.expect("local checkout");
+            discover_checkouts(&mut aggregator, std::slice::from_ref(&object)).await;
             let mut expected = [None, None];
             for (origin, op) in operations {
                 let branch = format!("branch-{op}");
@@ -7751,7 +7706,6 @@ mod tests {
     #[tokio::test]
     async fn restart_relist_removes_local_rows_missing_from_stores() {
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
         let state = AggregatorProjectionState::new();
         let stale_ref = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "deleted-during-outage");
         state.write().await.local_rows.insert(
@@ -7775,8 +7729,6 @@ mod tests {
                     .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
                     .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
                     .durable_hosts(durable.including_replicas::<flotilla_resources::Host>("flotilla"))
-                    .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
-                    .observed_checkouts(observed.using::<Checkout>("flotilla"))
                     .build(),
             ),
         );
@@ -7840,8 +7792,6 @@ mod tests {
         let durable_repositories = Arc::new(ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_sessions = Arc::new(ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let observed_checkouts = Arc::new(ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
 
@@ -7856,8 +7806,6 @@ mod tests {
                 .durable_repositories(durable_repositories.as_ref())
                 .durable_vessels(&durable_vessels)
                 .durable_hosts(&durable_hosts)
-                .observed_sessions(observed_sessions.as_ref())
-                .observed_checkouts(observed_checkouts.as_ref())
                 .build();
             Aggregator::new(run_state, HostName::new("local"), event_tx).run_with_sources(sources).await
         });
@@ -8190,7 +8138,7 @@ mod tests {
         .expect("held provider check is canceled on drop");
     }
 
-    fn resource_resolvers(d: &ResourceBackend, observed: &ResourceBackend) -> AggregatorResolvers {
+    fn resource_resolvers(d: &ResourceBackend) -> AggregatorResolvers {
         AggregatorResolvers::builder()
             .durable_convoys(d.including_replicas::<Convoy>("flotilla"))
             .durable_convoy_ensures(d.including_replicas::<ConvoyEnsure>("flotilla"))
@@ -8199,8 +8147,6 @@ mod tests {
             .durable_repositories(d.including_replicas::<Repository>("flotilla"))
             .durable_vessels(d.including_replicas::<Vessel>("flotilla"))
             .durable_hosts(d.including_replicas::<flotilla_resources::Host>("flotilla"))
-            .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
-            .observed_checkouts(observed.using::<Checkout>("flotilla"))
             .build()
     }
 
@@ -8232,7 +8178,6 @@ mod tests {
             } else {
                 ResourceBackend::new(InMemoryBackend::default())
             };
-            let observed = ResourceBackend::new(InMemoryBackend::observed());
             let sessions = durable.using::<TerminalSession>("flotilla");
             let session = session_object("terminal-probe").await;
             let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -8240,7 +8185,7 @@ mod tests {
             let state = AggregatorProjectionState::new();
             let (tx, mut rx) = broadcast::channel(4096);
             let aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver(gate.clone());
-            let resolvers = resource_resolvers(&durable, &observed);
+            let resolvers = resource_resolvers(&durable);
             let task = tokio::spawn(aggregator.run(resolvers));
             timeout(Duration::from_secs(1), async {
                 loop {

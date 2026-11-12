@@ -101,7 +101,6 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
                     &context,
                     None,
                     None,
-                    Some("https://example.test/ledger".into()),
                     Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
                 )
                 .await
@@ -204,7 +203,6 @@ async fn completion_advisory_does_not_write_claim_evidence() {
         &command_context(&held),
         None,
         None,
-        Some("https://example.test/ledger".into()),
         Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
     )
     .await

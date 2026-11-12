@@ -956,9 +956,6 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     for hold in &explanation.holds {
         let _ = writeln!(output, "Turn delivery: {} held since={}: {}", hold.source, hold.raised_at, hold.reason);
     }
-    for mutation in &explanation.lifecycle_mutations {
-        let _ = writeln!(output, "{} by {} at {}", mutation.action, mutation.caller, mutation.at);
-    }
     if let Some(message) = explanation.message.as_deref() {
         let _ = writeln!(output, "Message: {message}");
     }
@@ -1096,6 +1093,17 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             let _ = writeln!(output, "  - {}: {} — {}", unmet.reason, unmet.subject, unmet.detail);
         }
     }
+    if !explanation.settlement.discharged.is_empty() {
+        output.push_str("\nDischarged unread (no vessel left to read them):\n");
+        for discharge in &explanation.settlement.discharged {
+            let unmet = &discharge.expectation;
+            let _ = writeln!(output, "  - {}: {} — {}", unmet.reason, unmet.subject, unmet.detail);
+            for vessel in &discharge.ended_vessels {
+                let reason = vessel.reason.as_deref().map(|reason| format!(" ({reason})")).unwrap_or_default();
+                let _ = writeln!(output, "      {} {}{} at {}", vessel.launch, vessel.reading, reason, vessel.ended_at);
+            }
+        }
+    }
 
     if !explanation.unclaimed_work.is_empty() {
         output.push_str("\nCrew work needing a settlement claim:\n");
@@ -1155,16 +1163,11 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 continue;
             }
             if ledger.missing {
-                let detail = ledger.override_principal.as_ref().map_or_else(
-                    || {
-                        if ledger.comment_url.is_some() {
-                            "PR comment exists, decision-ledger artifact not found".to_string()
-                        } else {
-                            "decision-ledger artifact not found".to_string()
-                        }
-                    },
-                    |principal| format!("completed by {}/{} with --force", principal.namespace, principal.name),
-                );
+                let detail = if ledger.comment_url.is_some() {
+                    "PR comment exists, decision-ledger artifact not found"
+                } else {
+                    "decision-ledger artifact not found"
+                };
                 let _ = writeln!(
                     output,
                     "  - {}/{} claimed_at={} MISSING ({detail}){} comment={}",
@@ -1501,6 +1504,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
             image_check::format_image_check_human(&image_check::ImageCheckOutcome { report: (**report).clone(), timed_out: false })
         }
         CommandValue::ImageBuild(build) => format!("image build {}: {} (attempt {})\n", build.name, build.phase.as_str(), build.attempt),
+        CommandValue::ImageBuildRetried { launch } => format!("launched {launch}"),
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
         CommandValue::CrewStalls(stalls) => {
             if stalls.rows.is_empty() {

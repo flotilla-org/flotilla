@@ -178,8 +178,8 @@ async fn explicit_ensure_roll_readmits_current_config_and_retains_the_previous_g
 }
 
 #[tokio::test]
-async fn forced_convoy_delete_retains_force_intent_until_checkout_finalizes() {
-    ensure_scenarios::forced_convoy_delete_retains_force_intent_until_checkout_finalizes(&Controller).await;
+async fn forced_convoy_delete_ends_a_convoy_whose_checkout_is_at_risk() {
+    ensure_scenarios::forced_convoy_delete_ends_a_convoy_whose_checkout_is_at_risk(&Controller).await;
 }
 
 #[tokio::test]

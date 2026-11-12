@@ -18,6 +18,14 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
+/// What creation reports for `launch` in the namespace's own project: the launch's address.
+fn created(launch: &str) -> CommandValue {
+    let project = "project:flotilla".parse().expect("project address");
+    CommandValue::ConvoyCreated {
+        name: flotilla_resources::convoy::engine::launch_address(&project, launch).expect("launch address").to_string(),
+    }
+}
+
 async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
     backend
         .using::<Convoy>("flotilla")
@@ -211,10 +219,11 @@ async fn convoy_create_command_creates_convoy_resource() {
         .expect("execute");
 
     let result = await_command_result(&mut rx, id).await;
-    assert_eq!(result, CommandValue::ConvoyCreated { name: "my-scratch".into() });
+    let launch = convoy_record_name(&backend, "my-scratch").await;
+    assert_eq!(result, created(&launch));
 
     let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys.get(&convoy_record_name(&backend, "my-scratch").await).await.expect("convoy should exist");
+    let convoy = convoys.get(&launch).await.expect("convoy should exist");
     assert_eq!(convoy.spec.workflow_ref, "scratch");
     assert_eq!(convoy.spec.dispatching_principal_ref, PrincipalRef::implicit_for_namespace("flotilla"));
     assert_eq!(convoy.spec.inputs.len(), 1);
@@ -363,7 +372,8 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
         )
         .await
         .expect("execute");
-    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "sqlite-scratch".into() });
+    let result = await_command_result(&mut rx, id).await;
+    assert_eq!(result, created(&convoy_record_name(&backend, "sqlite-scratch").await));
 
     // Admission must publish the placement decision with the convoy. Controllers
     // can act on Added immediately; a later status patch races their writes.

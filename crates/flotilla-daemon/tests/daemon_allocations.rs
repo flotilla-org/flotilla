@@ -4,7 +4,7 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId, QueryCursor, QueryId};
-use flotilla_resources::{Convoy, ConvoySpec, ConvoyStatus, InputMeta};
+use flotilla_resources::{Convoy, ConvoySpec, ConvoyStatus};
 use flotilla_store::{ResourceBackend, ViewSnapshot, WatchView};
 use flotilla_store_memory::InMemoryBackend;
 use std::{
@@ -75,18 +75,6 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"memory-scenario\"\n").unwrap();
     let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("memory-scenario"));
-    let resolver = backend.using::<Convoy>("flotilla");
-    for i in 0..n {
-        let object = resolver
-            .create(
-                &InputMeta::builder().name(format!("convoy-{i:04}")).build(),
-                &ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
-            )
-            .await
-            .unwrap();
-        let status: ConvoyStatus = serde_json::from_value(serde_json::json!({"phase": if i % 8 == 0 { "Active" } else { "Landed" }, "message":"diagnostic ".repeat(1500), "workflow_snapshot": {"vessels": flotilla_resources::single_agent_workflow_spec().vessels}})).unwrap();
-        resolver.update_status(&object.metadata.name, &object.metadata.resource_version, &status).await.unwrap();
-    }
     eprintln!("N={n} owner=store live_delta={}", counters().0.saturating_sub(scenario_start.0));
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
@@ -99,6 +87,22 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
     .await;
     // Composed with its engine, as the runtime composes a daemon.
     flotilla_daemon_testkit::engine::engine(&daemon);
+    // The inventory is the engine's launches: one in eight active, the rest landed.
+    let path = daemon.convoy_engine_path();
+    for i in 0..n {
+        let status: ConvoyStatus = serde_json::from_value(serde_json::json!({"phase": "Active", "message":"diagnostic ".repeat(1500), "workflow_snapshot": {"vessels": flotilla_resources::single_agent_workflow_spec().vessels}})).unwrap();
+        let mut convoy = flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            &format!("convoy-{i:04}"),
+            ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
+            status,
+        );
+        convoy.metadata.name = flotilla_engine_convoys_testkit::launch(&path, convoy.clone()).await;
+        if i % 8 != 0 {
+            flotilla_engine_convoys_testkit::land(&path, &convoy).await;
+        }
+    }
+    eprintln!("N={n} owner=engine_inventory live={}", counters().0);
     eprintln!("N={n} owner=daemon live={}", counters().0);
     let mut bootstrap_events = daemon.subscribe();
     let state = daemon.aggregator_projection_state().await;
@@ -108,7 +112,7 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
         flotilla_projections::run(
             flotilla_projections::AggregatorContext {
                 durable: aggregate_daemon.resource_backend(),
-                observed: aggregate_daemon.observed_resource_backend(),
+                discovered: aggregate_daemon.discovered_checkouts(),
                 host_name: aggregate_daemon.host_name().clone(),
                 event_sink: aggregate_daemon.event_sink(),
                 events: aggregate_daemon.subscribe(),

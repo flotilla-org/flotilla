@@ -198,8 +198,9 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
         .build();
     let convoys = backend.clone().using::<Convoy>("flotilla");
     // The crew's work is kept, and the launch Landing, before its PR is bound: an operator links
-    // it as what the launch produces.
-    let launch = standard_landing(&backend, &home, "adopt-late", spec).await;
+    // it as what the launch produces. Its vessel stays live until the PR is kept: a seat whose
+    // vessel is gone would read Interrupted once the PR reopens its work.
+    let (launch, vessel) = landing_launch_with_vessel(&backend, &home, "adopt-late", spec, ExitDeclaration::standard_table()).await;
     let pr = flotilla_protocol::Subject {
         kind: flotilla_protocol::SubjectKind::ChangeRequest,
         source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
@@ -220,6 +221,21 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
     .await
     .expect("late binding should instantiate exit leaves");
     source.merged.store(true, Ordering::SeqCst);
+    // The merged PR keeps its promise; the work's checkout, never made, holds Landing until the
+    // vessel that could have made it is released.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = convoys.get(&launch).await.expect("convoy").status.expect("status");
+            let kept = status.promises.values().flat_map(|crew| crew.values()).flatten().all(|promise| promise.state.terminal());
+            if status.phase == ConvoyPhase::Landing && kept {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the merged PR keeps its promise");
+    home.engine.vessels.step(&vessel, VesselStep::Released);
     let status = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let status = convoys.get(&launch).await.expect("convoy").status.expect("status");

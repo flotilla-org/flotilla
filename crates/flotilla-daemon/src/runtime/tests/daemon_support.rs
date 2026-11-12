@@ -321,6 +321,25 @@ where
     wait_until_with_timeout(Duration::from_secs(5), condition).await;
 }
 
+/// Waits until convoy `name`'s status satisfies `reached`, naming `what` and the last status read
+/// when it never does.
+pub(super) async fn wait_for_convoy(
+    convoys: &flotilla_store::TypedResolver<Convoy>,
+    name: &str,
+    what: &str,
+    reached: impl Fn(&flotilla_resources::ConvoyStatus) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = convoys.get(name).await.ok().and_then(|convoy| convoy.status);
+        if status.as_ref().is_some_and(&reached) {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "convoy {name} never reached {what}; last status: {status:#?}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 pub(super) async fn wait_until_with_timeout<F, Fut>(timeout: Duration, mut condition: F)
 where
     F: FnMut() -> Fut,

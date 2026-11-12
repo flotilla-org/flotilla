@@ -46,7 +46,7 @@ mod overload_contract {
 mod read_pressure_contract {
     use super::*;
     use flotilla_protocol::NodeId;
-    use flotilla_replication::{replicate_kind_direct, LocalStores, ReplicationHealth, ReplicationHost, ReplicationStore};
+    use flotilla_replication::{replicate_kind_direct, ReplicationHealth, ReplicationHost};
     use flotilla_store::controller::{ControllerLoop, ReconcileOutcome, Reconciler};
     use std::{
         sync::{
@@ -134,11 +134,7 @@ mod read_pressure_contract {
             .replace(&records.list().await.unwrap(), chrono::Utc::now())
             .await
             .unwrap();
-        let host = ReplicationHost::new(
-            NodeId::new("holder"),
-            LocalStores { durable: backend.clone(), observed: backend.clone() },
-            Arc::new(Health),
-        );
+        let host = ReplicationHost::new(NodeId::new("holder"), backend.clone(), Arc::new(Health));
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let writer = sqlite.writer_for_test();
@@ -166,7 +162,7 @@ mod read_pressure_contract {
         let replicator = tokio::spawn({
             let host = host.clone();
             let peer = peer.clone();
-            async move { replicate_kind_direct::<Convoy>(remote, &host, &peer, ReplicationStore::Durable).await }
+            async move { replicate_kind_direct::<Convoy>(remote, &host, &peer).await }
         });
         tokio::time::sleep(Duration::from_millis(2300)).await;
         assert!(!controller.is_finished(), "controller must retry its read in place");

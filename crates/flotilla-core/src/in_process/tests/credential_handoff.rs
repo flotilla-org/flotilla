@@ -5,16 +5,28 @@ use std::sync::Arc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{CrewCommandContext, HostName};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, RepositoryKey, Selector,
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, RepositoryKey, Selector,
     TerminalSession as ResourceTerminalSession, VesselRequirement,
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{designate_fleet, install_engine_messages, test_engine, test_meta, SessionStagingProbe, TestEngine};
+use super::support::{admit, convoy_engine, designate_fleet, install_engine_messages, test_engine, SessionStagingProbe, TestEngine};
 use crate::in_process::{InProcessDaemon, TerminalSessionIdentity};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_provisioning_testkit::Ending;
 use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource};
+
+/// A frozen workflow of the one vessel `requirement`.
+fn snapshot(requirement: VesselRequirement) -> flotilla_resources::WorkflowSnapshot {
+    flotilla_resources::WorkflowSnapshot {
+        cascade: None,
+        stall_nudges: Default::default(),
+        supervision: None,
+        exit: None,
+        turn_delivery: Default::default(),
+        vessels: vec![requirement],
+    }
+}
 
 #[tokio::test]
 async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_reviewer() {
@@ -62,55 +74,33 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         .build();
 
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let convoy = convoys
-        .create(&test_meta("convoy-two-crew"), &ConvoySpec::builder().workflow_ref("implement-review".to_string()).build())
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![requirement.clone()],
-                }),
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([
-                        ("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
-                        ("reviewer".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
-                    ]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("active convoy");
-    let vessel = engine.vessels.request("convoy-two-crew", "work", "test-host");
+    let two_crew = admit(
+        &daemon,
+        "convoy-two-crew",
+        ConvoySpec::builder().workflow_ref("implement-review".to_string()).build(),
+        ConvoyStatus { workflow_snapshot: Some(snapshot(requirement.clone())), ..Default::default() },
+    )
+    .await;
+    let vessel = engine.vessels.request(&two_crew, "work", "test-host");
 
     let requested = CrewCommandContext {
         crew_id: None,
         namespace: Some("flotilla".to_string()),
-        convoy: Some("convoy-two-crew".to_string()),
+        convoy: Some(two_crew.clone()),
         vessel_ref: Some(vessel.clone()),
         role: Some("coder".to_string()),
     };
+    let before = convoys.get(&two_crew).await.expect("convoy").status.expect("status").crew_work;
     let error =
         daemon.crew_handoff_internal(&requested, "reviewer", "Please review the implementation.").await.expect_err("missing anchor");
     assert!(error.contains("no active session to anchor"), "{error}");
-    let status = convoys.get("convoy-two-crew").await.expect("convoy").status.expect("status");
-    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    let status = convoys.get(&two_crew).await.expect("convoy").status.expect("status");
+    assert_eq!(status.crew_work, before, "a refused handoff changes no crew's work");
     assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Pending);
 
     let coder_identity = TerminalSessionIdentity::builder()
         .vessel_ref(vessel.clone())
-        .convoy("convoy-two-crew".to_string())
+        .convoy(two_crew.clone())
         .vessel("work".to_string())
         .role("coder".to_string())
         .vessel_index(0)
@@ -142,6 +132,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
     let probe = Arc::new(SessionStagingProbe {
         backend: backend.clone(),
+        convoy: two_crew.clone(),
         session: coder_identity.name(),
         environment: "contained-env".to_string(),
         fail_next: std::sync::atomic::AtomicBool::new(true),
@@ -152,7 +143,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     let error =
         daemon.crew_handoff_internal(&requested, "reviewer", "Please review the implementation.").await.expect_err("staging failure");
     assert!(error.contains("credential staging failed"), "{error}");
-    let status = convoys.get("convoy-two-crew").await.expect("convoy").status.expect("status");
+    let status = convoys.get(&two_crew).await.expect("convoy").status.expect("status");
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Pending);
     assert!(sessions.get(&reviewer_session).await.is_err());
@@ -172,20 +163,24 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     assert_eq!(reviewer.environment, "contained-env");
     assert_eq!(reviewer.vessel.as_deref(), Some(vessel.as_str()));
 
-    let convoy = convoys.get("convoy-two-crew").await.expect("convoy");
-    let mut terminal_status = convoy.status.expect("status");
-    terminal_status.phase = flotilla_resources::ConvoyPhase::Landed;
-    convoys.update_status("convoy-two-crew", &convoy.metadata.resource_version, &terminal_status).await.expect("landed convoy");
+    // An operator keeps every promise of the work and the convoy is delivered: it is Landed.
+    let convoy = convoys.get(&two_crew).await.expect("convoy");
+    let engine_convoys = convoy_engine(&daemon);
+    let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None };
+    engine_convoys.keep_by_verdict(&convoy, &scope, "operator", "reviewed").await.expect("promises kept");
+    engine_convoys.deliver(&convoy, "claim").await.expect("landed convoy");
+    let terminal_status = convoys.get(&two_crew).await.expect("convoy").status.expect("status");
+    assert_eq!(terminal_status.phase, flotilla_resources::ConvoyPhase::Landed);
     let error = daemon.crew_handoff_internal(&requested, "reviewer", "Late handoff").await.expect_err("terminal handoff");
     assert!(error.contains("terminal"), "{error}");
-    assert_eq!(convoys.get("convoy-two-crew").await.expect("convoy").status.expect("status"), terminal_status);
+    assert_eq!(convoys.get(&two_crew).await.expect("convoy").status.expect("status"), terminal_status);
     assert_eq!(probe.engine.terminals.record(&reviewer_session), reviewer);
 }
 
 // Stands in for the vessel controller: when the handoff writes the target's
 // brief, the controller has already requested the target's session.
 struct ConcurrentSessionCreation {
-    engine: Arc<TestEngine>,
+    engine: TestEngine,
     request: TerminalLaunchRequest,
     ending: Option<Ending<'static>>,
 }
@@ -237,42 +232,19 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
         };
         let requirement = VesselRequirement::builder().name("work".to_string()).crew(vec![agent("governor"), agent("aide")]).build();
         let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-        let convoy = convoys
-            .create(&test_meta("convoy-concurrent"), &ConvoySpec::builder().workflow_ref("govern".to_string()).build())
-            .await
-            .expect("convoy");
-        convoys
-            .update_status(
-                &convoy.metadata.name,
-                &convoy.metadata.resource_version,
-                &ConvoyStatus {
-                    phase: flotilla_resources::ConvoyPhase::Active,
-                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                        cascade: None,
-                        stall_nudges: Default::default(),
-                        supervision: None,
-                        exit: None,
-                        turn_delivery: Default::default(),
-                        vessels: vec![requirement.clone()],
-                    }),
-                    crew_work: BTreeMap::from([(
-                        "work".to_string(),
-                        BTreeMap::from([
-                            ("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
-                            ("aide".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
-                        ]),
-                    )]),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("active convoy");
-        let engine = Arc::new(test_engine(&daemon));
-        let vessel = engine.vessels.request("convoy-concurrent", "work", "test-host");
+        let concurrent = admit(
+            &daemon,
+            "convoy-concurrent",
+            ConvoySpec::builder().workflow_ref("govern".to_string()).build(),
+            ConvoyStatus { workflow_snapshot: Some(snapshot(requirement.clone())), ..Default::default() },
+        )
+        .await;
+        let engine = test_engine(&daemon);
+        let vessel = engine.vessels.request(&concurrent, "work", "test-host");
         let identity = |role: &str, crew_index| {
             TerminalSessionIdentity::builder()
                 .vessel_ref(vessel.clone())
-                .convoy("convoy-concurrent".to_string())
+                .convoy(concurrent.clone())
                 .vessel("work".to_string())
                 .role(role.to_string())
                 .vessel_index(0)
@@ -315,7 +287,7 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
         let requested = CrewCommandContext {
             crew_id: None,
             namespace: Some("flotilla".to_string()),
-            convoy: Some("convoy-concurrent".to_string()),
+            convoy: Some(concurrent.clone()),
             vessel_ref: Some(vessel.clone()),
             role: Some("governor".to_string()),
         };
@@ -332,12 +304,16 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
         let messages = backend.clone().using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items;
         assert!(
             messages.iter().any(|message| {
-                message.spec.receiver == "project:flotilla/convoy:convoy-concurrent/role:aide" && message.spec.body == "Task 1."
+                message.spec.receiver == format!("project:flotilla/convoy:{}/role:aide", concurrent.replace('#', "%23"))
+                    && message.spec.body == "Task 1."
             }),
             "the handoff is queued for the aide: {:?}",
             messages.iter().map(|message| (&message.spec.receiver, &message.spec.body)).collect::<Vec<_>>()
         );
-        let status = convoys.get("convoy-concurrent").await.expect("convoy").status.expect("status");
-        assert_ne!(status.crew_work["work"]["aide"].phase, CrewWorkPhase::Pending, "the aide's work is reopened");
+        let status = convoys.get(&concurrent).await.expect("convoy").status.expect("status");
+        // The aide's work is reopened: it is assigned the task and owns the governor's promises.
+        // It reads Working only once its session is live.
+        assert!(status.crew_work["work"]["aide"].task_assigned, "the aide's work is reopened");
+        assert!(!flotilla_resources::promises::owned(&status, "work", "aide").is_empty(), "the aide owns the handed-off promises");
     }
 }

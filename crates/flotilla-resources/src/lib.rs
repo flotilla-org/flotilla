@@ -53,6 +53,7 @@ pub use image_layer::{
 pub mod delivery_hold;
 #[doc(hidden)]
 pub mod digest;
+pub mod discovered_checkouts;
 pub use digest::{digest_bucket, DigestQuery, PartitionDigest, DIGEST_FANOUT};
 pub mod clone_records;
 #[doc(hidden)]
@@ -71,6 +72,7 @@ mod forge;
 mod fulfilment_kind;
 #[doc(hidden)]
 pub mod host;
+pub mod image_build_records;
 mod issue;
 pub mod labels;
 mod leaf;
@@ -140,14 +142,13 @@ pub use convoy::{
     ConvoyAttention, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
     CrewCompletionOverride, CrewCompletionRefusal, CrewCompletionRefusalCause, CrewWorkPhase, CrewWorkState, DeclaredSubject,
     DiscoveredSubject, InputValue, InstantiatedExit, InstantiatedExitEntry, InstantiatedTurnDelivery, IssueSnapshot, LandingClaim,
-    LandingEntry, LandingTurn, LeafMaker, LifecycleMutation, NudgeObligation, PendingBrief, PendingSupervisorTurn, PlacementStatus,
-    QueuedTurnObservation, ResumeIntent, SettlementEvaluation, SettlementMode, SettlementSubject, StallCause, StallEvidenceSource,
-    StallNudge, StallProposedDisposition, StallReason, StallRung, StallSupervisor, StalledCondition, SubjectDiscovery,
-    SubjectDiscoverySource, SupersededCrewClaim, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryFailure, TurnDeliveryFailureKind,
-    TurnDeliveryOutcome, TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation, UnresolvedChangeRequestSubject,
-    VesselPlacementPin, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, ADOPTED_CHECKOUT_ANNOTATION,
-    CONVOY_TEARDOWN_FINALIZER, ENSURED_FROM_ANNOTATION, FORCE_TEARDOWN_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION,
-    VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
+    LandingEntry, LandingTurn, LeafMaker, NudgeObligation, PendingBrief, PendingSupervisorTurn, PlacementStatus, QueuedTurnObservation,
+    ResumeIntent, SettlementEvaluation, SettlementMode, SettlementSubject, StallCause, StallEvidenceSource, StallNudge,
+    StallProposedDisposition, StallReason, StallRung, StallSupervisor, StalledCondition, SubjectDiscovery, SubjectDiscoverySource,
+    SupersededCrewClaim, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryFailure, TurnDeliveryFailureKind, TurnDeliveryOutcome,
+    TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation, UnresolvedChangeRequestSubject, VesselPlacementPin,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, ADOPTED_CHECKOUT_ANNOTATION, ENSURED_FROM_ANNOTATION,
+    PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{
     ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus,
