@@ -5,7 +5,7 @@ use crate::leaf_engine::stalls::stalled_source_actor;
 /// whose session `reviewer-session` was lost, so the launch reads Interrupted. The actor rows of
 /// `armed` are armed.
 async fn interrupted_launch(armed: &[&str]) -> Case {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let delivery = Arc::new(RecordingTurnDelivery::default());
     wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
@@ -81,7 +81,7 @@ async fn interrupted_seat_does_not_read_stalled() {
 // same way.
 #[tokio::test]
 async fn failed_session_seat_is_interrupted_not_stalled() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let delivery = Arc::new(RecordingTurnDelivery::default());
     wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;

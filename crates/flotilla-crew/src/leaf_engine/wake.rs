@@ -155,7 +155,6 @@ pub(super) struct LeafViews {
     pub(super) sessions: WatchView<TerminalSession>,
     pub(super) change_requests: WatchView<ChangeRequest>,
     pub(super) vessels: WatchView<Vessel>,
-    pub(super) messages: WatchView<flotilla_resources::Message>,
     pub(super) forges: WatchView<Forge>,
     local_convoys: tokio::sync::Mutex<Option<CachedLocalConvoys>>,
     row_dependencies: tokio::sync::Mutex<RowDependencies>,
@@ -176,7 +175,6 @@ impl LeafViews {
             sessions: WatchView::start(backend.clone(), namespace).await?,
             change_requests: WatchView::start(backend.clone(), namespace).await?,
             vessels: WatchView::start(backend.clone(), namespace).await?,
-            messages: WatchView::start(backend.clone(), namespace).await?,
             forges: WatchView::start(backend.clone(), namespace).await?,
             local_convoys: Default::default(),
             row_dependencies: Default::default(),
@@ -265,9 +263,9 @@ impl ReconcilerWake {
         sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        let cell = self.views(namespace).await?;
-        let messages = cell.get().expect("initialized views").messages.list().await.map_err(|error| error.to_string())?;
-        self.observe_queued_turns_from_messages(namespace, convoy, sessions, &messages.items, now).await
+        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        let messages = primitives.views(namespace).await.map_err(|error| error.to_string())?;
+        self.observe_queued_turns_from_messages(namespace, convoy, sessions, &messages, now).await
     }
 
     pub(super) async fn observe_queued_turns_from_messages(

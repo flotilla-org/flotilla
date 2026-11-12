@@ -1326,7 +1326,6 @@ impl InProcessDaemon {
             lifecycle_reads.clone(),
         )
         .with_clock(Arc::clone(&clock))
-        .with_message_inboxes(Arc::clone(&message_inboxes))
         .with_message_path(Arc::clone(&crew_message_path))
         .with_convoy_engine(Arc::clone(&convoy_engine_path))
         .with_charter_brief_renderer(Arc::new(flotilla_crew::charter_notifications::LiveCharterBriefRenderer::new(

@@ -1480,6 +1480,7 @@ mod tests {
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
+        flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
         (daemon, backend, temp)
     }
 

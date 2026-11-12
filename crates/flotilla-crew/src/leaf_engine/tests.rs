@@ -242,10 +242,11 @@ fn leaf(address: LeafAddress, field_path: &str, literal: &str) -> Leaf {
 }
 
 /// A leaf test's backend, serving the launches, vessels and sessions of one engine at its home
-/// (#3108), and that engine.
-fn engine_backend() -> (ResourceBackend, Arc<EngineHome>) {
+/// (#3108), and that engine. The home's fleet is designated, so its Message path delivers.
+async fn engine_backend() -> (ResourceBackend, Arc<EngineHome>) {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let home = Arc::new(EngineHome::install(&backend, "flotilla", "test-host"));
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
     (backend, home)
 }
 
@@ -280,6 +281,7 @@ fn supervision_wake_over(backend: &ResourceBackend, home: &EngineHome, reads: Ar
     );
     ReconcilerWake::new(
         LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, reads, limit)
+            .with_message_path(home.message_path())
             .with_convoy_engine(home.path()),
     )
 }
@@ -398,7 +400,7 @@ fn supervised_workflow() -> WorkflowSnapshot {
 /// a launch of the project's governor role at its generation, its governor at work, or ended as
 /// its phase names. The coder's actor row is armed.
 async fn supervised_case(workflow: WorkflowSnapshot, governors: &[(&str, u64, ConvoyPhase)]) -> Case {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let delivery = Arc::new(RecordingTurnDelivery::default());
     wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
@@ -464,28 +466,12 @@ async fn message_to_coder(case: &Case, name: &str, body: &str) {
         .body(body.into())
         .relation(flotilla_resources::MessageRelation::Supervisor)
         .build();
-    flotilla_messaging::MessageInbox::new(case.backend.clone(), "flotilla")
-        .accept(&InputMeta::builder().name(name.into()).build(), &spec, Utc::now())
-        .await
-        .expect("message accepted");
+    case.home.messages.messages().admit("flotilla", name, &spec).await.expect("message accepted");
 }
 
 /// Records Message `name` delivered to the coder's session at `at`, as its delivery does.
 async fn deliver_to_coder(case: &Case, name: &str, at: DateTime<Utc>) {
-    let messages = case.backend.using::<flotilla_resources::Message>("flotilla");
-    let message = messages.get(name).await.expect("message");
-    let mut status = message.status.clone().expect("accepted status");
-    status.phase = flotilla_resources::MessagePhase::Delivered;
-    status.since = at;
-    status.resolved_receiver = Some(
-        flotilla_resources::ResolvedMessageReceiver::builder()
-            .crew_id(case.launch("resumed-coder"))
-            .session("resumed-coder".into())
-            .delivered_at(at)
-            .evidence("turn".into())
-            .build(),
-    );
-    messages.update_status(name, &message.metadata.resource_version, &status).await.expect("message delivered");
+    case.home.deliver_turn_at(name, &case.launch("resumed-coder"), at).await;
 }
 
 async fn idle_nudge_scenario() -> Case {
@@ -908,7 +894,7 @@ async fn assert_leaf_subscription_contract(backend: ResourceBackend) {
 async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: bool, open_ledger: bool) {
     use flotilla_resources::convoy::engine::Actor;
     use flotilla_resources::{Observation, ObservedChangeRequestState};
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let table = &wake.subscriptions;
     let actuator = Arc::new(RecordingTurnDelivery::default());
@@ -1412,7 +1398,7 @@ fn notes_changed(notes: &mut broadcast::Receiver<String>) -> bool {
 async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &str) {
     use flotilla_resources::{Observation, ObservedChecks};
 
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let table = &wake.subscriptions;
     let actuator = Arc::new(RecordingTurnDelivery::default());
@@ -1643,7 +1629,7 @@ async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
     mergeability: flotilla_resources::ObservedMergeability,
     brief: &str,
 ) {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let (event_tx, _) = broadcast::channel(4);
     let refresher = ChangeRequestRefresher::new(
         backend.clone(),
@@ -1821,7 +1807,9 @@ fn engine_table(
     event_sink: Arc<dyn super::EventSink>,
     change_requests: ChangeRequestRefresher,
 ) -> LeafSubscriptionTable {
-    LeafSubscriptionTable::new(backend, event_sink, change_requests, home.reads()).with_convoy_engine(home.path())
+    LeafSubscriptionTable::new(backend, event_sink, change_requests, home.reads())
+        .with_message_path(home.message_path())
+        .with_convoy_engine(home.path())
 }
 
 mod change_request_authority;

@@ -14,8 +14,15 @@ pub trait WorkCredentialReconciler: Send + Sync {
 }
 
 /// The composition root's slot for [`flotilla_messaging::EngineMessages`]: set once, at startup,
-/// when `[primitives]` is on.
+/// after the engine's store opens.
 pub type MessagePath = std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn flotilla_messaging::EngineMessages>>>;
+
+/// The Message path in `path`; a read before startup installs it is refused.
+pub(crate) fn installed_messages(
+    path: &MessagePath,
+) -> Result<std::sync::Arc<dyn flotilla_messaging::EngineMessages>, flotilla_resources::ResourceError> {
+    path.get().cloned().ok_or_else(|| flotilla_resources::ResourceError::other("the Message path is not installed"))
+}
 
 /// Fresh inspection requested by an explicit convoy deletion before its gate reads the evidence
 /// (#3108): the checkout's home inspects it and records the inspection on its launch; this

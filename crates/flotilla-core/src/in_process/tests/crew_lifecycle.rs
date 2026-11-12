@@ -15,8 +15,9 @@ use flotilla_store::ResourceBackend;
 use flotilla_state_machines::machines::agent_session::Activity;
 
 use super::support::{
-    admit_snapshot, admit_standing, agent_sessions, claim_crew, complete_work, engine_at, ensure_vessel, observe_attention,
-    resume_staging_fixture_shaped, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
+    admit_snapshot, admit_standing, agent_sessions, claim_crew, complete_work, engine_at, ensure_vessel, install_engine_messages,
+    observe_attention, resume_staging_fixture_shaped, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta,
+    wait_for_stall,
 };
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
@@ -413,6 +414,7 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    install_engine_messages(&daemon);
     let (sender, _receiver) = flotilla_store::controller::WorkQueueSender::channel();
     let watch = daemon.reconciler_wake_watch();
     let replica_check = replica.clone();

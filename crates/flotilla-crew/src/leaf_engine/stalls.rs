@@ -511,7 +511,13 @@ impl ReconcilerWake {
         status: &ConvoyStatus,
         stalled: Option<&StalledCondition>,
     ) {
-        let Some(primitives) = self.subscriptions.message_primitives() else { return };
+        let primitives = match self.subscriptions.message_primitives() {
+            Ok(primitives) => primitives,
+            Err(error) => {
+                tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "ending settled stall records failed");
+                return;
+            }
+        };
         let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
         let address = |vessel: &str, role: &str| crew_role_address(project, &convoy.metadata.name, vessel, role);
         let stalled =
@@ -545,11 +551,10 @@ impl ReconcilerWake {
         convoys: &HashMap<String, impl ConvoyRead>,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        if let Some(primitives) = self.subscriptions.message_primitives() {
-            if let Some(wait) = primitives.delivery_wait(namespace).await? {
-                tracing::debug!(namespace, %wait, "stall judging waits");
-                return Ok(());
-            }
+        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        if let Some(wait) = primitives.delivery_wait(namespace).await? {
+            tracing::debug!(namespace, %wait, "stall judging waits");
+            return Ok(());
         }
         let inputs = off_frame(|| self.read_stall_inputs(namespace, now)).await?;
         let available_convoys = &inputs.available_convoys;
@@ -629,27 +634,15 @@ impl ReconcilerWake {
         let forges =
             views.forges.definitions().await.map_err(|error| error.to_string())?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
         let vessels_list = views.vessels.shared_list().await.map_err(|error| error.to_string())?;
-        let primitives = self.subscriptions.message_primitives();
-        let messages_list = match &primitives {
-            Some(primitives) => std::sync::Arc::new(flotilla_resources::ReadResourceList {
-                items: primitives.views(namespace).await.map_err(|error| error.to_string())?,
-            }),
-            None => views.messages.shared_list().await.map_err(|error| error.to_string())?,
-        };
+        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        let messages_list = std::sync::Arc::new(flotilla_resources::ReadResourceList {
+            items: primitives.views(namespace).await.map_err(|error| error.to_string())?,
+        });
         // Routing helpers retain their public Store-based interface, but all
         // their reads come from the same request snapshot of the watched kinds.
         views.defaults.insert_snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
         views.fleet.insert_snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
         let read_backend = flotilla_store::ResourceBackend::from_arc(std::sync::Arc::new(snapshot));
-        let inbox = self
-            .subscriptions
-            .inner
-            .message_inboxes
-            .lock()
-            .await
-            .entry(namespace.to_string())
-            .or_insert_with(|| flotilla_messaging::MessageInbox::new(backend.clone(), namespace))
-            .clone();
         let receivers = flotilla_messaging::MessageReceiverSnapshot::load_from_shared_observations(
             &read_backend,
             namespace,
@@ -658,13 +651,9 @@ impl ReconcilerWake {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let engine_notices = primitives.map(|primitives| primitives.charter_notices(namespace));
-        let notices: &dyn flotilla_messaging::CharterNotices = match &engine_notices {
-            Some(notices) => notices.as_ref(),
-            None => &inbox,
-        };
+        let notices = primitives.charter_notices(namespace);
         flotilla_messaging::reconcile_charter_notifications_with_receivers(
-            notices,
+            notices.as_ref(),
             self.subscriptions.inner.charter_brief_renderer.as_ref(),
             now,
             &read_backend,

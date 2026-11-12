@@ -363,6 +363,11 @@ async fn a_persons_message_traces_its_principal_and_records_its_role() {
     let writer = lines.clone();
     let _subscriber =
         tracing::subscriber::set_default(tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish());
+    // While one dispatcher is registered, tracing-core caches a callsite's interest from the
+    // default of whichever thread reaches it first, so a concurrent test without a subscriber
+    // would turn the admission trace off for the whole binary. A second registered dispatcher
+    // makes the cache ask every registered subscriber.
+    let _registered = tracing::Dispatch::new(tracing_subscriber::registry());
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"principal-trace-test\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -390,4 +395,43 @@ async fn a_persons_message_traces_its_principal_and_records_its_role() {
         let logged = String::from_utf8(lines.0.lock().expect("lines").clone()).expect("UTF-8");
         assert!(logged.contains(&format!("message.principal=\"{traced}\"")), "{logged}");
     }
+}
+
+// A principal the project's charter declares keeps its name: the record names
+// the role it holds there, and the crew's view reads that role back as the principal.
+#[tokio::test]
+async fn a_declared_principal_reads_back_under_its_own_name() {
+    use flotilla_resources::{MessageRelation, MessageSpec, Project, ProjectSpec, RoleDefinition};
+    use std::collections::BTreeMap;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"declared-principal-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+        Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let primitives = install_engine_messages(&daemon);
+    designate_fleet(&backend).await;
+    let owner = RoleDefinition { principal: Some("principal:alice".into()), ..Default::default() };
+    let charter =
+        ProjectSpec::builder().display_name("Flotilla".into()).role_definitions(BTreeMap::from([("owner".into(), owner)])).build();
+    backend.definitions::<Project>("flotilla").apply(&test_meta("flotilla"), &charter).await.expect("project");
+    let intent = MessageSpec::builder()
+        .sender("principal:alice".into())
+        .receiver("flotilla/gui-approver".into())
+        .relation(MessageRelation::Peer)
+        .body("approved".into())
+        .build();
+    primitives.admit("flotilla", "from-alice", &intent).await.expect("admitted");
+    let stored = primitives.stored_view("flotilla", "from-alice").expect("read").expect("stored");
+    assert_eq!(stored.object.spec.sender, "project:flotilla/role:owner", "the record names the role");
+    let viewed = primitives.views("flotilla").await.expect("crew views");
+    let viewed = viewed.iter().find(|read| read.object.metadata.name == "from-alice").expect("the crew's view spells it");
+    assert_eq!(viewed.object.spec.sender, "principal:alice");
 }

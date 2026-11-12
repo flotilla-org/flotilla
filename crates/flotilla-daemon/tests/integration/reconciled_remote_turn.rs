@@ -84,6 +84,11 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
 
     let home = home_daemon.resource_backend();
     let placement = placement_daemon.resource_backend();
+    // The runtime opens each daemon's Message path at startup.
+    home_daemon.open_message_primitives().expect("home message path");
+    placement_daemon.open_message_primitives().expect("placement message path");
+    flotilla_engine_messages_testkit::designate_fleet(&home, "flotilla").await;
+    flotilla_engine_messages_testkit::designate_fleet(&placement, "flotilla").await;
 
     // Keep the real request endpoints alive: producers publish ordinary
     // receiver-homed mutations rather than enqueueing at the convoy authority.
@@ -251,7 +256,8 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .subject_revision("stall-1".to_string())
         .sender("system:nudge".into())
         .expectation(MessageExpectation::Outcome {
-            condition: "work/nudge-convoy/work .crew.coder.phase == Done".parse().expect("nudge outcome"),
+            // The outcome names the launch the nudge is for.
+            condition: format!("work/{convoy}/work .crew.coder.phase == Done").parse().expect("nudge outcome"),
         })
         .build();
     // The receiver admits ordinary Message mutations through the real router.
@@ -272,9 +278,10 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .await
         .expect("closed dependency watch resubscribes without a timer");
     }
-    let records = placement.using::<Message>("flotilla").list().await.expect("receiver inbox").items;
+    // The receiver's Messages as the crew reads them.
+    let records = placement_daemon.message_primitives().expect("placement message path").views("flotilla").await.expect("receiver inbox");
     assert_eq!(records.len(), 1);
-    let nudge = &records[0];
+    let nudge = &records[0].object;
     assert_eq!(nudge.spec.sender, "system:nudge");
     assert_eq!(nudge.spec.receiver, format!("flotilla/{convoy}/work/coder"));
     assert!(nudge.spec.body.contains("Please continue"));

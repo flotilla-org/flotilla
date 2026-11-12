@@ -7,13 +7,12 @@ use std::{
 
 use flotilla_agent::adapter::CAPABILITIES_HEADING;
 use flotilla_capability_contract::{credential_card, CredentialCapability, SessionCapabilitySource};
-use flotilla_messaging::MessageInbox;
 use flotilla_resources::account_access::AccountRecords;
 use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{
-    message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, InputMeta, Message,
-    MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, Vessel,
+    message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, Message, MessageReference,
+    MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec, Vessel,
 };
 use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
@@ -280,7 +279,7 @@ pub fn card_delta(previous: &str, current: &str) -> String {
 
 /// Ephemeral baselines preserve stored resource shapes. Pending snapshots survive
 /// annotation CAS retries; delivery evidence advances the agent's delta baseline.
-/// The Message path it publishes through is the `[primitives]` switch's when on.
+/// It publishes through the Message path installed at startup.
 #[derive(Default)]
 pub struct CapabilityCardTracker(Mutex<BTreeMap<(String, String), SessionCardObservation>>, crate::ports::MessagePath);
 
@@ -292,8 +291,8 @@ impl CapabilityCardTracker {
         Self(Mutex::default(), path)
     }
 
-    fn primitives(&self) -> Option<Arc<dyn flotilla_messaging::EngineMessages>> {
-        self.1.get().cloned()
+    fn primitives(&self) -> Result<Arc<dyn flotilla_messaging::EngineMessages>, ResourceError> {
+        crate::ports::installed_messages(&self.1)
     }
 
     async fn observation(&self, namespace: &str, session: &str) -> SessionCardObservation {
@@ -357,7 +356,7 @@ pub async fn observe_card(
     let mut retired = Vec::new();
     let pending = observation.pending.clone();
     for (revision, (name, snapshot)) in &pending {
-        let message = match message_by_name(backend, namespace, name, tracker).await {
+        let message = match message_by_name(namespace, name, tracker).await {
             Ok(message) => message,
             Err(ResourceError::NotFound { .. }) => {
                 // An audit record can be reaped before the next capability change.
@@ -393,34 +392,16 @@ pub async fn observe_card(
     Ok(())
 }
 
-/// Admission is idempotent. Recover a published revision whose annotation CAS
-/// lost a race before trying to supersede it with a newer observation.
+/// Admission is idempotent. Recover a published revision before trying to
+/// supersede it with a newer observation: a message's name is its producer
+/// key's digest, the same revision of the same session's card.
 async fn recover_published_revision(
-    backend: &ResourceBackend,
     namespace: &str,
     name: &str,
-    requested: &MessageSpec,
     tracker: &CapabilityCardTracker,
 ) -> Result<Option<ResourceObject<Message>>, String> {
-    if tracker.primitives().is_some() {
-        // An engine message's name is its producer key's digest: the same
-        // revision of the same session's card.
-        return match message_by_name(backend, namespace, name, tracker).await {
-            Ok(existing) => Ok(Some(existing)),
-            Err(ResourceError::NotFound { .. }) => Ok(None),
-            Err(error) => Err(error.to_string()),
-        };
-    }
-    let messages = backend.clone().using::<Message>(namespace);
-    match messages.get(name).await {
-        Ok(existing) => {
-            let mut expected = requested.clone();
-            expected.body = existing.spec.body.clone();
-            if expected != existing.spec {
-                return Err("capability Message identity collision".into());
-            }
-            Ok(Some(existing))
-        }
+    match message_by_name(namespace, name, tracker).await {
+        Ok(existing) => Ok(Some(existing)),
         Err(ResourceError::NotFound { .. }) => Ok(None),
         Err(error) => Err(error.to_string()),
     }
@@ -460,7 +441,7 @@ async fn publish_card_revision(
         revision: format!("capabilities@{revision}"),
     };
     let supersedes = match supersedes {
-        Some(name) => match message_by_name(backend, namespace, &name, tracker).await {
+        Some(name) => match message_by_name(namespace, &name, tracker).await {
             Ok(_) => Some(name),
             Err(ResourceError::NotFound { .. }) => None, // Reaped audit data cannot be a predecessor.
             Err(error) => return Err(error.to_string()),
@@ -476,7 +457,7 @@ async fn publish_card_revision(
         .subject(subject)
         .maybe_supersedes(supersedes)
         .build();
-    let recovered = recover_published_revision(backend, namespace, &name, &requested, tracker).await?;
+    let recovered = recover_published_revision(namespace, &name, tracker).await?;
     let digest = recovered
         .as_ref()
         .and_then(|message| message.metadata.annotations.get(DIGEST_ANNOTATION))
@@ -484,33 +465,14 @@ async fn publish_card_revision(
         // Previous-generation Messages without this annotation always contain full cards.
         .unwrap_or_else(|| recovered.as_ref().map(|message| card_digest(&message.spec.body)).unwrap_or_else(|| card_digest(card)));
     let spec = recovered.map(|message| message.spec).unwrap_or(requested);
-    if let Some(primitives) = tracker.primitives() {
-        // The engine keeps no annotations: a revision's card is the one it was published with.
-        primitives.admit(namespace, &name, &spec).await.map_err(|error| error.to_string())?;
-        return Ok((name, digest));
-    }
-    MessageInbox::new(backend.clone(), namespace)
-        .accept(
-            &InputMeta::builder().name(name.clone()).annotations(BTreeMap::from([(DIGEST_ANNOTATION.into(), digest.clone())])).build(),
-            &spec,
-            chrono::Utc::now(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    // The engine keeps no annotations: a revision's card is the one it was published with.
+    tracker.primitives().map_err(|error| error.to_string())?.admit(namespace, &name, &spec).await.map_err(|error| error.to_string())?;
     Ok((name, digest))
 }
 
-/// A capability Message by name, through the switch's Message path when on.
-async fn message_by_name(
-    backend: &ResourceBackend,
-    namespace: &str,
-    name: &str,
-    tracker: &CapabilityCardTracker,
-) -> Result<ResourceObject<Message>, ResourceError> {
-    match tracker.primitives() {
-        Some(primitives) => primitives.view(namespace, name).await?.map(|view| view.object).ok_or_else(|| ResourceError::not_found(name)),
-        None => backend.clone().using::<Message>(namespace).get(name).await,
-    }
+/// A capability Message by name.
+async fn message_by_name(namespace: &str, name: &str, tracker: &CapabilityCardTracker) -> Result<ResourceObject<Message>, ResourceError> {
+    tracker.primitives()?.view(namespace, name).await?.map(|view| view.object).ok_or_else(|| ResourceError::not_found(name))
 }
 
 /// Advisory launch observation: callers can warn and still launch with the card.

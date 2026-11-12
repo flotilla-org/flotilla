@@ -1,13 +1,10 @@
 use super::*;
-use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
 use flotilla_resources::attentions::{OpenAttention, Sender, Subject};
 
 /// A launch whose coder works in session `coder-session`, with no supervisor declared, at a home
-/// whose Message path is installed so a person can be told. Its coder's actor row is armed.
-async fn unsupervised_launch() -> (Case, EngineMessagesHome) {
-    let (backend, home) = engine_backend();
-    let messages = EngineMessagesHome::open("test-host", "flotilla", &backend);
-    designate_fleet(&backend, "flotilla").await;
+/// whose fleet is designated so a person can be told. Its coder's actor row is armed.
+async fn unsupervised_launch() -> Case {
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let delivery = Arc::new(RecordingTurnDelivery::default());
     wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
@@ -16,7 +13,7 @@ async fn unsupervised_launch() -> (Case, EngineMessagesHome) {
     home.seat(&backend, &work, (&vessel, "work"), ("coder", "coder-session"), CrewWorkPhase::Working).await;
     let case = Case { backend, home, wake, delivery, work, vessel, governors: BTreeMap::new() };
     arm_coder(&case.wake, &case.work).await;
-    (case, messages)
+    case
 }
 
 /// Arms `wake`'s actor row for the coder of launch `work`.
@@ -64,7 +61,7 @@ async fn stall_attentions(case: &Case) -> Vec<OpenAttention> {
 // the stalled seat, however often it is judged, withdrawn when the crew works again.
 #[tokio::test]
 async fn unnamed_operator_stall_is_told_once_and_withdrawn_when_it_closes() {
-    let (case, _messages) = unsupervised_launch().await;
+    let case = unsupervised_launch().await;
     let start = Utc::now();
     let at = |tick: i64| start + chrono::Duration::seconds(tick * 600);
     // The idle coder is nudged until its nudges run out, then its stall reaches the operator.
@@ -96,7 +93,7 @@ async fn unnamed_operator_stall_is_told_once_and_withdrawn_when_it_closes() {
 // no second one is raised, and a new turn closes both.
 #[tokio::test]
 async fn told_stall_is_noted_again_after_a_restart() {
-    let (case, _messages) = unsupervised_launch().await;
+    let case = unsupervised_launch().await;
     let start = Utc::now();
     let at = |tick: i64| start + chrono::Duration::seconds(tick);
     case.home

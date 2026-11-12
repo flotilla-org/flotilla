@@ -50,7 +50,7 @@ fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestC
     let field = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4));
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         for field in [0, 1, 2, 3, 4, field] {
-            let (backend, home) = engine_backend();
+            let (backend, home) = engine_backend().await;
             let mut wake = supervision_wake(&backend, &home);
             let now = Utc::now();
             let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(now));
@@ -139,7 +139,7 @@ fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestC
 // a fresh observation clears it and allows a new episode to read a schedule.
 #[tokio::test]
 async fn stale_episode_reads_one_schedule_and_does_not_rewrite_lag() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let lag = landing_launch(&backend, &home, "lag", convoy_spec(), ExitDeclaration::standard_table()).await;
     let start = Utc::now();
@@ -215,7 +215,7 @@ async fn replica_event_work_measurement() {
     use flotilla_resources::convoy::engine::Actor;
     use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource};
     use flotilla_store_testkit::ReadCountsBackendExt;
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     // The launches are another daemon's, heard here as its log arrives.
     let remote_backend = ResourceBackend::new(InMemoryBackend::default());
     let remote = EngineHome::install(&remote_backend, "flotilla", "remote");
@@ -282,7 +282,7 @@ async fn replica_event_work_measurement() {
 // does nothing, and a deleted key prunes without re-evaluating other parents.
 #[tokio::test]
 async fn row_sync_evaluates_only_selected_convoys() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let mut launches = Vec::new();
     for index in 0..32 {

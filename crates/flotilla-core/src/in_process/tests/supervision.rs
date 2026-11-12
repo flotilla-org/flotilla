@@ -14,7 +14,7 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 use futures::{FutureExt, StreamExt};
 
-use super::support::{test_engine, test_meta};
+use super::support::{crew_messages, designate_fleet, test_engine, test_meta};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource};
@@ -197,6 +197,8 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     };
     test_engine(&daemon);
     let placement_engine = test_engine(&placement_daemon);
+    designate_fleet(&daemon.resource_backend()).await;
+    designate_fleet(&placement).await;
     // The governor convoy is admitted at home, its work `govern` crewed by the governor, and
     // replicated to the placement host.
     let governor = super::support::admit(
@@ -274,15 +276,17 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
             ))
         }
     }
-    let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> = Arc::new(PlacementPublisher(placement_daemon));
+    let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
+        Arc::new(PlacementPublisher(Arc::clone(&placement_daemon)));
     daemon.set_resource_intent_publisher(Arc::downgrade(&publisher));
     daemon.deliver_standing_turn(&request).await.expect("remote governor intent accepted");
-    let messages = placement.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver messages").items;
+    let messages = crew_messages(&placement_daemon, "flotilla").await;
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].spec.receiver, format!("flotilla/{governor}/govern/governor"));
     assert_eq!(messages[0].spec.relation, flotilla_resources::MessageRelation::Supervisor);
     assert_eq!(messages[0].spec.body, "Escalated from coder@work in graphql-budget@flotilla:\n\nSupervise the stalled crew");
-    assert_eq!(messages[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Accepted);
+    // Admitted and not yet received: the engine's pending Message.
+    assert_eq!(messages[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Deliverable);
     assert!(home.using::<flotilla_resources::Message>("flotilla").list().await.expect("sender messages").items.is_empty());
     assert_eq!(convoys.get(&governor).await.expect("governor").status.expect("status").attention, Some(existing_attention));
 }

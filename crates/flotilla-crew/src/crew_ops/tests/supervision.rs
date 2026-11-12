@@ -15,7 +15,7 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 use tokio::sync::RwLock;
 
-use super::{fixture, old_store_fixture, old_store_prelude_fixture, old_store_shaped_fixture, shaped_fixture, Crewed, Held};
+use super::{fixture, prelude_fixture, shaped_fixture, Crewed, Held};
 use crate::crew_ops::{queue_pending_crew_message, CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator, ResolvedCrewContext};
 use crate::ports::WorkCredentialReconciler;
 use flotilla_resources::{CrewMessageSender, Selector, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec};
@@ -39,7 +39,6 @@ fn with_member(snapshot: &mut WorkflowSnapshot, member: &str) {
     snapshot.vessels[0].crew.push(crew);
 }
 
-// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[hegel::test]
 fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
     use flotilla_messaging::MessageInbox;
@@ -81,8 +80,7 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
         }
     }
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (crew, backend, probe, held) =
-            old_store_shaped_fixture(CrewWorkPhase::Working, with_review(receiver_phase == CrewWorkPhase::Done)).await;
+        let (crew, backend, probe, held) = shaped_fixture(CrewWorkPhase::Working, with_review(receiver_phase == CrewWorkPhase::Done)).await;
         probe.fail.store(false, Ordering::SeqCst);
         let launch = held.launch.clone();
         if receiver_phase == CrewWorkPhase::Done {
@@ -119,7 +117,12 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
             crew.handoff_with_carries(&context, target, "review this", vec![carry.clone()]).await.expect("handoff");
             // The handoff delivers the reviewer its task: it is wanted running, and its vessel starts it.
             assert!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].task_assigned);
-            let records = home.using::<Message>("flotilla").list().await.expect("receiver inbox").items;
+            // The crew's view of a local Message spells its receiver by the vessel that holds it.
+            let records: Vec<_> = if remote {
+                home.using::<Message>("flotilla").list().await.expect("receiver inbox").items
+            } else {
+                held.messages().messages().views("flotilla").await.expect("receiver inbox").into_iter().map(|read| read.object).collect()
+            };
             assert_eq!(records.len(), index + 1, "each handoff is distinct even when its body repeats");
             for record in records {
                 assert_eq!(record.spec.sender, held.receiver("work", "coder"));
@@ -138,10 +141,9 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
 }
 
 // An authenticated operator can send supervisor guidance to crew that has no stall.
-// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[tokio::test]
 async fn operator_supervision_messages_working_crew() {
-    let (crew, backend, _probe, held) = old_store_fixture(CrewWorkPhase::Working).await;
+    let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
     let principal = PrincipalRef { namespace: "flotilla".into(), name: "operator-alice".into() };
     crew.supervise(CrewSupervisionRequest {
         namespace: "flotilla",
@@ -157,18 +159,19 @@ async fn operator_supervision_messages_working_crew() {
     .expect("operator guidance");
     let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].spec.sender, "principal:operator-alice");
-    assert_eq!(messages[0].spec.receiver, held.receiver("work", "coder"));
+    // The engine stores a person as the role they send in; the principal goes to the trace.
+    assert_eq!(messages[0].spec.sender, "project:flotilla/role:operator");
+    let viewed = held.messages().messages().views("flotilla").await.expect("inbox");
+    assert_eq!(viewed[0].object.spec.receiver, held.receiver("work", "coder"));
     assert_eq!(messages[0].spec.relation, flotilla_resources::MessageRelation::Supervisor);
     assert_eq!(messages[0].spec.body, "please follow up");
     assert!(held.convoy(&backend).await.status.expect("status").stalled.is_none());
 }
 
 // Legacy PendingBrief adoption is replay-safe and retains both attribution and continuation intent.
-// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[tokio::test]
 async fn legacy_pending_brief_is_adopted_once_before_withdrawal() {
-    let (crew, backend, _probe, held) = old_store_fixture(CrewWorkPhase::Working).await;
+    let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
     // Decode the exact previous-generation record rather than invoking a retired producer: the
     // home's notes on its launch hold it, as an imported launch's do.
     held.engine
@@ -188,7 +191,8 @@ async fn legacy_pending_brief_is_adopted_once_before_withdrawal() {
     }
     let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].spec.sender, "principal:alice");
+    // The engine stores a person as the role they send in; the principal goes to the trace.
+    assert_eq!(messages[0].spec.sender, "project:flotilla/role:operator");
     assert_eq!(messages[0].spec.body, "legacy follow-up");
     let status = held.convoy(&backend).await.status.expect("status");
     assert!(status.pending_brief().is_none());
@@ -348,7 +352,6 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
 // Message, plus one notice to the held crew (#3565), across retries, with no forge
 // collaborator available. Cover local and project supervisors, no PR binding, and
 // retries carrying newer head identities.
-// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[hegel::test]
 fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -356,7 +359,7 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
     let address_supervisor = tc.draw(gs::booleans());
     let retries = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (crew, backend, _, held) = old_store_shaped_fixture(CrewWorkPhase::Done, |snapshot| {
+        let (crew, backend, _, held) = shaped_fixture(CrewWorkPhase::Done, |snapshot| {
             if local_supervisor {
                 with_member(snapshot, "bosun");
             }
@@ -381,14 +384,15 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
         }
         let convoy = held.convoy(&backend).await;
         assert_eq!(convoy.status.expect("status").attention.expect("attention").reason, "episode limit");
-        let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages");
-        assert_eq!(messages.items.len(), 2, "retries cannot duplicate the supervisor signal or the crew notice");
+        let messages: Vec<_> =
+            held.messages().messages().views("flotilla").await.expect("messages").into_iter().map(|read| read.object).collect();
+        assert_eq!(messages.len(), 2, "retries cannot duplicate the supervisor signal or the crew notice");
         // #3565: the held crew is told why its wakes stopped.
         let coder = held.receiver("work", "coder");
-        let notice = messages.items.iter().find(|message| message.spec.receiver == coder).expect("crew notice");
+        let notice = messages.iter().find(|message| message.spec.receiver == coder).expect("crew notice");
         assert_eq!(notice.spec.relation, flotilla_resources::MessageRelation::System);
         assert!(notice.spec.body.contains("`checks-settled` turns for you are held") && notice.spec.body.contains("episode limit"));
-        let message = messages.items.iter().find(|message| message.spec.receiver != coder).expect("supervisor signal");
+        let message = messages.iter().find(|message| message.spec.receiver != coder).expect("supervisor signal");
         let expected = if address_supervisor {
             "project:flotilla/role:attended".to_owned()
         } else if local_supervisor {
@@ -474,6 +478,7 @@ async fn lost_vessel_resume_explains_rehydration() {
         .brief_artifact_writer(crew.brief_artifact_writer.clone())
         .checkout_vcs(crew.checkout_vcs.clone())
         .local_environment_id(crew.local_environment_id.clone())
+        .message_path(held.engine.message_path())
         .convoy_engine(held.engine.path())
         .build();
     drop(crew);
@@ -562,7 +567,6 @@ async fn escalation_without_receiver_preserves_owner() {
 
 // Escalation either transfers the obligation to a bound receiver, or refuses
 // without changing ownership. Repeated judgments must not return it to the caller.
-// On the old Message store: goes when crew compares engine addresses (#3108 gate task).
 #[hegel::test]
 fn escalation_admission_and_ownership(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -591,9 +595,10 @@ fn escalation_admission_and_ownership(tc: hegel::TestCase) {
 use crate::leaf_engine::{CrewTurnAdmission, CrewTurnIntent, TurnDeliveryActuator};
 use flotilla_resources::{Message, MessageExpectation, MessageRelation, MessageSpec, StallRung, StallSupervisor, SupervisionTarget};
 // Boundary fake: receiver-home publication may be unreachable. Successful
-// admissions go through the real durable inbox, not an accepting mock.
+// admissions go through the home's Message path, not an accepting mock.
 struct Delivery {
     backend: ResourceBackend,
+    messages: Arc<dyn flotilla_messaging::EngineMessages>,
     path: EngineConvoyPath,
     launch: String,
     reachable: bool,
@@ -620,14 +625,7 @@ impl TurnDeliveryActuator for Delivery {
             .body(request.brief.clone())
             .build();
         let name = flotilla_resources::message_record_name(receiver, &request.sender, &request.source);
-        let admission = flotilla_messaging::MessageInbox::new(self.backend.clone(), &request.namespace)
-            .accept(&InputMeta::builder().name(name).build(), &intent, Utc::now())
-            .await
-            .map_err(|error| error.to_string())?;
-        let record = match admission {
-            flotilla_messaging::MessageAdmission::Accepted(record) => record,
-            flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
-        };
+        let record = self.messages.admit(&request.namespace, &name, &intent).await.map_err(|error| error.to_string())?;
         let convoys = self.backend.using::<ResourceConvoy>(&request.namespace);
         if request.convoy == self.launch && request.vessel == "work" && request.role == "deputy" {
             // The receiver's home delivers it the turn: its task is noted.
@@ -707,7 +705,7 @@ async fn run_escalation_scenarios(
         // the home has never admitted.
         let next = Crewed { name: "next", role: "governor", work: "watch", member: "governor", session: "next-session" };
         let prelude = if bound && !operator && !collocated { std::slice::from_ref(&next) } else { &[] };
-        let (crew, backend, _, held) = old_store_prelude_fixture(CrewWorkPhase::Working, prelude, |snapshot, admitted| {
+        let (crew, backend, _, held) = prelude_fixture(CrewWorkPhase::Working, prelude, |snapshot, admitted| {
             let next = admitted.first().map_or("next#1", |(launch, _)| launch.as_str());
             let next = flotilla_resources::crew_role_address("flotilla", next, "watch", "governor");
             escalation_shape(snapshot, operator, collocated, bound, if operator { "principal:operator" } else { &next })
@@ -723,6 +721,7 @@ async fn run_escalation_scenarios(
         };
         crew.set_turn_delivery_actuator(Arc::new(Delivery {
             backend: backend.clone(),
+            messages: held.messages().messages(),
             path: held.engine.path(),
             launch: held.launch.clone(),
             reachable,
@@ -748,7 +747,8 @@ async fn run_escalation_scenarios(
             })
             .await;
         let after = held.convoy(&backend).await.status.expect("status").stalled;
-        let records = backend.using::<Message>("flotilla").list().await.expect("messages").items;
+        let records: Vec<_> =
+            held.messages().messages().views("flotilla").await.expect("messages").into_iter().map(|read| read.object).collect();
         if bound && reachable && conflict {
             assert!(result.is_err(), "a concurrent ruling must refuse the ownership transfer: {result:?}");
             // The ruling failed the coder's seat and so the launch: its view shows no stall, and
@@ -808,9 +808,10 @@ async fn run_escalation_scenarios(
 async fn collocated_escalation_refuses_a_concurrent_change_to_the_seat() {
     for (conflict, resume_coder) in [(true, false), (false, true)] {
         let (crew, backend, _, held) =
-            old_store_prelude_fixture(CrewWorkPhase::Working, &[], |snapshot, _| escalation_shape(snapshot, false, true, true, "")).await;
+            prelude_fixture(CrewWorkPhase::Working, &[], |snapshot, _| escalation_shape(snapshot, false, true, true, "")).await;
         crew.set_turn_delivery_actuator(Arc::new(Delivery {
             backend: backend.clone(),
+            messages: held.messages().messages(),
             path: held.engine.path(),
             launch: held.launch.clone(),
             reachable: true,
@@ -836,7 +837,9 @@ async fn collocated_escalation_refuses_a_concurrent_change_to_the_seat() {
         assert!(error.contains("stall changed during escalation"), "{error}");
         let status = held.convoy(&backend).await.status.expect("status");
         assert!(status.stalled.as_ref().is_none_or(|stall| stall.supervisor.as_ref().is_none_or(|owner| owner.role != "deputy")));
-        assert_ruling_unlinked(&backend.using::<Message>("flotilla").list().await.expect("messages").items, &held);
+        let records: Vec<_> =
+            held.messages().messages().views("flotilla").await.expect("messages").into_iter().map(|read| read.object).collect();
+        assert_ruling_unlinked(&records, &held);
     }
 }
 

@@ -7,7 +7,7 @@ async fn standard_landing(backend: &ResourceBackend, home: &EngineHome, name: &s
 
 #[tokio::test]
 async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
     let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
@@ -134,7 +134,7 @@ fn generated_active_checks_settlement_deduplicates_heads(tc: hegel::TestCase) {
 
 #[tokio::test]
 async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let (event_tx, _) = broadcast::channel(16);
     let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default();
     let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), Arc::new(UnavailableChangeRequests), cadence);
@@ -168,7 +168,7 @@ async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
 
 #[tokio::test]
 async fn change_request_bound_after_claims_instantiates_and_settles() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
     let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
@@ -272,7 +272,7 @@ fn retracted_unlinked_submission_does_not_recreate_observation(tc: hegel::TestCa
     let reconciliations = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
     runtime.block_on(async {
-        let (backend, home) = engine_backend();
+        let (backend, home) = engine_backend().await;
         let convoys = backend.using::<Convoy>("flotilla");
         let address = flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/rigging", 70, &[]).unwrap();
         let subject = flotilla_resources::address::subject_for(&address).unwrap();

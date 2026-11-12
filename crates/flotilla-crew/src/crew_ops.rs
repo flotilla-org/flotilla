@@ -2244,7 +2244,7 @@ impl CrewService {
             Ok(())
         }
         .await;
-        if let (Err(_), Some(engine)) = (&handed_off, self.message_primitives()) {
+        if let (Err(_), Ok(engine)) = (&handed_off, self.message_primitives()) {
             if let Err(error) = engine.withdraw(&context.namespace, &message_name, &context.convoy).await {
                 tracing::warn!(convoy = %context.convoy, message = %message_name, %error, "a failed handoff's admitted turn was not withdrawn");
             }
@@ -2481,7 +2481,7 @@ impl CrewService {
         // same sender.
         let spelled = self.spelled_message_intent(namespace, &intent).await.map_err(|error| error.to_string())?;
         let prior = self
-            .open_messages_to(namespace, &spelled.receiver)
+            .active_message_records(namespace, Some(&spelled.receiver))
             .await
             .map_err(|error| error.to_string())?
             .into_iter()
@@ -2654,47 +2654,9 @@ impl CrewService {
         messages.sort_by_key(|message| message.object.metadata.creation_timestamp);
         let withdrawn = messages.last().map(|message| message.object.spec.body.clone());
         let mut closed = BTreeSet::new();
+        let primitives = self.message_primitives().map_err(|error| error.to_string())?;
         for message in messages {
-            let patch = flotilla_resources::MessageStatusPatch::Finish {
-                phase: flotilla_resources::MessagePhase::Expired,
-                reason: "operator withdrew the queued brief".into(),
-                at: self.clock.now(),
-            };
-            let mut next = message.object.status.clone().unwrap_or_default();
-            flotilla_resources::StatusPatch::apply(&patch, &mut next);
-            let replacement = serde_json::to_value(next).expect("message status");
-            let result = if let Some(primitives) = self.message_primitives() {
-                primitives.withdraw(namespace, &message.object.metadata.name, name).await
-            } else if matches!(message.provenance, ResourceProvenance::Local) {
-                flotilla_store::patch_resource_status_if_version(
-                    &self.resource_backend,
-                    namespace,
-                    "Message",
-                    &message.object.metadata.name,
-                    replacement,
-                    &message.object.metadata.resource_version,
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-            } else {
-                let publisher = self.resource_intent_publisher.read().expect("publisher lock").as_ref().and_then(Weak::upgrade);
-                match publisher {
-                    Some(publisher) => {
-                        publisher
-                            .patch_status(
-                                namespace,
-                                "Message",
-                                &message.object.metadata.name,
-                                replacement,
-                                &message.object.metadata.resource_version,
-                            )
-                            .await
-                    }
-                    None => Err("resource status mutation router unavailable".into()),
-                }
-            };
-            if let Err(error) = result {
+            if let Err(error) = primitives.withdraw(namespace, &message.object.metadata.name, name).await {
                 return Err(format!(
                     "withdrawal of {} failed: {error}; already withdrawn: {closed:?}; last queued brief: {withdrawn:?}",
                     message.object.metadata.name
@@ -2772,7 +2734,7 @@ impl CrewService {
             &turn_message_producer_key(&request.source, &request.subject_revision),
         );
         match self.message_record(&request.namespace, &name).await {
-            Ok(existing) if self.same_message_intent(&existing.object.spec, &intent) => {
+            Ok(existing) => {
                 // A repeat records what an earlier send could not (record is idempotent).
                 self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref())
                     .await?;
@@ -2787,7 +2749,6 @@ impl CrewService {
                         .unwrap_or_else(|| ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &name)),
                 });
             }
-            Ok(_) => return Err("message producer ID already names different intent".into()),
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
@@ -2804,10 +2765,7 @@ impl CrewService {
             if holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
                 return Err("receiver-home resource mutation router unavailable".into());
             }
-            let existing = match self.message_primitives() {
-                Some(_) => self.message_record(&request.namespace, &name).await.is_ok(),
-                None => self.resource_backend.using::<flotilla_resources::Message>(&request.namespace).get(&name).await.is_ok(),
-            };
+            let existing = self.message_record(&request.namespace, &name).await.is_ok();
             let admission = self
                 .admit_message(&request.namespace, &InputMeta::builder().name(name).build(), &intent)
                 .await
@@ -2987,7 +2945,7 @@ impl CrewService {
         rung: TurnDeliveryRung,
     ) -> Result<Option<CrewTurnAdmission>, String> {
         match self.message_record(&request.namespace, name).await {
-            Ok(existing) if self.same_message_intent(&existing.object.spec, intent) => {
+            Ok(existing) => {
                 // A repeat records what an earlier send could not (record is idempotent).
                 self.record_awaiting(&request.namespace, name, intent, self.admitted_home(&existing), request.stall_of.as_deref()).await?;
                 return Ok(Some(CrewTurnAdmission {
@@ -3001,7 +2959,6 @@ impl CrewService {
                         .unwrap_or_else(|| ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, name)),
                 }));
             }
-            Ok(_) => return Err("message producer ID already names different intent".into()),
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
@@ -3406,12 +3363,11 @@ impl CrewService {
         intent: &flotilla_resources::MessageSpec,
     ) -> Result<ResourceRef, String> {
         match self.message_record(namespace, name).await {
-            Ok(existing) if self.same_message_intent(&existing.object.spec, intent) => {
+            Ok(existing) => {
                 // A repeat records what an earlier send could not (record is idempotent).
                 self.record_awaiting(namespace, name, intent, self.admitted_home(&existing), None).await?;
                 return Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, &existing.object.metadata.name));
             }
-            Ok(_) => return Err("message producer ID already names different intent".into()),
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
@@ -3445,14 +3401,13 @@ impl CrewService {
     fn admitted_home(&self, read: &flotilla_resources::ReadResourceObject<flotilla_resources::Message>) -> Option<String> {
         match &read.provenance {
             ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str().to_owned()),
-            ResourceProvenance::Local => self.message_primitives().map(|engine| engine.home()),
+            ResourceProvenance::Local => self.message_primitives().ok().map(|engine| engine.home()),
         }
     }
 
-    /// With `[primitives]` on, records the sender's half of a send expecting
-    /// a reply or an outcome, once its receiver's home admitted it at `home`
-    /// (#3587 layer 7): a stall's supervision about the stalled crew, or a
-    /// plain reply or outcome. Nothing is recorded off the engine path.
+    /// Records the sender's half of a send expecting a reply or an outcome,
+    /// once its receiver's home admitted it at `home` (#3587 layer 7): a
+    /// stall's supervision about the stalled crew, or a plain reply or outcome.
     ///
     /// A send is not finished until its record is written (#3587 ruling
     /// 6353439323): a failed record is the send's error, so its producer
@@ -3467,7 +3422,7 @@ impl CrewService {
         stall_of: Option<&str>,
     ) -> Result<(), String> {
         let Some(kind) = awaiting_kind(&intent.expectation, stall_of) else { return Ok(()) };
-        let Some(engine) = self.message_primitives() else { return Ok(()) };
+        let engine = self.message_primitives().map_err(|error| error.to_string())?;
         let Some(home) = home else {
             // A receiver home off the engine path answers without it, on every repeat.
             tracing::debug!(message = %name, "the receiver home reported no admitting home; no awaiting-reply record");

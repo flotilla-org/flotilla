@@ -13,7 +13,8 @@ use flotilla_store_memory::InMemoryBackend;
 use flotilla_state_machines::machines::agent_session::Activity;
 
 use super::support::{
-    ensure_vessel, observe_attention, resume_staging_fixture, resume_staging_fixture_open, resume_staging_fixture_shaped, test_meta,
+    crew_messages, ensure_vessel, observe_attention, resume_staging_fixture, resume_staging_fixture_open, resume_staging_fixture_shaped,
+    test_meta,
 };
 use flotilla_crew::crew_ops::{ConvoyResumeOutcome, CrewSupervisionRequest};
 
@@ -34,10 +35,11 @@ async fn working_resume_uses_message_delivery_instead_of_pending_brief_release()
         .expect("queue intent");
     daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("migration scan");
     assert!(convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").pending_brief().is_none());
-    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
+    let records = crew_messages(&daemon, "flotilla").await;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].spec.body, "operator guidance");
-    assert_eq!(records[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Accepted);
+    // Admitted and not yet received: the engine's pending Message.
+    assert_eq!(records[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Deliverable);
     assert!(records[0].status.as_ref().expect("status").resolved_receiver.is_none());
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
@@ -55,11 +57,12 @@ async fn resume_stages_credentials_before_message_and_retries_failure() {
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
     resume().await.expect("retry resume");
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
-    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
+    let records = crew_messages(&daemon, "flotilla").await;
     assert_eq!(records.len(), 1);
     // Native Message attribution is separate from its unframed body.
     assert_eq!(records[0].spec.body, "continue");
-    assert_eq!(records[0].spec.sender, "principal:implicit");
+    // The engine addresses a principal no charter declares as the operator role (#3513).
+    assert_eq!(records[0].spec.sender, "principal:operator");
 }
 
 /// System time plus an offset the test only ever moves forward.
@@ -277,12 +280,8 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     let resumed = convoys.get(&probe.convoy).await.expect("source").status.expect("status");
     assert_eq!(resumed.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     assert!(resumed.stalled.is_none());
-    let guidance = backend
-        .using::<flotilla_resources::Message>("flotilla")
-        .list()
+    let guidance = crew_messages(&daemon, "flotilla")
         .await
-        .expect("guidance inbox")
-        .items
         .into_iter()
         .find(|message| message.spec.body.contains("continue with access"))
         .expect("guidance Message");

@@ -23,7 +23,7 @@ async fn status_of(backend: &ResourceBackend, home: &EngineHome, launch: &str) -
 // zero-subject claim exit. An idle controller is able regardless of row age.
 #[tokio::test]
 async fn satisfied_landing_has_controller_dependency() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let mut wake = supervision_wake(&backend, &home);
     let now = Utc::now() + chrono::Duration::days(365);
     wake.subscriptions = wake.subscriptions.with_clock(Arc::new(VirtualClock::new(now)));
@@ -82,7 +82,7 @@ async fn landing_transition_clears_stall_without_another_judge() {
 // total Landing residence, bounds the wait.
 #[tokio::test]
 async fn satisfied_landing_names_stuck_controller_and_recovers() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let (queue, _receiver) = WorkQueueSender::channel();
     wake.subscriptions.inner.controller_queues.lock().await.insert("flotilla".into(), queue.clone());
@@ -123,7 +123,7 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
             for (age, missing, merged) in
                 [(0, false, false), (19, false, false), (20, false, false), (21, true, false), (400, false, true), (age, missing, merged)]
             {
-                let (backend, home) = engine_backend();
+                let (backend, home) = engine_backend().await;
                 let wake = supervision_wake(&backend, &home);
                 let launch = landing_launch(&backend, &home, "forge", convoy_spec(), ExitDeclaration::standard_table()).await;
                 let start = Utc::now();
@@ -241,7 +241,7 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
 #[tokio::test]
 #[ignore = "waits for held-checkout expectations (engine-path-2)"]
 async fn landing_discovery_window_has_an_owed_row_then_settles() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let mut wake = supervision_wake(&backend, &home);
     let now = Utc::now();
     let clock = Arc::new(VirtualClock::new(now));
@@ -317,7 +317,7 @@ async fn landing_discovery_window_has_an_owed_row_then_settles() {
 // no route forward. Keep the empty-row stall and its diagnostic evidence.
 #[tokio::test]
 async fn landing_with_nothing_owed_stalls_with_evidence() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let mut status = ledger_owed();
     status.workflow_snapshot.as_mut().expect("workflow").exit = None;
@@ -351,7 +351,7 @@ fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel
     let checkout_present = tc.draw(gs::booleans());
     let merged_age = tc.draw(gs::integers::<i64>().min_value(0).max_value(3600));
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        let (backend, home) = engine_backend();
+        let (backend, home) = engine_backend().await;
         let mut wake = supervision_wake(&backend, &home);
         let now = Utc::now();
         wake.subscriptions = wake.subscriptions.with_clock(Arc::new(VirtualClock::new(now)));
@@ -538,7 +538,7 @@ async fn waiting_launch(backend: &ResourceBackend, home: &EngineHome, stall: flo
 
 #[tokio::test]
 async fn judge_keeps_the_convoy_controllers_capacity_stall() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let stall = pending_stall(Some(flotilla_resources::StallCause::Capacity));
     let launch = waiting_launch(&backend, &home, stall.clone()).await;
@@ -552,7 +552,7 @@ async fn judge_keeps_the_convoy_controllers_capacity_stall() {
 // stall on a convoy with nothing actionable is still cleared.
 #[tokio::test]
 async fn judge_still_clears_other_stalls_on_a_convoy_with_nothing_actionable() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let launch = waiting_launch(&backend, &home, pending_stall(None)).await;
     let objects = heard(&backend, &home, &wake, &launch).await;

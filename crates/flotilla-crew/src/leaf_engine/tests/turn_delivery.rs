@@ -65,7 +65,7 @@ fn queued_turn_waits_for_receipt_and_exposes_bound(tc: hegel::TestCase) {
                     panic!("queued")
                 };
                 assert_eq!(*queued_at, start);
-                assert!(blocking_reason.contains("waiting for receiver"), "{blocking_reason}");
+                assert!(blocking_reason.contains("waiting for its consumer"), "{blocking_reason}");
             }
             // Terminal settlement can race a submission receipt. It must neither
             // strand the episode nor retain its queued-turn advisory.
@@ -269,7 +269,7 @@ fn delivery_failures_are_durable_and_log_once() {
         let subscriber = captured_subscriber(logs.clone(), tracing::Level::WARN);
         tracing::subscriber::with_default(subscriber, || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(async {
-                let (backend, home) = engine_backend();
+                let (backend, home) = engine_backend().await;
                 let limit = if kind == 2 || kind == 3 { 0 } else { 3 };
                 let mut wake = supervision_wake_with_limit(&backend, &home, limit);
                 let convoys = backend.using::<Convoy>("flotilla");
@@ -470,7 +470,7 @@ async fn conflicting_mergeability_delivers_once_per_head_past_the_episode_limit(
 
 #[tokio::test]
 async fn issue_turn_delivery_fires_once_for_changed_issue() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let (event_tx, _) = broadcast::channel(4);
     let refresher = ChangeRequestRefresher::new(
         backend.clone(),
@@ -619,7 +619,7 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
         use flotilla_resources::convoy::engine::Actor;
         use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, Submission};
         use flotilla_resources::{Observation, ObservedChangeRequestState};
-        let (backend, home) = engine_backend();
+        let (backend, home) = engine_backend().await;
         let wake = supervision_wake(&backend, &home);
         let table = &wake.subscriptions;
         let actuator = Arc::new(RecordingTurnDelivery::default());
@@ -725,7 +725,7 @@ fn empty_queued_batches_preserve_attention_cleanup(tc: hegel::TestCase) {
     let attention_kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     runtime.block_on(async {
-        let (backend, home) = engine_backend();
+        let (backend, home) = engine_backend().await;
         let wake = supervision_wake(&backend, &home);
         let now = Utc::now();
         let attention = (attention_kind != 0).then(|| flotilla_resources::ConvoyAttention {
@@ -1077,7 +1077,7 @@ struct Rounds {
 /// [`Rounds`] whose coder reads `phase`, and whose workflow also delivers turns on `custom`, a
 /// checks predicate, as `custom-pending`.
 async fn review_rounds_fixture(phase: CrewWorkPhase, custom: Option<&str>) -> Rounds {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let actuator = Arc::new(RecordingTurnDelivery::default());
     wake.subscriptions.set_turn_delivery_actuator(actuator.clone()).await;
@@ -1234,7 +1234,7 @@ fn custom_checks_rules_deliver_pending_once(tc: hegel::TestCase) {
 // that head stay held, and a new head clears the hold and delivers.
 #[tokio::test]
 async fn artifact_rounds_at_one_head_hold_until_the_head_moves() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let table = &wake.subscriptions;
     let actuator = Arc::new(RecordingTurnDelivery::default());

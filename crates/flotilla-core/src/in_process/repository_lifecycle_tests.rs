@@ -508,6 +508,7 @@ async fn github_observation_credential_failure_is_visible_and_recovers() {
     // The engine's readings, which a running daemon always has.
     super::tests::test_engine(&daemon);
     let backend = daemon.resource_backend();
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
     let forge = flotilla_resources::ForgeSpec::builder()
         .forge_id("github".into())
         .kind(flotilla_resources::ForgeKind::Github)

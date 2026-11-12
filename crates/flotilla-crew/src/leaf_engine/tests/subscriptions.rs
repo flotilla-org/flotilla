@@ -43,7 +43,7 @@ async fn until(what: &str, mut ready: impl AsyncFnMut() -> bool) {
 #[tokio::test]
 async fn leaf_wait_recovers_after_watch_overflow() {
     use futures::FutureExt;
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let table = supervision_wake(&backend, &home).subscriptions;
     let busy = active_launch(&backend, &home, "busy").await;
     let id = uuid::Uuid::new_v4();
@@ -79,7 +79,7 @@ async fn leaf_wait_recovers_after_watch_overflow() {
 #[tokio::test(start_paused = true)]
 async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
     use futures::FutureExt;
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let table = supervision_wake(&backend, &home).subscriptions;
     let busy = active_launch(&backend, &home, "busy").await;
     let row = overload_row(uuid::Uuid::new_v4(), &busy);
@@ -135,7 +135,7 @@ async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
 #[tokio::test(start_paused = true)]
 async fn leaf_overload_backoff_is_cancelled_by_disconnect() {
     use futures::FutureExt;
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let table = supervision_wake(&backend, &home).subscriptions;
     let busy = active_launch(&backend, &home, "busy").await;
     let connection_id = uuid::Uuid::new_v4();
@@ -316,7 +316,7 @@ async fn sqlite_leaf_subscription_contract() {
 
 #[tokio::test]
 async fn diagnostics_retain_the_last_firing_for_an_armed_reconciler_row() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let (event_tx, _) = broadcast::channel(4);
     let refresher = ChangeRequestRefresher::new(
         backend.clone(),
@@ -360,7 +360,7 @@ fn unchanged_subscription_decisions_log_once() {
     let subscriber = captured_subscriber(logs.clone(), tracing::Level::DEBUG);
     tracing::subscriber::with_default(subscriber, || {
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(async {
-            let (backend, home) = engine_backend();
+            let (backend, home) = engine_backend().await;
             let wake = supervision_wake(&backend, &home);
             let status = ConvoyStatus { workflow_snapshot: Some(stock_snapshot("single-agent")), ..Default::default() };
             let launch = home.admit("checks-wake", ConvoySpec::builder().workflow_ref("single-agent".into()).build(), status).await;
@@ -390,7 +390,7 @@ fn unchanged_subscription_decisions_log_once() {
 
 #[tokio::test]
 async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
     let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
@@ -563,7 +563,7 @@ async fn router_processed(table: &LeafSubscriptionTable, previous: usize) {
 #[tokio::test]
 async fn leaf_routing_missing_work_and_restart() {
     use futures::FutureExt;
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let table = supervision_wake(&backend, &home).subscriptions;
     // The launch is reserved, so its name is known, but not yet admitted.
     let missing = home.reserve("missing").await;
@@ -601,7 +601,7 @@ async fn leaf_routing_missing_work_and_restart() {
 #[tokio::test]
 async fn leaf_resync_evaluates_each_row_once_then_routes_again() {
     use futures::FutureExt;
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let busy = active_launch(&backend, &home, "busy").await;
     let objects = [active_launch(&backend, &home, "object-0").await, active_launch(&backend, &home, "object-1").await];
     let table = supervision_wake(&backend, &home).subscriptions;
@@ -663,7 +663,7 @@ async fn leaf_resync_evaluates_each_row_once_then_routes_again() {
 #[tokio::test]
 async fn slow_leaf_watch_open_does_not_block_other_namespaces() {
     use futures::FutureExt;
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let busy = active_launch(&backend, &home, "busy").await;
     let table = supervision_wake(&backend, &home).subscriptions;
     let connection = uuid::Uuid::new_v4();
@@ -699,7 +699,7 @@ async fn slow_leaf_watch_open_does_not_block_other_namespaces() {
 #[tokio::test]
 async fn racing_leaf_openers_share_router_and_remove_only_their_addresses() {
     use futures::FutureExt;
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let table = supervision_wake(&backend, &home).subscriptions;
     let busy = home.reserve("busy").await;
     let row = overload_row(uuid::Uuid::new_v4(), &busy);
@@ -739,7 +739,7 @@ async fn racing_leaf_openers_share_router_and_remove_only_their_addresses() {
 #[tokio::test(start_paused = true)]
 async fn leaf_targeted_reads_retry_without_losing_wait_identity() {
     use futures::FutureExt;
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let busy = launch_at(&backend, &home, "busy", ledger_owed(), ConvoyPhase::Failed).await;
     let table = supervision_wake(&backend, &home).subscriptions;
     let row = overload_row(uuid::Uuid::new_v4(), &busy);
@@ -786,7 +786,7 @@ async fn leaf_targeted_reads_retry_without_losing_wait_identity() {
 // demand immediately; no read retries occur after cancellation.
 #[tokio::test(start_paused = true)]
 async fn leaf_read_backoff_is_cancelled_by_disconnect() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let table = supervision_wake(&backend, &home).subscriptions;
     let connection = uuid::Uuid::new_v4();
     let row = overload_row(connection, "busy#1");

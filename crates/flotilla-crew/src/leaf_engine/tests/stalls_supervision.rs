@@ -1,5 +1,4 @@
 use flotilla_change_request::observation;
-use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
 use flotilla_provisioning_testkit::TerminalsFixture;
 use flotilla_resources::attentions::{Sender, Subject};
 use flotilla_resources::checkout_records::CheckoutHolder;
@@ -526,8 +525,6 @@ async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
 async fn unavailable_governor_tells_the_operator_once() {
     for unavailable in GovernorUnavailable::ALL {
         let case = project_supervision_case(&[]).await;
-        let messages = EngineMessagesHome::open("test-host", "flotilla", &case.backend);
-        designate_fleet(&case.backend, "flotilla").await;
         // The stalled convoy's project is defined, so its operator inbox is a person's inbox.
         case.backend
             .definitions::<Project>("flotilla")
@@ -567,7 +564,7 @@ async fn unavailable_governor_tells_the_operator_once() {
         let fact = flotilla_resources::attentions::Fact::Stalled { convoy: case.work.clone(), role: "coder".into() };
         let again = flotilla_resources::attentions::Attention::new(fact, attention.reason.clone(), stall.began_at);
         case.backend.attentions().raise("flotilla", &again).await.expect("raise again");
-        let stored = messages.primitives().messages().expect("stored messages");
+        let stored = case.home.messages.primitives().messages().expect("stored messages");
         let told = stored.iter().filter(|(_, message)| message.spec().sender.to_string().ends_with("/role:stall-judge")).count();
         assert_eq!(told, 1, "{unavailable:?}");
     }
@@ -852,7 +849,7 @@ async fn stale_busy_screen_does_not_stall() {
 
 #[tokio::test]
 async fn clone_controller_rows_judge_transient_terminal_and_exhausted_failures() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let launch = home.admit("delivery", convoy_spec(), single_agent("coder")).await;
     home.vessel(&launch, "work", "delivery-env");
@@ -933,7 +930,7 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
             Err(self.0.clone())
         }
     }
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let now = Utc::now();
     let retry_at = now + chrono::Duration::seconds(60);
     let error = {
@@ -989,7 +986,7 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
 #[tokio::test]
 async fn steady_state_stall_judgements_do_not_read_the_store() {
     use flotilla_store_testkit::ReadCountsBackendExt;
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let counted = backend.clone().with_read_counts();
     let wake = supervision_wake(&counted, &home);
     backend
@@ -1026,7 +1023,7 @@ async fn steady_state_stall_judgements_do_not_read_the_store() {
 #[tokio::test]
 async fn leaf_engine_steady_state_reconcile_reads_no_store() {
     use flotilla_store_testkit::ReadCountsBackendExt;
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let counted = backend.clone().with_read_counts();
     let wake = supervision_wake(&counted, &home);
     backend
@@ -1471,7 +1468,7 @@ fn pending_launch_progress_is_bounded_and_recovers(tc: hegel::TestCase) {
 // A vessel the engine realises is launch progress: its Ready restarts the launch bound.
 #[tokio::test]
 async fn engine_vessel_progress_resets_the_launch_bound() {
-    let (backend, home) = engine_backend();
+    let (backend, home) = engine_backend().await;
     let wake = supervision_wake(&backend, &home);
     let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("graphql-budget".into()).project_ref("wheelhouse".into()).build();
     let launch =

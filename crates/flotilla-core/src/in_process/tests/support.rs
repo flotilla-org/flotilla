@@ -146,6 +146,7 @@ pub(super) async fn resume_staging_fixture_shaped(
     )
     .await;
     let engine = test_engine(&daemon);
+    designate_fleet(&backend).await;
     // Its coder owes a decision ledger. When it is kept by an operator's verdict, the convoy is
     // Landing, its work Complete and its crew Done.
     let coder = claim_crew("coder");
@@ -569,6 +570,8 @@ pub(in crate::in_process) fn test_engine(daemon: &InProcessDaemon) -> TestEngine
         drop(engine.checkouts.checkouts.follow(Arc::clone(&service)).expect("follow the checkouts"));
     }
     daemon.install_lifecycle_reads(engine.reads()).expect("engine reads");
+    // The runtime opens the Message path at startup; crew reads and admits Messages only through it.
+    install_engine_messages(daemon);
     engines.push((Arc::downgrade(&service), Arc::clone(&engine)));
     engine
 }
@@ -763,6 +766,7 @@ pub(super) async fn stall_test_daemon_with_clock(clock: Arc<dyn flotilla_resourc
     )
     .await;
     let engine = test_engine(&daemon);
+    designate_fleet(&backend).await;
     let (sender, mut receiver) = flotilla_store::controller::WorkQueueSender::channel();
     let watch = daemon.reconciler_wake_watch();
     let watch_backend = backend.clone();
@@ -941,11 +945,29 @@ pub(in crate::in_process) fn engine_messages(
     primitives
 }
 
-/// `daemon`'s Message path over its decided store, installed as its runtime installs it.
+/// `daemon`'s Message path over its decided store, installed as its runtime installs it: opened
+/// on first use, the same path after.
 pub(in crate::in_process) fn install_engine_messages(
     daemon: &crate::in_process::InProcessDaemon,
 ) -> Arc<flotilla_engine_messages::MessagePrimitives> {
-    daemon.open_message_primitives().expect("message path")
+    match daemon.message_primitives() {
+        Some(primitives) => primitives,
+        None => daemon.open_message_primitives().expect("message path"),
+    }
+}
+
+/// `daemon`'s Messages in `namespace` as the crew and the crew Message reads see them.
+pub(in crate::in_process) async fn crew_messages(
+    daemon: &InProcessDaemon,
+    namespace: &str,
+) -> Vec<ResourceObject<flotilla_resources::Message>> {
+    let views = install_engine_messages(daemon).views(namespace).await.expect("crew Message views");
+    views.into_iter().map(|read| read.object).collect()
+}
+
+/// Records the Message `record` as a turn crew `session` received `at`, through `daemon`'s inbox.
+pub(in crate::in_process) async fn receive_turn(daemon: &InProcessDaemon, record: &str, session: &str, at: chrono::DateTime<Utc>) {
+    flotilla_engine_messages_testkit::deliver_turn(&install_engine_messages(daemon), record, session, at).await;
 }
 
 /// Declare and designate the fleet whose roles the engine's Message delivery reads.

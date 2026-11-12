@@ -76,21 +76,26 @@ impl EngineMessagesHome {
     /// delivery records one: the session registered and bound to the message's inbox, then its
     /// receipt, then its deliver.
     pub async fn deliver_turn(&self, record: &str, session: &str) {
-        let (id, _) = self.primitives.locate(record).expect("locate").unwrap_or_else(|| panic!("no message `{record}`"));
-        let messages = self.primitives.messages().expect("messages");
-        let (_, message) = messages.iter().find(|(_, message)| message.name() == id).expect("the located message");
-        let now = Timestamp::from_datetime(&chrono::Utc::now());
-        let consumer = self.primitives.register(session, now).await.expect("register the session");
-        let inbox = self.primitives.inbox();
-        inbox.bind(message.spec().inbox.clone(), consumer.clone()).await.expect("bind the session");
-        inbox.receive(&consumer, &id, Transport::Turn).await.expect("receipt");
-        inbox.deliver(&id, Deliver { receiver: consumer, transport: Transport::Turn }).await.expect("deliver");
+        deliver_turn(&self.primitives, record, session, chrono::Utc::now()).await;
     }
 
     /// The path as the crew's Message port.
     pub fn messages(&self) -> Arc<dyn EngineMessages> {
         Arc::clone(&self.primitives) as Arc<dyn EngineMessages>
     }
+}
+
+/// [`EngineMessagesHome::deliver_turn`] on any home's Message path, such as a daemon's, the
+/// session registered `at`.
+pub async fn deliver_turn(primitives: &MessagePrimitives, record: &str, session: &str, at: chrono::DateTime<chrono::Utc>) {
+    let (id, _) = primitives.locate(record).expect("locate").unwrap_or_else(|| panic!("no message `{record}`"));
+    let messages = primitives.messages().expect("messages");
+    let (_, message) = messages.iter().find(|(_, message)| message.name() == id).expect("the located message");
+    let consumer = primitives.register(session, Timestamp::from_datetime(&at)).await.expect("register the session");
+    let inbox = primitives.inbox();
+    inbox.bind(message.spec().inbox.clone(), consumer.clone()).await.expect("bind the session");
+    inbox.receive(&consumer, &id, Transport::Turn).await.expect("receipt");
+    inbox.deliver(&id, Deliver { receiver: consumer, transport: Transport::Turn }).await.expect("deliver");
 }
 
 /// Declares Project `fleet` in `namespace` and designates it, so the fleet roles the system

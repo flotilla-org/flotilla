@@ -12,7 +12,7 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{ensure_vessel, observe_attention, resume_staging_fixture, RecordingWorkCredentials};
+use super::support::{crew_messages, ensure_vessel, observe_attention, receive_turn, resume_staging_fixture, RecordingWorkCredentials};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 
@@ -44,7 +44,7 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
     let relaunched = terminals.record("resume-staging-session");
     assert_ne!(relaunched.name, exited.name);
     assert_eq!(relaunched.source, exited.source);
-    let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items;
+    let messages = crew_messages(&daemon, "flotilla").await;
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].spec.body, "fresh turn");
     assert_eq!(messages[0].spec.sender, "system:turn-rules");
@@ -67,23 +67,8 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
         .sender("system:turn-rules".into())
         .build();
     daemon.deliver_standing_turn(&request).await.expect("first intent");
-    let messages = backend.using::<flotilla_resources::Message>("flotilla");
-    let message = messages.list().await.expect("messages").items.remove(0);
-    flotilla_store::apply_status_patch(
-        &messages,
-        &message.metadata.name,
-        &flotilla_resources::MessageStatusPatch::Delivered {
-            receiver: flotilla_resources::ResolvedMessageReceiver::builder()
-                .crew_id("crew".into())
-                .session("old-session".into())
-                .delivered_at(Utc::now())
-                .evidence("holder accepted input".into())
-                .build(),
-            at: Utc::now(),
-        },
-    )
-    .await
-    .expect("receipt");
+    let message = crew_messages(&daemon, "flotilla").await.remove(0);
+    receive_turn(&daemon, &message.metadata.name, "old-session", Utc::now()).await;
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let terminals = &probe.engine.terminals;
     let lost = terminals.record("resume-staging-session").name;
@@ -91,7 +76,7 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
     terminals.lost(&lost, "pool lost the session");
     assert_eq!(daemon.deliver_standing_turn(&request).await.expect("duplicate already accepted"), TurnDeliveryRung::FreshAgent);
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(messages.list().await.expect("messages").items.len(), 1);
+    assert_eq!(crew_messages(&daemon, "flotilla").await.len(), 1);
     assert_eq!(
         sessions.get("resume-staging-session").await.expect("session").status.expect("status").phase,
         ResourceTerminalSessionPhase::Lost
@@ -116,6 +101,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
         .await;
         // The engine's readings, which a running daemon always has.
         let engine = super::test_engine(&daemon);
+        super::support::designate_fleet(&backend).await;
         // The coder's work is kept: the convoy is Landing, its work Complete and its crew Done.
         let mut snapshot = super::support::stall_workflow_snapshot(vec![super::support::claim_crew("coder")]);
         snapshot.vessels[0].credential_refs = BTreeSet::from(["github-crew-pr".to_string()]);
@@ -184,10 +170,11 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
         daemon.deliver_standing_turn(&request).await.expect("retry conflicting turn");
         let delivered = sessions.get("turn-credential-session").await.expect("delivered session");
         assert_eq!(*credentials.delivered.lock().await, BTreeSet::from(["github-crew-pr".to_string()]));
-        let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("accepted messages").items;
+        let messages = crew_messages(&daemon, "flotilla").await;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].spec.body, "rebase the PR");
-        assert_eq!(messages[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Accepted);
+        // Admitted and not yet received: the engine's pending Message.
+        assert_eq!(messages[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Deliverable);
         if phase == ResourceTerminalSessionPhase::Stopped {
             assert_eq!(delivered.status.expect("status").phase, ResourceTerminalSessionPhase::Starting);
         }
@@ -237,29 +224,14 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         if limit == 0 {
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
         } else {
-            let messages = backend.using::<flotilla_resources::Message>("flotilla");
-            let nudge = messages.list().await.expect("nudges").items.remove(0);
+            let nudge = crew_messages(&daemon, "flotilla").await.remove(0);
             assert!(nudge.spec.body.contains("You owe deliverables for work/coder"));
             assert!(matches!(nudge.spec.expectation, flotilla_resources::MessageExpectation::Outcome { .. }));
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
             for (cooldown_seconds, desired_rung) in [(1, StallRung::Nudge), (2, StallRung::Operator)] {
-                for nudge in messages.list().await.expect("nudges").items {
+                for nudge in crew_messages(&daemon, "flotilla").await {
                     if nudge.status.as_ref().is_some_and(|status| status.phase.is_waiting()) {
-                        flotilla_store::apply_status_patch(
-                            &messages,
-                            &nudge.metadata.name,
-                            &flotilla_resources::MessageStatusPatch::Delivered {
-                                receiver: flotilla_resources::ResolvedMessageReceiver::builder()
-                                    .crew_id("crew".into())
-                                    .session("resume-staging-session".into())
-                                    .delivered_at(clock.now())
-                                    .evidence("agent accepted nudge".into())
-                                    .build(),
-                                at: clock.now(),
-                            },
-                        )
-                        .await
-                        .expect("consume nudge");
+                        receive_turn(&daemon, &nudge.metadata.name, "resume-staging-session", clock.now()).await;
                     }
                 }
                 // First observe delivery; only a later idle observation is a reply
@@ -310,7 +282,12 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
         .sender(flotilla_resources::legacy_message_sender(&CrewMessageSender::Unknown).0)
         .build();
     let admission = daemon.crew.deliver_turn(&request).await.expect("controller intent");
-    let original = backend.using::<Message>("flotilla").get(&admission.message.name).await.expect("receiver intent");
+    // The crew's reply is spelled as the crew reads the original.
+    let original = crew_messages(&daemon, "flotilla")
+        .await
+        .into_iter()
+        .find(|message| message.metadata.name == admission.message.name)
+        .expect("receiver intent");
     let reply = serde_json::json!({
         "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"legacy-reply"},
         "spec":{"sender":original.spec.receiver,"receiver":original.spec.sender,"relation":"peer",
@@ -320,7 +297,8 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
         daemon.message_creation_origin("flotilla", &reply).await.expect("correlated system reply has a home"),
         Some(daemon.node_id().clone())
     );
-    assert_eq!(original.spec.sender, "system:legacy");
+    // The engine folds the legacy controller sender into turn rules (#3513).
+    assert_eq!(original.spec.sender, "system:turn-rules");
     daemon.apply_intent_document("flotilla", reply).await.expect("create correlated system reply");
     assert!(backend.using::<Message>("flotilla").get("legacy-reply").await.is_ok());
 }

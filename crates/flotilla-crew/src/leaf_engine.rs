@@ -112,8 +112,7 @@ struct LeafSubscriptionTableInner {
     clock: Arc<dyn flotilla_resources::Clock>,
     backend: ResourceBackend,
     watch_views: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<wake::LeafViews>>>>,
-    message_inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>,
-    /// The `[primitives]` Message path; empty while the switch is off.
+    /// The Message path, installed at startup.
     message_path: crate::ports::MessagePath,
     /// The `[primitives]` Convoy path: promises are read from the engine when it holds a convoy.
     convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
@@ -182,13 +181,8 @@ impl LeafSubscriptionTable {
         self
     }
 
-    pub(crate) fn message_primitives(&self) -> Option<Arc<dyn flotilla_messaging::EngineMessages>> {
-        self.inner.message_path.get().cloned()
-    }
-
-    pub fn with_message_inboxes(mut self, inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>) -> Self {
-        Arc::get_mut(&mut self.inner).expect("configure inboxes before sharing subscriptions").message_inboxes = inboxes;
-        self
+    pub(crate) fn message_primitives(&self) -> Result<Arc<dyn flotilla_messaging::EngineMessages>, flotilla_resources::ResourceError> {
+        crate::ports::installed_messages(&self.inner.message_path)
     }
 
     pub fn new(
@@ -242,7 +236,6 @@ impl LeafSubscriptionTable {
                 clock: Arc::new(flotilla_resources::SystemClock),
                 backend,
                 watch_views: Default::default(),
-                message_inboxes: Default::default(),
                 message_path: Default::default(),
                 convoy_engine: Default::default(),
                 charter_brief_renderer: Arc::new(flotilla_messaging::CharterProseRenderer),

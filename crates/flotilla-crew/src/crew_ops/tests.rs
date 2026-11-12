@@ -84,11 +84,10 @@ impl WorkCredentialReconciler for StagingProbe {
 }
 
 /// What a fixture's crew service needs kept alive, and the engine records it drives: its config
-/// directory, the engine's Message path at its home, and the engine at its home holding convoy
-/// `crew`'s launch, the launch's vessel for `work` and the `coder`'s agent session in it.
+/// directory, and the engine at its home holding convoy `crew`'s launch, the launch's vessel for
+/// `work` and the `coder`'s agent session in it.
 struct Held {
     _config: tempfile::TempDir,
-    messages: Option<EngineMessagesHome>,
     engine: EngineHome,
     /// Convoy `crew`'s launch.
     launch: String,
@@ -103,7 +102,7 @@ struct Held {
 impl Held {
     /// The engine's Message path at the fixture's home.
     fn messages(&self) -> &EngineMessagesHome {
-        self.messages.as_ref().expect("a fixture on the engine's Message path")
+        &self.engine.messages
     }
 
     /// The fixture convoy's view.
@@ -193,30 +192,19 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
     fixture_with_message_path(phase, Default::default()).await
 }
 
-/// [`fixture`], with the `[primitives]` Message path the crew service and its
-/// leaf subscriptions share, as the composition root wires them; the engine's
-/// path at this home unless `message_path` is already set.
+/// [`fixture`], with the Message path the crew service and its leaf subscriptions share, as the
+/// composition root wires them; the engine's path at this home unless `message_path` is already
+/// set.
 async fn fixture_with_message_path(
     phase: CrewWorkPhase,
     message_path: crate::ports::MessagePath,
 ) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
-    let messages = EngineMessagesHome::open("host", "flotilla", &backend);
-    designate_fleet(&backend, "flotilla").await;
-    if message_path.get().is_none() {
-        let _ = message_path.set(messages.messages());
-    }
-    build_fixture(phase, backend, message_path, Some(messages), crew_spec(), &[], |_, _| {}).await
+    build_fixture(phase, message_path, crew_spec(), &[], |_, _| {}).await
 }
 
 /// [`fixture`], its convoy admitted with `spec`.
 async fn spec_fixture(phase: CrewWorkPhase, spec: ConvoySpec) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
-    let messages = EngineMessagesHome::open("host", "flotilla", &backend);
-    designate_fleet(&backend, "flotilla").await;
-    let message_path = crate::ports::MessagePath::default();
-    let _ = message_path.set(messages.messages());
-    build_fixture(phase, backend, message_path, Some(messages), spec, &[], |_, _| {}).await
+    build_fixture(phase, Default::default(), spec, &[], |_, _| {}).await
 }
 
 /// The fixture convoy's spec: workflow `workflow`, for role `crew`.
@@ -230,55 +218,38 @@ async fn shaped_fixture(
     phase: CrewWorkPhase,
     shape: impl FnOnce(&mut WorkflowSnapshot),
 ) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
-    let messages = EngineMessagesHome::open("host", "flotilla", &backend);
-    designate_fleet(&backend, "flotilla").await;
-    let message_path = crate::ports::MessagePath::default();
-    let _ = message_path.set(messages.messages());
-    build_fixture(phase, backend, message_path, Some(messages), crew_spec(), &[], |snapshot, _| shape(snapshot)).await
+    prelude_fixture(phase, &[], |snapshot, _| shape(snapshot)).await
 }
 
-/// [`fixture`] on the old Message store, for crew behaviour that compares old receiver and
-/// sender spellings. Goes when crew compares engine addresses (#3108 gate task).
-async fn old_store_fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    old_store_shaped_fixture(phase, |_| {}).await
-}
-
-/// [`old_store_fixture`] admitted with the workflow `shape` makes of the fixture's.
-async fn old_store_shaped_fixture(
-    phase: CrewWorkPhase,
-    shape: impl FnOnce(&mut WorkflowSnapshot),
-) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    old_store_prelude_fixture(phase, &[], |snapshot, _| shape(snapshot)).await
-}
-
-/// [`old_store_fixture`] at a home that admitted `prelude` first, its workflow shaped by `shape`
-/// from the prelude's launches and crew ids.
-async fn old_store_prelude_fixture(
+/// [`fixture`] at a home that admitted `prelude` first, its workflow shaped by `shape` from the
+/// prelude's launches and crew ids.
+async fn prelude_fixture(
     phase: CrewWorkPhase,
     prelude: &[Crewed<'_>],
     shape: impl FnOnce(&mut WorkflowSnapshot, &[(String, String)]),
 ) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
-    backend.install_attentions(Arc::new(flotilla_store_testkit::NoAttentions));
-    build_fixture(phase, backend, Default::default(), None, crew_spec(), prelude, shape).await
+    build_fixture(phase, Default::default(), crew_spec(), prelude, shape).await
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The fixture at a home whose fleet is designated, its crew service on `message_path`, or on
+/// the home's Message path when that is not set.
 async fn build_fixture(
     phase: CrewWorkPhase,
-    backend: ResourceBackend,
     message_path: crate::ports::MessagePath,
-    messages: Option<EngineMessagesHome>,
     spec: ConvoySpec,
     prelude: &[Crewed<'_>],
     shape: impl FnOnce(&mut WorkflowSnapshot, &[(String, String)]),
 ) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
+    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
     let config_dir = tempfile::tempdir().expect("config directory");
     let config = Arc::new(ConfigStore::with_base(config_dir.path()));
     let environment = EnvironmentId::new("local");
     let namespace = Arc::new(std::sync::RwLock::new("flotilla".into()));
     let engine = EngineHome::install(&backend, "flotilla", "host");
+    designate_fleet(&backend, "flotilla").await;
+    if message_path.get().is_none() {
+        let _ = message_path.set(engine.messages.messages());
+    }
     let refresher =
         ChangeRequestRefresher::new(backend.clone(), "host".into(), Arc::new(UnusedForge), ChangeRequestRefreshCadence::default());
     let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::new(RecordingEventSink::default()), refresher, engine.reads())
@@ -366,7 +337,7 @@ async fn build_fixture(
         CrewWorkPhase::Interrupted => engine.engine.terminals.lost(&session, "pool lost the session"),
         other => panic!("no fixture for a {other:?} coder"),
     }
-    let held = Held { _config: config_dir, messages, engine, launch, vessel, session, prelude: admitted };
+    let held = Held { _config: config_dir, engine, launch, vessel, session, prelude: admitted };
     assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["work"]["coder"].phase, phase);
     (crew, backend, probe, held)
 }

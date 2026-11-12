@@ -1,11 +1,13 @@
 //! The engine at a crew test's home (#3108): one decided store whose launches, vessels, terminal
 //! sessions and environments a test drives, served on its resource backend as Convoy, Vessel and
-//! TerminalSession the way the composition root serves them, and the readings a crew service and
-//! its leaf subscriptions take over the same store.
+//! TerminalSession the way the composition root serves them, the readings a crew service and its
+//! leaf subscriptions take over the same store, and the home's Message path.
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use flotilla_engine_convoys_testkit::EngineConvoysHome;
+use flotilla_engine_messages_testkit::EngineMessagesHome;
 use flotilla_provisioning::engine::reads::{LifecycleReadPort, StoreReads};
 use flotilla_provisioning_testkit::{AgentSessionsFixture, EngineFixture, TerminalsFixture};
 use flotilla_resources::{
@@ -13,7 +15,7 @@ use flotilla_resources::{
     convoy::engine::{set_notes, EngineConvoyPath, EngineConvoys, VerdictScope},
     lifecycle_reads::LifecycleReads,
     terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource},
-    Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, ResourceObject, SystemClock,
+    Clock, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, ResourceObject, SystemClock,
 };
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::ResourceBackend;
@@ -23,6 +25,10 @@ pub(crate) struct EngineHome {
     pub engine: EngineFixture,
     pub convoys: EngineConvoysHome,
     pub agents: Arc<AgentSessionsFixture>,
+    /// The home's Message path, installed on its backend.
+    pub messages: EngineMessagesHome,
+    /// The Message path's clock.
+    message_clock: Arc<MessageClock>,
     namespace: String,
     host: String,
     service: Arc<Service>,
@@ -41,7 +47,34 @@ impl EngineHome {
         let convoys = EngineConvoysHome::over(&service, namespace, backend, Arc::new(SystemClock), engine.reads());
         let agents = Arc::new(AgentSessionsFixture::new(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH));
         crate::serve_agents(Arc::clone(&agents));
-        Self { engine, convoys, agents, namespace: namespace.to_owned(), host: home.to_owned(), service, _dir: dir }
+        let message_clock = Arc::new(MessageClock::default());
+        let messages = EngineMessagesHome::open_with_clock(home, namespace, backend, Arc::clone(&message_clock) as Arc<dyn Clock>);
+        Self {
+            engine,
+            convoys,
+            agents,
+            messages,
+            message_clock,
+            namespace: namespace.to_owned(),
+            host: home.to_owned(),
+            service,
+            _dir: dir,
+        }
+    }
+
+    /// The Message path, as the crew and its leaf subscriptions take it.
+    pub fn message_path(&self) -> crate::ports::MessagePath {
+        let path = crate::ports::MessagePath::default();
+        let _ = path.set(self.messages.messages());
+        path
+    }
+
+    /// Records the message `record` names as a turn `session` confirmed at `at`, as its delivery
+    /// does.
+    pub async fn deliver_turn_at(&self, record: &str, session: &str, at: DateTime<Utc>) {
+        *self.message_clock.pinned.lock().expect("message clock") = Some(at);
+        self.messages.deliver_turn(record, session).await;
+        *self.message_clock.pinned.lock().expect("message clock") = None;
     }
 
     /// The home's decided store: another home's log is replicated into it as a peer's arrives.
@@ -223,14 +256,25 @@ impl EngineHome {
     }
 }
 
+/// The system clock, unless a test pins it to the instant a step happened at.
+#[derive(Debug, Default)]
+struct MessageClock {
+    pinned: std::sync::Mutex<Option<DateTime<Utc>>>,
+}
+
+impl Clock for MessageClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.pinned.lock().expect("message clock").unwrap_or_else(Utc::now)
+    }
+}
+
 #[test]
 fn dropping_a_home_and_its_backend_closes_its_stores() {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     let stores = runtime.block_on(async {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let home = EngineHome::install(&backend, "flotilla", "host");
-        let messages = flotilla_engine_messages_testkit::EngineMessagesHome::open("host", "flotilla", &backend);
-        [Arc::downgrade(&home.service), Arc::downgrade(messages.service())]
+        [Arc::downgrade(&home.service), Arc::downgrade(home.messages.service())]
     });
     // The runtime's tasks go with it; a port the backend holds must not hold the backend back.
     drop(runtime);
