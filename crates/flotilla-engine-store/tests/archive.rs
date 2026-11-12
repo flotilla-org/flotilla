@@ -1,7 +1,7 @@
 //! Archiving ended resources (#3939): selection from the home's log, the bundle and its replay,
 //! and removal in two writes that followers tail without a fresh snapshot.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_engine_store::{
     archive::{bundle_key, ArchiveKinds, Archiver, Bundle, Due, Prepared, Stage, ARCHIVE_AFTER_MICROS, ARCHIVE_WRITER},
@@ -10,7 +10,7 @@ use flotilla_engine_store::{
 use flotilla_schema::{Address, Cause, Identity, Kind, Timestamp};
 use flotilla_schema_sqlite::{
     stream::{self, Follower, Frame},
-    Store,
+    Store, StoreHandle,
 };
 use flotilla_state_machines::{
     machines::{
@@ -81,7 +81,7 @@ fn follow(source: &mut Store, target: &mut Store, after: Option<u64>) -> bool {
 // restart between the two writes resumes at the expunge.
 #[test]
 fn a_dropped_message_ships_a_week_later_and_leaves_in_two_writes() {
-    let shared = Arc::new(Mutex::new(store(HOME)));
+    let shared = Arc::new(StoreHandle::new(store(HOME)));
     let mut messages = Home::<Message, MessageLog>::with_log(HOME, MessageLog::new(shared.clone())).expect("message home");
     let mut world = MemoryMessageWorld::default();
     world.binding.put(&Ref::new(inbox().as_str()), InboxBinding::Unbound { since: Timestamp(0) });

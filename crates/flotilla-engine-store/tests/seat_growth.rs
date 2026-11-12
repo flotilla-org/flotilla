@@ -1,19 +1,20 @@
 //! A convoy's seats grow within the cap; retired seats keep their names.
 use flotilla_engine_store::{convoy_registry, StoreLog};
 use flotilla_schema::{Address, Frozen, Kind, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{machines::convoy::*, Home, Ref, Resource, WriteError};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 #[test]
 fn retired_seats_keep_their_names_and_replicas_follow_seat_edges() {
     let name = "project:flotilla/convoy:governor";
     let address: Address = name.parse().unwrap();
-    let store =
-        Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().unwrap(), "home", convoy_registry().unwrap()).unwrap()));
+    let store = Arc::new(StoreHandle::new(
+        Store::open(rusqlite::Connection::open_in_memory().unwrap(), "home", convoy_registry().unwrap()).unwrap(),
+    ));
     let mut home = Home::<Convoy, _>::with_log("home", StoreLog::new(Arc::clone(&store))).unwrap();
     let project: Address = "project:flotilla".parse().unwrap();
     let authority = Ref::new("ensure");

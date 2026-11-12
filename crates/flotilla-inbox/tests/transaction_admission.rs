@@ -1,10 +1,10 @@
 //! Storage assigns Message admission in the create transaction (approved owner seam).
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_inbox::sqlite::MessageLog;
 use flotilla_inbox_testkit::{consumer, inbox, spec, SessionPort};
 use flotilla_schema::{Kind, NewChange, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     machines::message::{MemoryMessageWorld, Message},
     Home, MemoryLog, Ref, Resource,
@@ -20,7 +20,7 @@ use rusqlite::Connection;
 fn transaction_assigns_admission_to_home_and_store(tc: TestCase) {
     let competitors = tc.draw(gs::sampled_from(vec![0usize, 1, 10]));
     let supplied = tc.draw(gs::sampled_from(vec![0u64, 1, u64::MAX]));
-    let store = Arc::new(Mutex::new(
+    let store = Arc::new(StoreHandle::new(
         Store::open(Connection::open_in_memory().expect("db"), "test", flotilla_state_machines::kinds().expect("registry")).expect("store"),
     ));
     let mut request = spec();
@@ -98,7 +98,7 @@ fn evicted_names_remain_unique_in_the_source() {
         assert_eq!(stored.version(), original.version());
     }
     check(flotilla_inbox::MemoryInboxLog::default());
-    let store = Arc::new(Mutex::new(
+    let store = Arc::new(StoreHandle::new(
         Store::open(Connection::open_in_memory().unwrap(), "test", flotilla_state_machines::kinds().unwrap()).unwrap(),
     ));
     check(MessageLog::new(store));
@@ -122,7 +122,7 @@ fn both_logs_refuse_direct_caller_stamped_create() {
         assert!(log.load("caller-stamped").unwrap().is_none());
     }
     check(flotilla_inbox::MemoryInboxLog::default());
-    let store = Arc::new(Mutex::new(
+    let store = Arc::new(StoreHandle::new(
         Store::open(Connection::open_in_memory().unwrap(), "test", flotilla_state_machines::kinds().unwrap()).unwrap(),
     ));
     check(MessageLog::new(store));

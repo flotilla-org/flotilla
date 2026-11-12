@@ -9,10 +9,7 @@
 //! launch released once nothing demanded it is launched again by the next demand. The ImageBuild
 //! controller writes every edge after the request.
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use flotilla_engine_store::plain::{PendingChange, PlainError, PlainLog};
 use flotilla_protocol::LifecycleReading;
@@ -21,7 +18,7 @@ use flotilla_resources::{
     ImageBuildReservation, ImageBuildSpec, ImageDelivery,
 };
 use flotilla_schema::{Frozen, Kind, NewChange, Ref, Timestamp};
-use flotilla_schema_sqlite::{stream::Service, Read, Store, StoreError};
+use flotilla_schema_sqlite::{stream::Service, Read, StoreError, StoreHandle};
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Resource};
 
 use super::{
@@ -218,7 +215,7 @@ impl EngineImageBuilds {
     /// The port over `store`, whose homes `homes` names.
     pub fn new(
         lifecycles: Arc<dyn Lifecycles<ImageBuildKind>>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<StoreHandle>,
         homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
         Self { lifecycles, reads: StoreReads::new(Arc::clone(&store)), log: PlainLog::new(store), homes: Box::new(homes) }

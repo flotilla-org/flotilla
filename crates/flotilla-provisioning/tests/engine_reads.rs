@@ -1,7 +1,7 @@
 //! The provisioning read port over the decided store (#3629 layer 4): keyed and indexed reads,
 //! and the judgements made per key at read time.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_engine_store::StoreLog;
 use flotilla_provisioning::{
@@ -17,15 +17,15 @@ use flotilla_provisioning::{
     },
 };
 use flotilla_schema::{Kind, KindRegistry, Ref, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Home, Outcome};
 
 const HOME: &str = "home";
 
-fn store() -> Arc<Mutex<Store>> {
+fn store() -> Arc<StoreHandle> {
     let mut registry = KindRegistry::new();
     stored::register(&mut registry).expect("registry");
-    Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")))
+    Arc::new(StoreHandle::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")))
 }
 
 fn checkout(name: &str, environment: &str, convoy: &str) -> CheckoutRequest {
@@ -132,7 +132,9 @@ fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
     let replica_of = || {
         let mut registry = KindRegistry::new();
         stored::register(&mut registry).expect("registry");
-        Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "replica", registry).expect("store")))
+        Arc::new(StoreHandle::new(
+            Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "replica", registry).expect("store"),
+        ))
     };
     let followed = replica_of();
     {

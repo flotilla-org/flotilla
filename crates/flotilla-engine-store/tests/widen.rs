@@ -3,7 +3,7 @@
 
 use flotilla_engine_store::registry;
 use flotilla_schema::{Address, ColumnType, KindRegistry, NewChange, State, Timestamp};
-use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store, StoreError};
+use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store, StoreError, StoreHandle};
 use flotilla_state_machines::{
     machines::{
         consumer::{ConsumerKind, Receiver},
@@ -209,14 +209,11 @@ fn a_table_missing_a_defaulted_column_and_a_code_is_widened() {
     use flotilla_engine_store::{convoy_registry, StoreLog};
     use flotilla_schema::Frozen;
     use flotilla_state_machines::{machines::convoy::*, Home};
-    use std::{
-        collections::BTreeMap,
-        sync::{Arc, Mutex},
-    };
+    use std::{collections::BTreeMap, sync::Arc};
 
     let current = defaulted(convoy_registry().expect("registry"), "convoy", "priority");
     let older = narrowed(current.clone(), &[("convoy", "state", "ab")]);
-    let store = Arc::new(Mutex::new(Store::open(Connection::open_in_memory().expect("SQLite"), HOME, older).expect("old store")));
+    let store = Arc::new(StoreHandle::new(Store::open(Connection::open_in_memory().expect("SQLite"), HOME, older).expect("old store")));
     let mut home = Home::<Convoy, _>::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("convoy home");
     let project: Address = "project:fleet".parse().expect("project");
     let owner = SeatName::new("governor", "");
@@ -243,7 +240,7 @@ fn a_table_missing_a_defaulted_column_and_a_code_is_widened() {
     };
     home.create("standing", request, &MemoryConvoyWorld::default().with_project(&project), Timestamp(0)).expect("convoy");
     drop(home);
-    let conn = Arc::try_unwrap(store).unwrap_or_else(|_| panic!("store still held")).into_inner().expect("store").into_connection();
+    let conn = Arc::try_unwrap(store).unwrap_or_else(|_| panic!("store still held")).into_inner().into_connection();
     let (id, before): (i64, i64) =
         conn.query_row("SELECT id, version FROM convoy", [], |row| Ok((row.get(0)?, row.get(1)?))).expect("convoy row");
     let duties = count(&conn, "convoy_duties");

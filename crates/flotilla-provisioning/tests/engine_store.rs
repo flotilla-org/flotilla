@@ -1,10 +1,7 @@
 //! The provisioning write path over the decided store (#3629 layer 3): a reconcile through the
 //! engine writes the store, and a home reopened over the store (a restart) holds what was written.
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::DateTime;
 use flotilla_engine_store::{open_home, StoreLog};
@@ -14,19 +11,19 @@ use flotilla_provisioning::{
 };
 use flotilla_resources::{Clone as OldClone, CloneSpec, ObjectMeta, ResourceObject};
 use flotilla_schema::{KindRegistry, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome};
 
 const HOME: &str = "home";
 
-fn store() -> Arc<Mutex<Store>> {
+fn store() -> Arc<StoreHandle> {
     // The production kinds: a checkout is held for an engine Convoy (#3108).
     let registry = stored::production_kinds().expect("registry");
     let connection = rusqlite::Connection::open_in_memory().expect("memory");
-    Arc::new(Mutex::new(Store::open(connection, HOME, registry).expect("store")))
+    Arc::new(StoreHandle::new(Store::open(connection, HOME, registry).expect("store")))
 }
 
-fn clones(store: &Arc<Mutex<Store>>) -> Arc<dyn Lifecycles<CloneKind>> {
+fn clones(store: &Arc<StoreHandle>) -> Arc<dyn Lifecycles<CloneKind>> {
     Arc::new(LifecycleHome::new(HOME, open_home(StoreLog::new(Arc::clone(store))).expect("home")))
 }
 
@@ -158,12 +155,12 @@ fn a_clone_stored_before_discovered_reads_as_not_discovered() {
     let home = clones(&store);
     realise_clone(home.as_ref(), false);
     drop(home);
-    let connection = Arc::try_unwrap(store).unwrap_or_else(|_| panic!("store still held")).into_inner().expect("lock").into_connection();
+    let connection = Arc::try_unwrap(store).unwrap_or_else(|_| panic!("store still held")).into_inner().into_connection();
     // The previous generation's table: no `discovered` column.
     connection.execute_batch("DROP VIEW clone_view; ALTER TABLE clone DROP COLUMN discovered;").expect("predate discovered");
     let mut registry = KindRegistry::new();
     stored::register(&mut registry).expect("registry");
-    let reopened = Arc::new(Mutex::new(Store::open(connection, HOME, registry).expect("the old shape opens")));
+    let reopened = Arc::new(StoreHandle::new(Store::open(connection, HOME, registry).expect("the old shape opens")));
     let restored = clones(&reopened).newest_launch("clone-a").expect("restored");
     assert!(!restored.spec().discovered);
     assert_eq!(restored.state(), &LifecycleState::Realised { identity: "/clones/repo".into() });

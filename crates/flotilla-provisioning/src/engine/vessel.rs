@@ -31,7 +31,7 @@ use chrono::{DateTime, Utc};
 use flotilla_engine_store::follow::Followed;
 use flotilla_resources::vessel_records::{VesselChange, VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep};
 use flotilla_schema::{Kind, Timestamp};
-use flotilla_schema_sqlite::{stream::Service, Read, Store};
+use flotilla_schema_sqlite::{stream::Service, Read, StoreHandle};
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
@@ -276,7 +276,7 @@ impl EngineVessels {
     /// The port over `store`, whose homes `homes` names.
     pub fn new(
         lifecycles: Arc<dyn Lifecycles<VesselKind>>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<StoreHandle>,
         homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
         Self { lifecycles, reads: StoreReads::new(store), homes: Arc::new(homes), changes: tokio::sync::broadcast::channel(CHANGES).0 }

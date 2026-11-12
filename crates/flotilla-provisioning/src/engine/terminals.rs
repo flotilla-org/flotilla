@@ -6,7 +6,7 @@
 //! it has ended starts the next launch. The TerminalSession controller writes every edge after the
 //! request, and the launch's facts in the transaction that realises it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
@@ -17,7 +17,7 @@ use flotilla_resources::{
     TerminalSession as OldTerminalSession, TerminalSessionSource,
 };
 use flotilla_schema::{Frozen, Kind, Ref, Timestamp};
-use flotilla_schema_sqlite::{stream::Service, Read, Store};
+use flotilla_schema_sqlite::{stream::Service, Read, StoreHandle};
 use flotilla_state_machines::Resource;
 
 use super::{
@@ -196,7 +196,7 @@ impl EngineTerminals {
     /// The port over `store`, whose homes `homes` names.
     pub fn new(
         lifecycles: Arc<dyn Lifecycles<TerminalSessionKind>>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<StoreHandle>,
         homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
         Self {

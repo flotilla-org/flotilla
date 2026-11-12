@@ -3623,7 +3623,6 @@ dependencies = [
  "flotilla-schema-sqlite",
  "flotilla-state-machines",
  "flotilla-store",
- "flotilla-store-testkit",
  "flotilla-vcs",
  "reqwest 0.13.2",
  "rusqlite",

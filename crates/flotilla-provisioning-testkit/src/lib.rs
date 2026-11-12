@@ -16,13 +16,23 @@ pub use memory_store::memory_store;
 pub use other_home::{
     other_home_for, put_host_at_its_home, put_host_at_its_home_heard, replicate_home, replicate_home_at, replicate_home_tail, OtherHome,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 pub use terminals::TerminalsFixture;
 pub use vessels::VesselsFixture;
 
 use flotilla_provisioning::engine::reads::{LifecycleReadPort, StoreReads};
 use flotilla_resources::{environment_records::EnvironmentRecords, lifecycle_reads::LifecycleReads, ResourceObject};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::StoreHandle;
+
+/// Poisons `store`'s lock, so every read through it fails, while keeping the real store.
+pub fn poison_store(store: Arc<StoreHandle>) {
+    assert!(std::thread::spawn(move || {
+        let _guard = store.lock().expect("healthy test store");
+        panic!("injected store poisoning");
+    })
+    .join()
+    .is_err());
+}
 
 /// The engine's environments, image builds, clones, checkouts, terminal sessions and vessels homed
 /// at one home on one store, each fixture's `reads` serving them all, as a daemon's lifecycle reads do.
@@ -48,7 +58,7 @@ impl EngineFixture {
     }
 
     /// An engine over `store`, whose home is `home`: a daemon's decided store, say.
-    pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
+    pub fn over(home: &str, store: Arc<StoreHandle>) -> Self {
         Self::with_terminals(
             home,
             Arc::clone(&store),
@@ -72,7 +82,7 @@ impl EngineFixture {
 
     fn with_terminals(
         home: &str,
-        store: Arc<Mutex<Store>>,
+        store: Arc<StoreHandle>,
         mut image_builds: image_build::ImageBuildFixture,
         mut terminals: TerminalsFixture,
         mut vessels: VesselsFixture,

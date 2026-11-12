@@ -1,13 +1,13 @@
 //! Reserved launch numbers (#3108, team-lead ruling TL-2): admission takes a launch's number
 //! before it writes anything keyed by the launch's name, then creates the launch with it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_engine_store::{registry, StoreLog};
 use flotilla_schema::{Address, Frozen, Timestamp};
 use flotilla_schema_sqlite::{
     stream::{self, Follower, Frame},
-    Store,
+    Store, StoreHandle,
 };
 use flotilla_state_machines::{
     kinds::{stock, Catalog},
@@ -20,8 +20,10 @@ use rusqlite::Connection;
 
 const HOME: &str = "alpha";
 
-fn store() -> Arc<Mutex<Store>> {
-    Arc::new(Mutex::new(Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry().expect("registry")).expect("store")))
+fn store() -> Arc<StoreHandle> {
+    Arc::new(StoreHandle::new(
+        Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry().expect("registry")).expect("store"),
+    ))
 }
 
 fn project() -> Address {
@@ -68,7 +70,7 @@ fn world() -> MemoryConvoyWorld {
 }
 
 /// Follows `source`'s home from `after` into `target`; whether the round sent a fresh snapshot.
-fn follow(source: &Arc<Mutex<Store>>, target: &mut Store, after: Option<u64>) -> bool {
+fn follow(source: &Arc<StoreHandle>, target: &mut Store, after: Option<u64>) -> bool {
     let mut snapshot = false;
     Follower::new(target)
         .receive(HOME, |sink| {

@@ -1,7 +1,7 @@
 //! An Environment launch's facts (#3108, owner's look-over): written once, in the transaction of
 //! the launch's Realise edge, and archived with the launch.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_engine_store::{
     archive::{ArchiveKinds, Archiver, Due, Prepared, ARCHIVE_AFTER_MICROS},
@@ -19,18 +19,18 @@ use flotilla_provisioning::{
     },
 };
 use flotilla_schema::{Frozen, Identity, Kind, KindRegistry, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Resource};
 
 const HOME: &str = "alpha";
 
-fn store() -> Arc<Mutex<Store>> {
+fn store() -> Arc<StoreHandle> {
     let mut registry = KindRegistry::new();
     stored::register(&mut registry).expect("registry");
-    Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")))
+    Arc::new(StoreHandle::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")))
 }
 
-fn environments(store: &Arc<Mutex<Store>>, staged: &StagedFacts) -> Arc<dyn Lifecycles<EnvironmentKind>> {
+fn environments(store: &Arc<StoreHandle>, staged: &StagedFacts) -> Arc<dyn Lifecycles<EnvironmentKind>> {
     let log = StoreLog::new(Arc::clone(store));
     let home = open_home_with(&log, LaunchLog::new(log.clone(), staged.clone())).expect("home");
     Arc::new(LifecycleHome::new(HOME, home))
@@ -56,7 +56,7 @@ fn facts() -> EnvironmentLaunchFacts {
 }
 
 /// The launch's facts as stored, and the change of their only entry.
-fn stored_facts(store: &Arc<Mutex<Store>>, name: &str) -> Option<(EnvironmentLaunchFacts, u64)> {
+fn stored_facts(store: &Arc<StoreHandle>, name: &str) -> Option<(EnvironmentLaunchFacts, u64)> {
     let mut store = store.lock().expect("store");
     let mut read = store.read().expect("read");
     let id = read.resolve(EnvironmentLaunchFacts::CODE, name, HOME).expect("resolve")?;
@@ -67,7 +67,7 @@ fn stored_facts(store: &Arc<Mutex<Store>>, name: &str) -> Option<(EnvironmentLau
 }
 
 /// The change of the last entry about launch `name`.
-fn last_change(store: &Arc<Mutex<Store>>, name: &str) -> u64 {
+fn last_change(store: &Arc<StoreHandle>, name: &str) -> u64 {
     let mut store = store.lock().expect("store");
     let mut read = store.read().expect("read");
     let id = read.resolve(Resource::<Environment>::CODE, name, HOME).expect("resolve").expect("stored");

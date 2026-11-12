@@ -20,7 +20,7 @@ use flotilla_resources::{
     AdmissionDocument, CheckoutSpec, WorkflowSnapshot,
 };
 use flotilla_schema::{Address, ChangeItem, Frozen, Identity, Kind, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::StoreHandle;
 use flotilla_state_machines::{
     machines::{
         convoy::{
@@ -37,7 +37,7 @@ use crate::Ending;
 /// One home's checkouts on a decided store, served through the engine's readings.
 pub struct CheckoutFixture {
     pub home: String,
-    pub store: Arc<Mutex<Store>>,
+    pub store: Arc<StoreHandle>,
     pub lifecycles: Arc<dyn Lifecycles<CheckoutKind>>,
     pub checkouts: Arc<EngineCheckouts>,
     /// The engine's readings, serving [`Self::checkouts`].
@@ -112,11 +112,11 @@ impl Default for CheckoutFixture {
 impl CheckoutFixture {
     /// A fixture whose checkouts are homed at `home`.
     pub fn at(home: &str) -> Self {
-        Self::over(home, Arc::new(Mutex::new(crate::memory_store(home))))
+        Self::over(home, Arc::new(StoreHandle::new(crate::memory_store(home))))
     }
 
     /// A fixture over `store`, whose home is `home`.
-    pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
+    pub fn over(home: &str, store: Arc<StoreHandle>) -> Self {
         let staged = StagedFacts::default();
         let inputs = StagedFacts::default();
         let log = StoreLog::new(Arc::clone(&store));
@@ -317,7 +317,7 @@ impl CheckoutFixture {
 
     /// Poisons the store's lock, so every read through it fails.
     pub fn poison(&self) {
-        flotilla_store_testkit::poison_mutex(Arc::clone(&self.store));
+        crate::poison_store(Arc::clone(&self.store));
     }
 
     fn step(&self, launch: &str, step: Step) {

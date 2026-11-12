@@ -150,6 +150,8 @@ impl Default for StoreOptions {
 pub struct Store {
     conn: Connection,
     runtime: Runtime,
+    /// Whether a write transaction began since its handle's guard last looked.
+    wrote: bool,
 }
 
 struct Runtime {
@@ -256,7 +258,12 @@ impl Store {
             ids: TwoGen::new(options.identity_cache),
             change_page_bytes: options.change_page_bytes,
         };
-        Ok(Store { conn, runtime })
+        Ok(Store { conn, runtime, wrote: false })
+    }
+
+    /// Whether a write transaction began since the last call; for a [`crate::StoreGuard`].
+    pub(crate) fn take_wrote(&mut self) -> bool {
+        std::mem::take(&mut self.wrote)
     }
 
     /// Audits every registered interned column, including child keys, and the shared identity,
@@ -324,8 +331,9 @@ impl Store {
 
     /// Begins an immediate write transaction; many writes may share it.
     pub fn write(&mut self) -> Result<Write<'_>, StoreError> {
+        self.wrote = true;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Ok(Write { tx, runtime: &mut self.runtime, pending: Pending::default(), began: std::time::Instant::now() })
+        Ok(Write { tx, runtime: &mut self.runtime, pending: Pending::default() })
     }
 
     /// Begins a deferred read transaction, for consistent loads across tables.
@@ -563,8 +571,6 @@ pub struct Write<'s> {
     tx: Transaction<'s>,
     runtime: &'s mut Runtime,
     pending: Pending,
-    /// When its transaction began, so a commit reports how long the write ran.
-    began: std::time::Instant,
 }
 
 impl Write<'_> {
@@ -916,7 +922,6 @@ impl Write<'_> {
 
     pub fn commit(self) -> Result<(), StoreError> {
         self.tx.commit()?;
-        let took = self.began.elapsed();
         let Pending { strings, identities, ids, watermarks, applied, kinds, moved, rescan, .. } = self.pending;
         let heard: BTreeSet<String> = watermarks.keys().cloned().collect();
         self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner).extend(watermarks);
@@ -935,7 +940,7 @@ impl Write<'_> {
             self.runtime.ids.insert(id, identity);
         }
         // Last, so a woken reader sees the new watermarks and interned names.
-        self.runtime.commits.committed(&crate::stream::Committed { kinds: &kinds, homes: &moved, heard: &heard, rescan, took });
+        self.runtime.commits.committed(&crate::stream::Committed { kinds: &kinds, homes: &moved, heard: &heard, rescan });
         Ok(())
     }
 }

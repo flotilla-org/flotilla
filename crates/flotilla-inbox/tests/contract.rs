@@ -1,11 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_inbox::{
     sqlite::{MessageLog, SqliteInbox, StoreLog},
     EngineInbox, MemoryInbox, MemoryInboxLog,
 };
 use flotilla_inbox_testkit::{consumer, Evidence, Factory, Harness, SessionPort, Supervisors};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{machines::agent_session::AgentSession, MemoryLog};
 use rusqlite::Connection;
 
@@ -41,7 +41,7 @@ impl Factory for Sqlite {
         backend.get_blocking(message).expect("message")
     }
     fn create(&self) -> Harness<Self::Backend> {
-        let store = Arc::new(Mutex::new(
+        let store = Arc::new(StoreHandle::new(
             Store::open(Connection::open_in_memory().expect("SQLite"), "test", flotilla_state_machines::kinds().expect("registry"))
                 .expect("store"),
         ));
@@ -73,7 +73,7 @@ async fn sqlite_recovers_receipts_and_resumes_log_cursors() {
     use flotilla_inbox_testkit::{inbox, spec};
     use flotilla_state_machines::{machines::message::Deliver, Transport};
     use futures::StreamExt;
-    let store = Arc::new(Mutex::new(
+    let store = Arc::new(StoreHandle::new(
         Store::open(Connection::open_in_memory().expect("SQLite"), "test", flotilla_state_machines::kinds().expect("registry"))
             .expect("store"),
     ));
@@ -185,7 +185,7 @@ async fn sqlite_rejects_consumer_in_another_store() {
     use flotilla_inbox::{Error, InboxBackend};
     use flotilla_inbox_testkit::spec;
     let make_store = || {
-        Arc::new(Mutex::new(
+        Arc::new(StoreHandle::new(
             Store::open(Connection::open_in_memory().expect("SQLite"), "test", flotilla_state_machines::kinds().expect("registry"))
                 .expect("store"),
         ))

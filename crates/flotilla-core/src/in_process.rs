@@ -718,10 +718,8 @@ const ENVIRONMENT_ADOPTION_DEADLINE: std::time::Duration = std::time::Duration::
 pub struct InProcessDaemon {
     change_stream_rounds: change_stream::Rounds,
     decided_store: std::sync::Mutex<Option<Arc<flotilla_schema_sqlite::stream::Service>>>,
-    /// The decided store's writes as load metrics, recorded by `decided_store_commits`.
+    /// The decided store's holds as load metrics: each lock's wait and time held, as a read or a write.
     decided_store_metrics: Arc<flotilla_store::load_metrics::StoreLoadMetrics>,
-    /// The commit listener recording `decided_store_metrics`; the store holds it only weakly.
-    decided_store_commits: std::sync::OnceLock<Arc<flotilla_schema_sqlite::stream::CommitListener>>,
     change_request_branches: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>>,
     /// The forge observations' records (ChangeRequest and Issue), whose changes wake the aggregator.
     observation_records: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::EngineRecords>>,
@@ -1449,7 +1447,6 @@ impl InProcessDaemon {
             surfaces: Surfaces::default(),
             decided_store: Default::default(),
             decided_store_metrics: Default::default(),
-            decided_store_commits: Default::default(),
             change_request_branches: Default::default(),
             observation_records: Default::default(),
             change_stream_rounds: Default::default(),
@@ -2307,12 +2304,12 @@ impl InProcessDaemon {
             fleet.report_change_stream(&node, update);
         }))?;
         let metrics = Arc::clone(&self.decided_store_metrics);
-        let listener = self.decided_store_commits.get_or_init(|| {
-            let record: Arc<flotilla_schema_sqlite::stream::CommitListener> =
-                Arc::new(move |committed: &flotilla_schema_sqlite::stream::Committed<'_>| metrics.write_execution.record(committed.took));
-            record
-        });
-        service.on_commit(Arc::downgrade(listener));
+        service.store().time_holds(Arc::new(move |hold: flotilla_schema_sqlite::Hold| {
+            let (wait, execution) =
+                if hold.write { (&metrics.write_wait, &metrics.write_execution) } else { (&metrics.read_wait, &metrics.read_execution) };
+            wait.record(hold.wait);
+            execution.record(hold.held);
+        }))?;
         *slot = Some(Arc::clone(&service));
         drop(slot);
         // Convoys are launches on this store, so the store brings this home's Convoy path.

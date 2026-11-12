@@ -6,13 +6,13 @@ use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::{
         atomic::{AtomicIsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
 };
 
 use flotilla_inbox::{sqlite::StoreLog, InboxBackend, Rules};
 use flotilla_inbox_testkit::{consumer, inbox, spec, Evidence, SessionPort, Supervisors};
-use flotilla_schema_sqlite::{Store, StoreOptions};
+use flotilla_schema_sqlite::{Store, StoreHandle, StoreOptions};
 use flotilla_state_machines::machines::message::MessageBody;
 use futures::TryStreamExt;
 use rusqlite::Connection;
@@ -60,7 +60,7 @@ async fn bounded_resident_allocation_workload() {
     const BUDGET: usize = 32 * 1024;
     // Small, explicitly bounded source caches isolate the replica plateau.
     // Production Store defaults have the same two-generation policy at 65,536.
-    let store = Arc::new(Mutex::new(
+    let store = Arc::new(StoreHandle::new(
         Store::open_with(
             Connection::open_in_memory().expect("db"),
             "test",

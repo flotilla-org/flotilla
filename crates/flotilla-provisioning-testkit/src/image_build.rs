@@ -47,7 +47,7 @@ use flotilla_resources::{
 use flotilla_schema::{Kind, NewChange, Ref, Timestamp};
 use flotilla_schema_sqlite::{
     stream::{CommitListener, Committed, Service},
-    Store,
+    StoreHandle,
 };
 use flotilla_state_machines::{
     machines::lifecycle::{LifecycleState, VanishCause},
@@ -394,7 +394,7 @@ impl Builder {
 }
 
 /// The builds `home` demands, by name.
-pub fn demands_at(store: Arc<Mutex<Store>>, home: &str) -> Vec<String> {
+pub fn demands_at(store: Arc<StoreHandle>, home: &str) -> Vec<String> {
     let mut store = store.lock().expect("store");
     let mut read = store.read().expect("read");
     let mut names = Vec::new();
@@ -412,7 +412,7 @@ pub fn demands_at(store: Arc<Mutex<Store>>, home: &str) -> Vec<String> {
 }
 
 /// Writes host `host`'s Host record at `home`, offering `capacity`, and its observed `architecture`.
-pub fn write_host(store: &Mutex<Store>, home: &str, host: &str, architecture: &str, capacity: Option<ImageBuildCapacity>) {
+pub fn write_host(store: &StoreHandle, home: &str, host: &str, architecture: &str, capacity: Option<ImageBuildCapacity>) {
     let record = HostRecord::new(&HostSpec { image_build_capacity: capacity, ..Default::default() });
     let observation = HostObservation { architecture: Some(architecture.to_owned()), ..Default::default() };
     let mut store = store.lock().expect("store");
@@ -444,7 +444,7 @@ pub fn write_host(store: &Mutex<Store>, home: &str, host: &str, architecture: &s
 /// step it.
 pub struct ImageBuildFixture {
     pub home: String,
-    pub store: Arc<Mutex<Store>>,
+    pub store: Arc<StoreHandle>,
     pub lifecycles: Arc<dyn Lifecycles<ImageBuildKind>>,
     pub builds: Arc<EngineImageBuilds>,
     /// The engine's readings, serving [`Self::builds`].
@@ -454,11 +454,11 @@ pub struct ImageBuildFixture {
 impl ImageBuildFixture {
     /// A fixture whose builds are demanded and built at `home`.
     pub fn at(home: &str) -> Self {
-        Self::over(home, Arc::new(Mutex::new(crate::memory_store(home))))
+        Self::over(home, Arc::new(StoreHandle::new(crate::memory_store(home))))
     }
 
     /// A fixture over `store`, whose home is `home`.
-    pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
+    pub fn over(home: &str, store: Arc<StoreHandle>) -> Self {
         let only = home.to_owned();
         Self::over_homes(home, store, move || vec![only.clone()])
     }
@@ -471,7 +471,7 @@ impl ImageBuildFixture {
         Self::over_homes(service.home(), service.store(), move || homes.homes())
     }
 
-    fn over_homes(home: &str, store: Arc<Mutex<Store>>, homes: impl Fn() -> Vec<String> + Send + Sync + 'static) -> Self {
+    fn over_homes(home: &str, store: Arc<StoreHandle>, homes: impl Fn() -> Vec<String> + Send + Sync + 'static) -> Self {
         let lifecycles: Arc<dyn Lifecycles<ImageBuildKind>> =
             Arc::new(LifecycleHome::new(home, open_home(StoreLog::new(Arc::clone(&store))).expect("image builds")));
         let builds = Arc::new(EngineImageBuilds::new(Arc::clone(&lifecycles), Arc::clone(&store), homes));
@@ -543,7 +543,7 @@ impl ImageBuildFixture {
 
     /// Poisons the store's lock, so every read through it fails.
     pub fn poison(&self) {
-        flotilla_store_testkit::poison_mutex(Arc::clone(&self.store));
+        crate::poison_store(Arc::clone(&self.store));
     }
 
     fn step(&self, launch: &str, step: Step) {

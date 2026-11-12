@@ -5,10 +5,10 @@
 //! exhausted, lost) are computed per key at read time from the stored state and the policy, and
 //! never stored. A Gone state carries its ending, including on snapshot-only replicas.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_schema::{Address, IndexQuery, Kind, Ref, Timestamp};
-use flotilla_schema_sqlite::{Read, ResourceId, Store, StoreError};
+use flotilla_schema_sqlite::{Read, ResourceId, StoreError, StoreHandle};
 use flotilla_state_machines::{
     edge_event,
     machines::lifecycle::{Ending, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState, VanishCause},
@@ -133,7 +133,7 @@ pub trait ProvisioningReads: Send + Sync {
 /// short transaction (about 0.1 to 0.4 ms), which bounds how long a read can wait for it.
 #[derive(Clone)]
 pub struct StoreReads {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreHandle>,
 }
 
 /// Resource-facing lifecycle readings backed by the engine's keyed read port.
@@ -273,7 +273,7 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
 const PAGE: u32 = 256;
 
 impl StoreReads {
-    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+    pub fn new(store: Arc<StoreHandle>) -> Self {
         Self { store }
     }
 

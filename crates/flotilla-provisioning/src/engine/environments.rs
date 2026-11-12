@@ -2,10 +2,7 @@
 //! request shows its readers and providers, and the [`EnvironmentRecords`] port over the decided
 //! store.
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_resources::{
@@ -13,7 +10,7 @@ use flotilla_resources::{
     CloudSandboxEnvironmentSpec, DockerEnvironmentSpec, EnvironmentSpec, HostDirectEnvironmentSpec,
 };
 use flotilla_schema::{Frozen, Kind, Ref, Timestamp};
-use flotilla_schema_sqlite::{Read, Store};
+use flotilla_schema_sqlite::{Read, StoreHandle};
 use flotilla_state_machines::Resource;
 
 use super::{
@@ -220,7 +217,7 @@ impl EngineEnvironments {
     /// The port over `store`, whose homes `homes` names.
     pub fn new(
         lifecycles: Arc<dyn Lifecycles<EnvironmentKind>>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<StoreHandle>,
         homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
         Self {

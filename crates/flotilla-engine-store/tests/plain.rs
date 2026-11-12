@@ -2,31 +2,27 @@
 //! moves. Each layer that moves a plain kind adds one `#[hegel::test]` calling [`contract`] with
 //! a generator of its specs.
 
-use std::{
-    collections::BTreeMap,
-    fmt::Debug,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, fmt::Debug, sync::Arc};
 
 use flotilla_engine_store::{
     plain::{register_plain, PendingChange, Plain, PlainError, PlainLog},
     rehearse_plain,
 };
 use flotilla_schema::{Kind, KindRegistry, NewChange, Stored, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
 const HOME: &str = "alpha";
 const REPLICA: &str = "beta";
 
-fn open(home: &str, kinds: &KindRegistry) -> Arc<Mutex<Store>> {
-    Arc::new(Mutex::new(Store::open(Connection::open_in_memory().expect("SQLite"), home, kinds.clone()).expect("store")))
+fn open(home: &str, kinds: &KindRegistry) -> Arc<StoreHandle> {
+    Arc::new(StoreHandle::new(Store::open(Connection::open_in_memory().expect("SQLite"), home, kinds.clone()).expect("store")))
 }
 
 /// Applies every entry the home logged after `after` at the replica, each after its change, as the
 /// change stream does, and returns the last sequence applied.
-fn follow(home: &Arc<Mutex<Store>>, replica: &Arc<Mutex<Store>>, after: u64) -> u64 {
+fn follow(home: &Arc<StoreHandle>, replica: &Arc<StoreHandle>, after: u64) -> u64 {
     let (events, changes) = {
         let mut home = home.lock().expect("home");
         let mut read = home.read().expect("read");

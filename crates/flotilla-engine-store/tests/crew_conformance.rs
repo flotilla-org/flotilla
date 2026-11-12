@@ -7,7 +7,7 @@
 //! QUINT_GRAPH_DIR=DIR cargo test -p flotilla-engine-store --test crew_conformance -- --ignored
 //! ```
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_engine_store::StoreLog;
 use flotilla_quint_testkit::{
@@ -15,7 +15,7 @@ use flotilla_quint_testkit::{
     vessel::{VesselConformance, VesselLogs},
 };
 use flotilla_schema::{Kind, KindRegistry};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{machines::vessel::Vessel, Home, Machine, Resource};
 
 const HOME: &str = "home";
@@ -29,7 +29,7 @@ where
     let mut registry = KindRegistry::new();
     registry.register::<Resource<M>>().expect("stored kind");
     let connection = rusqlite::Connection::open_in_memory().expect("memory");
-    StoreLog::new(Arc::new(Mutex::new(Store::open(connection, HOME, registry).expect("store"))))
+    StoreLog::new(Arc::new(StoreHandle::new(Store::open(connection, HOME, registry).expect("store"))))
 }
 
 /// Every resource `home` holds is stored as it holds it.

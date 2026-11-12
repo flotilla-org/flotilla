@@ -7,7 +7,7 @@ use flotilla_inbox::{
     Cursor, EngineInbox, Error, InboxBackend, InboxLog, MemoryInbox, MemoryInboxLog, Rules, RESIDENT_BUDGET,
 };
 use flotilla_inbox_testkit::{address, consumer, inbox, spec, Evidence, SessionPort, Supervisors};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     machines::{agent_session::AgentSession, message::*},
     MemoryLog, Ref, Transport,
@@ -16,13 +16,13 @@ use futures::{StreamExt, TryStreamExt};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
-fn database() -> Arc<Mutex<Store>> {
-    Arc::new(Mutex::new(
+fn database() -> Arc<StoreHandle> {
+    Arc::new(StoreHandle::new(
         Store::open(Connection::open_in_memory().expect("db"), "test", flotilla_state_machines::kinds().expect("registry")).expect("store"),
     ))
 }
 
-fn backend(store: Arc<Mutex<Store>>, evidence: Arc<Evidence>, budget: usize) -> (SqliteInbox, CountingLog) {
+fn backend(store: Arc<StoreHandle>, evidence: Arc<Evidence>, budget: usize) -> (SqliteInbox, CountingLog) {
     let log = CountingLog::new(store.clone());
     let backend = SqliteInbox::open_with_budget("test", log.clone(), evidence, Arc::new(Supervisors), budget).expect("open");
     backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(store)));
@@ -693,7 +693,7 @@ async fn watch_lag_survives_sqlite_connection_restart() {
     let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let file = File(std::env::temp_dir().join(format!("inbox-watch-{}-{unique}.sqlite", std::process::id())));
     let open = || {
-        CountingLog::new(Arc::new(Mutex::new(
+        CountingLog::new(Arc::new(StoreHandle::new(
             Store::open(Connection::open(&file.0).unwrap(), "test", flotilla_state_machines::kinds().unwrap()).unwrap(),
         )))
     };

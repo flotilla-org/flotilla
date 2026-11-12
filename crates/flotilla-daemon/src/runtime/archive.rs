@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use flotilla_engine_store::archive::{bundle_key, ArchiveError, ArchiveKinds, Archiver, Bundle, Due, Prepared, Stage, BUNDLE_MEDIA_TYPE};
 use flotilla_resources::{Clock, ConditionValue, HostCondition};
 use flotilla_schema::{Identity, KindRegistry, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -139,7 +139,7 @@ impl ShipError {
 }
 
 pub(crate) struct ArchiveShipper {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreHandle>,
     /// The archived kinds, whose commits wake a pass.
     codes: std::collections::BTreeSet<flotilla_schema::KindCode>,
     archiver: Arc<Mutex<Archiver>>,
@@ -155,7 +155,7 @@ impl ArchiveShipper {
     /// `report` receives the `Archive` condition after every pass: present while a bundle is
     /// overdue, absent otherwise.
     pub(crate) fn new(
-        store: Arc<Mutex<Store>>,
+        store: Arc<StoreHandle>,
         kinds: ArchiveKinds,
         targets: Vec<Arc<dyn ArchiveTarget>>,
         clock: Arc<dyn Clock>,

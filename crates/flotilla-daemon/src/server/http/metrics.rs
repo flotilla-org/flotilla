@@ -53,10 +53,11 @@ impl Exposition {
         self.current = name.to_owned();
         let help = match name {
             "flotilla_store_read_contention_total" => "Busy read refusals returned to callers; each refusal counts once.",
-            "flotilla_store_queue_wait_seconds" => "Time queued before a store read or write starts, in seconds.",
-            "flotilla_store_execution_seconds" => "Store read or write execution time, excluding queue wait, in seconds.",
-            "flotilla_decided_store_write_seconds" => {
-                "Decided store write time, from its transaction's start through its commit, local or applied, in seconds."
+            "flotilla_store_queue_wait_seconds" => {
+                "Time queued before a store read or write starts (the decided store: waiting for its lock), in seconds."
+            }
+            "flotilla_store_execution_seconds" => {
+                "Store read or write execution time, excluding queue wait (the decided store: its lock held), in seconds."
             }
             "flotilla_convoys_waiting_capacity" => "Convoys this home holds that wait for capacity on a host their placement chose.",
             "flotilla_convoys_unreadable" => "Convoy launches, at any home, whose records cannot be read; each is listed with why.",
@@ -91,18 +92,22 @@ impl Exposition {
 fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDaemon) -> String {
     let mut out = Exposition { current: String::new(), host: escaped(daemon.host_name().as_str()), families: Default::default() };
     let store = metrics.store.snapshot();
-    for (operation, wait, execution, peak) in [
-        ("read", &store.read_wait, &store.read_execution, store.read_queue_peak),
-        ("write", &store.write_wait, &store.write_execution, store.write_queue_peak),
-    ] {
-        let labels = format!(",operation=\"{operation}\"");
-        out.histogram("flotilla_store_queue_wait_seconds", &labels, wait);
-        out.histogram("flotilla_store_execution_seconds", &labels, execution);
-        out.number("flotilla_store_queue_peak", "gauge", &labels, peak);
+    // The resource store queues its reads and writes; the decided store's are its lock's holds.
+    let decided = daemon.decided_store_metrics().snapshot();
+    for (name, snapshot) in [("resources", &store), ("decided", &decided)] {
+        for (operation, wait, execution) in
+            [("read", &snapshot.read_wait, &snapshot.read_execution), ("write", &snapshot.write_wait, &snapshot.write_execution)]
+        {
+            let labels = format!(",store=\"{name}\",operation=\"{operation}\"");
+            out.histogram("flotilla_store_queue_wait_seconds", &labels, wait);
+            out.histogram("flotilla_store_execution_seconds", &labels, execution);
+        }
+    }
+    for (operation, peak) in [("read", store.read_queue_peak), ("write", store.write_queue_peak)] {
+        out.number("flotilla_store_queue_peak", "gauge", &format!(",operation=\"{operation}\""), peak);
     }
     out.number("flotilla_store_reads_shed_total", "counter", "", store.reads_shed);
     out.number("flotilla_store_read_contention_total", "counter", "", store.read_contention);
-    out.histogram("flotilla_decided_store_write_seconds", "", &daemon.decided_store_metrics().snapshot().write_execution);
     if let Some(controllers) = metrics.controllers.get() {
         // Kinds are registered by the compiled controller set, never resource IDs.
         for (kind, snapshot) in controllers.snapshot() {

@@ -20,10 +20,7 @@
 //! QUINT_GRAPH_DIR=DIR cargo test -p flotilla-provisioning --test lifecycle_conformance -- --ignored
 //! ```
 
-use std::{
-    marker::PhantomData,
-    sync::{Arc, Mutex},
-};
+use std::{marker::PhantomData, sync::Arc};
 
 use flotilla_engine_store::StoreLog;
 use flotilla_provisioning::stored::{
@@ -40,7 +37,7 @@ use flotilla_quint_testkit::{
 };
 use flotilla_resources::{ImageLayerSource, ImageLayerSpec, ImageLayerTier};
 use flotilla_schema::{Address, Frozen, Kind, KindRegistry, Ref as StoredRef, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     edge_event,
     machines::lifecycle::{
@@ -163,7 +160,7 @@ where
     StoreLog: Log<Machine<K>>,
 {
     home: Home<Machine<K>, StoreLog>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreHandle>,
 }
 
 impl<K: Sample> Stored<K>
@@ -252,7 +249,7 @@ where
         let mut registry = KindRegistry::new();
         registry.register::<Resource<Machine<K>>>().expect("registry");
         let connection = rusqlite::Connection::open_in_memory().expect("memory");
-        let store = Arc::new(Mutex::new(Store::open(connection, HOME, registry).expect("store")));
+        let store = Arc::new(StoreHandle::new(Store::open(connection, HOME, registry).expect("store")));
         let mut home = Home::<Machine<K>, StoreLog>::with_log(HOME, StoreLog::new(store.clone())).expect("valid declaration");
         home.create(NAME, K::request(), &MemoryLifecycleWorld::default(), Timestamp(0)).expect("created");
         Stored { home, store }

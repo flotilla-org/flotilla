@@ -1,7 +1,7 @@
 //! Environments on a real decided store, for the tests of their readers: each is requested through
 //! the environment port and stepped as the Environment controller would step it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_engine_store::{open_home_with, StoreLog};
 use flotilla_provisioning::engine::{
@@ -17,7 +17,7 @@ use flotilla_resources::{
     EnvironmentSpec,
 };
 use flotilla_schema::Timestamp;
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::StoreHandle;
 use flotilla_state_machines::{
     machines::lifecycle::{LifecycleState, VanishCause},
     Cause, CauseCategory, Outcome,
@@ -28,7 +28,7 @@ use crate::Ending;
 /// One home's environments on an in-memory decided store, served through the engine's readings.
 pub struct EnvironmentFixture {
     pub home: String,
-    pub store: Arc<Mutex<Store>>,
+    pub store: Arc<StoreHandle>,
     pub lifecycles: Arc<dyn Lifecycles<EnvironmentKind>>,
     pub environments: Arc<EngineEnvironments>,
     /// The engine's readings, serving [`Self::environments`].
@@ -45,11 +45,11 @@ impl Default for EnvironmentFixture {
 impl EnvironmentFixture {
     /// A fixture whose environments are homed at `home`.
     pub fn at(home: &str) -> Self {
-        Self::over(home, Arc::new(Mutex::new(crate::memory_store(home))))
+        Self::over(home, Arc::new(StoreHandle::new(crate::memory_store(home))))
     }
 
     /// A fixture over `store`, whose home is `home`.
-    pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
+    pub fn over(home: &str, store: Arc<StoreHandle>) -> Self {
         let staged = StagedFacts::default();
         let log = StoreLog::new(Arc::clone(&store));
         let lifecycles: Arc<dyn Lifecycles<EnvironmentKind>> =
@@ -151,7 +151,7 @@ impl EnvironmentFixture {
 
     /// Poisons the store's lock, so every read through it fails.
     pub fn poison(&self) {
-        flotilla_store_testkit::poison_mutex(Arc::clone(&self.store));
+        crate::poison_store(Arc::clone(&self.store));
     }
 
     fn step(&self, name: &str, step: Step) {

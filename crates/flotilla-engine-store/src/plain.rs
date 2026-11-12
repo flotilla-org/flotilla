@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use flotilla_schema::{ChangeHeader, Kind, KindRegistry, NewChange, RegistryError};
-use flotilla_schema_sqlite::{ChangeId, Loaded, Store, StoreError, Write};
+use flotilla_schema_sqlite::{ChangeId, Loaded, StoreError, StoreHandle, Write};
 
 use crate::lock_store;
 
@@ -138,7 +138,7 @@ impl PendingChange {
 /// Runs `body` in one write naming `change`'s id, and commits; a change this write opened is
 /// forgotten again if the write does not commit.
 fn in_change<T>(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<StoreHandle>,
     change: &PendingChange,
     body: impl FnOnce(&mut Write<'_>, ChangeId) -> Result<T, PlainError>,
 ) -> Result<T, PlainError> {
@@ -158,16 +158,16 @@ pub fn register_plain<K: Kind>(kinds: &mut KindRegistry) -> Result<(), RegistryE
     kinds.register::<K>()
 }
 
-/// One home's writer and reader of plain kinds over a shared [`Store`], beside the machine kinds'
+/// One home's writer and reader of plain kinds over a shared [`StoreHandle`], beside the machine kinds'
 /// `StoreLog` on the same store.
 #[derive(Clone)]
 pub struct PlainLog {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreHandle>,
     home: String,
 }
 
 impl PlainLog {
-    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+    pub fn new(store: Arc<StoreHandle>) -> Self {
         let home = lock_store(&store).home().to_owned();
         Self { store, home }
     }

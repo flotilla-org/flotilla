@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
-use crate::{Snapshot, Store, StoreError, StreamResourceLimit, MAX_PAGE};
+use crate::{Snapshot, Store, StoreError, StoreHandle, StreamResourceLimit, MAX_PAGE};
 
 /// Local gate input. Missing metadata means zero/epoch, never proof of freshness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -438,7 +438,7 @@ pub(crate) fn watermark(marks: &Watermarks, home: &str) -> Watermark {
 /// Listener-independent store service. The daemon's HTTP adapter supplies the transport and
 /// injected home time. All production writes, gates and followers share this same store.
 pub struct Service {
-    store: std::sync::Arc<Mutex<Store>>,
+    store: std::sync::Arc<StoreHandle>,
     source: Source,
     watermarks: Watermarks,
     applied: AppliedListeners,
@@ -471,8 +471,6 @@ pub struct Committed<'a> {
     /// A home's state moved without entries to read (a snapshot cut, a replica reset), or a home
     /// is newly held here: every follower looks.
     pub rescan: bool,
-    /// How long the write ran, from its transaction's start through its commit.
-    pub took: std::time::Duration,
 }
 
 impl Committed<'_> {
@@ -555,7 +553,7 @@ impl Service {
     }
     /// The store's shared handle, for engine logs that write through the same
     /// connection and lock as the service's followers (#3317).
-    pub fn store(&self) -> std::sync::Arc<Mutex<Store>> {
+    pub fn store(&self) -> std::sync::Arc<StoreHandle> {
         std::sync::Arc::clone(&self.store)
     }
     pub fn open(path: &std::path::Path, home: &str, kinds: flotilla_schema::KindRegistry) -> Result<Self, StoreError> {
@@ -566,7 +564,14 @@ impl Service {
         let watermarks = store.watermarks();
         let applied = store.applied_listeners();
         let commits = store.commits();
-        Ok(Self { store: std::sync::Arc::new(Mutex::new(store)), source, watermarks, applied, commits, serve_observer: OnceLock::new() })
+        Ok(Self {
+            store: std::sync::Arc::new(StoreHandle::new(store)),
+            source,
+            watermarks,
+            applied,
+            commits,
+            serve_observer: OnceLock::new(),
+        })
     }
     /// The highest sequence of `home` this store holds; 0 when none.
     pub fn last_sequence(&self, home: &str) -> Result<u64, StoreError> {

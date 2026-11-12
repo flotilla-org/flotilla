@@ -13,7 +13,6 @@ flotilla-schema = { path = "../flotilla-schema" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 flotilla-engine-store = { path = "../flotilla-engine-store" }
-flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-environment = { path = "../flotilla-environment" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-vcs = { path = "../flotilla-vcs" }

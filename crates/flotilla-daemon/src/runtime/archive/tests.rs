@@ -11,7 +11,7 @@ use flotilla_engine_store::{archive::BUNDLE_MEDIA_TYPE, MessageLog};
 use flotilla_provider_runtime::{ChannelLabel, HttpClient};
 use flotilla_resources::{Clock, HostCondition};
 use flotilla_schema::{Address, Kind, KindCode, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     machines::message::{
         DropMessage, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message, MessageBody, MessageSpec, Relation,
@@ -161,7 +161,7 @@ fn inbox() -> Address {
 }
 
 struct Harness {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreHandle>,
     s3: Arc<S3StandIn>,
     targets: Vec<Arc<dyn ArchiveTarget>>,
     clock: Arc<dyn Clock>,
@@ -179,8 +179,9 @@ impl Harness {
     /// As [`Harness::new`], with more messages dropped at the same time beside it.
     fn with_neighbours(neighbours: &[&str]) -> Self {
         let registry = crate::runtime::decided_registry().expect("registry");
-        let store =
-            Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("SQLite"), HOME, registry).expect("store")));
+        let store = Arc::new(StoreHandle::new(
+            Store::open(rusqlite::Connection::open_in_memory().expect("SQLite"), HOME, registry).expect("store"),
+        ));
         let clock: Arc<dyn Clock> = Arc::new(flotilla_store_testkit::PausedClock::start());
         let now = Timestamp::from_datetime(&clock.now());
         let name = Address::message(&inbox(), "notice").expect("address").as_str().to_owned();

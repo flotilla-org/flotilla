@@ -3802,7 +3802,7 @@ mod vessel_ending_tests {
             vessel_ending_reason(fixture.reads.as_ref(), &vessel, "legacy").expect("ended"),
             Some((LifecycleReading::Released, "released".into()))
         );
-        flotilla_store_testkit::poison_mutex(std::sync::Arc::clone(&fixture.store));
+        flotilla_provisioning_testkit::poison_store(std::sync::Arc::clone(&fixture.store));
         assert!(vessel_ending_reason(fixture.reads.as_ref(), &vessel, "legacy").unwrap_err().contains("poisoned"));
     }
 }

@@ -1,7 +1,7 @@
 //! Vessels on a real decided store, for the tests of their readers: each launch is requested
 //! through the vessel port and stepped as its home's vessel planner would step it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_engine_store::StoreLog;
 use flotilla_provisioning::engine::{
@@ -14,7 +14,7 @@ use flotilla_resources::{
     vessel_records::{VesselLaunchRequest, VesselRecords, VesselStep},
 };
 use flotilla_schema::Timestamp;
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::StoreHandle;
 use flotilla_state_machines::{
     machines::{
         lifecycle::{Attempted, Lifecycle, MemoryLifecycleWorld},
@@ -26,7 +26,7 @@ use flotilla_state_machines::{
 /// One home's vessels on a decided store, served through the engine's readings.
 pub struct VesselsFixture {
     pub home: String,
-    pub store: Arc<Mutex<Store>>,
+    pub store: Arc<StoreHandle>,
     pub lifecycles: Arc<dyn Lifecycles<VesselKind>>,
     pub vessels: Arc<EngineVessels>,
     /// The engine's readings, serving [`Self::vessels`].
@@ -42,11 +42,11 @@ impl Default for VesselsFixture {
 impl VesselsFixture {
     /// A fixture whose vessels are homed at `home`.
     pub fn at(home: &str) -> Self {
-        Self::over(home, Arc::new(Mutex::new(crate::memory_store(home))))
+        Self::over(home, Arc::new(StoreHandle::new(crate::memory_store(home))))
     }
 
     /// A fixture over `store`, whose home is `home`.
-    pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
+    pub fn over(home: &str, store: Arc<StoreHandle>) -> Self {
         let owned = home.to_owned();
         Self::over_homes(home, store, move || vec![owned.clone()])
     }
@@ -57,7 +57,7 @@ impl VesselsFixture {
         Self::over_homes(service.home(), service.store(), move || homes.homes())
     }
 
-    fn over_homes(home: &str, store: Arc<Mutex<Store>>, homes: impl Fn() -> Vec<String> + Send + Sync + 'static) -> Self {
+    fn over_homes(home: &str, store: Arc<StoreHandle>, homes: impl Fn() -> Vec<String> + Send + Sync + 'static) -> Self {
         let log = StoreLog::new(Arc::clone(&store));
         let lifecycles: Arc<dyn Lifecycles<VesselKind>> =
             Arc::new(PlacementLifecycles::new(home, Home::with_log(home, log).expect("vessel home")).expect("vessel placements"));
@@ -110,6 +110,6 @@ impl VesselsFixture {
 
     /// Poisons the store's lock, so every read through it fails.
     pub fn poison(&self) {
-        flotilla_store_testkit::poison_mutex(Arc::clone(&self.store));
+        crate::poison_store(Arc::clone(&self.store));
     }
 }

@@ -1,11 +1,11 @@
 //! The storage port (#3317): the engine's Log over one Store, and receipts
 //! served from `Read::about`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_engine_store::{registry, MessageLog, StoreLog};
 use flotilla_schema::{Address, Kind, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     machines::{
         agent_session::{AgentSession, MemoryAgentSessionWorld, Receive},
@@ -21,8 +21,10 @@ use rusqlite::Connection;
 
 const HOME: &str = "alpha";
 
-fn store() -> Arc<Mutex<Store>> {
-    Arc::new(Mutex::new(Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry().expect("registry")).expect("store")))
+fn store() -> Arc<StoreHandle> {
+    Arc::new(StoreHandle::new(
+        Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry().expect("registry")).expect("store"),
+    ))
 }
 
 fn inbox() -> Address {
@@ -50,11 +52,11 @@ fn session() -> Receiver {
     Receiver { kind: ConsumerKind::AgentSession, id: "terminal-demo-coder".into(), host: HOME.into() }
 }
 
-fn last_sequence(store: &Arc<Mutex<Store>>) -> u64 {
+fn last_sequence(store: &Arc<StoreHandle>) -> u64 {
     store.lock().expect("store").read().expect("read").last_sequence(HOME).expect("sequence")
 }
 
-fn stored(store: &Arc<Mutex<Store>>, name: &str) -> Resource<Message> {
+fn stored(store: &Arc<StoreHandle>, name: &str) -> Resource<Message> {
     let mut store = store.lock().expect("store");
     let mut read = store.read().expect("read");
     let id = read.resolve(Resource::<Message>::CODE, name, HOME).expect("resolve").expect("stored");

@@ -24,14 +24,7 @@
 //! the ledger's view), a vessel's sessions (`terminal_session.by_holder`), and a convoy's sessions
 //! (its vessels by convoy, then their sessions by holder).
 
-use std::{
-    collections::BTreeMap,
-    env, fs,
-    path::PathBuf,
-    process,
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{collections::BTreeMap, env, fs, path::PathBuf, process, sync::Arc, time::Instant};
 
 use flotilla_engine_store::{open_home, register_crew, StoreLog};
 use flotilla_provisioning::{
@@ -51,7 +44,7 @@ use flotilla_resources::{
     vessel_records::{VesselLaunchRequest, VesselRecords, VesselStep},
 };
 use flotilla_schema::{KindRegistry, Ref as StoredRef, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
@@ -137,7 +130,7 @@ struct Crew {
 }
 
 impl Crew {
-    fn new(home: &str, store: &Arc<Mutex<Store>>) -> Self {
+    fn new(home: &str, store: &Arc<StoreHandle>) -> Self {
         let log = || StoreLog::new(store.clone());
         let (placements, unplaced) = Placements::new(Home::with_log(home, log()).expect("declaration"), hosts()).expect("hosts");
         assert!(unplaced.is_empty());
@@ -255,9 +248,9 @@ fn peak_resident_kib() -> Option<u64> {
 fn crew_load() {
     let convoys = convoys();
     let (_remote_db, remote_conn) = connection("remote");
-    let remote = Arc::new(Mutex::new(Store::open(remote_conn, "remote", registry()).expect("store")));
+    let remote = Arc::new(StoreHandle::new(Store::open(remote_conn, "remote", registry()).expect("store")));
     let (local_db, local_conn) = connection("local");
-    let local = Arc::new(Mutex::new(Store::open(local_conn, "local", registry()).expect("store")));
+    let local = Arc::new(StoreHandle::new(Store::open(local_conn, "local", registry()).expect("store")));
 
     let started = Instant::now();
     let mut remote_crew = Crew::new("remote", &remote);

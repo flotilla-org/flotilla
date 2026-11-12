@@ -1,7 +1,7 @@
 //! Test-only logical storage-operation audit. No production allocation/counters.
 use flotilla_inbox::{sqlite::MessageLog, ChangePage, Cursor, Error, InboxLog, ReceiptScope, ScanPage, WatchReader};
 use flotilla_schema::{Address, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::StoreHandle;
 use flotilla_state_machines::{machines::message::*, EdgeEventOf, InputRead, Log, LogError, Resource, StoredState, Transport, Version};
 use std::{
     collections::BTreeMap,
@@ -26,7 +26,7 @@ pub struct CountingLog<L = MessageLog> {
 }
 pub type CountedInbox = flotilla_inbox::EngineInbox<CountingLog>;
 impl CountingLog {
-    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+    pub fn new(store: Arc<StoreHandle>) -> Self {
         Self::wrap(MessageLog::new(store))
     }
 }

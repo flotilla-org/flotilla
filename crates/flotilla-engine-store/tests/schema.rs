@@ -105,12 +105,9 @@ fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_widened_at_open()
 fn a_store_whose_link_sources_predate_branch_is_widened_at_open() {
     use flotilla_engine_store::StoreLog;
     use flotilla_schema::{Frozen, Timestamp};
-    use flotilla_schema_sqlite::Store;
+    use flotilla_schema_sqlite::{Store, StoreHandle};
     use flotilla_state_machines::{machines::convoy::*, Home, Ref};
-    use std::{
-        collections::BTreeMap,
-        sync::{Arc, Mutex},
-    };
+    use std::{collections::BTreeMap, sync::Arc};
     let current = schema_ddl(&convoy_registry().expect("registry"), DdlMode::IfNotExists);
     let previous = current
         .replace(
@@ -122,7 +119,7 @@ fn a_store_whose_link_sources_predate_branch_is_widened_at_open() {
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     connection.execute_batch(&previous).expect("previous schema");
     let store = Store::open(connection, "home", convoy_registry().expect("registry")).expect("the previous generation opens");
-    let store = Arc::new(Mutex::new(store));
+    let store = Arc::new(StoreHandle::new(store));
     let sql: String = store
         .lock()
         .expect("store")

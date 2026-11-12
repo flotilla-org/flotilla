@@ -28,7 +28,7 @@ use std::{
     env, fs,
     path::PathBuf,
     process,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Instant,
 };
 
@@ -44,7 +44,7 @@ use flotilla_provisioning::stored::{
 };
 use flotilla_resources::{ImageLayerSource, ImageLayerSpec, ImageLayerTier};
 use flotilla_schema::{Address, Frozen, KindRegistry, Ref as StoredRef, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     machines::lifecycle::{Attempted, LifecycleKind, MemoryLifecycleWorld, Observed, Realise, Release},
     Cause, CauseCategory, Home, Outcome, Ref,
@@ -158,7 +158,7 @@ struct Homes {
 }
 
 impl Homes {
-    fn new(home: &str, store: &Arc<Mutex<Store>>) -> Self {
+    fn new(home: &str, store: &Arc<StoreHandle>) -> Self {
         let log = || StoreLog::new(store.clone());
         Homes {
             environments: Home::with_log(home, log()).expect("declaration"),
@@ -267,9 +267,9 @@ fn per_event(what: &str, count: usize, started: Instant, writes: &str) {
 fn provisioning_load() {
     let convoys = convoys();
     let (_remote_db, remote_conn) = connection("remote");
-    let remote = Arc::new(Mutex::new(Store::open(remote_conn, "remote", registry()).expect("store")));
+    let remote = Arc::new(StoreHandle::new(Store::open(remote_conn, "remote", registry()).expect("store")));
     let (local_db, local_conn) = connection("local");
-    let local = Arc::new(Mutex::new(Store::open(local_conn, "local", registry()).expect("store")));
+    let local = Arc::new(StoreHandle::new(Store::open(local_conn, "local", registry()).expect("store")));
 
     let started = Instant::now();
     let mut remote_homes = Homes::new("remote", &remote);

@@ -27,17 +27,11 @@
 //! store keeps one object for all 10,000 convoys. Per event, the `pr` kind's ready and kept rules
 //! are judged over in-memory observations.
 
-use std::{
-    env, fs,
-    path::PathBuf,
-    process,
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{env, fs, path::PathBuf, process, sync::Arc, time::Instant};
 
 use flotilla_engine_store::{convoy_registry, StoreLog};
 use flotilla_schema::{Address, Frozen, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     kinds::{stock, Catalog, KindDefinition, Observation, Observations, Rule, Template},
     machines::convoy::{
@@ -249,9 +243,9 @@ const PROMISE_BY_LABEL: &str = "SELECT p.id, p.progress FROM convoy_promises p \
 fn convoy_load() {
     let world = world();
     let (_remote_db, remote_conn) = connection("remote");
-    let remote = Arc::new(Mutex::new(Store::open(remote_conn, "remote", convoy_registry().expect("registry")).expect("store")));
+    let remote = Arc::new(StoreHandle::new(Store::open(remote_conn, "remote", convoy_registry().expect("registry")).expect("store")));
     let (local_db, local_conn) = connection("local");
-    let local = Arc::new(Mutex::new(Store::open(local_conn, "local", convoy_registry().expect("registry")).expect("store")));
+    let local = Arc::new(StoreHandle::new(Store::open(local_conn, "local", convoy_registry().expect("registry")).expect("store")));
 
     let started = Instant::now();
     let mut remote_home = Home::<Convoy, StoreLog>::with_log("remote", StoreLog::new(remote.clone())).expect("declaration");

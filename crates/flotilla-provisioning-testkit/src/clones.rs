@@ -1,7 +1,7 @@
 //! Clones on a real decided store, for the tests of their readers: each is requested through the
 //! clone port and stepped as the Clone controller would step it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_engine_store::{open_home_with, StoreLog};
 use flotilla_provisioning::{
@@ -19,7 +19,7 @@ use flotilla_resources::{
     CloneSpec, RepositorySpec,
 };
 use flotilla_schema::Timestamp;
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::StoreHandle;
 use flotilla_state_machines::{
     machines::lifecycle::{LifecycleState, VanishCause},
     Cause, CauseCategory, Outcome,
@@ -30,7 +30,7 @@ use crate::Ending;
 /// One home's clones on a decided store, served through the engine's readings.
 pub struct CloneFixture {
     pub home: String,
-    pub store: Arc<Mutex<Store>>,
+    pub store: Arc<StoreHandle>,
     pub lifecycles: Arc<dyn Lifecycles<CloneKind>>,
     pub clones: Arc<EngineClones>,
     /// The engine's readings, serving [`Self::clones`].
@@ -47,11 +47,11 @@ impl Default for CloneFixture {
 impl CloneFixture {
     /// A fixture whose clones are homed at `home`.
     pub fn at(home: &str) -> Self {
-        Self::over(home, Arc::new(Mutex::new(crate::memory_store(home))))
+        Self::over(home, Arc::new(StoreHandle::new(crate::memory_store(home))))
     }
 
     /// A fixture over `store`, whose home is `home`.
-    pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
+    pub fn over(home: &str, store: Arc<StoreHandle>) -> Self {
         let staged = StagedFacts::default();
         let log = StoreLog::new(Arc::clone(&store));
         let lifecycles: Arc<dyn Lifecycles<CloneKind>> =
@@ -136,7 +136,7 @@ impl CloneFixture {
 
     /// Poisons the store's lock, so every read through it fails.
     pub fn poison(&self) {
-        flotilla_store_testkit::poison_mutex(Arc::clone(&self.store));
+        crate::poison_store(Arc::clone(&self.store));
     }
 
     fn step(&self, launch: &str, step: Step) {

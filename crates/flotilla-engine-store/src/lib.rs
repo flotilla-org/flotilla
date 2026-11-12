@@ -10,12 +10,12 @@ pub mod follow;
 pub mod plain;
 pub mod watch;
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use flotilla_schema::{
     Cbor, ChangeItem, Event, Identity, Kind, KindRegistry, KindSpec, Labelled, NewChange, RegistryError, StateData, Timestamp,
 };
-use flotilla_schema_sqlite::{AboutCursor, ChangeId, Read, Stamp, Store, StoreError, Write};
+use flotilla_schema_sqlite::{AboutCursor, ChangeId, Read, Stamp, Store, StoreError, StoreGuard, StoreHandle, Write};
 use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession,
@@ -94,7 +94,7 @@ fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
 // cache only committed IDs, and identity removal only invalidates cache entries.
 // No resource state is cached in Store, so there is nothing to rebuild here.
 // Recover as the provisioning home wrappers do above this log.
-fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
+fn lock_store(store: &StoreHandle) -> StoreGuard<'_> {
     store.lock().unwrap_or_else(|poisoned| {
         let store = poisoned.into_inner();
         tracing::warn!(home = store.home(), "recovering poisoned decided-store lock");
@@ -107,14 +107,14 @@ fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
 /// and the Message it names commit to one store and home.
 #[derive(Clone)]
 pub struct StoreLog {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreHandle>,
     home: String,
     receipts: ReceiptLog,
 }
 
 impl StoreLog {
     /// A log homed at the store's own home, accepting AgentSession, Person and Service receipts.
-    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+    pub fn new(store: Arc<StoreHandle>) -> Self {
         let home = lock_store(&store).home().to_owned();
         Self { store, home, receipts: ReceiptLog::new() }
     }
@@ -129,7 +129,7 @@ impl StoreLog {
         self
     }
 
-    pub fn store(&self) -> &Arc<Mutex<Store>> {
+    pub fn store(&self) -> &Arc<StoreHandle> {
         &self.store
     }
 
@@ -622,7 +622,7 @@ impl std::ops::Deref for MessageLog {
 }
 
 impl MessageLog {
-    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+    pub fn new(store: Arc<StoreHandle>) -> Self {
         Self { inner: StoreLog::new(store) }
     }
 

@@ -12,7 +12,7 @@
 //! ended from the first entry after that version that ends the Convoy (Delivered or Abandoned),
 //! read from the log rather than from the Convoy's current state.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use flotilla_engine_store::plain::{PendingChange, PlainLog};
@@ -25,7 +25,7 @@ use flotilla_resources::{
     HOST_DIRECT_NAME_PREFIX,
 };
 use flotilla_schema::{ChangeItem, Identity, Kind, NewChange, Ref, Timestamp};
-use flotilla_schema_sqlite::{Read, Store};
+use flotilla_schema_sqlite::{Read, StoreHandle};
 use flotilla_state_machines::{
     machines::convoy::{Convoy as EngineConvoy, ConvoyLabel},
     Resource, StateValue,
@@ -231,7 +231,7 @@ impl EngineCheckouts {
     /// in `inputs` ([`super::launch_log::LaunchLog::with_inputs`]), reading the homes `homes` names.
     pub fn new(
         lifecycles: Arc<dyn Lifecycles<CheckoutKind>>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<StoreHandle>,
         inputs: StagedFacts<Vec<ChangeItem>>,
         homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
     ) -> Self {

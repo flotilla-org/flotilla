@@ -43,6 +43,7 @@ mod audit;
 mod cache;
 mod effect;
 mod error;
+mod handle;
 mod query;
 mod shared;
 mod sql;
@@ -52,6 +53,7 @@ pub mod stream;
 
 pub use audit::audit_domains;
 pub use error::{Malformed, StoreError, StreamResourceLimit};
+pub use handle::{Hold, HoldTimer, StoreGuard, StoreHandle};
 pub use query::{Cursor, Page, MAX_PAGE};
 pub use shared::{schema_ddl, SORTED_STATEMENTS};
 pub use store::{

@@ -2,10 +2,7 @@
 //! requested through the terminal port and stepped as the TerminalSession controller would step
 //! it, its facts written with its Realise.
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use flotilla_engine_store::{open_home_with, StoreLog};
 use flotilla_provisioning::{
@@ -24,14 +21,14 @@ use flotilla_resources::{
     },
 };
 use flotilla_schema::Timestamp;
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::StoreHandle;
 use flotilla_state_machines::machines::lifecycle::VanishCause;
 use flotilla_state_machines::{Cause, CauseCategory, Outcome};
 
 /// One home's terminal sessions on a decided store, served through the engine's readings.
 pub struct TerminalsFixture {
     pub home: String,
-    pub store: Arc<Mutex<Store>>,
+    pub store: Arc<StoreHandle>,
     pub lifecycles: Arc<dyn Lifecycles<TerminalSessionKind>>,
     pub terminals: Arc<EngineTerminals>,
     /// The engine's readings, serving [`Self::terminals`].
@@ -49,11 +46,11 @@ impl Default for TerminalsFixture {
 impl TerminalsFixture {
     /// A fixture whose sessions are homed at `home`.
     pub fn at(home: &str) -> Self {
-        Self::over(home, Arc::new(Mutex::new(crate::memory_store(home))))
+        Self::over(home, Arc::new(StoreHandle::new(crate::memory_store(home))))
     }
 
     /// A fixture over `store`, whose home is `home`.
-    pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
+    pub fn over(home: &str, store: Arc<StoreHandle>) -> Self {
         let owned = home.to_owned();
         Self::over_homes(home, store, move || vec![owned.clone()])
     }
@@ -65,7 +62,7 @@ impl TerminalsFixture {
         Self::over_homes(service.home(), service.store(), move || homes.homes())
     }
 
-    fn over_homes(home: &str, store: Arc<Mutex<Store>>, homes: impl Fn() -> Vec<String> + Send + Sync + 'static) -> Self {
+    fn over_homes(home: &str, store: Arc<StoreHandle>, homes: impl Fn() -> Vec<String> + Send + Sync + 'static) -> Self {
         let staged = StagedFacts::default();
         let log = StoreLog::new(Arc::clone(&store));
         let lifecycles: Arc<dyn Lifecycles<TerminalSessionKind>> = Arc::new(LifecycleHome::new(

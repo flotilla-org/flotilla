@@ -5,14 +5,14 @@
 //! latest launch has not ended is served by that launch; a request, or a renewal, once it has
 //! ended starts the next launch. The Clone controller writes every edge after the request.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_resources::{
     clone_records::{clone_name, launched, CloneChange, CloneRecord, CloneRecords, CloneRenewal},
     CloneSpec, RepositoryKey, RepositorySpec,
 };
 use flotilla_schema::{Kind, Ref, Timestamp};
-use flotilla_schema_sqlite::{Read, Store};
+use flotilla_schema_sqlite::{Read, StoreHandle};
 use flotilla_state_machines::Resource;
 
 use super::{
@@ -79,7 +79,7 @@ impl EngineClones {
     /// The port over `store`, whose homes `homes` names.
     pub fn new(
         lifecycles: Arc<dyn Lifecycles<CloneKind>>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<StoreHandle>,
         homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
         Self { lifecycles, reads: StoreReads::new(store), homes: Box::new(homes), changes: tokio::sync::broadcast::channel(CHANGES).0 }
