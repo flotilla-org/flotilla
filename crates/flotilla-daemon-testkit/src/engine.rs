@@ -4,15 +4,26 @@
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use flotilla_core::in_process::InProcessDaemon;
+use flotilla_protocol::LifecycleReading;
 use flotilla_provisioning_testkit::{EngineFixture, EnvironmentFixture};
 use flotilla_resources::{
-    terminal_records::{TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource},
+    agent_activity::AgentSessionReads,
+    checkout_records::CheckoutRecords,
+    clone_records::CloneRecords,
+    convoy_records::ConvoyRecords,
+    environment_records::EnvironmentRecords,
+    image_build_records::ImageBuildRecords,
+    lifecycle_reads::{LifecycleReads, ProvisioningKind},
+    terminal_records::{TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords},
+    vessel_records::VesselRecords,
     Convoy, ResourceObject, TerminalSessionSource, TerminalSessionSpec,
 };
 use flotilla_schema_sqlite::stream::Service;
 
-/// An engine installed into a test daemon, by the decided store it is on.
-type Installed = (Weak<Service>, Arc<EngineFixture>);
+/// An engine installed into a test daemon, by the decided store it is on. The daemon holds the
+/// engine through its lifecycle reads ([`Held`]); this registry only finds it again, so the engine
+/// and the store it holds go with the daemon.
+type Installed = (Weak<Service>, Weak<EngineFixture>);
 
 /// The engines installed into test daemons.
 static ENGINES: LazyLock<Mutex<Vec<Installed>>> = LazyLock::new(Default::default);
@@ -25,9 +36,11 @@ static ENGINES: LazyLock<Mutex<Vec<Installed>>> = LazyLock::new(Default::default
 pub fn engine(daemon: &InProcessDaemon) -> Arc<EngineFixture> {
     let service = daemon.decided_store().expect("decided store");
     let mut engines = ENGINES.lock().unwrap_or_else(PoisonError::into_inner);
-    engines.retain(|(store, _)| store.strong_count() > 0);
-    if let Some((_, engine)) = engines.iter().find(|(store, _)| store.as_ptr() == Arc::as_ptr(&service)) {
-        return Arc::clone(engine);
+    engines.retain(|(_, engine)| engine.strong_count() > 0);
+    if let Some(engine) =
+        engines.iter().filter(|(store, _)| store.as_ptr() == Arc::as_ptr(&service)).find_map(|(_, engine)| engine.upgrade())
+    {
+        return engine;
     }
     let engine = Arc::new(EngineFixture::over_service(&service));
     // Its terminal sessions', vessels', environments' and checkouts' readers and watchers hear each
@@ -38,9 +51,59 @@ pub fn engine(daemon: &InProcessDaemon) -> Arc<EngineFixture> {
         drop(engine.environments.environments.follow(Arc::clone(&service)).expect("follow the environments"));
         drop(engine.checkouts.checkouts.follow(Arc::clone(&service)).expect("follow the checkouts"));
     }
-    daemon.install_lifecycle_reads(engine.reads()).expect("install the engine's readings");
-    engines.push((Arc::downgrade(&service), Arc::clone(&engine)));
+    daemon
+        .install_lifecycle_reads(Arc::new(Held { reads: engine.reads(), _engine: Arc::clone(&engine) }))
+        .expect("install the engine's readings");
+    engines.push((Arc::downgrade(&service), Arc::downgrade(&engine)));
     engine
+}
+
+/// An engine's readings, installed in its daemon, holding the engine for as long as the daemon does.
+struct Held {
+    reads: Arc<dyn LifecycleReads>,
+    _engine: Arc<EngineFixture>,
+}
+
+impl LifecycleReads for Held {
+    fn is_disabled(&self) -> bool {
+        self.reads.is_disabled()
+    }
+
+    fn try_reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Result<Option<LifecycleReading>, String> {
+        self.reads.try_reading(kind, name, origin)
+    }
+
+    fn environments(&self) -> Result<&dyn EnvironmentRecords, String> {
+        self.reads.environments()
+    }
+
+    fn clones(&self) -> Result<&dyn CloneRecords, String> {
+        self.reads.clones()
+    }
+
+    fn checkouts(&self) -> Result<&dyn CheckoutRecords, String> {
+        self.reads.checkouts()
+    }
+
+    fn image_builds(&self) -> Result<&dyn ImageBuildRecords, String> {
+        self.reads.image_builds()
+    }
+
+    fn agent_sessions(&self) -> Result<&dyn AgentSessionReads, String> {
+        self.reads.agent_sessions()
+    }
+
+    fn terminals(&self) -> Result<&dyn TerminalRecords, String> {
+        self.reads.terminals()
+    }
+
+    fn vessels(&self) -> Result<&dyn VesselRecords, String> {
+        self.reads.vessels()
+    }
+
+    fn convoys(&self) -> Result<&dyn ConvoyRecords, String> {
+        self.reads.convoys()
+    }
 }
 
 /// Requests session `name` at `daemon`'s [`engine`] as old TerminalSession `spec` describes it,
