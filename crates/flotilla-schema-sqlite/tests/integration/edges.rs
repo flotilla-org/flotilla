@@ -19,8 +19,8 @@ use crate::fixtures::{
     synthetic::{
         Deliverable, DeliverableState, DossierEdge, DossierEvent, DossierState, Evidence, PlacementSnapshot, PromiseKind, PromiseSource,
     },
-    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Payload, Person, Pick, Referral, Resource, Service,
-    TerminalSession, Vessel, LOCAL,
+    AgentSession, AwaitingReply, Convoy, Dossier, Fixture, Message, Payload, Person, Pick, Referral, Resource, Service, TerminalSession,
+    Vessel, LOCAL,
 };
 
 fn snapshot(store: &mut Store, id: ResourceId) -> Snapshot {
@@ -273,11 +273,6 @@ fn an_edge_touches_exactly_its_declared_rows_awaiting_reply(tc: TestCase) {
 #[hegel::test(test_cases = 60)]
 fn an_edge_touches_exactly_its_declared_rows_convoy(tc: TestCase) {
     touches_only_declared_rows::<Resource<Convoy>>(&tc);
-}
-
-#[hegel::test(test_cases = 60)]
-fn an_edge_touches_exactly_its_declared_rows_ensure(tc: TestCase) {
-    touches_only_declared_rows::<Resource<Ensure>>(&tc);
 }
 
 #[hegel::test(test_cases = 60)]

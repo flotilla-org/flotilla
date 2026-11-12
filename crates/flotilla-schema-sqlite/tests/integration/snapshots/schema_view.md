@@ -21,9 +21,6 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 | `dossier_deliverables` | records | 9 | 2: `source` 2 | `dossier_deliverables_evidence` (records) | – |
 | `dossier_deliverables_evidence` | records | 9 | – | `dossier_deliverables_evidence_metadata` (child) | – |
 | `dossier_deliverables_evidence_metadata` | child | 5 | – | – | – |
-| `ensure` | root | 6 | – | `ensure_recorded` (state data), `ensure_created` (state data) | `by_inbox` (inbox) |
-| `ensure_recorded` | state data | 2 | – | – | – |
-| `ensure_created` | state data | 2 | – | – | – |
 | `message` | root | 23 | 5: `expectation` 2, `reason` 3 | `message_references` (child) | `pending_by_inbox` (inbox, admitted_seq), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
 | `message_references` | child | 5 | – | – | – |
 | `person` | root | 4 | – | – | – |
@@ -46,7 +43,6 @@ States with data (one label column, then data shared by name across the labels):
 - `awaiting_reply`.`state`: label `state` and `state_since`; data columns `reason`; data tables –
 - `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `activity`, `activity_since`, `activity_cause`, `reason`; data tables –
 - `convoy`.`state`: label `state` and `state_since`; data columns `disposition`, `cause`, `reason`; data tables `convoy_quota`, `convoy_retired`
-- `ensure`.`state`: label `state` and `state_since`; data columns `bound`; data tables `ensure_recorded`, `ensure_created`
 - `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –
 - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_by`, `hold_until`, `reason`, `closed_by`, `signature_who`, `signature_at`; data tables `ticket_assignees`, `ticket_notes`
 - `terminal_session`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `ending`, `ending_reason`, `cause_category`, `cause_detail`; data tables –
@@ -83,10 +79,6 @@ Interned column domains:
 | `dossier_deliverables` | `label` | `lb` |
 | `dossier_deliverables` | `source_step` | `st` |
 | `dossier_deliverables_evidence` | `verdict_by` | `wr` |
-| `ensure` | `inbox` | `ad` |
-| `ensure` | `bound` | `rn` |
-| `ensure_recorded` | `value` | `rn` |
-| `ensure_created` | `value` | `rn` |
 | `message` | `sender` | `ad` |
 | `message` | `inbox` | `ad` |
 | `message` | `expectation_condition` | `ad` |

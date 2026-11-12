@@ -302,7 +302,7 @@ impl WorkflowTemplateDefinition {
 
 /// A standing convoy's declaration, as the engine stores it: kind code `ce`. Project operations
 /// materialise it from a project's operational entries. It holds no status: the ensure pass derives
-/// that from the role's launches and the engine Ensure. The repositories and agent overrides keep
+/// that from the role's launches. The repositories and agent overrides keep
 /// their authored order, which the configuration-drift comparison reads, so each is a document.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "ConvoyEnsure", code = "ce")]

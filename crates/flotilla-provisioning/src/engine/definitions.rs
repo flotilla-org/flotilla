@@ -24,7 +24,7 @@ use flotilla_engine_store::{
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin, DEFINITION_KINDS},
     engine_records::{EngineObject, EngineRecords},
-    CredentialGrantSpec, CredentialSpecSpec, CrewDefaultsSpec, FleetDesignationSpec, ForgeSpec, ImageLayerResourceSpec,
+    ConvoyEnsureSpec, CredentialGrantSpec, CredentialSpecSpec, CrewDefaultsSpec, FleetDesignationSpec, ForgeSpec, ImageLayerResourceSpec,
     WorkflowTemplateSpec,
 };
 use flotilla_schema::{Identity, Kind, KindCode, NewChange, Timestamp};
@@ -36,8 +36,8 @@ use super::provenance;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::definition::{
-    CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition, ForgeDefinition,
-    ImageLayerDefinition, WorkflowTemplateDefinition,
+    ConvoyEnsureDefinition, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition,
+    ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
 };
 use crate::stored::manifest_root::ManifestRoot;
 
@@ -88,6 +88,7 @@ whole!(
     CredentialSpecDefinition => "CredentialSpec", CredentialSpecSpec;
     CredentialGrantDefinition => "CredentialGrant", CredentialGrantSpec;
     CrewDefaultsDefinition => "CrewDefaults", CrewDefaultsSpec;
+    ConvoyEnsureDefinition => "ConvoyEnsure", ConvoyEnsureSpec;
 );
 
 impl Definition for ImageLayerDefinition {
@@ -149,13 +150,17 @@ macro_rules! by_kind {
                 type $k = WorkflowTemplateDefinition;
                 $body
             }
+            "ConvoyEnsure" => {
+                type $k = ConvoyEnsureDefinition;
+                $body
+            }
             other => Err(format!("{other} is not a definition kind")),
         }
     };
 }
 
 /// The definition kinds' codes, with their resource kind names.
-fn codes() -> [(KindCode, &'static str); 7] {
+fn codes() -> [(KindCode, &'static str); 8] {
     [
         (ForgeDefinition::CODE, ForgeDefinition::NAME),
         (FleetDesignationDefinition::CODE, FleetDesignationDefinition::NAME),
@@ -164,6 +169,7 @@ fn codes() -> [(KindCode, &'static str); 7] {
         (CrewDefaultsDefinition::CODE, CrewDefaultsDefinition::NAME),
         (ImageLayerDefinition::CODE, ImageLayerDefinition::NAME),
         (WorkflowTemplateDefinition::CODE, WorkflowTemplateDefinition::NAME),
+        (ConvoyEnsureDefinition::CODE, ConvoyEnsureDefinition::NAME),
     ]
 }
 
@@ -237,6 +243,7 @@ fn reload(read: &mut Read<'_>, records: &mut Records, identity: &Identity) -> Re
         "CredentialGrant" => load::<CredentialGrantDefinition>(read, id)?,
         "CrewDefaults" => load::<CrewDefaultsDefinition>(read, id)?,
         "ImageLayer" => load::<ImageLayerDefinition>(read, id)?,
+        "ConvoyEnsure" => load::<ConvoyEnsureDefinition>(read, id)?,
         _ => load::<WorkflowTemplateDefinition>(read, id)?,
     };
     match found {
@@ -275,7 +282,8 @@ fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), 
     scan::<CredentialGrantDefinition>(read, roots, records, home)?;
     scan::<CrewDefaultsDefinition>(read, roots, records, home)?;
     scan::<ImageLayerDefinition>(read, roots, records, home)?;
-    scan::<WorkflowTemplateDefinition>(read, roots, records, home)
+    scan::<WorkflowTemplateDefinition>(read, roots, records, home)?;
+    scan::<ConvoyEnsureDefinition>(read, roots, records, home)
 }
 
 /// `kind`'s record `name` as several homes' resolve at `home`: its own, else the lexically first

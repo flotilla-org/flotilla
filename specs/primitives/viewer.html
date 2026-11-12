@@ -33,7 +33,7 @@ function load(data) {
   trace = data.states; machines = [];
   const first = trace[0];
   if(typeof first['mbt::actionTaken'] !== 'string') throw Error('Expected a Quint --mbt trace.');
-  const stores = {convoys:'Convoy',ensures:'Ensure',messages:'Message',sessions:'AgentSession',resources:'Shared lifecycle',vessels:'Vessel'};
+  const stores = {convoys:'Convoy',messages:'Message',sessions:'AgentSession',resources:'Shared lifecycle',vessels:'Vessel'};
   for(const [field,value] of Object.entries(first)) {
     const kind=field.split('::').at(-1), title=stores[kind];
     if(!title || !value || !Array.isArray(value['#map'])) continue;

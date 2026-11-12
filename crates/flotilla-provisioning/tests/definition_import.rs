@@ -9,8 +9,8 @@ use flotilla_provisioning::{
     engine::definition_import::{import_kind, rehearse_definitions, DefinitionCopies, DefinitionCopy, ImportedDefinition},
     engine::import::ImportReport,
     stored::definition::{
-        CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition, ForgeDefinition,
-        ImageLayerDefinition, WorkflowTemplateDefinition,
+        ConvoyEnsureDefinition, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition,
+        ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
     },
     stored::project::{DeclarationRefusal, EntriesReadiness, ProjectDefinition, ProjectOpsRecord},
 };
@@ -24,7 +24,7 @@ use flotilla_resources::{
         WHOLE_REPOSITORY_PROJECT_MANAGER,
     },
     definitions::{CharterOrigin, DefinitionOrigin},
-    CharterPointer, CharterSource, CharterStoreBinding, CredentialConsumer, CredentialGrantSelector, CredentialGrantSpec,
+    CharterPointer, CharterSource, CharterStoreBinding, ConvoyEnsureSpec, CredentialConsumer, CredentialGrantSelector, CredentialGrantSpec,
     CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpecSpec, CrewDefaultsSpec,
     DeclarationRefusedCondition, DispatchQueueAttention, FleetDesignationSpec, ForgeKind, ForgeSpec, HostActionSelector, HostImageAction,
     ImageCacheBinding, ImageLayerResourceSpec, ImageSelection, LandingCredentialScope, ObjectMeta, OperationalEntriesCondition, Project,
@@ -256,6 +256,22 @@ fn crew_defaults(tc: &TestCase) -> CrewDefaultsSpec {
     }
 }
 
+// A standing role's declaration: each optional part present or absent, repositories and agent
+// overrides in their authored order.
+fn convoy_ensure(tc: &TestCase) -> ConvoyEnsureSpec {
+    ConvoyEnsureSpec {
+        project_ref: word(tc),
+        role: word(tc),
+        driver_ref: maybe(tc, word),
+        workflow_ref: pick(tc, &["", "review"]).to_string(),
+        placement_policy: maybe(tc, word),
+        escalation_reason: maybe(tc, word),
+        repositories: words(tc).into_iter().rev().map(RepositoryKey).collect(),
+        presents_as: maybe(tc, word),
+        agent_overrides: maybe(tc, |tc| vec![pick(tc, &["claude", "review=codex:o3"]).parse().expect("an override")]).unwrap_or_default(),
+    }
+}
+
 fn forge(tc: &TestCase) -> ForgeSpec {
     ForgeSpec {
         forge_id: word(tc),
@@ -337,6 +353,7 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
     let (forge_spec, fleet_spec, credential, grant, defaults) =
         (forge(tc), fleet(tc), credential_spec(tc), credential_grant(tc), crew_defaults(tc));
     let (template, layer, project_spec) = (pick(tc, &templates).clone(), pick(tc, &layers).clone(), project(tc));
+    let ensure = convoy_ensure(tc);
     let copies = DefinitionCopies {
         forges: vec![copy("forge", "alpha", labels.clone(), annotations.clone(), forge_spec.clone())],
         fleet_designations: vec![copy("fleet", "alpha", labels.clone(), annotations.clone(), fleet_spec.clone())],
@@ -345,11 +362,12 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
         crew_defaults: vec![copy("defaults", "alpha", labels.clone(), annotations.clone(), defaults.clone())],
         image_layers: vec![copy("layer", "alpha", labels.clone(), annotations.clone(), layer.clone())],
         workflow_templates: vec![copy("template", "alpha", labels.clone(), annotations.clone(), template.clone())],
+        convoy_ensures: vec![copy("ensure", "alpha", labels.clone(), annotations.clone(), ensure.clone())],
         projects: vec![copy("project", "alpha", labels.clone(), annotations.clone(), project_spec.clone())],
     };
     let report = rehearse_definitions(&copies);
     assert!(report.refused.is_empty(), "{:?}", report.refused);
-    assert_eq!(report.imported.values().sum::<usize>(), 8, "{report:?}");
+    assert_eq!(report.imported.values().sum::<usize>(), 9, "{report:?}");
 
     let mut report = ImportReport::default();
     let forge = only_imported(import_kind::<ForgeDefinition>(&copies.forges, &mut report));
@@ -360,7 +378,10 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
     let layer_record = only_imported(import_kind::<ImageLayerDefinition>(&copies.image_layers, &mut report));
     let template_record = only_imported(import_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, &mut report));
     let project_record = only_imported(import_kind::<ProjectDefinition>(&copies.projects, &mut report));
+    let ensure_record = only_imported(import_kind::<ConvoyEnsureDefinition>(&copies.convoy_ensures, &mut report));
+    assert_eq!(ensure_record.record.spec(), ensure);
     for record_origin in [
+        &ensure_record.origin,
         &forge.origin,
         &fleet.origin,
         &credential_record.origin,

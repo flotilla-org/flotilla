@@ -212,6 +212,20 @@ impl MessageInbox {
     }
 }
 
+/// Each standing role's current generations among `convoys`, by project and role: the newest live
+/// convoy of each ensure the role is ensured from. Derived from the generations alone (#3108).
+fn standing_generations<'a>(
+    namespace: &str,
+    convoys: impl IntoIterator<Item = &'a crate::ResourceObject<Convoy>>,
+) -> BTreeMap<(String, String), Vec<String>> {
+    let mut standing = BTreeMap::<_, Vec<String>>::new();
+    for convoy in crate::newest_live_generations(convoys).into_values() {
+        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace).to_string();
+        standing.entry((project, convoy.spec.role.clone())).or_default().push(convoy.metadata.name.clone());
+    }
+    standing
+}
+
 /// Receiver evidence frozen for one batch. Shared view generations avoid
 /// retaining a fresh inventory copy for each batch.
 /// Resolution after loading is pure, including adopted-role validation.
@@ -220,7 +234,9 @@ pub struct MessageReceiverSnapshot {
     namespace: String,
     convoys: std::sync::Arc<crate::ReadResourceList<Convoy>>,
     terminals: std::sync::Arc<crate::ReadResourceList<TerminalSession>>,
-    ensures: std::sync::Arc<crate::ReadResourceList<ConvoyEnsure>>,
+    /// Each standing role's current generations in this batch, by project and role: the newest
+    /// live convoy of each ensure holding it. More than one is an ambiguous holder.
+    standing: BTreeMap<(String, String), Vec<String>>,
     projects: BTreeMap<String, ProjectSpec>,
     hierarchy: ProjectHierarchy,
     defaults: Vec<(String, CrewDefaultsSpec)>,
@@ -230,7 +246,8 @@ impl MessageReceiverSnapshot {
     /// Load exactly the receivers named by a request, reading each holder kind once.
     pub async fn load_for_addresses(backend: &ResourceBackend, namespace: &str, addresses: &[String]) -> Result<Self, ResourceError> {
         let mut convoy_names = std::collections::BTreeSet::new();
-        let mut ensure_queries = Vec::new();
+        let mut standing_queries = Vec::new();
+        let mut standing_roles = std::collections::BTreeSet::new();
         let mut adopted_queries = Vec::new();
         for address in addresses {
             validate_message_address(address)?;
@@ -250,10 +267,13 @@ impl MessageReceiverSnapshot {
                     convoy_names.insert(convoy);
                 }
                 [project, role] => {
-                    ensure_queries.push(crate::StoreQuery {
+                    // The role's live ensured convoys; the newest per ensure is its holder.
+                    standing_queries.push(crate::StoreQuery {
+                        present: vec![format!("metadata.annotations.\"{}\"", crate::ENSURED_FROM_ANNOTATION)],
                         fields: BTreeMap::from([("spec.project_ref".into(), (*project).into()), ("spec.role".into(), (*role).into())]),
-                        ..Default::default()
+                        ..crate::live_convoys_query()
                     });
+                    standing_roles.insert(((*project).to_string(), (*role).to_string()));
                     adopted_queries.push(crate::StoreQuery {
                         fields: BTreeMap::from([("metadata.annotations.\"flotilla.work/role-address\"".into(), address.clone())]),
                         ..Default::default()
@@ -262,37 +282,32 @@ impl MessageReceiverSnapshot {
                 _ => {}
             }
         }
-        let ensures = if ensure_queries.is_empty() {
-            Vec::new()
-        } else {
-            backend
-                .query_declared::<ConvoyEnsure>(
-                    namespace,
-                    &crate::StoreQuery { any_of: Some(ensure_queries), include_replicas: true, ..Default::default() },
-                )
-                .await?
-                .items
-        };
-        let standing_convoys = ensures
-            .iter()
-            .filter_map(|ensure| ensure.object.status.as_ref()?.convoy_ref.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        convoy_names.extend(standing_convoys.iter().cloned());
-        let convoys = if convoy_names.is_empty() {
+        // One Convoy read: the named convoys and the standing roles' live generations.
+        let mut convoy_queries = standing_queries;
+        if !convoy_names.is_empty() {
+            convoy_queries.push(crate::StoreQuery {
+                field_values: BTreeMap::from([("metadata.name".into(), convoy_names.iter().cloned().collect())]),
+                ..Default::default()
+            });
+        }
+        let convoys = if convoy_queries.is_empty() {
             Vec::new()
         } else {
             backend
                 .query_declared::<Convoy>(
                     namespace,
-                    &crate::StoreQuery {
-                        field_values: BTreeMap::from([("metadata.name".into(), convoy_names.iter().cloned().collect())]),
-                        include_replicas: true,
-                        ..Default::default()
-                    },
+                    &crate::StoreQuery { any_of: Some(convoy_queries), include_replicas: true, ..Default::default() },
                 )
                 .await?
                 .items
         };
+        // Only the requested roles' generations: a named convoy may itself be one, but a
+        // four-part address needs no standing-role holders.
+        let standing_convoys = standing_generations(namespace, convoys.iter().map(|row| &row.object))
+            .into_iter()
+            .filter(|(key, _)| standing_roles.contains(key))
+            .flat_map(|(_, names)| names)
+            .collect::<std::collections::BTreeSet<_>>();
         adopted_queries.extend(
             standing_convoys
                 .into_iter()
@@ -309,7 +324,7 @@ impl MessageReceiverSnapshot {
                 .await?
                 .items
         };
-        Self::load_with_ensures(backend, namespace, convoys, terminals, ensures).await
+        Self::load_from_observations(backend, namespace, convoys, terminals).await
     }
 
     pub async fn load(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
@@ -326,24 +341,11 @@ impl MessageReceiverSnapshot {
         convoys: Vec<crate::ReadResourceObject<Convoy>>,
         terminals: Vec<crate::ReadResourceObject<TerminalSession>>,
     ) -> Result<Self, ResourceError> {
-        // A full observation batch resolves every standing-role declaration.
-        let ensures = backend.including_replicas::<ConvoyEnsure>(namespace).list().await?.items;
-        Self::load_with_ensures(backend, namespace, convoys, terminals, ensures).await
-    }
-
-    async fn load_with_ensures(
-        backend: &ResourceBackend,
-        namespace: &str,
-        convoys: Vec<crate::ReadResourceObject<Convoy>>,
-        terminals: Vec<crate::ReadResourceObject<TerminalSession>>,
-        ensures: Vec<crate::ReadResourceObject<ConvoyEnsure>>,
-    ) -> Result<Self, ResourceError> {
         Self::load_from_shared_observations(
             backend,
             namespace,
             std::sync::Arc::new(crate::ReadResourceList { items: convoys }),
             std::sync::Arc::new(crate::ReadResourceList { items: terminals }),
-            std::sync::Arc::new(crate::ReadResourceList { items: ensures }),
         )
         .await
     }
@@ -354,7 +356,6 @@ impl MessageReceiverSnapshot {
         namespace: &str,
         convoys: std::sync::Arc<crate::ReadResourceList<Convoy>>,
         terminals: std::sync::Arc<crate::ReadResourceList<TerminalSession>>,
-        ensures: std::sync::Arc<crate::ReadResourceList<ConvoyEnsure>>,
     ) -> Result<Self, ResourceError> {
         let mut projects = BTreeMap::new();
         let mut fleet = None;
@@ -384,7 +385,8 @@ impl MessageReceiverSnapshot {
         }
         let hierarchy =
             ProjectHierarchy::from_declared(projects.iter().map(|(name, spec)| (name.clone(), spec.parent.clone())).collect(), fleet);
-        Ok(Self { namespace: namespace.into(), convoys, terminals, ensures, projects, hierarchy, defaults })
+        let standing = standing_generations(namespace, convoys.items.iter().map(|source| &source.object));
+        Ok(Self { namespace: namespace.into(), convoys, terminals, standing, projects, hierarchy, defaults })
     }
 
     /// Cheap candidate filter before resolving message addresses. Two-part roles
@@ -394,15 +396,13 @@ impl MessageReceiverSnapshot {
         match parts.as_slice() {
             [p, c, _, _] => *p == project && flotilla_resources::convoy_of_segment(c) == convoy,
             [p, role] if *p == project => {
-                self.ensures.items.iter().any(|source| {
-                    let declaration = &source.object;
-                    declaration.spec.project_ref == project
-                        && declaration.spec.role == *role
-                        && declaration.status.as_ref().and_then(|status| status.convoy_ref.as_deref()) == Some(convoy)
-                }) || self.terminals.items.iter().any(|holder| {
-                    holder.object.metadata.annotations.get(ROLE_ADDRESS_ANNOTATION).is_some_and(|claim| claim == address)
-                        && holder.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|name| name == convoy)
-                })
+                self.standing
+                    .get(&(project.to_string(), (*role).to_string()))
+                    .is_some_and(|generations| generations.iter().any(|name| name == convoy))
+                    || self.terminals.items.iter().any(|holder| {
+                        holder.object.metadata.annotations.get(ROLE_ADDRESS_ANNOTATION).is_some_and(|claim| claim == address)
+                            && holder.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|name| name == convoy)
+                    })
             }
             _ => false,
         }
@@ -472,16 +472,12 @@ impl MessageReceiverSnapshot {
             }
         }
         let declared_convoy = if convoy.is_none() {
-            let declarations = &self.ensures.items;
-            let mut holders = declarations
-                .iter()
-                .filter(|declaration| declaration.object.spec.project_ref == project && declaration.object.spec.role == role);
-            let Some(declaration) = holders.next() else { return Ok(None) };
-            if holders.next().is_some() {
+            // A role with no live generation has no holder.
+            let Some(generations) = self.standing.get(&(project.to_string(), role.to_string())) else { return Ok(None) };
+            let [name] = generations.as_slice() else {
                 return Err(ResourceError::invalid("project role has multiple holder declarations"));
-            }
-            let Some(name) = declaration.object.status.as_ref().and_then(|status| status.convoy_ref.clone()) else { return Ok(None) };
-            Some(name)
+            };
+            Some(name.clone())
         } else {
             None
         };

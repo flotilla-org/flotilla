@@ -10,10 +10,9 @@ use std::{
 use crate::convoy_admission::PreparedConvoyAdmission;
 use crate::convoy_ensure::ConvoyEnsureAdmission;
 use crate::convoy_ensure::ConvoyEnsureReconciler;
-use crate::convoy_ensure::EngineEnsures;
 use crate::convoy_ensure::StandingConvoyBackingInspector;
 use crate::ports::ConvoyTeardown;
-use crate::standing::{self, Decision, Ending, Generation, HoldAttention, StandingReading};
+use crate::standing::{self, Decision, Ending, Generation, HoldAttention, StandingHold, StandingReading, StandingRole};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_charter::ops_entry::{
@@ -23,21 +22,37 @@ use flotilla_charter::ops_entry::{
 use flotilla_protocol::{PlacementTargetHost, PrincipalRef};
 use flotilla_resources::attentions::{Attention, Attentions, Fact, OpenAttention, Sender, Subject};
 use flotilla_resources::{
-    Clock, ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift,
-    ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch, ConvoyPhase, FulfilmentKind,
-    Host as ResourceHost, Project, ReadResourceObject, Repository, ResourceError, ResourceObject, ResourceProvenance, WorkflowTemplate,
-    DRIVER_ADMISSION_CONDITION_TYPE,
+    config_changes, Clock, ControllerRetry, ControllerRetryDisposition, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec,
+    ConvoyPhase, FulfilmentKind, Host as ResourceHost, Project, ReadResourceObject, Repository, ResourceError, ResourceObject,
+    ResourceProvenance, WorkflowTemplate, LOCAL_RETRY_LIMIT,
 };
-use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend, StoreQuery};
+use flotilla_store::{ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
+
+/// The note a refused admission leaves: the only state a standing role's controller holds of its
+/// own. It is in memory and resets when the controller restarts, which retries at once: a refusal
+/// admitted no generation, so nothing durable records it, and every host derives the rest of the
+/// role's state from its generations and their attention (#3108).
 #[derive(Debug, Clone)]
 struct EnsureAdmissionRetry {
     config_hash: String,
     dependency_hash: String,
     retry: ControllerRetry,
+    failure: String,
+    refused_at: DateTime<Utc>,
 }
+
+impl EnsureAdmissionRetry {
+    /// Whether the refusals reached [`LOCAL_RETRY_LIMIT`]: the role then waits for an event.
+    fn past_limit(&self) -> bool {
+        self.retry.next_attempt_at().is_none()
+    }
+}
+
+/// What a role past the refusal limit needs before it is admitted again.
+const ADMISSION_REFUSED_NEEDS: &str = "a changed declaration or dependency, an acknowledgement, or reconcile-now";
 
 /// The reason a standing role's restart-limit hold gives its person: `failures` consecutive
 /// generations of it failed.
@@ -51,12 +66,15 @@ fn record_ensure_admission_retry(
     config_hash: String,
     dependency_hash: String,
     now: DateTime<Utc>,
-    persisted: Option<&ControllerRetry>,
-) -> (u32, DateTime<Utc>) {
-    let previous = retries.get(&key).map(|entry| &entry.retry).or(persisted);
-    let retry = ControllerRetry::retryable(previous, now, flotilla_resources::PROVISIONING_RETRY_BACKOFF);
-    let result = (retry.attempts, retry.next_attempt_at().expect("new admission retry is retryable"));
-    retries.insert(key, EnsureAdmissionRetry { config_hash, dependency_hash, retry });
+    failure: String,
+) -> (u32, Option<DateTime<Utc>>) {
+    let previous = retries.get(&key).map(|entry| &entry.retry);
+    let mut retry = ControllerRetry::retryable(previous, now, flotilla_resources::PROVISIONING_RETRY_BACKOFF);
+    if retry.attempts >= LOCAL_RETRY_LIMIT {
+        retry.disposition = ControllerRetryDisposition::Terminal { needs: ADMISSION_REFUSED_NEEDS.to_owned() };
+    }
+    let result = (retry.attempts, retry.next_attempt_at());
+    retries.insert(key, EnsureAdmissionRetry { config_hash, dependency_hash, retry, failure, refused_at: now });
     result
 }
 
@@ -64,6 +82,11 @@ fn record_ensure_admission_retry(
 enum EnsureConvoyScope {
     Local,
     IncludingReplicas,
+}
+
+/// The standing role `ensure` declares, as its drift and refusal attentions name it.
+fn standing_subject(ensure: &ResourceObject<ConvoyEnsure>) -> Subject {
+    Subject::StandingRole { project: ensure.spec.project_ref.clone(), role: ensure.spec.role.clone() }
 }
 
 /// Whether a generation has ended: an ended one admits a successor only through the role's
@@ -117,8 +140,6 @@ pub struct EnsureReconciler {
     /// Per namespace, the earliest time the last pass deferred an ensure to.
     #[builder(skip)]
     next_due: StdMutex<HashMap<String, DateTime<Utc>>>,
-    /// The engine's Ensure behind `[primitives]` (#3629 layer 7); absent with the switch off.
-    engine: Option<Arc<dyn EngineEnsures>>,
     /// The daemon's ManifestRoots (#3824 layer 2c); the old store's when absent.
     manifest_roots: Option<Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>>,
 }
@@ -139,7 +160,6 @@ impl EnsureReconciler {
             .ensure_reconciliation(&self.ensure_reconciliation)
             .next_due(&self.next_due)
             .admission(admission)
-            .maybe_engine(self.engine.as_ref())
             .build()
     }
 }
@@ -176,7 +196,6 @@ struct EnsurePass<'a> {
     ensure_reconciliation: &'a Mutex<()>,
     next_due: &'a StdMutex<HashMap<String, DateTime<Utc>>>,
     admission: &'a dyn ConvoyEnsureAdmission,
-    engine: Option<&'a Arc<dyn EngineEnsures>>,
 }
 
 #[async_trait]
@@ -222,7 +241,70 @@ impl ConvoyEnsureReconciler for EnsureReconciler {
     fn next_due(&self, namespace: &str) -> Option<DateTime<Utc>> {
         self.next_due.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(namespace).copied()
     }
+    async fn standing_role(&self, namespace: &str, project: &str, role: &str) -> Result<Option<StandingRole>, String> {
+        let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace).list().await.map_err(|e| e.to_string())?;
+        let Some(ensure) = ensures.into_iter().find(|ensure| ensure.spec.project_ref == project && ensure.spec.role == role) else {
+            return Ok(None);
+        };
+        self.role_of(namespace, &ensure).await.map(Some)
+    }
 }
+
+impl EnsureReconciler {
+    /// The standing role `ensure` declares, as every host reads it.
+    async fn role_of(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<StandingRole, String> {
+        let attentions = self.resource_backend.attentions();
+        // Every host reads the role from every home's generations.
+        let generations = newest_generations_first(&self.resource_backend, namespace, &ensure.metadata.name, true).await?;
+        let now = self.clock.now();
+        let (reading, attention) = standing_reading(&*attentions, namespace, ensure, &generations, now, false).await?;
+        let newest = generations.first();
+        let live = newest.filter(|convoy| !ended(convoy));
+        let hold = match reading.decision {
+            Decision::Held { .. } => Some(StandingHold::RestartLimit),
+            _ if live.is_none() && attention.open => Some(StandingHold::BackingUnverified),
+            _ => None,
+        };
+        let held_on = newest.filter(|_| hold.is_some());
+        // Only the host that admits the role holds a refusal note.
+        let note = self.ensure_admission_retries.lock().await.get(&(namespace.to_owned(), ensure.metadata.name.clone())).cloned();
+        let next_attempt = match reading.decision {
+            Decision::BackOff { until } => Some(until),
+            _ => note.as_ref().and_then(|note| note.retry.next_attempt_at()),
+        };
+        let backing = match (hold, held_on) {
+            (Some(StandingHold::BackingUnverified), Some(convoy)) => attentions
+                .open(namespace, Some(Sender::Standing), Some(&Subject::convoy(convoy.metadata.name.clone())))
+                .await?
+                .into_iter()
+                .next()
+                .map(|open| open.reason),
+            _ => None,
+        };
+        let drift = live
+            .map(|convoy| config_changes(&ensure.spec, convoy.status.as_ref().and_then(|status| status.ensure_admission.as_ref())))
+            .filter(|changes| !changes.is_empty())
+            .map(|changes| format!("ConfigDrift: {}", changes.join("; ")));
+        let last_failure = declaration_refused(&self.resource_backend, namespace, ensure)
+            .await?
+            .map(|refused| format!("DeclarationRefused: {refused}"))
+            .or(drift)
+            .or_else(|| matches!(hold, Some(StandingHold::RestartLimit)).then(|| restart_limit_reason(reading.strikes)))
+            .or(backing)
+            .or_else(|| matches!(reading.decision, Decision::BackOff { .. }).then(|| TERMINAL_FAILURE.to_owned()))
+            .or_else(|| note.map(|note| note.failure));
+        Ok(StandingRole {
+            convoy: live.or(held_on).map(|convoy| convoy.metadata.name.clone()),
+            hold,
+            strikes: reading.strikes,
+            next_attempt,
+            last_failure,
+        })
+    }
+}
+
+/// What a standing role's failed generation says of it while it backs off.
+const TERMINAL_FAILURE: &str = "ensured convoy entered a terminal failure phase";
 
 impl EnsurePass<'_> {
     /// Records that an ensure deferred its work until `at`; the pass's caller wakes then.
@@ -233,8 +315,10 @@ impl EnsurePass<'_> {
     }
 
     /// Definitions reads merge every host's copy, so local presence does not
-    /// establish home. ManifestRoots are home-bound; undeclared definitions
-    /// belong to their earliest creation, before later local reapplications.
+    /// establish home. ManifestRoots are home-bound; an undeclared definition
+    /// belongs to the home whose copy sorts first by origin, since every engine
+    /// copy reads its creation time as the epoch. A later same-name copy at a
+    /// lower-sorting home also acts; owner question open (#3108).
     async fn driverless_ensure_is_home(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<bool, ResourceError> {
         if let Some(root) = ensure.metadata.annotations.get("flotilla.work/manifest-reconciler-root") {
             if let Some(root) = self.manifest_roots.root(namespace, root).await.map_err(ResourceError::other)? {
@@ -258,8 +342,8 @@ impl EnsurePass<'_> {
             .resource_backend
             .query_declared::<ConvoyEnsure>(namespace, &StoreQuery::names([ensure.metadata.name.clone()], true))
             .await?;
-        // Replication preserves each origin's creation_timestamp; it never
-        // substitutes the replica's arrival time. Reapplications create later sources.
+        // The engine keeps no creation time (every copy reads as the epoch), so the origin
+        // tie-break alone decides which home's copy is first.
         let first = sources.items.into_iter().filter(|source| source.object.metadata.deletion_timestamp.is_none()).min_by_key(|source| {
             let origin = match &source.provenance {
                 ResourceProvenance::Local => &local_root,
@@ -297,89 +381,23 @@ impl EnsurePass<'_> {
                 {
                     self.observe_ensure_config_drift(namespace, &ensure, &convoy).await?;
                 }
-                if self.resource_backend.clone().using::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await.is_ok()
-                    && ensure.status.as_ref().is_some_and(|status| status.convoy_ref.is_some() || status.running_since.is_some())
-                {
-                    if let Err(error) =
-                        self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::DriverManaged).await
-                    {
-                        errors.push(format!(
-                            "ConvoyEnsure/{}: could not clear legacy status for driver ownership: {error}",
-                            ensure.metadata.name
-                        ));
-                    }
-                }
+                // Only the driver admits. Whether it is known and reachable is read from its Host
+                // records by whoever asks; the ensure keeps no condition of it.
                 let target = match canonical_placement_host_ref(self.resource_backend, namespace, driver_ref).await {
                     Ok(Some(target)) => target,
                     Ok(None) => {
-                        if let Err(error) = self
-                            .set_ensure_driver_condition(
-                                namespace,
-                                &ensure,
-                                "UnknownDriver",
-                                format!("driver host `{driver_ref}` is unknown"),
-                            )
-                            .await
-                        {
-                            errors.push(format!("ConvoyEnsure/{}: could not record driver condition: {error}", ensure.metadata.name));
-                        }
+                        debug!(ensure = %ensure.metadata.name, %driver_ref, "standing convoy driver host is unknown");
                         continue;
                     }
                     Err(error) => {
-                        if let Err(patch_error) = self
-                            .set_ensure_driver_condition(
-                                namespace,
-                                &ensure,
-                                "DriverUnreachable",
-                                format!("driver host `{driver_ref}` could not be resolved: {error}"),
-                            )
-                            .await
-                        {
-                            errors.push(format!("ConvoyEnsure/{}: could not record driver condition: {patch_error}", ensure.metadata.name));
-                        }
+                        errors.push(format!(
+                            "ConvoyEnsure/{}: driver host `{driver_ref}` could not be resolved: {error}",
+                            ensure.metadata.name
+                        ));
                         continue;
                     }
                 };
                 if self.admission.local_host_id().as_ref() != Some(&target.reference) {
-                    // Read only the driver's provenances: a per-ensure namespace
-                    // list would scale reconciliation with every Host.
-                    let hosts = match self
-                        .resource_backend
-                        .including_replicas::<ResourceHost>(namespace)
-                        .get_all(target.reference.as_str())
-                        .await
-                    {
-                        Ok(hosts) => hosts,
-                        Err(error) => {
-                            errors.push(format!(
-                                "ConvoyEnsure/{}: could not inspect driver host `{driver_ref}` reachability: {error}",
-                                ensure.metadata.name
-                            ));
-                            continue;
-                        }
-                    };
-                    let reachable = hosts
-                        .items
-                        .iter()
-                        .find(|host| host.object.metadata.name == target.reference.as_str())
-                        .is_some_and(|host| host.object.status.as_ref().is_some_and(|status| status.ready));
-                    if reachable {
-                        if let Err(error) = self.clear_ensure_driver_condition(namespace, &ensure).await {
-                            errors.push(format!("ConvoyEnsure/{}: could not clear driver condition: {error}", ensure.metadata.name));
-                        }
-                    } else {
-                        if let Err(error) = self
-                            .set_ensure_driver_condition(
-                                namespace,
-                                &ensure,
-                                "DriverUnreachable",
-                                format!("driver host `{driver_ref}` is not reachable"),
-                            )
-                            .await
-                        {
-                            errors.push(format!("ConvoyEnsure/{}: could not record driver condition: {error}", ensure.metadata.name));
-                        }
-                    }
                     continue;
                 }
                 match self.reconcile_driver_convoy_ensure(namespace, &ensure, backing_inspector, false).await {
@@ -430,7 +448,8 @@ impl EnsurePass<'_> {
         }
     }
 
-    /// Reset one ensure's retry budget and drive its admission synchronously.
+    /// Drive one ensure's admission synchronously, past its backoff. Below the refusal limit
+    /// that resets its retry budget; past it, a refusal waits for the next event again.
     pub async fn reconcile_convoy_ensure_now(
         &self,
         namespace: &str,
@@ -441,7 +460,6 @@ impl EnsurePass<'_> {
         let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace);
         let ensure = ensures.get(name).await.map_err(|error| error.to_string())?;
         if ensure.spec.driver_ref.is_some() {
-            self.ensure_admission_retries.lock().await.remove(&(namespace.to_string(), name.to_string()));
             return self
                 .reconcile_driver_convoy_ensure(namespace, &ensure, backing_inspector, true)
                 .await
@@ -486,9 +504,8 @@ impl EnsurePass<'_> {
     /// interrupt the current crew. The ordinary lifecycle reclaims old backing.
     pub async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String> {
         let _reconciliation = self.ensure_reconciliation.lock().await;
-        let ensure =
-            self.resource_backend.including_replicas::<ConvoyEnsure>(namespace).get(name).await.map_err(|error| error.to_string())?.object;
-        if ensure.status.as_ref().is_some_and(|status| status.declaration_refused.is_some()) {
+        let ensure = self.resource_backend.definitions::<ConvoyEnsure>(namespace).get(name).await.map_err(|error| error.to_string())?;
+        if self.declaration_refused(namespace, &ensure).await?.is_some() {
             return Err(format!("ConvoyEnsure/{name} has a refused declaration; refresh successfully before rolling"));
         }
         let convoy = self
@@ -526,21 +543,13 @@ impl EnsurePass<'_> {
         // atomic transaction. A crash or write failure below leaves a gap: the
         // ordinary ensure reconciliation loop retries admission (with backing
         // verification/backoff). A driver move is recovered by the new driver.
-        self.patch_driver_ensure_status_if_local(namespace, name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
+        self.ensure_admission_retries.lock().await.remove(&(namespace.to_string(), name.to_string()));
         if let Some(target) = driver_target {
             if self.admission.local_host_id().as_ref() != Some(&target.reference) {
                 return Ok(format!("ConvoyEnsure/{name} retired its old generation; admission awaits driver {}", target.reference));
             }
         }
         let replacement = self.commit_ensured_convoy(namespace, &ensure, admission).await?;
-        if ensure.spec.driver_ref.is_none() {
-            self.patch_convoy_ensure(
-                namespace,
-                name,
-                ConvoyEnsureStatusPatch::Running { convoy_ref: replacement.clone(), observed_at: self.clock.now(), strikes: 0 },
-            )
-            .await?;
-        }
         Ok(format!("ConvoyEnsure/{name} rolled to {replacement}"))
     }
 
@@ -672,16 +681,6 @@ impl EnsurePass<'_> {
                 // Automatic passes require positive death evidence before admitting a successor.
                 backing_inspector.verify_backing_dead(latest.expect("strikes need a generation")).await?;
                 self.due_at(namespace, until);
-                self.patch_driver_ensure_status_if_local(
-                    namespace,
-                    &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::BackoffState {
-                        strikes: reading.strikes,
-                        retry_at: until,
-                        failure: "ensured convoy entered a terminal failure phase".to_string(),
-                    },
-                )
-                .await?;
                 return Ok(None);
             }
             Decision::Admit => {}
@@ -695,82 +694,14 @@ impl EnsurePass<'_> {
         if !released && reading.strikes > 0 {
             backing_inspector.verify_backing_dead(latest.expect("strikes need a generation")).await?;
         }
-        if let Some(retry_at) = self.admission_retry_due(&retry_key, &config_hash, &dependency_hash, released, None).await {
-            self.due_at(namespace, retry_at);
+        if self.admission_waits(namespace, ensure, &retry_key, &config_hash, &dependency_hash, released, force_now).await? {
             return Ok(None);
         }
 
         match self.start_ensured_convoy(namespace, ensure).await {
-            Ok(_) => {
-                self.ensure_admission_retries.lock().await.remove(&retry_key);
-                self.patch_driver_ensure_status_if_local(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
-                Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
-            }
-            Err(error) => {
-                let (refusals, retry_at) = {
-                    let mut retries = self.ensure_admission_retries.lock().await;
-                    record_ensure_admission_retry(
-                        &mut retries,
-                        retry_key,
-                        config_hash,
-                        dependency_hash,
-                        now,
-                        ensure.status.as_ref().and_then(|status| status.retry.as_ref()),
-                    )
-                };
-                self.due_at(namespace, retry_at);
-                self.patch_driver_ensure_status_if_local(
-                    namespace,
-                    &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::BackoffState { strikes: reading.strikes, retry_at, failure: error.clone() },
-                )
-                .await?;
-                Err(format!("driver admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
-            }
+            Ok(_) => self.admitted(namespace, ensure, &retry_key).await,
+            Err(error) => self.admission_refused(namespace, ensure, retry_key, config_hash, dependency_hash, now, error).await,
         }
-    }
-
-    async fn set_ensure_driver_condition(
-        &self,
-        namespace: &str,
-        ensure: &ResourceObject<ConvoyEnsure>,
-        reason: &str,
-        message: String,
-    ) -> Result<(), String> {
-        let unchanged = ensure.status.as_ref().is_some_and(|status| {
-            status.conditions.iter().any(|condition| {
-                condition.condition_type == DRIVER_ADMISSION_CONDITION_TYPE && condition.reason == reason && condition.message == message
-            })
-        });
-        if unchanged {
-            return Ok(());
-        }
-        self.patch_convoy_ensure(
-            namespace,
-            &ensure.metadata.name,
-            ConvoyEnsureStatusPatch::DriverAdmission {
-                condition: Some(ConvoyEnsureCondition {
-                    condition_type: DRIVER_ADMISSION_CONDITION_TYPE.to_string(),
-                    value: ConditionValue::False,
-                    reason: reason.to_string(),
-                    message,
-                    observed_at: self.clock.now(),
-                }),
-            },
-        )
-        .await
-    }
-
-    async fn clear_ensure_driver_condition(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<(), String> {
-        if ensure
-            .status
-            .as_ref()
-            .is_some_and(|status| status.conditions.iter().any(|condition| condition.condition_type == DRIVER_ADMISSION_CONDITION_TYPE))
-        {
-            self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::DriverAdmission { condition: None })
-                .await?;
-        }
-        Ok(())
     }
 
     async fn reconcile_convoy_ensure(
@@ -781,64 +712,32 @@ impl EnsurePass<'_> {
         force_now: bool,
     ) -> Result<Option<String>, String> {
         let now = self.clock.now();
-        let status = ensure.status.clone().unwrap_or_default();
         let config_hash = ensure_config_hash(&ensure.spec)?;
-        if status.observed_config_hash.as_deref() != Some(&config_hash) {
-            let changed = status.observed_config_hash.is_some();
-            self.patch_convoy_ensure(
-                namespace,
-                &ensure.metadata.name,
-                ConvoyEnsureStatusPatch::ObserveConfig { config_hash: config_hash.clone(), changed },
-            )
-            .await?;
-            if changed {
-                self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
-            }
-        }
         let generations = self.newest_generations_first(namespace, ensure).await?;
         if let Some(convoy) = generations.first().filter(|convoy| !ended(convoy)) {
             self.observe_ensure_config_drift(namespace, ensure, convoy).await?;
             self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
-            let convoy_ref = convoy.metadata.name.clone();
-            if status.convoy_ref.as_deref() != Some(&convoy_ref) || status.retry_at.is_some() || status.last_failure.is_some() {
-                self.patch_convoy_ensure(
-                    namespace,
-                    &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::Running { convoy_ref, observed_at: now, strikes: status.restart_count },
-                )
-                .await?;
-                return Ok(Some(format!("ConvoyEnsure/{} observed running", ensure.metadata.name)));
-            }
             return Ok(None);
         }
 
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
         let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
         let Some(latest) = generations.first() else {
-            if let Some(retry_at) = self.admission_retry_due(&retry_key, &config_hash, &dependency_hash, force_now, status.retry_at).await {
-                self.due_at(namespace, retry_at);
+            if self.admission_waits(namespace, ensure, &retry_key, &config_hash, &dependency_hash, force_now, force_now).await? {
                 return Ok(None);
             }
-            return self.restart_absent_ensured_convoy(namespace, ensure, &status, now).await;
+            return self.restart_absent_ensured_convoy(namespace, ensure, now).await;
         };
         let (reading, attention) = self.standing_reading(namespace, ensure, &generations, now, force_now).await?;
-        let failure = "ensured convoy entered a terminal failure phase";
         match reading.decision {
             Decision::Running => return Ok(None),
             Decision::Held { raise } => {
-                if raise {
-                    // Raised once, as the hold begins; one on its backing earlier is another episode.
-                    let failure = restart_limit_reason(reading.strikes);
-                    self.raise_ensure_attention(ensure, latest, &failure, now).await?;
+                if !raise {
+                    return Ok(None);
                 }
-                if raise || status.hold_reason != Some(ConvoyEnsureHoldReason::RestartLimit) {
-                    let failure = restart_limit_reason(reading.strikes);
-                    let convoy_ref = latest.metadata.name.clone();
-                    let patch = ConvoyEnsureStatusPatch::RestartLimitReached { convoy_ref, strikes: reading.strikes, failure };
-                    self.patch_convoy_ensure(namespace, &ensure.metadata.name, patch).await?;
-                    return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
-                }
-                return Ok(None);
+                // Raised once, as the hold begins; one on its backing earlier is another episode.
+                self.raise_ensure_attention(ensure, latest, &restart_limit_reason(reading.strikes), now).await?;
+                return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
             }
             Decision::BackOff { .. } | Decision::Admit => {}
         }
@@ -850,17 +749,13 @@ impl EnsurePass<'_> {
             if let Err(reason) = backing_inspector.verify_backing_dead(latest).await {
                 let failure = format!("standing convoy teardown held: {reason}");
                 warn!(ensure = %ensure.metadata.name, convoy = %latest.metadata.name, %failure, "standing convoy backing evidence refused");
-                self.raise_ensure_attention(ensure, latest, &failure, hold_began_at(&status, now)).await?;
-                if status.retry_at.is_some() || status.last_failure.as_deref() != Some(&failure) {
-                    self.patch_convoy_ensure(
-                        namespace,
-                        &ensure.metadata.name,
-                        ConvoyEnsureStatusPatch::Holding { convoy_ref: latest.metadata.name.clone(), failure },
-                    )
-                    .await?;
-                    return Ok(Some(format!("ConvoyEnsure/{} held for operator attention", ensure.metadata.name)));
+                // The hold on a generation begins as it ends.
+                let ended_at = generation(latest, &ensure.spec).ended.map_or(now, |(_, at)| at);
+                self.raise_ensure_attention(ensure, latest, &failure, ended_at).await?;
+                if attention.open {
+                    return Ok(None);
                 }
-                return Ok(None);
+                return Ok(Some(format!("ConvoyEnsure/{} held for operator attention", ensure.metadata.name)));
             }
         }
         // The backing is verified dead: a hold on it is answered.
@@ -868,36 +763,16 @@ impl EnsurePass<'_> {
         self.clear_hold(namespace, &latest.metadata.name).await?;
         if let Decision::BackOff { until } = reading.decision {
             self.due_at(namespace, until);
-            if status.retry_at != Some(until) || status.restart_count != reading.strikes || status.convoy_ref.is_some() {
-                let patch = ConvoyEnsureStatusPatch::BackingOff { strikes: reading.strikes, retry_at: until, failure: failure.into() };
-                self.patch_convoy_ensure(namespace, &ensure.metadata.name, patch).await?;
-                return Ok(Some(format!("ConvoyEnsure/{} backing off until {until}", ensure.metadata.name)));
-            }
             return Ok(None);
         }
-        // A released hold, or an operator's reconcile-now, resumes the engine's Ensure.
-        if force_now || status.hold_reason.is_some() || attention.acknowledged_at.is_some() {
-            self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
-        }
-        let refused_until = status.retry_at.filter(|_| status.hold_reason.is_none());
-        if let Some(retry_at) = self.admission_retry_due(&retry_key, &config_hash, &dependency_hash, force_now, refused_until).await {
-            self.due_at(namespace, retry_at);
+        if self.admission_waits(namespace, ensure, &retry_key, &config_hash, &dependency_hash, force_now, force_now).await? {
             return Ok(None);
         }
         // The ended generation remains as history. A successful restart admits the next
         // generation under a fresh record name.
         match self.start_ensured_convoy(namespace, ensure).await {
-            Ok(convoy_ref) => {
-                self.ensure_admission_retries.lock().await.remove(&retry_key);
-                self.patch_convoy_ensure(
-                    namespace,
-                    &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::Running { convoy_ref, observed_at: now, strikes: reading.strikes },
-                )
-                .await?;
-                Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
-            }
-            Err(error) => self.admission_refused(namespace, ensure, &status, retry_key, config_hash, dependency_hash, now, error).await,
+            Ok(_) => self.admitted(namespace, ensure, &retry_key).await,
+            Err(error) => self.admission_refused(namespace, ensure, retry_key, config_hash, dependency_hash, now, error).await,
         }
     }
 
@@ -905,41 +780,47 @@ impl EnsurePass<'_> {
         &self,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
-        status: &ConvoyEnsureStatus,
         now: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
         self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
-        // With no running convoy, no admitted configuration can have drifted.
-        let role = Subject::StandingRole { project: ensure.spec.project_ref.clone(), role: ensure.spec.role.clone() };
-        self.attentions.clear(namespace, Sender::Standing, &role).await?;
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
+        // With no running convoy, no admitted configuration can have drifted. While refusals
+        // run, the role's attention is their own, which only an admission or a changed
+        // declaration ends.
+        if !self.ensure_admission_retries.lock().await.contains_key(&retry_key) {
+            self.attentions.clear(namespace, Sender::Standing, &standing_subject(ensure)).await?;
+        }
         match self.start_ensured_convoy(namespace, ensure).await {
-            Ok(convoy_ref) => {
-                self.ensure_admission_retries.lock().await.remove(&retry_key);
-                self.patch_convoy_ensure(
-                    namespace,
-                    &ensure.metadata.name,
-                    ConvoyEnsureStatusPatch::Running { convoy_ref, observed_at: now, strikes: 0 },
-                )
-                .await?;
-                Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
-            }
+            Ok(_) => self.admitted(namespace, ensure, &retry_key).await,
             Err(error) => {
                 let config_hash = ensure_config_hash(&ensure.spec)?;
                 let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
-                self.admission_refused(namespace, ensure, status, retry_key, config_hash, dependency_hash, now, error).await
+                self.admission_refused(namespace, ensure, retry_key, config_hash, dependency_hash, now, error).await
             }
         }
     }
 
-    /// Records a refused admission: a warning with its cause, the in-memory refusal backoff, and
-    /// the status the person reads. A refusal is no strike: no generation was admitted.
+    /// A generation was admitted: the refusal note ends, and with it the refusal attention.
+    async fn admitted(
+        &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+        retry_key: &(String, String),
+    ) -> Result<Option<String>, String> {
+        self.ensure_admission_retries.lock().await.remove(retry_key);
+        self.attentions.clear(namespace, Sender::Standing, &standing_subject(ensure)).await?;
+        Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
+    }
+
+    /// Records a refused admission: a warning with its cause and the in-memory refusal note, which
+    /// backs the next attempt off. At [`LOCAL_RETRY_LIMIT`] refusals in a row the role stops
+    /// retrying on time and tells a person, once while the refusals run. A refusal is no strike:
+    /// no generation was admitted.
     #[allow(clippy::too_many_arguments)]
     async fn admission_refused(
         &self,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
-        status: &ConvoyEnsureStatus,
         retry_key: (String, String),
         config_hash: String,
         dependency_hash: String,
@@ -949,34 +830,65 @@ impl EnsurePass<'_> {
         warn!(ensure = %ensure.metadata.name, %error, "standing convoy admission refused");
         let (refusals, retry_at) = {
             let mut retries = self.ensure_admission_retries.lock().await;
-            record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, status.retry.as_ref())
+            record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, error.clone())
+        };
+        let Some(retry_at) = retry_at else {
+            let fact = Fact::Refused {
+                ensure: ensure.metadata.name.clone(),
+                project: ensure.spec.project_ref.clone(),
+                role: ensure.spec.role.clone(),
+            };
+            // The same refusal is one open attention; a person's acknowledgement answers the
+            // refusals before it, and a later one tells them again.
+            self.attentions.raise(namespace, &Attention::new(fact, format!("AdmissionRefused: {error}"), now)).await?;
+            return Err(format!("admission refused ({refusals} consecutive refusals); waiting for {ADMISSION_REFUSED_NEEDS}: {error}"));
         };
         self.due_at(namespace, retry_at);
-        self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying { retry_at, failure: error.clone() })
-            .await?;
         Err(format!("admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
     }
 
-    /// When a refused admission may next be tried, while that is still to come: `None` once it is
-    /// due, when `released`, or when the configuration or a dependency changed since the refusal.
-    /// `recorded` is the deadline the ensure's status keeps, which outlives this controller.
-    async fn admission_retry_due(
+    /// Whether a refused admission still waits, telling the pass when a timed wait ends. A changed
+    /// declaration or dependency ends the wait and resets the count; a changed declaration also
+    /// withdraws the refusal attention. Below [`LOCAL_RETRY_LIMIT`] refusals the wait ends at its
+    /// deadline or when `released`. Past it, only reconcile-now (`forced`) or a person's
+    /// acknowledgement since the last refusal admits, and the note stays, so the next refusal
+    /// waits again.
+    #[allow(clippy::too_many_arguments)]
+    async fn admission_waits(
         &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
         retry_key: &(String, String),
         config_hash: &str,
         dependency_hash: &str,
         released: bool,
-        recorded: Option<DateTime<Utc>>,
-    ) -> Option<DateTime<Utc>> {
-        let mut retries = self.ensure_admission_retries.lock().await;
-        let changed =
-            retries.get(retry_key).is_some_and(|retry| retry.config_hash != config_hash || retry.dependency_hash != dependency_hash);
-        if changed || released {
-            retries.remove(retry_key);
-            return None;
+        forced: bool,
+    ) -> Result<bool, String> {
+        let Some(note) = self.ensure_admission_retries.lock().await.get(retry_key).cloned() else { return Ok(false) };
+        if note.config_hash != config_hash || note.dependency_hash != dependency_hash {
+            self.ensure_admission_retries.lock().await.remove(retry_key);
+            if note.past_limit() && note.config_hash != config_hash {
+                self.attentions.clear(namespace, Sender::Standing, &standing_subject(ensure)).await?;
+            }
+            return Ok(false);
         }
-        let held = retries.get(retry_key).and_then(|retry| retry.retry.next_attempt_at());
-        held.or(recorded).filter(|retry_at| *retry_at > self.clock.now())
+        if !note.past_limit() {
+            if released {
+                self.ensure_admission_retries.lock().await.remove(retry_key);
+                return Ok(false);
+            }
+            let retry_at = note.retry.next_attempt_at().expect("a note below the limit is retryable");
+            if retry_at <= self.clock.now() {
+                return Ok(false);
+            }
+            self.due_at(namespace, retry_at);
+            return Ok(true);
+        }
+        if forced {
+            return Ok(false);
+        }
+        let acknowledged = self.attentions.acknowledged(namespace, Sender::Standing, &standing_subject(ensure), note.refused_at).await?;
+        Ok(acknowledged.is_none())
     }
 
     /// The role's generations homed here, newest first.
@@ -985,15 +897,9 @@ impl EnsurePass<'_> {
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
     ) -> Result<Vec<ResourceObject<ResourceConvoy>>, String> {
-        let mut generations = self.ensured_convoy_generations(namespace, &ensure.metadata.name).await?;
-        generations.sort_by_key(|convoy| std::cmp::Reverse(convoy.spec.generation));
-        Ok(generations)
+        newest_generations_first(self.resource_backend, namespace, &ensure.metadata.name, false).await
     }
 
-    /// The role's strike run and decision ([`standing::derive`]) from `generations`, newest
-    /// first, and the hold attention about them: whether one is open on the newest, and when the
-    /// newest generation a person acknowledged a hold on was admitted. The acknowledgement ends
-    /// the run, so the walk stops at the first generation that is no strike.
     async fn standing_reading(
         &self,
         namespace: &str,
@@ -1002,90 +908,25 @@ impl EnsurePass<'_> {
         now: DateTime<Utc>,
         forced: bool,
     ) -> Result<(StandingReading, HoldAttention), String> {
-        let read: Vec<Generation> = generations.iter().map(|convoy| generation(convoy, &ensure.spec)).collect();
-        let mut attention = HoldAttention::default();
-        if let Some(newest) = generations.first() {
-            attention.open = self.hold_is_open(namespace, &newest.metadata.name).await?;
-        }
-        for (convoy, generation) in generations.iter().zip(&read) {
-            let Some((Ending::Failed, finished_at)) = generation.ended.filter(|_| generation.current_config) else { break };
-            // A hold on a generation begins once it has ended.
-            let subject = Subject::convoy(convoy.metadata.name.clone());
-            if self.attentions.acknowledged(namespace, Sender::Standing, &subject, finished_at).await?.is_some() {
-                attention.acknowledged_at = Some(generation.admitted_at);
-                break;
-            }
-        }
-        Ok((standing::derive(&read, attention, now, forced), attention))
+        standing_reading(&*self.attentions, namespace, ensure, generations, now, forced).await
     }
 
+    /// Raises or clears the role's drift attention from how its declaration differs from the
+    /// configuration that admitted `convoy`, its current generation.
     async fn observe_ensure_config_drift(
         &self,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
         convoy: &ResourceObject<ResourceConvoy>,
     ) -> Result<(), String> {
-        let admitted = convoy.status.as_ref().and_then(|status| status.ensure_admission.clone());
-        let observed_hash = ensure_config_hash(&ensure.spec)?;
-        let admitted_hash = admitted.as_ref().map(ensure_config_hash).transpose()?;
-        let mut changes = Vec::new();
-        if let Some(old) = &admitted {
-            for repo in ensure.spec.repositories.iter().filter(|repo| !old.repositories.contains(repo)) {
-                changes.push(format!("repository added: {repo}"));
-            }
-            for repo in old.repositories.iter().filter(|repo| !ensure.spec.repositories.contains(repo)) {
-                changes.push(format!("repository removed: {repo}"));
-            }
-            if old.repositories != ensure.spec.repositories && changes.is_empty() {
-                changes.push("repository order changed".into());
-            }
-            if old.workflow_ref != ensure.spec.workflow_ref {
-                changes.push(format!("workflow: {} -> {}", old.workflow_ref, ensure.spec.workflow_ref));
-            }
-            if old.placement_policy != ensure.spec.placement_policy {
-                changes.push(format!("placement: {:?} -> {:?}", old.placement_policy, ensure.spec.placement_policy));
-            }
-            if old.agent_overrides != ensure.spec.agent_overrides {
-                changes.push(format!("agents: {:?} -> {:?}", old.agent_overrides, ensure.spec.agent_overrides));
-            }
-            if old.driver_ref != ensure.spec.driver_ref {
-                changes.push(format!("driver: {:?} -> {:?}", old.driver_ref, ensure.spec.driver_ref));
-            }
-            if old.presents_as != ensure.spec.presents_as {
-                changes.push(format!("presentation: {:?} -> {:?}", old.presents_as, ensure.spec.presents_as));
-            }
-            if old.escalation_reason != ensure.spec.escalation_reason {
-                changes.push("placement escalation reason changed".into());
-            }
-            if old.project_ref != ensure.spec.project_ref {
-                changes.push(format!("project: {} -> {}", old.project_ref, ensure.spec.project_ref));
-            }
-            if old.role != ensure.spec.role {
-                changes.push(format!("role: {} -> {}", old.role, ensure.spec.role));
-            }
-        } else {
-            // Never infer a previous generation's admission baseline from the
-            // latest observed declaration: it may already have silently drifted.
-            changes.push("admission configuration unknown; explicitly roll to establish a baseline".into());
-        }
-        let drift = (!changes.is_empty()).then(|| ConvoyEnsureConfigDrift { changes: changes.clone(), observed_at: self.clock.now() });
-        let unchanged = ensure.status.as_ref().is_some_and(|status| {
-            status.admitted_config_hash == admitted_hash
-                && status.observed_config_hash.as_ref() == Some(&observed_hash)
-                && status.config_drift.as_ref().map(|old| &old.changes) == drift.as_ref().map(|new| &new.changes)
-        });
-        if !unchanged {
-            let patch = ConvoyEnsureStatusPatch::ConfigDrift { admitted_hash, observed_hash, drift };
-            self.patch_driver_ensure_status_if_local(namespace, &ensure.metadata.name, patch).await?;
-        }
-        // Only the convoy's authority host raises runtime attention. The
-        // definition home observes the replica and records its typed status.
+        let changes = config_changes(&ensure.spec, convoy.status.as_ref().and_then(|status| status.ensure_admission.as_ref()));
+        // Only the convoy's authority host raises runtime attention.
         match self.resource_backend.using::<ResourceConvoy>(namespace).get(&convoy.metadata.name).await {
             Ok(_) => {}
             Err(ResourceError::NotFound { .. }) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         }
-        let role = Subject::StandingRole { project: ensure.spec.project_ref.clone(), role: ensure.spec.role.clone() };
+        let role = standing_subject(ensure);
         if changes.is_empty() {
             return self.attentions.clear(namespace, Sender::Standing, &role).await;
         }
@@ -1096,14 +937,9 @@ impl EnsurePass<'_> {
             convoy: convoy.metadata.name.clone(),
         };
         let reason = format!("ConfigDrift: {}; run flotilla ensure roll {}", changes.join("; "), ensure.metadata.name);
-        // The drift began when its changes were first observed.
-        let began_at = ensure
-            .status
-            .as_ref()
-            .and_then(|status| status.config_drift.as_ref())
-            .filter(|seen| seen.changes == changes)
-            .map_or_else(|| self.clock.now(), |seen| seen.observed_at);
-        self.attentions.raise(namespace, &Attention::new(fact, reason, began_at)).await
+        // A generation's drift is one episode from its admission: a person who acknowledged it
+        // answered every change to this generation's declaration.
+        self.attentions.raise(namespace, &Attention::new(fact, reason, admitted_at(convoy))).await
     }
 
     async fn raise_ensure_attention(
@@ -1115,12 +951,6 @@ impl EnsurePass<'_> {
     ) -> Result<(), String> {
         let fact = Fact::Hold { ensure: ensure.metadata.name.clone(), convoy: convoy.metadata.name.clone() };
         self.attentions.raise(&convoy.metadata.namespace, &Attention::new(fact, reason, began_at)).await
-    }
-
-    async fn hold_is_open(&self, namespace: &str, convoy: &str) -> Result<bool, String> {
-        let subject = Subject::convoy(convoy);
-        // A standing role's attention about a convoy is its hold.
-        Ok(!self.attentions.open(namespace, Some(Sender::Standing), Some(&subject)).await?.is_empty())
     }
 
     /// Withdraws the hold on `convoy` if it is open.
@@ -1145,32 +975,9 @@ impl EnsurePass<'_> {
         Ok(())
     }
 
-    async fn patch_convoy_ensure(&self, namespace: &str, name: &str, patch: ConvoyEnsureStatusPatch) -> Result<(), String> {
-        let ensures = self.resource_backend.clone().using::<ConvoyEnsure>(namespace);
-        // Behind `[primitives]` the engine decides first; the old status takes its answer.
-        let patch = match self.engine {
-            Some(engine) => {
-                let ensure = match ensures.get(name).await {
-                    Ok(ensure) => ensure,
-                    Err(ResourceError::NotFound { .. }) => return Ok(()),
-                    Err(error) => return Err(error.to_string()),
-                };
-                match engine.decide(namespace, &ensure, patch).await? {
-                    Some(patch) => patch,
-                    None => return Ok(()),
-                }
-            }
-            None => patch,
-        };
-        apply_resource_status_patch(&ensures, name, &patch).await.map(|_| ()).map_err(|error| error.to_string())
-    }
-
-    async fn patch_driver_ensure_status_if_local(&self, namespace: &str, name: &str, patch: ConvoyEnsureStatusPatch) -> Result<(), String> {
-        match self.resource_backend.using::<ConvoyEnsure>(namespace).get(name).await {
-            Ok(_) => self.patch_convoy_ensure(namespace, name, patch).await,
-            Err(ResourceError::NotFound { .. }) => Ok(()),
-            Err(error) => Err(error.to_string()),
-        }
+    /// The refusal the role's project declaration carries, if any: an ensure is refused with it.
+    async fn declaration_refused(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<Option<String>, String> {
+        declaration_refused(self.resource_backend, namespace, ensure).await
     }
 
     async fn start_ensured_convoy(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
@@ -1252,12 +1059,70 @@ async fn canonical_placement_host_ref(
     canonical_placement_host_ref_from_sources(&hosts.items, host_ref)
 }
 
-/// When a backing hold's episode began: its retry episode's first failure, which releasing a
-/// hold resets, or now for one not yet recorded.
-fn hold_began_at(status: &ConvoyEnsureStatus, now: DateTime<Utc>) -> DateTime<Utc> {
-    status.retry.as_ref().map_or(now, |retry| retry.first_failure_at)
+/// The role `ensure`'s generations homed here, or at every home with `everywhere`, newest first.
+async fn newest_generations_first(
+    backend: &ResourceBackend,
+    namespace: &str,
+    ensure: &str,
+    everywhere: bool,
+) -> Result<Vec<ResourceObject<ResourceConvoy>>, String> {
+    let mut generations = backend
+        .using::<ResourceConvoy>(namespace)
+        .query_declared(&StoreQuery {
+            fields: BTreeMap::from([(format!("metadata.annotations.\"{ENSURED_FROM_ANNOTATION}\""), ensure.into())]),
+            include_replicas: everywhere,
+            ..Default::default()
+        })
+        .await
+        .map(|rows| rows.items.into_iter().map(|source| source.object).collect::<Vec<_>>())
+        .map_err(|error| error.to_string())?;
+    generations.sort_by_key(|convoy| std::cmp::Reverse(convoy.spec.generation));
+    Ok(generations)
 }
 
+/// The role's strike run and decision ([`standing::derive`]) from `generations`, newest first,
+/// and the hold attention about them: whether one is open on the newest, and when the newest
+/// generation a person acknowledged a hold on was admitted. The acknowledgement ends the run, so
+/// the walk stops at the first generation that is no strike.
+async fn standing_reading(
+    attentions: &dyn Attentions,
+    namespace: &str,
+    ensure: &ResourceObject<ConvoyEnsure>,
+    generations: &[ResourceObject<ResourceConvoy>],
+    now: DateTime<Utc>,
+    forced: bool,
+) -> Result<(StandingReading, HoldAttention), String> {
+    let read: Vec<Generation> = generations.iter().map(|convoy| generation(convoy, &ensure.spec)).collect();
+    let mut attention = HoldAttention::default();
+    if let Some(newest) = generations.first() {
+        // A standing role's attention about a convoy is its hold.
+        let subject = Subject::convoy(newest.metadata.name.clone());
+        attention.open = !attentions.open(namespace, Some(Sender::Standing), Some(&subject)).await?.is_empty();
+    }
+    for (convoy, generation) in generations.iter().zip(&read) {
+        let Some((Ending::Failed, finished_at)) = generation.ended.filter(|_| generation.current_config) else { break };
+        // A hold on a generation begins once it has ended.
+        let subject = Subject::convoy(convoy.metadata.name.clone());
+        if attentions.acknowledged(namespace, Sender::Standing, &subject, finished_at).await?.is_some() {
+            attention.acknowledged_at = Some(generation.admitted_at);
+            break;
+        }
+    }
+    Ok((standing::derive(&read, attention, now, forced), attention))
+}
+
+/// The refusal `ensure`'s project declaration carries, if any: its ensures are refused with it.
+async fn declaration_refused(
+    backend: &ResourceBackend,
+    namespace: &str,
+    ensure: &ResourceObject<ConvoyEnsure>,
+) -> Result<Option<String>, String> {
+    match backend.definitions::<Project>(namespace).get(&ensure.spec.project_ref).await {
+        Ok(project) => Ok(project.status.and_then(|status| status.declaration_refused).map(|refused| refused.message)),
+        Err(ResourceError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1488,9 +1353,15 @@ mod tests {
         let open = admission.backend.attentions().open("test", Some(Sender::Standing), None).await.expect("attentions");
         open.iter().any(OpenAttention::is_hold)
     }
+    /// The role's newest generation.
+    fn current(admission: &Admission) -> String {
+        format!("generation-{}", admission.commits.load(Ordering::SeqCst))
+    }
+    async fn standing(controller: &EnsureReconciler) -> StandingRole {
+        controller.standing_role("test", "project", "standing").await.expect("role reads").expect("role declared")
+    }
     async fn fail_current(admission: &Admission, clock: &VirtualClock) {
-        let ensure = admission.backend.using::<ConvoyEnsure>("test").get("standing").await.expect("ensure fixture");
-        let name = ensure.status.expect("resource status").convoy_ref.expect("admitted convoy reference");
+        let name = current(admission);
         let convoys = admission.backend.using::<ResourceConvoy>("test");
         let convoy = convoys.get(&name).await.expect("admitted convoy");
         let mut status = convoy.status.expect("resource status");
@@ -1507,9 +1378,8 @@ mod tests {
         controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("admit");
         fail_current(&admission, &clock).await;
         let ensures = admission.backend.using::<ConvoyEnsure>("test");
-        let ensure = ensures.get("standing").await.expect("ensure");
         let convoys = admission.backend.using::<ResourceConvoy>("test");
-        let name = ensure.status.as_ref().expect("status").convoy_ref.as_ref().expect("convoy");
+        let name = &current(&admission);
         let failed = convoys.get(name).await.expect("failed convoy");
         clock.advance(failed.metadata.creation_timestamp + ChronoDuration::hours(24) - clock.now());
         let mut status = failed.status.expect("status");
@@ -1535,18 +1405,16 @@ mod tests {
         assert_eq!(admission.commits.load(Ordering::SeqCst), 2);
     }
 
-    // #2220: read-only admission refusals obey their deadline, survive controller
-    // reconstruction, and retry without consuming the runtime restart budget.
+    // #2220: read-only admission refusals obey their deadline and retry without consuming the
+    // restart budget. The deadline is the admitting host's note, so a new controller retries at once.
     #[tokio::test]
-    async fn admission_backoff_survives_controller_restart() {
+    async fn admission_backoff_obeys_its_deadline_and_resets_at_restart() {
         let (controller, admission, clock) = fixture().await;
         admission.refused.store(true, Ordering::SeqCst);
         assert!(controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.is_err());
-        let controller = EnsureReconciler::builder()
-            .teardown(Arc::new(admission.clone()))
-            .resource_backend(admission.backend.clone())
-            .clock(clock.clone())
-            .build();
+        let role = standing(&controller).await;
+        assert!(role.next_attempt.is_some_and(|at| at > clock.now()), "the admitting host shows its deadline");
+        assert_eq!(role.last_failure.as_deref().map(|failure| failure.contains("admission unavailable")), Some(true));
         clock.advance(ChronoDuration::seconds(29));
         assert!(controller
             .reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead)
@@ -1554,8 +1422,15 @@ mod tests {
             .expect("fixture operation succeeds")
             .is_empty());
         assert_eq!(admission.prepares.load(Ordering::SeqCst), 1);
+        let controller = EnsureReconciler::builder()
+            .teardown(Arc::new(admission.clone()))
+            .resource_backend(admission.backend.clone())
+            .clock(clock.clone())
+            .build();
+        assert!(controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.is_err());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), 2, "the note is in memory: a restarted controller retries");
         admission.refused.store(false, Ordering::SeqCst);
-        clock.advance(ChronoDuration::seconds(1));
+        clock.advance(ChronoDuration::seconds(30));
         assert_eq!(
             controller
                 .reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead)
@@ -1564,11 +1439,88 @@ mod tests {
                 .len(),
             1
         );
-        let status =
-            admission.backend.using::<ConvoyEnsure>("test").get("standing").await.expect("ensure fixture").status.expect("resource status");
-        assert_eq!(status.restart_count, 0);
-        assert!(status.retry_at.is_none());
+        let role = standing(&controller).await;
+        assert_eq!(role.strikes, 0);
+        assert_eq!(role.next_attempt, None);
+        assert_eq!(role.convoy.as_deref(), Some("generation-1"));
         assert_eq!(admission.commits.load(Ordering::SeqCst), 1);
+    }
+
+    // #3108: refusals with the same hashes stop retrying on time at LOCAL_RETRY_LIMIT and tell a
+    // person once. Reconcile-now and an acknowledgement each admit once more; a changed declaration
+    // withdraws the attention and resets the count; an admission ends both.
+    #[tokio::test]
+    async fn refusals_past_the_limit_wait_for_events_with_one_attention() {
+        let (controller, admission, clock) = fixture().await;
+        let messages = admission._messages.clone().expect("engine messages");
+        let refusal_messages = || {
+            messages
+                .primitives()
+                .messages()
+                .expect("messages")
+                .into_iter()
+                .filter(|(_, message)| {
+                    message.spec().subject().is_some_and(|subject| subject.address.as_str() == "project:project/role:standing")
+                })
+                .count()
+        };
+        let pass = || controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead);
+        admission.refused.store(true, Ordering::SeqCst);
+        for _ in 0..LOCAL_RETRY_LIMIT {
+            assert!(pass().await.is_err());
+            clock.advance(ChronoDuration::minutes(16));
+        }
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT);
+        assert_eq!(refusal_messages(), 1, "the limit tells a person");
+        let role = standing(&controller).await;
+        assert_eq!(role.next_attempt, None, "past the limit nothing is due on time");
+
+        // Time alone admits nothing more.
+        clock.advance(ChronoDuration::hours(6));
+        assert!(pass().await.expect("waits").is_empty());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT);
+
+        // Reconcile-now tries once; the same refusal raises no second message.
+        assert!(controller.reconcile_convoy_ensure_now(&admission, "test", "standing", &Backing::Dead).await.is_err());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 1);
+        assert!(pass().await.expect("waits again").is_empty());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 1);
+        assert_eq!(refusal_messages(), 1, "repeated refusals with the same hashes are one message");
+
+        // A person's acknowledgement admits once more; the refusal after it tells them again.
+        let (_, waiting) = messages
+            .primitives()
+            .person_messages("test")
+            .await
+            .expect("person messages")
+            .into_iter()
+            .next()
+            .expect("the refusal waits for a person");
+        let address: flotilla_address::Address = waiting.name().parse().expect("message address");
+        messages.primitives().acknowledge("test", address.name()).await.expect("acknowledged");
+        clock.advance(ChronoDuration::seconds(1));
+        assert!(pass().await.is_err());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 2);
+        assert!(pass().await.expect("waits after the answered attempt").is_empty());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 2);
+        assert_eq!(refusal_messages(), 2);
+
+        // A changed declaration withdraws the attention and tries again with a fresh count.
+        let ensures = admission.backend.using::<ConvoyEnsure>("test");
+        let ensure = ensures.get("standing").await.expect("ensure");
+        let changed = ConvoyEnsureSpec { workflow_ref: "standing-two".into(), ..ensure.spec.clone() };
+        ensures.update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &changed).await.expect("declaration changed");
+        assert!(pass().await.is_err());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 3);
+        let open = admission.backend.attentions().open("test", Some(Sender::Standing), None).await.expect("attentions");
+        assert!(open.is_empty(), "a changed declaration ends the refusal attention: {open:?}");
+        assert!(standing(&controller).await.next_attempt.is_some(), "a fresh count retries on time");
+
+        // An admission ends the note.
+        admission.refused.store(false, Ordering::SeqCst);
+        clock.advance(ChronoDuration::minutes(1));
+        assert_eq!(pass().await.expect("admits").len(), 1);
+        assert_eq!(standing(&controller).await.convoy.as_deref(), Some("generation-1"));
     }
 
     // #2220: live backing raises attention and holds admission; verified death
@@ -1625,9 +1577,7 @@ mod tests {
         admission.fails_after_create.store(false, Ordering::SeqCst);
         fail_current(&admission, &clock).await;
         controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("failure counted");
-        let status =
-            admission.backend.using::<ConvoyEnsure>("test").get("standing").await.expect("ensure fixture").status.expect("resource status");
-        assert_eq!(status.restart_count, 1, "the generation's failure is a strike");
+        assert_eq!(standing(&controller).await.strikes, 1, "the generation's failure is a strike");
         clock.advance(ChronoDuration::minutes(3));
         controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("restarted");
         assert_eq!(admission.commits.load(Ordering::SeqCst), 2, "one successor, after the backoff");

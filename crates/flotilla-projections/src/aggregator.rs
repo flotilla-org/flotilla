@@ -25,7 +25,7 @@ use flotilla_protocol::{
     result_set::{
         CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, ProjectRepositoriesRow,
         ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ReadinessBlocker, ReadinessState, ResultDelta, SessionPhase,
-        StandingRoleHold, StandingRoleRow, SurfaceState, VesselRow, WorkPhase,
+        StandingRoleRow, SurfaceState, VesselRow, WorkPhase,
     },
     Change, ConfiguredResourceLimits, DaemonEvent, EnvironmentKind, HostName, LifecycleAuthority, RepoDelta, RepoIdentity, RepositoryKey,
     ResourceRef, UNKNOWN_REPOSITORY_LABEL,
@@ -36,9 +36,9 @@ use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
 use flotilla_resources::environment_records::EnvironmentChange;
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
-    Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
-    FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError,
-    ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement,
+    Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, FulfilmentKind,
+    FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError, ResourceObject,
+    ResourceProvenance, StallRung, StalledCondition, TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement,
     WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, CONVOY_UNREADABLE_ANNOTATION, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL,
     VESSEL_LABEL,
 };
@@ -208,6 +208,13 @@ pub struct Aggregator {
     fleet_projects: BTreeMap<String, String>,
     #[builder(skip)]
     convoy_ensures: BTreeMap<EnsureKey, ResourceObject<ConvoyEnsure>>,
+    /// Reads each declared role's state from its generations (#3108).
+    #[builder(skip = Arc::new(crate::ports::NoStandingRoles))]
+    standing_role_port: Arc<dyn crate::ports::StandingRoles>,
+    /// The last reading of each declared role, by its ensure's namespace and name; `None` when
+    /// it did not read.
+    #[builder(skip)]
+    standing_readings: HashMap<(String, String), Option<crate::ports::StandingRoleReading>>,
     repositories: HashMap<RepositoryKey, ResourceObject<Repository>>,
     repository_sources: BTreeMap<RepositorySourceKey, ReadResourceObject<Repository>>,
     /// The checkouts this host's refresh discovered, as Checkouts in `discovered_namespace`.
@@ -367,6 +374,8 @@ impl Aggregator {
             projects: HashMap::new(),
             fleet_projects: BTreeMap::new(),
             convoy_ensures: BTreeMap::new(),
+            standing_role_port: Arc::new(crate::ports::NoStandingRoles),
+            standing_readings: HashMap::new(),
             repositories: HashMap::new(),
             repository_sources: BTreeMap::new(),
             discovered_checkouts: DiscoveredCheckouts::default(),
@@ -418,6 +427,12 @@ impl Aggregator {
     /// Crew members show their AgentSessions, read from the decided store through `port`.
     pub fn with_agent_sessions(mut self, port: Arc<dyn crate::ports::AgentSessions>) -> Self {
         self.agent_session_port = port;
+        self
+    }
+
+    /// Standing role rows show each role's state as `port` derives it.
+    pub fn with_standing_roles(mut self, port: Arc<dyn crate::ports::StandingRoles>) -> Self {
+        self.standing_role_port = port;
         self
     }
 
@@ -1080,6 +1095,8 @@ impl Aggregator {
     async fn refresh_attentions(&mut self) {
         if self.read_attentions().await {
             self.rebuild_local_projection().await;
+            // A role's hold is read from its attention.
+            self.rebuild_standing_roles().await;
         }
     }
 
@@ -1104,6 +1121,12 @@ impl Aggregator {
         if let Err(error) = self.rebuild_checkout_rows().await {
             debug!(%error, "could not refresh checkout orphan attention after convoy relist");
         }
+        self.rebuild_standing_roles().await;
+    }
+
+    /// The role convoy `convoy` is a generation of, as its ensure's namespace and name.
+    fn generation_of(convoy: &ResourceObject<Convoy>) -> Option<(String, String)> {
+        convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(|ensure| (convoy.metadata.namespace.clone(), ensure.clone()))
     }
 
     async fn apply_replica_convoy_event(&mut self, event: ReadWatchEvent<Convoy>) {
@@ -1117,6 +1140,13 @@ impl Aggregator {
         let previous_all = new_origin.then(|| self.effective_convoys());
         let previous = self.effective_convoy_key(&key).filter(|item| item.object.metadata.deletion_timestamp.is_none()).cloned();
         let previous_ref = self.convoy_key_ref(&key);
+        let role = match &event {
+            ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) | ReadWatchEvent::Deleted(convoy) => {
+                Self::generation_of(&convoy.object)
+            }
+            ReadWatchEvent::DeletedByName { .. } => None,
+        }
+        .or_else(|| previous.as_ref().and_then(|item| Self::generation_of(&item.object)));
         match event {
             ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) => {
                 self.convoys.insert(key.clone(), Arc::new(convoy));
@@ -1147,6 +1177,9 @@ impl Aggregator {
                 if let Err(error) = self.rebuild_checkout_rows().await {
                     debug!(%error, "could not refresh checkout orphan attention after origin change");
                 }
+                if let Some((namespace, ensure)) = role {
+                    self.refresh_standing_role(&namespace, &ensure).await;
+                }
                 return;
             }
         }
@@ -1172,6 +1205,10 @@ impl Aggregator {
                 debug!(%error, "could not refresh checkout orphan attention after convoy event");
             }
         }
+        // A role's state is read from its generations.
+        if let Some((namespace, ensure)) = role {
+            self.refresh_standing_role(&namespace, &ensure).await;
+        }
     }
 
     /// This home's convoy `name` changed on the engine: re-project its row.
@@ -1185,8 +1222,12 @@ impl Aggregator {
         if keys.is_empty() {
             return;
         }
+        let role = keys.iter().filter_map(|key| self.convoys.get(key)).find_map(|convoy| Self::generation_of(&convoy.object));
         self.projection_keys.extend(keys);
         self.schedule_local_projection().await;
+        if let Some((namespace, ensure)) = role {
+            self.refresh_standing_role(&namespace, &ensure).await;
+        }
     }
 
     fn has_convoy(&self, namespace: &str, name: &str) -> bool {
@@ -1857,34 +1898,62 @@ impl Aggregator {
     }
 
     async fn apply_convoy_ensure_event(&mut self, event: ReadWatchEvent<ConvoyEnsure>) {
-        match event {
+        let key = match event {
             ReadWatchEvent::Added(ensure) | ReadWatchEvent::Modified(ensure) => {
                 let key = repository_source_key(&ensure.object.metadata.namespace, &ensure.object.metadata.name, &ensure.provenance);
-                self.convoy_ensures.insert(key, ensure.object);
+                self.convoy_ensures.insert(key.clone(), ensure.object);
+                key
             }
             ReadWatchEvent::Deleted(ensure) => {
                 let key = repository_source_key(&ensure.object.metadata.namespace, &ensure.object.metadata.name, &ensure.provenance);
                 self.convoy_ensures.remove(&key);
+                key
             }
             ReadWatchEvent::DeletedByName { tombstone, provenance } => {
-                self.convoy_ensures.remove(&tombstone_key(&tombstone, &provenance));
+                let key = tombstone_key(&tombstone, &provenance);
+                self.convoy_ensures.remove(&key);
+                key
             }
-        }
-        self.rebuild_standing_roles().await;
+        };
+        self.refresh_standing_role(&key.0, &key.1).await;
     }
 
-    /// One row per declared role. Several roots may hold a copy of the same
-    /// definition, but only the admitting root records controller status, so
-    /// the representative is the copy carrying that status (local first).
-    async fn rebuild_standing_roles(&self) {
-        let mut representatives: BTreeMap<(&str, &str), &ResourceObject<ConvoyEnsure>> = BTreeMap::new();
+    /// One declaration per role. Several roots may hold a copy of the same definition; any copy
+    /// serves, since nothing of the role's state is stored on it (#3108). This host's comes first.
+    fn standing_role_declarations(&self) -> BTreeMap<(String, String), ResourceObject<ConvoyEnsure>> {
+        let mut declared = BTreeMap::new();
         for ((namespace, name, _), ensure) in &self.convoy_ensures {
-            let slot = representatives.entry((namespace.as_str(), name.as_str())).or_insert(ensure);
-            if !ensure_has_controller_status(slot) && ensure_has_controller_status(ensure) {
-                *slot = ensure;
-            }
+            declared.entry((namespace.clone(), name.clone())).or_insert_with(|| ensure.clone());
         }
-        let rows = representatives.into_values().map(standing_role_row).collect();
+        declared
+    }
+
+    /// Re-reads every declared role and republishes their rows.
+    async fn rebuild_standing_roles(&mut self) {
+        let declared = self.standing_role_declarations();
+        for (key, ensure) in &declared {
+            let reading = self.standing_role_port.reading(&key.0, &ensure.spec.project_ref, &ensure.spec.role).await;
+            self.standing_readings.insert(key.clone(), reading);
+        }
+        self.publish_standing_roles(&declared).await;
+    }
+
+    /// Re-reads the role that ensure `name` in `namespace` declares, after a change to it or to
+    /// one of its generations.
+    async fn refresh_standing_role(&mut self, namespace: &str, name: &str) {
+        let declared = self.standing_role_declarations();
+        let key = (namespace.to_owned(), name.to_owned());
+        if let Some(ensure) = declared.get(&key) {
+            let reading = self.standing_role_port.reading(namespace, &ensure.spec.project_ref, &ensure.spec.role).await;
+            self.standing_readings.insert(key, reading);
+        }
+        self.publish_standing_roles(&declared).await;
+    }
+
+    async fn publish_standing_roles(&mut self, declared: &BTreeMap<(String, String), ResourceObject<ConvoyEnsure>>) {
+        self.standing_readings.retain(|key, _| declared.contains_key(key));
+        let rows =
+            declared.iter().map(|(key, ensure)| standing_role_row(ensure, self.standing_readings.get(key).cloned().flatten())).collect();
         let deltas = self.state.replace_standing_role_rows(rows).await;
         self.emit_store_deltas(deltas).await;
     }
@@ -3077,15 +3146,9 @@ fn same_host_authority(left: &ResourceObject<flotilla_resources::Host>, right: &
     left.spec.display_name == right.spec.display_name && left.spec.connection == right.spec.connection
 }
 
-fn ensure_has_controller_status(ensure: &ResourceObject<ConvoyEnsure>) -> bool {
-    ensure.status.as_ref().is_some_and(|status| {
-        status.convoy_ref.is_some() || status.hold_reason.is_some() || status.restart_count > 0 || status.last_failure.is_some()
-    })
-}
-
-fn standing_role_row(ensure: &ResourceObject<ConvoyEnsure>) -> StandingRoleRow {
-    let status = ensure.status.clone().unwrap_or_default();
-    StandingRoleRow::builder()
+/// `ensure`'s row, its state from `reading`; with none the state is unknown.
+fn standing_role_row(ensure: &ResourceObject<ConvoyEnsure>, reading: Option<crate::ports::StandingRoleReading>) -> StandingRoleRow {
+    let row = StandingRoleRow::builder()
         .resource(ResourceRef::new(
             api_version(ConvoyEnsure::API_PATHS),
             ConvoyEnsure::API_PATHS.kind,
@@ -3094,22 +3157,17 @@ fn standing_role_row(ensure: &ResourceObject<ConvoyEnsure>) -> StandingRoleRow {
         ))
         .project_ref(&ensure.spec.project_ref)
         .role(&ensure.spec.role)
-        .maybe_presents_as(ensure.spec.presents_as.clone())
-        .maybe_convoy_ref(status.convoy_ref)
-        .maybe_hold(status.hold_reason.map(|hold| match hold {
-            ConvoyEnsureHoldReason::BackingUnverified => StandingRoleHold::BackingUnverified,
-            ConvoyEnsureHoldReason::RestartLimit => StandingRoleHold::RestartLimit,
-        }))
-        .strikes(status.restart_count)
-        .maybe_next_attempt(status.retry_at)
-        .maybe_last_failure(
-            status
-                .declaration_refused
-                .map(|refusal| format!("DeclarationRefused: {}", refusal.message))
-                .or_else(|| status.config_drift.map(|drift| format!("ConfigDrift: {}", drift.changes.join("; "))))
-                .or(status.last_failure),
-        )
-        .build()
+        .maybe_presents_as(ensure.spec.presents_as.clone());
+    match reading {
+        Some(reading) => row
+            .maybe_convoy_ref(reading.convoy_ref)
+            .maybe_hold(reading.hold)
+            .strikes(reading.strikes)
+            .maybe_next_attempt(reading.next_attempt)
+            .maybe_last_failure(reading.last_failure)
+            .build(),
+        None => row.state_unknown(true).build(),
+    }
 }
 
 #[cfg(test)]
@@ -3240,7 +3298,7 @@ mod tests {
     };
 
     use chrono::Utc;
-    use flotilla_protocol::{result_set::Rows, PrincipalRef, Subject};
+    use flotilla_protocol::{result_set::Rows, PrincipalRef, StandingRoleHold, Subject};
     use flotilla_resources::{
         discovered_checkouts::DiscoveredCheckout, BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject,
         InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus, ProjectSpec, RepositorySpec, TerminalAttention,
@@ -4221,7 +4279,7 @@ mod tests {
     #[tokio::test]
     async fn subscriber_joining_during_bootstrap_receives_every_materialized_family() {
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let ensure = convoy_ensure_object("governor", None).await;
+        let ensure = convoy_ensure_object("governor").await;
         durable
             .clone()
             .using::<ConvoyEnsure>("flotilla")
@@ -4425,9 +4483,9 @@ mod tests {
         assert!(state.result_set_for(&query).await.expect("query").rows.is_empty());
     }
 
-    async fn convoy_ensure_object(role: &str, status: Option<flotilla_resources::ConvoyEnsureStatus>) -> ResourceObject<ConvoyEnsure> {
+    async fn convoy_ensure_object(role: &str) -> ResourceObject<ConvoyEnsure> {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let mut ensure = backend
+        backend
             .using::<ConvoyEnsure>("flotilla")
             .create(
                 &InputMeta::builder().name(format!("ensure-{role}")).build(),
@@ -4440,60 +4498,67 @@ mod tests {
                     .build(),
             )
             .await
-            .expect("create scripted convoy ensure");
-        ensure.status = status;
-        ensure
+            .expect("create scripted convoy ensure")
+    }
+
+    /// Reads whatever reading a test sets, for any role.
+    #[derive(Default)]
+    struct ScriptedStandingRoles(std::sync::Mutex<Option<crate::ports::StandingRoleReading>>);
+
+    #[async_trait]
+    impl crate::ports::StandingRoles for ScriptedStandingRoles {
+        async fn reading(&self, _: &str, project: &str, role: &str) -> Option<crate::ports::StandingRoleReading> {
+            assert_eq!((project, role), ("widgets", "governor"), "the role is asked for by its project and name");
+            self.0.lock().expect("scripted reading").clone()
+        }
     }
 
     #[tokio::test]
-    async fn standing_roles_follow_ensures_and_prefer_the_copy_with_controller_status() {
+    async fn standing_roles_show_the_reading_their_generations_give_and_unknown_until_it_reads() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let roles = Arc::new(ScriptedStandingRoles::default());
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_standing_roles(roles.clone());
         let query = QueryId::StandingRoles { scope: None };
 
-        // A non-admitting root's copy carries no controller status; the
-        // admitting root's replica does, and must win in either order.
-        let local = convoy_ensure_object("governor", None).await;
-        let admitting = convoy_ensure_object(
-            "governor",
-            Some(flotilla_resources::ConvoyEnsureStatus {
-                convoy_ref: Some("convoy-a".to_string()),
-                hold_reason: Some(ConvoyEnsureHoldReason::RestartLimit),
-                restart_count: 3,
-                ..Default::default()
-            }),
-        )
-        .await;
-        aggregator
-            .apply_convoy_ensure_event(ReadWatchEvent::Added(ReadResourceObject {
-                object: admitting,
-                provenance: ResourceProvenance::Replica {
-                    origin_root: flotilla_protocol::NodeId::new("feta-node-id"),
-                    last_synced_at: Utc::now(),
-                },
-            }))
-            .await;
-        aggregator
-            .apply_convoy_ensure_event(ReadWatchEvent::Added(ReadResourceObject { object: local, provenance: ResourceProvenance::Local }))
-            .await;
-
+        // Every root may hold a copy of the declaration; none carries the role's state.
+        for provenance in [
+            ResourceProvenance::Replica { origin_root: flotilla_protocol::NodeId::new("feta-node-id"), last_synced_at: Utc::now() },
+            ResourceProvenance::Local,
+        ] {
+            let object = convoy_ensure_object("governor").await;
+            aggregator.apply_convoy_ensure_event(ReadWatchEvent::Added(ReadResourceObject { object, provenance })).await;
+        }
         let set = state.result_set_for(&query).await.expect("standing roles result set");
         let rows = set.rows.as_standing_roles().expect("standing role rows");
         assert_eq!(rows.len(), 1, "copies of one declaration fold onto one role");
         assert_eq!(rows[0].role, "governor");
         assert_eq!(rows[0].project_ref, "widgets");
         assert_eq!(rows[0].presents_as.as_deref(), Some("fleet"));
-        assert_eq!(rows[0].convoy_ref.as_deref(), Some("convoy-a"));
-        assert_eq!(rows[0].hold, Some(StandingRoleHold::RestartLimit));
-        assert_eq!(rows[0].strikes, 3);
+        assert!(rows[0].state_unknown, "a role that did not read is unknown");
+        assert_eq!(rows[0].hold, None);
 
+        // A generation's change re-reads its role.
+        *roles.0.lock().expect("scripted reading") = Some(crate::ports::StandingRoleReading {
+            convoy_ref: Some("convoy-a".to_string()),
+            hold: Some(StandingRoleHold::RestartLimit),
+            strikes: 3,
+            next_attempt: None,
+            last_failure: Some("ensured convoy entered a terminal failure phase".to_string()),
+        });
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.to_string(), "ensure-governor".to_string());
         aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
         let convoys = state.result_set().await;
         let row = convoys.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         assert_eq!(row.ensured_from.as_deref(), Some("ensure-governor"));
+        let set = state.result_set_for(&query).await.expect("standing roles result set");
+        let rows = set.rows.as_standing_roles().expect("standing role rows");
+        assert!(!rows[0].state_unknown);
+        assert_eq!(rows[0].convoy_ref.as_deref(), Some("convoy-a"));
+        assert_eq!(rows[0].hold, Some(StandingRoleHold::RestartLimit));
+        assert_eq!(rows[0].strikes, 3);
+        assert_eq!(rows[0].last_failure.as_deref(), Some("ensured convoy entered a terminal failure phase"));
 
         for provenance in [
             ResourceProvenance::Local,

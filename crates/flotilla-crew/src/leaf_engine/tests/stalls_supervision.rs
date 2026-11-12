@@ -102,8 +102,9 @@ async fn coder_promise(case: &Case, number: u64, state: PromiseState) {
 }
 
 /// Launches generation `generation` of wheelhouse's governor role at `home`, as `name`, its
-/// `govern` vessel crewed by a governor at work; returns the launch.
-async fn governor_at(home: &EngineHome, name: &str, generation: u64) -> String {
+/// `govern` vessel crewed by a governor at work; returns the launch. With `ensure`, the launch is
+/// a generation of the standing role ensured from it.
+async fn governor_at(home: &EngineHome, name: &str, ensure: Option<&str>, generation: u64) -> String {
     let spec = ConvoySpec::builder()
         .workflow_ref("workflow".into())
         .project_ref("wheelhouse".into())
@@ -112,7 +113,10 @@ async fn governor_at(home: &EngineHome, name: &str, generation: u64) -> String {
         .build();
     let mut status = single_agent("governor");
     status.workflow_snapshot.as_mut().expect("workflow").vessels[0].name = "govern".into();
-    let launch = home.admit(name, spec, status).await;
+    let launch = match ensure {
+        Some(ensure) => home.admit_ensured(name, ensure, spec, status).await,
+        None => home.admit(name, spec, status).await,
+    };
     let vessel = home.vessel(&launch, "govern", "env");
     home.session(&vessel, "governor", &format!("{name}-{generation}-governor"), "env");
     launch
@@ -217,7 +221,7 @@ fn missing_turn_hook_is_visible_and_recovers(tc: hegel::TestCase) {
 // parent and publishes exactly one intent to the fleet's declared holder.
 #[tokio::test]
 async fn subscribed_fleet_holder_receives_stall_through_empty_parent() {
-    use flotilla_resources::{ConvoyEnsureSpec, ConvoyEnsureStatus, ProjectSpec, RoleDefinition, RoleSubscription};
+    use flotilla_resources::{ProjectSpec, RoleDefinition, RoleSubscription};
     let case = project_supervision_case(&[]).await;
     let projects = case.backend.definitions::<Project>("flotilla");
     for (name, parent) in [("root", None), ("empty-parent", Some("root")), ("wheelhouse", Some("empty-parent"))] {
@@ -246,26 +250,10 @@ async fn subscribed_fleet_holder_receives_stall_through_empty_parent() {
     // The coder declared its stall (the case's own). The fleet's guide is at work.
     assert_eq!(case.status().await.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
     let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("root".into()).role("guide".into()).build();
-    let guide = case.home.admit("fleet-guide", spec, single_agent("guide")).await;
+    // The guide is the standing role's generation: the role's holder.
+    let guide = case.home.admit_ensured("fleet-guide", "root-guide", spec, single_agent("guide")).await;
     let vessel = case.home.vessel(&guide, "work", "env");
     case.home.seat(&case.backend, &guide, (&vessel, "work"), ("guide", "guide-terminal"), CrewWorkPhase::Working).await;
-    let ensures = case.backend.using::<ConvoyEnsure>("flotilla");
-    let ensure = ensures
-        .create(
-            &InputMeta::builder().name("root-guide".into()).build(),
-            &ConvoyEnsureSpec::builder().project_ref("root".into()).role("guide".into()).repositories(Vec::new()).build(),
-        )
-        .await
-        .expect("presence");
-    let ensure = ensures.get(&ensure.metadata.name).await.expect("local ensure");
-    ensures
-        .update_status(
-            "root-guide",
-            &ensure.metadata.resource_version,
-            &ConvoyEnsureStatus { convoy_ref: Some(guide.clone()), ..Default::default() },
-        )
-        .await
-        .expect("holder");
     case.judge(&case.wake, Utc::now()).await;
     let requests = case.delivery.requests.lock().expect("requests");
     assert_eq!(requests.len(), 1);
@@ -719,19 +707,13 @@ async fn exhausted_governor_cursor_retries_in_one_pass() {
 #[tokio::test]
 async fn replicated_governor_receives_stall_in_one_pass() {
     let case = project_supervision_case(&[]).await;
-    // The governors are another daemon's, heard here as its log arrives, with the ensure that
-    // owns the older one.
+    // The governors are another daemon's, heard here as its log arrives; the older one is the
+    // standing role's generation.
     let remote_backend = ResourceBackend::new(InMemoryBackend::default());
     let remote = EngineHome::install(&remote_backend, "flotilla", "remote");
-    let governor = governor_at(&remote, "governor", 1).await;
-    governor_at(&remote, "newer-unowned-governor", 2).await;
-    create_governor_ensure(&remote_backend, &governor).await;
+    let governor = governor_at(&remote, "governor", Some("wheelhouse-governor"), 1).await;
+    governor_at(&remote, "newer-unowned-governor", None, 2).await;
     flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", case.home.service());
-    case.backend
-        .replica_writer::<ConvoyEnsure>(NodeId::new("remote"), "flotilla")
-        .replace(&remote_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("remote ensure"), Utc::now())
-        .await
-        .expect("replicate governor ownership");
     case.judge(&case.wake, Utc::now()).await;
     assert_eq!(case.status().await.stalled.expect("stall").supervisor.expect("supervisor").convoy, governor);
     let requests = case.delivery.requests.lock().expect("deliveries");
@@ -820,12 +802,13 @@ async fn stalled_work_without_live_governor_names_reason_at_operator_rung() {
 
 #[tokio::test]
 async fn stalled_work_prefers_governor_owned_by_ensure_over_higher_live_generation() {
-    let case = project_supervision_case(&[("governor-two", 2, ConvoyPhase::Active), ("governor-three", 3, ConvoyPhase::Active)]).await;
-    create_governor_ensure(&case.backend, &case.governor("governor-two")).await;
+    let case = project_supervision_case(&[("governor-three", 3, ConvoyPhase::Active)]).await;
+    // The standing role's generation is older than an unensured governor at work.
+    let owned = governor_at(&case.home, "governor-two", Some("wheelhouse-governor"), 2).await;
     case.judge(&case.wake, Utc::now()).await;
     let stalled = case.status().await.stalled.expect("stalled");
-    assert_eq!(stalled.supervisor.expect("supervisor").convoy, case.governor("governor-two"));
-    assert_eq!(case.delivery.requests.lock().expect("deliveries")[0].convoy, case.governor("governor-two"));
+    assert_eq!(stalled.supervisor.expect("supervisor").convoy, owned);
+    assert_eq!(case.delivery.requests.lock().expect("deliveries")[0].convoy, owned);
 }
 
 #[tokio::test]
@@ -842,13 +825,10 @@ async fn stalled_work_names_missing_governor_crew_at_operator_rung() {
 
 #[tokio::test]
 async fn stalled_work_ignores_terminal_ensure_attempt_and_uses_highest_live_generation() {
-    let case = project_supervision_case(&[
-        ("governor-one", 1, ConvoyPhase::Abandoned),
-        ("governor-two", 2, ConvoyPhase::Active),
-        ("governor-three", 3, ConvoyPhase::Active),
-    ])
-    .await;
-    create_governor_ensure(&case.backend, &case.governor("governor-one")).await;
+    let case = project_supervision_case(&[("governor-two", 2, ConvoyPhase::Active), ("governor-three", 3, ConvoyPhase::Active)]).await;
+    // The standing role's only generation has ended.
+    let ended = governor_at(&case.home, "governor-one", Some("wheelhouse-governor"), 1).await;
+    case.home.end(&case.backend, &ended, ConvoyPhase::Abandoned).await;
     case.judge(&case.wake, Utc::now()).await;
     let stalled = case.status().await.stalled.expect("stalled");
     assert_eq!(stalled.supervisor.expect("supervisor").convoy, case.governor("governor-three"));
@@ -1005,8 +985,8 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
 
 // #3044: populated kinds are bootstrapped once; repeated no-op judgements perform zero
 // backing-store reads, including indirect supervisor routing reads. (The read counter wraps the
-// resource backend: the launches' engine reads are not counted, the Project, ConvoyEnsure and
-// Message reads of routing are.)
+// resource backend: the launches' engine reads are not counted, the Project and Message reads
+// of routing are.)
 #[tokio::test]
 async fn steady_state_stall_judgements_do_not_read_the_store() {
     use flotilla_store_testkit::ReadCountsBackendExt;

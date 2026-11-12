@@ -22,11 +22,11 @@ use flotilla_charter::ops_entry::SOURCE_ENTRY_PATH_ANNOTATION;
 use flotilla_charter::ops_entry::SOURCE_REPOSITORY_ANNOTATION;
 use flotilla_core::in_process::*;
 use flotilla_discovery_testkit::fake_discovery;
+use flotilla_projections::ports::{StandingRoleReading, StandingRoles};
+use flotilla_protocol::StandingRoleHold;
 use flotilla_resources::attentions::{OpenAttention, Sender};
 use flotilla_resources::controller_patches;
-use flotilla_resources::ConvoyEnsureHoldReason;
 use flotilla_resources::ConvoyEnsureSpec;
-use flotilla_resources::ConvoyEnsureStatus;
 use flotilla_resources::ConvoyPhase;
 use flotilla_resources::ConvoyStatus;
 use flotilla_resources::CrewSource;
@@ -43,7 +43,6 @@ use flotilla_resources::RepositoryStatus;
 use flotilla_resources::Selector;
 use flotilla_resources::VesselRequirement;
 use flotilla_resources::WorkflowTemplateSpec;
-use flotilla_resources::DRIVER_ADMISSION_CONDITION_TYPE;
 use flotilla_resources::GENERATION_LABEL;
 use flotilla_resources::PROJECT_LABEL;
 use flotilla_resources::ROLE_LABEL;
@@ -440,16 +439,14 @@ async fn abandon_generation(daemon: &InProcessDaemon, name: &str) {
     convoy_engine(daemon).abandon(&convoy, "operator", "operator reap").await.expect("abandon generation");
 }
 
+/// The fixture's standing role, `quartermaster` of `standing-project`, as `daemon` reads it from
+/// its generations, their attention and its project (#3108): the ensure stores none of it.
+async fn quartermaster(daemon: &InProcessDaemon) -> StandingRoleReading {
+    StandingRoles::reading(daemon, "flotilla", "standing-project", "quartermaster").await.expect("the standing role reads")
+}
+
 async fn fail_ensured_generation(daemon: &InProcessDaemon) -> String {
-    let convoy_ref = daemon
-        .resource_backend()
-        .using::<ConvoyEnsure>("flotilla")
-        .get("quartermaster")
-        .await
-        .expect("ensure")
-        .status
-        .and_then(|status| status.convoy_ref)
-        .expect("live generation");
+    let convoy_ref = quartermaster(daemon).await.convoy_ref.expect("live generation");
     fail_generation(daemon, &convoy_ref, "placement failed").await;
     convoy_ref
 }

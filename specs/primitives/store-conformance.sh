@@ -20,7 +20,7 @@ QUINT_GRAPH_DIR="$run/graphs" "${cargo_test[@]}" -p flotilla-provisioning \
   --test manifest_root_conformance -- --ignored --nocapture 2>&1 | tee "$run/manifest_root.log"
 QUINT_TRACE_DIR="$run" "${cargo_test[@]}" -p flotilla-schema-sqlite \
   --test quint_replay -- --ignored --nocapture 2>&1 | tee "$run/follower.log"
-# The crew kinds (#3629): the placement composition and Ensure through the decided store.
+# The crew kind (#3629): the placement composition through the decided store.
 QUINT_GRAPH_DIR="$run/graphs" "${cargo_test[@]}" -p flotilla-engine-store \
   --test crew_conformance -- --ignored --nocapture 2>&1 | tee "$run/crew.log"
 # Backends share the trace mapping but replay only the Message race; full-graph

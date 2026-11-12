@@ -151,8 +151,8 @@ pub use convoy::{
     ENSURED_FROM_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{
-    ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus,
-    ConvoyEnsureStatusPatch, DRIVER_ADMISSION_CONDITION_TYPE,
+    config_changes, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
+    ConvoyEnsureStatus,
 };
 pub use credential::{
     capped_github_app_permissions, permission_level_rank, validate_matching_grant_permissions, CloneCredentials, CredentialConsumer,

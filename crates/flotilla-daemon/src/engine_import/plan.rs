@@ -25,7 +25,7 @@ pub const PLAN: &[(&str, Plan)] = &[
     ("Checkout", Plan::Imported("lifecycle import (#3629)")),
     ("TerminalSession", Plan::Imported("lifecycle import (#3629)")),
     ("Vessel", Plan::Imported("lifecycle import (#3629)")),
-    ("ConvoyEnsure", Plan::Imported("lifecycle import (#3629)")),
+    ("ConvoyEnsure", Plan::Imported("definitions import (#3108): its status is derived, not carried")),
     ("Convoy", Plan::Imported("Convoy import (#3587)")),
     ("AccountBinding", Plan::Imported("account import (#3824 layer 1)")),
     ("AccountProvision", Plan::Imported("account import (#3824 layer 1)")),

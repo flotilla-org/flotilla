@@ -7225,6 +7225,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
             &InputMeta::builder()
                 .name("governor".to_string())
                 .annotations(BTreeMap::from([
+                    ("flotilla.work/materialized-project".to_string(), "ghostty".to_string()),
                     ("flotilla.work/source-repository".to_string(), front.key().to_string()),
                     ("flotilla.work/source-commit".to_string(), "abc123".to_string()),
                 ]))
@@ -7334,9 +7335,17 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         .await
         .expect("record alias first");
     daemon.reconcile_convoy_ensure_now("flotilla", "governor", daemon.as_ref()).await.expect("ensure re-admits after forge sweep");
-    let renewed = ensures.get("governor").await.expect("migrated ensure");
     let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
-    let successor = convoys.get(&renewed.status.expect("ensure status").convoy_ref.expect("successor")).await.expect("second generation");
+    // No ensure status is stored (#3108): the successor is the role's newest generation.
+    let selector = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "governor".to_string())]);
+    let successor = convoys
+        .list_matching_labels(&selector)
+        .await
+        .expect("list generations")
+        .items
+        .into_iter()
+        .max_by_key(|convoy| convoy.spec.generation)
+        .expect("second generation");
     assert!(successor.spec.generation > first.spec.generation);
     assert_eq!(successor.spec.repositories.len(), 1);
     assert_eq!(successor.spec.repositories[0].repo_ref, expected);

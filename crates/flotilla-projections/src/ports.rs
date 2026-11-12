@@ -62,6 +62,36 @@ pub trait AgentSessions: Send + Sync {
     async fn follow(&self) -> Result<AgentSessionFollow, String>;
 }
 
+/// A standing role's state as its generations, their hold attention and its project's
+/// declaration say it (#3108): nothing of it is stored on its ConvoyEnsure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandingRoleReading {
+    /// Its current generation: the newest live one, or the ended one it is held on.
+    pub convoy_ref: Option<String>,
+    pub hold: Option<flotilla_protocol::StandingRoleHold>,
+    pub strikes: u32,
+    pub next_attempt: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_failure: Option<String>,
+}
+
+/// Reads standing roles for the rows that show them.
+#[async_trait]
+pub trait StandingRoles: Send + Sync {
+    /// The role `role` of `project` in `namespace`; `None` when it cannot be read now, which is
+    /// unknown, never "not held".
+    async fn reading(&self, namespace: &str, project: &str, role: &str) -> Option<StandingRoleReading>;
+}
+
+/// No standing role controller is composed: every role reads as unknown.
+pub struct NoStandingRoles;
+
+#[async_trait]
+impl StandingRoles for NoStandingRoles {
+    async fn reading(&self, _: &str, _: &str, _: &str) -> Option<StandingRoleReading> {
+        None
+    }
+}
+
 /// No decided store: no crew member shows an AgentSession.
 pub struct NoAgentSessions;
 

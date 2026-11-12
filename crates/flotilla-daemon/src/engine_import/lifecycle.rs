@@ -1,25 +1,23 @@
-//! The lifecycle importer: Vessel, TerminalSession, Environment, ImageBuild, Clone, Checkout and
-//! ConvoyEnsure. A placed Vessel is its work's first launch, a lease granted on its pinned host;
-//! one never placed is noted, not stored. An Ensure is bound while the convoy it records is live.
+//! The lifecycle importer: Vessel, TerminalSession, Environment, ImageBuild, Clone and Checkout. A
+//! placed Vessel is its work's first launch, a lease granted on its pinned host; one never placed
+//! is noted, not stored.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_core::primitives::ensures::import_ensures;
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::{
-    import_checkouts, import_clones, import_environments, import_image_builds, import_terminal_sessions, import_vessels, ImportRefusal,
-    ImportReport, RowOutcome,
+    import_checkouts, import_clones, import_environments, import_image_builds, import_terminal_sessions, import_vessels, ImportReport,
 };
 use flotilla_resources::{
-    convoy::engine::engine_name, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure, Environment, Host, ImageBuild, TerminalSession,
-    Vessel, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    convoy::engine::engine_name, Checkout, Clone as CloneResource, Convoy, Environment, Host, ImageBuild, TerminalSession, Vessel,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
 use flotilla_schema::{Identity, Kind};
 use flotilla_state_machines::{machines::convoy::Convoy as EngineConvoy, Resource};
 
 use super::{Carried, Source};
 
-pub(super) const KINDS: [&str; 5] = ["environments", "imagebuilds", "clones", "checkouts", "convoyensures"];
+pub(super) const KINDS: [&str; 4] = ["environments", "imagebuilds", "clones", "checkouts"];
 
 /// Vessels import first, each as its work's first launch, so the environments and terminal
 /// sessions held for an old vessel are held for the launch it became: a launch's number is its
@@ -50,7 +48,8 @@ pub(super) fn terminal_sessions(source: &Source, target: &mut Import, carried: &
 }
 
 pub(super) fn lifecycles(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
-    for namespace in source.namespaces(&KINDS) {
+    // A namespace with only convoys still notes how its standing generations fold.
+    for namespace in source.namespaces(&["environments", "imagebuilds", "clones", "checkouts", "convoys"]) {
         namespace_lifecycles(source, namespace, target, carried, report);
     }
 }
@@ -148,44 +147,4 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
             standing.len() - identities.len()
         ));
     }
-    // Each convoy's liveness, and whether it has a status yet: one with none is a fresh convoy,
-    // read as live, and an Ensure bound to it is noted.
-    let live: BTreeMap<String, (bool, bool)> = convoys
-        .into_iter()
-        .map(|convoy| {
-            let live = convoy.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal());
-            (convoy.object.metadata.name, (live, convoy.object.status.is_some()))
-        })
-        .collect();
-    let mut ensures = Vec::new();
-    for ensure in source.owned::<ConvoyEnsure>("convoyensures", namespace, "Ensure", target, report) {
-        let (ensure, home) = (ensure.object, ensure.home);
-        let convoy = ensure.status.as_ref().and_then(|status| status.convoy_ref.clone());
-        let convoy_live = match convoy.as_ref().map(|convoy| (convoy, live.get(convoy))) {
-            Some((_, Some((live, true)))) => *live,
-            Some((convoy, Some((live, false)))) => {
-                report.notes.push(format!(
-                    "Ensure `{}` records convoy `{convoy}`, which has no status yet: read as live, imported bound",
-                    ensure.metadata.name
-                ));
-                *live
-            }
-            Some((convoy, None)) => {
-                // The safe direction: unfulfilled, so the first engine pass binds it again.
-                report.notes.push(format!(
-                    "Ensure `{}` records convoy `{convoy}`, which is not held (or did not decode): imported unfulfilled",
-                    ensure.metadata.name
-                ));
-                false
-            }
-            None => false,
-        };
-        ensures.push((ensure, home, convoy_live));
-    }
-    let (counts, refused) = import_ensures(&ensures, target);
-    for (label, count) in counts {
-        *report.imported.entry(("Ensure", label)).or_default() += count;
-        report.rows("ConvoyEnsure", RowOutcome::Imported, count);
-    }
-    report.refused.extend(refused.into_iter().map(|(record, reason)| ImportRefusal { kind: "Ensure", record, reason }));
 }

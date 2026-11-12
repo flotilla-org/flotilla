@@ -1,8 +1,7 @@
-//! The crew kinds' machines through the decided store (#3629 layer 6): `conformance/vessel.qnt`
-//! against the production placement composition and `conformance/ensure.qnt` against the Ensure,
-//! each over [`StoreLog`] on an SQLite store holding the stored kind. The adaptors are the
-//! engine's own (`flotilla_quint_testkit::{vessel, ensure}`); here every write is one store
-//! transaction, and the stored row must hold what the home holds.
+//! The crew kind's machine through the decided store (#3629 layer 6): `conformance/vessel.qnt`
+//! against the production placement composition, over [`StoreLog`] on an SQLite store holding the
+//! stored kind. The adaptor is the engine's own (`flotilla_quint_testkit::vessel`); here every
+//! write is one store transaction, and the stored row must hold what the home holds.
 //!
 //! ```text
 //! QUINT_GRAPH_DIR=DIR cargo test -p flotilla-engine-store --test crew_conformance -- --ignored
@@ -12,16 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use flotilla_engine_store::StoreLog;
 use flotilla_quint_testkit::{
-    ensure::{EnsureConformance, EnsureLogs},
     graph::{self, Conformance, Report},
     vessel::{VesselConformance, VesselLogs},
 };
 use flotilla_schema::{Kind, KindRegistry};
 use flotilla_schema_sqlite::Store;
-use flotilla_state_machines::{
-    machines::{ensure::Ensure, vessel::Vessel},
-    Home, Machine, Resource,
-};
+use flotilla_state_machines::{machines::vessel::Vessel, Home, Machine, Resource};
 
 const HOME: &str = "home";
 
@@ -66,16 +61,6 @@ impl VesselLogs for StoreLogs {
     }
 }
 
-impl EnsureLogs for StoreLogs {
-    type Log = StoreLog;
-    fn log() -> StoreLog {
-        store::<Ensure>()
-    }
-    fn check(home: &Home<Ensure, StoreLog>) {
-        stored_as_held(home);
-    }
-}
-
 // Every reachable vessel state is reached through the store by the spec's path, and every probe
 // agrees, writing nothing when refused.
 #[test]
@@ -86,21 +71,12 @@ fn vessel_follows_the_full_graph_through_the_store() {
     report.finish();
 }
 
-// Every reachable Ensure state is reached through the store, its history read back from its log.
-#[test]
-#[ignore = "export graphs with specs/primitives/check.sh"]
-fn ensure_follows_the_full_graph_through_the_store() {
-    let mut report = Report::new("ensure (store)");
-    graph::check::<EnsureConformance<StoreLogs>>(&graph::load(EnsureConformance::<StoreLogs>::MACHINE), &mut report);
-    report.finish();
-}
-
 /// One path through each adaptor with the spec's results written out, so the adaptors run in the
 /// ordinary test run.
 mod walk {
     use flotilla_quint_testkit::{
         graph::{Conformance, Step},
-        itf::{int, map_of, set_of, tag, unit, variant},
+        itf::{int, map_of, set_of, tag, variant},
     };
     use serde_json::{json, Value};
 
@@ -152,20 +128,5 @@ mod walk {
         assert!(matches!(V::apply(&mut vessel, &variant("Release", json!({ "complete": true }))), Step::Accepted));
         assert_eq!(V::encode(&vessel), variant("Gone", placement));
         assert_eq!(refused(V::apply(&mut vessel, &realise)), "WrongState");
-    }
-
-    // Behaviour: through the store, an Ensure records and creates a fulfiller, is held, and its
-    // work is read back from the store.
-    #[test]
-    fn an_ensure_records_and_holds_through_the_store() {
-        type E = EnsureConformance<StoreLogs>;
-        let mut ensure = E::create(&Value::Null);
-        assert!(matches!(E::apply(&mut ensure, &variant("Record", int(1))), Step::Accepted));
-        let create = variant("Create", json!({ "id": int(1), "noLive": true, "absent": true }));
-        assert!(matches!(E::apply(&mut ensure, &create), Step::Accepted));
-        assert!(matches!(E::apply(&mut ensure, &variant("Hold", unit())), Step::Accepted));
-        let encoded = E::encode(&ensure);
-        assert_eq!(tag(&encoded), "Held");
-        assert_eq!(encoded["value"]["created"], set_of([int(1)]), "the created fulfiller is read back");
     }
 }

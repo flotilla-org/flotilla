@@ -363,9 +363,15 @@ async fn addresses_resolve_current_holders_after_replication() {
     let holder = resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/coder").await.expect("resolve").expect("holder");
     assert_eq!(holder.object.metadata.name, "terminal");
     assert!(matches!(holder.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == NodeId::new("remote")));
+    // A role with no live standing generation has no holder.
+    assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/coder").await.expect("role without generation").is_none());
+    // The role's current generation: its newest live convoy ensured from the role's declaration.
     convoys
         .create(
-            &InputMeta::builder().name("next-convoy".into()).build(),
+            &InputMeta::builder()
+                .name("next-convoy".into())
+                .annotations(BTreeMap::from([(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), "coder-holder".into())]))
+                .build(),
             &ConvoySpec::builder()
                 .workflow_ref("workflow".into())
                 .project_ref("flotilla".into())
@@ -390,29 +396,6 @@ async fn addresses_resolve_current_holders_after_replication() {
         )
         .await
         .expect("new holder");
-    assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/coder").await.expect("undeclared role").is_none());
-    let declarations = backend.using::<flotilla_resources::ConvoyEnsure>("flotilla");
-    let declaration = declarations
-        .create(
-            &InputMeta::builder().name("coder-holder".into()).build(),
-            &flotilla_resources::ConvoyEnsureSpec::builder()
-                .project_ref("flotilla".into())
-                .role("coder".into())
-                .workflow_ref("workflow".into())
-                .repositories(Vec::new())
-                .build(),
-        )
-        .await
-        .expect("holder declaration");
-    let declaration = declarations.get(&declaration.metadata.name).await.expect("current declaration");
-    declarations
-        .update_status(
-            "coder-holder",
-            &declaration.metadata.resource_version,
-            &flotilla_resources::ConvoyEnsureStatus { convoy_ref: Some("next-convoy".into()), ..Default::default() },
-        )
-        .await
-        .expect("declared current holder");
     let holder = resolve_message_receiver(&backend, "flotilla", "flotilla/coder").await.expect("project role").expect("holder");
     assert_eq!(holder.object.metadata.name, "new-terminal");
 }
@@ -879,11 +862,30 @@ async fn routing_project(backend: &ResourceBackend, name: &str, parent: Option<&
 async fn routing_holder(backend: &ResourceBackend, project: &str, generation: &str) {
     use flotilla_resources::*;
     let name = format!("{project}-{generation}");
+    let ensure = format!("{project}-holder");
+    // Each holder is the role's newest generation, and so its current one.
+    let earlier = backend
+        .using::<Convoy>("flotilla")
+        .list()
+        .await
+        .expect("convoys")
+        .items
+        .iter()
+        .filter(|convoy| convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure))
+        .count();
     backend
         .using::<Convoy>("flotilla")
         .create(
-            &InputMeta::builder().name(name.clone()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(project.into()).role("guide".into()).build(),
+            &InputMeta::builder()
+                .name(name.clone())
+                .annotations(std::collections::BTreeMap::from([(ENSURED_FROM_ANNOTATION.into(), ensure.clone())]))
+                .build(),
+            &ConvoySpec::builder()
+                .workflow_ref("workflow".into())
+                .project_ref(project.into())
+                .role("guide".into())
+                .generation(earlier as u64 + 1)
+                .build(),
         )
         .await
         .expect("standing convoy");
@@ -902,27 +904,6 @@ async fn routing_holder(backend: &ResourceBackend, project: &str, generation: &s
         )
         .await
         .expect("terminal");
-    let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
-    let declaration = match ensures.get(&format!("{project}-holder")).await {
-        Ok(declaration) => declaration,
-        Err(_) => ensures
-            .create(
-                &InputMeta::builder().name(format!("{project}-holder")).build(),
-                &ConvoyEnsureSpec::builder().project_ref(project.into()).role("guide".into()).repositories(Vec::new()).build(),
-            )
-            .await
-            .expect("ensure"),
-    };
-    let declaration = backend.using::<ConvoyEnsure>("flotilla").get(&declaration.metadata.name).await.expect("local declaration");
-    backend
-        .using::<ConvoyEnsure>("flotilla")
-        .update_status(
-            &declaration.metadata.name,
-            &declaration.metadata.resource_version,
-            &ConvoyEnsureStatus { convoy_ref: Some(name), ..Default::default() },
-        )
-        .await
-        .expect("holder pointer");
 }
 
 // Supervision skips unoccupied parent levels, stops at the nearest subscribed
@@ -965,9 +946,11 @@ fn subscription_supervision_follows_live_parent_chain(tc: hegel::TestCase) {
         // Every presence combination shares one local-plus-replica snapshot,
         // even when supervision and peer contacts resolve several addresses.
         let calls = memory.read_snapshot().since(&before).calls_by_kind();
-        for kind in ["Convoy", "TerminalSession", "ConvoyEnsure"] {
+        for kind in ["Convoy", "TerminalSession"] {
             assert_eq!(calls.get(kind).copied().unwrap_or_default(), 2, "one snapshot for {kind}");
         }
+        // The standing roles' holders come from the convoys alone.
+        assert_eq!(calls.get("ConvoyEnsure").copied().unwrap_or_default(), 0, "no ConvoyEnsure reads");
         routing_holder(&backend, "root", "two").await;
         let next = crew_address_book(&backend, "flotilla", "child/task/work/coder").await.expect("refreshed contacts");
         assert_eq!(next.supervision.last().expect("root").terminal.as_deref(), Some("terminal-root-two"));
@@ -1209,9 +1192,7 @@ fn delivery_guard_admission_compatibility() {
 #[tokio::test]
 async fn addressed_receiver_reads_ignore_unrelated_holders() {
     use flotilla_messaging::{resolve_message_receiver, MessageReceiverSnapshot};
-    use flotilla_resources::{
-        Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoySpec, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
-    };
+    use flotilla_resources::{Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoySpec, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
     use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadSnapshot};
     use std::collections::BTreeMap;
     // Exact per-kind (calls, decoded objects) for Convoy, TerminalSession, ConvoyEnsure, Message.
@@ -1229,10 +1210,15 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
         .with_read_counts();
         for n in 0..=unrelated {
             let name = if n == 0 { "convoy".into() } else { format!("unrelated-{n}") };
+            let ensure_name = if n == 0 { "ensure".into() } else { format!("ensure-{n}") };
+            // Each convoy is its ensure's current generation.
             backend
                 .using::<Convoy>("flotilla")
                 .create(
-                    &InputMeta::builder().name(name.clone()).build(),
+                    &InputMeta::builder()
+                        .name(name.clone())
+                        .annotations(BTreeMap::from([(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), ensure_name.clone())]))
+                        .build(),
                     &ConvoySpec::builder()
                         .workflow_ref("workflow".into())
                         .project_ref("flotilla".into())
@@ -1257,9 +1243,8 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
                 )
                 .await
                 .expect("holder");
-            let ensure_name = if n == 0 { "ensure".into() } else { format!("ensure-{n}") };
-            let ensures = backend.using::<ConvoyEnsure>("flotilla");
-            ensures
+            backend
+                .using::<ConvoyEnsure>("flotilla")
                 .create(
                     &InputMeta::builder().name(ensure_name.clone()).build(),
                     &ConvoyEnsureSpec::builder()
@@ -1270,15 +1255,6 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
                 )
                 .await
                 .expect("ensure");
-            let ensure = ensures.get(&ensure_name).await.expect("local ensure version");
-            ensures
-                .update_status(
-                    &ensure_name,
-                    &ensure.metadata.resource_version,
-                    &ConvoyEnsureStatus { convoy_ref: Some(name), ..Default::default() },
-                )
-                .await
-                .expect("ensure status");
             if n > 0 {
                 backend
                     .using::<Message>("flotilla")
@@ -1308,7 +1284,8 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
         }
         let batch = backend.read_snapshot().since(&before);
         batch.assert_no_lists("receiver batch");
-        assert_eq!(kinds(&batch), [(1, 1), (1, 1), (1, 1), (0, 0)]);
+        // A standing role's holder is its newest live generation: no ConvoyEnsure is read.
+        assert_eq!(kinds(&batch), [(1, 1), (1, 1), (0, 0), (0, 0)]);
         // A four-part address selects its crew, even when the named convoy
         // contains other sessions. It does not need standing-role holders.
         backend

@@ -105,7 +105,7 @@ echo 'Model checking completed. No error has been found'
         shutil.copy(HERE / 'deep-local.sh', copy)
         # Unrelated scenarios stop after their first Quint call; focus the copy on inbox.
         path = copy / 'deep-local.sh'
-        path.write_text(path.read_text().replace('convoy_deliver ensure_bind inbox_delivery message_race admission_placement reply_exchange;', 'inbox_delivery;'))
+        path.write_text(path.read_text().replace('convoy_deliver inbox_delivery message_race admission_placement reply_exchange;', 'inbox_delivery;'))
         self.stub('quint', 'echo reached-quint >&2; exit 17')
         result = self.run_script(path)
         self.assertEqual(result.returncode, 17, result.stderr)

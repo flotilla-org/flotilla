@@ -25,8 +25,8 @@ use flotilla_provisioning::engine::observations::EngineObservations;
 use flotilla_provisioning_testkit::other_home::OtherHome;
 use flotilla_resources::{
     engine_records::EngineRecords, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Convoy, ConvoyEnsure,
-    ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoySpec, DeclaredSubject, HostSpec, HostStatus, InputMeta, IssueSourceBindingSpec,
-    Observation, ObservedChangeRequestState, ProjectSpec, SystemClock, ENSURED_FROM_ANNOTATION,
+    ConvoyEnsureSpec, ConvoySpec, DeclaredSubject, HostSpec, HostStatus, InputMeta, IssueSourceBindingSpec, Observation,
+    ObservedChangeRequestState, ProjectSpec, SystemClock, ENSURED_FROM_ANNOTATION,
 };
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::ResourceBackend;
@@ -127,7 +127,8 @@ async fn seed(daemon: &InProcessDaemon, backend: &ResourceBackend, namespace: &s
             .build(),
     )
     .await;
-    let ensure = backend
+    // The launch is the role's current generation: its newest live convoy ensured from it.
+    backend
         .using::<ConvoyEnsure>(namespace)
         .create(
             &meta("governor"),
@@ -140,16 +141,6 @@ async fn seed(daemon: &InProcessDaemon, backend: &ResourceBackend, namespace: &s
         )
         .await
         .expect("standing role");
-    let ensure = backend.using::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await.expect("local ensure version");
-    backend
-        .using::<ConvoyEnsure>(namespace)
-        .update_status(
-            "governor",
-            &ensure.metadata.resource_version,
-            &ConvoyEnsureStatus { convoy_ref: Some(launch.clone()), ..Default::default() },
-        )
-        .await
-        .expect("current attempt");
     launch
 }
 
@@ -261,16 +252,6 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     let mut second_spec = previous.spec;
     second_spec.generation = 2;
     let second = admit_attempt(&daemon, "attempt-2", second_spec).await;
-    let ensure = backend.using::<ConvoyEnsure>("flotilla").get("governor").await.expect("standing role version");
-    backend
-        .using::<ConvoyEnsure>("flotilla")
-        .update_status(
-            "governor",
-            &ensure.metadata.resource_version,
-            &ConvoyEnsureStatus { convoy_ref: Some(second.clone()), ..Default::default() },
-        )
-        .await
-        .expect("new current attempt");
     wait("new current attempt", || {
         sink.value(&role, "flotilla.role.current_attempt")
             == Some(MetadataValue::EntityRefs(vec![entity::convoy("flotilla", &second, "local")]))

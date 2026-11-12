@@ -24,10 +24,10 @@ use flotilla_resources::terminal_records::TerminalRecords as _;
 use flotilla_resources::vessel_records::VesselStep;
 use flotilla_resources::StatusPatch;
 use flotilla_resources::{
-    external_patches, Artifact, ChangeRequest, Convoy, ConvoyAttention, ConvoyEnsure, HoldAct, Issue, LeafMaker, NudgeObligation,
-    ObservedChecks, Project, ResourceError, RetryCeiling, StallEvidenceSource, StallRung, SupervisionTarget, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
-    TurnDeliveryRung, WatchEvent, WatchStart,
+    external_patches, Artifact, ChangeRequest, Convoy, ConvoyAttention, HoldAct, Issue, LeafMaker, NudgeObligation, ObservedChecks,
+    Project, ResourceError, RetryCeiling, StallEvidenceSource, StallRung, SupervisionTarget, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, WatchEvent,
+    WatchStart,
 };
 use flotilla_resources::{
     BoundChangeRequest, CheckoutSpec, ControllerRetry, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase,
@@ -565,31 +565,6 @@ async fn observe_claude_hook(case: &Case, wake: &ReconcilerWake, event: &str, no
         agents().progress.tool("resumed-coder", now);
     }
     observe_actor_source(case, wake, state, TerminalAttentionSource::Hook, now).await;
-}
-
-async fn create_governor_ensure(backend: &ResourceBackend, convoy_ref: &str) {
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
-    let created = ensures
-        .create(
-            &InputMeta::builder().name("wheelhouse-governor".into()).build(),
-            &flotilla_resources::ConvoyEnsureSpec::builder()
-                .project_ref("wheelhouse".into())
-                .role("governor".into())
-                .workflow_ref("workflow".into())
-                .repositories(Vec::new())
-                .build(),
-        )
-        .await
-        .expect("create ensure");
-    let created = ensures.get(&created.metadata.name).await.expect("read ensure");
-    ensures
-        .update_status(
-            "wheelhouse-governor",
-            &created.metadata.resource_version,
-            &flotilla_resources::ConvoyEnsureStatus { convoy_ref: Some(convoy_ref.into()), ..Default::default() },
-        )
-        .await
-        .expect("set owned attempt");
 }
 
 #[derive(Clone, Copy, Debug)]

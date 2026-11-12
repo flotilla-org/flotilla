@@ -1,6 +1,6 @@
 //! The declared definition kinds' records (#3824 layer 2b-ii): Forge, FleetDesignation,
-//! CredentialSpec, CredentialGrant, CrewDefaults, ImageLayer and WorkflowTemplate, and Project
-//! (layer 3b).
+//! CredentialSpec, CredentialGrant, CrewDefaults, ImageLayer, WorkflowTemplate and ConvoyEnsure,
+//! and Project (layer 3b).
 //!
 //! On the engine each is a plain record at the home that declared it, holding only its own fields:
 //! why it was written is its change's (#4024), never a column of its row. [`DefinitionOrigin`] is
@@ -23,8 +23,8 @@ use crate::{
 };
 
 /// The kinds the engine's definition records serve, by their resource kind names.
-pub const DEFINITION_KINDS: [&str; 7] =
-    ["Forge", "FleetDesignation", "CredentialSpec", "CredentialGrant", "CrewDefaults", "ImageLayer", "WorkflowTemplate"];
+pub const DEFINITION_KINDS: [&str; 8] =
+    ["Forge", "FleetDesignation", "CredentialSpec", "CredentialGrant", "CrewDefaults", "ImageLayer", "WorkflowTemplate", "ConvoyEnsure"];
 
 /// Whether `kind` is one of [`DEFINITION_KINDS`].
 pub fn is_definition_kind(kind: &str) -> bool {
@@ -85,6 +85,10 @@ pub fn declares(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String
 
 /// The origin a writer stamped as `labels` and `annotations`. Stamps naming an origin without all
 /// of its fields are refused with the missing key named.
+///
+/// A ProjectOps origin does not hold the `manifest-reconciler-root` that project operations stamp
+/// for a bound ops root, so an engine read of such a definition carries no root. Its home is still
+/// the binding host: project operations materialise from a bound root only on that host.
 pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, String>) -> Result<DefinitionOrigin, String> {
     let annotation = |key: &str| annotations.get(key).cloned().ok_or_else(|| format!("no `{key}` annotation"));
     let managed_by = labels.get(MANAGED_BY_LABEL).map(String::as_str);

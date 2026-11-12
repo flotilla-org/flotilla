@@ -81,8 +81,8 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         terminal_session::TerminalSession,
     };
     use flotilla_state_machines::machines::{
-        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
-        service::Service, vessel::Vessel,
+        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, message::Message, person::Person, service::Service,
+        vessel::Vessel,
     };
     ArchiveKinds::new()
         .with::<Message>()
@@ -102,7 +102,6 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         .companion::<Checkout, CheckoutIntegration>()
         .with::<TerminalSession>()
         .with::<Vessel>()
-        .with::<Ensure>()
         .with::<AccountBinding>()
         .with::<ManifestRoot>()
         // A person consumer has no end, so it stays live and is never shipped (#3938).

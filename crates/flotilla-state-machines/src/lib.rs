@@ -41,8 +41,8 @@
 //! Every machine's stored kind is its [`Resource`] (#3392 ruling D5): the
 //! storage derive targets the machine's spec, which names the kind, its code,
 //! indexes and state, and its state; the store keeps its name and version and
-//! logs its edges. Message, AgentSession, Person, Convoy,
-//! Vessel and Ensure declare their specs here, listed under their permanent
+//! logs its edges. Message, AgentSession, Person, Convoy and
+//! Vessel declare their specs here, listed under their permanent
 //! codes by the production registry ([`kinds`]), and any other lifecycle
 //! kind's request is its spec wherever it is declared. A reference to a
 //! definitions-class kind or to anything outside the store is an address

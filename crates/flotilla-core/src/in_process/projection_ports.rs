@@ -177,6 +177,32 @@ impl flotilla_projections::ports::AgentSessions for InProcessDaemon {
     }
 }
 
+/// Standing roles as the installed ConvoyEnsure controller derives them from their generations
+/// (#3108). Without the controller, or when the read fails, a role is unknown.
+#[async_trait]
+impl flotilla_projections::ports::StandingRoles for InProcessDaemon {
+    async fn reading(&self, namespace: &str, project: &str, role: &str) -> Option<flotilla_projections::ports::StandingRoleReading> {
+        let reconciler = self.convoy_ensure_reconciler().await.ok()?;
+        let standing = match reconciler.standing_role(namespace, project, role).await {
+            Ok(standing) => standing?,
+            Err(error) => {
+                tracing::debug!(%error, namespace, project, role, "standing role did not read");
+                return None;
+            }
+        };
+        Some(flotilla_projections::ports::StandingRoleReading {
+            convoy_ref: standing.convoy,
+            hold: standing.hold.map(|hold| match hold {
+                flotilla_admission::standing::StandingHold::BackingUnverified => flotilla_protocol::StandingRoleHold::BackingUnverified,
+                flotilla_admission::standing::StandingHold::RestartLimit => flotilla_protocol::StandingRoleHold::RestartLimit,
+            }),
+            strikes: standing.strikes,
+            next_attempt: standing.next_attempt,
+            last_failure: standing.last_failure,
+        })
+    }
+}
+
 pub use agent_sessions::DecidedAgentSessions;
 
 /// Provisioning readings whose AgentSessions and Convoys are the daemon's own.

@@ -17,7 +17,6 @@ use flotilla_state_machines::{
             AdmittedPromise, Authority, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyRequest, Deliver, Duty, DutyId, DutyScope, Keep,
             MemoryConvoyWorld, Priority, PromiseId, PromiseKinds, PromiseSource, RetireDuty, Seat, SeatName, Submit, Terms, VesselClass,
         },
-        ensure::{Ensure, EnsureSpec, Hold, MemoryEnsureWorld, Record},
         lifecycle::{self, LifecycleLabel, LifecycleState, MemoryLifecycleWorld, Observed, Realisation, Realise, Vanish},
         message::{
             Expectation, MemoryMessageWorld, Message, MessageBody, MessageEdgeKind, MessageRef, MessageReference, MessageSpec, Relation,
@@ -41,7 +40,6 @@ fn kind_codes_are_pinned() {
         (Resource::<AgentSession>::KIND, Resource::<AgentSession>::CODE),
         (Resource::<AwaitingReply>::KIND, Resource::<AwaitingReply>::CODE),
         (Resource::<Convoy>::KIND, Resource::<Convoy>::CODE),
-        (Resource::<Ensure>::KIND, Resource::<Ensure>::CODE),
         (Resource::<Message>::KIND, Resource::<Message>::CODE),
         (Resource::<Person>::KIND, Resource::<Person>::CODE),
         (
@@ -54,7 +52,6 @@ fn kind_codes_are_pinned() {
         ("AgentSession", KindCode::new("as")),
         ("AwaitingReply", KindCode::new("ar")),
         ("Convoy", KindCode::new("cv")),
-        ("Ensure", KindCode::new("en")),
         ("Message", KindCode::new("ms")),
         ("Person", KindCode::new("pn")),
         ("Service", KindCode::new("sv")),
@@ -183,16 +180,6 @@ fn resources_survive_the_codec() {
     assert_eq!((convoy.version(), convoy.since()), (Version(3), Timestamp(2)), "a records edge keeps since");
     assert_eq!(convoy.spec().promises.get(flotilla_schema::Position(0)).expect("row").record.submissions.len(), 1);
 
-    let mut ensures = Home::<Ensure>::new("home").expect("valid");
-    ensures
-        .create("e", EnsureSpec { inbox: Address::project("i").expect("inbox") }, &MemoryEnsureWorld::default(), Timestamp(0))
-        .expect("created");
-    ensures.apply("e", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(4)).expect("recorded");
-    ensures.apply("e", Hold, &MemoryEnsureWorld::default(), Timestamp(5)).expect("held");
-    let ensure = round_trip(&ensures, "e");
-    assert_eq!(ensures.log().history("e", Version(0), usize::MAX).len(), 2, "each edge is a log entry");
-    assert_eq!(ensure.state().recorded(), &BTreeSet::from([Ref::new("f")]));
-
     // A vessel's convoy is homed elsewhere: its reference keeps the convoy's home (#3392 G3).
     let mut vessels = Home::<Vessel>::new("capacity-host").expect("valid");
     let vessel = lease_of("c", 4);
@@ -290,7 +277,6 @@ fn the_log_is_the_only_history() {
     assert_eq!(tables(Resource::<Message>::table_set()), ["message", "message_references"]);
     assert_eq!(tables(Resource::<AgentSession>::table_set()), ["agent_session"]);
     assert_eq!(tables(Resource::<Person>::table_set()), ["person"]);
-    assert_eq!(tables(Resource::<Ensure>::table_set()), ["ensure", "ensure_recorded", "ensure_created"]);
     assert_eq!(tables(Resource::<Vessel>::table_set()), ["vessel", "vessel_shape"]);
     assert_eq!(Resource::<Message>::table_set().edges, <MessageEdgeKind as CodeEnum>::CODES);
     assert_eq!(Resource::<Convoy>::table_set().edges, <ConvoyEdgeKind as CodeEnum>::CODES);

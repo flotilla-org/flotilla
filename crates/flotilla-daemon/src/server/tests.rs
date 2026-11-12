@@ -5878,7 +5878,7 @@ async fn environment_client_lease_releases_idle_accounting() {
 }
 
 pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
-    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Project, ProjectSpec};
+    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, Project, ProjectSpec};
     let (_tmp, daemon) = empty_daemon().await;
     let backend = daemon.resource_backend();
     backend
@@ -5893,10 +5893,20 @@ pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
         .await
         .unwrap();
     let host = daemon.local_host_id().expect("local host").to_string();
+    // The supervisor is the current generation of the standing role `holder` declares, so the
+    // engine names it by that role.
+    let supervisor = flotilla_resources::convoy::engine::standing_name("project-a", "lead").expect("standing name");
     for (name, project) in [("supervisor", "project-a"), ("target", "project-a"), ("foreign", "project-b")] {
-        let spec = ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref(project.into()).build();
+        let mut spec = ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref(project.into()).build();
         let status = flotilla_engine_convoys_testkit::single_agent("coder");
-        let launch = admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, status)).await;
+        if name == "supervisor" {
+            spec.role = "lead".into();
+        }
+        let mut convoy = flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, status);
+        if name == "supervisor" {
+            convoy.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), "holder".into());
+        }
+        let launch = admit_convoy(&daemon, convoy).await;
         install_engine(&daemon).vessels.request(&launch, "work", &host);
     }
     let spec = TerminalSessionSpec {
@@ -5910,26 +5920,18 @@ pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
             brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
             context: Box::new(TerminalCrewContext {
                 namespace: "flotilla".into(),
-                convoy: current_launch(&daemon, "supervisor"),
-                vessel_ref: vessel_of(&daemon, "supervisor"),
+                convoy: current_launch(&daemon, &supervisor),
+                vessel_ref: vessel_of(&daemon, &supervisor),
             }),
         },
     };
     let launch = request_session(&daemon, "supervisor-session", &spec);
     install_engine(&daemon).terminals.ready(&launch, "supervisor-session", &codex_crew_facts());
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
-    ensures
+    backend
+        .using::<ConvoyEnsure>("flotilla")
         .create(
             &InputMeta::builder().name("holder".into()).build(),
             &ConvoyEnsureSpec::builder().project_ref("project-a".into()).role("lead".into()).repositories(Vec::new()).build(),
-        )
-        .await
-        .unwrap();
-    ensures
-        .update_status(
-            "holder",
-            &ensures.get("holder").await.unwrap().metadata.resource_version,
-            &ConvoyEnsureStatus { convoy_ref: Some(current_launch(&daemon, "supervisor")), ..Default::default() },
         )
         .await
         .unwrap();

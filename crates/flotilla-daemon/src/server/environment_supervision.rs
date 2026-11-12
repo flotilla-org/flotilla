@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::{CallerCrew, CommandAction, CrewCommandContext, DaemonEvent, Request};
-use flotilla_resources::{Convoy, ConvoyEnsure, Project, ResolvedCascade, TerminalSession, TerminalSessionSource, ROLE_ADDRESS_ANNOTATION};
+use flotilla_resources::{
+    Convoy, ConvoyEnsure, Project, ResolvedCascade, TerminalSession, TerminalSessionSource, ENSURED_FROM_ANNOTATION,
+    ROLE_ADDRESS_ANNOTATION,
+};
 use flotilla_store::{ResolvedCascadeStoreExt, StoreQuery};
 
 async fn binding(daemon: &InProcessDaemon, crew: &CallerCrew) -> Result<String, String> {
@@ -16,20 +19,16 @@ async fn binding(daemon: &InProcessDaemon, crew: &CallerCrew) -> Result<String, 
     if let Some(address) = session.metadata.annotations.get(ROLE_ADDRESS_ANNOTATION) {
         addresses.push(address.clone());
     }
-    let ensures = backend
-        .query_declared::<ConvoyEnsure>(
-            &crew.namespace,
-            &StoreQuery {
-                fields: BTreeMap::from([("status.convoy_ref".into(), crew.convoy.clone()), ("spec.project_ref".into(), project.clone())]),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    for ensure in ensures.items {
+    // A standing role binds the convoy that is its current generation.
+    let ensured_from = convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).cloned();
+    let current = match ensured_from {
+        Some(ensure) => flotilla_store::current_generations(&backend, &crew.namespace, [ensure]).await.map_err(|e| e.to_string())?,
+        None => BTreeMap::new(),
+    };
+    for (ensure, _) in current.into_iter().filter(|(_, generation)| generation.metadata.name == crew.convoy) {
         // Runtime observations can outlive their Definition. Only a live
         // declaration may confer a standing role binding.
-        let declaration = match backend.definitions::<ConvoyEnsure>(&crew.namespace).get(&ensure.object.metadata.name).await {
+        let declaration = match backend.definitions::<ConvoyEnsure>(&crew.namespace).get(&ensure).await {
             Ok(declaration) => declaration,
             Err(flotilla_resources::ResourceError::NotFound { .. }) => continue,
             Err(error) => return Err(error.to_string()),

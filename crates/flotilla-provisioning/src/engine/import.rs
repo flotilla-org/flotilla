@@ -237,7 +237,7 @@ pub fn created<R: flotilla_resources::Resource>(obj: &ResourceObject<R>) -> NewC
 }
 
 /// A temporary store holding the provisioning stored kinds, TerminalSession and the engine's crew
-/// kinds (Vessel, Ensure), for a rehearsal of their import.
+/// kind (Vessel), for a rehearsal of their import.
 pub fn rehearsal() -> Result<Rehearsal, String> {
     let mut kinds = flotilla_schema::KindRegistry::new();
     crate::stored::register(&mut kinds)

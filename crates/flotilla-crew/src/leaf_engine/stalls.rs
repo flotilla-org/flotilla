@@ -418,7 +418,6 @@ pub(super) fn is_active_change_request_probe(
 struct StallInputs {
     projects: Arc<flotilla_resources::ReadResourceList<flotilla_resources::Project>>,
     available_convoys: Arc<flotilla_resources::ReadResourceList<Convoy>>,
-    available_ensures: Arc<flotilla_resources::ReadResourceList<flotilla_resources::ConvoyEnsure>>,
     sessions_list: Arc<flotilla_resources::ReadResourceList<TerminalSession>>,
     observation_list: Arc<flotilla_resources::ReadResourceList<flotilla_resources::ChangeRequest>>,
     forges: Vec<flotilla_resources::ForgeSpec>,
@@ -624,7 +623,6 @@ impl ReconcilerWake {
         let mut snapshot = flotilla_store::ViewSnapshot::new(backend.local_root().ok());
         let projects = views.projects.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
         let available_convoys = views.convoys.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
-        let available_ensures = views.ensures.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
         let sessions_snapshot = views.sessions.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
         let sessions_list = sessions_snapshot;
         let observation_list = views.change_requests.shared_list().await.map_err(|error| error.to_string())?;
@@ -657,7 +655,6 @@ impl ReconcilerWake {
             namespace,
             available_convoys.clone(),
             sessions_list.clone(),
-            available_ensures.clone(),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -680,7 +677,6 @@ impl ReconcilerWake {
         Ok(StallInputs {
             projects,
             available_convoys,
-            available_ensures,
             sessions_list,
             observation_list,
             forges,
@@ -1464,8 +1460,7 @@ impl ReconcilerWake {
     ) -> Result<StalledCondition, String> {
         let StallTick { namespace, now, .. } = tick;
         let messages = &tick.inputs.messages_list.items;
-        let (available_convoys, available_ensures, projects) =
-            (&tick.inputs.available_convoys, &tick.inputs.available_ensures, &tick.inputs.projects);
+        let (available_convoys, projects) = (&tick.inputs.available_convoys, &tick.inputs.projects);
         let (leaves, maker, evidence, source) = if let Some((row, evidence, source)) = unable {
             (row.leaves.clone(), Some(row.maker.clone()), evidence.clone(), source.clone())
         } else {
@@ -1632,10 +1627,10 @@ impl ReconcilerWake {
                             )
                         })
                         .collect::<BTreeMap<_, _>>(),
-                    available_ensures
-                        .items
-                        .iter()
-                        .map(|ensure| (&ensure.object.metadata.name, &ensure.object.metadata.resource_version))
+                    // Every standing role's holder: an address target may name another project's role.
+                    flotilla_store::newest_live_generations(available_convoys.items.iter().map(|source| &source.object))
+                        .into_iter()
+                        .map(|(ensure, holder)| (ensure, &holder.metadata.name))
                         .collect::<BTreeMap<_, _>>(),
                     projects
                         .items
@@ -1709,7 +1704,7 @@ impl ReconcilerWake {
         context: String,
     ) -> Result<(), String> {
         let StallTick { namespace, .. } = tick;
-        let (available_convoys, available_ensures) = (&tick.inputs.available_convoys, &tick.inputs.available_ensures);
+        let available_convoys = &tick.inputs.available_convoys;
         self.subscriptions.inner.supervisor_context.lock().await.remove(&context_key);
         condition.rung = StallRung::Operator;
         condition.supervisor = None;
@@ -1738,14 +1733,8 @@ impl ReconcilerWake {
         let mut delivery_failed = false;
         let mut operator_delivered = false;
         for (index, target) in policy.iter().enumerate().skip(start) {
-            let candidate = super::supervision::resolve_target(
-                &tick.inputs.receivers,
-                convoy,
-                &mut *condition,
-                target,
-                &available_convoys.items,
-                &available_ensures.items,
-            )?;
+            let candidate =
+                super::supervision::resolve_target(&tick.inputs.receivers, convoy, &mut *condition, target, &available_convoys.items)?;
             if let Some((target_convoy, target_vessel, target_role, rung)) = candidate {
                 if target_convoy == convoy.metadata.name
                     && stalled_source_actor(&*condition).is_some_and(|(vessel, role)| vessel == target_vessel && role == target_role)

@@ -11,18 +11,18 @@
 //! 10,000 convoys' worth of crew kinds, nine in ten homed remotely and replicated into the local
 //! store through its change stream, one in ten local. Each convoy has one vessel, leased through
 //! the placement composition on one of 100 hosts and realised, and two terminal sessions in it (an
-//! agent and a tool), realised. 100 standing roles each hold an Ensure.
+//! agent and a tool), realised.
 //!
 //! Per-event cost on the local home, one transaction each: a vessel's placement (the lease's
-//! grant and the vessel's create), its realise, a session's create and realise, and an Ensure's
-//! failed attempt. The placement ledger's rebuild from the stored live vessels, as a restart does
-//! it, is timed too. The engine's write paths (layer 7) are timed: a session's launches through
-//! the terminal port, through `decide` an Ensure's patches, and through the vessel port a pinned vessel's lease granted, realised and lost (Q6).
+//! grant and the vessel's create), its realise, and a session's create and realise. The placement
+//! ledger's rebuild from the stored live vessels, as a restart does it, is timed too. The engine's
+//! write paths (layer 7) are timed: a session's launches through the terminal port, and through
+//! the vessel port a pinned vessel's lease granted, realised and lost (Q6).
 //!
 //! Per-query reads, on a read connection, each statement's VM steps and full-scan steps counted by
 //! SQLite: a convoy's vessels (`vessel.by_launch`, by its convoy), a host's live vessels (`vessel.live_by_host`,
-//! the ledger's view), a vessel's sessions (`terminal_session.by_holder`), a convoy's sessions
-//! (its vessels by convoy, then their sessions by holder) and a role's Ensure (`ensure.by_inbox`).
+//! the ledger's view), a vessel's sessions (`terminal_session.by_holder`), and a convoy's sessions
+//! (its vessels by convoy, then their sessions by holder).
 
 use std::{
     collections::BTreeMap,
@@ -49,14 +49,12 @@ use flotilla_provisioning::{
 use flotilla_resources::{
     terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords, TerminalRenewal, PROCESS_EXITED},
     vessel_records::{VesselLaunchRequest, VesselRecords, VesselStep},
-    ConvoyEnsureStatusPatch, StatusPatch,
 };
-use flotilla_schema::{Address, KindRegistry, Ref as StoredRef, Timestamp};
+use flotilla_schema::{KindRegistry, Ref as StoredRef, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
-        ensure::{Create, Ensure, EnsureSpec, Fulfiller, Hold, MemoryEnsureWorld, Record},
         lifecycle::{MemoryLifecycleWorld, Observed, Realise, VanishCause},
         vessel::{Vessel, VesselKind},
     },
@@ -67,7 +65,6 @@ use rusqlite::{Connection, StatementStatus};
 
 const LOCAL_ONE_IN: usize = 10;
 const HOSTS: u32 = 100;
-const ROLES: usize = 100;
 
 fn convoys() -> usize {
     env::var("CREW_BENCH_CONVOYS").ok().map_or(10_000, |n| n.parse().expect("CREW_BENCH_CONVOYS is a count"))
@@ -137,7 +134,6 @@ fn realised(name: &str) -> MemoryLifecycleWorld {
 struct Crew {
     placements: Placements<StoreLog>,
     sessions: Home<TerminalSession, StoreLog>,
-    ensures: Home<Ensure, StoreLog>,
 }
 
 impl Crew {
@@ -145,11 +141,7 @@ impl Crew {
         let log = || StoreLog::new(store.clone());
         let (placements, unplaced) = Placements::new(Home::with_log(home, log()).expect("declaration"), hosts()).expect("hosts");
         assert!(unplaced.is_empty());
-        Crew {
-            placements,
-            sessions: Home::with_log(home, log()).expect("declaration"),
-            ensures: Home::with_log(home, log()).expect("declaration"),
-        }
+        Crew { placements, sessions: Home::with_log(home, log()).expect("declaration") }
     }
 
     /// Convoy `n`'s vessel placed and realised, and its two sessions realised. Returns the
@@ -181,10 +173,6 @@ impl Crew {
     }
 }
 
-fn inbox(role: usize) -> Address {
-    format!("project:p{role}/role:standing").parse().expect("inbox")
-}
-
 /// Convoy `n`'s crew session, as its vessel requests it.
 /// Convoy `n`'s crew session, held for its vessel's launch `vessel`.
 fn crew_session(n: usize, vessel: &str) -> TerminalLaunchRequest {
@@ -200,19 +188,6 @@ fn crew_session(n: usize, vessel: &str) -> TerminalLaunchRequest {
     }
 }
 
-/// Standing role `role`'s ConvoyEnsure, untouched.
-fn standing(role: usize) -> flotilla_resources::ResourceObject<flotilla_resources::ConvoyEnsure> {
-    flotilla_resources::ResourceObject {
-        metadata: meta(&format!("standing-{role}")),
-        spec: flotilla_resources::ConvoyEnsureSpec::builder()
-            .project_ref(format!("p{role}"))
-            .role("ops".into())
-            .repositories(vec![])
-            .build(),
-        status: None,
-    }
-}
-
 /// Local convoy `n`'s pinned vessel launch, on one of the hosts.
 fn pinned(n: usize) -> VesselLaunchRequest {
     VesselLaunchRequest {
@@ -220,21 +195,6 @@ fn pinned(n: usize) -> VesselLaunchRequest {
         convoy_home: "local".into(),
         work: "implement".into(),
         host: format!("host-{}", (n as u32) % HOSTS),
-    }
-}
-
-fn meta(name: &str) -> flotilla_resources::ObjectMeta {
-    flotilla_resources::ObjectMeta {
-        name: name.into(),
-        namespace: "flotilla".into(),
-        resource_version: "1".into(),
-        labels: BTreeMap::new(),
-        annotations: BTreeMap::new(),
-        owner_references: vec![],
-        finalizers: vec![],
-        deletion_timestamp: None,
-        creation_timestamp: chrono::DateTime::UNIX_EPOCH,
-        merge: None,
     }
 }
 
@@ -383,20 +343,6 @@ fn crew_load() {
     }
     per_event("session create, one transaction", locals.len(), started, "the row, its env rows, identity and log entry");
 
-    // Standing roles: an Ensure each, a fulfiller recorded and created, then held.
-    for role in 0..ROLES {
-        let name = format!("ensure-{role}");
-        crew.ensures.create(&name, EnsureSpec { inbox: inbox(role) }, &MemoryEnsureWorld::default(), Timestamp(13)).expect("created");
-        let fulfiller = Ref::<Fulfiller>::new(format!("standing-{role}"));
-        crew.ensures.apply(&name, Record { fulfiller: fulfiller.clone() }, &MemoryEnsureWorld::default(), Timestamp(14)).expect("recorded");
-        crew.ensures.apply(&name, Create { fulfiller }, &MemoryEnsureWorld::default(), Timestamp(15)).expect("created");
-    }
-    let started = Instant::now();
-    for role in 0..ROLES {
-        crew.ensures.apply(&format!("ensure-{role}"), Hold, &MemoryEnsureWorld::default(), Timestamp(16)).expect("held");
-    }
-    per_event("ensure hold, one transaction", ROLES, started, "the state and the log entry");
-
     // The crew sessions' write path (#3629 layer 7): each local convoy's crew session requested
     // and realised as the TerminalSession controller steps it, its process exited, and renewed
     // into its next launch, realised.
@@ -437,23 +383,6 @@ fn crew_load() {
         assert!(terminals.of_vessel(&vessels[n]).expect("index").len() >= 2);
     }
     eprintln!("{:>40}: {:>8.1} µs/query", "port: a vessel's served sessions", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
-
-    // Standing roles' Ensures decided through the engine: a convoy bound, failed, a replacement bound.
-    let ensures = flotilla_core::primitives::ensures::EngineEnsurePath::open(local.clone(), Arc::new(flotilla_resources::SystemClock))
-        .expect("ensures");
-    let started = Instant::now();
-    for role in 0..ROLES {
-        let mut obj = standing(role);
-        for patch in [
-            ConvoyEnsureStatusPatch::Running { convoy_ref: format!("standing-{role}-1"), observed_at: chrono::Utc::now(), strikes: 0 },
-            ConvoyEnsureStatusPatch::BackingOff { strikes: 1, retry_at: chrono::Utc::now(), failure: "convoy failed".into() },
-            ConvoyEnsureStatusPatch::Running { convoy_ref: format!("standing-{role}-2"), observed_at: chrono::Utc::now(), strikes: 1 },
-        ] {
-            let decided = ensures.decide_now(&obj, patch).expect("decided").expect("taken");
-            decided.apply(obj.status.get_or_insert_with(Default::default));
-        }
-    }
-    per_event("ensure patch decided", ROLES * 3, started, "its edges (record, create, bind or unbind), one transaction each");
 
     // The Vessel write path (#3629 layer 7, Q6): each local convoy's pinned vessel requested (its
     // lease granted), realised, then lost, through the engine's vessel port. Its lease is freed,
@@ -542,12 +471,6 @@ fn crew_load() {
     assert!(convoy_sessions.rows >= 2.0, "each convoy has its sessions");
     assert_eq!(convoy_sessions.fullscan_steps, 0.0);
     report("a convoy's sessions", &convoy_sessions);
-    let inboxes: Vec<Vec<String>> = (0..ROLES).map(|role| vec![inbox(role).to_string()]).collect();
-    let ensures =
-        measure(&read, "SELECT e.id FROM ensure e WHERE e.inbox = (SELECT id FROM strings WHERE domain = 'ad' AND s = ?1)", &inboxes);
-    assert_eq!(ensures.rows, 1.0);
-    assert_eq!(ensures.fullscan_steps, 0.0);
-    report("a role's ensure", &ensures);
     match peak_resident_kib() {
         Some(kib) => eprintln!("{:>40}: {} MiB", "peak resident memory", kib / 1024),
         None => eprintln!("{:>40}: n/a", "peak resident memory"),

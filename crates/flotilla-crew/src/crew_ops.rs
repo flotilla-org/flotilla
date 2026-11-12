@@ -2316,17 +2316,13 @@ impl CrewService {
             .iter()
             .flat_map(|(vessel, crew)| crew.iter().map(move |(role, state)| (vessel, role, state)))
             .filter(|(vessel, role, state)| {
-                // A crew whose process exited reads Pending on the engine (Working is a live
-                // session): one named by vessel and role is resumable, and has its session.
-                let named = requested_vessel.is_some() && requested_role.is_some();
-                (matches!(
+                matches!(
                     state.phase,
                     flotilla_resources::CrewWorkPhase::Working
                         | flotilla_resources::CrewWorkPhase::Interrupted
                         | flotilla_resources::CrewWorkPhase::Stalled
                         | flotilla_resources::CrewWorkPhase::Done
-                ) || (named && state.phase == flotilla_resources::CrewWorkPhase::Pending))
-                    && requested_vessel.is_none_or(|requested| requested == vessel.as_str())
+                ) && requested_vessel.is_none_or(|requested| requested == vessel.as_str())
                     && requested_role.is_none_or(|requested| requested == role.as_str())
             })
             .map(|(vessel, role, _)| (vessel.clone(), role.clone()))

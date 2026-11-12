@@ -5228,11 +5228,13 @@ impl InProcessDaemon {
         receiver: &str,
         parts: &[&str],
     ) -> Result<Option<flotilla_resources::ReadResourceObject<ResourceConvoy>>, String> {
-        let [project, convoy_name, vessel, _role] = parts else { return Ok(None) };
+        let [project, segment, vessel, _role] = parts else { return Ok(None) };
+        // A standing role's launch name carries its project's address, escaped in the segment.
+        let convoy_name = flotilla_resources::convoy_of_segment(segment);
         let convoy = self
             .resource_backend
             .including_replicas::<ResourceConvoy>(namespace)
-            .get(convoy_name)
+            .get(&convoy_name)
             .await
             .map_err(|error| format!("receiver `{receiver}` has no admitted convoy: {error}"))?;
         if convoy.object.spec.project_ref.as_deref().unwrap_or(namespace) != *project {
@@ -5278,54 +5280,67 @@ impl InProcessDaemon {
         }))
     }
 
-    /// The home of a project role receiver: its one holder declaration's stored origin.
+    /// The home of a project role receiver: its standing role's newest live generation's home, else
+    /// its definition's home, where messages wait for a generation. A role with neither has none.
     async fn project_role_receiver_origin(&self, namespace: &str, project: &str, role: &str) -> Result<Option<NodeId>, String> {
-        let declarations = self
-            .resource_backend
-            .including_replicas::<flotilla_resources::ConvoyEnsure>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut homes = declarations
+        match self.project_role_holder_origin(namespace, project, role).await? {
+            Some(home) => Ok(Some(home)),
+            None => self.project_role_definition_origin(namespace, project, role).await,
+        }
+    }
+
+    /// The home of the role's definition record. Several homes may hold the definition; its home
+    /// is the one standing admission chooses.
+    async fn project_role_definition_origin(&self, namespace: &str, project: &str, role: &str) -> Result<Option<NodeId>, String> {
+        let declarations = self.resource_backend.including_replicas::<flotilla_resources::ConvoyEnsure>(namespace);
+        // Each home's copy with its home; an HTTP backend serves only the merged read.
+        let definitions =
+            if self.resource_backend.serves_read_views() { declarations.list().await } else { declarations.list_replica_sources().await }
+                .map_err(|error| error.to_string())?;
+        let homes = definitions
             .items
             .into_iter()
-            .filter(|declaration| declaration.object.spec.project_ref == *project && declaration.object.spec.role == *role);
-        if let Some(home) = homes.next() {
-            if homes.next().is_some() {
-                return Err("project role has multiple holder declarations".into());
-            }
-            // Definitions reads merge sources and report Local even
-            // when the declaration exists only at a remote origin.
-            // Keep the merged spec for selection, but recover the home
-            // from the original stored declaration sources.
-            let home = if self.resource_backend.serves_read_views() {
-                home
-            } else {
-                let sources = self
-                    .resource_backend
-                    .including_replicas::<flotilla_resources::ConvoyEnsure>(namespace)
-                    .list_replica_sources()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                sources
-                    .items
-                    .into_iter()
-                    .filter(|source| source.object.metadata.name == home.object.metadata.name)
-                    .min_by_key(|source| {
-                        let origin = match &source.provenance {
-                            ResourceProvenance::Local => self.node_id.clone(),
-                            ResourceProvenance::Replica { origin_root, .. } => origin_root.clone(),
-                        };
-                        (source.object.metadata.creation_timestamp, origin)
-                    })
-                    .ok_or_else(|| "project role declaration has no stored origin".to_string())?
-            };
-            return Ok(Some(match home.provenance {
-                ResourceProvenance::Local => self.node_id.clone(),
-                ResourceProvenance::Replica { origin_root, .. } => origin_root,
-            }));
+            .filter(|source| source.object.metadata.deletion_timestamp.is_none())
+            .filter(|source| source.object.spec.project_ref == *project && source.object.spec.role == *role)
+            .map(|source| {
+                let home = match source.provenance {
+                    ResourceProvenance::Local => self.node_id.clone(),
+                    ResourceProvenance::Replica { origin_root, .. } => origin_root,
+                };
+                (source.object.metadata.name, source.object.metadata.creation_timestamp, home)
+            })
+            .collect::<Vec<_>>();
+        if homes.iter().any(|(name, ..)| *name != homes[0].0) {
+            return Err("project role has multiple holder declarations".into());
         }
-        Ok(None)
+        // The earliest creation, then the lexically first home: the engine keeps no creation
+        // time, so there the first home holding it.
+        Ok(homes.into_iter().map(|(_, created, home)| (created, home)).min().map(|(_, home)| home))
+    }
+
+    /// The home of the role's newest live generation, its current holder.
+    async fn project_role_holder_origin(&self, namespace: &str, project: &str, role: &str) -> Result<Option<NodeId>, String> {
+        let query = flotilla_store::StoreQuery {
+            present: vec![format!("metadata.annotations.\"{}\"", flotilla_resources::ENSURED_FROM_ANNOTATION)],
+            fields: BTreeMap::from([("spec.project_ref".into(), project.into()), ("spec.role".into(), role.into())]),
+            ..flotilla_store::live_convoys_query()
+        };
+        let convoys = self.resource_backend.query_declared::<ResourceConvoy>(namespace, &query).await.map_err(|error| error.to_string())?;
+        let generations = flotilla_store::newest_live_generations(convoys.items.iter().map(|source| &source.object));
+        let mut holders = generations.values();
+        let Some(holder) = holders.next() else { return Ok(None) };
+        if holders.next().is_some() {
+            return Err("project role has multiple holder declarations".into());
+        }
+        let home = convoys
+            .items
+            .iter()
+            .find(|source| source.object.metadata.name == holder.metadata.name)
+            .ok_or_else(|| "project role generation has no stored origin".to_string())?;
+        Ok(Some(match &home.provenance {
+            ResourceProvenance::Local => self.node_id.clone(),
+            ResourceProvenance::Replica { origin_root, .. } => origin_root.clone(),
+        }))
     }
 
     pub async fn route_remote_attach_binding(&self, binding: &AttachBinding) -> Result<ResolvedAttachPlan, String> {

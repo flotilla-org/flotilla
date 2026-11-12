@@ -115,14 +115,7 @@ pub async fn reconcile_now_acknowledges_recordless_teardown_and_readmits_the_ens
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let failed_ref = backend
-        .using::<ConvoyEnsure>("flotilla")
-        .get("quartermaster")
-        .await
-        .expect("ensure")
-        .status
-        .and_then(|status| status.convoy_ref)
-        .expect("live generation");
+    let failed_ref = quartermaster(&daemon).await.convoy_ref.expect("live generation");
     let failed = convoys.get(&failed_ref).await.expect("generation");
     fail_generation(&daemon, &failed_ref, "clone failed before the work environment was provisioned").await;
 
@@ -191,10 +184,11 @@ pub async fn reconcile_now_waits_for_periodic_backing_inspection_and_keeps_one_g
     let live =
         convoys.items.iter().filter(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal())).collect::<Vec<_>>();
     assert_eq!(live.len(), 1);
-    let status = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.expect("status");
-    assert_eq!(status.convoy_ref.as_deref(), Some(live[0].metadata.name.as_str()));
-    assert_eq!(status.last_failure, None, "a stale periodic pass must not overwrite the forced recovery");
-    assert_eq!(status.retry_at, None);
+    let role = quartermaster(&daemon).await;
+    assert_eq!(role.convoy_ref.as_deref(), Some(live[0].metadata.name.as_str()));
+    assert_eq!(role.last_failure, None, "a stale periodic pass must not overwrite the forced recovery");
+    assert_eq!(role.next_attempt, None);
+    assert_eq!(role.hold, None);
 }
 
 pub async fn driver_reconcile_now_acknowledges_recordless_teardown_and_readmits_the_ensure(factory: &dyn EnsureScenarioController) {
@@ -225,15 +219,7 @@ pub async fn driver_reconcile_now_acknowledges_recordless_teardown_and_readmits_
 pub async fn standing_backing_inspection_holds_empty_evidence_after_provisioning_started(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
-    let convoy_ref = backend
-        .using::<ConvoyEnsure>("flotilla")
-        .get("quartermaster")
-        .await
-        .expect("ensure")
-        .status
-        .expect("ensure status")
-        .convoy_ref
-        .expect("convoy ref");
+    let convoy_ref = quartermaster(&daemon).await.convoy_ref.expect("convoy ref");
     // Provisioning started: its work launched a vessel, which holds no environment yet.
     engine(&daemon).vessels.request(&convoy_ref, "work", "local");
     fail_generation(&daemon, &convoy_ref, "post-provisioning failure").await;
@@ -248,10 +234,12 @@ pub async fn standing_backing_inspection_holds_empty_evidence_after_provisioning
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("hold without backing evidence"),
         vec!["ConvoyEnsure/quartermaster held for operator attention"]
     );
-    let status = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.expect("ensure status");
+    let held = quartermaster(&daemon).await;
+    assert_eq!(held.hold, Some(StandingRoleHold::BackingUnverified));
+    assert_eq!(held.convoy_ref.as_deref(), Some(convoy_ref.as_str()), "held on its ended generation");
     assert!(
-        status.last_failure.as_deref().is_some_and(|failure| failure.contains("no backing environment evidence is available")),
-        "{status:?}"
+        held.last_failure.as_deref().is_some_and(|failure| failure.contains("no backing environment evidence is available")),
+        "{held:?}"
     );
 }
 
@@ -261,15 +249,7 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
     let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let first_ref = backend
-        .using::<ConvoyEnsure>("flotilla")
-        .get("quartermaster")
-        .await
-        .expect("ensure")
-        .status
-        .expect("ensure status")
-        .convoy_ref
-        .expect("convoy ref");
+    let first_ref = quartermaster(&daemon).await.convoy_ref.expect("convoy ref");
     let first = convoys.get(&first_ref).await.expect("standing convoy");
     // Admission froze its workflow: its vessel, `work`, names the environment held for it.
     fail_generation(&daemon, &first_ref, "provider registry unavailable").await;
@@ -305,12 +285,13 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
     clock.advance(ChronoDuration::hours(1));
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("continue holding").is_empty());
     assert!(convoys.get(&first_ref).await.is_ok(), "failed convoy and its live container must survive");
-    let held = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("held ensure");
-    assert_eq!(held.status.as_ref().expect("status").restart_count, 0);
+    let held = quartermaster(&daemon).await;
+    // ConvoyEnsure B: the failed generation is its strike as soon as it ends.
+    assert_eq!(held.strikes, 1);
+    assert_eq!(held.hold, Some(StandingRoleHold::BackingUnverified));
     assert!(
-        held.status.as_ref().expect("status").last_failure.as_deref().is_some_and(|failure| failure.contains("not verified dead")),
-        "unexpected ensure status: {:?}",
-        held.status
+        held.last_failure.as_deref().is_some_and(|failure| failure.contains("not verified dead")),
+        "unexpected standing role: {held:?}"
     );
     assert_eq!(open_holds(&backend).await.len(), 1, "the live backing holds it for a person");
 
@@ -327,21 +308,16 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
     let generations = convoys.list().await.expect("standing generations").items;
     assert_eq!(generations.len(), 2);
     assert!(generations.iter().any(|convoy| convoy.metadata.name == first_ref && convoy.spec.generation == first.spec.generation));
-    assert!(generations.iter().any(|convoy| convoy.spec.generation > first.spec.generation));
-    assert_eq!(backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 1);
+    let replacement = generations.iter().find(|convoy| convoy.spec.generation > first.spec.generation).expect("replacement");
+    let running = quartermaster(&daemon).await;
+    assert_eq!(running.convoy_ref.as_deref(), Some(replacement.metadata.name.as_str()));
+    assert_eq!(running.hold, None);
 }
 
 pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
-    let convoy_ref = backend
-        .using::<ConvoyEnsure>("flotilla")
-        .get("quartermaster")
-        .await
-        .expect("ensure")
-        .status
-        .and_then(|status| status.convoy_ref)
-        .expect("convoy ref");
+    let convoy_ref = quartermaster(&daemon).await.convoy_ref.expect("convoy ref");
     // Convoy teardown ends the convoy and its managed children: its vessel's launch is released by
     // the vessel requester once the convoy has ended; its sessions are the engine's, released then too.
     let launch = engine(&daemon).vessels.request(&convoy_ref, "work", "local");
@@ -406,14 +382,7 @@ impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for San
 pub async fn forced_convoy_delete_ends_a_convoy_whose_checkout_is_at_risk(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
-    let convoy_ref = backend
-        .using::<ConvoyEnsure>("flotilla")
-        .get("quartermaster")
-        .await
-        .expect("ensure")
-        .status
-        .and_then(|status| status.convoy_ref)
-        .expect("convoy ref");
+    let convoy_ref = quartermaster(&daemon).await.convoy_ref.expect("convoy ref");
     // A checkout the convoy's launch holds on the engine, made for it and not yet removed.
     let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy_ref.clone());
     engine(&daemon).checkouts.put_ready(

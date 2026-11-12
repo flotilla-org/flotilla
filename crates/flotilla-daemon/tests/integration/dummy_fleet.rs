@@ -340,18 +340,27 @@ async fn a_standing_ensure_readmits_after_abandon() {
         .placement_policy(DUMMY_FULFILMENT_KIND.into())
         .repositories(vec![repository.key()])
         .build();
+    // Project operations' stamps, as they materialise an ensure: on the engine a definition keeps
+    // only the stamps of its origin, so a source commit alone reads back as an operator's.
+    let source = repository.key().to_string();
     apply_annotated::<ConvoyEnsure>(
         &fleet,
         "engine-standing",
-        &[(flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION, "fixture")],
+        &[
+            (flotilla_charter::ops_entry::MATERIALIZED_PROJECT_ANNOTATION, "fleet"),
+            (flotilla_charter::ops_entry::SOURCE_REPOSITORY_ANNOTATION, source.as_str()),
+            (flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION, "fixture"),
+        ],
         ensure,
     )
     .await;
-    let generation = |ensure: &ResourceObject<ConvoyEnsure>| {
-        (ensure.metadata.name == "engine-standing").then(|| ensure.status.as_ref()?.convoy_ref.clone()).flatten()
-    };
-    let first = fleet.wait("a first generation", |ensure| generation(ensure).is_some()).await;
-    let first = generation(&first).expect("first generation");
+    let first = fleet
+        .wait("a first generation", |convoy: &ResourceObject<Convoy>| {
+            convoy.metadata.annotations.get(flotilla_resources::ENSURED_FROM_ANNOTATION).map(String::as_str) == Some("engine-standing")
+        })
+        .await
+        .metadata
+        .name;
     let open = |status: &ConvoyStatus| !status.phase.is_terminal();
     // Abandon refuses a convoy still moving out of Pending.
     fleet.wait("the first generation Active", in_phase(&first, ConvoyPhase::Active)).await;
@@ -365,13 +374,13 @@ async fn a_standing_ensure_readmits_after_abandon() {
     assert!(!matches!(abandoned, CommandValue::Error { .. }), "{abandoned:?}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let second = loop {
-        let ensure = fleet.get::<ConvoyEnsure>("engine-standing").await.expect("ensure");
-        if let Some(next) = generation(&ensure).filter(|next| next != &first) {
-            break next;
+        if let Some(next) = generations_of(&fleet, "engine-standing").await.into_iter().find(|next| next.metadata.name != first) {
+            break next.metadata.name;
         }
-        assert!(tokio::time::Instant::now() < deadline, "Ensure admits a fresh generation after abandon: {:?}", ensure.status);
+        let role = standing_role(&fleet, "engine-standing").await;
+        assert!(tokio::time::Instant::now() < deadline, "Ensure admits a fresh generation after abandon: {role:?}");
         // The ended generation waits out its backoff; skip just that.
-        skip_to_retry(&clock, ensure.status.and_then(|status| status.retry_at));
+        skip_to_retry(&clock, role.and_then(|role| role.next_attempt));
         tokio::time::sleep(Duration::from_millis(300)).await;
     };
     fleet.wait("the next generation admitted", convoy(&second, open)).await;
@@ -393,6 +402,22 @@ async fn apply_annotated<T: flotilla_resources::Resource>(fleet: &TestDaemon, na
 /// The dummy forge's service URL, as the seeded Forge records it.
 async fn catalog_forge_url(fleet: &TestDaemon) -> String {
     fleet.get::<flotilla_resources::Forge>(catalog::DUMMY_FORGE_ID).await.expect("dummy forge").spec.https_url
+}
+
+/// The standing role ensure `ensure` declares, as an operator's standing roles query shows it.
+async fn standing_role(fleet: &TestDaemon, ensure: &str) -> Option<flotilla_protocol::StandingRoleRow> {
+    let set = fleet.wait_query(flotilla_protocol::QueryId::StandingRoles { scope: None }, |_| true).await;
+    set.rows.as_standing_roles()?.iter().find(|row| row.resource.name == ensure).cloned()
+}
+
+/// The generations of the standing role ensure `ensure` declares.
+async fn generations_of(fleet: &TestDaemon, ensure: &str) -> Vec<ResourceObject<Convoy>> {
+    fleet
+        .list::<Convoy>()
+        .await
+        .into_iter()
+        .filter(|convoy| convoy.metadata.annotations.get(flotilla_resources::ENSURED_FROM_ANNOTATION).map(String::as_str) == Some(ensure))
+        .collect()
 }
 
 fn skip_to_retry(clock: &SkippingClock, retry_at: Option<chrono::DateTime<chrono::Utc>>) {
@@ -546,12 +571,10 @@ impl flotilla_resources::Clock for SkippingClock {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
     use flotilla_charter::ops_entry::{
-        ENSURED_FROM_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
-        SOURCE_REPOSITORY_ANNOTATION,
+        MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
     };
-    use flotilla_resources::{
-        ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyEnsureSpec, Project, ProjectRepositoryRole, ProjectRepositorySpec,
-    };
+    use flotilla_protocol::StandingRoleHold;
+    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, Project, ProjectRepositoryRole, ProjectRepositorySpec};
 
     let clock = Arc::new(SkippingClock::default());
     let fleet = TestDaemon::builder().clock(clock.clone() as Arc<dyn flotilla_resources::Clock>).start().await;
@@ -597,26 +620,19 @@ async fn acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
     fleet.vendor().refuse_provisioning(true);
     apply_annotated::<ConvoyEnsure>(&fleet, "quartermaster", &annotations, ensure).await;
 
-    let generations = || async {
-        fleet
-            .list::<Convoy>()
-            .await
-            .into_iter()
-            .filter(|convoy| convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(String::as_str) == Some("quartermaster"))
-            .collect::<Vec<_>>()
-    };
-    let ensure = || async { fleet.get::<ConvoyEnsure>("quartermaster").await.and_then(|ensure| ensure.status) };
+    let generations = || generations_of(&fleet, "quartermaster");
+    let role = || standing_role(&fleet, "quartermaster");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while !ensure().await.is_some_and(|status| status.hold_reason == Some(ConvoyEnsureHoldReason::RestartLimit)) {
+    while !role().await.is_some_and(|role| role.hold == Some(StandingRoleHold::RestartLimit)) {
         let latest = generations().await.into_iter().max_by_key(|convoy| convoy.spec.generation);
         assert!(
             tokio::time::Instant::now() < deadline,
-            "never held: {:?}, ensure {:?}",
+            "never held: {:?}, role {:?}",
             latest.as_ref().map(|convoy| (convoy.metadata.name.clone(), convoy.status.as_ref().map(|status| status.phase))),
-            ensure().await
+            role().await
         );
         // Each ended generation waits out its backoff; skip just that.
-        skip_to_retry(&clock, ensure().await.and_then(|status| status.retry_at));
+        skip_to_retry(&clock, role().await.and_then(|role| role.next_attempt));
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     assert_eq!(generations().await.len(), 3, "three failed generations, then the hold");

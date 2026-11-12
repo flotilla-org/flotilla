@@ -159,7 +159,14 @@ impl MessagePrimitives {
 
     /// The engine's cause and person inbox for a fact, read from the records it names.
     async fn cause(&self, namespace: &str, fact: &Fact, conversion: &Conversion<'_>) -> Result<(Cause, Address), String> {
-        let name = fact.convoy();
+        let Some(name) = fact.convoy() else {
+            let Fact::Refused { ensure, project, role } = fact else { unreachable!("only a refused admission names no convoy") };
+            // No generation was admitted: the principal admission would have stamped hears it,
+            // in the role's project, as the other standing attentions are addressed.
+            let principal = format!("principal:{}", flotilla_protocol::PrincipalRef::implicit_for_namespace(namespace).name);
+            let inbox = conversion.person(&principal, Some(project))?;
+            return Ok((Cause::Refused { role: self.standing_role(namespace, ensure, project, role).await? }, inbox));
+        };
         let mut records = self.records(namespace).await.map_err(|error| error.to_string())?;
         if !records.convoys.contains_key(name) {
             // The held read may predate the convoy: a miss is judged again on a read made now.
@@ -173,12 +180,9 @@ impl MessagePrimitives {
             Fact::Hold { .. } => Cause::Hold { convoy: held },
             Fact::ReclaimRefused { .. } => Cause::ReclaimRefused { convoy: held },
             Fact::Drift { ensure, project, role, .. } => {
-                let ensure: ResourceObject<ConvoyEnsure> =
-                    self.backend()?.definitions::<ConvoyEnsure>(namespace).get(ensure).await.map_err(|error| error.to_string())?;
-                let project = Address::project(project).map_err(|error| format!("project `{project}`: {error}"))?;
-                let role = Read { address: child(&project, Kind::Role, role)?, revision: ensure.metadata.resource_version };
-                Cause::Drift { role, convoy: held }
+                Cause::Drift { role: self.standing_role(namespace, ensure, project, role).await?, convoy: held }
             }
+            Fact::Refused { .. } => unreachable!("a refused admission names no convoy"),
             Fact::CredentialRefresh { vessel, .. } => {
                 let record = self
                     .backend()?
@@ -201,6 +205,14 @@ impl MessagePrimitives {
             }
         };
         Ok((cause, inbox))
+    }
+
+    /// The standing role `ensure` declares, read at its declaration's revision.
+    async fn standing_role(&self, namespace: &str, ensure: &str, project: &str, role: &str) -> Result<Read, String> {
+        let ensure: ResourceObject<ConvoyEnsure> =
+            self.backend()?.definitions::<ConvoyEnsure>(namespace).get(ensure).await.map_err(|error| error.to_string())?;
+        let project = Address::project(project).map_err(|error| format!("project `{project}`: {error}"))?;
+        Ok(Read { address: child(&project, Kind::Role, role)?, revision: ensure.metadata.resource_version })
     }
 
     /// Withdraws the open ones homed here, each on its subject's authority; the others stay.

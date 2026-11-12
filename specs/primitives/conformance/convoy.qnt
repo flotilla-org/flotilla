@@ -5,7 +5,7 @@
 // Event domain. Promises 0 and 1; promise 1 is never admitted, so it stays
 // unknown until declared. Seats "a" (root) and "b" (under "a") are admitted,
 // and "z" never is. Features are spread across requests rather than
-// multiplied, which keeps the graph near the Ensure harness's size: a request
+// multiplied, which keeps the graph small: a request
 // admits promise 0 (template or dispatch) alone or beside a duty (lifetime or
 // while open), or only a lifetime duty, which the crew's Declare of promise 0
 // then joins. The deciding seat matters only to the Owner authority, so the

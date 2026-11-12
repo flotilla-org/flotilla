@@ -1,6 +1,6 @@
 //! Quint ITF trace replay through the engine (#3220, #3319).
 //!
-//! `specs/primitives/check.sh` simulates the eight scenarios in
+//! `specs/primitives/check.sh` simulates the seven scenarios in
 //! `specs/primitives/scenarios/` and writes one ITF file per trace; nothing
 //! here is a stored fixture. Each trace drives the real single writer
 //! ([`Home::apply`]: attempts and receipts are edges too) and the placement
@@ -79,7 +79,7 @@ use session_value::session_value;
 use flotilla_quint_testkit::message::MessageSubject;
 use flotilla_quint_testkit::{
     itf,
-    replay::{at_address, constant, id_of, moment, same, slot_at, store, Step, Stream, Trace, INBOX, OWNER, UNIT},
+    replay::{at_address, constant, id_of, moment, same, slot_at, store, Step, Stream, Trace, OWNER, UNIT},
 };
 const ONE: &str = "1";
 
@@ -102,8 +102,7 @@ use flotilla_state_machines::{
             self, Convoy, ConvoyEdge, ConvoyId, ConvoyRequest, ConvoyState, MemoryConvoyWorld, Priority, PromiseId, PromiseSource, Quota,
             SeatName, VesselClass,
         },
-        ensure::{self, Ensure, EnsureSpec, EnsureState, FulfillerPhase, FulfillerStatus, MemoryEnsureWorld, UnbindReason},
-        lifecycle::{self, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed},
+        lifecycle::{self, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState, MemoryLifecycleWorld, Observed},
         message::{
             self, DropReason, InboxBinding, MemoryMessageWorld, Message, MessageEdge, MessageEdgeKind, MessageRef, MessageSpec,
             MessageState,
@@ -307,13 +306,6 @@ impl LifecycleKind for CloneKind {
     fn policy() -> AttemptPolicy {
         AttemptPolicy::immediate(2)
     }
-}
-
-/// `ensure_bind`'s fulfillers: terminal sessions an Ensure keeps bound.
-struct TerminalSession;
-impl LifecycleKind for TerminalSession {
-    const NAME: &'static str = "TerminalSession";
-    type Request = ();
 }
 
 /// `admission_placement`'s vessels; the ledger holds their placement requests.
@@ -1263,165 +1255,6 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
 }
 
 // ---------------------------------------------------------------------------
-// ensure_bind: an Ensure and the lifecycles of its fulfillers
-
-type Fulfillers = Home<Lifecycle<TerminalSession>>;
-
-fn phase(state: &LifecycleState) -> FulfillerPhase {
-    match state {
-        LifecycleState::Requested { .. } => FulfillerPhase::Requested,
-        LifecycleState::Realised { .. } => FulfillerPhase::Realised,
-        LifecycleState::Gone { .. } => FulfillerPhase::Gone,
-        LifecycleState::GaveUp { .. } => FulfillerPhase::GaveUp,
-    }
-}
-
-/// What the Ensure reads: each fulfiller's phase from its lifecycle resource,
-/// a drained inbox and a complete teardown (the scenario passes `true` for
-/// both), and the authority as the step's `auth` pick.
-fn ensure_world(fulfillers: &Fulfillers, authorised: bool) -> MemoryEnsureWorld {
-    let mut world = MemoryEnsureWorld::default();
-    for resource in fulfillers.resources() {
-        world.fulfillers.put(&Ref::new(resource.name()), FulfillerStatus { phase: phase(resource.state()), can_receive: true });
-    }
-    world.drains.put(&Ref::new(INBOX), true);
-    world.authorities.put(&owner(), authorised);
-    world.teardowns.put(&Ref::new("fulfillers"), true);
-    world
-}
-
-fn ensure_work(model: &Value) -> &Value {
-    match tag(model) {
-        "Fulfilled" => &payload(model)["work"],
-        _ => payload(model),
-    }
-}
-
-fn fulfiller_set(fulfillers: &ensure::Fulfillers) -> Value {
-    set_of(fulfillers.iter().map(|fulfiller| int(id_of(fulfiller.name()))))
-}
-
-/// The spec's `Unfulfilled(Work) | Fulfilled({ work, bound }) | Held(Work) | Retired(Work)`
-/// with `Work = { recorded, created }`: the state's data.
-fn ensure_value(_: &Home<Ensure>, resource: &Resource<Ensure>) -> Value {
-    let state = resource.state();
-    let work = json!({ "recorded": fulfiller_set(state.recorded()), "created": fulfiller_set(state.created()) });
-    match state {
-        EnsureState::Unfulfilled { .. } => variant("Unfulfilled", work),
-        EnsureState::Fulfilled { bound, .. } => variant("Fulfilled", json!({ "work": work, "bound": int(id_of(bound.name())) })),
-        EnsureState::Held { .. } => variant("Held", work),
-        EnsureState::Retired { .. } => variant("Retired", work),
-    }
-}
-
-/// From the reached state: a create the Rust gates would accept names a
-/// recorded fulfiller while none is live (`recordedBeforeCreate`,
-/// `oneLiveFulfiller`); a bind names a recorded one (`boundRecorded`); a
-/// Retired Ensure refuses everything.
-fn probe_ensure(home: &mut Home<Ensure>, fulfillers: &Fulfillers, state: &Value, now: Timestamp, step: &Step, tally: &mut Tally) {
-    let Some(model) = slot_at(state, "::ensures", 1) else { return };
-    let world = ensure_world(fulfillers, true);
-    let fulfiller = |id: i64| Ref::<ensure::Fulfiller>::new(id.to_string());
-    if tag(model) == "Retired" {
-        let probes = vec![
-            ensure::Record { fulfiller: fulfiller(1) }.into(),
-            ensure::Create { fulfiller: fulfiller(2) }.into(),
-            ensure::Bind { fulfiller: fulfiller(1) }.into(),
-            ensure::Unbind { reason: UnbindReason::Gone, fulfiller: fulfiller(1) }.into(),
-            ensure::Hold.into(),
-            ensure::Resume { by: "owner".into(), authority: owner() }.into(),
-            ensure::Retire { by: "owner".into(), authority: owner(), teardown: Ref::new("fulfillers") }.into(),
-        ];
-        assert_end_refuses(home, ONE, probes, &world, now, step, tally);
-        return;
-    }
-    // The negative `auth` pick: without authority, resume and retire refuse.
-    let refused = ensure_world(fulfillers, false);
-    let resume = ensure::Resume { by: "owner".into(), authority: owner() };
-    assert!(!would_accept(home, ONE, resume, &refused, now, tally), "{step}: resumes without authority");
-    let retire = ensure::Retire { by: "owner".into(), authority: owner(), teardown: Ref::new("fulfillers") };
-    assert!(!would_accept(home, ONE, retire, &refused, now, tally), "{step}: retires without authority");
-    // `heldUnbound`: a hold the Rust gate would allow leaves nothing bound.
-    if would_accept(home, ONE, ensure::Hold, &world, now, tally) {
-        assert_eq!(tag(model), "Unfulfilled", "{step}: holds a bound Ensure");
-    }
-    let recorded: BTreeSet<i64> = set(&ensure_work(model)["recorded"]).iter().map(number).collect();
-    for id in [1, 2] {
-        if would_accept(home, ONE, ensure::Create { fulfiller: fulfiller(id) }, &world, now, tally) {
-            assert!(recorded.contains(&id), "{step}: creates unrecorded fulfiller {id}");
-            let live: Vec<&str> = fulfillers.resources().filter(|r| r.state().live()).map(Resource::name).collect();
-            assert!(live.is_empty(), "{step}: creates fulfiller {id} while {live:?} live");
-        }
-        if would_accept(home, ONE, ensure::Bind { fulfiller: fulfiller(id) }, &world, now, tally) {
-            assert!(recorded.contains(&id), "{step}: binds unrecorded fulfiller {id}");
-        }
-    }
-}
-
-/// The scenario's `L::releaseAll(recorded, true)` on retire: each recorded
-/// fulfiller is released, and one the model left unchanged (already ended)
-/// must be refused.
-fn release_all(fulfillers: &mut Fulfillers, step: &Step, now: Timestamp, tally: &mut Tally) {
-    let model = slot_at(step.before, "::ensures", 1).expect("retiring Ensure");
-    let mut world = MemoryLifecycleWorld::default();
-    world.teardowns.put(&Ref::new("fulfillers"), true);
-    for id in set(&ensure_work(model)["recorded"]).iter().map(number) {
-        let name = id.to_string();
-        if fulfillers.get(&name).is_none() {
-            continue;
-        }
-        let changed = slot_at(step.before, "::resources", id) != slot_at(step.after, "::resources", id);
-        let result = fulfillers.apply(&name, lifecycle::Release { teardown: Ref::new("fulfillers") }, &world, now).map(|_| ());
-        match (changed, result) {
-            (true, Ok(())) => tally.writes += 1,
-            (false, Err(WriteError::Refused(LifecycleRefusal::Ended(_)))) => tally.refusals += 1,
-            (changed, result) => panic!("{step}: releasing fulfiller {id} (model changed it: {changed}) answered {result:?}"),
-        }
-    }
-}
-
-fn ensure_bind(trace: &Trace, tally: &mut Tally) {
-    let mut home = Home::<Ensure>::new("home").expect("declaration");
-    let mut fulfillers = Fulfillers::new("home").expect("declaration");
-    for step in trace.steps() {
-        tally.steps += 1;
-        let now = step.tick();
-        let who = step.chosen("who");
-        let name = who.to_string();
-        let world = ensure_world(&fulfillers, step.yes("auth"));
-        let fulfiller = Ref::<ensure::Fulfiller>::new(name.clone());
-        match step.action() {
-            "request" => create(&mut home, ONE, EnsureSpec { inbox: at_address(INBOX) }, &world, &step, tally),
-            "record" => accept(&mut home, ONE, ensure::Record { fulfiller }, &world, now, &step, tally),
-            "create" => {
-                accept(&mut home, ONE, ensure::Create { fulfiller }, &world, now, &step, tally);
-                create(&mut fulfillers, &name, (), &MemoryLifecycleWorld::default(), &step, tally);
-            }
-            op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut fulfillers, &name, op, true, true, "model", now, &step, tally),
-            "bind" => accept(&mut home, ONE, ensure::Bind { fulfiller }, &world, now, &step, tally),
-            "unbind" => accept(&mut home, ONE, ensure::Unbind { reason: UnbindReason::Gone, fulfiller }, &world, now, &step, tally),
-            "hold" => accept(&mut home, ONE, ensure::Hold, &world, now, &step, tally),
-            "resume" => accept(&mut home, ONE, ensure::Resume { by: "owner".into(), authority: owner() }, &world, now, &step, tally),
-            "retire" => {
-                let edge = ensure::Retire { by: "owner".into(), authority: owner(), teardown: Ref::new("fulfillers") };
-                accept(&mut home, ONE, edge, &world, now, &step, tally);
-                release_all(&mut fulfillers, &step, now, tally);
-            }
-            "unchanged" => {}
-            other => panic!("{step}: ensure_bind operation {other}"),
-        }
-        check_store(&home, store(step.after, "::ensures"), ensure_value, &step, "Ensure");
-        check_store(&fulfillers, store(step.after, "::resources"), lifecycle_value, &step, "fulfiller");
-        for id in [1, 2] {
-            if ended(&fulfillers, &id.to_string()) {
-                lifecycle_end_refuses(&mut fulfillers, &id.to_string(), "model", now, &step, tally);
-            }
-        }
-        probe_ensure(&mut home, &fulfillers, step.after, now, &step, tally);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // inbox_delivery and service_delivery: Message and consumer session stores
 
 /// These engine compositions differ in their consumers, stream and evidence.
@@ -1880,9 +1713,8 @@ fn scenario_of<'a>(file: &str, prefix: &'a str) -> Option<&'a str> {
 fn replay_quint_itf_traces() {
     let directory =
         std::env::var("QUINT_TRACE_DIR").expect("QUINT_TRACE_DIR names a directory of ITF traces from specs/primitives/check.sh");
-    let scenarios: [(&str, Scenario); 8] = [
+    let scenarios: [(&str, Scenario); 7] = [
         ("convoy_deliver", convoy_deliver),
-        ("ensure_bind", ensure_bind),
         ("inbox_delivery", inbox_delivery),
         ("message_race", message_race::<BareMessage>),
         ("service_delivery", service_delivery),
@@ -1890,7 +1722,7 @@ fn replay_quint_itf_traces() {
         ("admission_placement", admission_placement),
         ("reply_exchange", reply_exchange),
     ];
-    let mut tallies = [Tally::default(); 8];
+    let mut tallies = [Tally::default(); 7];
     let mut paths: Vec<_> = fs::read_dir(Path::new(&directory))
         .unwrap_or_else(|error| panic!("read {directory}: {error}"))
         .map(|entry| entry.expect("entry").path())

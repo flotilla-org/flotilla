@@ -19,6 +19,48 @@ pub fn live_convoys_query() -> crate::StoreQuery {
     }
 }
 
+/// Each named standing role's current generation: its newest live convoy, by the ConvoyEnsure name
+/// the convoy was ensured from. A role with no live generation is absent. Every host reads the same
+/// generations, so the answer needs no status of the ensure's own (#3108).
+pub async fn current_generations(
+    backend: &crate::ResourceBackend,
+    namespace: &str,
+    ensures: impl IntoIterator<Item = String>,
+) -> Result<BTreeMap<String, flotilla_resources::ResourceObject<flotilla_resources::Convoy>>, flotilla_resources::ResourceError> {
+    let names: Vec<String> = ensures.into_iter().collect();
+    if names.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let rows = backend.query_declared::<flotilla_resources::Convoy>(namespace, &generations_query(names)).await?.items;
+    Ok(newest_live_generations(rows.iter().map(|row| &row.object)).into_iter().map(|(ensure, convoy)| (ensure, convoy.clone())).collect())
+}
+
+/// The live convoys ensured from the named ConvoyEnsures: what [`current_generations`] reads, for
+/// a reader that folds it into a wider query.
+pub fn generations_query(ensures: Vec<String>) -> crate::StoreQuery {
+    let mut query = live_convoys_query();
+    query.field_values.insert(format!("metadata.annotations.\"{}\"", flotilla_resources::ENSURED_FROM_ANNOTATION), ensures);
+    query
+}
+
+/// Each standing role's current generation among `convoys`: its newest live convoy, by the
+/// ConvoyEnsure name it was ensured from.
+pub fn newest_live_generations<'a>(
+    convoys: impl IntoIterator<Item = &'a flotilla_resources::ResourceObject<flotilla_resources::Convoy>>,
+) -> BTreeMap<String, &'a flotilla_resources::ResourceObject<flotilla_resources::Convoy>> {
+    let mut current = BTreeMap::<String, &flotilla_resources::ResourceObject<flotilla_resources::Convoy>>::new();
+    for convoy in convoys {
+        let Some(ensure) = convoy.metadata.annotations.get(flotilla_resources::ENSURED_FROM_ANNOTATION) else { continue };
+        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            continue;
+        }
+        if current.get(ensure).is_none_or(|held| held.spec.generation < convoy.spec.generation) {
+            current.insert(ensure.clone(), convoy);
+        }
+    }
+    current
+}
+
 /// Resolves a convoy address to its local record name.
 pub async fn resolve_local_convoy_name(backend: &crate::ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
     let convoys = backend.clone().using::<flotilla_resources::Convoy>(namespace);

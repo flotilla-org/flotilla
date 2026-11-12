@@ -910,9 +910,12 @@ pub struct StandingRoleRow {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presents_as: Option<String>,
-    /// Current attempt as recorded by the ensure controller. Driver-managed
-    /// ensures leave this empty; consumers resolve attempts through
-    /// [`ConvoyRow::ensured_from`].
+    /// Whether the role's state could not be read: its hold, strikes, next attempt and failure
+    /// are then unknown, never "not held".
+    #[builder(default)]
+    #[serde(default)]
+    pub state_unknown: bool,
+    /// Its current generation: the newest live one, or the ended one it is held on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

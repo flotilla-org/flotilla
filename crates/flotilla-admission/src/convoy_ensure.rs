@@ -4,9 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
-use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureStatusPatch, ConvoyProvisioningState, ReadResourceObject, ResourceObject,
-};
+use flotilla_resources::{Convoy as ResourceConvoy, ConvoyEnsure, ConvoyProvisioningState, ReadResourceObject, ResourceObject};
 
 use crate::convoy_admission::PreparedConvoyAdmission;
 
@@ -44,6 +42,9 @@ pub trait ConvoyEnsureReconciler: Send + Sync {
     /// The earliest time the last full pass deferred an ensure to (a strike's backoff or an
     /// admission refusal's retry): nothing else wakes the pass then.
     fn next_due(&self, namespace: &str) -> Option<chrono::DateTime<chrono::Utc>>;
+    /// Role `role` of project `project`, as derived from its generations (#3108); `None` when
+    /// no ensure declares it.
+    async fn standing_role(&self, namespace: &str, project: &str, role: &str) -> Result<Option<crate::standing::StandingRole>, String>;
 }
 
 /// Admission and lifecycle operations used by the standing-convoy controller.
@@ -64,26 +65,6 @@ pub trait ConvoyEnsureAdmission: Send + Sync {
         admission: PreparedConvoyAdmission,
         annotations: BTreeMap<String, String>,
     ) -> Result<String, String>;
-}
-
-/// The `[primitives]` switch's Ensure path (#3629 layer 7). With it on, the
-/// engine's Ensure decides each standing-convoy status write: the pass reports
-/// the patch it would write, the engine applies what it means (record, create,
-/// attempt, bind, unbind, hold, resume) and answers with the patch the old
-/// status may take. The copy runs one way, engine to old. Absent, nothing
-/// changes.
-#[async_trait]
-pub trait EngineEnsures: Send + Sync {
-    /// The patch `ensure` may take for `patch`: `patch` itself when the engine
-    /// took what it means, or `None` when the engine refused it and the old
-    /// status stays as it is. An Ensure the engine does not hold (one written
-    /// before the switch, until the import) keeps the old path: `patch` passes.
-    async fn decide(
-        &self,
-        namespace: &str,
-        ensure: &ResourceObject<ConvoyEnsure>,
-        patch: ConvoyEnsureStatusPatch,
-    ) -> Result<Option<ConvoyEnsureStatusPatch>, String>;
 }
 
 /// Verifies the provider backing of a terminal standing convoy before the

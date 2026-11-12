@@ -21,7 +21,7 @@ use flotilla_state_machines::{
         agent_session::AgentSession,
         awaiting_reply::AwaitingReply,
         consumer::Consumer,
-        convoy, ensure,
+        convoy,
         message::{Message, ReceiptLog},
         person::Person,
         vessel,
@@ -72,21 +72,16 @@ pub fn convoy_registry() -> Result<KindRegistry, RegistryError> {
     Ok(kinds)
 }
 
-/// Registers the engine's crew kinds the `[primitives]` switch moves (#3629 layer 6): Vessel,
-/// the placement lease, and Ensure, each under its production code.
+/// Registers the engine's crew kind the `[primitives]` switch moves (#3629 layer 6): Vessel, the
+/// placement lease, under its production code.
 pub fn register_crew(kinds: &mut KindRegistry) -> Result<(), RegistryError> {
     kinds.register::<Resource<vessel::Vessel>>()?;
-    kinds.register::<Resource<ensure::Ensure>>()?;
     Ok(())
 }
 
 /// The machine diagram of each kind [`register_crew`] registers, by kind name.
 pub fn crew_diagrams() -> std::collections::BTreeMap<String, String> {
-    [
-        (Resource::<vessel::Vessel>::KIND.to_owned(), vessel::Vessel::definition().mermaid(flotilla_state_machines::Diagram::Full)),
-        (Resource::<ensure::Ensure>::KIND.to_owned(), ensure::Ensure::definition().mermaid(flotilla_state_machines::Diagram::Full)),
-    ]
-    .into()
+    [(Resource::<vessel::Vessel>::KIND.to_owned(), vessel::Vessel::definition().mermaid(flotilla_state_machines::Diagram::Full))].into()
 }
 
 fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
@@ -98,7 +93,7 @@ fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
 // IDs; a partially promoted commit leaves valid entries or cache misses. Reads
 // cache only committed IDs, and identity removal only invalidates cache entries.
 // No resource state is cached in Store, so there is nothing to rebuild here.
-// Recover as the provisioning and Ensure home wrappers do above this log.
+// Recover as the provisioning home wrappers do above this log.
 fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
     store.lock().unwrap_or_else(|poisoned| {
         let store = poisoned.into_inner();
