@@ -1475,7 +1475,7 @@ impl InProcessDaemon {
         });
         daemon.install_decided_store(engine.service)?;
         engine.source_observers.install(Arc::new(flotilla_observation::forge_observation::DaemonSourceObservers::new(
-            daemon.resource_backend(),
+            &daemon.resource_backend,
             Arc::clone(&daemon.provisioning_namespace),
         )))?;
         daemon.install_observation_records(engine.observations, engine.observation_failures)?;

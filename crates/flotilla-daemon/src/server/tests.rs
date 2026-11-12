@@ -1141,6 +1141,38 @@ async fn dispatch_add_list_remove_repo_round_trip() {
     assert!(matches!(ok_response(remove, 12), Response::RemoveRepo));
 }
 
+/// A dropped daemon releases its resource backend and its decided store, so a daemon
+/// restarted in the same process over the same state directory does not find them held.
+#[test]
+fn dropped_daemon_releases_its_stores() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(tmp.path().join("config"));
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let (backend, decided) = runtime.block_on(async {
+        let (backend, _metrics) = super::build_embedded_resource_backend(&config).await.expect("backend");
+        let daemon = InProcessDaemon::new_composed(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery(false),
+            HostName::local(),
+            backend,
+            Arc::new(flotilla_resources::SystemClock),
+            Arc::new(crate::peer::HostPeerOverlay::default()),
+            crate::runtime::engine_opener(&config),
+        )
+        .await
+        .expect("daemon should compose");
+        let backend = daemon.resource_backend().downgrade();
+        let decided = Arc::downgrade(&daemon.decided_store().expect("decided store should open"));
+        drop(daemon);
+        (backend, decided)
+    });
+    drop(runtime);
+
+    assert!(backend.upgrade().is_none(), "the dropped daemon's resource backend is still held");
+    assert!(decided.upgrade().is_none(), "the dropped daemon's decided store is still held");
+}
+
 #[tokio::test]
 async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
     let tmp = tempfile::tempdir().expect("tempdir");
