@@ -396,11 +396,13 @@ mod tests {
 
     use super::*;
     use flotilla_engine_messages::{MessagePrimitives, RequestAnswer};
+    use flotilla_engine_messages_testkit::Served;
 
     const NAMESPACE: &str = "flotilla";
     const HOME: &str = "home-a";
 
-    async fn primitives(dir: &tempfile::TempDir) -> Arc<MessagePrimitives> {
+    /// The home's Message primitives, with the backend that serves them held as long as they are.
+    async fn primitives(dir: &tempfile::TempDir) -> Served<Arc<MessagePrimitives>> {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         backend
             .clone()
@@ -426,7 +428,7 @@ mod tests {
         let service = Arc::new(
             Service::open(&dir.path().join("decided.sqlite"), HOME, flotilla_engine_store::registry().expect("registry")).expect("store"),
         );
-        Arc::new(MessagePrimitives::open(HOME, service, backend, Arc::new(SystemClock)).expect("primitives"))
+        Served::new(Arc::new(MessagePrimitives::open(HOME, service, backend.clone(), Arc::new(SystemClock)).expect("primitives")), backend)
     }
 
     /// The checkouts asked about, and the launch each is realised under.
