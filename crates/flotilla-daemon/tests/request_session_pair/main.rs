@@ -1395,9 +1395,12 @@ async fn router_homing_scenario_table_runs_mutations_at_the_record_home() {
     }
 }
 
+/// A routed command, built from the launch it targets.
+type LaunchAction = fn(&str) -> CommandAction;
+
 #[tokio::test]
 async fn router_delivery_scenario_table_reaches_remote_convoy_authority() {
-    let scenarios: [(&str, fn(&str) -> CommandAction); 4] = [
+    let scenarios: [(&str, LaunchAction); 4] = [
         ("ensure-roll", |_| CommandAction::ConvoyEnsureRoll { namespace: "flotilla".into(), name: "remote-ensure".into() }),
         ("resume", |launch| CommandAction::ConvoyResume {
             reopen: false,

@@ -30,6 +30,7 @@ use tokio_tungstenite::{
 use tower::ServiceExt;
 
 use super::{surface, CallerAuth, HttpRouter, ListenerOrigin, LoginStore};
+use crate::testkits::engine::admit_convoy;
 
 const HOST: &str = "surface.test";
 const WAIT: Duration = Duration::from_secs(10);
@@ -536,7 +537,7 @@ impl Daemon {
     async fn convoy(&self, name: &str) -> String {
         let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
         let convoy = flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, flotilla_engine_convoys_testkit::single_agent("coder"));
-        crate::testkits::engine::admit_convoy(&self.daemon, convoy).await
+        admit_convoy(&self.daemon, convoy).await
     }
 
     /// The framed protocol's result set for `query`, as `SubscribeQueries` replays it.

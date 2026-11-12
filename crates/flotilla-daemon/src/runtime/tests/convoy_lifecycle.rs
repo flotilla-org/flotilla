@@ -1,5 +1,5 @@
 use super::*;
-use crate::testkits::engine::engine;
+use crate::testkits::engine::{admit_convoy, engine};
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 
@@ -521,7 +521,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     let repository_key = flotilla_resources::RepositoryKey("repo-a".to_string());
 
     // A's engine readings, which read every home's records in its decided store.
-    crate::testkits::engine::engine(&authority_daemon);
+    engine(&authority_daemon);
     // Checkout host B is another home of A's decided store: each home's log reaches the other.
     let decided = authority_daemon.decided_store().expect("authority decided store");
     let checkout_home = flotilla_provisioning_testkit::other_home_for(&decided, "checkout-root");
@@ -559,7 +559,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
             .build()])
         .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "checkout-b".to_string())]))
         .build();
-    let convoy_name = crate::testkits::engine::admit_convoy(
+    let convoy_name = admit_convoy(
         &authority_daemon,
         flotilla_engine_convoys_testkit::convoy(NAMESPACE, "cross-host", spec, status),
     )

@@ -41,6 +41,7 @@ use crate::server::{
         Verbs,
     },
 };
+use crate::testkits::engine::admit_convoy;
 
 #[path = "../../../../../tests/support/span_exporter.rs"]
 mod span_exporter;
@@ -483,7 +484,7 @@ async fn convoy_explain_finds_a_convoy_by_its_record_name_or_role() {
     let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role("fix-3774".into()).build();
     let mut convoy = flotilla_engine_convoys_testkit::convoy(&namespace, "convoy-0123", spec, flotilla_engine_convoys_testkit::single_agent("coder"));
     convoy.metadata.labels = labels;
-    let launch = crate::testkits::engine::admit_convoy(&daemon, convoy).await;
+    let launch = admit_convoy(&daemon, convoy).await;
     let router =
         HttpRouter::for_daemon(Arc::clone(&daemon), Arc::new(LoginStore::new(daemon.clock_for_scenarios())), ListenerOrigin::default())
             .into_router();
