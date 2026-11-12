@@ -33,9 +33,6 @@ pub(super) async fn crew_message_views(
     message_views(backend, namespace, &super::projection_ports::MessageReceiverEvidence(receivers, None), None, &BTreeSet::new()).await
 }
 
-/// The `[primitives]` Convoy path, off: explanations read the stored promises.
-static NO_CONVOY_ENGINE: std::sync::LazyLock<flotilla_resources::convoy::engine::EngineConvoyPath> =
-    std::sync::LazyLock::new(Default::default);
 /// Receiver evidence with the switch off: Messages are read from the old store.
 static OLD_STORE_RECEIVERS: std::sync::LazyLock<super::projection_ports::MessageReceivers> =
     std::sync::LazyLock::new(|| super::projection_ports::MessageReceivers(Default::default()));
@@ -319,6 +316,9 @@ mod tests {
         engine: flotilla_provisioning_testkit::EnvironmentFixture,
         /// The engine's Message path, whose attentions the projections read.
         _messages: Arc<flotilla_engine_messages::MessagePrimitives>,
+        /// The engine's Convoy path, holding none of the test's convoys: explanations read them as stored.
+        _convoys: flotilla_engine_convoys_testkit::EngineConvoysHome,
+        convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
     }
 
     #[async_trait]
@@ -382,8 +382,19 @@ mod tests {
                 .expect("decided store"),
             );
             let _messages = engine_messages(service, &backend);
+            // Its own backend, so its convoy views do not stand in for the convoys the tests store.
+            let _convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::open(
+                node_id.as_str(),
+                "flotilla",
+                &ResourceBackend::new(InMemoryBackend::default()),
+                Arc::new(SystemClock),
+                Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+            );
+            let convoy_engine = _convoys.path();
             Self {
                 _messages,
+                _convoys,
+                convoy_engine,
                 temp,
                 backend,
                 config,
@@ -419,7 +430,7 @@ mod tests {
                 leaf_subscriptions: &self.subscriptions,
                 fleet: &self.fleet,
                 lifecycles: self.engine.reads.as_ref(),
-                convoy_engine: &NO_CONVOY_ENGINE,
+                convoy_engine: &self.convoy_engine,
                 accounts: &self.accounts,
                 manifest_roots: &self.manifest_roots,
                 attentions: self.backend.attentions(),

@@ -192,18 +192,15 @@ pub fn deciding<'a>(path: &'a EngineConvoyPath, convoy: &ResourceObject<Convoy>)
 
 /// A convoy as its readers see it (#3587 layer 8), read at its home (a
 /// replica's origin home): with the engine's promises in place of the stored
-/// ones when the engine holds it, else as stored. A failed read is an error,
-/// never the stored record: an engine-held convoy's stored promises were
-/// handed over, and would read as none.
+/// ones when the engine holds it, else as stored. A failed read, or one before
+/// the path is installed, is an error, never the stored record: an engine-held
+/// convoy's stored promises were handed over, and would read as none.
 pub fn viewed_read(path: &EngineConvoyPath, read: &ReadResourceObject<Convoy>) -> Result<ResourceObject<Convoy>, String> {
     let home = match &read.provenance {
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str()),
         _ => None,
     };
-    let held = match path.get() {
-        Some(engine) => engine.promises(&read.object, home)?,
-        None => None,
-    };
+    let held = path.get().ok_or(NO_ENGINE)?.promises(&read.object, home)?;
     Ok(match held {
         Some(promises) => with_promises(&read.object, promises),
         None => read.object.clone(),
@@ -439,13 +436,13 @@ mod tests {
     }
 
     // Behaviour (#3587 layer 8): readers see the engine's promises in place of the stored ones when
-    // the switch is on and the engine holds the convoy, asked at the convoy's own home; with the
-    // switch off, or for a convoy the engine does not hold, they see the record as stored.
+    // the engine holds the convoy, asked at the convoy's own home; for a convoy the engine does not
+    // hold, they see the record as stored. Before the path is installed, a read is refused.
     #[test]
     fn readers_see_the_engines_promises_only_where_it_holds_the_convoy() {
         let local = |name: &str| ReadResourceObject { object: convoy(name), provenance: ResourceProvenance::Local };
-        let off = EngineConvoyPath::default();
-        assert!(viewed_read(&off, &local("c")).expect("read").status.expect("status").promises.is_empty(), "switch off: as stored");
+        let uninstalled = EngineConvoyPath::default();
+        assert_eq!(viewed_read(&uninstalled, &local("c")).expect_err("uninstalled: refused"), NO_ENGINE);
 
         let engine = Arc::new(Holding { asked: Mutex::new(Vec::new()), memory: Default::default() });
         let on = EngineConvoyPath::default();

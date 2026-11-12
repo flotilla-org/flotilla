@@ -3454,6 +3454,7 @@ dependencies = [
  "flotilla-charter",
  "flotilla-config",
  "flotilla-daemon-api",
+ "flotilla-engine-convoys-testkit",
  "flotilla-forge-github",
  "flotilla-github-providers",
  "flotilla-issue-tracker",

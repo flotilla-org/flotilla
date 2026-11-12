@@ -3347,6 +3347,21 @@ mod tests {
             .await;
     }
 
+    /// `aggregator` reading its convoy rows through an installed engine Convoy path, as the
+    /// daemon's does; the engine holds none of the test's convoys, so their rows show them as
+    /// stored. The path lives as long as the returned home.
+    pub(super) fn with_convoy_engine(aggregator: Aggregator) -> (Aggregator, flotilla_engine_convoys_testkit::EngineConvoysHome) {
+        let engine_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let home = flotilla_engine_convoys_testkit::EngineConvoysHome::open(
+            OWN_HOME,
+            "flotilla",
+            &engine_backend,
+            Arc::new(flotilla_resources::SystemClock),
+            Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        );
+        (aggregator.with_convoy_engine(home.path(), "flotilla"), home)
+    }
+
     /// This home hears from `home` at `at`, as a keepalive or entry on its change stream.
     async fn home_heard(aggregator: &mut Aggregator, home: &str, at: chrono::DateTime<Utc>) {
         aggregator.agent_sessions_changed(AgentSessionUpdate::Heard { home: flotilla_protocol::NodeId::new(home), at }).await;
@@ -3366,7 +3381,7 @@ mod tests {
     async fn pending_supervisor_turn_is_visible_on_the_governor_convoy() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut governor = convoy_with_vessel("governor").await;
         let status = governor.status.as_mut().expect("status");
         status.attention = Some(flotilla_resources::ConvoyAttention {
@@ -3419,7 +3434,7 @@ mod tests {
     async fn fleet_surface_states_keep_available_and_handled_stalls_out_of_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         for name in ["governor-a", "governor-b", "governor-c", "crew", "orphan"] {
             let mut convoy = convoy_with_vessel(name).await;
             if name == "crew" || name == "orphan" {
@@ -3517,8 +3532,9 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let attentions = Arc::new(SetAttentions::default());
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla"),
+        );
         let query = QueryId::Convoys { scope: None };
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query, since: None }]);
         aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
@@ -3556,7 +3572,7 @@ mod tests {
     async fn idle_crew_with_composer_text_names_itself_in_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         state
             .replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: QueryId::Convoys { scope: None }, since: None }]);
         aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
@@ -3605,8 +3621,9 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let attentions = Arc::new(SetAttentions::default());
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla"),
+        );
         state
             .replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: QueryId::Convoys { scope: None }, since: None }]);
         aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
@@ -3646,7 +3663,7 @@ mod tests {
     async fn attention_projection_is_namespace_scoped_and_tracks_idle_unsettled_sessions() {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
         let query = QueryId::Convoys { scope: None };
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: query.clone(), since: None }]);
@@ -3689,7 +3706,7 @@ mod tests {
     async fn adopted_change_request_claim_does_not_raise_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = convoy_with_vessel("adopted-pr").await;
         let subject = Subject {
             kind: flotilla_protocol::SubjectKind::ChangeRequest,
@@ -3718,7 +3735,7 @@ mod tests {
     async fn multiple_produced_subjects_do_not_raise_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         let now = Utc::now();
         for number in [281, 282] {
@@ -3762,7 +3779,7 @@ mod tests {
     async fn vessel_projection_surfaces_terminal_degradation_loss_and_recovery() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("health-convoy").await)).await;
         let mut session = session_object("health-session").await;
         session.metadata.labels =
@@ -3799,7 +3816,7 @@ mod tests {
     async fn vessel_needs_you_overrides_a_different_handled_stall() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         let status = convoy.status.as_mut().expect("convoy status");
         status
@@ -3858,7 +3875,8 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
         let resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(Arc::clone(&resolver));
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(Arc::clone(&resolver)));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement = Some(PlacementStatus {
             fields: BTreeMap::from([
@@ -3913,7 +3931,8 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
         let resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(resolver);
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(resolver));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement =
             Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
@@ -3963,9 +3982,11 @@ mod tests {
         let resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
         // The daemon's clock, which the test moves: the deadline is judged against it.
         let clock = Arc::new(ManualClock(std::sync::Mutex::new(Utc::now())));
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
-            .with_attach_resolver(resolver)
-            .with_clock(Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>);
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
+                .with_attach_resolver(resolver)
+                .with_clock(Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>),
+        );
         let mut convoy = convoy_with_vessel("convoy-a").await;
         let status = convoy.status.as_mut().expect("convoy status");
         status.work.get_mut("implement").expect("work status").placement =
@@ -4044,7 +4065,8 @@ mod tests {
             attachable_host: HostName::new("kiwi"),
             origin_hosts: HashMap::from([(flotilla_protocol::NodeId::new("feta-node-id"), HostName::new("feta"))]),
         });
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(resolver);
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(resolver));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement =
             Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
@@ -4080,8 +4102,10 @@ mod tests {
     async fn replicated_convoy_appears_origin_tagged_in_fleet_awareness() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
-            .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta")));
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
+                .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"))),
+        );
         let now = Utc::now();
         aggregator
             .replace_replica_convoys(vec![ReadResourceObject {
@@ -4113,8 +4137,10 @@ mod tests {
     async fn remote_homed_idle_governor_remains_in_project_awareness() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
-            .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node-id", "udder")));
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
+                .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node-id", "udder"))),
+        );
         let now = Utc::now();
         let provenance = ResourceProvenance::Replica { origin_root: flotilla_protocol::NodeId::new("udder-node-id"), last_synced_at: now };
         let mut convoy = convoy_with_vessel("governor-andamento-01234567").await;
@@ -4237,12 +4263,9 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let attach_resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
         let run_state = state.clone();
-        let run = tokio::spawn(async move {
-            Aggregator::new(run_state, HostName::new("kiwi"), event_tx)
-                .with_attach_resolver(attach_resolver)
-                .run(namespace_resolvers(&durable))
-                .await
-        });
+        let (aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(run_state, HostName::new("kiwi"), event_tx).with_attach_resolver(attach_resolver));
+        let run = tokio::spawn(async move { aggregator.run(namespace_resolvers(&durable)).await });
 
         let (convoy, awareness) = timeout(Duration::from_secs(1), async {
             let mut convoy = None;
@@ -4369,7 +4392,8 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(64);
         let run_state = state.clone();
         let resolvers = namespace_resolvers(&counted_durable);
-        let run = tokio::spawn(async move { Aggregator::new(run_state, HostName::new("kiwi"), event_tx).run(resolvers).await });
+        let (aggregator, _engine) = with_convoy_engine(Aggregator::new(run_state, HostName::new("kiwi"), event_tx));
+        let run = tokio::spawn(async move { aggregator.run(resolvers).await });
         async fn wait_for(receiver: &mut broadcast::Receiver<DaemonEvent>, name: &str) -> DaemonEvent {
             let names = |event: &DaemonEvent| match event {
                 DaemonEvent::ResultSet(result) if result.query() == (QueryId::Convoys { scope: None }) => {
@@ -4518,7 +4542,8 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
         let roles = Arc::new(ScriptedStandingRoles::default());
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_standing_roles(roles.clone());
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_standing_roles(roles.clone()));
         let query = QueryId::StandingRoles { scope: None };
 
         // Every root may hold a copy of the declaration; none carries the role's state.
@@ -4548,6 +4573,8 @@ mod tests {
         });
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.to_string(), "ensure-governor".to_string());
+        // A standing convoy is a launch of its ensure's role, which the engine reads it by.
+        convoy.spec.role = "governor".to_string();
         aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
         let convoys = state.result_set().await;
         let row = convoys.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
@@ -4581,7 +4608,7 @@ mod tests {
         let principal = PrincipalRef::implicit_for_namespace("people");
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.spec.dispatching_principal_ref = principal.clone();
 
@@ -4597,8 +4624,9 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
         let attentions = Arc::new(SetAttentions::default());
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla"),
+        );
         let query = QueryId::Awareness {
             scope: None,
             grouping: flotilla_protocol::AwarenessGrouping::Convoy,
@@ -4982,7 +5010,8 @@ mod tests {
                 origins.iter().map(|origin| (origin.clone(), HostName::new("remote"))).collect()
             }
         }
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver_arc(Arc::new(Hosts));
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver_arc(Arc::new(Hosts)));
         let mut records = Vec::new();
         for index in 0..320 {
             let mut object = convoy_object(&format!("remote-{index}")).await;
@@ -5053,7 +5082,8 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (tx, _) = broadcast::channel(32);
         let hosts = Arc::new(Hosts::default());
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver_arc(hosts.clone());
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver_arc(hosts.clone()));
         let mut first = ReadResourceObject {
             object: convoy_with_vessel("buffered").await,
             provenance: ResourceProvenance::Replica {
@@ -5454,7 +5484,7 @@ mod tests {
     async fn failed_convoy_remains_projected_until_reaping_finishes() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(1);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = convoy_object("failed-convoy").await;
         convoy.status = Some(ConvoyStatus {
             phase: ResourceConvoyPhase::Failed,
@@ -5484,8 +5514,9 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let attentions = Arc::new(SetAttentions::default());
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla"),
+        );
         let convoy = convoy_object("stuck-reclaim").await;
         aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
         let awareness_query =
@@ -5637,7 +5668,8 @@ mod tests {
             vec![Ok(watch_events(events))],
         );
         let (tx, mut rx) = broadcast::channel(1024);
-        let run = run_with_test_sources(Aggregator::new(state.clone(), HostName::new("local"), tx), &durable_convoys);
+        let (aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), tx));
+        let run = run_with_test_sources(aggregator, &durable_convoys);
         tokio::pin!(run);
         tokio::select! {
             result = &mut run => panic!("aggregator stopped: {result:?}"),
@@ -5691,10 +5723,10 @@ mod tests {
                 ),
             ))],
         );
-        let run = run_with_test_sources(
+        let (aggregator, _engine) = with_convoy_engine(
             Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::new(BlockingChangeRequestResolver)),
-            &durable_convoys,
         );
+        let run = run_with_test_sources(aggregator, &durable_convoys);
         tokio::pin!(run);
 
         tokio::select! {
@@ -5741,7 +5773,7 @@ mod tests {
     async fn soft_deleting_convoy_remains_in_rows_and_salience() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let now = Utc::now();
         let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Landed).work_phase(ResourceWorkPhase::Complete).call();
         convoy.metadata.deletion_timestamp = Some(now);
@@ -5824,7 +5856,8 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let resolver = Arc::new(FlippingAttachResolver { calls: AtomicUsize::new(0) });
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attach_resolver(resolver);
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attach_resolver(resolver));
         aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
 
         let mut session = session_object("terminal-convoy-a-implement").await;
@@ -5873,9 +5906,9 @@ mod tests {
             .durable_vessels(&durable_vessels)
             .durable_hosts(&durable_hosts)
             .build();
-        let run = Aggregator::new(state, HostName::new("kiwi"), event_tx.clone())
-            .with_attach_resolver(Arc::clone(&resolver))
-            .run_with_sources(sources);
+        let (aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state, HostName::new("kiwi"), event_tx.clone()).with_attach_resolver(Arc::clone(&resolver)));
+        let run = aggregator.run_with_sources(sources);
         tokio::pin!(run);
 
         tokio::select! {
@@ -5939,8 +5972,9 @@ mod tests {
             branches: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
         });
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver)),
+        );
         let mut convoy = convoy_with_branch("convoy-a").await;
 
         aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
@@ -5972,8 +6006,9 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let resolver = Arc::new(RecordingBoundChangeRequestResolver { calls: Mutex::new(Vec::new()) });
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver)),
+        );
         let mut convoy = convoy_with_branch("convoy-a").await;
         convoy.spec.change_request = Some(BoundChangeRequest {
             id: "1071".to_string(),
@@ -6010,7 +6045,9 @@ mod tests {
             branches: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
         });
-        let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver)),
+        );
         let mut convoy = convoy_with_branch("convoy-a").await;
 
         aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
@@ -6783,7 +6820,7 @@ mod tests {
             });
             let state = AggregatorProjectionState::new();
             let (tx, _rx) = broadcast::channel(1);
-            let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
+            let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), tx));
             aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
             let result = state.result_set().await;
             let reason = &result.rows.as_convoys().expect("convoys")[0].landing_reason;
@@ -6797,7 +6834,7 @@ mod tests {
     async fn emitted_vessel(convoy: ResourceObject<Convoy>) -> VesselRow {
         let state = AggregatorProjectionState::new();
         let (tx, mut rx) = broadcast::channel(1);
-        let mut aggregator = Aggregator::new(state, HostName::new("local"), tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state, HostName::new("local"), tx));
 
         aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
 
@@ -7495,7 +7532,7 @@ mod tests {
                 for phase in [CrewWorkPhase::Pending, CrewWorkPhase::Working, CrewWorkPhase::Stalled, CrewWorkPhase::Interrupted] {
                     let state = AggregatorProjectionState::new();
                     let (event_tx, _) = broadcast::channel(8);
-                    let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+                    let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
                     let mut convoy = convoy_with_work().convoy_phase(convoy_phase).work_phase(ResourceWorkPhase::Abandoned).call();
                     let status = convoy.status.as_mut().unwrap();
                     if !snapshot {
@@ -7675,9 +7712,11 @@ mod tests {
             let (events, _) = broadcast::channel(128);
             // The engine holds no launch of this vessel, so its stored status is read.
             let engine = flotilla_provisioning_testkit::VesselsFixture::at(OWN_HOME);
-            let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events)
-                .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node", "udder")))
-                .with_lifecycle_reads(engine.reads.clone());
+            let (mut aggregator, _convoys) = with_convoy_engine(
+                Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events)
+                    .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node", "udder")))
+                    .with_lifecycle_reads(engine.reads.clone()),
+            );
             let origin = flotilla_protocol::NodeId::new("udder-node");
             aggregator.origin_hosts.insert(origin.clone(), HostName::new("udder"));
             let provenance = ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() };
@@ -7914,9 +7953,8 @@ mod tests {
 
         let run_durable_convoys = Arc::clone(&durable_convoys);
         let run_state = state.clone();
-        let task = tokio::spawn(async move {
-            run_with_test_sources(Aggregator::new(run_state, HostName::new("local"), event_tx), run_durable_convoys.as_ref()).await
-        });
+        let (aggregator, _engine) = with_convoy_engine(Aggregator::new(run_state, HostName::new("local"), event_tx));
+        let task = tokio::spawn(async move { run_with_test_sources(aggregator, run_durable_convoys.as_ref()).await });
 
         let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial result set timeout").await;
         let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
@@ -8341,7 +8379,8 @@ mod tests {
             let gate = Arc::new(HeldAttachResolver { entered: entered_tx, release: tokio::sync::Semaphore::new(0) });
             let state = AggregatorProjectionState::new();
             let (tx, mut rx) = broadcast::channel(4096);
-            let aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver(gate.clone());
+            let (aggregator, _engine) =
+                with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver(gate.clone()));
             let resolvers = resource_resolvers(&durable);
             let task = tokio::spawn(aggregator.run(resolvers));
             timeout(Duration::from_secs(1), async {
@@ -8549,7 +8588,8 @@ mod hold_attention_tests {
                 ] {
                     let state = AggregatorProjectionState::new();
                     let (event_tx, _) = broadcast::channel(8);
-                    let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+                    let (mut aggregator, _engine) =
+                        super::tests::with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
                     let mut convoy = super::tests::convoy_with_vessel("held").await;
                     let status = convoy.status.as_mut().expect("status");
                     status.phase = phase;
@@ -8584,7 +8624,7 @@ mod hold_attention_tests {
     async fn persisted_hold_survives_attention_slot_clear() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = super::tests::with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = super::tests::convoy_with_vessel("held").await;
         let status = convoy.status.as_mut().expect("status");
         status.attention = None;
