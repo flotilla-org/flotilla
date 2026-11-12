@@ -179,7 +179,7 @@ impl TestVessels<'_> {
 /// The planner and seats under test, reading the engine's records from `engine`.
 fn test_vessel_reconciler<'a>(backend: ResourceBackend, namespace: &str, engine: &'a EngineFixture) -> TestVessels<'a> {
     let planning = Arc::new(
-        VesselPlanning::new(backend.clone(), namespace)
+        VesselPlanning::new(backend.clone(), namespace, Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone())))
             .with_worktree_metadata(Arc::new(TestWorktreeMetadata(engine.reads())))
             .with_lifecycle_reads(engine.reads()),
     );
@@ -2521,8 +2521,10 @@ async fn a_vessel_reaches_ready_from_wakes_alone(#[case] remote: bool) {
 
     // The Vessel controller over the planner, told of its convoy's changes by the runtime's
     // rechecks, and the crew seats with their wakes; no periodic resync within the test.
+    let accounts: Arc<dyn flotilla_resources::account_access::AccountRecords> =
+        Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone()));
     let planning = Arc::new(
-        VesselPlanning::new(backend.clone(), NAMESPACE)
+        VesselPlanning::new(backend.clone(), NAMESPACE, Arc::clone(&accounts))
             .with_worktree_metadata(Arc::new(TestWorktreeMetadata(lease_engine.reads())))
             .with_lifecycle_reads(lease_engine.reads())
             // A convoy homed elsewhere is read from its replica, as the runtime's planner reads it.
@@ -2533,7 +2535,7 @@ async fn a_vessel_reaches_ready_from_wakes_alone(#[case] remote: bool) {
         NAMESPACE,
         lease_engine.reads(),
         Arc::new(std::sync::OnceLock::new()),
-        Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())),
+        accounts,
     );
     let (rechecks, recheck_events) = tokio::sync::mpsc::channel(64);
     let controller = flotilla_provisioning::engine::controller::Controller::start(

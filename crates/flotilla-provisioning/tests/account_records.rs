@@ -14,8 +14,9 @@ use flotilla_resources::{
 };
 use flotilla_schema::{Records, Ref, State, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
-use flotilla_store::{OldStoreAccounts, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_testkit::OldStoreAccounts;
 use futures::StreamExt;
 
 const NS: &str = "flotilla";

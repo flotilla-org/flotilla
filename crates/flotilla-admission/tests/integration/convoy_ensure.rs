@@ -7,8 +7,14 @@ use flotilla_admission::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureRecon
 use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_orchestration_testkit as ensure_scenarios;
 use flotilla_orchestration_testkit::EnsureScenarioController;
+use flotilla_resources::manifest_roots::ManifestRoots;
 use flotilla_resources::{Clock, ConvoyEnsure, ResourceObject};
 use flotilla_store::ResourceBackend;
+
+/// The scenarios' manifest roots, over the backend each scenario gives.
+fn roots(backend: &ResourceBackend) -> Arc<dyn ManifestRoots> {
+    Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone()))
+}
 
 struct Controller;
 #[async_trait]
@@ -19,7 +25,9 @@ impl EnsureScenarioController for Controller {
         backend: ResourceBackend,
         clock: Arc<dyn Clock>,
     ) -> Arc<dyn ConvoyEnsureReconciler> {
-        Arc::new(EnsureReconciler::builder().teardown(teardown).resource_backend(backend).clock(clock).build())
+        Arc::new(
+            EnsureReconciler::builder().teardown(teardown).manifest_roots(roots(&backend)).resource_backend(backend).clock(clock).build(),
+        )
     }
     async fn dependency_hash(
         &self,
@@ -32,6 +40,7 @@ impl EnsureScenarioController for Controller {
     ) -> Result<String, String> {
         EnsureReconciler::builder()
             .teardown(teardown)
+            .manifest_roots(roots(&backend))
             .resource_backend(backend)
             .clock(clock)
             .build()
@@ -49,6 +58,7 @@ impl EnsureScenarioController for Controller {
     ) -> Result<String, String> {
         EnsureReconciler::builder()
             .teardown(teardown)
+            .manifest_roots(roots(&backend))
             .resource_backend(backend)
             .clock(clock)
             .build()

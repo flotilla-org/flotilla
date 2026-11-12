@@ -7312,6 +7312,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
                 .teardown(daemon.convoy_teardown())
                 .resource_backend(daemon.resource_backend())
                 .clock(Arc::new(flotilla_resources::SystemClock))
+                .manifest_roots(daemon.manifest_roots())
                 .build(),
         ))
         .await;

@@ -1,6 +1,7 @@
-//! The ManifestRoot port over the old store, with `[primitives]` off (#3824 layer 2c): the
-//! ManifestRoot resources' spec and status, written as the manifest reconciler, project ops and the
-//! CLI wrote them. The engine's port replaces this one with the switch on; both go with the switch.
+//! The ManifestRoot port over the old store (#3824 layer 2c): the ManifestRoot resources' spec and
+//! status, written as the manifest reconciler, project ops and the CLI wrote them. Production
+//! composes the engine's port; tests that have no engine service still use this one, until they
+//! move to it.
 
 use std::collections::BTreeMap;
 
@@ -10,7 +11,7 @@ use flotilla_resources::{
     Resolution, ResolutionAction, ResolutionOutcome, ResourceError, ResourceProvenance, MANAGED_BY_LABEL,
 };
 
-use crate::{ResourceBackend, StoreQuery};
+use flotilla_store::{ResourceBackend, StoreQuery};
 
 /// The label that marks a project's operational-entry root.
 const OPS_MANAGER: &str = "ops-charter";

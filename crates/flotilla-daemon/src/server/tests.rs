@@ -2295,7 +2295,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     let vessels = flotilla_orchestration_testkit::run_vessels(
         &placed,
         "flotilla",
-        flotilla_crew::reconcilers::vessel::VesselPlanning::new(placed.clone(), "flotilla")
+        flotilla_crew::reconcilers::vessel::VesselPlanning::new(placed.clone(), "flotilla", remote_daemon.account_records())
             .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
         Arc::clone(&install_engine(&remote_daemon).vessels.lifecycles),
         remote_daemon.lifecycle_reads(),

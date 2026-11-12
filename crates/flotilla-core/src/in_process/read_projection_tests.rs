@@ -310,8 +310,8 @@ mod tests {
         clock: Arc<dyn Clock>,
         subscriptions: super::super::projection_ports::LeafSubscriptionDiagnostics,
         fleet: FleetService,
-        accounts: flotilla_store::OldStoreAccounts,
-        manifest_roots: flotilla_store::OldStoreManifestRoots,
+        accounts: flotilla_store_testkit::OldStoreAccounts,
+        manifest_roots: flotilla_store_testkit::OldStoreManifestRoots,
         /// The engine's environments the projections read.
         engine: flotilla_provisioning_testkit::EnvironmentFixture,
         /// The engine's Message path, whose attentions the projections read.
@@ -371,8 +371,8 @@ mod tests {
                 Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
             ));
             let fleet = FleetService::new(AggregatorProjectionState::new(), host_name.clone(), None);
-            let accounts = flotilla_store::OldStoreAccounts::new(backend.clone());
-            let manifest_roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+            let accounts = flotilla_store_testkit::OldStoreAccounts::new(backend.clone());
+            let manifest_roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
             let service = Arc::new(
                 flotilla_schema_sqlite::stream::Service::open(
                     &temp.path().join("decided.sqlite"),

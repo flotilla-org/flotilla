@@ -11,6 +11,10 @@ mod attentions;
 pub use attentions::NoAttentions;
 mod message;
 pub use message::LegacyMessageFixture;
+mod old_store_accounts;
+pub use old_store_accounts::OldStoreAccounts;
+mod old_store_manifest_roots;
+pub use old_store_manifest_roots::OldStoreManifestRoots;
 
 /// Fresh logical store for API-crate tests without an upward adapter dependency.
 pub fn memory_backend() -> flotilla_store::ResourceBackend {

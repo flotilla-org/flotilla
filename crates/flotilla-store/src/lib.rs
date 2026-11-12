@@ -5,9 +5,7 @@
 use flotilla_resources::*;
 use flotilla_resources::{error, host, labels, resource, retention};
 
-mod account_records;
 mod attentions;
-pub use account_records::OldStoreAccounts;
 mod backend;
 pub use backend::*;
 pub mod controller;
@@ -19,9 +17,7 @@ mod decoded;
 pub use decoded::*;
 mod definition;
 mod engine_feed;
-mod manifest_roots;
 pub use definition::*;
-pub use manifest_roots::OldStoreManifestRoots;
 mod convoy_views;
 mod held_listing;
 mod lifecycle_views;

@@ -1218,12 +1218,16 @@ fn spawn_checkout_controller(
 
 /// This home's vessel planner over `backend` in `namespace`.
 fn vessel_planning(state: &Arc<ControllerRuntimeState>, backend: &ResourceBackend, namespace: &str) -> VesselPlanning {
-    VesselPlanning::new_with_config_dir(backend.clone(), namespace, state.config.base_path().as_path().to_path_buf())
-        .with_lifecycle_reads(state.daemon.lifecycle_reads())
-        .with_accounts(state.daemon.account_records())
-        .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(state), change_requests: None }))
-        .with_federated_dependencies(backend, CanonicalHostId::resolved(state.local_host_ref.clone()))
-        .with_additional_host_refs(state.ssh_host_refs())
+    VesselPlanning::new_with_config_dir(
+        backend.clone(),
+        namespace,
+        state.daemon.account_records(),
+        state.config.base_path().as_path().to_path_buf(),
+    )
+    .with_lifecycle_reads(state.daemon.lifecycle_reads())
+    .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(state), change_requests: None }))
+    .with_federated_dependencies(backend, CanonicalHostId::resolved(state.local_host_ref.clone()))
+    .with_additional_host_refs(state.ssh_host_refs())
 }
 
 /// The Vessel controller (#3108): the single writer of this home's vessel launches, realising each

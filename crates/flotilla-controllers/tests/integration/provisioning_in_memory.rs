@@ -40,6 +40,11 @@ use crate::common;
 
 const NAMESPACE: &str = "flotilla";
 
+/// The account records a planner reads: none of these tests binds an account.
+fn old_store_accounts(backend: &ResourceBackend) -> Arc<dyn flotilla_resources::account_access::AccountRecords> {
+    Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone()))
+}
+
 #[derive(Default)]
 struct FakeCloneRuntime;
 
@@ -210,7 +215,8 @@ async fn a_project_gaining_a_member_leaves_a_running_convoys_checkouts_unchanged
     grown.repositories.push(member(added.key()));
     projects.update(&InputMeta::from(&project.metadata), &project.metadata.resource_version, &grown).await.expect("project gains a member");
 
-    let planning = VesselPlanning::new(backend.clone(), NAMESPACE).with_lifecycle_reads(Arc::clone(&launches.reads));
+    let planning =
+        VesselPlanning::new(backend.clone(), NAMESPACE, old_store_accounts(&backend)).with_lifecycle_reads(Arc::clone(&launches.reads));
     planning.plan(&launch).await.expect("vessel planned");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(checkout_launches(), before, "no checkout is requested for the new member");
@@ -468,7 +474,9 @@ async fn a_released_vessel_leaves_the_convoys_checkout() {
         ControllerLoop {
             primary: workspaces.clone(),
             secondaries: CrewSeats::secondary_watches(),
-            reconciler: CrewSeats::new(Arc::new(VesselPlanning::new(backend.clone(), NAMESPACE).with_lifecycle_reads(engine.reads()))),
+            reconciler: CrewSeats::new(Arc::new(
+                VesselPlanning::new(backend.clone(), NAMESPACE, old_store_accounts(&backend)).with_lifecycle_reads(engine.reads()),
+            )),
             backend: backend.clone(),
         }
         .run(),
@@ -571,7 +579,7 @@ fn full_controller_harness(backend: ResourceBackend, engine: &RunningClones) -> 
     harness.hold(vessels.vessels.follow(Arc::clone(&engine.service)).expect("follow the vessels"));
     // This must progress through its holdings' commits rather than a periodic Vessel relist;
     // production resync is also deliberately slow.
-    let planning = VesselPlanning::new(backend.clone(), NAMESPACE).with_lifecycle_reads(Arc::clone(&reads));
+    let planning = VesselPlanning::new(backend.clone(), NAMESPACE, old_store_accounts(&backend)).with_lifecycle_reads(Arc::clone(&reads));
     let running = flotilla_orchestration_testkit::run_vessels(
         &backend,
         NAMESPACE,

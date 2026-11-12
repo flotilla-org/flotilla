@@ -294,7 +294,7 @@ async fn build_fixture(
     let crew = Arc::new(
         CrewService::builder()
             .resource_backend(backend.clone())
-            .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())))
+            .accounts(Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone())))
             .leaf_subscriptions(subscriptions)
             .lifecycle_reads(engine.reads())
             .vessel_seats(Arc::new(flotilla_store::EngineVesselSeats::new(engine.reads())))

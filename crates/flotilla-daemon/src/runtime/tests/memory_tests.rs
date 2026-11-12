@@ -156,7 +156,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     let _running = flotilla_orchestration_testkit::run_vessels(
         &backend,
         NAMESPACE,
-        VesselPlanning::new(backend.clone(), NAMESPACE).with_lifecycle_reads(daemon.lifecycle_reads()),
+        VesselPlanning::new(backend.clone(), NAMESPACE, daemon.account_records()).with_lifecycle_reads(daemon.lifecycle_reads()),
         Arc::clone(&engine.vessels.lifecycles),
         daemon.lifecycle_reads(),
         daemon.decided_store().expect("decided store"),

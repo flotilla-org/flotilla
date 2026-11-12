@@ -1700,7 +1700,7 @@ mod tests {
             let discovered = DiscoveredCheckouts::default();
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let namespace = std::sync::RwLock::new("flotilla".to_string());
-            let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+            let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
             let service = ProjectService {
                 image_layer_refresh: Default::default(),
                 resource_backend: &backend,
@@ -1886,7 +1886,7 @@ mod tests {
             .expect("repository seen through its alias");
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new(test_namespace.to_string());
-        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
         let service = ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: &backend,

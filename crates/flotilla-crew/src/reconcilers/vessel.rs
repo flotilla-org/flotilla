@@ -92,11 +92,11 @@ struct EnvironmentDependency {
 }
 
 impl VesselPlanning {
-    pub fn new(backend: ResourceBackend, namespace: &str) -> Self {
+    pub fn new(backend: ResourceBackend, namespace: &str, accounts: Arc<dyn AccountRecords>) -> Self {
         Self {
             backend: backend.clone(),
             lifecycle_reads: Arc::new(NoLifecycleReads),
-            accounts: Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())),
+            accounts,
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             kinds: backend.clone().using::<FulfilmentKind>(namespace),
@@ -131,12 +131,6 @@ impl VesselPlanning {
                 .reason()
                 .map(|reason| format!("crew `{}` waits: {reason}; `flotilla convoy rebind` opens a new binding", process.role))
         }))
-    }
-
-    /// The account records the daemon composed: the engine's behind `[primitives]`.
-    pub fn with_accounts(mut self, accounts: Arc<dyn AccountRecords>) -> Self {
-        self.accounts = accounts;
-        self
     }
 
     pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
@@ -197,8 +191,13 @@ impl VesselPlanning {
         Ok(None)
     }
 
-    pub fn new_with_config_dir(backend: ResourceBackend, namespace: &str, config_dir: impl Into<PathBuf>) -> Self {
-        Self { brief_templates: CrewBriefTemplateResolver::with_config_dir(config_dir), ..Self::new(backend, namespace) }
+    pub fn new_with_config_dir(
+        backend: ResourceBackend,
+        namespace: &str,
+        accounts: Arc<dyn AccountRecords>,
+        config_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self { brief_templates: CrewBriefTemplateResolver::with_config_dir(config_dir), ..Self::new(backend, namespace, accounts) }
     }
 
     pub fn with_worktree_metadata(mut self, resolver: Arc<dyn WorktreeMetadataResolver>) -> Self {
@@ -1678,6 +1677,11 @@ mod tests {
         legible_waiting_for, placement_strategy, PlacementStrategy, VesselPlanning,
     };
 
+    /// The account records a planner reads: none of these tests binds an account.
+    fn accounts(backend: &ResourceBackend) -> Arc<dyn flotilla_resources::account_access::AccountRecords> {
+        Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone()))
+    }
+
     // #2682: deduplicate shared parents, retain every own-admin overlay, and
     // refuse invalid/unavailable metadata instead of granting writable siblings.
     #[tokio::test]
@@ -1723,7 +1727,7 @@ mod tests {
             None,
         );
         let valid = WorktreeMetadata { common_dir: "/clone/.git".into(), admin_dir: "/clone/.git/worktrees/actual".into() };
-        let reconciler = VesselPlanning::new(backend.clone(), namespace)
+        let reconciler = VesselPlanning::new(backend.clone(), namespace, accounts(&backend))
             .with_lifecycle_reads(checkouts.reads.clone())
             .with_worktree_metadata(Arc::new(Metadata(Ok(valid.clone()))));
         assert!(reconciler.contained_git_mounts(&[]).await.expect("empty").is_empty());
@@ -1743,12 +1747,12 @@ mod tests {
             Ok(WorktreeMetadata { admin_dir: "/sibling".into(), ..valid.clone() }),
             Ok(WorktreeMetadata { admin_dir: "/clone/.git/worktrees/own/nested".into(), ..valid.clone() }),
         ] {
-            let refusing = VesselPlanning::new(backend.clone(), namespace)
+            let refusing = VesselPlanning::new(backend.clone(), namespace, accounts(&backend))
                 .with_lifecycle_reads(checkouts.reads.clone())
                 .with_worktree_metadata(Arc::new(Metadata(metadata)));
             assert!(refusing.contained_git_mounts(std::slice::from_ref(&own)).await.is_err(), "invalid metadata must fail closed");
         }
-        let unavailable = VesselPlanning::new(backend, namespace).with_lifecycle_reads(checkouts.reads.clone());
+        let unavailable = VesselPlanning::new(backend.clone(), namespace, accounts(&backend)).with_lifecycle_reads(checkouts.reads.clone());
         assert!(
             matches!(unavailable.contained_git_mounts(&[own]).await, Err(ResourceError::Other { .. })),
             "missing resolver must retry without guessing paths or failing the vessel"
@@ -1843,7 +1847,7 @@ mod tests {
             .replace(&kinds.list().await.expect("author kinds"), chrono::Utc::now())
             .await
             .expect("replicate kinds");
-        let reconciler = VesselPlanning::new(driver.clone(), "flotilla")
+        let reconciler = VesselPlanning::new(driver.clone(), "flotilla", accounts(&driver))
             .with_federated_dependencies(&driver, flotilla_protocol::CanonicalHostId::resolved("driver-host"));
         for (name, origin) in [("local-vessel", None), ("remote-vessel", Some("convoy-origin"))] {
             let mut meta = InputMeta::builder().name(name.to_string()).build();
@@ -1914,7 +1918,7 @@ mod tests {
             host: "driver-host".into(),
         });
         driver.install_engine_records(Arc::new(flotilla_store::VesselViews::new(driver.clone(), "flotilla", vessels.reads.clone())));
-        let reconciler = VesselPlanning::new(driver.clone(), "flotilla")
+        let reconciler = VesselPlanning::new(driver.clone(), "flotilla", accounts(&driver))
             .with_federated_dependencies(&driver, flotilla_protocol::CanonicalHostId::resolved("driver-host"))
             .with_lifecycle_reads(vessels.reads.clone());
         let vessel = driver.using::<Vessel>("flotilla").get(&launch).await.expect("vessel");
@@ -1961,7 +1965,7 @@ mod tests {
             )
             .await
             .expect("host");
-        let reconciler = VesselPlanning::new(backend.clone(), "flotilla");
+        let reconciler = VesselPlanning::new(backend.clone(), "flotilla", accounts(&backend));
         let kind = FulfilmentKindSpec::builder()
             .host_ref("h".into())
             .pool("cleat".into())
@@ -2255,7 +2259,7 @@ mod tests {
     #[test]
     fn missing_host_local_environment_warns_with_store_and_host_context() {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let reconciler = VesselPlanning::new(backend.clone(), "flotilla")
+        let reconciler = VesselPlanning::new(backend.clone(), "flotilla", accounts(&backend))
             .with_federated_dependencies(&backend, flotilla_protocol::CanonicalHostId::resolved("feta-host"));
         let log_output = Arc::new(Mutex::new(Vec::new()));
         let message;
@@ -2291,8 +2295,8 @@ mod tests {
             ..Default::default()
         };
         let fixture = EnvironmentFixture::default();
-        let reconciler = VesselPlanning::new(ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()), "flotilla")
-            .with_lifecycle_reads(fixture.reads.clone());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let reconciler = VesselPlanning::new(backend.clone(), "flotilla", accounts(&backend)).with_lifecycle_reads(fixture.reads.clone());
         let dependency = || reconciler.environment("env").map(|record| super::environment_dependency(&record.expect("held"), &[]));
         fixture.request("env", &spec, None);
         assert!(!dependency().expect("requested").ready);

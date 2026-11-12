@@ -1,7 +1,7 @@
-//! The account kinds' records in the old store, with `[primitives]` off (#3824 layer 1): the
-//! [`AccountRecords`] port over AccountBinding and AccountProvision resources. A binding is named
-//! for its requester and requirement, and a rebind keeps the closed one under a retired name.
-//! The engine's port replaces this one with the switch on; both go with the switch.
+//! The account kinds' records in the old store (#3824 layer 1): the [`AccountRecords`] port over
+//! AccountBinding and AccountProvision resources. A binding is named for its requester and
+//! requirement, and a rebind keeps the closed one under a retired name. Production composes the
+//! engine's port; tests that have no engine service still use this one, until they move to it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,7 +15,7 @@ use flotilla_resources::{
 };
 use futures::{stream::BoxStream, StreamExt};
 
-use crate::{ResourceBackend, StoreQuery};
+use flotilla_store::{ResourceBackend, StoreQuery};
 
 /// The account records of the old store.
 #[derive(Clone)]

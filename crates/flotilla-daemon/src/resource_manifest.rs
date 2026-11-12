@@ -24,7 +24,7 @@ use flotilla_resources::{
 };
 use flotilla_store::{
     apply_manifest_resource_document, delete_resource_kind, get_resource_kind, resource_document_spec_hash, validate_resource_document,
-    OldStoreManifestRoots, ResourceBackend,
+    ResourceBackend,
 };
 use flotilla_vcs::vcs::Vcs;
 use serde::Deserialize;
@@ -157,9 +157,16 @@ pub(crate) async fn materialize_bound_manifest_root(
 }
 
 impl ResourceManifestReconciler {
-    pub(crate) fn new(backend: ResourceBackend, default_namespace: impl Into<String>, root: impl Into<PathBuf>) -> Self {
+    /// A reconciler of the manifests under `root`, recording each pass through `roots` (the
+    /// daemon's ManifestRoots).
+    pub(crate) fn new(
+        backend: ResourceBackend,
+        roots: Arc<dyn ManifestRoots>,
+        default_namespace: impl Into<String>,
+        root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
-            roots: Arc::new(OldStoreManifestRoots::new(backend.clone())),
+            roots,
             backend,
             default_namespace: default_namespace.into(),
             root: root.into(),
@@ -186,13 +193,6 @@ impl ResourceManifestReconciler {
 
     pub fn with_binding(mut self, binding: Option<CharterSource>) -> Self {
         self.binding = binding;
-        self
-    }
-
-    /// Reads and writes this reconciler's root through `roots` (the daemon's: the engine's behind
-    /// `[primitives]`) rather than the old store's.
-    pub fn with_roots(mut self, roots: Arc<dyn ManifestRoots>) -> Self {
-        self.roots = roots;
         self
     }
 
@@ -1197,6 +1197,12 @@ mod tests {
 
     const NAMESPACE: &str = "flotilla";
 
+    /// The roots these tests record passes in and read back: the old store's ManifestRoot
+    /// resources on `backend`.
+    pub(super) fn old_roots(backend: &ResourceBackend) -> Arc<dyn ManifestRoots> {
+        Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone()))
+    }
+
     // #2720: branch-head changes apply without updating a working tree. Invalid
     // heads and fetch failures retain every last-applied record and its revision.
     #[tokio::test]
@@ -1299,7 +1305,7 @@ mod tests {
         let cache = tempfile::tempdir().expect("unused cache");
         write(&dir.path().join("policy.yaml"), &manifest("laptop", "local"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, cache.path())
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, cache.path())
             .with_binding(Some(CharterSource::LocalDirectory { directory: dir.path().to_string_lossy().into_owned() }));
         reconciler.reconcile_once_for_test().await.expect("apply directory");
         let first = test_root(&backend).await.status.expect("status").applied_revision.expect("revision");
@@ -1419,8 +1425,7 @@ mod tests {
         )
         .await;
         let backend = daemon.resource_backend();
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, source.path())
-            .with_roots(daemon.manifest_roots())
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), daemon.manifest_roots(), NAMESPACE, source.path())
             .with_declared_source("laptop-charter", daemon.local_host_id().expect("host").to_string())
             .with_binding(Some(CharterSource::LocalDirectory { directory: source.path().to_string_lossy().into_owned() }));
         write(&source.path().join("policy.yaml"), "bad: [");
@@ -1492,7 +1497,9 @@ mod tests {
             .probe(&bag, &ConfigStore::with_base(dir), &ExecutionEnvironmentPath::new(dir), runner)
             .await
             .expect("discover Git VCS");
-        ResourceManifestReconciler::new(backend, NAMESPACE, dir).with_declared_source("project-map", "kiwi").with_vcs(vcs)
+        ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir)
+            .with_declared_source("project-map", "kiwi")
+            .with_vcs(vcs)
     }
 
     fn manifest(name: &str, pool: &str) -> String {
@@ -1531,7 +1538,7 @@ mod tests {
             r#"{"apiVersion":"flotilla.work/v1","kind":"FulfilmentKind","metadata":{"name":"beta"},"spec":{"host_ref":"host","pool":"two","cost_class":"metered","realisation":"host_direct"}}"#,
         );
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once_for_test().await.expect("manifest pass");
 
@@ -1569,7 +1576,7 @@ mod tests {
         write(&feta_dir.path().join("policy.yaml"), &manifest("shared", "stale"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
 
-        let mut kiwi = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, kiwi_dir.path())
+        let mut kiwi = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, kiwi_dir.path())
             .with_declared_source("project-map", "kiwi")
             .with_revision("current-revision");
         kiwi.reconcile_once_for_test().await.expect("declared root pass");
@@ -1640,12 +1647,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("steady", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut first = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut first = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         first.reconcile_once_for_test().await.expect("initial pass");
         let before = backend.using::<FulfilmentKind>(NAMESPACE).get("steady").await.expect("policy");
 
         let mut events = backend.using::<FulfilmentKind>(NAMESPACE).watch(WatchStart::Now).await.expect("watch");
-        let mut restarted = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut restarted = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         let report = restarted.reconcile_once_for_test().await.expect("restart pass");
         let after = backend.using::<FulfilmentKind>(NAMESPACE).get("steady").await.expect("policy");
 
@@ -1659,7 +1666,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("steady-revision", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path())
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path())
             .with_declared_source("project-map", "kiwi")
             .with_revision("revision-one");
         reconciler.reconcile_once_for_test().await.expect("initial pass");
@@ -1680,10 +1687,10 @@ mod tests {
         let parent = tempfile::tempdir().expect("tempdir");
         let root = parent.path().join("not-created-yet");
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        materialize_manifest_root(&OldStoreManifestRoots::new(backend.clone()), NAMESPACE, &root, "local", "local", None)
-            .await
-            .expect("materialize root");
-        let task = tokio::spawn(ResourceManifestReconciler::new(backend.clone(), NAMESPACE, root.clone()).run(Duration::from_millis(5)));
+        materialize_manifest_root(&*old_roots(&backend), NAMESPACE, &root, "local", "local", None).await.expect("materialize root");
+        let task = tokio::spawn(
+            ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, root.clone()).run(Duration::from_millis(5)),
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         std::fs::create_dir(&root).expect("create manifest directory");
@@ -1708,7 +1715,7 @@ mod tests {
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("moving", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let applied = resolver.get("moving").await.expect("policy");
@@ -1756,7 +1763,7 @@ mod tests {
         };
         write(&path, &workflow("echo-one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
 
         let steady = reconciler.reconcile_once_for_test().await.expect("steady pass");
@@ -1791,7 +1798,7 @@ mod tests {
             .create(&InputMeta::builder().name("colliding".to_string()).build(), &kind_spec("live"))
             .await
             .expect("create unmanaged object");
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path()).with_roots(daemon.manifest_roots());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), daemon.manifest_roots(), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("reconcile");
         let root = test_root(&backend).await;
         let status = root.status.expect("status");
@@ -1808,7 +1815,7 @@ mod tests {
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("drifted", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let applied = resolver.get("drifted").await.expect("policy");
@@ -1837,7 +1844,7 @@ mod tests {
         write(&path, &manifest("atomic-refusal", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         let applied = resolver.get("atomic-refusal").await.expect("policy");
         let edited = resolver
@@ -1863,7 +1870,7 @@ mod tests {
             .create(&InputMeta::builder().name("convergent".to_string()).build(), &kind_spec("same"))
             .await
             .expect("unmanaged but convergent policy");
-        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once_for_test().await.expect("repair pass");
         let object = resolver.get("convergent").await.expect("policy");
@@ -1881,7 +1888,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("fresh-baseline", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
 
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("creation pass").created, 1);
         let next = reconciler.reconcile_once_for_test().await.expect("verification pass");
@@ -1900,7 +1907,7 @@ mod tests {
         write(&path, &manifest("suspended", "manifest"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("suspended").await.expect("policy");
         set_suspended(&reconciler.backend, key("suspended"), true).await;
@@ -1928,7 +1935,7 @@ mod tests {
         write(&path, &manifest("sync-me", "manifest"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("sync-me").await.expect("policy");
         resolver
@@ -1979,7 +1986,7 @@ mod tests {
             Arc::new(EngineManifestRoots::open(service, Arc::new(flotilla_resources::SystemClock)).expect("engine roots"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path()).with_roots(Arc::clone(&roots));
+        let mut reconciler = ResourceManifestReconciler::new(backend, Arc::clone(&roots), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let name = reconciler.root_name();
         let applied = resolver.get("sync-me").await.expect("policy");
@@ -2052,7 +2059,7 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         backend.install_engine_records(Arc::new(EngineDefinitions::open(service, clock).expect("definitions")));
         let forges = backend.definitions::<Forge>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path()).with_roots(Arc::clone(&roots));
+        let mut reconciler = ResourceManifestReconciler::new(backend, Arc::clone(&roots), NAMESPACE, dir.path());
 
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("creation").created, 1);
         let applied = forges.get("lab").await.expect("forge");
@@ -2083,7 +2090,7 @@ mod tests {
         write(&dir.path().join("policy.yaml"), &manifest("interrupted", "manifest"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("interrupted").await.expect("policy");
         resolver
@@ -2098,7 +2105,7 @@ mod tests {
             .await
             .expect("claim"));
 
-        let mut restarted = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut restarted = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         assert_eq!(restarted.reconcile_once_for_test().await.expect("restart pass").drifted, 1);
         assert_eq!(resolver.get("interrupted").await.expect("policy").spec.pool, "live");
         let root = test_root(&backend).await;
@@ -2121,7 +2128,7 @@ mod tests {
 
         let current = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("current-root"));
         let stale = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("stale-root"));
-        let mut current_reconciler = ResourceManifestReconciler::new(current.clone(), NAMESPACE, current_dir.path());
+        let mut current_reconciler = ResourceManifestReconciler::new(current.clone(), old_roots(&current), NAMESPACE, current_dir.path());
         current_reconciler.reconcile_once_for_test().await.expect("current creation");
         let stale_document = serde_json::from_str(&project_manifest("single-agent", false)).expect("stale manifest document");
         apply_manifest_resource_document(&stale, NAMESPACE, stale_document).await.expect("seed pre-existing divergent peer state");
@@ -2193,7 +2200,7 @@ mod tests {
         write(&path, &manifest("adopt-me", "manifest"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("adopt-me").await.expect("policy");
         resolver
@@ -2220,7 +2227,7 @@ mod tests {
             .create(&InputMeta::builder().name("unmanaged".to_string()).build(), &kind_spec("live"))
             .await
             .expect("unmanaged policy");
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once_for_test().await.expect("manifest pass");
         let object = backend.using::<FulfilmentKind>(NAMESPACE).get("unmanaged").await.expect("policy");
@@ -2253,7 +2260,7 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         resolver.create(&InputMeta::builder().name("unmanaged".to_string()).build(), &kind_spec("live")).await.expect("unmanaged policy");
-        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         let identity =
             ObjectIdentity { kind: "FulfilmentKind".to_string(), namespace: NAMESPACE.to_string(), name: "unmanaged".to_string() };
 
@@ -2283,7 +2290,7 @@ mod tests {
         write(&dir.path().join("broken.yaml"), "kind: [");
         write(&dir.path().join("valid.yaml"), &manifest("valid", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once_for_test().await.expect("manifest pass");
 
@@ -2303,7 +2310,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("retained", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
 
         let root = test_root(&backend).await;
@@ -2325,7 +2332,7 @@ mod tests {
     fn pruning_stores() -> Vec<PruningStore> {
         use flotilla_provisioning::engine::{definitions::EngineDefinitions, manifest_root::EngineManifestRoots};
         let old = ResourceBackend::new(InMemoryBackend::default());
-        let old_roots: Arc<dyn ManifestRoots> = Arc::new(OldStoreManifestRoots::new(old.clone()));
+        let old_roots: Arc<dyn ManifestRoots> = old_roots(&old);
         let store = tempfile::tempdir().expect("store dir");
         let mut kinds = flotilla_schema::KindRegistry::new();
         flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
@@ -2353,7 +2360,7 @@ mod tests {
             write(&dir.path().join("forge.yaml"), &forge_manifest("lab.example"));
             let forges = backend.definitions::<flotilla_resources::Forge>(NAMESPACE);
             let mut reconciler =
-                ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path()).with_roots(Arc::clone(&roots)).with_revision("r1");
+                ResourceManifestReconciler::new(backend.clone(), Arc::clone(&roots), NAMESPACE, dir.path()).with_revision("r1");
             reconciler.reconcile_once_for_test().await.expect("creation");
             forges.get("lab").await.expect("applied");
 
@@ -2379,7 +2386,7 @@ mod tests {
             write(&dir.path().join("forge.yaml"), &forge_manifest("lab.example"));
             let forges = backend.definitions::<flotilla_resources::Forge>(NAMESPACE);
             let mut reconciler =
-                ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path()).with_roots(Arc::clone(&roots)).with_revision("r1");
+                ResourceManifestReconciler::new(backend.clone(), Arc::clone(&roots), NAMESPACE, dir.path()).with_revision("r1");
             reconciler.reconcile_once_for_test().await.expect("creation");
             let current = forges.get("lab").await.expect("applied");
             let mut live = current.spec.clone();
@@ -2404,7 +2411,7 @@ mod tests {
     async fn applied_policy(dir: &Path, name: &str) -> (ResourceBackend, ResourceManifestReconciler) {
         write(&dir.join("policy.yaml"), &manifest(name, "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir).with_revision("r1");
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir).with_revision("r1");
         reconciler.reconcile_once_for_test().await.expect("creation");
         (backend, reconciler)
     }
@@ -2487,7 +2494,7 @@ mod tests {
         write(&dir.path().join("policy.yaml"), &manifest("legacy", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         let object = resolver.get("legacy").await.expect("policy");
         let mut meta = InputMeta::from(&object.metadata);
@@ -2520,6 +2527,7 @@ mod registered_charter_tests {
     use flotilla_resources::{InputMeta, ManifestRoot};
     use flotilla_store_memory::InMemoryBackend;
 
+    use super::tests::old_roots;
     use super::*;
     use crate::testkits::server::spawn_in_memory_request_topology;
 
@@ -2545,7 +2553,7 @@ mod registered_charter_tests {
         let pointer = CharterPointer::Inline { documents: vec![], files: BTreeMap::new() };
         let good = project(pointer);
         std::fs::write(directory.path().join("project.json"), serde_json::to_string(&good).expect("encode")).expect("write");
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), "flotilla", directory.path())
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), "flotilla", directory.path())
             .with_binding(Some(CharterSource::LocalDirectory { directory: directory.path().to_string_lossy().into_owned() }));
         reconciler.reconcile_once_for_test().await.expect("initial apply");
         let initial_root = backend.using::<ManifestRoot>("flotilla").get(&reconciler.root_name()).await.expect("root");
@@ -2596,7 +2604,8 @@ mod registered_charter_tests {
             .expect("legacy bootstrap Project");
         let path = directory.path().join("project.json");
         std::fs::write(&path, serde_json::to_string(&registration).expect("encode")).expect("registration");
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), "flotilla", directory.path()).with_revision("first");
+        let mut reconciler =
+            ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), "flotilla", directory.path()).with_revision("first");
         let report = reconciler.reconcile_once_for_test().await.expect("first apply");
         assert!(report.errors.is_empty(), "{report:?}");
         let registered = backend.using::<Project>("flotilla").get("app").await.expect("transferred registration");
@@ -2648,7 +2657,8 @@ mod registered_charter_tests {
             .build();
         let layers = backend.definitions::<flotilla_resources::ImageLayer>("flotilla");
         layers.apply(&InputMeta::builder().name(other.resource_name()).build(), &other.clone().into()).await.expect("other layer");
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), "flotilla", directory.path()).with_revision("first");
+        let mut reconciler =
+            ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), "flotilla", directory.path()).with_revision("first");
         let report = reconciler.reconcile_once_for_test().await.expect("first apply");
         assert!(report.errors.is_empty(), "{report:?}");
         let name = layers
@@ -2722,9 +2732,8 @@ mod registered_charter_tests {
         let path = input.join("placement.json");
         let mut document = serde_json::json!({"apiVersion": "flotilla.work/v1", "kind": "FulfilmentKind", "metadata": {"name": "fleet-target-host"}, "spec": spec});
         std::fs::write(&path, serde_json::to_string(&document).expect("encode")).expect("fleet policy");
-        let mut reconciler = ResourceManifestReconciler::new(fleet_backend.clone(), "flotilla", &input)
-            .with_binding(Some(CharterSource::LocalDirectory { directory: input.to_string_lossy().into_owned() }))
-            .with_roots(fleet.manifest_roots());
+        let mut reconciler = ResourceManifestReconciler::new(fleet_backend.clone(), fleet.manifest_roots(), "flotilla", &input)
+            .with_binding(Some(CharterSource::LocalDirectory { directory: input.to_string_lossy().into_owned() }));
         reconciler.reconcile_once_for_test().await.expect("apply fleet policy");
         let topology = spawn_in_memory_request_topology(fleet, host).await.expect("connect daemon stores");
         for cost_class in [flotilla_resources::FulfilmentCostClass::OwnedIdle, flotilla_resources::FulfilmentCostClass::Metered] {

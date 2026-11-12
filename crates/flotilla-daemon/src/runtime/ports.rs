@@ -93,12 +93,11 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                     return Err(format!("manifest root `{name}` does not match the declared source"));
                 }
                 let mut reconciler =
-                    ResourceManifestReconciler::new(self.state.daemon.resource_backend(), namespace, manifests.dir.clone())
+                    ResourceManifestReconciler::new(self.state.daemon.resource_backend(), roots, namespace, manifests.dir.clone())
                         .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone())
                         .with_binding(manifests.binding.clone())
                         .with_vcs(if manifests.binding.is_some() { self.state.daemon.local_charter_vcs()? }
-                            else { self.state.daemon.local_vcs_for_checkout(&manifests.dir).await? })
-                        .with_roots(roots);
+                            else { self.state.daemon.local_vcs_for_checkout(&manifests.dir).await? });
                 let report = reconciler.reconcile_once().await?;
                 Ok(format!(
                     "manifest root {name}: {} created, {} updated, {} unchanged, {} errors",

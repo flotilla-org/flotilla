@@ -95,7 +95,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
             source.as_ref(),
             &crew.capability_cards,
             held.engine.reads(),
-            &flotilla_store::OldStoreAccounts::new(backend.clone()),
+            &flotilla_store_testkit::OldStoreAccounts::new(backend.clone()),
         )
         .await
         .expect_err("aggregate error");
@@ -245,13 +245,27 @@ async fn failing_source_never_publishes_an_empty_card() {
     assert_eq!(session.status.map(|status| status.phase), Some(ResourceTerminalSessionPhase::Running));
     let source = Delivery(RwLock::new(BTreeMap::new()), std::sync::atomic::AtomicBool::new(false));
     let tracker = CapabilityCardTracker::with_message_path(crew.message_path.clone());
-    refresh_cards(&backend, "flotilla", &source, &tracker, held.engine.reads(), &flotilla_store::OldStoreAccounts::new(backend.clone()))
-        .await
-        .expect("initial baseline");
+    refresh_cards(
+        &backend,
+        "flotilla",
+        &source,
+        &tracker,
+        held.engine.reads(),
+        &flotilla_store_testkit::OldStoreAccounts::new(backend.clone()),
+    )
+    .await
+    .expect("initial baseline");
     source.1.store(true, std::sync::atomic::Ordering::SeqCst);
-    refresh_cards(&backend, "flotilla", &source, &tracker, held.engine.reads(), &flotilla_store::OldStoreAccounts::new(backend.clone()))
-        .await
-        .expect_err("reconstruction gap");
+    refresh_cards(
+        &backend,
+        "flotilla",
+        &source,
+        &tracker,
+        held.engine.reads(),
+        &flotilla_store_testkit::OldStoreAccounts::new(backend.clone()),
+    )
+    .await
+    .expect_err("reconstruction gap");
     let messages = backend.using::<Message>("flotilla").list().await.expect("messages").items;
     assert!(messages.is_empty());
 }
@@ -287,7 +301,7 @@ async fn image_capabilities_follow_engine_builds() {
     let mut session_spec = session.spec;
     session_spec.source = flotilla_resources::TerminalSessionSource::Tool { command: "true".into() };
     let endpoints = BTreeMap::new();
-    let accounts = flotilla_store::OldStoreAccounts::new(backend.clone());
+    let accounts = flotilla_store_testkit::OldStoreAccounts::new(backend.clone());
     let card = || {
         crate::crew_capabilities::session_card(
             &backend,

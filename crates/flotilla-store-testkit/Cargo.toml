@@ -26,6 +26,7 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { workspace = true, features = ["v4"] }
 
 flotilla-resources = { path = "../flotilla-resources" }
 

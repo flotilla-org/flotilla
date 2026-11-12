@@ -194,6 +194,7 @@ async fn daemon_named_without_engine(host_name: &str, free_space_floor_gib: Opti
                 .teardown(daemon.convoy_teardown())
                 .resource_backend(daemon.resource_backend())
                 .clock(Arc::new(SystemClock))
+                .manifest_roots(daemon.manifest_roots())
                 .build(),
         ))
         .await;

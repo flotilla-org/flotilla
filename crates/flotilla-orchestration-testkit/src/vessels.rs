@@ -8,7 +8,8 @@ use flotilla_provisioning::engine::{controller::Controller, vessel_actuator::Ves
 use flotilla_resources::{lifecycle_reads::LifecycleReads, SystemClock, Vessel};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::machines::vessel::VesselKind;
-use flotilla_store::{controller::ControllerLoop, OldStoreAccounts, ResourceBackend};
+use flotilla_store::{controller::ControllerLoop, ResourceBackend};
+use flotilla_store_testkit::OldStoreAccounts;
 use tokio::task::JoinHandle;
 
 /// The tasks running this home's vessels, stopped when dropped.

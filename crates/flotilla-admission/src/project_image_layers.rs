@@ -388,7 +388,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         *source.error.lock().unwrap() = Some("Unable to create /cache/shallow.lock: File exists".into());
         service.reconcile_project_image_layers().await.unwrap();
@@ -444,7 +444,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         service.reconcile_project_image_layers().await.unwrap();
         assert_eq!(service.image_layer_refresh.lock().await.conditions().len(), 1);
@@ -464,7 +464,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         let repository_name = backend.using::<Project>("flotilla").get("app").await.unwrap().spec.repositories[1].repo.to_string();
         let repositories = backend.using::<Repository>("flotilla");
@@ -503,7 +503,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         service.reconcile_project_image_layers().await.unwrap();
         let conditions = service.image_layer_refresh.lock().await.conditions();
@@ -526,7 +526,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         service.reconcile_project_image_layers().await.unwrap();
         assert_eq!(
@@ -553,7 +553,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         service.reconcile_project_image_layers().await.unwrap();
         assert_eq!(service.image_layer_refresh.lock().await.conditions().len(), 1);
@@ -677,7 +677,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
         let service = ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: &backend,
@@ -747,7 +747,7 @@ mod tests {
         clock: &'a Arc<dyn Clock>,
         namespace: &'a std::sync::RwLock<String>,
         operations: &'a Operations,
-        roots: &'a flotilla_store::OldStoreManifestRoots,
+        roots: &'a flotilla_store_testkit::OldStoreManifestRoots,
     ) -> ProjectService<'a> {
         ProjectService {
             image_layer_refresh: Default::default(),
@@ -780,7 +780,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         service.reconcile_project_image_layers().await.expect("sync");
         let layers = backend.definitions::<ImageLayer>("flotilla");

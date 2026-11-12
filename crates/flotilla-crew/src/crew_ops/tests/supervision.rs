@@ -462,7 +462,7 @@ async fn lost_vessel_resume_explains_rehydration() {
     // vessel's record.
     let restarted = CrewService::builder()
         .resource_backend(backend.clone())
-        .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())))
+        .accounts(Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone())))
         .leaf_subscriptions(crew.leaf_subscriptions.clone())
         .lifecycle_reads(held.engine.reads())
         .vessel_seats(Arc::clone(&crew.vessel_seats))

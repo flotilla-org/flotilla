@@ -140,21 +140,17 @@ pub struct EnsureReconciler {
     /// Per namespace, the earliest time the last pass deferred an ensure to.
     #[builder(skip)]
     next_due: StdMutex<HashMap<String, DateTime<Utc>>>,
-    /// The daemon's ManifestRoots (#3824 layer 2c); the old store's when absent.
-    manifest_roots: Option<Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>>,
+    /// The daemon's ManifestRoots (#3824 layer 2c).
+    manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
 }
 
 impl EnsureReconciler {
     fn pass<'a>(&'a self, admission: &'a dyn ConvoyEnsureAdmission) -> EnsurePass<'a> {
-        let manifest_roots = self
-            .manifest_roots
-            .clone()
-            .unwrap_or_else(|| Arc::new(flotilla_store::OldStoreManifestRoots::new(self.resource_backend.clone())));
         EnsurePass::builder()
             .attentions(self.resource_backend.attentions())
             .teardown(&self.teardown)
             .resource_backend(&self.resource_backend)
-            .manifest_roots(manifest_roots)
+            .manifest_roots(Arc::clone(&self.manifest_roots))
             .clock(&self.clock)
             .ensure_admission_retries(&self.ensure_admission_retries)
             .ensure_reconciliation(&self.ensure_reconciliation)
@@ -1293,6 +1289,7 @@ mod tests {
             .teardown(Arc::new(Admission::builder().backend(backend.clone()).build()))
             .resource_backend(backend.clone())
             .clock(clock)
+            .manifest_roots(Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone())))
             .build();
         let admission = Admission::builder().backend(backend.clone()).build();
         for scope in [EnsureConvoyScope::Local, EnsureConvoyScope::IncludingReplicas] {
@@ -1344,6 +1341,7 @@ mod tests {
             .teardown(Arc::new(admission.clone()))
             .resource_backend(backend.clone())
             .clock(clock.clone())
+            .manifest_roots(Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone())))
             .build();
         (controller, admission, clock)
     }
@@ -1390,6 +1388,7 @@ mod tests {
                 .teardown(Arc::new(admission.clone()))
                 .resource_backend(admission.backend.clone())
                 .clock(clock.clone())
+                .manifest_roots(Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(admission.backend.clone())))
                 .build();
             let ensure = ensures.get("standing").await.expect("ensure");
             controller.pass(&admission).reconcile_driver_convoy_ensure("test", &ensure, &Backing::Dead, false).await.expect("backoff");
@@ -1426,6 +1425,7 @@ mod tests {
             .teardown(Arc::new(admission.clone()))
             .resource_backend(admission.backend.clone())
             .clock(clock.clone())
+            .manifest_roots(Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(admission.backend.clone())))
             .build();
         assert!(controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.is_err());
         assert_eq!(admission.prepares.load(Ordering::SeqCst), 2, "the note is in memory: a restarted controller retries");

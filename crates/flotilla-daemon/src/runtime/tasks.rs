@@ -240,11 +240,10 @@ pub(super) fn spawn_manifest_reconciler_task(
                     daemon.local_vcs_for_checkout(&manifests.dir).await
                 }
                 .map_err(ResourceError::other)?;
-                ResourceManifestReconciler::new(daemon.resource_backend(), namespace, manifests.dir)
+                ResourceManifestReconciler::new(daemon.resource_backend(), roots, namespace, manifests.dir)
                     .with_declared_source(manifests.source, manifests.reconciler_root)
                     .with_binding(manifests.binding)
                     .with_vcs(vcs)
-                    .with_roots(roots)
                     .run(interval)
                     .await
             }

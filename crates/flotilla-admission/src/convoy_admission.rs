@@ -4852,7 +4852,7 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
     let admission = ConvoyAdmission::builder()
         .backend(resource_backend.clone())
         .convoys(convoys)
-        .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(resource_backend.clone())))
+        .accounts(Arc::new(flotilla_store_testkit::OldStoreAccounts::new(resource_backend.clone())))
         .discovered_checkouts(DiscoveredCheckouts::default())
         .config(Arc::clone(&config))
         .discovery(Arc::clone(&discovery))
