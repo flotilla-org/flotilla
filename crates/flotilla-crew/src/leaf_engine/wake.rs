@@ -15,9 +15,11 @@ use flotilla_resources::{
     address::{leaf_address, leaf_for, record_name, subject_address},
     checkout_records::{latest_launches, CheckoutChange, CheckoutRecord},
     clone_records::{launched, CloneChange, CloneRecord},
-    instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest, CheckoutSpec,
-    ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyPhase, CrewWorkPhase, Forge, InstantiatedExit, LeafMaker, ResourceError,
-    ResourceObject, RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
+    instantiate_exit, instantiate_turn_delivery,
+    promises::{PromiseKind, PromiseState},
+    select_convoy_children, subject_relationship_conflicts, ChangeRequest, CheckoutSpec, ControllerRetry, ControllerRetryDisposition,
+    Convoy, ConvoyPhase, CrewWorkPhase, Forge, InstantiatedExit, LeafMaker, ResourceError, ResourceObject, RetryCeiling, StatusPatch,
+    TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
 };
 use flotilla_store::{
     controller::{SecondaryWatch, WorkQueueSender},
@@ -744,6 +746,39 @@ impl ReconcilerWake {
                         created_at: Utc::now(),
                         episode_key: EpisodeKeyFields::default(),
                     });
+                }
+                // A submitted PR promise is kept or broken by its record's state:
+                // that record's change wakes the controller to observe it.
+                for submission in status
+                    .promises
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .flatten()
+                    .filter(|promise| promise.kind == PromiseKind::Pr && promise.state == PromiseState::Submitted)
+                    .filter_map(|promise| promise.submissions.last())
+                {
+                    let Some(address) = submission.subject_address(&forges).ok() else { continue };
+                    let Some(leaf_address @ LeafAddress::ChangeRequest { .. }) = leaf_for(&address).ok() else { continue };
+                    if let Some(name) = record_name(&address) {
+                        inputs.insert(name);
+                    }
+                    for literal in ["merged", "closed"] {
+                        desired.push(LeafSubscriptionRow {
+                            id: uuid::Uuid::nil(),
+                            namespace: namespace.to_string(),
+                            leaves: vec![Leaf {
+                                address: leaf_address.clone(),
+                                field_path: ".state".into(),
+                                operator: LeafOperator::Equal,
+                                literal: literal.into(),
+                            }],
+                            watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
+                            maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
+                            freshness_demand: None,
+                            created_at: Utc::now(),
+                            episode_key: EpisodeKeyFields::default(),
+                        });
+                    }
                 }
                 continue;
             }
