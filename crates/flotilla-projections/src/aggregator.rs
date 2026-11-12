@@ -39,14 +39,14 @@ use flotilla_resources::{
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
     FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError,
     ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement,
-    WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 #[cfg(test)]
-use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
-use flotilla_store::{
-    recover_local_view, recover_view, LocalViewSource as AggregatorWatchSource, ViewSource as AggregatorReplicaWatchSource,
-};
-use flotilla_store::{ReplicaReadResolver, TypedResolver};
+use flotilla_resources::{ReadResourceList, ResourceList, WatchEvent, WatchStart, WatchStream};
+#[cfg(test)]
+use flotilla_store::LocalViewSource as AggregatorWatchSource;
+use flotilla_store::ReplicaReadResolver;
+use flotilla_store::{recover_view, ViewSource as AggregatorReplicaWatchSource};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::{
     sync::{broadcast, mpsc},
@@ -4106,7 +4106,6 @@ mod tests {
     #[tokio::test]
     async fn run_bootstraps_materialization_and_subscribed_fleet_awareness() {
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement =
             Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
@@ -4152,7 +4151,7 @@ mod tests {
         let run = tokio::spawn(async move {
             Aggregator::new(run_state, HostName::new("kiwi"), event_tx)
                 .with_attach_resolver(attach_resolver)
-                .run(namespace_resolvers(&durable, &observed))
+                .run(namespace_resolvers(&durable))
                 .await
         });
 
@@ -4185,7 +4184,7 @@ mod tests {
         let _ = run.await;
     }
 
-    fn namespace_resolvers(durable: &ResourceBackend, observed: &ResourceBackend) -> AggregatorResolvers {
+    fn namespace_resolvers(durable: &ResourceBackend) -> AggregatorResolvers {
         AggregatorResolvers::builder()
             .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
             .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
@@ -4216,8 +4215,7 @@ mod tests {
     async fn steady_state_delta_read_contract(definitions: bool) {
         use flotilla_store_testkit::ReadCountsBackendExt;
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
-        let (counted_durable, counted_observed) = (durable.clone().with_read_counts(), observed.clone().with_read_counts());
+        let counted_durable = durable.clone().with_read_counts();
         let convoys = durable.clone().using::<Convoy>("flotilla");
         let seed = convoy_with_vessel("convoy-a").await;
         let created = convoys.create(&InputMeta::builder().name("convoy-a".into()).build(), &seed.spec).await.expect("seed convoy");
@@ -4226,7 +4224,7 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(64);
         let run_state = state.clone();
-        let resolvers = namespace_resolvers(&counted_durable, &counted_observed);
+        let resolvers = namespace_resolvers(&counted_durable);
         let run = tokio::spawn(async move { Aggregator::new(run_state, HostName::new("kiwi"), event_tx).run(resolvers).await });
         async fn wait_for(receiver: &mut broadcast::Receiver<DaemonEvent>, name: &str) -> DaemonEvent {
             let names = |event: &DaemonEvent| match event {
@@ -4249,7 +4247,6 @@ mod tests {
         }
         wait_for(&mut event_rx, "convoy-a").await;
         let durable_bootstrap = counted_durable.read_snapshot();
-        let observed_bootstrap = counted_observed.read_snapshot();
         assert!(!durable_bootstrap.lists().is_empty(), "bootstrap lists each watched kind once");
 
         for index in 0..8 {
@@ -4296,7 +4293,6 @@ mod tests {
         // gets keep their separate zero-budget guard expected to fail.
         durable_reads.assert_no_lists("aggregator durable watches");
         durable_reads.assert_zero("aggregator durable delta emission");
-        counted_observed.read_snapshot().since(&observed_bootstrap).assert_zero("aggregator observed delta emission");
         assert!(!run.is_finished(), "the resource watches remain live");
         run.abort();
         let _ = run.await;
@@ -6347,7 +6343,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_convoy_without_a_change_request_is_looked_up_again_when_the_records_change() {
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
         let template = convoy_with_branch("convoy-a").await;
         let convoys = durable.using::<Convoy>("flotilla");
         let created = convoys.create(&InputMeta::builder().name("convoy-a".to_string()).build(), &template.spec).await.expect("convoy");
@@ -6364,7 +6359,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(4096);
         let aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), tx)
             .with_change_request_resolver(Arc::clone(&resolver));
-        let task = tokio::spawn(aggregator.run(resource_resolvers(&durable, &observed)));
+        let task = tokio::spawn(aggregator.run(resource_resolvers(&durable)));
         let looked_up = |count: usize| {
             let resolver = Arc::clone(&resolver);
             async move {
@@ -7711,7 +7706,6 @@ mod tests {
     #[tokio::test]
     async fn restart_relist_removes_local_rows_missing_from_stores() {
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
         let state = AggregatorProjectionState::new();
         let stale_ref = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "deleted-during-outage");
         state.write().await.local_rows.insert(
@@ -8144,7 +8138,7 @@ mod tests {
         .expect("held provider check is canceled on drop");
     }
 
-    fn resource_resolvers(d: &ResourceBackend, observed: &ResourceBackend) -> AggregatorResolvers {
+    fn resource_resolvers(d: &ResourceBackend) -> AggregatorResolvers {
         AggregatorResolvers::builder()
             .durable_convoys(d.including_replicas::<Convoy>("flotilla"))
             .durable_convoy_ensures(d.including_replicas::<ConvoyEnsure>("flotilla"))
@@ -8184,7 +8178,6 @@ mod tests {
             } else {
                 ResourceBackend::new(InMemoryBackend::default())
             };
-            let observed = ResourceBackend::new(InMemoryBackend::observed());
             let sessions = durable.using::<TerminalSession>("flotilla");
             let session = session_object("terminal-probe").await;
             let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -8192,7 +8185,7 @@ mod tests {
             let state = AggregatorProjectionState::new();
             let (tx, mut rx) = broadcast::channel(4096);
             let aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver(gate.clone());
-            let resolvers = resource_resolvers(&durable, &observed);
+            let resolvers = resource_resolvers(&durable);
             let task = tokio::spawn(aggregator.run(resolvers));
             timeout(Duration::from_secs(1), async {
                 loop {

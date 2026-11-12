@@ -1,7 +1,7 @@
 //! Resource-store query projection and demand-backed issue materialization.
 //!
 //! The daemon supervises this future. Each invocation subscribes afresh and
-//! bootstraps durable and observed stores, preserving projection precedence.
+//! bootstraps the durable store and this host's discovered checkouts.
 // async_trait's generated futures trigger Clippy 1.99's redundant must-use lint.
 // Remove when async_trait or Clippy stops producing this warning.
 #![allow(clippy::double_must_use)]
@@ -52,7 +52,6 @@ pub fn run(
 ) -> BoxFuture<'_, Result<(), ResourceError>> {
     Box::pin(async move {
         let durable = context.durable;
-        let observed = context.observed;
         let aggregator = Aggregator::with_events(state, context.host_name, context.event_sink, context.events)
             .with_attach_resolver_arc(context.attach)
             .with_lifecycle_reads(context.lifecycles)
@@ -86,7 +85,6 @@ pub fn run(
 /// Runtime inputs for one supervised projection lifetime.
 pub struct AggregatorContext {
     pub durable: ResourceBackend,
-    pub observed: ResourceBackend,
     /// The checkouts this host's refresh discovered.
     pub discovered: flotilla_resources::discovered_checkouts::DiscoveredCheckouts,
     pub host_name: HostName,
