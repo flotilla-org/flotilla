@@ -90,8 +90,9 @@ pub trait EngineConvoys: Send + Sync {
     /// An operator keeps or retracts one promise by its label, with a reason.
     async fn verdict(&self, convoy: &ResourceObject<Convoy>, label: &str, keep: bool, principal: &str, reason: &str) -> Result<(), String>;
 
-    /// Landing's delivery: refused while anything is open.
-    async fn deliver(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String>;
+    /// Landing's delivery as `disposition`, the exit-table entry settlement chose (claim, merged,
+    /// closed-unmerged or a workflow's declared name): refused while anything is open.
+    async fn deliver(&self, convoy: &ResourceObject<Convoy>, disposition: &str) -> Result<(), String>;
 
     /// The disposition the engine delivered `convoy` with, once it has: the convoy's outcome is
     /// decided, and nothing the old path observes afterwards (a work failing as its vessels find
@@ -359,7 +360,7 @@ mod tests {
         async fn verdict(&self, _: &ResourceObject<Convoy>, _: &str, _: bool, _: &str, _: &str) -> Result<(), String> {
             Ok(())
         }
-        async fn deliver(&self, _: &ResourceObject<Convoy>) -> Result<(), String> {
+        async fn deliver(&self, _: &ResourceObject<Convoy>, _: &str) -> Result<(), String> {
             Ok(())
         }
         fn delivered(&self, _: &ResourceObject<Convoy>) -> Option<String> {

@@ -165,7 +165,7 @@ async fn a_fresh_convoy_is_admitted_with_its_seeded_promises() {
 async fn a_submitted_pr_is_kept_by_its_merge_and_the_convoy_delivers() {
     let fixture = fixture();
     let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true)])])).await;
-    let refused = fixture.engine.deliver(&convoy).await.expect_err("an open promise holds delivery");
+    let refused = fixture.engine.deliver(&convoy, "merged").await.expect_err("an open promise holds delivery");
     assert!(refused.contains("PromisesOutstanding"), "{refused}");
 
     fixture.engine.promise(&convoy, "work", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("submitted");
@@ -182,9 +182,11 @@ async fn a_submitted_pr_is_kept_by_its_merge_and_the_convoy_delivers() {
     fixture.engine.promise(&convoy, "work", "coder", &merged("template/pr"), Actor::Observer).await.expect("kept");
     let convoy = reread(&fixture, "c").await;
     assert_eq!(old_promise(&convoy, "work", "coder", "template/pr").state, PromiseState::Kept);
-    fixture.engine.deliver(&convoy).await.expect("delivered");
+    fixture.engine.deliver(&convoy, "merged").await.expect("delivered");
     assert_eq!(fixture.convoys.get("c").expect("held").label(), ConvoyLabel::Delivered);
-    fixture.engine.deliver(&convoy).await.expect("delivering again is no error");
+    // The delivery records the exit entry it was given; delivering again changes nothing.
+    fixture.engine.deliver(&convoy, "closed-unmerged").await.expect("delivering again is no error");
+    assert_eq!(fixture.engine.delivered(&convoy).as_deref(), Some("merged"));
 }
 
 // Behaviour: the engine's refusals reach the caller and write nothing: a crew may not retract a
@@ -275,7 +277,7 @@ async fn operator_verdicts_keep_and_retract() {
     let convoy = reread(&fixture, "c").await;
     assert_eq!(old_promise(&convoy, "a", "coder", "template/pr").state, PromiseState::Kept);
     assert_eq!(old_promise(&convoy, "b", "coder", "template/pr").state, PromiseState::Retracted);
-    fixture.engine.deliver(&convoy).await.expect("nothing open");
+    fixture.engine.deliver(&convoy, "claim").await.expect("nothing open");
 }
 
 // Behaviour: a convoy with no obligation is refused by name, and nothing is admitted. (A convoy

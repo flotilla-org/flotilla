@@ -788,14 +788,14 @@ impl Reconciler for ConvoyReconciler {
                 now,
             )
         });
-        if settlement.as_ref().is_some_and(|settlement| settlement.disposition.is_some()) {
+        if let Some(disposition) = settlement.as_ref().and_then(|settlement| settlement.disposition.as_deref()) {
             let held_until = self.delivery_held_until(obj).await?;
             engine.memory().update(&obj.metadata.name, |notes| notes.delivery_held_until = held_until);
             if let Some(until) = held_until {
                 // A Message change wakes it sooner; the hold's end is its one deadline.
                 pass.requeue_after = Some(until.signed_duration_since(now).to_std().unwrap_or_default());
             } else {
-                match engine.deliver(obj).await {
+                match engine.deliver(obj, disposition).await {
                     Ok(()) => self.note_target_mismatches(engine.as_ref(), obj, &checkouts),
                     Err(error) => tracing::info!(convoy = %obj.metadata.name, %error, "the engine refused delivery; landing holds"),
                 }

@@ -72,7 +72,7 @@ impl EngineConvoys for Recording {
     async fn verdict(&self, _: &ResourceObject<Convoy>, _: &str, _: bool, _: &str, _: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn deliver(&self, _: &ResourceObject<Convoy>) -> Result<(), String> {
+    async fn deliver(&self, _: &ResourceObject<Convoy>, _: &str) -> Result<(), String> {
         *self.deliveries.lock().expect("deliveries") += 1;
         Ok(())
     }
