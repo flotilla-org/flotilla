@@ -14,7 +14,8 @@ use flotilla_address::{Address, Condition, Kind};
 use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
 use flotilla_resources::{
     address::{leaf_address, stored_change_request_address, stored_issue_address, stored_repository_address},
-    ForgeSpec, MessageExpectation, MessageReference, MessageRelation, MessageSpec as OldSpec,
+    convoy::engine::{launch_address, split_launch},
+    convoy_of_segment, ForgeSpec, MessageExpectation, MessageReference, MessageRelation, MessageSpec as OldSpec,
 };
 use flotilla_state_machines::machines::message::{
     Expectation, MessageBody, MessageRef, MessageReference as Reference, MessageSpec, Relation,
@@ -89,10 +90,16 @@ impl Conversion<'_> {
         }
         let refused = |error: flotilla_address::Error| format!("`{receiver}`: {error}");
         match receiver.split('/').collect::<Vec<_>>().as_slice() {
-            [project, convoy, _vessel, role] => Address::project(project)
-                .and_then(|project| project.child(Kind::Convoy, convoy))
-                .and_then(|convoy| convoy.child(Kind::Role, role))
-                .map_err(refused),
+            [project, segment, _vessel, role] => {
+                let project = Address::project(project).map_err(refused)?;
+                // The segment escapes the convoy's name; a standing role's launch is named by its own address.
+                let convoy = convoy_of_segment(segment);
+                let launch = match split_launch(&convoy) {
+                    Some(_) => launch_address(&project, &convoy).map_err(|error| format!("`{receiver}`: {error}"))?,
+                    None => project.child(Kind::Convoy, &convoy).map_err(refused)?,
+                };
+                launch.child(Kind::Role, role).map_err(refused)
+            }
             [project, role] => Address::project(project).and_then(|project| project.child(Kind::Role, role)).map_err(refused),
             _ => Err(format!("`{receiver}` is not a role address")),
         }
@@ -317,6 +324,19 @@ mod tests {
         assert!(map.sender("principal:alice").is_err(), "a person has no address outside a message's context");
         assert!(map.inbox("topic:flotilla/reviews").is_err());
         assert!(map.inbox("system:unknown").is_err());
+    }
+
+    // Behaviour: a standing role's launch is named by its own address, escaped in the old
+    // receiver's segment; the inbox is that launch's role, not an address of the escaped text.
+    #[test]
+    fn a_standing_launch_receiver_is_its_launch_role() {
+        let roles = FleetRoles::declared("fleet").expect("roles");
+        let map = conversion(&roles);
+        let launch = format!("{}#5", flotilla_resources::convoy::engine::standing_name("flotilla", "governor").expect("standing name"));
+        let receiver = flotilla_resources::crew_role_address("flotilla", &launch, "govern", "governor");
+        let project = Address::project("flotilla").expect("project");
+        let expected = launch_address(&project, &launch).expect("launch").child(Kind::Role, "governor").expect("role");
+        assert_eq!(map.inbox(&receiver).expect("standing launch role").as_str(), expected.as_str());
     }
 
     /// Charter declarations of the roles principals hold, by project.
