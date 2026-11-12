@@ -1,7 +1,7 @@
-//! Whether the engine serves the forge observations (`[primitives]`). Once it does, an observer
-//! writes only records it observes, at its own home: no placeholder for another host's demand and
-//! no convoy history, which the convoys hold. A failed read is recorded on the record, and records
-//! nothing demands are swept after one demand lease.
+//! The engine's forge observation records. An observer writes only records it observes, at its own
+//! home: no placeholder for another host's demand and no convoy history, which the convoys hold. A
+//! failed read is recorded on the record, and records nothing demands are swept after one demand
+//! lease.
 
 use std::sync::{Arc, OnceLock};
 
@@ -18,10 +18,6 @@ impl EngineObservers {
 
     pub(crate) fn failures(&self) -> Option<&Arc<dyn ObservationFailures>> {
         self.0.get()
-    }
-
-    pub(crate) fn installed(&self) -> bool {
-        self.0.get().is_some()
     }
 
     /// Records a failed read of `kind`'s record `name` at this home, when the engine serves it.

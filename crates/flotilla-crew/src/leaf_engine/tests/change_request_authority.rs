@@ -770,7 +770,19 @@ async fn observed_issue_change_fires_wait_leaf() {
     )
     .expect("record name");
     let records = backend.using::<Issue>("flotilla");
-    let created = records.get(&name).await.expect("demand creates record");
+    // The demand writes no record; the observer writes it on its first observation.
+    let created = records
+        .create(
+            &InputMeta::builder().name(name.clone()).build(),
+            &flotilla_resources::IssueSpec::builder()
+                .service("github.com".into())
+                .scope("flotilla-org/flotilla".into())
+                .number(2052)
+                .observing_authority("authority".into())
+                .build(),
+        )
+        .await
+        .expect("observed issue record");
     let now = Utc::now();
     let status = flotilla_resources::IssueStatus {
         title: Default::default(),

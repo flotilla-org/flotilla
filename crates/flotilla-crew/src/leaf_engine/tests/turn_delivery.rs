@@ -747,16 +747,17 @@ fn empty_queued_batches_preserve_attention_cleanup(tc: hegel::TestCase) {
     });
 }
 
-async fn demand_placeholder_spec<T: flotilla_resources::Resource>(
+async fn demand_without_placeholder<T: flotilla_resources::Resource>(
     home: &ResourceBackend,
     name: &str,
     demand: impl std::future::Future<Output = Result<(), String>>,
-) -> T::Spec {
+) {
     demand.await.unwrap();
-    let local = home.using::<T>("flotilla").get(name).await.unwrap();
-    // Demand must create a placeholder without inventing observed evidence.
-    assert!(local.status.is_none(), "demand creates an empty local placeholder");
-    local.spec
+    // Demand writes no local record: the observation reaches the home only from its observer.
+    assert!(
+        matches!(home.using::<T>("flotilla").get(name).await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+        "demand writes no local placeholder"
+    );
 }
 
 async fn publish_remote_observation<T: flotilla_resources::Resource>(
@@ -801,15 +802,15 @@ struct ReplicaTurnSetup<'a> {
     observer: &'a ResourceBackend,
     name: &'a str,
     id: uuid::Uuid,
-    /// When set, the observation is older than the placeholder yet newer than this instant.
-    older_than_placeholder_after: Option<DateTime<Utc>>,
+    /// When set, the observation is older than the demand yet newer than this instant.
+    observed_after: Option<DateTime<Utc>>,
 }
 
 impl ReplicaTurnSetup<'_> {
-    /// Called once the placeholder exists, so a midpoint is older than it.
+    /// Called once the demand is made, so a midpoint is older than it.
     fn observed_at(&self) -> DateTime<Utc> {
         let now = Utc::now();
-        self.older_than_placeholder_after.map_or(now, |after| after + (now - after) / 2)
+        self.observed_after.map_or(now, |after| after + (now - after) / 2)
     }
 
     async fn observe_issue(&self, issues: &IssueRefresher) -> DateTime<Utc> {
@@ -817,14 +818,17 @@ impl ReplicaTurnSetup<'_> {
         let observer = self.observer;
         let name = self.name;
         let id = self.id;
-        let key = flotilla_observation::issue_observer::IssueKey::new(
-            "flotilla",
-            flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
-        )
-        .unwrap();
-        let mut spec = demand_placeholder_spec::<Issue>(home, name, issues.demand(id, key, None)).await;
+        let address = flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap();
+        let (service, scope) = flotilla_resources::address::stored_service_scope(&address).unwrap();
+        let key = flotilla_observation::issue_observer::IssueKey::new("flotilla", address).unwrap();
+        let spec = flotilla_resources::IssueSpec::builder()
+            .service(service)
+            .scope(scope)
+            .number(key.number())
+            .observing_authority("observer".into())
+            .build();
+        demand_without_placeholder::<Issue>(home, name, issues.demand(id, key, None)).await;
         let observed_at = self.observed_at();
-        spec.observing_authority = "observer".into();
         let observed = publish_remote_observation::<Issue>(
             home,
             observer,
@@ -854,9 +858,15 @@ impl ReplicaTurnSetup<'_> {
             flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
         )
         .unwrap();
-        let mut spec = demand_placeholder_spec::<ChangeRequest>(home, name, refresher.demand(id, key, None)).await;
+        let (service, scope) = key.stored_service_scope();
+        let spec = flotilla_resources::ChangeRequestSpec::builder()
+            .service(service)
+            .scope(scope)
+            .number(key.number())
+            .observing_authority("observer".into())
+            .build();
+        demand_without_placeholder::<ChangeRequest>(home, name, refresher.demand(id, key, None)).await;
         let observed_at = self.observed_at();
-        spec.observing_authority = "observer".into();
         let observed = publish_remote_observation::<ChangeRequest>(
             home,
             observer,
@@ -940,13 +950,13 @@ impl ReplicaTurnSource {
     }
 }
 
-// A demanded placeholder on the convoy home must never hide observations from
-// another host: triggering and delivery must agree, including a stalled merge.
+// A demand on the convoy home writes no record there; another host's observation reaches it
+// as a replica, and triggering and delivery must agree, including a stalled merge.
 #[hegel::test]
 fn replica_status_turn_delivery(tc: hegel::TestCase) {
     use super::super::routing::{ObjectAddress, ObjectKind};
-    // Cross both timestamp orders; a newly created empty copy is not evidence.
-    let newer_placeholder = tc.draw(hegel::generators::booleans());
+    // Cross both timestamp orders: observed now, or between the launch's judgement and now.
+    let observed_since_judgement = tc.draw(hegel::generators::booleans());
     // Both terminal check outcomes satisfy the stock checks-settled rule.
     let failed_checks = tc.draw(hegel::generators::booleans());
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
@@ -1006,7 +1016,7 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
                 assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
             }
             // A launch starts, and its coder claims, when admitted: evidence older than that is
-            // never a turn, so an older-than-placeholder observation still follows it.
+            // never a turn, so an observation from between the judgement and now still follows it.
             let status = convoys.get(launch).await.unwrap().status.unwrap();
             let judged = status.crew_work["work"]["coder"].finished_at.or(status.started_at).expect("launch started");
             let setup = ReplicaTurnSetup {
@@ -1014,7 +1024,7 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
                 observer: &observer,
                 name: &name,
                 id,
-                older_than_placeholder_after: newer_placeholder.then_some(judged),
+                observed_after: observed_since_judgement.then_some(judged),
             };
             let (kind, observed_at) = if is_issue {
                 (ObjectKind::Issue, setup.observe_issue(&issues).await)

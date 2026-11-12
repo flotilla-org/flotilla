@@ -922,18 +922,13 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
     let name = cr_name("github.com", "flotilla-org/flotilla", 2596);
     // The home's Host is the forge's only observer, so the record is its own: a foreign
     // authority would be taken over, and its observation dropped, once a row demands it.
-    records
-        .create(
-            &InputMeta::builder().name(name.clone()).build(),
-            &flotilla_resources::ChangeRequestSpec::builder()
-                .service("github.com".into())
-                .scope("flotilla-org/flotilla".into())
-                .number(2596)
-                .observing_authority("test-host".into())
-                .build(),
-        )
-        .await
-        .expect("PR record");
+    let spec = flotilla_resources::ChangeRequestSpec::builder()
+        .service("github.com".into())
+        .scope("flotilla-org/flotilla".into())
+        .number(2596)
+        .observing_authority("test-host".into())
+        .build();
+    records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("PR record");
     // Pending and terminal crews do not owe an active settlement turn.
     for phase in [CrewWorkPhase::Pending, CrewWorkPhase::Done, CrewWorkPhase::Failed, CrewWorkPhase::HandedBack] {
         let launch = produced_pr_launch(&backend, &home, "single-agent", "coder", phase).await;
@@ -1012,15 +1007,21 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
         review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
     };
     // Arm this launch's rows before the PR is observed: the sync retires the earlier launches'
-    // rows, and the record they alone demanded is collected and recreated unobserved. Disarm
-    // their watches so the merged observation fires only through the deterministic evaluation
-    // below.
+    // rows, and the record they alone demanded is collected; the observer writes it again when it
+    // next observes the PR, as below. Disarm their watches so the merged observation fires only
+    // through the deterministic evaluation below.
     let objects = HashMap::from([(launch.to_owned(), convoys.get(launch).await.expect("convoy"))]);
     wake.sync_rows("flotilla", &objects).await.expect("active subscriptions");
     for task in table.inner.tasks.lock().await.drain().map(|(_, task)| task) {
         task.abort();
     }
-    let record = records.get(&name).await.expect("record");
+    let record = match records.get(&name).await {
+        Ok(record) => record,
+        Err(ResourceError::NotFound { .. }) => {
+            records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("observed PR record")
+        }
+        Err(error) => panic!("record: {error}"),
+    };
     let record = records.update_status(&name, &record.metadata.resource_version, &observed).await.expect("merged observation");
     if stalled {
         let observed = observe_promise(&home, &backend, launch, &BTreeMap::from([(name.clone(), record.clone())]), &BTreeMap::new()).await;

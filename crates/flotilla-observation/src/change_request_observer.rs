@@ -12,8 +12,8 @@ use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     address::{stored_spelling_names, subject_address},
     convoy_subject_rows, merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestSpec,
-    ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks,
-    ResourceError, ResourceObject, ResourceProvenance,
+    ChangeRequestStatus, Convoy, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks, ResourceError, ResourceObject,
+    ResourceProvenance,
 };
 use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend, StoreQuery};
 
@@ -35,7 +35,6 @@ const RETAINED_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// request: the forge observer's edge probe (#3108). The webhook relay's change request hints are
 /// to replace this cadence.
 const BRANCH_PROBE_INTERVAL: Duration = Duration::from_secs(15 * 60);
-const HISTORY_REFRESH_INTERVAL_SECS: i64 = 60 * 60;
 
 // Deadline arithmetic on the judge path must remain total even for a cadence
 // outside chrono's duration range or an observation near its final timestamp.
@@ -85,7 +84,6 @@ pub struct ChangeRequestRefresher {
 struct ChangeRequestRefresherInner {
     backend: ResourceBackend,
     authority: String,
-    origin: String,
     source: Arc<dyn ChangeRequestObservationSource>,
     cadence: ChangeRequestRefreshCadence,
     active: Mutex<HashMap<ChangeRequestKey, ActiveRefresh>>,
@@ -105,8 +103,10 @@ struct ChangeRequestRefresherInner {
 }
 
 impl ChangeRequestRefresher {
+    // `_origin` named the convoy history this observer wrote; it has no reader now, and its
+    // callers drop it in the next change.
     pub fn new(
-        origin: String,
+        _origin: String,
         backend: ResourceBackend,
         authority: String,
         source: Arc<dyn ChangeRequestObservationSource>,
@@ -116,7 +116,6 @@ impl ChangeRequestRefresher {
             inner: Arc::new(ChangeRequestRefresherInner {
                 backend,
                 authority,
-                origin,
                 source,
                 cadence,
                 active: Mutex::new(HashMap::new()),
@@ -568,15 +567,6 @@ impl ChangeRequestRefresher {
     ) -> Result<(), String> {
         let lock = self.subject_lock(&subject).await;
         let _guard = lock.lock().await;
-        let name = subject.record_name();
-        match self.inner.backend.including_replicas::<ChangeRequest>(subject.namespace()).get(&name).await {
-            Ok(_) => {}
-            Err(ResourceError::NotFound { .. }) if self.inner.engine.installed() => {}
-            Err(ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
-            Err(error) => return Err(error.to_string()),
-        }
-
-        self.record_convoy_history_locked(&subject).await?;
         let mut active = self.inner.active.lock().await;
         if let Some(refresh) = active.get_mut(&subject) {
             let was_retained = refresh.demands.is_empty();
@@ -785,121 +775,6 @@ impl ChangeRequestRefresher {
                 scheduled_cadence: RETAINED_REFRESH_INTERVAL,
             },
         );
-    }
-
-    /// Capture links at admission, before a convoy can disappear. History is in
-    /// the spec so ordinary forge status refreshes cannot erase it, and it follows
-    /// the record's existing observation replication class.
-    // Tests can capture history without already holding demand admission's lock.
-    #[cfg(test)]
-    async fn record_convoy_history(&self, subject: &ChangeRequestKey) -> Result<(), String> {
-        let lock = self.subject_lock(subject).await;
-        let _guard = lock.lock().await;
-        self.record_convoy_history_locked(subject).await
-    }
-
-    // Caller holds the subject lock, shared by demand admission and unlink cleanup.
-    async fn record_convoy_history_locked(&self, subject: &ChangeRequestKey) -> Result<(), String> {
-        if self.inner.engine.installed() {
-            return Ok(());
-        }
-        let convoys = self.inner.backend.using::<Convoy>(subject.namespace()).list().await.map_err(|error| error.to_string())?;
-        let forges = self.forges(subject.namespace()).await?;
-        let mut history = Vec::new();
-        let references = ReferenceContext::default();
-        for convoy in convoys.items {
-            for row in convoy_subject_rows(&convoy, &references) {
-                // Convoy rows keep the spelling they were admitted with; one
-                // change request matches whatever its spelling.
-                if row.subject.kind != ConvoySubjectKind::ChangeRequest {
-                    continue;
-                }
-                let address = match subject_address(&row.subject, &forges) {
-                    Ok(address) => address,
-                    Err(error) => {
-                        tracing::debug!(convoy = %convoy.metadata.name, %error, "convoy change request subject has no address; no history recorded");
-                        continue;
-                    }
-                };
-                if &address != subject.address() {
-                    continue;
-                }
-                history.push(
-                    ChangeRequestSubjectHistory::builder()
-                        .namespace(convoy.metadata.namespace.clone())
-                        .convoy(convoy.metadata.name.clone())
-                        .origin(self.inner.origin.clone())
-                        .relationship(row.relationship)
-                        .role(convoy.spec.role.clone())
-                        .maybe_project(convoy.spec.project_ref.clone())
-                        .last_seen(Utc::now())
-                        .build(),
-                );
-            }
-        }
-        if history.is_empty() {
-            return Ok(());
-        }
-        let name = subject.record_name();
-        let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
-        loop {
-            let current = match records.get(&name).await {
-                Ok(current) => current,
-                Err(ResourceError::NotFound { .. }) => {
-                    // The observing authority may be remote. Keep a local copy
-                    // of its record so this convoy's history can replicate too.
-                    let observed = self
-                        .inner
-                        .backend
-                        .including_replicas::<ChangeRequest>(subject.namespace())
-                        .get(&name)
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .object;
-                    let mut spec = observed.spec.clone();
-                    merge_change_request_history(&mut spec.subject_of, &history);
-                    match records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await {
-                        Ok(created) => {
-                            if let Some(status) = observed.status {
-                                records
-                                    .update_status(&name, &created.metadata.resource_version, &status)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                            }
-                            continue;
-                        }
-                        Err(ResourceError::Conflict { .. }) => continue,
-                        Err(error) => return Err(error.to_string()),
-                    }
-                }
-                Err(error) => return Err(error.to_string()),
-            };
-            let mut spec = current.spec.clone();
-            let mut incoming = history.clone();
-            for entry in &mut incoming {
-                if let Some(prior) = spec.subject_of.iter().find(|prior| {
-                    prior.namespace == entry.namespace
-                        && prior.convoy == entry.convoy
-                        && prior.origin == entry.origin
-                        && prior.relationship == entry.relationship
-                        && prior.role == entry.role
-                        && prior.project == entry.project
-                }) {
-                    if entry.last_seen.signed_duration_since(prior.last_seen).num_seconds() < HISTORY_REFRESH_INTERVAL_SECS {
-                        entry.last_seen = prior.last_seen;
-                    }
-                }
-            }
-            merge_change_request_history(&mut spec.subject_of, &incoming);
-            if spec == current.spec {
-                return Ok(());
-            }
-            match records.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await {
-                Ok(_) => return Ok(()),
-                Err(ResourceError::Conflict { .. }) => continue,
-                Err(error) => return Err(error.to_string()),
-            }
-        }
     }
 
     /// Number of currently retained observation demands.
@@ -1167,7 +1042,6 @@ impl ChangeRequestRefresher {
         if !self.owns_record(subject, allow_takeover, create_missing).await? {
             return Ok(());
         }
-        self.record_convoy_history_locked(subject).await?;
         let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
         let current = records.get(name).await.map_err(|error| error.to_string())?;
         if current.spec.observing_authority != self.inner.authority {
@@ -1183,10 +1057,6 @@ impl ChangeRequestRefresher {
         }
         records.update_status(name, &current.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
         Ok(())
-    }
-
-    async fn ensure_record(&self, subject: &ChangeRequestKey, name: &str) -> Result<(), String> {
-        self.get_or_create_record(subject, name).await.map(|_| ())
     }
 
     async fn get_or_create_record(
@@ -1343,7 +1213,7 @@ mod tests {
         recipe::FlotillaRecipes,
         wire::{MetadataTarget, MetadataValue},
     };
-    use flotilla_resources::{ChangeRequestReviewObservation, Observation, ObservedMergeability};
+    use flotilla_resources::{ChangeRequestReviewObservation, ChangeRequestSubjectHistory, Observation, ObservedMergeability};
     use flotilla_store::{ResourceBackend, TypedResolver};
 
     use super::*;
@@ -1354,7 +1224,6 @@ mod tests {
         .expect("record name")
     }
     use flotilla_change_request::observation::parse_gh_observation;
-    use flotilla_protocol::Subject as ConvoySubject;
 
     // Convoy demand discovery decodes live inventory only, regardless of retained history.
     #[tokio::test]
@@ -1554,7 +1423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_first_demands_converge_on_one_authority_record() {
+    async fn concurrent_first_demands_share_one_refresh_and_write_no_placeholder() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
@@ -1574,120 +1443,12 @@ mod tests {
         );
         first.expect("first demand");
         second.expect("concurrent demand");
-        assert_eq!(backend.using::<ChangeRequest>("flotilla").list().await.expect("list CRs").items.len(), 1);
+        assert!(
+            backend.using::<ChangeRequest>("flotilla").list().await.expect("list CRs").items.is_empty(),
+            "the observer writes no placeholder"
+        );
+        assert_eq!(refresher.inner.active.lock().await.len(), 1);
         assert_eq!(refresher.active_demands().await, 2);
-    }
-
-    // Behaviour (#2445): a local convoy keeps history even when a different
-    // host observes the forge. A terminal history-bearing local copy is collectible.
-    #[tokio::test(start_paused = true)]
-    async fn remote_observer_does_not_lose_local_convoy_history() {
-        use flotilla_protocol::{IssueSource, NodeId, Relationship, Subject, SubjectKind};
-        use flotilla_resources::{Convoy, ConvoySpec, DeclaredSubject};
-        for via_replica in [false, true] {
-            let backend = ResourceBackend::new(InMemoryBackend::default());
-            let remote = ResourceBackend::new(InMemoryBackend::default());
-            let subject = ChangeRequestKey::new(
-                "ops",
-                flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
-            )
-            .expect("key");
-            let remote_records = remote.using::<ChangeRequest>("ops");
-            let record = remote_records
-                .create(
-                    &InputMeta::builder().name(subject.record_name()).build(),
-                    &ChangeRequestSpec::builder()
-                        .service(subject.stored_service_scope().0)
-                        .scope(subject.stored_service_scope().1)
-                        .number(subject.number())
-                        .observing_authority("remote".into())
-                        .build(),
-                )
-                .await
-                .expect("remote record");
-            let observed = parse_gh_observation(r#"{"state":"OPEN"}"#, Utc::now()).expect("observation");
-            remote_records
-                .update_status(&subject.record_name(), &record.metadata.resource_version, &observed)
-                .await
-                .expect("remote observation");
-            backend
-                .replica_writer::<ChangeRequest>(NodeId::new("remote"), "ops")
-                .replace(&remote_records.list().await.expect("remote list"), Utc::now())
-                .await
-                .expect("replica");
-            backend
-                .using::<Convoy>("ops")
-                .create(
-                    &InputMeta::builder().name("producer".into()).build(),
-                    &ConvoySpec::builder()
-                        .workflow_ref("dev".into())
-                        .role("coder".into())
-                        .subjects(vec![DeclaredSubject {
-                            subject: Subject {
-                                kind: SubjectKind::ChangeRequest,
-                                source: IssueSource { service: subject.stored_service_scope().0, scope: subject.stored_service_scope().1 },
-                                id: "42".into(),
-                            },
-                            relationship: Relationship::Produces,
-                            issue: None,
-                            change_request: None,
-                        }])
-                        .build(),
-                )
-                .await
-                .expect("local convoy");
-            let refresher = ChangeRequestRefresher::new(
-                "kiwi".into(),
-                backend.clone(),
-                "local".into(),
-                Arc::new(UnavailableSource),
-                ChangeRequestRefreshCadence::default(),
-            );
-            let demand = uuid::Uuid::new_v4();
-            refresher.demand(demand, subject.clone(), None).await.expect("demand");
-            let records = backend.using::<ChangeRequest>("ops");
-            let record = records.get(&subject.record_name()).await.expect("local history copy");
-            assert_eq!(record.spec.observing_authority, "remote");
-            assert_eq!(record.spec.subject_of.len(), 1);
-            assert_eq!(record.spec.subject_of[0].origin, "kiwi");
-            assert_eq!(record.status.as_ref().expect("copied observation").state.value, Some(ObservedChangeRequestState::Open));
-            let second = uuid::Uuid::new_v4();
-            refresher.demand(second, subject.clone(), None).await.expect("second demand");
-            assert_eq!(
-                records.get(&subject.record_name()).await.expect("history unchanged").metadata.resource_version,
-                record.metadata.resource_version
-            );
-            backend.using::<Convoy>("ops").delete("producer").await.expect("delete producer");
-            refresher.release(demand).await;
-            if via_replica {
-                refresher.release(second).await;
-                assert!(records.get(&subject.record_name()).await.is_ok());
-                let current = remote_records.get(&subject.record_name()).await.expect("remote current");
-                let mut terminal = current.status.expect("remote status");
-                terminal.state = Observation::known(ObservedChangeRequestState::Merged, Utc::now() + chrono::Duration::seconds(1));
-                remote_records
-                    .update_status(&subject.record_name(), &current.metadata.resource_version, &terminal)
-                    .await
-                    .expect("remote merge");
-                backend
-                    .replica_writer::<ChangeRequest>(NodeId::new("remote"), "ops")
-                    .replace(&remote_records.list().await.expect("remote terminal list"), Utc::now())
-                    .await
-                    .expect("terminal replica");
-                tokio::time::advance(RETAINED_REFRESH_INTERVAL).await;
-                wait_for_request_state(&records, &subject.record_name(), None).await;
-                assert!(!refresher.inner.active.lock().await.contains_key(&subject));
-                continue;
-            }
-            let mut terminal = record.status.expect("status");
-            terminal.state = Observation::known(ObservedChangeRequestState::Closed, Utc::now());
-            records
-                .update_status(&subject.record_name(), &record.metadata.resource_version, &terminal)
-                .await
-                .expect("terminal observation");
-            refresher.release(second).await;
-            assert!(records.list().await.expect("local records").items.is_empty());
-        }
     }
 
     // Forge boundary: inject observations instead of invoking a live forge API.
@@ -1778,6 +1539,8 @@ mod tests {
         let sibling = test_subject(42);
         let demand = uuid::Uuid::new_v4();
         refresher.demand(demand, sibling.clone(), None).await.expect("sibling demand");
+        // The sibling's record is the refresh loop's first write; its next refresh is the batch read.
+        refresher.get_or_create_record(&sibling, &sibling.record_name()).await.expect("sibling record");
         refresher.refresh_once_with_creation(&sibling, false).await.expect("sibling batch");
         let groups = source.0.lock().await.clone();
         assert!(!groups.is_empty());
@@ -1859,7 +1622,7 @@ mod tests {
                 flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
             )
             .expect("key");
-            refresher.ensure_record(&subject, &subject.record_name()).await.expect("record");
+            refresher.get_or_create_record(&subject, &subject.record_name()).await.expect("record");
             let records = backend.using::<ChangeRequest>("ops");
             let record = records.get(&subject.record_name()).await.expect("record");
             let mut spec = record.spec.clone();
@@ -1912,7 +1675,7 @@ mod tests {
                 flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
             )
             .expect("key");
-            refresher.ensure_record(&subject, &subject.record_name()).await.expect("record");
+            let record = refresher.get_or_create_record(&subject, &subject.record_name()).await.expect("record");
             let convoys = backend.using::<Convoy>("ops");
             let linked = flotilla_protocol::Subject {
                 kind: ConvoySubjectKind::ChangeRequest,
@@ -1937,7 +1700,22 @@ mod tests {
                 );
                 convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("link");
             }
-            refresher.record_convoy_history(&subject).await.expect("history");
+            // Each holder's history, as the record held it when written beside the convoys.
+            let mut spec = record.spec.clone();
+            for i in 0..holders {
+                spec.subject_of.push(
+                    ChangeRequestSubjectHistory::builder()
+                        .namespace("ops".into())
+                        .convoy(format!("producer-{i}"))
+                        .origin("kiwi".into())
+                        .relationship(Relationship::Produces)
+                        .role("coder".into())
+                        .last_seen(Utc::now())
+                        .build(),
+                );
+            }
+            let records = backend.using::<ChangeRequest>("ops");
+            records.update(&InputMeta::from(&record.metadata), &record.metadata.resource_version, &spec).await.expect("history");
             let mut order = (0..holders).collect::<Vec<_>>();
             if reverse {
                 order.reverse();
@@ -2031,7 +1809,7 @@ mod tests {
                 flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).unwrap(),
             )
             .unwrap();
-            refresher.ensure_record(&subject, &subject.record_name()).await.unwrap();
+            refresher.get_or_create_record(&subject, &subject.record_name()).await.unwrap();
             refresher.start_retained(subject.clone()).await;
             source.started.notified().await;
             let demand = uuid::Uuid::new_v4();
@@ -2175,11 +1953,11 @@ mod tests {
         }
     }
 
-    // Behaviour (#2445): link history replicates with the request, survives convoy
-    // deletion, demand release, and daemon restart, then terminal polling collects it.
+    // Behaviour (#2445): a request a convoy produced, with that link in its history (as an
+    // imported record holds it), survives demand release and daemon restart, then terminal
+    // polling collects it.
     #[tokio::test(start_paused = true)]
     async fn produced_request_survives_release_and_restart_until_terminal() {
-        use flotilla_resources::{Convoy, ConvoySpec, ConvoyStatus, SubjectDiscoverySource};
         for terminal in [ObservedChangeRequestState::Merged, ObservedChangeRequestState::Closed] {
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let observed_at = Utc::now();
@@ -2196,41 +1974,32 @@ mod tests {
                 source.clone(),
                 ChangeRequestRefreshCadence::default(),
             );
-            let convoys = backend.using::<Convoy>("ops");
-            let convoy = convoys
-                .create(
-                    &InputMeta::builder().name("producer".into()).build(),
-                    &ConvoySpec::builder().workflow_ref("dev".into()).role("coder".into()).project_ref("platform".into()).build(),
-                )
-                .await
-                .expect("convoy");
             let subject = ChangeRequestKey::new(
                 "ops",
                 flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
             )
             .expect("key");
-            let mut status = ConvoyStatus::default();
-            status.discover_subject(
-                ConvoySubject {
-                    kind: ConvoySubjectKind::ChangeRequest,
-                    source: IssueSource { service: subject.stored_service_scope().0, scope: subject.stored_service_scope().1 },
-                    id: "42".into(),
-                },
-                Relationship::Produces,
-                SubjectDiscoverySource::Claim,
-                observed_at,
+            let record = refresher.get_or_create_record(&subject, &subject.record_name()).await.expect("record");
+            let mut spec = record.spec.clone();
+            spec.subject_of.push(
+                ChangeRequestSubjectHistory::builder()
+                    .namespace("ops".into())
+                    .convoy("producer".into())
+                    .origin("kiwi".into())
+                    .relationship(Relationship::Produces)
+                    .role("coder".into())
+                    .project("platform".into())
+                    .last_seen(observed_at)
+                    .build(),
             );
-            convoys.update_status("producer", &convoy.metadata.resource_version, &status).await.expect("link");
+            let records = backend.using::<ChangeRequest>("ops");
+            records.update(&InputMeta::from(&record.metadata), &record.metadata.resource_version, &spec).await.expect("history");
             let demand = uuid::Uuid::new_v4();
             refresher.demand(demand, subject.clone(), None).await.expect("demand");
             refresher.refresh_once(&subject).await.expect("initial observation");
-            let records = backend.using::<ChangeRequest>("ops");
             let record = records.get(&subject.record_name()).await.expect("request");
             assert_eq!(record.spec.subject_of.len(), 1);
             assert_eq!(record.spec.subject_of[0].convoy, "producer");
-            assert_eq!(record.spec.subject_of[0].origin, "kiwi");
-            assert_eq!(record.spec.subject_of[0].role, "coder");
-            convoys.delete("producer").await.expect("delete convoy");
             let next_observation = source.1.load(Ordering::SeqCst) + 1;
             refresher.release(demand).await;
             assert!(records.get(&subject.record_name()).await.is_ok());
@@ -2322,6 +2091,7 @@ mod tests {
             flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1366, &[]).expect("address"),
         )
         .expect("key");
+        refresher.get_or_create_record(&subject, &subject.record_name()).await.expect("observed record");
         let first = uuid::Uuid::new_v4();
         let last = uuid::Uuid::new_v4();
         refresher.demand(first, subject.clone(), None).await.expect("first demand");
@@ -2350,6 +2120,7 @@ mod tests {
             flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1366, &[]).expect("address"),
         )
         .expect("key");
+        refresher.get_or_create_record(&subject, &subject.record_name()).await.expect("observed record");
         refresher.demand(uuid::Uuid::new_v4(), subject, None).await.expect("non-default namespace demand");
         assert_eq!(backend.local_namespaces::<ChangeRequest>().await.expect("local namespaces"), vec!["ops"]);
 
@@ -2577,7 +2348,7 @@ mod tests {
 
     // Behaviour (observation ruling): under the engine, a host that does not observe
     // a change request writes nothing for it: no local copy and no convoy history, however a
-    // local convoy links it. The old store's copy of both is `remote_observer_does_not_lose_local_convoy_history`.
+    // local convoy links it.
     #[tokio::test]
     async fn under_the_engine_only_the_observer_writes() {
         use flotilla_protocol::{IssueSource, NodeId, Relationship, Subject, SubjectKind};
@@ -2626,7 +2397,6 @@ mod tests {
         refresher.engine().install(Arc::new(RecordedFailures::default())).expect("engine");
         let demand = uuid::Uuid::new_v4();
         refresher.demand(demand, subject.clone(), None).await.expect("demand");
-        refresher.record_convoy_history(&subject).await.expect("history is the convoys' under the engine");
 
         // A change request no home holds yet, whose source a Project at `remote` declares: the
         // demand leaves its record to `remote`.
