@@ -80,6 +80,8 @@ struct InFlight {
     consumer: Receiver,
     members: Vec<String>,
     submitted_at: chrono::DateTime<Utc>,
+    /// Confirmed, but a receipt was refused: the next pass retries only the receipts.
+    confirmed: bool,
 }
 
 pub(super) struct MessageDelivery {
@@ -380,7 +382,7 @@ impl MessageDelivery {
                 // transport confirms the turn, then the deliver. A receipt whose deliver is
                 // refused or interrupted stays committed: the message is no longer pending
                 // for this consumer, so it is never retyped, and the sweep records its deliver.
-                Ok(TerminalDeliveryOutcome::Confirmed) => self.record_turn(&turn).await,
+                Ok(TerminalDeliveryOutcome::Confirmed) => self.record_turn(turn).await,
                 // Typed, but no stable busy signal followed: held, never retyped, until the agent's
                 // record confirms it or the hold runs out.
                 Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)) => {
@@ -401,7 +403,7 @@ impl MessageDelivery {
     /// clears it once no turn is held there: the session view explains the hold (#3108).
     fn show_held_turns(&mut self) {
         let mut held = BTreeMap::<String, chrono::DateTime<Utc>>::new();
-        for turn in self.held_turns.iter().filter(|turn| turn.members.iter().any(|message| self.held.is_held(message))) {
+        for turn in self.held_turns.iter().filter(|turn| !turn.confirmed && turn.members.iter().any(|message| self.held.is_held(message))) {
             let since = held.entry(turn.consumer.id.clone()).or_insert(turn.submitted_at);
             *since = (*since).min(turn.submitted_at);
         }
@@ -428,19 +430,32 @@ impl MessageDelivery {
         self.showing_held = held.into_keys().collect();
     }
 
-    /// Records a confirmed turn: each message's receipt, then its deliver.
-    async fn record_turn(&mut self, turn: &InFlight) {
+    /// Records a confirmed turn: each message's receipt, then its deliver. A message whose receipt
+    /// is refused stays held, never retyped: the turn is kept as confirmed, so the next pass retries
+    /// only its receipt, until the hold runs out.
+    async fn record_turn(&mut self, mut turn: InFlight) {
         let inbox = self.primitives.inbox();
-        for message in &turn.members {
-            self.held.release(message);
-            if let Err(error) = inbox.receive(&turn.consumer, message, Transport::Turn).await {
-                warn!(%message, %error, "a confirmed turn's receipt was refused");
+        let mut refused = Vec::new();
+        for message in std::mem::take(&mut turn.members) {
+            if let Err(error) = inbox.receive(&turn.consumer, &message, Transport::Turn).await {
+                warn!(%message, %error, "a confirmed turn's receipt was refused; it is retried, never retyped");
+                refused.push(message);
                 continue;
             }
-            if let Err(error) = inbox.deliver(message, Deliver { receiver: turn.consumer.clone(), transport: Transport::Turn }).await {
+            self.held.release(&message);
+            if let Err(error) = inbox.deliver(&message, Deliver { receiver: turn.consumer.clone(), transport: Transport::Turn }).await {
                 warn!(%message, %error, "a confirmed turn's deliver was refused; the sweep reconciles it");
             }
         }
+        if refused.is_empty() {
+            return;
+        }
+        // A turn confirmed at once was never held: its hold starts now.
+        let until = std::time::Instant::now() + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
+        self.held.hold(refused.iter().filter(|message| !self.held.is_held(message)).cloned().collect::<Vec<_>>(), until);
+        turn.members = refused;
+        turn.confirmed = true;
+        self.held_turns.push(turn);
     }
 
     /// Confirms held turns the agent took up (#3108): its AgentSession began working after the
@@ -454,6 +469,10 @@ impl MessageDelivery {
         self.held_turns.retain(|turn| !turn.members.is_empty());
         let mut confirmed = Vec::new();
         for (index, turn) in self.held_turns.iter().enumerate() {
+            if turn.confirmed {
+                confirmed.push(index);
+                continue;
+            }
             let agent = match self.state.daemon.lifecycle_reads().agent_sessions().and_then(|reads| reads.read(&turn.consumer.id, None)) {
                 Ok(agent) => agent,
                 Err(error) => {
@@ -482,12 +501,15 @@ impl MessageDelivery {
                 confirmed.push(index);
             }
         }
-        for index in confirmed.into_iter().rev() {
-            let turn = self.held_turns.remove(index);
-            tracing::info!(session = %turn.consumer.id, messages = ?turn.members, "the agent's record confirms a held turn");
-            self.record_turn(&turn).await;
+        let confirmed: Vec<_> = confirmed.into_iter().rev().map(|index| self.held_turns.remove(index)).collect();
+        for turn in confirmed {
+            if !turn.confirmed {
+                tracing::info!(session = %turn.consumer.id, messages = ?turn.members, "the agent's record confirms a held turn");
+            }
+            self.record_turn(turn).await;
         }
-        self.holding.store(!self.held_turns.is_empty(), std::sync::atomic::Ordering::SeqCst);
+        // Only an unconfirmed turn waits on the agent's evidence.
+        self.holding.store(self.held_turns.iter().any(|turn| !turn.confirmed), std::sync::atomic::Ordering::SeqCst);
     }
 
     /// A due operator or supervisor turn supersedes this session's held
@@ -609,7 +631,8 @@ impl MessageDelivery {
             .instrument(primary_span),
         );
         deliveries.insert(holder.session_id.clone(), PendingTerminalDelivery { task, engine_turn: EngineTurn::new(stop) });
-        self.inflight.insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members, submitted_at });
+        self.inflight
+            .insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members, submitted_at, confirmed: false });
         Ok(())
     }
 }

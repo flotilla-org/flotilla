@@ -256,6 +256,30 @@ async fn a_sessions_pending_messages_are_typed_as_one_turn() {
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
 }
 
+// A confirmed turn whose receipt is refused stays held: later passes retry the receipt and never
+// type the turn again while the hold lasts. The refusal here is the agent's record ending between
+// the turn's confirmation and its receipt.
+#[tokio::test(start_paused = true)]
+async fn a_confirmed_turn_whose_receipt_is_refused_is_not_retyped() {
+    let pool = lossy_pool();
+    let crew = engine_crew("claude-code", pool.clone()).await;
+    let agents = Arc::clone(crew.primitives.sessions());
+    agents.observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
+    let mut delivery = crew.delivery();
+    crew.send("refused-receipt", "system:turn-rules", MessageRelation::System, "wake").await;
+    passes(&mut delivery, 20).await;
+    assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1, "a held turn is typed once");
+    let after = Utc::now() + chrono::Duration::milliseconds(1);
+    agents
+        .end(&crew.launch, flotilla_state_machines::machines::agent_session::EndReason::Lost, EngineCrew::at(after))
+        .expect("end the agent's record");
+    // This daemon saw the agent take the turn up: the turn is confirmed.
+    crew.daemon.crew_progress().prompt_submit("agent", after);
+    passes(&mut delivery, 20).await;
+    assert!(!crew.delivered("refused-receipt").await, "the receipt is refused");
+    assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1, "a confirmed turn is never retyped");
+}
+
 // #3455: an operator's turn to a session holding an unconfirmed system turn drops that turn as
 // superseded, rather than typing it again once its hold runs out, and is typed on its own.
 #[tokio::test(start_paused = true)]
