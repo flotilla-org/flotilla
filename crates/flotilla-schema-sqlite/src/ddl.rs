@@ -61,17 +61,8 @@ pub fn render_ddl_with(set: &TableSet, mode: DdlMode) -> String {
     for table in &set.tables {
         let _ = writeln!(out, "{};", create_table(set, table, exists));
     }
-    let mut indexes: Vec<_> = set.indexes.iter().cloned().chain(set.reference_indexes()).collect();
-    indexes.sort_by_key(|index| index.object_name());
-    for index in &indexes {
-        let columns: Vec<String> = set.index_key(index).iter().map(|column| quote_ident(column)).collect();
-        let name = quote_ident(&index.object_name());
-        let unique = if index.unique { "UNIQUE " } else { "" };
-        let _ = write!(out, "CREATE {unique}INDEX {exists}{name} ON {} ({})", quote_ident(&index.table), columns.join(", "));
-        if let Some(predicate) = index.predicate_sql() {
-            let _ = write!(out, " WHERE {predicate}");
-        }
-        out.push_str(";\n");
+    for (_, index) in render_indexes(set, mode) {
+        let _ = writeln!(out, "{index};");
     }
     render_codes(&mut out, set, mode);
     if mode == DdlMode::Create {
@@ -80,6 +71,31 @@ pub fn render_ddl_with(set: &TableSet, mode: DdlMode) -> String {
         }
     }
     out
+}
+
+/// The kind's indexes, declared and generated for references, sorted by object name: each one's
+/// object name and statement. The `Create` statement is the text SQLite keeps in `sqlite_schema`,
+/// which [`sync_indexes`](crate::shared) compares against on open.
+pub fn render_indexes(set: &TableSet, mode: DdlMode) -> Vec<(String, String)> {
+    let exists = match mode {
+        DdlMode::Create => "",
+        DdlMode::IfNotExists => "IF NOT EXISTS ",
+    };
+    let mut indexes: Vec<_> = set.indexes.iter().cloned().chain(set.reference_indexes()).collect();
+    indexes.sort_by_key(|index| index.object_name());
+    indexes
+        .iter()
+        .map(|index| {
+            let columns: Vec<String> = set.index_key(index).iter().map(|column| quote_ident(column)).collect();
+            let name = quote_ident(&index.object_name());
+            let unique = if index.unique { "UNIQUE " } else { "" };
+            let mut sql = format!("CREATE {unique}INDEX {exists}{name} ON {} ({})", quote_ident(&index.table), columns.join(", "));
+            if let Some(predicate) = index.predicate_sql() {
+                let _ = write!(sql, " WHERE {predicate}");
+            }
+            (index.object_name(), sql)
+        })
+        .collect()
 }
 
 /// The `codes` field of column `column` of `table`; see [`CODES_DDL`]. Column names are Rust

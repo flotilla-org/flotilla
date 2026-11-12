@@ -5,7 +5,7 @@ use std::{
     fmt::Write as _,
 };
 
-use crate::{quote_ident, render_ddl_with, render_views, DdlMode, StoreError, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
+use crate::{quote_ident, render_ddl_with, render_indexes, render_views, DdlMode, StoreError, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
 use flotilla_schema::{ColumnDef, ColumnType, KindRegistry, Table, TableSet};
 use rusqlite::Connection;
 
@@ -331,6 +331,36 @@ pub(crate) fn sync_views(conn: &Connection, kinds: &KindRegistry) -> rusqlite::R
     for (name, sql) in kinds.iter().flat_map(render_views).chain([log]).chain(progress_views()) {
         if stored.get(&name) != Some(&sql) {
             let _ = writeln!(replace, "DROP VIEW IF EXISTS {};\n{sql};", quote_ident(&name));
+        }
+    }
+    if !replace.is_empty() {
+        conn.execute_batch(&replace)?;
+    }
+    Ok(())
+}
+
+/// Brings every kind table's indexes up to its kind's declarations on open, after the
+/// `IF NOT EXISTS` DDL has created any that are missing: an index whose stored statement differs
+/// from the declared one is dropped and created again, and an index on a kind table that the kind
+/// no longer declares is dropped. Indexes on tables of kinds outside `kinds`, and SQLite's own
+/// (which hold no statement), are left alone. An unchanged schema writes nothing.
+pub(crate) fn sync_indexes(conn: &Connection, kinds: &KindRegistry) -> rusqlite::Result<()> {
+    let declared: HashMap<String, String> = kinds.iter().flat_map(|set| render_indexes(set, DdlMode::Create)).collect();
+    let tables: BTreeSet<&str> = kinds.iter().flat_map(|set| set.tables.iter().map(|table| table.name.as_str())).collect();
+    let mut statement = conn.prepare("SELECT name, tbl_name, sql FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL")?;
+    let stored = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut replace = String::new();
+    for (name, _, sql) in stored.iter().filter(|(_, table, _)| tables.contains(table.as_str())) {
+        match declared.get(name) {
+            Some(want) if want == sql => {}
+            Some(want) => {
+                let _ = writeln!(replace, "DROP INDEX {};\n{want};", quote_ident(name));
+            }
+            None => {
+                let _ = writeln!(replace, "DROP INDEX {};", quote_ident(name));
+            }
         }
     }
     if !replace.is_empty() {

@@ -27,7 +27,7 @@ use crate::{
     error::{Malformed, StoreError},
     query::{page_limit, Cursor, Page},
     shared::{
-        check_kind_codes, check_kind_columns, has_string_domain, log_predates_changes, schema_ddl, sync_views, CHANGE_APPEND,
+        check_kind_codes, check_kind_columns, has_string_domain, log_predates_changes, schema_ddl, sync_indexes, sync_views, CHANGE_APPEND,
         CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_NAMED, CHANGE_NAMING, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE,
         HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_NAMED,
         IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME,
@@ -206,7 +206,8 @@ impl Store {
     }
 
     /// Creates the shared tables and every registered kind's tables if they do not exist, widens
-    /// kind tables' code CHECKs, brings the `codes` rows and readable views up to date, enables
+    /// kind tables' code CHECKs, brings kind tables' indexes, the `codes` rows and readable views
+    /// up to date, enables
     /// foreign keys, and renders each kind's statements once. Foreign keys are off while the
     /// schema is brought up to date, so widening a table can drop it without cascading.
     pub fn open_with(mut conn: Connection, home: &str, kinds: KindRegistry, options: StoreOptions) -> Result<Store, StoreError> {
@@ -225,6 +226,7 @@ impl Store {
         // whose change to the stored text would stop the table from widening.
         check_kind_codes(&tx, &kinds)?;
         check_kind_columns(&tx, &kinds)?;
+        sync_indexes(&tx, &kinds)?;
         sync_views(&tx, &kinds)?;
         tx.commit()?;
         // An early return leaves foreign keys off, which is safe only because it drops `conn`.

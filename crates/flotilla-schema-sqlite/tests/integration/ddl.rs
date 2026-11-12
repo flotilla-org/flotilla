@@ -233,6 +233,30 @@ fn reopening_an_unchanged_schema_changes_nothing() {
     assert_eq!(views, 1, "a missing view is recreated");
 }
 
+// Behaviour (Message index ruling, 2026-11-12): opening a store brings kind tables' indexes up to
+// the declarations. An index whose definition differs is recreated as declared, one no kind
+// declares any longer is dropped, and an index on a table no registered kind owns is left alone.
+#[test]
+fn opening_syncs_kind_indexes_with_their_declarations() {
+    let conn = store().into_connection();
+    let stored = |conn: &rusqlite::Connection, name: &str| -> Option<String> {
+        conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1", [name], |row| row.get(0)).ok()
+    };
+    let declared = stored(&conn, "message_by_reply").expect("declared index");
+    conn.execute_batch(
+        "DROP INDEX message_by_reply;
+         CREATE INDEX message_by_reply ON message (in_reply_to, admitted_seq);
+         CREATE INDEX message_retired ON message (admitted_seq);
+         CREATE TABLE unowned (a INTEGER);
+         CREATE INDEX unowned_by_a ON unowned (a);",
+    )
+    .expect("drift");
+    let conn = Store::open(conn, LOCAL, registry()).expect("reopen").into_connection();
+    assert_eq!(stored(&conn, "message_by_reply"), Some(declared), "a changed index is recreated as declared");
+    assert_eq!(stored(&conn, "message_retired"), None, "an undeclared index on a kind table is dropped");
+    assert!(stored(&conn, "unowned_by_a").is_some(), "an index on another table is left alone");
+}
+
 // ADR 0067: the existing Message kind describes enum values, typed references and generated
 // structural roles. This constant descriptor is glue; one exact example covers its mapping.
 #[test]
