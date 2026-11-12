@@ -425,6 +425,7 @@ CREATE TABLE "message" (
   "receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'pe', 'sv')),
   "receiver_id" INTEGER REFERENCES "strings" ("id"),
   "receiver_host" INTEGER REFERENCES "strings" ("id"),
+  "delivered_at" INTEGER,
   "reason" TEXT CHECK ("reason" IN ('cu', 'ex', 'su', 'un', 'wi')),
   "reason_by" INTEGER REFERENCES "strings" ("id"),
   "reason_authority" INTEGER REFERENCES "strings" ("id"),
@@ -468,6 +469,7 @@ CREATE TABLE "message" (
       THEN "receiver_kind" IS NULL
       AND "receiver_id" IS NULL
       AND "receiver_host" IS NULL
+      AND "delivered_at" IS NULL
       AND "reason" IS NULL
       AND "reason_by" IS NULL
       AND "reason_authority" IS NULL
@@ -477,6 +479,7 @@ CREATE TABLE "message" (
       THEN "receiver_kind" IS NOT NULL
       AND "receiver_id" IS NOT NULL
       AND "receiver_host" IS NOT NULL
+      AND "delivered_at" IS NOT NULL
       AND "reason" IS NULL
       AND "reason_by" IS NULL
       AND "reason_authority" IS NULL
@@ -501,10 +504,12 @@ CREATE TABLE "message_references" (
   PRIMARY KEY ("message", "pos"),
   FOREIGN KEY ("message") REFERENCES "message" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
+CREATE INDEX "message_by_inbox" ON "message" ("inbox", "state", "admitted_seq");
 CREATE INDEX "message_by_reply" ON "message" ("in_reply_to") WHERE "in_reply_to" IS NOT NULL;
 CREATE INDEX "message_by_supersedes" ON "message" ("supersedes") WHERE "supersedes" IS NOT NULL;
 CREATE INDEX "message_deadline" ON "message" ("deadline") WHERE "state" IN ('pe', 'aw') AND "deadline" IS NOT NULL;
-CREATE INDEX "message_pending_by_inbox" ON "message" ("inbox", "admitted_seq") WHERE "state" IN ('pe');
+CREATE INDEX "message_delivered_by_inbox" ON "message" ("inbox", "delivered_at") WHERE "delivered_at" IS NOT NULL;
+CREATE INDEX "message_settled_by_inbox" ON "message" ("inbox", "state_since") WHERE "state" IN ('se');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ms', 'relation', 'de', 'Dependee'),
   ('ms', 'relation', 'dy', 'Dependency'),
@@ -553,6 +558,7 @@ CREATE VIEW "message_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'receiver_kind' AND "code" = "message"."receiver_kind") AS "receiver_kind",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."receiver_id") AS "receiver_id",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."receiver_host") AS "receiver_host",
+  "message"."delivered_at",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'reason' AND "code" = "message"."reason") AS "reason",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."reason_by") AS "reason_by",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."reason_authority") AS "reason_authority",

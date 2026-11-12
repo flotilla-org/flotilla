@@ -116,13 +116,17 @@ fn the_enumeration_covers_every_kind_and_index() {
         "dossier_deliverables last position",
         "dossier_deliverables_evidence last position",
         "referral set subject",
-        "index message_pending_by_inbox first",
-        "index message_pending_by_inbox after",
-        "index message_pending_by_inbox integer keys",
+        "index message_by_inbox first",
+        "index message_by_inbox after",
+        "index message_by_inbox integer keys",
+        "index message_delivered_by_inbox first",
+        "index message_delivered_by_inbox after",
+        "index message_settled_by_inbox first",
+        "index message_settled_by_inbox after",
         "index terminal_session_by_vessel integer keys",
         "index referral_by_session integer keys",
         "index vessel_by_launch integer keys",
-        "index message_pending_by_inbox integer keys before",
+        "index message_by_inbox integer keys before",
         "index terminal_session_by_vessel integer keys before",
         "index referral_by_session integer keys before",
         "index vessel_by_launch integer keys before",
@@ -149,7 +153,7 @@ fn the_enumeration_covers_every_kind_and_index() {
     ] {
         assert!(labels.contains(&expected), "missing {expected}");
     }
-    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 17 + 2 * 5);
+    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 19 + 2 * 5);
     assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 11);
     assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(

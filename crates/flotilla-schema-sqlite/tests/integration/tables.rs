@@ -98,7 +98,7 @@ fn spec_edits_refuse_what_only_edges_write() {
 
     let mut write = store.write().expect("write");
     // Settled with no receiver keeps every receiver column empty, as Pending does: only the label moves.
-    let settled = MessageState::Settled { receiver: None };
+    let settled = MessageState::Settled { receiver: None, delivered_at: None };
     let moved = sent.clone().with_state(State::new(settled, sent.since()));
     assert_eq!(refused(write.update(&current, &moved, &origin())), "message.state");
     let later = sent.clone().with_state(State::new(sent.state().clone(), Timestamp(9))).with_spec(in_edited.clone());
@@ -175,7 +175,7 @@ fn writes_touch_only_their_rows() {
     let (mut store, _) = rows_written(store, |_| {});
     // The strings the edges write are interned first, so no `strings` row is counted below.
     for (n, (session, host)) in [("s", "h"), ("w", "w")].into_iter().enumerate() {
-        let awaiting = MessageState::Awaiting { receiver: message::agent(session, host) };
+        let awaiting = MessageState::Awaiting { receiver: message::agent(session, host), delivered_at: Timestamp(0) };
         let mut write = store.write().expect("pre-intern");
         write
             .insert(

@@ -97,17 +97,28 @@ pub fn reason(tc: &TestCase, pick: Pick) -> DropReason {
     }
 }
 
+/// A kept delivery, or none: the receiver and its receipt time travel together.
+fn delivery(tc: &TestCase, pick: Pick) -> (Option<Receiver>, Option<Timestamp>) {
+    match pick.digit(tc, 2, 20) {
+        0 => (Some(receiver(tc)), Some(timestamp(tc))),
+        _ => (None, None),
+    }
+}
+
 /// A state of every label in turn when covering, its data drawn.
 pub fn state_value(tc: &TestCase, pick: Pick) -> MessageState {
     match pick.digit(tc, 4, 1) {
         0 => MessageState::Pending,
-        1 => MessageState::Awaiting { receiver: receiver(tc) },
-        2 => MessageState::Settled { receiver: (pick.digit(tc, 2, 20) == 0).then(|| receiver(tc)) },
-        _ => MessageState::Dropped {
-            reason: reason(tc, pick),
-            receiver: (pick.digit(tc, 2, 20) == 0).then(|| receiver(tc)),
-            watermark: tc.draw(gs::booleans()).then(|| timestamp(tc)),
-        },
+        1 => MessageState::Awaiting { receiver: receiver(tc), delivered_at: timestamp(tc) },
+        2 => {
+            let (receiver, delivered_at) = delivery(tc, pick);
+            MessageState::Settled { receiver, delivered_at }
+        }
+        _ => {
+            let reason = reason(tc, pick);
+            let (receiver, delivered_at) = delivery(tc, pick);
+            MessageState::Dropped { reason, receiver, delivered_at, watermark: tc.draw(gs::booleans()).then(|| timestamp(tc)) }
+        }
     }
 }
 

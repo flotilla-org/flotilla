@@ -101,15 +101,15 @@ pub fn message_value_at(
     let envelope = envelope_value_at(resource.spec(), unit, missing_deadline);
     match resource.state() {
         MessageState::Pending => variant("Pending", envelope),
-        MessageState::Awaiting { receiver } => variant(
+        MessageState::Awaiting { receiver, .. } => variant(
             "Awaiting",
             json!({ "envelope": envelope, "receiver": { "consumer": int(session_number(&canonical(receiver))), "host": canonical(receiver).host } }),
         ),
-        MessageState::Settled { receiver } => variant(
+        MessageState::Settled { receiver, .. } => variant(
             "Settled",
             json!({ "envelope": envelope, "receiver": int(receiver.as_ref().map_or(0, |receiver|session_number(&canonical(receiver)))) }),
         ),
-        MessageState::Dropped { reason, receiver, watermark } => variant(
+        MessageState::Dropped { reason, receiver, watermark, .. } => variant(
             "Dropped",
             json!({
                 "reason": constant(reason_name(reason)),

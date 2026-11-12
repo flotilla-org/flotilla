@@ -627,7 +627,8 @@ mod tests {
         let spec = expanded(quote! {
             #[store(kind = "Message", code = "ms", state = MessageState,
                 index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])),
-                index(name = "by_state", eq(inbox, state), order(state_since)))]
+                index(name = "by_state", eq(inbox, state), order(state_since)),
+                index(name = "delivered", eq(inbox), order(delivered_at), when(delivered_at is_some)))]
             struct MessageSpec {
                 #[store(intern = "ad")] inbox: String,
                 deadline: Option<Timestamp>,
@@ -642,6 +643,9 @@ mod tests {
             "IndexQuery :: new (< Self as :: flotilla_schema :: KindSpec > :: CODE",
             "pub fn by_state (inbox : & String , state : & < MessageState as :: flotilla_schema :: Labelled > :: Label)",
             ":: std :: string :: String :: from (\"state_since\")",
+            "order : :: std :: vec ! [:: std :: string :: String :: from (\"delivered_at\")]",
+            ":: flotilla_schema :: Condition :: NotNull { column : :: std :: string :: String :: from (\"delivered_at\") }",
+            "pub fn delivered (inbox : & String)",
         ] {
             assert!(spec.contains(expected), "missing {expected} in {spec}");
         }
@@ -655,6 +659,9 @@ mod tests {
             (quote! { #[store(kind = "A", code = "k1", state = S)] struct A { state: u8 } }, "rename this field"),
             (quote! { #[store(state = S)] enum A { #[store(code = "c1")] B } }, "spec struct"),
             (quote! { #[store(kind = "A", code = "k1", index(name = "x", eq(a), when(state in [B])))] struct A { a: u8 } }, "not a field"),
+            (quote! { #[store(kind = "A", code = "k1", index(name = "x", eq(nope)))] struct A { a: u8 } }, "not a field"),
+            (quote! { #[store(kind = "A", code = "k1", state = S, index(name = "x", eq(d)))] struct A { a: u8 } }, "not key `eq`"),
+            (quote! { #[store(kind = "A", code = "k1", state = S, index(name = "x", order(d)))] struct A { a: u8 } }, "is_some"),
         ] {
             let message = error(case.clone());
             assert!(message.contains(SUPPORTED) && message.contains(problem), "{case}: {message}");

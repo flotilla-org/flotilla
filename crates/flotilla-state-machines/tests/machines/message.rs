@@ -123,12 +123,12 @@ fn codes_are_pinned() {
 #[test]
 fn the_diagram_is_pinned() {
     let diagram = "---\ntitle: Message\n---\nstateDiagram-v2\n  direction LR\n  [*] --> Pending\n\
-                   \x20 Pending --> Settled: deliver [receiver]\n\
-                   \x20 Pending --> Awaiting: deliver [receiver]\n\
-                   \x20 Pending --> Settled: settle [receiver]\n\
-                   \x20 Awaiting --> Settled: settle [receiver]\n\
-                   \x20 Pending --> Dropped: drop [reason, receiver, watermark]\n\
-                   \x20 Awaiting --> Dropped: drop [reason, receiver, watermark]\n\
+                   \x20 Pending --> Settled: deliver [receiver, delivered_at]\n\
+                   \x20 Pending --> Awaiting: deliver [receiver, delivered_at]\n\
+                   \x20 Pending --> Settled: settle [receiver, delivered_at]\n\
+                   \x20 Awaiting --> Settled: settle [receiver, delivered_at]\n\
+                   \x20 Pending --> Dropped: drop [reason, receiver, delivered_at, watermark]\n\
+                   \x20 Awaiting --> Dropped: drop [reason, receiver, delivered_at, watermark]\n\
                    \x20 Settled --> [*]\n  note right of Settled: the message was settled\n\
                    \x20 Dropped --> [*]\n  note right of Dropped: the message was dropped\n";
     let definition = Message::definition();
@@ -161,7 +161,7 @@ fn deliver_records_one_receiver_and_awaits() {
     home.apply("m", deliver("old", Transport::Mute), &world, t(1)).expect("delivered");
     receipt(&mut world, "replacement", Transport::Turn);
     assert_eq!(home.apply("m", deliver("replacement", Transport::Turn), &world, t(2)).err(), refused(MessageRefusal::WrongState));
-    assert_eq!(*state(&home), MessageState::Awaiting { receiver: session("old") });
+    assert_eq!(*state(&home), MessageState::Awaiting { receiver: session("old"), delivered_at: t(1) });
     assert_eq!(home.log().history("m", Version(0), usize::MAX).len(), 1, "one delivery");
 }
 
@@ -173,7 +173,11 @@ fn delivering_an_expectation_free_message_settles_it() {
     let mut world = MemoryMessageWorld::default();
     receipt(&mut world, "s1", Transport::Notify);
     home.apply("m", deliver("s1", Transport::Notify), &world, t(1)).expect("delivered");
-    assert_eq!(*state(&home), MessageState::Settled { receiver: Some(session("s1")) }, "a settled message keeps its receiver");
+    assert_eq!(
+        *state(&home),
+        MessageState::Settled { receiver: Some(session("s1")), delivered_at: Some(t(1)) },
+        "a settled message keeps its receiver"
+    );
     let ended = refused(MessageRefusal::Ended);
     assert_eq!(home.apply("m", deliver("s1", Transport::Notify), &world, t(2)).err(), ended);
     assert_eq!(home.apply("m", drop(DropReason::Expired), &world, t(9)).err(), ended);
@@ -201,7 +205,7 @@ fn an_answer_settles_an_awaiting_reply() {
     assert_eq!(reply.apply("m", answered(), &world, t(2)).err(), refused(MessageRefusal::MissingEvidence));
     world.reply.put(&Ref::new("m"), ());
     reply.apply("m", answered(), &world, t(3)).expect("settled");
-    assert_eq!(*state(&reply), MessageState::Settled { receiver: Some(session("s1")) });
+    assert_eq!(*state(&reply), MessageState::Settled { receiver: Some(session("s1")), delivered_at: Some(t(1)) });
 }
 
 // An observed outcome settles a message expecting it, even while Pending (the
@@ -221,7 +225,7 @@ fn an_observed_outcome_settles_from_pending() {
     assert_eq!(outcome.apply("m", observed(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
     world.condition.put(&condition_ref(), true);
     outcome.apply("m", observed(), &world, t(2)).expect("settled");
-    assert_eq!(*state(&outcome), MessageState::Settled { receiver: None }, "settled from Pending: no receiver");
+    assert_eq!(*state(&outcome), MessageState::Settled { receiver: None, delivered_at: None }, "settled from Pending: no receiver");
 }
 
 // Superseded needs a supersession naming this message as the older one.
@@ -236,7 +240,10 @@ fn supersession_must_name_this_message() {
     assert_eq!(home.apply("m", superseded(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
     world.supersession.put(&Ref::<Supersession>::new(by.as_str()), Supersedes { older: "m".into() });
     home.apply("m", superseded(), &world, t(1)).expect("dropped");
-    assert_eq!(*state(&home), MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: None, watermark: None });
+    assert_eq!(
+        *state(&home),
+        MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: None, delivered_at: None, watermark: None }
+    );
 }
 
 // Withdrawn and ConsumerUnreachable are deliberate drops that need authority,
@@ -259,7 +266,8 @@ fn deliberate_drops_need_authority() {
         assert_eq!(home.apply("m", reason("absent"), &world, t(2)).err(), refused(MessageRefusal::Unauthorised));
         home.apply("m", reason("yes"), &world, t(2)).expect("dropped");
         let receiver = delivered.then(|| session("s1"));
-        assert_eq!(*state(&home), MessageState::Dropped { reason: reason("yes").reason, receiver, watermark: None });
+        let delivered_at = delivered.then(|| t(1));
+        assert_eq!(*state(&home), MessageState::Dropped { reason: reason("yes").reason, receiver, delivered_at, watermark: None });
     }
 }
 
@@ -281,7 +289,10 @@ fn expiry_needs_a_passed_deadline_and_no_expected_evidence() {
     assert_eq!(outcome.apply("m", drop(DropReason::Expired), &world, t(6)).err(), refused(MessageRefusal::ExpectationMet));
     world.condition.put(&condition_ref(), false);
     outcome.apply("m", drop(DropReason::Expired), &world, t(6)).expect("expired");
-    assert_eq!(*state(&outcome), MessageState::Dropped { reason: DropReason::Expired, receiver: None, watermark: None });
+    assert_eq!(
+        *state(&outcome),
+        MessageState::Dropped { reason: DropReason::Expired, receiver: None, delivered_at: None, watermark: None }
+    );
     let history = outcome.log().history("m", Version(0), usize::MAX);
     let (_, dropped) = history.last().expect("dropped");
     assert_eq!(dropped.at, t(6), "the drop's time is its event's, the state's since (G4)");
@@ -303,7 +314,10 @@ fn expiry_with_a_consumer_waits_for_the_watermark_and_records_it() {
     let kinds: Vec<_> = event.arguments.reads.iter().map(|read| (read.kind.as_ref(), read.name.as_str())).collect();
     assert!(kinds.contains(&(<Binding as Kind>::NAME, INBOX)), "{kinds:?}");
     assert!(kinds.contains(&(<AppliedThrough as Kind>::NAME, INBOX)), "{kinds:?}");
-    assert_eq!(*state(&home), MessageState::Dropped { reason: DropReason::Expired, receiver: None, watermark: Some(t(6)) });
+    assert_eq!(
+        *state(&home),
+        MessageState::Dropped { reason: DropReason::Expired, receiver: None, delivered_at: None, watermark: Some(t(6)) }
+    );
 
     // A receiver counts as a consumer even with the inbox unbound.
     let (mut delivered, mut world) = awaiting(Some(5));
@@ -311,7 +325,12 @@ fn expiry_with_a_consumer_waits_for_the_watermark_and_records_it() {
     assert_eq!(delivered.apply("m", drop(DropReason::Expired), &world, t(7)).err(), refused(MessageRefusal::PrefixBeforeDeadline));
     world.applied_through.put(&Ref::new(INBOX), t(9));
     delivered.apply("m", drop(DropReason::Expired), &world, t(10)).expect("expired");
-    let expired = MessageState::Dropped { reason: DropReason::Expired, receiver: Some(session("s1")), watermark: Some(t(9)) };
+    let expired = MessageState::Dropped {
+        reason: DropReason::Expired,
+        receiver: Some(session("s1")),
+        delivered_at: Some(t(1)),
+        watermark: Some(t(9)),
+    };
     assert_eq!(*state(&delivered), expired);
 }
 
@@ -334,7 +353,10 @@ fn undeliverable_needs_no_receipt_and_an_unbound_inbox_or_a_failure() {
     assert_eq!(pending.apply("m", drop(DropReason::Undeliverable), &world, t(20)).err(), refused(MessageRefusal::MissingEvidence));
     world.delivery_failure.put(&Ref::new("m"), ());
     pending.apply("m", drop(DropReason::Undeliverable), &world, t(20)).expect("dropped");
-    assert_eq!(*state(&pending), MessageState::Dropped { reason: DropReason::Undeliverable, receiver: None, watermark: None });
+    assert_eq!(
+        *state(&pending),
+        MessageState::Dropped { reason: DropReason::Undeliverable, receiver: None, delivered_at: None, watermark: None }
+    );
 }
 
 // The time rules' boundaries, as named cases: expiry needs `now` strictly past
@@ -488,7 +510,7 @@ fn a_lapsed_delivery_condition_withdraws_the_message() {
     let event = home.apply("m", drop(turn_rules.clone()), &world, t(2)).expect("withdrawn");
     let reads: Vec<_> = event.arguments.reads.iter().map(|read| (read.kind.as_ref(), read.name.as_str())).collect();
     assert!(reads.contains(&(<Condition as Kind>::NAME, wanted.to_string().as_str())), "{reads:?}");
-    assert_eq!(*state(&home), MessageState::Dropped { reason: turn_rules, receiver: None, watermark: None });
+    assert_eq!(*state(&home), MessageState::Dropped { reason: turn_rules, receiver: None, delivered_at: None, watermark: None });
 }
 
 // A shared inbox binds a set of consumers (#3424 ruling 3). The message is pending for each bound
@@ -521,7 +543,7 @@ fn a_shared_inbox_is_pending_for_each_consumer_until_its_receipt() {
         "the first accepted deliver claims it"
     );
     assert!(!pending(&home, &world, &agent), "claimed: pending for nobody");
-    assert_eq!(*state(&home), MessageState::Awaiting { receiver: service });
+    assert_eq!(*state(&home), MessageState::Awaiting { receiver: service, delivered_at: t(2) });
 }
 
 // A service consuming an inbox through its own resource (#3424 ruling 2): a

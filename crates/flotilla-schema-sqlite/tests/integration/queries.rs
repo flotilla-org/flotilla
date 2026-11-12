@@ -2,13 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Address, IndexQuery, Kind, Ref, State, Timestamp};
+use flotilla_schema::{Address, IndexQuery, Kind, Labelled, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{Cursor, Page, ResourceId, Store, StoreError, MAX_PAGE};
 use flotilla_state_machines::machines::{
     awaiting_reply::{AwaitingReplySpec, AwaitingReplyState},
     convoy::{ConvoySpec, ConvoyState},
     lifecycle::LifecycleState,
-    message::{MessageSpec, MessageState},
+    message::{MessageLabel, MessageSpec, MessageState},
 };
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
@@ -70,7 +70,7 @@ fn small_time(tc: &TestCase) -> Timestamp {
 /// A drawn message whose indexed fields come from small domains, so equal order values (ties
 /// broken by id) and shared inboxes occur, in every label.
 fn drawn_message(tc: &TestCase) -> Resource<Message> {
-    drawn_spec(tc, message::generate(tc, Pick::Draw).with_state(State::new(message::state_value(tc, Pick::Draw), Timestamp(0))))
+    drawn_spec(tc, message::generate(tc, Pick::Draw).with_state(State::new(message::state_value(tc, Pick::Draw), small_time(tc))))
 }
 
 /// `message` with a drawn inbox and deadline from the small domains.
@@ -93,8 +93,19 @@ fn check_messages(tc: &TestCase, store: &mut Store, model: &BTreeMap<ResourceId,
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
     for inbox in ["i0", "i1"] {
         let inbox = project(inbox);
-        let want = expected(model, |m| *m.state() == MessageState::Pending && m.spec().inbox == inbox, |m| m.spec().admitted_seq);
-        assert_eq!(collect(store, &MessageSpec::pending_by_inbox(&inbox), limit), want, "pending_by_inbox {inbox}");
+        for label in [MessageLabel::Pending, MessageLabel::Awaiting, MessageLabel::Settled] {
+            let want = expected(model, |m| *m.state().label() == label && m.spec().inbox == inbox, |m| m.spec().admitted_seq);
+            assert_eq!(collect(store, &MessageSpec::by_inbox(&inbox, &label), limit), want, "by_inbox {inbox} {label:?}");
+        }
+        let want = expected(
+            model,
+            |m| m.state().delivered_at().is_some() && m.spec().inbox == inbox,
+            |m| m.state().delivered_at().map(Timestamp::micros),
+        );
+        assert_eq!(collect(store, &MessageSpec::delivered_by_inbox(&inbox), limit), want, "delivered_by_inbox {inbox}");
+        let settled = |m: &Resource<Message>| matches!(m.state(), MessageState::Settled { .. });
+        let want = expected(model, |m| settled(m) && m.spec().inbox == inbox, |m| m.since().micros());
+        assert_eq!(collect(store, &MessageSpec::settled_by_inbox(&inbox), limit), want, "settled_by_inbox {inbox}");
     }
     let want = expected(model, |m| open(m) && m.spec().deadline.is_some(), |m| m.spec().deadline.map(Timestamp::micros));
     assert_eq!(collect(store, &MessageSpec::deadline(), limit), want, "deadline");
@@ -145,7 +156,7 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
         assert!(identities.values().any(|id| id.0 == boundary));
         assigned_ids.push(identities);
 
-        let ids = collect(&mut replica, &MessageSpec::pending_by_inbox(&project("inbox")), limit);
+        let ids = collect(&mut replica, &MessageSpec::by_inbox(&project("inbox"), &MessageLabel::Pending), limit);
         let mut read = replica.read().expect("read");
         let rows: Vec<_> = ids
             .iter()
@@ -165,7 +176,7 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
         // The key-only lower-bound route returns the same home order without bodies,
         // excluding tied admissions at other homes before applying each page limit.
         for home in ["sender-a", "sender-b"] {
-            let query = MessageSpec::pending_by_inbox(&project("inbox"));
+            let query = MessageSpec::by_inbox(&project("inbox"), &MessageLabel::Pending);
             let mut after = 0;
             let mut keys = Vec::new();
             loop {
@@ -409,7 +420,7 @@ fn unknown_arguments_give_an_empty_page_and_create_nothing() {
     let mut store = store();
     insert_messages(&mut store, 2, |_| message::sample());
     let mut read = store.read().expect("read");
-    let page = read.page(&MessageSpec::pending_by_inbox(&project("never")), None, 10).expect("page");
+    let page = read.page(&MessageSpec::by_inbox(&project("never"), &MessageLabel::Pending), None, 10).expect("page");
     assert_eq!(page, Page { ids: vec![], next: None });
     let page = read.page(&Referral::by_session(&Ref::new("never", LOCAL)), None, 10).expect("page");
     assert!(page.ids.is_empty());
@@ -439,10 +450,10 @@ fn cursors_are_bound_to_their_query() {
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    let inbox = MessageSpec::pending_by_inbox(&project("inbox"));
+    let inbox = MessageSpec::by_inbox(&project("inbox"), &MessageLabel::Pending);
     let cursor = read.page(&inbox, None, 1).expect("page").next.expect("more follow");
     assert_eq!(read.page(&inbox, Some(&cursor), 5).expect("continue").ids.len(), 2);
-    let other_inbox = MessageSpec::pending_by_inbox(&project("other"));
+    let other_inbox = MessageSpec::by_inbox(&project("other"), &MessageLabel::Pending);
     assert!(matches!(read.page(&other_inbox, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
     let deadline = MessageSpec::deadline();
     assert!(matches!(read.page(&deadline, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
@@ -457,7 +468,7 @@ fn limits_are_required_and_capped() {
     let mut store = store();
     insert_messages(&mut store, MAX_PAGE as usize + 1, |_| message::sample());
     let mut read = store.read().expect("read");
-    let inbox = MessageSpec::pending_by_inbox(&project("inbox"));
+    let inbox = MessageSpec::by_inbox(&project("inbox"), &MessageLabel::Pending);
     assert!(matches!(read.page(&inbox, None, 0), Err(StoreError::ZeroLimit)));
     assert!(matches!(read.scan::<Resource<Message>>(LOCAL, None, 0), Err(StoreError::ZeroLimit)));
     let page = read.page(&inbox, None, u32::MAX).expect("page");
