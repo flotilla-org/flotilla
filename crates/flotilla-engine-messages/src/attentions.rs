@@ -108,13 +108,13 @@ impl MessagePrimitives {
     /// The person inbox a convoy's attentions are sent to, as [`Self::cause`] names it: its
     /// dispatching principal's role in its project. None when the convoy is not held here.
     async fn convoy_attention_inbox(&self, namespace: &str, convoy: &str, roles: &FleetRoles) -> Result<Option<Address>, String> {
-        let convoy = match self.backend.including_replicas::<Convoy>(namespace).get(convoy).await {
+        let convoy = match self.backend()?.including_replicas::<Convoy>(namespace).get(convoy).await {
             Ok(convoy) => convoy.object,
             Err(ResourceError::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.to_string()),
         };
         let projects = match convoy.spec.project_ref.as_deref() {
-            Some(project) => match self.backend.definitions::<Project>(namespace).get(project).await {
+            Some(project) => match self.backend()?.definitions::<Project>(namespace).get(project).await {
                 Ok(project) => vec![project],
                 Err(ResourceError::NotFound { .. }) => Vec::new(),
                 Err(error) => return Err(error.to_string()),
@@ -174,14 +174,14 @@ impl MessagePrimitives {
             Fact::ReclaimRefused { .. } => Cause::ReclaimRefused { convoy: held },
             Fact::Drift { ensure, project, role, .. } => {
                 let ensure: ResourceObject<ConvoyEnsure> =
-                    self.backend.definitions::<ConvoyEnsure>(namespace).get(ensure).await.map_err(|error| error.to_string())?;
+                    self.backend()?.definitions::<ConvoyEnsure>(namespace).get(ensure).await.map_err(|error| error.to_string())?;
                 let project = Address::project(project).map_err(|error| format!("project `{project}`: {error}"))?;
                 let role = Read { address: child(&project, Kind::Role, role)?, revision: ensure.metadata.resource_version };
                 Cause::Drift { role, convoy: held }
             }
             Fact::CredentialRefresh { vessel, .. } => {
                 let record = self
-                    .backend
+                    .backend()?
                     .including_replicas::<Vessel>(namespace)
                     .list()
                     .await

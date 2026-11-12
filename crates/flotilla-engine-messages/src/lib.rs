@@ -53,7 +53,7 @@ use flotilla_state_machines::{
     },
     Home, Resource, Transport,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{ResourceBackend, WeakResourceBackend};
 
 /// The world the Message gates read at this home: a snapshot the delivery
 /// adapter and admission keep current, and the home clock.
@@ -387,7 +387,8 @@ pub struct MessagePrimitives {
     services: Arc<Services>,
     awaiting: Arc<awaiting::AwaitingReplies>,
     world: Arc<GateWorld>,
-    backend: ResourceBackend,
+    /// Weak: the backend holds this path as its Message port and attentions.
+    backend: WeakResourceBackend,
     consumers: Mutex<BTreeSet<Receiver>>,
     receipts: StoreLog,
     charter_pass: Arc<tokio::sync::Mutex<()>>,
@@ -484,8 +485,8 @@ impl MessagePrimitives {
             receipts,
             charter_pass: Arc::default(),
             charter_admission: Arc::default(),
-            bindings: Arc::new(ports::OldRoleRouting { backend: backend.clone() }),
-            conditions: Arc::new(ports::OldStoreConditions { backend: backend.clone() }),
+            bindings: Arc::new(ports::OldRoleRouting { backend: backend.downgrade() }),
+            conditions: Arc::new(ports::OldStoreConditions { backend: backend.downgrade() }),
             home_reads: std::sync::OnceLock::new(),
             located: Mutex::new(BTreeMap::new()),
             records: tokio::sync::Mutex::new(BTreeMap::new()),
@@ -493,8 +494,12 @@ impl MessagePrimitives {
             _records_listener: records_listener,
             attention_changes,
             acknowledgements: tokio::sync::broadcast::channel(16).0,
-            backend,
+            backend: backend.downgrade(),
         })
+    }
+
+    fn backend(&self) -> Result<ResourceBackend, String> {
+        ports::upgrade(&self.backend)
     }
 
     pub fn home(&self) -> &str {
@@ -561,7 +566,7 @@ impl MessagePrimitives {
             return Ok(read.clone());
         }
         let world_at = self.world.now();
-        let records = Arc::new(OldStoreRecords::load(&self.backend, namespace).await?);
+        let records = Arc::new(OldStoreRecords::load(&self.backend().map_err(ResourceError::other)?, namespace).await?);
         let read = RecordsRead { at: std::time::Instant::now(), moved, world_at, rechecked: reread, records };
         cache.insert(namespace.to_owned(), read.clone());
         Ok(read)
@@ -691,7 +696,7 @@ impl MessagePrimitives {
         if let Ok(roles) = self.roles_or_wait(namespace).await? {
             return Ok(roles);
         }
-        let designations = flotilla_store::WatchView::<flotilla_resources::FleetDesignation>::start(self.backend.clone(), namespace)
+        let designations = flotilla_store::WatchView::<flotilla_resources::FleetDesignation>::start(self.backend()?, namespace)
             .await
             .map_err(|error| format!("watch the FleetDesignation: {error}"))?;
         let mut changes = designations.subscribe();
@@ -755,7 +760,7 @@ impl MessagePrimitives {
         let roles = self.roles(namespace).await?;
         // Only the projects' charters name person roles: no other record is read.
         let declared: Vec<ResourceObject<Project>> =
-            self.backend.definitions::<Project>(namespace).list().await.map_err(|error| error.to_string())?;
+            self.backend()?.definitions::<Project>(namespace).list().await.map_err(|error| error.to_string())?;
         let records = OldStoreRecords::from_records(namespace, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), declared);
         let mut inboxes: BTreeSet<Address> = roles::PERSON_ROLES.iter().filter_map(|role| roles.person(role.name)).collect();
         let projects: BTreeSet<&str> = records.projects().chain([namespace]).collect();
@@ -831,7 +836,7 @@ impl MessagePrimitives {
 
     /// The fleet roles, or the plain-words reason delivery waits when the FleetDesignation is missing or invalid.
     pub async fn roles_or_wait(&self, namespace: &str) -> Result<Result<FleetRoles, String>, String> {
-        let roles = match designated_fleet_roles(&self.backend, namespace).await {
+        let roles = match designated_fleet_roles(&self.backend()?, namespace).await {
             Ok(roles) => roles,
             Err(ResourceError::NotFound { .. }) => {
                 return Ok(Err(format!(

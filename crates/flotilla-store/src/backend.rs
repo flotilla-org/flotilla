@@ -56,9 +56,34 @@ pub struct ResourceBackend {
     engines: EngineSlot,
     attentions: std::sync::Arc<AttentionSlot>,
 }
+/// A [`ResourceBackend`] that does not keep its installed ports alive: a port the backend holds
+/// keeps this, not the backend, so dropping the backend drops the port.
+#[derive(Debug, Clone)]
+pub struct WeakResourceBackend {
+    store: std::sync::Arc<dyn crate::Store>,
+    engines: std::sync::Weak<std::sync::RwLock<EngineSlots>>,
+    attentions: std::sync::Weak<AttentionSlot>,
+}
+impl WeakResourceBackend {
+    /// The backend, while any handle to it is alive.
+    pub fn upgrade(&self) -> Option<ResourceBackend> {
+        Some(ResourceBackend {
+            store: std::sync::Arc::clone(&self.store),
+            engines: self.engines.upgrade()?,
+            attentions: self.attentions.upgrade()?,
+        })
+    }
+}
 impl ResourceBackend {
     pub fn new(store: impl Into<Self>) -> Self {
         store.into()
+    }
+    pub fn downgrade(&self) -> WeakResourceBackend {
+        WeakResourceBackend {
+            store: std::sync::Arc::clone(&self.store),
+            engines: std::sync::Arc::downgrade(&self.engines),
+            attentions: std::sync::Arc::downgrade(&self.attentions),
+        }
     }
     pub fn from_arc(store: std::sync::Arc<dyn crate::Store>) -> Self {
         Self { store, engines: EngineSlot::default(), attentions: Default::default() }
