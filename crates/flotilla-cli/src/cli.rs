@@ -1152,16 +1152,11 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 continue;
             }
             if ledger.missing {
-                let detail = ledger.override_principal.as_ref().map_or_else(
-                    || {
-                        if ledger.comment_url.is_some() {
-                            "PR comment exists, decision-ledger artifact not found".to_string()
-                        } else {
-                            "decision-ledger artifact not found".to_string()
-                        }
-                    },
-                    |principal| format!("completed by {}/{} with --force", principal.namespace, principal.name),
-                );
+                let detail = if ledger.comment_url.is_some() {
+                    "PR comment exists, decision-ledger artifact not found"
+                } else {
+                    "decision-ledger artifact not found"
+                };
                 let _ = writeln!(
                     output,
                     "  - {}/{} claimed_at={} MISSING ({detail}){} comment={}",

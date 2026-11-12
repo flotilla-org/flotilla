@@ -239,7 +239,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T11:59:00Z".into()),
                 comment_url: Some("https://example.test/pull/1#prior".into()),
                 missing: false,
-                override_principal: None,
                 completed_while_crew_active: false,
                 message: Some("first turn complete".into()),
                 superseded: true,
@@ -253,7 +252,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T12:00:00Z".into()),
                 comment_url: Some("https://example.test/pull/1#comment-2".into()),
                 missing: false,
-                override_principal: None,
                 completed_while_crew_active: false,
                 message: None,
                 superseded: false,
@@ -267,7 +265,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T12:01:00Z".into()),
                 comment_url: Some("https://example.test/pull/1#orphaned".into()),
                 missing: true,
-                override_principal: None,
                 completed_while_crew_active: false,
                 message: None,
                 superseded: false,
@@ -281,7 +278,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T12:02:00Z".into()),
                 comment_url: None,
                 missing: true,
-                override_principal: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
                 completed_while_crew_active: true,
                 message: None,
                 superseded: false,
@@ -408,7 +404,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         .contains("work/coder claimed_at=2026-08-21T12:00:00Z artifact=artifact/ledger comment=https://example.test/pull/1#comment-2"));
     assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (PR comment exists, decision-ledger artifact not found) comment=https://example.test/pull/1#orphaned"));
     assert!(output.contains(
-        "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (completed by flotilla/operator with --force) — completed while crew active"
+        "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (decision-ledger artifact not found) — completed while crew active"
     ));
     // #2677: the human display names durable artifact evidence with no PR comment;
     // a failed bound projection is a separate flag, never a missing ledger.

@@ -11,7 +11,7 @@ use crate::{
         FulfilmentListResponse, HostListResponse, HostProvidersResponse, HostStatusResponse, PersonInboxResponse, ProjectListResponse,
         RepoProvidersResponse,
     },
-    IssueRef, PlacementDecision, PrincipalRef, RepoIdentity,
+    IssueRef, PlacementDecision, RepoIdentity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,8 +381,6 @@ pub struct ExplainedDecisionLedger {
     /// Historical ledger comment only; remove at the next wire-format change.
     pub comment_url: Option<String>,
     pub missing: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub override_principal: Option<PrincipalRef>,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub completed_while_crew_active: bool,
