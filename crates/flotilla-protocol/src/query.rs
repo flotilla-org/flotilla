@@ -808,15 +808,20 @@ pub struct CrewStallRow {
     pub project_display_name: Option<String>,
     pub convoy: String,
     pub convoy_display_name: String,
-    pub vessel: String,
+    /// Absent where the stall's record names no vessel: an operator-rung attention read from
+    /// another host names only the convoy and role.
+    pub vessel: Option<String>,
     pub role: String,
     pub rung: Option<StallRung>,
     pub supervisor: Option<String>,
     pub supervisor_absence_reason: Option<String>,
     pub began_at: Option<DateTime<Utc>>,
     pub age_seconds: Option<u64>,
+    /// When the stall judge's operator-rung attention was admitted; not when the stall began.
+    pub raised_at: Option<DateTime<Utc>>,
     pub proposed_disposition: Option<crate::StallProposedDisposition>,
-    pub evidence: String,
+    /// Absent where no record read here states it: a stall's evidence is its home's note.
+    pub evidence: Option<String>,
     /// Equal keys flag possible shared causes, without guessing from keywords.
     pub cause_group: String,
     pub shared_cause_count: usize,

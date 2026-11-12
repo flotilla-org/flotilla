@@ -9,6 +9,7 @@ use flotilla_engine_messages::{
     sweep::OpenMessages,
     MessagePrimitives, RequestAnswer,
 };
+use flotilla_engine_messages_testkit::Served;
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec, SystemClock, FLEET_DESIGNATION_NAME};
 use flotilla_schema::{Frozen, Timestamp};
@@ -27,11 +28,11 @@ use flotilla_store_memory::InMemoryBackend;
 const NAMESPACE: &str = "flotilla";
 const HOME: &str = "home-a";
 
-async fn primitives(dir: &tempfile::TempDir) -> MessagePrimitives {
+async fn primitives(dir: &tempfile::TempDir) -> Served<MessagePrimitives> {
     primitives_on(dir, Arc::new(SystemClock)).await
 }
 
-async fn primitives_on(dir: &tempfile::TempDir, clock: Arc<dyn flotilla_resources::Clock>) -> MessagePrimitives {
+async fn primitives_on(dir: &tempfile::TempDir, clock: Arc<dyn flotilla_resources::Clock>) -> Served<MessagePrimitives> {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend
         .clone()
@@ -57,7 +58,7 @@ async fn primitives_on(dir: &tempfile::TempDir, clock: Arc<dyn flotilla_resource
     let service = Arc::new(
         Service::open(&dir.path().join("decided.sqlite"), HOME, flotilla_engine_store::registry().expect("registry")).expect("store"),
     );
-    MessagePrimitives::open(HOME, service, backend, clock).expect("primitives")
+    Served::new(MessagePrimitives::open(HOME, service, backend.clone(), clock).expect("primitives"), backend)
 }
 
 /// A request for an inspection, from the teardown role to `host`'s inspector.

@@ -164,6 +164,22 @@ impl ReadProjections<'_> {
     ) -> Result<flotilla_protocol::CrewStallsResponse, String> {
         let mut rows = Vec::new();
         for namespace in backend.stored_namespaces::<ResourceConvoy>().await.map_err(|error| error.to_string())? {
+            // A home's stall note stays at its home (#3108). Another host sees an operator-rung
+            // stall as the stall judge's open attention about the convoy's role, and a lower rung
+            // as the seat's open stall record, which the replicated convoy reads as a stalled crew.
+            let mut raised: BTreeMap<String, BTreeMap<String, DateTime<Utc>>> = BTreeMap::new();
+            for attention in backend.attentions().open(&namespace, Some(Sender::StallJudge), None).await? {
+                if let attentions::Subject::ConvoyRole { convoy, role } = attention.subject {
+                    raised.entry(convoy).or_default().insert(role, attention.raised_at);
+                }
+            }
+            let mut stalled = vec![
+                StoreQuery { field_prefixes: BTreeMap::from([("status.stalled".into(), "{".into())]), ..Default::default() },
+                StoreQuery { fields: BTreeMap::from([("status.crew_work.*.*.phase".into(), "Stalled".into())]), ..Default::default() },
+            ];
+            if !raised.is_empty() {
+                stalled.push(StoreQuery::names(raised.keys().cloned(), false));
+            }
             let convoys = backend
                 .query_declared::<ResourceConvoy>(
                     &namespace,
@@ -172,13 +188,7 @@ impl ReadProjections<'_> {
                             "status.phase".into(),
                             ["Pending", "Active", "Interrupted", "Landing"].map(str::to_string).into(),
                         )]),
-                        any_of: Some(vec![
-                            StoreQuery { field_prefixes: BTreeMap::from([("status.stalled".into(), "{".into())]), ..Default::default() },
-                            StoreQuery {
-                                fields: BTreeMap::from([("status.crew_work.*.*.phase".into(), "Stalled".into())]),
-                                ..Default::default()
-                            },
-                        ]),
+                        any_of: Some(stalled),
                         include_replicas: true,
                         ..Default::default()
                     },
@@ -212,13 +222,13 @@ impl ReadProjections<'_> {
                     for leaf in &stall.leaves {
                         if let flotilla_protocol::LeafAddress::Work { work, .. } = &leaf.address {
                             if let Some(role) = leaf.field_path.strip_prefix(".crew.").and_then(|path| path.strip_suffix(".phase")) {
-                                obligations.insert((work.clone(), role.to_string()), Some(stall));
+                                obligations.insert((Some(work.clone()), role.to_string()), Some(stall));
                             }
                         }
                     }
                     if obligations.is_empty() {
                         if let Some(flotilla_resources::LeafMaker::Actor { vessel, role }) = &stall.maker {
-                            obligations.insert((vessel.clone(), role.clone()), Some(stall));
+                            obligations.insert((Some(vessel.clone()), role.clone()), Some(stall));
                         }
                     }
                 }
@@ -226,7 +236,7 @@ impl ReadProjections<'_> {
                 // leaves do not identify a crew actor (for example a controller wait).
                 if obligations.is_empty() {
                     if let Some(stall) = &status.stalled {
-                        obligations.insert((String::new(), String::new()), Some(stall));
+                        obligations.insert((None, String::new()), Some(stall));
                     }
                 }
                 // A later crew declaration can replace the convoy's visible condition.
@@ -234,34 +244,51 @@ impl ReadProjections<'_> {
                 for (vessel, crew) in &status.crew_work {
                     for (role, state) in crew {
                         if state.phase == CrewWorkPhase::Stalled {
-                            obligations.entry((vessel.clone(), role.clone())).or_insert(None);
+                            obligations.entry((Some(vessel.clone()), role.clone())).or_insert(None);
                         }
+                    }
+                }
+                // An operator-rung attention names the convoy and role, not the vessel: it joins the
+                // role's stalled crews, or stands as its own row.
+                let operator = match source.provenance {
+                    ResourceProvenance::Replica { .. } => raised.remove(&convoy.metadata.name).unwrap_or_default(),
+                    ResourceProvenance::Local => BTreeMap::new(),
+                };
+                for role in operator.keys() {
+                    if !obligations.keys().any(|(_, held)| held == role) {
+                        obligations.insert((None, role.clone()), None);
                     }
                 }
                 let project_display_name = convoy.spec.project_ref.as_ref().and_then(|name| {
                     projects.iter().find(|project| &project.metadata.name == name).map(|project| project.spec.display_name.clone())
                 });
                 for ((vessel, role), stall) in obligations {
-                    let evidence = stall
-                        .map(|stall| stall.evidence.clone())
-                        .or_else(|| status.crew_work.get(&vessel).and_then(|crew| crew.get(&role)).and_then(|state| state.message.clone()))
-                        .unwrap_or_default();
+                    let evidence = stall.map(|stall| stall.evidence.clone()).or_else(|| {
+                        vessel
+                            .as_ref()
+                            .and_then(|vessel| status.crew_work.get(vessel))
+                            .and_then(|crew| crew.get(&role))
+                            .and_then(|state| state.message.clone())
+                    });
                     let group = serde_json::to_string(&(
                         stall.and_then(|stall| stall.reason),
                         stall.and_then(|stall| stall.cause.as_ref()),
-                        evidence.split_whitespace().collect::<Vec<_>>().join(" "),
+                        evidence.as_ref().map(|evidence| evidence.split_whitespace().collect::<Vec<_>>().join(" ")),
                     ))
                     .map_err(|error| error.to_string())?;
+                    let rung = stall
+                        .map(|stall| stall.rung)
+                        .or_else(|| operator.contains_key(&role).then_some(flotilla_resources::StallRung::Operator));
+                    let raised_at = operator.get(&role).copied();
                     let supervisor = stall
                         .and_then(|stall| stall.supervisor.as_ref())
                         .map(|supervisor| format!("{}/{}/{}", supervisor.convoy, supervisor.vessel, supervisor.role));
-                    let absence = supervisor.is_none().then(|| {
-                        if stall.is_some() {
-                            evidence.clone()
-                        } else {
-                            "no current stall condition recorded for this obligation".into()
-                        }
-                    });
+                    let absence = match (&supervisor, stall) {
+                        (Some(_), _) => None,
+                        (None, Some(_)) => evidence.clone(),
+                        (None, None) if rung.is_some() => None,
+                        (None, None) => Some("no current stall condition recorded for this obligation".into()),
+                    };
                     rows.push(
                         flotilla_protocol::CrewStallRow::builder()
                             .namespace(namespace.clone())
@@ -273,15 +300,16 @@ impl ReadProjections<'_> {
                             } else {
                                 format!("{} #{}", convoy.spec.role, convoy.spec.generation)
                             })
-                            .vessel(vessel)
+                            .maybe_vessel(vessel)
                             .role(role)
-                            .maybe_rung(stall.map(|stall| stall.rung))
+                            .maybe_rung(rung)
                             .maybe_supervisor(supervisor)
                             .maybe_supervisor_absence_reason(absence)
                             .maybe_began_at(stall.map(|stall| stall.began_at))
                             .maybe_age_seconds(stall.map(|stall| now.signed_duration_since(stall.began_at).num_seconds().max(0) as u64))
+                            .maybe_raised_at(raised_at)
                             .maybe_proposed_disposition(stall.and_then(|stall| stall.proposed_disposition))
-                            .evidence(evidence)
+                            .maybe_evidence(evidence)
                             .cause_group(group)
                             .shared_cause_count(1)
                             .artifacts(

@@ -16,6 +16,27 @@ use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{machines::message::Deliver, Transport};
 use flotilla_store::ResourceBackend;
 
+/// A Message path held with the backend it reads. The path holds its backend weakly, since an
+/// installed path is held by that backend; the composition root holds both, and so does this.
+pub struct Served<T> {
+    path: T,
+    _backend: ResourceBackend,
+}
+
+impl<T> Served<T> {
+    pub fn new(path: T, backend: ResourceBackend) -> Self {
+        Self { path, _backend: backend }
+    }
+}
+
+impl<T> std::ops::Deref for Served<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.path
+    }
+}
+
 /// One home's engine Message path; the decided store lives as long as this value.
 pub struct EngineMessagesHome {
     primitives: Arc<MessagePrimitives>,
