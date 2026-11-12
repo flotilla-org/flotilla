@@ -3618,6 +3618,12 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     .await
     .expect("router topology");
     let (a, b) = if source_remote { (&topology.follower, &topology.leader) } else { (&topology.leader, &topology.follower) };
+    let a_holds = if source_remote { &topology.follower_stream_holds } else { &topology.leader_stream_holds };
+    let b_home = b.decided_store().expect("governor home").home().to_owned();
+    if unavailable {
+        // The governor's launch travels B's log: until A installs it, A has no live governor.
+        a_holds.hold(&b_home);
+    }
     off_frame(|| seed_supervision_crew(a, "stalled-work", "work", "coder")).await;
     let governor = off_frame(|| seed_supervision_crew(b, "governor", "govern", "governor")).await;
     let b_backend = b.resource_backend();
@@ -3625,6 +3631,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         off_frame(|| seed_governor_subscription(a, b)).await;
     }
     off_frame(|| stall_source_crew(a, legacy_cursor, unavailable)).await;
+    a_holds.release(&b_home);
     off_frame(|| replicate_governor_to_source(a, b, stale_home)).await;
     off_frame(|| await_replicated_session(a, &governor)).await;
 
@@ -3679,13 +3686,15 @@ async fn stall_source_crew(a: &InProcessDaemon, legacy_cursor: bool, unavailable
 
 /// The governor's convoy and session replicate to `a`, with its presentation feed.
 async fn replicate_governor_to_source(a: &InProcessDaemon, b: &InProcessDaemon, stale_home: bool) {
-    // The governor's convoy and session launches, and its holder vessel, travel B's engine log.
-    flotilla_provisioning_testkit::replicate_home(
-        &b.decided_store().expect("governor home"),
-        b.node_id().as_str(),
-        &a.decided_store().expect("source home"),
-    );
+    // The governor's convoy and session launches, and its holder vessel, travel B's engine log
+    // over the topology's own change streams. A copy sent beside them races their rounds: a
+    // round staged before a launch installs after it and resets the home without it.
     let governor = current_launch(b, "governor");
+    let convoys = a.resource_backend().including_replicas::<Convoy>("flotilla");
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "the governor's convoy should replicate to the source", || async {
+        convoys.get(&governor).await.is_ok()
+    })
+    .await;
     apply_convoy_replica_feed(a, "flotilla", &governor, b.host_name().clone()).await;
     if stale_home {
         // Ordinary Message homing follows resource provenance even when the
@@ -3711,13 +3720,14 @@ async fn await_replicated_session(a: &InProcessDaemon, crew_id: &str) {
 /// governor may issue supervision from B, which routes back to A and validates B's replicated
 /// identity at the stalled convoy's home.
 async fn replicate_stall_to_governor(a: &InProcessDaemon, b: &InProcessDaemon) {
-    apply_convoy_replica_feed(b, "flotilla", &current_launch(a, "stalled-work"), a.host_name().clone()).await;
-    // The stalled convoy's launch travels A's engine log.
-    flotilla_provisioning_testkit::replicate_home(
-        &a.decided_store().expect("source home"),
-        a.node_id().as_str(),
-        &b.decided_store().expect("governor home"),
-    );
+    let source = current_launch(a, "stalled-work");
+    apply_convoy_replica_feed(b, "flotilla", &source, a.host_name().clone()).await;
+    // The stalled convoy's launch travels A's engine log over the topology's own change streams.
+    let convoys = b.resource_backend().including_replicas::<Convoy>("flotilla");
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "the stalled convoy should replicate to the governor", || async {
+        convoys.get(&source).await.is_ok()
+    })
+    .await;
 }
 
 /// The supervised crew at `a` is working again, and the ruling replies to the escalation.
@@ -3777,6 +3787,8 @@ async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &st
     .await;
     // The crew's session is the daemon's engine launch, held for its vessel's launch.
     let held = engine(daemon).vessels.request(&convoy, vessel, daemon.node_id().as_str());
+    // The vessel is ready, so its work runs and the crew's seat is judged.
+    engine(daemon).vessels.step(&held, flotilla_resources::vessel_records::VesselStep::Realised { environment: "test-env".into() });
     let terminals = &engine(daemon).terminals;
     let launch = terminals.request(&TerminalLaunchRequest {
         session: format!("{name}-session"),
@@ -3885,7 +3897,10 @@ async fn check_supervision_escalation_pass(a: &InProcessDaemon, b: &InProcessDae
     })
     .await
     .expect("the escalation lists at A as B's");
-    assert!(a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source inbox").items.is_empty());
+    // Only the escalation's copy is at A: a person told of the stall before the governor was
+    // live holds a System attention there, not a Supervisor message.
+    let local = a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source inbox").items;
+    assert!(local.iter().all(|local| local.spec.relation != flotilla_resources::MessageRelation::Supervisor), "{local:?}");
     assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::Supervisor);
     let sender = flotilla_resources::convoy::engine::launch_address(&"project:project".parse().expect("project address"), &source)
         .expect("launch address");
