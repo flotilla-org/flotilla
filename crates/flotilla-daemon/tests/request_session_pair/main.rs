@@ -4042,8 +4042,10 @@ async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {
         ),
     )
     .await;
-    // The crew's session is the home's engine launch, held for its vessel's launch; its agent exited.
+    // The crew's session is the home's engine launch, held for its realised vessel's launch; its
+    // agent exited, which interrupts the seat.
     let vessel = engine(home).vessels.request(&convoy, "work", home.node_id().as_str());
+    engine(home).vessels.ready(&vessel, "warm-env");
     let terminals = &engine(home).terminals;
     let launch = terminals.request(&TerminalLaunchRequest {
         session: "exited-session".into(),

@@ -6,16 +6,17 @@ use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{CrewCommandContext, DaemonEvent, HostName, NodeId};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewWorkPhase, Selector, TerminalAttention,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase,
 };
 use flotilla_store::ResourceBackend;
 
 use flotilla_state_machines::machines::agent_session::Activity;
 
 use super::support::{
-    admit_snapshot, admit_standing, agent_sessions, claim_crew, complete_work, engine_at, observe_attention, resume_staging_fixture_open,
-    stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
+    admit_snapshot, admit_standing, agent_sessions, claim_crew, complete_work, engine_at, ensure_vessel, observe_attention,
+    resume_staging_fixture_shaped, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
 };
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
@@ -438,18 +439,34 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
 // that an exited agent cannot send; both observed and not-yet-observed exits work.
 #[tokio::test]
 async fn resume_relaunches_exited_active_and_interrupted_crew() {
-    let (daemon, backend, probe) = resume_staging_fixture_open().await;
+    // The coder is an agent, the shape its agent session is launched for: only an agent's exit
+    // interrupts its seat.
+    let (daemon, backend, probe) = resume_staging_fixture_shaped(
+        ResourceBackend::new(InMemoryBackend::default()),
+        Arc::new(flotilla_resources::SystemClock),
+        false,
+        |_, snapshot| {
+            snapshot.vessels[0].crew[0].source = CrewSource::Agent {
+                selector: Selector { capability: "code".to_string(), adapter: None, model: None },
+                prompt: None,
+                brief_template: None,
+            };
+        },
+    )
+    .await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
     let session = sessions.get("resume-staging-session").await.expect("session");
     let original_cwd = session.spec.cwd.clone();
+    // The session runs in a realised vessel, so its exit interrupts the seat.
+    probe.engine.vessels.ready(&ensure_vessel(&probe.engine, &probe.convoy, "work"), "resume-env");
     let terminals = &probe.engine.terminals;
     let exited = terminals.record("resume-staging-session").name;
     terminals.ready(&exited, "resume-staging-pool-session", &Default::default());
     terminals.exited(&exited, "exit 0");
     let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
-    assert_eq!(status.phase, ConvoyPhase::Active, "its work is unfinished");
+    assert_eq!(status.phase, ConvoyPhase::Interrupted, "its work is unfinished, interrupted by the exit");
     daemon
         .convoy_resume_internal(
             "flotilla",
