@@ -3771,18 +3771,11 @@ fn brief_convoy_query(
     let convoy_query = StoreQuery {
         any_of: Some(vec![
             convoy_scope.clone(),
+            // The visible projects' standing roles' current generations: their live ensured convoys.
             StoreQuery {
-                include_replicas: true,
-                ..StoreQuery::related_kind(
-                    "metadata.name",
-                    "ConvoyEnsure",
-                    "status.convoy_ref",
-                    StoreQuery {
-                        field_values: BTreeMap::from([("spec.project_ref".into(), visible.clone().into_iter().collect())]),
-                        include_replicas: true,
-                        ..Default::default()
-                    },
-                )
+                present: vec![format!("metadata.annotations.\"{}\"", flotilla_resources::ENSURED_FROM_ANNOTATION)],
+                field_values: BTreeMap::from([("spec.project_ref".into(), visible.clone().into_iter().collect())]),
+                ..flotilla_store::live_convoys_query()
             },
         ]),
         include_replicas: true,

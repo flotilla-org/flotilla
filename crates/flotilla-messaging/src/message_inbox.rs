@@ -221,6 +221,8 @@ pub struct MessageReceiverSnapshot {
     convoys: std::sync::Arc<crate::ReadResourceList<Convoy>>,
     terminals: std::sync::Arc<crate::ReadResourceList<TerminalSession>>,
     ensures: std::sync::Arc<crate::ReadResourceList<ConvoyEnsure>>,
+    /// Each standing role's current generation in this batch, by ensure name: its newest live convoy.
+    generations: BTreeMap<String, String>,
     projects: BTreeMap<String, ProjectSpec>,
     hierarchy: ProjectHierarchy,
     defaults: Vec<(String, CrewDefaultsSpec)>,
@@ -273,26 +275,35 @@ impl MessageReceiverSnapshot {
                 .await?
                 .items
         };
-        let standing_convoys = ensures
-            .iter()
-            .filter_map(|ensure| ensure.object.status.as_ref()?.convoy_ref.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        convoy_names.extend(standing_convoys.iter().cloned());
-        let convoys = if convoy_names.is_empty() {
+        // One Convoy read: the named convoys and the standing roles' live generations.
+        let mut convoy_queries = Vec::new();
+        if !convoy_names.is_empty() {
+            convoy_queries.push(crate::StoreQuery {
+                field_values: BTreeMap::from([("metadata.name".into(), convoy_names.iter().cloned().collect())]),
+                ..Default::default()
+            });
+        }
+        if !ensures.is_empty() {
+            convoy_queries.push(crate::generations_query(ensures.iter().map(|ensure| ensure.object.metadata.name.clone()).collect()));
+        }
+        let convoys = if convoy_queries.is_empty() {
             Vec::new()
         } else {
             backend
                 .query_declared::<Convoy>(
                     namespace,
-                    &crate::StoreQuery {
-                        field_values: BTreeMap::from([("metadata.name".into(), convoy_names.iter().cloned().collect())]),
-                        include_replicas: true,
-                        ..Default::default()
-                    },
+                    &crate::StoreQuery { any_of: Some(convoy_queries), include_replicas: true, ..Default::default() },
                 )
                 .await?
                 .items
         };
+        // Only the loaded ensures' generations: a named convoy may itself be one, but a
+        // four-part address needs no standing-role holders.
+        let standing_convoys = crate::newest_live_generations(convoys.iter().map(|row| &row.object))
+            .into_iter()
+            .filter(|(ensure, _)| ensures.iter().any(|declared| declared.object.metadata.name == *ensure))
+            .map(|(_, convoy)| convoy.metadata.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
         adopted_queries.extend(
             standing_convoys
                 .into_iter()
@@ -384,7 +395,11 @@ impl MessageReceiverSnapshot {
         }
         let hierarchy =
             ProjectHierarchy::from_declared(projects.iter().map(|(name, spec)| (name.clone(), spec.parent.clone())).collect(), fleet);
-        Ok(Self { namespace: namespace.into(), convoys, terminals, ensures, projects, hierarchy, defaults })
+        let generations = crate::newest_live_generations(convoys.items.iter().map(|source| &source.object))
+            .into_iter()
+            .map(|(ensure, convoy)| (ensure, convoy.metadata.name.clone()))
+            .collect();
+        Ok(Self { namespace: namespace.into(), convoys, terminals, ensures, generations, projects, hierarchy, defaults })
     }
 
     /// Cheap candidate filter before resolving message addresses. Two-part roles
@@ -398,7 +413,7 @@ impl MessageReceiverSnapshot {
                     let declaration = &source.object;
                     declaration.spec.project_ref == project
                         && declaration.spec.role == *role
-                        && declaration.status.as_ref().and_then(|status| status.convoy_ref.as_deref()) == Some(convoy)
+                        && self.generations.get(&declaration.metadata.name).map(String::as_str) == Some(convoy)
                 }) || self.terminals.items.iter().any(|holder| {
                     holder.object.metadata.annotations.get(ROLE_ADDRESS_ANNOTATION).is_some_and(|claim| claim == address)
                         && holder.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|name| name == convoy)
@@ -480,7 +495,7 @@ impl MessageReceiverSnapshot {
             if holders.next().is_some() {
                 return Err(ResourceError::invalid("project role has multiple holder declarations"));
             }
-            let Some(name) = declaration.object.status.as_ref().and_then(|status| status.convoy_ref.clone()) else { return Ok(None) };
+            let Some(name) = self.generations.get(&declaration.object.metadata.name).cloned() else { return Ok(None) };
             Some(name)
         } else {
             None

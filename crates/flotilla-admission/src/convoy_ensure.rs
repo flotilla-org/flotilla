@@ -42,6 +42,9 @@ pub trait ConvoyEnsureReconciler: Send + Sync {
     /// The earliest time the last full pass deferred an ensure to (a strike's backoff or an
     /// admission refusal's retry): nothing else wakes the pass then.
     fn next_due(&self, namespace: &str) -> Option<chrono::DateTime<chrono::Utc>>;
+    /// Role `role` of project `project`, as derived from its generations (#3108); `None` when
+    /// no ensure declares it.
+    async fn standing_role(&self, namespace: &str, project: &str, role: &str) -> Result<Option<crate::standing::StandingRole>, String>;
 }
 
 /// Admission and lifecycle operations used by the standing-convoy controller.

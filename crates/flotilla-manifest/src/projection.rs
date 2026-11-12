@@ -550,7 +550,8 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
             Badge { attention: convoy.surface_state.needs_attention() || vessel_attention, ..badge }
         }
         // Between generations the ensure loop is expected to admit the next
-        // attempt; a superseded failure is not the role's current state.
+        // attempt; a superseded failure is not the role's current state. A role
+        // whose state could not be read shows no attention it cannot vouch for.
         (None, _) => Badge { state: BadgeState::Waiting, attention: false },
     };
     let summary = match (role.hold, live) {

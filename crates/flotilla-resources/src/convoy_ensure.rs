@@ -3,26 +3,19 @@ use flotilla_protocol::AgentOverride;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    checkout::ConditionValue, resource::define_resource, status_patch::StatusPatch, ControllerRetry, LeafMaker, ReplicationClass,
-    RepositoryKey, RetryCeiling, StallEvidenceSource, StallRung, StalledCondition,
+    checkout::ConditionValue, resource::define_resource, status_patch::NoStatusPatch, ControllerRetry, ReplicationClass, RepositoryKey,
+    StalledCondition,
 };
 
-pub const DRIVER_ADMISSION_CONDITION_TYPE: &str = "DriverAdmission";
-
+// No status is written: a standing role's state is derived from its generations (#3108).
 define_resource!(
     ConvoyEnsure,
     "convoyensures",
     ConvoyEnsureSpec,
     ConvoyEnsureStatus,
-    ConvoyEnsureStatusPatch,
+    NoStatusPatch,
     replication = ReplicationClass::Definitions,
-    queryable = &[
-        "metadata.name",
-        "spec.project_ref",
-        "spec.role",
-        "status.convoy_ref",
-        "metadata.annotations.\"flotilla.work/materialized-project\"",
-    ]
+    queryable = &["metadata.name", "spec.project_ref", "spec.role", "metadata.annotations.\"flotilla.work/materialized-project\""]
 );
 
 /// Desired state for one standing convoy.
@@ -53,6 +46,54 @@ pub struct ConvoyEnsureSpec {
     pub agent_overrides: Vec<AgentOverride>,
 }
 
+/// How `declared` differs from the configuration that admitted a role's current generation, one
+/// line per change; `admitted` is `None` when that generation recorded none. Empty when they agree.
+/// A role's drift is derived from its generation, never held (#3108).
+pub fn config_changes(declared: &ConvoyEnsureSpec, admitted: Option<&ConvoyEnsureSpec>) -> Vec<String> {
+    let Some(old) = admitted else {
+        // Never infer a previous generation's admission baseline from the
+        // latest observed declaration: it may already have silently drifted.
+        return vec!["admission configuration unknown; explicitly roll to establish a baseline".into()];
+    };
+    let mut changes = Vec::new();
+    for repo in declared.repositories.iter().filter(|repo| !old.repositories.contains(repo)) {
+        changes.push(format!("repository added: {repo}"));
+    }
+    for repo in old.repositories.iter().filter(|repo| !declared.repositories.contains(repo)) {
+        changes.push(format!("repository removed: {repo}"));
+    }
+    if old.repositories != declared.repositories && changes.is_empty() {
+        changes.push("repository order changed".into());
+    }
+    if old.workflow_ref != declared.workflow_ref {
+        changes.push(format!("workflow: {} -> {}", old.workflow_ref, declared.workflow_ref));
+    }
+    if old.placement_policy != declared.placement_policy {
+        changes.push(format!("placement: {:?} -> {:?}", old.placement_policy, declared.placement_policy));
+    }
+    if old.agent_overrides != declared.agent_overrides {
+        changes.push(format!("agents: {:?} -> {:?}", old.agent_overrides, declared.agent_overrides));
+    }
+    if old.driver_ref != declared.driver_ref {
+        changes.push(format!("driver: {:?} -> {:?}", old.driver_ref, declared.driver_ref));
+    }
+    if old.presents_as != declared.presents_as {
+        changes.push(format!("presentation: {:?} -> {:?}", old.presents_as, declared.presents_as));
+    }
+    if old.escalation_reason != declared.escalation_reason {
+        changes.push("placement escalation reason changed".into());
+    }
+    if old.project_ref != declared.project_ref {
+        changes.push(format!("project: {} -> {}", old.project_ref, declared.project_ref));
+    }
+    if old.role != declared.role {
+        changes.push(format!("role: {} -> {}", old.role, declared.role));
+    }
+    changes
+}
+
+/// The previous generation's stored status: the first-start import reads it and drops it, as a
+/// role's state is derived from its generations (#3108). Remove one roll after that import.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyEnsureStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,172 +150,6 @@ pub enum ConvoyEnsureHoldReason {
     RestartLimit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConvoyEnsureStatusPatch {
-    ConfigDrift {
-        admitted_hash: Option<String>,
-        observed_hash: String,
-        drift: Option<ConvoyEnsureConfigDrift>,
-    },
-    DeclarationRefused {
-        condition: Option<crate::DeclarationRefusedCondition>,
-    },
-    /// `convoy_ref` runs, behind `strikes` consecutive failed generations.
-    Running {
-        convoy_ref: String,
-        observed_at: DateTime<Utc>,
-        strikes: u32,
-    },
-    /// Its convoy ended as the `strikes`th consecutive failure the role's generations show.
-    BackingOff {
-        strikes: u32,
-        retry_at: DateTime<Utc>,
-        failure: String,
-    },
-    Retrying {
-        retry_at: DateTime<Utc>,
-        failure: String,
-    },
-    Holding {
-        convoy_ref: String,
-        failure: String,
-    },
-    /// The role's generations show `strikes` consecutive failures, its limit.
-    RestartLimitReached {
-        convoy_ref: String,
-        strikes: u32,
-        failure: String,
-    },
-    ObserveConfig {
-        config_hash: String,
-        changed: bool,
-    },
-    BackoffState {
-        strikes: u32,
-        retry_at: DateTime<Utc>,
-        failure: String,
-    },
-    ResetBackoff,
-    DriverManaged,
-    DriverAdmission {
-        condition: Option<ConvoyEnsureCondition>,
-    },
-}
-
-impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
-    fn apply(&self, status: &mut ConvoyEnsureStatus) {
-        match self {
-            Self::ConfigDrift { admitted_hash, observed_hash, drift } => {
-                status.admitted_config_hash.clone_from(admitted_hash);
-                status.observed_config_hash = Some(observed_hash.clone());
-                status.config_drift.clone_from(drift);
-            }
-            Self::DeclarationRefused { condition } => status.declaration_refused.clone_from(condition),
-            Self::Running { convoy_ref, observed_at, strikes } => {
-                status.convoy_ref = Some(convoy_ref.clone());
-                status.restart_count = *strikes;
-                status.running_since = Some(*observed_at);
-                status.retry_at = None;
-                status.last_failure = None;
-                status.hold_reason = None;
-                status.retry = None;
-            }
-            Self::BackingOff { strikes, retry_at, failure } => {
-                status.convoy_ref = None;
-                status.restart_count = *strikes;
-                status.running_since = None;
-                status.retry_at = Some(*retry_at);
-                status.last_failure = Some(failure.clone());
-                status.hold_reason = None;
-                status.retry = Some(ControllerRetry::retryable_at(status.retry.as_ref(), Utc::now(), *retry_at));
-            }
-            Self::Retrying { retry_at, failure } => {
-                status.running_since = None;
-                status.retry_at = Some(*retry_at);
-                status.last_failure = Some(failure.clone());
-                status.hold_reason = None;
-                status.retry = Some(ControllerRetry::retryable_at(status.retry.as_ref(), Utc::now(), *retry_at));
-            }
-            Self::Holding { convoy_ref, failure } => {
-                status.convoy_ref = Some(convoy_ref.clone());
-                status.running_since = None;
-                status.retry_at = None;
-                status.last_failure = Some(failure.clone());
-                status.hold_reason = Some(ConvoyEnsureHoldReason::BackingUnverified);
-                status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), Utc::now(), failure.clone()));
-            }
-            Self::RestartLimitReached { convoy_ref, strikes, failure } => {
-                status.convoy_ref = Some(convoy_ref.clone());
-                status.restart_count = *strikes;
-                status.running_since = None;
-                status.retry_at = None;
-                status.last_failure = Some(failure.clone());
-                status.hold_reason = Some(ConvoyEnsureHoldReason::RestartLimit);
-                status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), Utc::now(), failure.clone()));
-            }
-            Self::ObserveConfig { config_hash, changed } => {
-                status.observed_config_hash = Some(config_hash.clone());
-                if *changed {
-                    status.restart_count = 0;
-                    status.retry_at = None;
-                    status.last_failure = None;
-                    status.hold_reason = None;
-                    status.retry = None;
-                }
-            }
-            Self::BackoffState { strikes, retry_at, failure } => {
-                status.restart_count = *strikes;
-                status.retry_at = Some(*retry_at);
-                status.last_failure = Some(failure.clone());
-                status.hold_reason = None;
-                status.retry = Some(ControllerRetry::retryable_at(status.retry.as_ref(), Utc::now(), *retry_at));
-            }
-            Self::ResetBackoff => {
-                status.restart_count = 0;
-                status.retry_at = None;
-                status.last_failure = None;
-                status.hold_reason = None;
-                status.retry = None;
-            }
-            Self::DriverManaged => {
-                status.convoy_ref = None;
-                status.running_since = None;
-                // Keep the observed hash: driver changes must not erase drift evidence.
-                status.retry = None;
-            }
-            Self::DriverAdmission { condition } => {
-                status.conditions.retain(|existing| existing.condition_type != DRIVER_ADMISSION_CONDITION_TYPE);
-                if let Some(condition) = condition {
-                    status.conditions.push(condition.clone());
-                }
-            }
-        }
-        let now = Utc::now();
-        let reason = status.retry.as_ref().and_then(|retry| retry.stall_reason(now, RetryCeiling::default()));
-        status.stalled = reason.map(|evidence| StalledCondition {
-            leaves: Vec::new(),
-            maker: status.retry.clone().map(|retry| LeafMaker::Controller {
-                resource_kind: "ConvoyEnsure".into(),
-                name: None,
-                retry,
-                ceiling: RetryCeiling::default(),
-            }),
-            evidence,
-            source: StallEvidenceSource::LeafEngine,
-            cause: None,
-            began_at: status.stalled.as_ref().map_or(now, |stalled| stalled.began_at),
-            rung: StallRung::Operator,
-            supervisor: None,
-            supervision_message: None,
-            supervision_index: None,
-            supervision_exhausted: false,
-            reason: None,
-            proposed_disposition: None,
-            nudge_history: Vec::new(),
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
@@ -283,46 +158,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn operator_ensure_retry_rows_stall_on_terminal_failure_or_ceiling() {
-        let now = Utc::now();
-        let mut status = ConvoyEnsureStatus::default();
-        ConvoyEnsureStatusPatch::Retrying { retry_at: now + chrono::Duration::seconds(30), failure: "provider unavailable".into() }
-            .apply(&mut status);
-        assert!(status.retry.is_some());
-        assert!(status.stalled.is_none(), "a transient controller failure keeps an able maker");
+    fn the_previous_generations_status_decodes_its_operator_vocabulary() {
+        let status: ConvoyEnsureStatus =
+            serde_json::from_value(json!({ "strikes": 3, "next_attempt": "2026-08-25T21:30:00Z", "hold_reason": "restart_limit" }))
+                .expect("decode status");
 
-        ConvoyEnsureStatusPatch::Holding { convoy_ref: "convoy-a".into(), failure: "operator must verify backing".into() }
-            .apply(&mut status);
-        assert_eq!(status.stalled.as_ref().map(|stalled| stalled.evidence.as_str()), Some("operator must verify backing"));
-        assert_eq!(status.stalled.as_ref().map(|stalled| stalled.rung), Some(StallRung::Operator));
-
-        ConvoyEnsureStatusPatch::ResetBackoff.apply(&mut status);
-        assert!(status.stalled.is_none());
-        for attempt in 0..RetryCeiling::default().attempts {
-            ConvoyEnsureStatusPatch::Retrying {
-                retry_at: now + chrono::Duration::seconds(30 + attempt as i64),
-                failure: "provider unavailable".into(),
-            }
-            .apply(&mut status);
-        }
-        assert_eq!(status.stalled.as_ref().map(|stalled| stalled.evidence.as_str()), Some("retrying without progress"));
-        ConvoyEnsureStatusPatch::ResetBackoff.apply(&mut status);
-        assert!(status.retry.is_none() && status.stalled.is_none(), "explicit reconcile-now clears the retry episode");
-    }
-
-    #[test]
-    fn serialized_backoff_uses_operator_vocabulary() {
-        let value = serde_json::to_value(ConvoyEnsureStatus {
-            restart_count: 3,
-            retry_at: Some(Utc.with_ymd_and_hms(2026, 8, 25, 21, 30, 0).single().expect("timestamp")),
-            ..Default::default()
-        })
-        .expect("serialize status");
-
-        assert_eq!(value["strikes"], 3);
-        assert_eq!(value["next_attempt"], "2026-08-25T21:30:00Z");
-        assert!(value.get("restart_count").is_none());
-        assert!(value.get("retry_at").is_none());
+        assert_eq!(status.restart_count, 3);
+        assert_eq!(status.retry_at, Some(Utc.with_ymd_and_hms(2026, 8, 25, 21, 30, 0).single().expect("timestamp")));
+        assert_eq!(status.hold_reason, Some(ConvoyEnsureHoldReason::RestartLimit));
     }
 
     #[test]

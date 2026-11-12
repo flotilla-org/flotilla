@@ -807,12 +807,9 @@ async fn ops_entries_materialization_scenario() {
         .await
         .expect("designate the fleet");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("start ensured standing convoy");
-    let ensured_convoy_ref = ensures
-        .get(&ensure_name)
+    let ensured_convoy_ref = flotilla_projections::ports::StandingRoles::reading(&*daemon, "flotilla", "demo", "quartermaster")
         .await
-        .expect("reconciled ensure")
-        .status
-        .and_then(|status| status.convoy_ref)
+        .and_then(|role| role.convoy_ref)
         .expect("ensured convoy ref");
     let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
     convoys.get(&ensured_convoy_ref).await.expect("ensured standing convoy record");
@@ -861,8 +858,11 @@ async fn ops_entries_materialization_scenario() {
     let refusal = project.status.expect("status").declaration_refused.expect("visible refusal condition");
     assert!(refusal.message.contains("unknown_option"));
     assert_eq!(refusal.entry_path, "quartermaster: named.entry");
-    let ensure = ensures.get(&ensure_name).await.expect("last accepted ensure remains");
-    assert!(ensure.status.expect("ensure status").declaration_refused.is_some());
+    ensures.get(&ensure_name).await.expect("last accepted ensure remains");
+    // The standing role shows its project's refusal, read from the Project.
+    let role =
+        flotilla_projections::ports::StandingRoles::reading(&*daemon, "flotilla", "demo", "quartermaster").await.expect("the role reads");
+    assert!(role.last_failure.is_some_and(|failure| failure.starts_with("DeclarationRefused:") && failure.contains("unknown_option")));
     let refused = |fleet: flotilla_protocol::FleetListResponse| {
         fleet
             .declaration_attention
@@ -887,7 +887,10 @@ async fn ops_entries_materialization_scenario() {
         .expect("status")
         .declaration_refused
         .is_none());
-    assert!(ensures.get(&ensure_name).await.expect("retained ensure").status.expect("status").declaration_refused.is_none());
+    ensures.get(&ensure_name).await.expect("retained ensure");
+    let role =
+        flotilla_projections::ports::StandingRoles::reading(&*daemon, "flotilla", "demo", "quartermaster").await.expect("the role reads");
+    assert!(!role.last_failure.is_some_and(|failure| failure.starts_with("DeclarationRefused:")), "the repair clears the role's refusal");
     assert!(!refused(daemon.fleet_list_internal().await.expect("fleet list")), "a repaired declaration needs no one");
 
     std::fs::remove_file(ensure_path).expect("remove ensure entry");

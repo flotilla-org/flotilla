@@ -57,6 +57,7 @@ pub fn run(
             .with_lifecycle_reads(context.lifecycles)
             .with_discovered_checkouts(context.discovered, namespace)
             .with_agent_sessions(context.agent_sessions)
+            .with_standing_roles(context.standing_roles)
             .with_change_request_resolver_arc(context.change_requests)
             .with_issue_resolver_arc(context.issues)
             .with_issue_polling_health(issue_polling)
@@ -101,6 +102,9 @@ pub struct AggregatorContext {
     /// The decided store's AgentSessions, at every home followed (#3108); `NoAgentSessions`
     /// where none is composed.
     pub agent_sessions: Arc<dyn ports::AgentSessions>,
+    /// Standing roles as derived from their generations (#3108); `NoStandingRoles` where no
+    /// standing role controller is composed.
+    pub standing_roles: Arc<dyn ports::StandingRoles>,
     /// The daemon's injected wall clock, which the projection judges times against.
     pub clock: Arc<dyn flotilla_resources::Clock>,
 }

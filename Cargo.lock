@@ -3399,6 +3399,7 @@ dependencies = [
  "flotilla-engine-messages",
  "flotilla-engine-messages-testkit",
  "flotilla-environment",
+ "flotilla-projections",
  "flotilla-protocol",
  "flotilla-provider-runtime",
  "flotilla-provisioning",

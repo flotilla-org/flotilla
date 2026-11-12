@@ -86,6 +86,31 @@ pub struct StandingReading {
     pub decision: Decision,
 }
 
+/// A standing role as every host reads it: derived from its generations, their hold attention
+/// and its project's declaration, with the refusal note of the host that admits it when that is
+/// the reading host. Nothing of it is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandingRole {
+    /// Its current generation: the newest live one, or the ended one it is held on.
+    pub convoy: Option<String>,
+    pub hold: Option<StandingHold>,
+    /// Consecutive failed generations in its current strike run.
+    pub strikes: u32,
+    /// When it will next try to admit: its backoff, or the reading host's refusal note.
+    pub next_attempt: Option<DateTime<Utc>>,
+    /// Why it is not running as declared, the most pressing first.
+    pub last_failure: Option<String>,
+}
+
+/// Why a standing role is held for a person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandingHold {
+    /// Its ended generation's backing could not be verified dead.
+    BackingUnverified,
+    /// Its strike run reached the limit.
+    RestartLimit,
+}
+
 /// Reads a standing role from its generations, newest first, its hold attention, and `now`.
 /// `forced` is an operator's reconcile-now: it admits whatever the strikes say.
 pub fn derive(generations: &[Generation], attention: HoldAttention, now: DateTime<Utc>, forced: bool) -> StandingReading {

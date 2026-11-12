@@ -3685,7 +3685,7 @@ async fn replicate_governor_to_source(a: &InProcessDaemon, b: &InProcessDaemon, 
         b.node_id().as_str(),
         &a.decided_store().expect("source home"),
     );
-    let governor = current_launch(b, "governor");
+    let governor = governor_launch(b);
     apply_convoy_replica_feed(a, "flotilla", &governor, b.host_name().clone()).await;
     if stale_home {
         // Ordinary Message homing follows resource provenance even when the
@@ -3732,6 +3732,12 @@ async fn check_supervised_resume(a: &InProcessDaemon, escalation_name: &str) {
     assert!(replies.items.iter().any(|message| message.spec.in_reply_to.as_deref() == Some(escalation_name)));
 }
 
+/// The governor's launch at `daemon`: as the current generation of a standing role, the engine
+/// names it by that role.
+fn governor_launch(daemon: &InProcessDaemon) -> String {
+    current_launch(daemon, &flotilla_resources::convoy::engine::standing_name("project", "governor").expect("standing name"))
+}
+
 /// One convoy with a working crew member and its running session, at `daemon`.
 async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &str, role: &str) -> String {
     let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).role(role.into()).build();
@@ -3756,25 +3762,26 @@ async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &st
         turn_delivery: Default::default(),
     };
     // The convoy is the daemon's engine launch, its crew owing a decision ledger.
-    let convoy = admit_convoy(
-        daemon,
-        flotilla_engine_convoys_testkit::convoy(
-            "flotilla",
-            name,
-            spec,
-            ConvoyStatus {
-                phase: ResourceConvoyPhase::Active,
-                workflow_snapshot: Some(snapshot),
-                work: BTreeMap::from([(vessel.into(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
-                crew_work: BTreeMap::from([(
-                    vessel.into(),
-                    BTreeMap::from([(role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                ..Default::default()
-            },
-        ),
-    )
-    .await;
+    let mut convoy = flotilla_engine_convoys_testkit::convoy(
+        "flotilla",
+        name,
+        spec,
+        ConvoyStatus {
+            phase: ResourceConvoyPhase::Active,
+            workflow_snapshot: Some(snapshot),
+            work: BTreeMap::from([(vessel.into(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+            crew_work: BTreeMap::from([(
+                vessel.into(),
+                BTreeMap::from([(role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            ..Default::default()
+        },
+    );
+    if role == "governor" {
+        // The governor is the current generation of the standing role `seed_governor_subscription` declares.
+        convoy.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), "project-governor".into());
+    }
+    let convoy = admit_convoy(daemon, convoy).await;
     // The crew's session is the daemon's engine launch, held for its vessel's launch.
     let held = engine(daemon).vessels.request(&convoy, vessel, daemon.node_id().as_str());
     let terminals = &engine(daemon).terminals;
@@ -3810,7 +3817,7 @@ async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &st
 async fn seed_governor_subscription(a: &InProcessDaemon, b: &InProcessDaemon) {
     let a_backend = a.resource_backend();
     let b_backend = b.resource_backend();
-    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Project, ProjectSpec, RoleDefinition, RoleSubscription};
+    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, Project, ProjectSpec, RoleDefinition, RoleSubscription};
     a_backend
         .definitions::<Project>("flotilla")
         .create(
@@ -3841,15 +3848,6 @@ async fn seed_governor_subscription(a: &InProcessDaemon, b: &InProcessDaemon) {
         )
         .await
         .expect("presence");
-    let ensure = ensures.get("project-governor").await.expect("local ensure");
-    ensures
-        .update_status(
-            "project-governor",
-            &ensure.metadata.resource_version,
-            &ConvoyEnsureStatus { convoy_ref: Some(current_launch(b, "governor")), ..Default::default() },
-        )
-        .await
-        .expect("holder");
     a_backend
         .replica_writer::<ConvoyEnsure>(b.node_id().clone(), "flotilla")
         .replace(&ensures.list().await.expect("ensure"), Utc::now())
@@ -3862,7 +3860,7 @@ async fn check_supervision_escalation_pass(a: &InProcessDaemon, b: &InProcessDae
     let a_backend = a.resource_backend();
     let b_backend = b.resource_backend();
     let convoys = a_backend.using::<Convoy>("flotilla");
-    let (source, governor) = (current_launch(a, "stalled-work"), current_launch(b, "governor"));
+    let (source, governor) = (current_launch(a, "stalled-work"), governor_launch(b));
     a.reconcile_crew_stalls_once("flotilla").await.expect("one escalation pass");
     let stall = convoys.get(&source).await.expect("source").status.expect("status").stalled.expect("stall");
     assert_eq!(stall.rung, flotilla_resources::StallRung::Governor);
@@ -4357,7 +4355,7 @@ mod message_homes;
 // Project roles retain a home before admission or launch. The ordinary router
 // must create their intent there and admit a reply addressed to a system sender.
 async fn run_message_role_waiting_home_case(remote: bool, admitted: bool) {
-    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Message, MessagePhase};
+    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, Message, MessagePhase};
     let topology =
         spawn_in_memory_request_topology_stateful(empty_daemon_named("message-caller").await, empty_daemon_named("role-home").await)
             .await
@@ -4373,25 +4371,14 @@ async fn run_message_role_waiting_home_case(remote: bool, admitted: bool) {
         .await
         .expect("declared standing role");
     if admitted {
-        // Admitted on the engine, with no terminal.
-        let standing = admit_convoy(
-            home,
-            engine_convoy(
-                "standing",
-                ConvoySpec::builder().workflow_ref("standing".into()).project_ref("flotilla".into()).role("governor".into()).build(),
-                ConvoyStatus::default(),
-            ),
-        )
-        .await;
-        let declaration = declarations.get("waiting-governor").await.expect("local declaration status version");
-        declarations
-            .update_status(
-                "waiting-governor",
-                &declaration.metadata.resource_version,
-                &ConvoyEnsureStatus { convoy_ref: Some(standing), ..Default::default() },
-            )
-            .await
-            .expect("standing declaration status");
+        // Admitted on the engine, with no terminal, as the declared role's current generation.
+        let mut standing = engine_convoy(
+            "standing",
+            ConvoySpec::builder().workflow_ref("standing".into()).project_ref("flotilla".into()).role("governor".into()).build(),
+            ConvoyStatus::default(),
+        );
+        standing.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), "waiting-governor".into());
+        admit_convoy(home, standing).await;
     }
     if remote {
         topology

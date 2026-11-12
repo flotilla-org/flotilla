@@ -1143,6 +1143,7 @@ pub(super) fn spawn_aggregator_task(
                         lifecycles: daemon.lifecycle_reads(),
                         convoy_engine: daemon.convoy_engine_path(),
                         agent_sessions: daemon.clone(),
+                        standing_roles: daemon.clone(),
                         clock: daemon.clock_for_scenarios(),
                     },
                     &namespace,

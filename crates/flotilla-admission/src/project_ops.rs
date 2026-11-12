@@ -28,10 +28,9 @@ use flotilla_resources::{
     checkout_path::checkout_path, definition_provenance::WHOLE_REPOSITORY_PROJECT_MANAGER, discovered_checkouts::DiscoveredCheckouts,
 };
 use flotilla_resources::{
-    normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyRepositorySpec,
-    DeclarationRefusedCondition, Forge, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
-    Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
-    WriterIdentity, MANAGED_BY_LABEL,
+    normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyRepositorySpec, DeclarationRefusedCondition, Forge, InputMeta,
+    Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, Repository, RepositoryIdentity, RepositoryKey,
+    RepositorySpec, ResourceError, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ensure_repository, ResourceBackend};
 use tracing::debug;
@@ -985,8 +984,11 @@ impl ProjectService<'_> {
                     && !ensures.contains_key(&ensure.metadata.name)
             })
         {
-            if let Some(convoy_ref) = stale.status.as_ref().and_then(|status| status.convoy_ref.as_deref()) {
-                self.operations.reap_ensured_convoy(&namespace, &stale.metadata.name, convoy_ref, false).await?;
+            let current = flotilla_store::current_generations(self.resource_backend, &namespace, [stale.metadata.name.clone()])
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(convoy) = current.get(&stale.metadata.name) {
+                self.operations.reap_ensured_convoy(&namespace, &stale.metadata.name, &convoy.metadata.name, false).await?;
             }
             convoy_ensures.delete(&stale.metadata.name).await.map_err(|error| error.to_string())?;
             changes.push(format!("deleted ConvoyEnsure/{}", stale.metadata.name));
@@ -1107,38 +1109,16 @@ impl ProjectService<'_> {
             since: project.status.as_ref().and_then(|status| status.declaration_refused.as_ref()).map_or(now, |old| old.since),
             observed_at: now,
         });
+        // A standing role reads its project's refusal from the Project (#3108): no copy is
+        // written to its ensure.
         let mut errors = Vec::new();
         for patch in [
             ProjectStatusPatch::ReplaceOperationalEntries { ready, message: message.to_string() },
-            ProjectStatusPatch::DeclarationRefused { condition: condition.clone() },
+            ProjectStatusPatch::DeclarationRefused { condition },
         ] {
             if let Err(error) = apply_resource_status_patch(&projects, project_name, &patch).await {
                 errors.push(error.to_string());
             }
-        }
-        match self
-            .resource_backend
-            .definitions::<ConvoyEnsure>(namespace)
-            .list_selected(flotilla_store::StoreQuery {
-                fields: BTreeMap::from([("spec.project_ref".into(), project_name.into())]),
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(ensures) => {
-                for ensure in ensures.into_iter().filter(|ensure| ensure.spec.project_ref == project_name) {
-                    if let Err(error) = apply_resource_status_patch(
-                        &self.resource_backend.using::<ConvoyEnsure>(namespace),
-                        &ensure.metadata.name,
-                        &ConvoyEnsureStatusPatch::DeclarationRefused { condition: condition.clone() },
-                    )
-                    .await
-                    {
-                        errors.push(format!("ConvoyEnsure/{}: {error}", ensure.metadata.name));
-                    }
-                }
-            }
-            Err(error) => errors.push(error.to_string()),
         }
         if errors.is_empty() {
             Ok(())

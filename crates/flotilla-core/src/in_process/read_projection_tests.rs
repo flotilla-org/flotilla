@@ -1528,8 +1528,7 @@ mod tests {
     #[tokio::test]
     async fn explain_message_reads_are_bounded() {
         use flotilla_resources::{
-            ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Message, MessageRelation, MessageSpec, Selector, TerminalBrief,
-            TerminalCrewContext,
+            ConvoyEnsure, ConvoyEnsureSpec, Message, MessageRelation, MessageSpec, Selector, TerminalBrief, TerminalCrewContext,
         };
         use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadSnapshot};
         async fn explain(n: usize, adopted: bool) -> ReadSnapshot {
@@ -1543,6 +1542,12 @@ mod tests {
                     &InputMeta::builder()
                         .name("target".into())
                         .labels(BTreeMap::from([(PROJECT_LABEL.into(), "flotilla".into()), (ROLE_LABEL.into(), "guide".into())]))
+                        // Unadopted, it is the current generation of the role the ensure declares.
+                        .annotations(if adopted {
+                            BTreeMap::new()
+                        } else {
+                            BTreeMap::from([(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), "guide".into())])
+                        })
                         .build(),
                     &ConvoySpec::builder().workflow_ref("scratch".into()).build(),
                 )
@@ -1566,23 +1571,15 @@ mod tests {
                     .await
                     .expect("adoptable role");
             } else {
-                let ensures = fixture.backend.using::<ConvoyEnsure>("flotilla");
-                let ensure = ensures
+                fixture
+                    .backend
+                    .using::<ConvoyEnsure>("flotilla")
                     .create(
                         &InputMeta::builder().name("guide".into()).build(),
                         &ConvoyEnsureSpec::builder().project_ref("flotilla".into()).role("guide".into()).repositories(Vec::new()).build(),
                     )
                     .await
                     .expect("ensure");
-                let ensure = ensures.get(&ensure.metadata.name).await.expect("current ensure");
-                ensures
-                    .update_status(
-                        "guide",
-                        &ensure.metadata.resource_version,
-                        &ConvoyEnsureStatus { convoy_ref: Some("target".into()), ..Default::default() },
-                    )
-                    .await
-                    .expect("holder declaration");
             }
             fixture
                 .backend
@@ -1712,9 +1709,12 @@ mod tests {
             for (kind, operation, tally) in reads.entries() {
                 assert!(tally.calls <= 1, "{kind} {operation:?}: {} reads", tally.calls);
             }
-            for kind in ["Convoy", "TerminalSession", "ConvoyEnsure", "Message"] {
+            for kind in ["Convoy", "TerminalSession", "Message"] {
                 assert_eq!(reads.calls_by_kind().get(kind), Some(&1), "one indexed inventory for {kind}");
             }
+            // Only a standing role's current generation reads its declarations; an adopted role is none.
+            let ensure_reads = if adopted { None } else { Some(&1) };
+            assert_eq!(reads.calls_by_kind().get("ConvoyEnsure"), ensure_reads, "declarations read only for a generation");
             assert_eq!(reads.objects_by_kind().get("Convoy"), Some(&1));
             assert_eq!(reads.objects_by_kind().get("Message"), Some(&2));
             reads

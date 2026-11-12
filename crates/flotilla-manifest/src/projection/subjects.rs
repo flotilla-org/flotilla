@@ -127,9 +127,20 @@ pub(super) fn project_role_attempts(catalog: &mut Catalog, role: &StandingRoleRo
     let mut facts = vec![
         (KEY_ROLE_ATTEMPTS, MetadataValue::EntityRefs(attempts.iter().map(|convoy| convoy_ref(convoy)).collect())),
         (KEY_ROLE_DESIRED_STATE, MetadataValue::text("running")),
-        (KEY_ROLE_STATE, MetadataValue::text(if role.hold.is_some() { "held" } else { "active" })),
-        (KEY_ROLE_RESTART_COUNT, MetadataValue::Integer(i64::from(role.strikes))),
+        (
+            KEY_ROLE_STATE,
+            MetadataValue::text(if role.state_unknown {
+                "unknown"
+            } else if role.hold.is_some() {
+                "held"
+            } else {
+                "active"
+            }),
+        ),
     ];
+    if !role.state_unknown {
+        facts.push((KEY_ROLE_RESTART_COUNT, MetadataValue::Integer(i64::from(role.strikes))));
+    }
     if let Some(next) = role.next_attempt {
         facts.push((KEY_ROLE_NEXT_ATTEMPT, MetadataValue::text(next.to_rfc3339())));
     }

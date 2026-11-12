@@ -15,8 +15,8 @@ pub async fn standing_ensure_holds_after_three_failed_generations_and_resumes_wh
             .await
             .expect("record failed generation");
         // The pass tells its caller when the backoff ends, as nothing else wakes it then.
-        let retry_at =
-            backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.expect("status").retry_at;
+        let retry_at = quartermaster(&daemon).await.next_attempt;
+        assert!(retry_at.is_some(), "a backing-off role shows when it next admits");
         assert_eq!(daemon.convoy_ensure_next_due("flotilla").await.expect("next due"), retry_at);
         clock.advance(ChronoDuration::seconds(delay));
         daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("admit replacement");
@@ -27,10 +27,9 @@ pub async fn standing_ensure_holds_after_three_failed_generations_and_resumes_wh
         daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("exhaust retry budget"),
         vec!["ConvoyEnsure/quartermaster exhausted restart budget"]
     );
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
-    let held = ensures.get("quartermaster").await.expect("held ensure");
-    assert_eq!(held.status.as_ref().expect("status").restart_count, 3);
-    assert_eq!(held.status.as_ref().expect("status").hold_reason, Some(ConvoyEnsureHoldReason::RestartLimit));
+    let held = quartermaster(&daemon).await;
+    assert_eq!(held.strikes, 3);
+    assert_eq!(held.hold, Some(StandingRoleHold::RestartLimit));
     assert_eq!(open_holds(&backend).await.len(), 1, "restart escalation");
 
     clock.advance(ChronoDuration::hours(6));
@@ -55,20 +54,21 @@ pub async fn reconcile_now_resets_backoff_and_admits_the_next_ensure_generation_
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     fail_ensured_generation(&daemon).await;
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("record backoff");
-    let backed_off = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("backed-off ensure");
-    assert_eq!(backed_off.status.as_ref().expect("status").restart_count, 1);
-    assert!(backed_off.status.as_ref().expect("status").retry_at.is_some());
+    let backed_off = quartermaster(&daemon).await;
+    assert_eq!(backed_off.strikes, 1);
+    assert!(backed_off.next_attempt.is_some());
 
     let outcome = daemon.reconcile_convoy_ensure_now("flotilla", "quartermaster", &VerifiedDeadBacking).await.expect("forced admission");
 
     assert_eq!(outcome, "started quartermaster@standing-project");
-    let reconciled = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("reconciled ensure");
-    let status = reconciled.status.expect("status");
-    // ConvoyEnsure B: reconcile-now skips the wait but does not erase the failed generation the
-    // strike count is derived from.
-    assert_eq!(status.restart_count, 1);
-    assert_eq!(status.retry_at, None);
+    let reconciled = quartermaster(&daemon).await;
+    assert_eq!(reconciled.next_attempt, None);
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 2);
+    // ConvoyEnsure B: reconcile-now skips the wait but does not erase the failed generation the
+    // strike count is derived from: the new generation failing is the run's second strike.
+    let live = reconciled.convoy_ref.expect("the admitted generation");
+    fail_generation(&daemon, &live, "placement failed").await;
+    assert_eq!(quartermaster(&daemon).await.strikes, 2);
 }
 
 pub async fn reconcile_now_clears_an_active_restart_limit_and_admits_in_one_pass(factory: &dyn EnsureScenarioController) {
@@ -86,13 +86,16 @@ pub async fn reconcile_now_clears_an_active_restart_limit_and_admits_in_one_pass
     let outcome = daemon.reconcile_convoy_ensure_now("flotilla", "quartermaster", &VerifiedDeadBacking).await.expect("forced restart");
 
     assert_eq!(outcome, "started quartermaster@standing-project");
-    let status = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.expect("status");
-    // ConvoyEnsure B: reconcile-now admits whatever the strikes say; only an acknowledgement ends
-    // the run, so the three failed generations still count.
-    assert_eq!(status.restart_count, 3);
-    assert_eq!(status.retry_at, None);
+    let running = quartermaster(&daemon).await;
+    assert_eq!((running.hold, running.next_attempt), (None, None));
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 4);
     assert!(open_holds(&backend).await.is_empty());
+    // ConvoyEnsure B: reconcile-now admits whatever the strikes say; only an acknowledgement ends
+    // the run, so the three failed generations still count when the forced one fails too.
+    fail_generation(&daemon, &running.convoy_ref.expect("the forced generation"), "placement failed").await;
+    let held = quartermaster(&daemon).await;
+    assert_eq!(held.strikes, 4);
+    assert_eq!(held.hold, Some(StandingRoleHold::RestartLimit));
 }
 
 pub async fn concurrent_periodic_and_explicit_ensure_admission_creates_only_one_live_generation(factory: &dyn EnsureScenarioController) {
@@ -114,10 +117,7 @@ pub async fn concurrent_periodic_and_explicit_ensure_admission_creates_only_one_
         .filter(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
         .collect::<Vec<_>>();
     assert_eq!(live.len(), 1);
-    assert_eq!(
-        backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.unwrap().convoy_ref,
-        Some(live[0].metadata.name.clone())
-    );
+    assert_eq!(quartermaster(&daemon).await.convoy_ref, Some(live[0].metadata.name.clone()));
 }
 
 pub async fn declared_driver_derives_bounded_backoff_from_its_homed_generations(factory: &dyn EnsureScenarioController) {
@@ -219,10 +219,6 @@ pub async fn declared_driver_derives_bounded_backoff_from_its_homed_generations(
     );
     assert!(open_holds(&driver_backend).await.is_empty());
     assert_eq!(driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("resumed generations").items.len(), 4);
-    assert!(
-        authority_backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("authority ensure").status.is_none(),
-        "driver admission must not persist control state on its ensure definition"
-    );
 }
 
 pub async fn declared_driver_admission_refusals_retry_indefinitely_without_strikes_or_human_gate(factory: &dyn EnsureScenarioController) {
@@ -246,35 +242,21 @@ pub async fn declared_driver_admission_refusals_retry_indefinitely_without_strik
     let mut spec = ensure.spec.clone();
     spec.workflow_ref = "missing-workflow".to_string();
     ensures.update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &spec).await.expect("make admission fail");
-    let ensure = ensures.get("quartermaster").await.expect("updated ensure");
-    ensures
-        .update_status(
-            &ensure.metadata.name,
-            &ensure.metadata.resource_version,
-            &ConvoyEnsureStatus {
-                convoy_ref: Some("stale-convoy".to_string()),
-                running_since: Some(clock.now() - ChronoDuration::days(1)),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("seed stale pre-driver status");
+    let declared_version = ensures.get("quartermaster").await.expect("updated ensure").metadata.resource_version;
 
     let first = daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("first admission refusal");
     assert!(first.contains("retry at"), "{first}");
-    let retrying_ensure = ensures.get("quartermaster").await.expect("ensure");
-    let retry_resource_version = retrying_ensure.metadata.resource_version.clone();
-    let status = retrying_ensure.status.expect("driver-managed status");
-    assert_eq!(status.convoy_ref, None);
-    assert_eq!(status.running_since, None);
-    assert_eq!(status.restart_count, 0);
-    assert!(status.retry_at.is_some());
+    let refused = quartermaster(&daemon).await;
+    assert_eq!(refused.convoy_ref, None);
+    assert_eq!(refused.strikes, 0);
+    assert!(refused.next_attempt.is_some());
+    assert!(refused.last_failure.is_some(), "the driver shows why it was refused");
 
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("backoff suppresses retry").is_empty());
     assert_eq!(
         ensures.get("quartermaster").await.expect("unchanged ensure").metadata.resource_version,
-        retry_resource_version,
-        "a driver retry deadline must not cause a no-op legacy-status write"
+        declared_version,
+        "a refusal writes nothing to its ensure"
     );
     clock.advance(ChronoDuration::seconds(30));
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("second admission refusal").contains("retry at"));
@@ -283,9 +265,9 @@ pub async fn declared_driver_admission_refusals_retry_indefinitely_without_strik
     for expected_delay in [60, 120, 240, 480, 900, 900] {
         clock.advance(ChronoDuration::seconds(expected_delay));
         assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("admission keeps retrying").contains("retry at"));
-        let status = ensures.get("quartermaster").await.expect("ensure").status.expect("retry status");
-        assert_eq!(status.restart_count, 0);
-        assert_eq!(status.retry_at.expect("deadline") - clock.now(), ChronoDuration::seconds((expected_delay * 2).min(900)));
+        let refused = quartermaster(&daemon).await;
+        assert_eq!(refused.strikes, 0);
+        assert_eq!(refused.next_attempt.expect("deadline") - clock.now(), ChronoDuration::seconds((expected_delay * 2).min(900)));
     }
     assert!(open_holds(&backend).await.is_empty());
 
@@ -307,10 +289,9 @@ pub async fn resolved_default_branch_dependency_change_retries_admission_before_
 
     let refusal = daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("unresolved default branch refuses admission");
     assert!(refusal.contains("no resolved default branch"), "{refusal}");
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
-    let status = ensures.get("quartermaster").await.expect("ensure").status.expect("retry status");
-    assert_eq!(status.restart_count, 0);
-    assert!(status.retry_at.is_some());
+    let refused = quartermaster(&daemon).await;
+    assert_eq!(refused.strikes, 0);
+    assert!(refused.next_attempt.is_some());
 
     let repository =
         backend.using::<Repository>("flotilla").list().await.expect("repositories").items.into_iter().next().expect("repository");
@@ -361,9 +342,9 @@ pub async fn changing_ensure_config_starts_a_fresh_retry_episode(factory: &dyn E
             .expect("config change opens a fresh episode"),
         vec!["started quartermaster@standing-project"]
     );
-    let status = definitions.get("quartermaster").await.expect("ensure").status.expect("status");
-    assert_eq!(status.restart_count, 0);
-    assert_eq!(status.hold_reason, None);
+    let fresh = quartermaster(&daemon).await;
+    assert_eq!(fresh.strikes, 0);
+    assert_eq!(fresh.hold, None);
     assert!(open_attentions(&backend).await.is_empty());
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 4);
 }
@@ -371,23 +352,16 @@ pub async fn changing_ensure_config_starts_a_fresh_retry_episode(factory: &dyn E
 pub async fn standing_ensure_retries_convoy_that_failed_before_provisioning(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
-    let convoy_ref = backend
-        .using::<ConvoyEnsure>("flotilla")
-        .get("quartermaster")
-        .await
-        .expect("ensure")
-        .status
-        .expect("ensure status")
-        .convoy_ref
-        .expect("convoy ref");
+    let convoy_ref = quartermaster(&daemon).await.convoy_ref.expect("convoy ref");
     // It failed before any of its works launched a vessel.
     fail_generation(&daemon, &convoy_ref, "workflow validation failed").await;
 
     let events = daemon.reconcile_convoy_ensures_once("flotilla").await.expect("reconcile terminal convoy");
 
-    assert!(events.iter().any(|event| event.contains("backing off")), "unexpected events: {events:?}");
-    let ensure = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure");
-    assert!(ensure.status.expect("ensure status").retry_at.is_some());
+    assert!(events.is_empty(), "a backoff writes nothing and admits nothing: {events:?}");
+    let backing_off = quartermaster(&daemon).await;
+    assert_eq!(backing_off.strikes, 1);
+    assert!(backing_off.next_attempt.is_some());
     assert!(open_attentions(&backend).await.is_empty());
 }
 
@@ -396,9 +370,7 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
 ) {
     let (daemon, backend, clock, temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
-    let ensure = ensures.get("quartermaster").await.expect("ensure");
-    let first_ref = ensure.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("first convoy ref");
+    let first_ref = quartermaster(&daemon).await.convoy_ref.expect("first convoy ref");
     // ConvoyEnsure B: the strike count is derived from the role's generations, so there is no
     // stored budget to seed; a reap leaves no failed generation behind, and the count stays 0.
     abandon_generation(&daemon, &first_ref).await;
@@ -407,17 +379,18 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("prompt resurrection"),
         vec!["started quartermaster@standing-project"]
     );
-    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 0);
+    let resurrected = quartermaster(&daemon).await;
+    assert_eq!(resurrected.strikes, 0);
 
     let materialized_name = flotilla_charter::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
     backend.definitions::<WorkflowTemplate>("flotilla").delete(&materialized_name).await.expect("temporary resolution loss");
-    let second_ref =
-        ensures.get("quartermaster").await.expect("ensure").status.and_then(|status| status.convoy_ref).expect("second convoy ref");
+    let second_ref = resurrected.convoy_ref.expect("second convoy ref");
     abandon_generation(&daemon, &second_ref).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("unresolved workflow schedules retry");
-    let retrying = ensures.get("quartermaster").await.expect("retrying ensure");
-    assert_eq!(retrying.status.as_ref().expect("status").restart_count, 0);
-    let retry_at = retrying.status.as_ref().expect("status").retry_at.expect("durable retry time");
+    let retrying = quartermaster(&daemon).await;
+    assert_eq!(retrying.strikes, 0, "a reap is no strike");
+    assert!(retrying.next_attempt.is_some_and(|retry_at| retry_at > clock.now()), "the refusal backs off");
+    assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("retry not due").is_empty());
 
     let repository_key = backend.using::<Repository>("flotilla").list().await.expect("repositories").items[0].spec.key();
     backend
@@ -452,11 +425,11 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
             restarted_daemon.clock_for_scenarios(),
         ))
         .await;
-    assert!(restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("retry not due").is_empty());
-    clock.set(retry_at);
+    // The refusal note is the admitting controller's, in memory (#3108): the restarted one holds
+    // none, and retries at once.
     assert_eq!(
-        restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("past-due retry"),
+        restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("retry after restart"),
         vec!["started quartermaster@standing-project"]
     );
-    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 0);
+    assert_eq!(quartermaster(&restarted_daemon).await.strikes, 0);
 }

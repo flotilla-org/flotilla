@@ -1264,8 +1264,13 @@ impl ReadProjections<'_> {
                 linked.push(StoreQuery::related(target, source, selected_query.clone()));
             }
         }
-        // Select candidate identities and linked landed evidence in one indexed
-        // operation; the address resolver still owns exact-name and ambiguity rules.
+        // The live generations of the standing role a candidate was ensured from, so the receiver
+        // evidence can tell whether it is that role's current generation.
+        let ensured_from = format!("metadata.annotations.\"{}\"", flotilla_resources::ENSURED_FROM_ANNOTATION);
+        let mut generations = flotilla_store::live_convoys_query();
+        generations.field_matches_query = StoreQuery::related(&ensured_from, &ensured_from, selected_query.clone()).field_matches_query;
+        // Select candidate identities, their roles' live generations and linked landed evidence in
+        // one indexed operation; the address resolver still owns exact-name and ambiguity rules.
         let convoy_sources = self
             .backend
             .query_declared::<ResourceConvoy>(
@@ -1273,6 +1278,7 @@ impl ReadProjections<'_> {
                 &StoreQuery {
                     any_of: Some(vec![
                         selected_query,
+                        generations,
                         StoreQuery {
                             fields: BTreeMap::from([("status.phase".into(), "Landed".into())]),
                             any_of: (!linked.is_empty()).then_some(linked),
@@ -2044,33 +2050,46 @@ pub async fn convoy_receiver_evidence(
         )
         .await
         .map_err(|error| error.to_string())?;
-    let ensures = backend
-        .query_declared::<ConvoyEnsure>(
-            namespace,
-            &StoreQuery {
-                fields: BTreeMap::from([("spec.project_ref".into(), project_name.into())]),
-                include_replicas: true,
-                ..StoreQuery::related(
-                    "spec.role",
-                    "spec.role",
-                    StoreQuery {
-                        fields: BTreeMap::from([
-                            ("status.convoy_ref".into(), convoy.metadata.name.clone()),
-                            ("spec.project_ref".into(), project_name.into()),
-                        ]),
-                        include_replicas: true,
-                        ..Default::default()
-                    },
-                )
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    // The standing role this convoy is the current generation of, with every declaration of that
+    // role in its project for the receiver snapshot. `convoys` holds the role's live generations.
+    let ensured_from = convoy.metadata.annotations.get(flotilla_resources::ENSURED_FROM_ANNOTATION).cloned();
+    let current = match &ensured_from {
+        Some(ensure) => flotilla_store::newest_live_generations(convoys.iter().map(|source| &source.object))
+            .remove(ensure)
+            .filter(|generation| generation.metadata.name == convoy.metadata.name),
+        None => None,
+    };
+    // One read: every declaration in the project sharing the role of the ensure named.
+    let ensures = match (&ensured_from, current) {
+        (Some(ensure), Some(_)) => backend
+            .query_declared::<ConvoyEnsure>(
+                namespace,
+                &StoreQuery {
+                    fields: BTreeMap::from([("spec.project_ref".into(), project_name.into())]),
+                    include_replicas: true,
+                    ..StoreQuery::related(
+                        "spec.role",
+                        "spec.role",
+                        StoreQuery {
+                            fields: BTreeMap::from([
+                                ("metadata.name".into(), ensure.clone()),
+                                ("spec.project_ref".into(), project_name.into()),
+                            ]),
+                            include_replicas: true,
+                            ..Default::default()
+                        },
+                    )
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?,
+        _ => flotilla_resources::ReadResourceList { items: Vec::new() },
+    };
     let mut aliases = ensures
         .items
         .iter()
-        .filter(|ensure| ensure.object.status.as_ref().and_then(|status| status.convoy_ref.as_deref()) == Some(&convoy.metadata.name))
-        .map(|ensure| format!("{}/{}", ensure.object.spec.project_ref, ensure.object.spec.role))
+        .filter(|declaration| Some(&declaration.object.metadata.name) == ensured_from.as_ref())
+        .map(|declaration| format!("{}/{}", declaration.object.spec.project_ref, declaration.object.spec.role))
         .collect::<BTreeSet<_>>();
     aliases.extend(
         terminals
