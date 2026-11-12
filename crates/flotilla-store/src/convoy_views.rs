@@ -22,6 +22,7 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
+use chrono::DateTime;
 use futures::{stream::BoxStream, StreamExt};
 
 use flotilla_protocol::{LifecycleReading, NodeId};
@@ -67,6 +68,8 @@ struct HeldViews {
     owed: BTreeSet<(String, String)>,
     /// A read of every launch was begun and not finished.
     refill_owed: bool,
+    /// The launches held as unreadable, by `(home, launch)`, at the version last told.
+    unreadable: BTreeMap<(String, String), u64>,
 }
 
 /// Cursors over the changes of the records a convoy's view is composed from.
@@ -181,7 +184,14 @@ impl ConvoyViews {
             let wakes = self.wakes()?;
             let notes = self.convoys().map_err(ResourceError::other)?.memory().subscribe();
             let cursors = self.blocking(Cursors::start).await?;
-            let mut held = HeldViews { views: BTreeMap::new(), cursors, notes, owed: BTreeSet::new(), refill_owed: false };
+            let mut held = HeldViews {
+                views: BTreeMap::new(),
+                cursors,
+                notes,
+                owed: BTreeSet::new(),
+                refill_owed: false,
+                unreadable: BTreeMap::new(),
+            };
             self.refill(&mut held).await?;
             *state = Some(held);
             tokio::spawn(self.clone().follow(wakes));
@@ -273,18 +283,37 @@ impl ConvoyViews {
             }
             held.owed.remove(&key);
         }
+        self.convoys().map_err(ResourceError::other)?.memory().set_unreadable(held.unreadable.len() as u64);
         Ok(())
     }
 
     /// Reads every launch again. Until it has, the whole views are owed.
     async fn refill(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
         held.refill_owed = true;
-        let records = self.blocking(|reads| reads.convoys()?.every()).await?;
-        let composed = self.compose(records).await?;
+        let listing = self.blocking(|reads| reads.convoys()?.every()).await?;
+        let mut composed = self.compose(listing.records).await?;
+        let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
+        // A launch that cannot be read stays listed, with why; when another home's last changed
+        // is not known.
+        composed.extend(listing.unreadable.iter().map(|launch| {
+            let provenance = if launch.home == here {
+                ResourceProvenance::Local
+            } else {
+                ResourceProvenance::Replica { origin_root: NodeId::new(launch.home.clone()), last_synced_at: DateTime::UNIX_EPOCH }
+            };
+            Composed {
+                home: launch.home.clone(),
+                view: ReadResourceObject { object: launch.read_view(&self.namespace), provenance },
+                unreadable: Some((launch.version, launch.reason.clone())),
+            }
+        }));
         held.views.clear();
+        let listed = listing.unreadable.iter().map(|launch| (launch.home.clone(), launch.name.clone())).collect::<BTreeSet<_>>();
+        held.unreadable.retain(|key, _| listed.contains(key));
         held.insert(composed);
         held.owed.clear();
         held.refill_owed = false;
+        self.convoys().map_err(ResourceError::other)?.memory().set_unreadable(held.unreadable.len() as u64);
         Ok(())
     }
 
@@ -321,7 +350,7 @@ impl ConvoyViews {
                     let synced = record.ended.as_ref().map_or(record.admitted_at, |(_, at)| *at);
                     ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: synced }
                 };
-                Composed { home: record.home.clone(), view: ReadResourceObject { object, provenance } }
+                Composed { home: record.home.clone(), view: ReadResourceObject { object, provenance }, unreadable: None }
             })
             .collect())
     }
@@ -457,17 +486,30 @@ impl EngineRecords for ConvoyViews {
 struct Composed {
     home: String,
     view: ReadResourceObject<Convoy>,
+    /// For a launch that cannot be read, its version and why.
+    unreadable: Option<(u64, String)>,
 }
 
 impl HeldViews {
     fn insert(&mut self, composed: Vec<Composed>) {
-        for Composed { home, view } in composed {
-            self.views.insert((home, view.object.metadata.name.clone()), view);
+        for Composed { home, view, unreadable } in composed {
+            let key = (home, view.object.metadata.name.clone());
+            match unreadable {
+                Some((version, reason)) => {
+                    // Told once for each version of the launch, not at each read of them all.
+                    if self.unreadable.insert(key.clone(), version) != Some(version) {
+                        tracing::warn!(launch = %key.1, home = %key.0, version, %reason, "convoy launch cannot be read");
+                    }
+                }
+                None => drop(self.unreadable.remove(&key)),
+            }
+            self.views.insert(key, view);
         }
     }
 
     fn remove(&mut self, key: &(String, String)) {
         self.views.remove(key);
+        self.unreadable.remove(key);
     }
 }
 

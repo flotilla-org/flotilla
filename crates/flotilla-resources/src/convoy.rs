@@ -92,6 +92,10 @@ pub const ENSURED_FROM_ANNOTATION: &str = "flotilla.work/ensured-from";
 /// When convoys leave the old store this becomes a field of the engine Convoy's request.
 pub const ADOPTED_CHECKOUT_ANNOTATION: &str = "flotilla.work/adopted-checkout";
 
+/// Why a launch's record could not be read, on its read view alone: the convoy views set it on a
+/// launch they list as unreadable (which has no status) and remove it from every readable one.
+pub const CONVOY_UNREADABLE_ANNOTATION: &str = "flotilla.work/convoy-unreadable";
+
 /// What convoy launch `name` (`<launch_of>#<n>`) is a launch of; a name with no launch number
 /// returns as is.
 pub fn launch_of(name: &str) -> &str {

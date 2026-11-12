@@ -17,7 +17,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use flotilla_protocol::{LifecycleReading, PrincipalRef};
 use flotilla_resources::{
     convoy::admission::AdmissionDocument,
-    convoy_records::{ConvoyChange, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes},
+    convoy_records::{ConvoyChange, ConvoyListing, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes},
     engine_records::EngineRecords,
     lifecycle_reads::{ChangeCursor, LifecycleReads, ProvisioningKind},
     promises::{Promise, PromiseKind, PromiseSource, PromiseState},
@@ -188,13 +188,13 @@ impl ConvoyRecords for Convoys {
         let home = home.unwrap_or(HERE);
         Ok(self.records().into_iter().filter(|record| record.launch_of == of && record.home == home).max_by_key(|record| record.launch))
     }
-    fn at(&self, home: &str) -> Result<Vec<ConvoyRecord>, String> {
-        Ok(self.records().into_iter().filter(|record| record.home == home).collect())
+    fn at(&self, home: &str) -> Result<ConvoyListing, String> {
+        Ok(ConvoyListing { records: self.records().into_iter().filter(|record| record.home == home).collect(), unreadable: Vec::new() })
     }
-    fn every(&self) -> Result<Vec<ConvoyRecord>, String> {
+    fn every(&self) -> Result<ConvoyListing, String> {
         let records = self.records();
         self.read.fetch_add(records.len(), Ordering::SeqCst);
-        Ok(records)
+        Ok(ConvoyListing { records, unreadable: Vec::new() })
     }
     fn memory(&self) -> &ConvoyMemory {
         &self.memory

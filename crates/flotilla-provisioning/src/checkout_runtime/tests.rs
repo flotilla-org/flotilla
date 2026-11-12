@@ -382,11 +382,14 @@ impl flotilla_resources::convoy_records::ConvoyRecords for Launches {
     fn newest(&self, _: &str, _: &str, _: Option<&str>) -> Result<Option<flotilla_resources::convoy_records::ConvoyRecord>, String> {
         unreachable!("the sweep lists every launch")
     }
-    fn at(&self, _: &str) -> Result<Vec<flotilla_resources::convoy_records::ConvoyRecord>, String> {
+    fn at(&self, _: &str) -> Result<flotilla_resources::convoy_records::ConvoyListing, String> {
         unreachable!("the sweep lists every launch")
     }
-    fn every(&self) -> Result<Vec<flotilla_resources::convoy_records::ConvoyRecord>, String> {
-        self.0.clone().map(|names| names.iter().map(|name| Self::record(name)).collect())
+    fn every(&self) -> Result<flotilla_resources::convoy_records::ConvoyListing, String> {
+        self.0.clone().map(|names| flotilla_resources::convoy_records::ConvoyListing {
+            records: names.iter().map(|name| Self::record(name)).collect(),
+            unreadable: Vec::new(),
+        })
     }
     fn memory(&self) -> &flotilla_resources::convoy_records::ConvoyMemory {
         &self.1

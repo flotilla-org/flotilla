@@ -39,7 +39,8 @@ use flotilla_resources::{
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
     FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError,
     ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement,
-    WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, CONVOY_UNREADABLE_ANNOTATION, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{ReadResourceList, ResourceList, WatchEvent, WatchStart, WatchStream};
@@ -1541,7 +1542,7 @@ impl Aggregator {
         // A convoy whose engine read failed keeps its row until a retried projection reads it.
         let mut unread: Vec<(ResourceRef, ResourceProvenance)> = Vec::new();
         for (reference, convoy) in effective_convoys {
-            let viewed = match flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, &convoy) {
+            let viewed = match self.viewed(&convoy) {
                 Ok(viewed) => viewed,
                 Err(error) => {
                     tracing::warn!(convoy = %reference.name, %error, "the engine convoy did not read; its row stays until a retry");
@@ -1569,7 +1570,7 @@ impl Aggregator {
                 .filter_map(|key| {
                     let reference = self.convoy_key_ref(key)?;
                     let row = match self.effective_convoy_key(key) {
-                        Some(item) => match flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, item) {
+                        Some(item) => match self.viewed(item) {
                             Ok(viewed) => Some(self.summarize(&reference, &viewed)),
                             Err(error) => {
                                 // Keep the row as it is, and project it again.
@@ -2576,9 +2577,29 @@ impl Aggregator {
             .clone()
     }
 
+    /// `read` as its row summarizes it: with the engine's promises, except for a launch the
+    /// convoy views could not read, which has nothing more to read.
+    fn viewed(&self, read: &ReadResourceObject<Convoy>) -> Result<ResourceObject<Convoy>, String> {
+        if unreadable_reason(&read.object).is_some() {
+            return Ok(read.object.clone());
+        }
+        flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, read)
+    }
+
     fn summarize(&self, resource: &ResourceRef, convoy: &ResourceObject<Convoy>) -> ConvoyRow {
         #[cfg(test)]
         self.summarized_convoys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(reason) = unreadable_reason(convoy) {
+            return ConvoyRow::builder()
+                .resource(resource.clone())
+                .name(&convoy.metadata.name)
+                .unreadable(reason.clone())
+                .generation(convoy.spec.generation)
+                .workflow_ref(&convoy.spec.workflow_ref)
+                .phase(ConvoyPhase::Pending)
+                .maybe_project_ref(convoy.spec.project_ref.clone())
+                .build();
+        }
         let name = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
         let status = convoy.status.as_ref();
         let subject_conflicts = subject_relationship_conflicts(convoy);
@@ -3164,6 +3185,12 @@ fn convoy_references_repo(convoy: &ResourceObject<Convoy>, repo_identity: &RepoI
 fn is_independent_session(session: &ResourceObject<TerminalSession>) -> bool {
     !session.metadata.labels.contains_key(CONVOY_LABEL)
         && session.status.as_ref().map(|status| status.phase) == Some(TerminalSessionPhase::Running)
+}
+
+/// Why the convoy views could not read `convoy`'s launch. They list such a launch with no status
+/// and the reason; a launch they read always has a status, and never carries the reason.
+fn unreadable_reason(convoy: &ResourceObject<Convoy>) -> Option<&String> {
+    convoy.metadata.annotations.get(CONVOY_UNREADABLE_ANNOTATION).filter(|_| convoy.status.is_none())
 }
 
 fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {

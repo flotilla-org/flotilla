@@ -1118,6 +1118,10 @@ pub struct ConvoyRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_role: Option<String>,
     pub name: String,
+    /// Why this launch's record could not be read. Its state is then unknown: no message,
+    /// phase or other state field of the row describes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
     #[builder(default)]
     #[serde(default)]
     pub generation: u64,

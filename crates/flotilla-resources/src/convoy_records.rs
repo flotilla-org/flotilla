@@ -12,7 +12,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, PoisonError,
+    },
 };
 
 use chrono::{DateTime, Utc};
@@ -80,6 +83,70 @@ pub struct ConvoyRecord {
     /// The subjects linked to it (an unlinked one is in `unlinked`).
     pub subjects: Vec<DiscoveredSubject>,
     pub unlinked: Vec<flotilla_protocol::Subject>,
+}
+
+/// A launch whose record could not be read (its admission document does not decode, say): what
+/// the engine's own spec says of it, and why the rest could not be read. Nothing of its state is
+/// known, so nothing of it is told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableLaunch {
+    pub name: String,
+    pub home: String,
+    pub version: u64,
+    pub launch_of: String,
+    pub launch: u64,
+    /// The project it belongs to, by name.
+    pub project: String,
+    pub workflow_ref: String,
+    pub reason: String,
+}
+
+/// The launches a read found: those read whole, and those that could not be.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConvoyListing {
+    pub records: Vec<ConvoyRecord>,
+    pub unreadable: Vec<UnreadableLaunch>,
+}
+
+impl ConvoyListing {
+    pub fn extend(&mut self, other: ConvoyListing) {
+        self.records.extend(other.records);
+        self.unreadable.extend(other.unreadable);
+    }
+
+    /// Every launch's name, read or not.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.records.iter().map(|record| record.name.as_str()).chain(self.unreadable.iter().map(|launch| launch.name.as_str()))
+    }
+}
+
+impl UnreadableLaunch {
+    /// The launch as an old Convoy object in `namespace`: its name, project and workflow, the
+    /// reason under [`crate::CONVOY_UNREADABLE_ANNOTATION`], and no status.
+    pub fn read_view(&self, namespace: &str) -> ResourceObject<Convoy> {
+        let mut labels = BTreeMap::from([(PROJECT_LABEL.to_owned(), self.project.clone())]);
+        labels.retain(|_, value| !value.is_empty());
+        ResourceObject {
+            metadata: ObjectMeta {
+                name: self.name.clone(),
+                namespace: namespace.to_owned(),
+                resource_version: self.version.to_string(),
+                labels,
+                annotations: BTreeMap::from([(crate::CONVOY_UNREADABLE_ANNOTATION.to_owned(), self.reason.clone())]),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: DateTime::UNIX_EPOCH,
+                merge: None,
+            },
+            spec: ConvoySpec::builder()
+                .workflow_ref(self.workflow_ref.clone())
+                .generation(self.launch)
+                .maybe_project_ref((!self.project.is_empty()).then(|| self.project.clone()))
+                .build(),
+            status: None,
+        }
+    }
 }
 
 /// What a work's Vessel says, for the read view.
@@ -423,6 +490,8 @@ impl ConvoyRecord {
         let document = &self.admission;
         // What admission wrote for the launch, under the annotations its readers find it by.
         let mut annotations = document.provenance.clone();
+        // Only an unreadable launch's view says why it is unreadable.
+        annotations.remove(crate::CONVOY_UNREADABLE_ANNOTATION);
         if let Some(workflow) = &document.workflow_template {
             annotations.insert(crate::WORKFLOW_SNAPSHOT_ANNOTATION.to_owned(), workflow.clone());
         }
@@ -494,10 +563,11 @@ pub trait ConvoyRecords: Send + Sync {
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String>;
     /// The newest launch of `of` in `project` held at `home`, or at this home when `None`.
     fn newest(&self, of: &str, project: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String>;
-    /// Every launch held at `home`.
-    fn at(&self, home: &str) -> Result<Vec<ConvoyRecord>, String>;
-    /// Every launch at every home this store holds.
-    fn every(&self) -> Result<Vec<ConvoyRecord>, String>;
+    /// Every launch held at `home`; one that cannot be read is listed as unreadable.
+    fn at(&self, home: &str) -> Result<ConvoyListing, String>;
+    /// Every launch at every home this store holds; one that cannot be read is listed as
+    /// unreadable.
+    fn every(&self) -> Result<ConvoyListing, String>;
     /// The launches whose records change, as they are written or replicated here, from now on.
     fn changes(&self) -> tokio::sync::broadcast::Receiver<ConvoyChange> {
         tokio::sync::broadcast::channel(1).1
@@ -516,15 +586,27 @@ pub trait ConvoyRecords: Send + Sync {
 pub struct ConvoyMemory {
     notes: Mutex<BTreeMap<String, ConvoyNotes>>,
     changes: tokio::sync::broadcast::Sender<String>,
+    /// How many launches, at any home, the convoy views last listed as unreadable.
+    unreadable: AtomicU64,
 }
 
 impl Default for ConvoyMemory {
     fn default() -> Self {
-        Self { notes: Mutex::default(), changes: tokio::sync::broadcast::channel(256).0 }
+        Self { notes: Mutex::default(), changes: tokio::sync::broadcast::channel(256).0, unreadable: AtomicU64::new(0) }
     }
 }
 
 impl ConvoyMemory {
+    /// How many launches the convoy views hold as unreadable.
+    pub fn unreadable(&self) -> u64 {
+        self.unreadable.load(Ordering::Relaxed)
+    }
+
+    /// Sets how many launches the convoy views hold as unreadable.
+    pub fn set_unreadable(&self, count: u64) {
+        self.unreadable.store(count, Ordering::Relaxed);
+    }
+
     /// The launches whose notes change, from now on.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
         self.changes.subscribe()
