@@ -27,6 +27,15 @@ pub trait EngineMessages: Send + Sync {
         name: &str,
         intent: &flotilla_resources::MessageSpec,
     ) -> Result<flotilla_resources::ResourceObject<flotilla_resources::Message>, flotilla_resources::ResourceError>;
+    /// An intent with its sender and receiver as this path's views spell
+    /// them, for comparing parties with messages read back: a person reads
+    /// back as the role they send in (the principal goes to the trace), a
+    /// convoy role as the vessel that holds it.
+    async fn spelled(
+        &self,
+        namespace: &str,
+        intent: &flotilla_resources::MessageSpec,
+    ) -> Result<flotilla_resources::MessageSpec, flotilla_resources::ResourceError>;
     /// An operator withdraws a queued message homed here, on the convoy's authority.
     async fn withdraw(&self, namespace: &str, record: &str, convoy: &str) -> Result<(), String>;
     /// The home this path admits at: this daemon's.

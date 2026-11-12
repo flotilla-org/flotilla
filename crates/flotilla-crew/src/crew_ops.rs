@@ -1461,13 +1461,22 @@ impl CrewService {
         let in_reply_to = if let Some(reference) = &stalled.supervision_message {
             Some(reference.name.clone())
         } else {
-            self.active_message_records(namespace, Some(sender))
+            // The escalation runs the other way: from the crew to this ruling's sender, its
+            // parties spelled as the messages read back spell them.
+            let escalation = flotilla_resources::MessageSpec::builder()
+                .sender(receiver.to_owned())
+                .receiver(sender.to_owned())
+                .relation(flotilla_resources::MessageRelation::Supervisor)
+                .body(String::new())
+                .build();
+            let escalation = self.spelled_message_intent(namespace, &escalation).await.map_err(|error| error.to_string())?;
+            self.active_message_records(namespace, Some(&escalation.receiver))
                 .await
                 .map_err(|error| error.to_string())?
                 .into_iter()
                 .filter(|record| {
-                    record.object.spec.receiver == sender
-                        && record.object.spec.sender == receiver
+                    record.object.spec.receiver == escalation.receiver
+                        && record.object.spec.sender == escalation.sender
                         && record.object.spec.expectation == flotilla_resources::MessageExpectation::Reply
                         && record.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
                         && record.object.spec.references.iter().any(|reference| {
@@ -2458,14 +2467,26 @@ impl CrewService {
         let receiver = crew_role_address(selected.project(namespace), name, vessel, role);
         let address = sender;
         let relation = flotilla_resources::MessageRelation::Supervisor;
+        let message_name = flotilla_resources::message_record_name(&receiver, &address, &format!("resume:{}", uuid::Uuid::new_v4()));
+        let mut intent = flotilla_resources::MessageSpec::builder()
+            .sender(address)
+            .receiver(receiver.clone())
+            .relation(relation)
+            .body(prompt.to_string())
+            .maybe_in_reply_to(in_reply_to)
+            .build();
+        // Parties compare as the messages read back spell them: on the engine
+        // a person is the role they send in, so the same operator role is the
+        // same sender.
+        let spelled = self.spelled_message_intent(namespace, &intent).await.map_err(|error| error.to_string())?;
         let prior = self
-            .open_messages_to(namespace, &receiver)
+            .open_messages_to(namespace, &spelled.receiver)
             .await
             .map_err(|error| error.to_string())?
             .into_iter()
             .filter(|message| {
-                message.object.spec.receiver == receiver
-                    && message.object.spec.sender == address
+                message.object.spec.receiver == spelled.receiver
+                    && message.object.spec.sender == spelled.sender
                     && message
                         .object
                         .status
@@ -2474,15 +2495,7 @@ impl CrewService {
             })
             .max_by_key(|message| message.object.metadata.creation_timestamp);
         let displaced = prior.as_ref().map(|message| message.object.spec.body.clone());
-        let message_name = flotilla_resources::message_record_name(&receiver, &address, &format!("resume:{}", uuid::Uuid::new_v4()));
-        let intent = flotilla_resources::MessageSpec::builder()
-            .sender(address)
-            .receiver(receiver.clone())
-            .relation(relation)
-            .body(prompt.to_string())
-            .maybe_supersedes(prior.map(|message| message.object.metadata.name))
-            .maybe_in_reply_to(in_reply_to)
-            .build();
+        intent.supersedes = prior.map(|message| message.object.metadata.name);
         // This per-command ID survives router retries. The publisher still
         // returns canonical admission, as it does for subject-based producers.
         let admitted = self.publish_message_intent(namespace, &message_name, &intent).await?;

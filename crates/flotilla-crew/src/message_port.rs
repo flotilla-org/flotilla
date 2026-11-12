@@ -22,6 +22,15 @@ impl CrewService {
         self.message_primitives().is_some() || admitted.same_intent(intent)
     }
 
+    /// An intent with its sender and receiver as Messages read back spell them,
+    /// for comparing parties: the old store keeps the intent's spelling.
+    pub(crate) async fn spelled_message_intent(&self, namespace: &str, intent: &MessageSpec) -> Result<MessageSpec, ResourceError> {
+        match self.message_primitives() {
+            Some(primitives) => primitives.spelled(namespace, intent).await,
+            None => Ok(intent.clone()),
+        }
+    }
+
     /// One Message by name, local or replicated.
     pub(crate) async fn message_record(&self, namespace: &str, name: &str) -> Result<ReadResourceObject<Message>, ResourceError> {
         match self.message_primitives() {

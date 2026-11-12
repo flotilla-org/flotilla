@@ -1393,6 +1393,23 @@ impl MessagePrimitives {
         Ok(Some(ReadResourceObject { object, provenance: self.provenance(&home) }))
     }
 
+    /// An intent with its sender and receiver as [`Self::view`] spells them once
+    /// admitted: each party converted as admission converts it, then spelled
+    /// back. A miss on held records is judged again on records read now.
+    pub async fn spelled(&self, namespace: &str, intent: &OldSpec) -> Result<OldSpec, ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        let spell = |records: &OldStoreRecords| -> Result<OldSpec, String> {
+            let conversion = Conversion { roles: &roles, forges: &records.forges, records };
+            let sender = view::old_address(&conversion.sender_of(intent)?, &roles, records)?;
+            let receiver = view::old_address(&conversion.receiver(intent)?, &roles, records)?;
+            Ok(OldSpec { sender, receiver, ..intent.clone() })
+        };
+        match spell(&self.read_records(namespace, false).await?.records) {
+            Ok(spelled) => Ok(spelled),
+            Err(_) => spell(&self.read_records(namespace, true).await?.records).map_err(ResourceError::invalid),
+        }
+    }
+
     /// A message in the old shape. A held read of the records may predate the
     /// convoy or session the message names, so a miss is judged again on
     /// records read now: once per held read, or again when the message
@@ -1471,6 +1488,9 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     }
     async fn admit(&self, namespace: &str, name: &str, intent: &OldSpec) -> Result<ResourceObject<OldMessage>, ResourceError> {
         MessagePrimitives::admit(self, namespace, name, intent).await
+    }
+    async fn spelled(&self, namespace: &str, intent: &OldSpec) -> Result<OldSpec, ResourceError> {
+        MessagePrimitives::spelled(self, namespace, intent).await
     }
     async fn withdraw(&self, namespace: &str, record: &str, convoy: &str) -> Result<(), String> {
         MessagePrimitives::withdraw(self, namespace, record, convoy).await

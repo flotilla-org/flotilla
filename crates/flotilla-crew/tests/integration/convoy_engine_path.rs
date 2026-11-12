@@ -564,6 +564,13 @@ impl flotilla_messaging::EngineMessages for Turns {
     ) -> Result<ResourceObject<flotilla_resources::Message>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler admits nothing")
     }
+    async fn spelled(
+        &self,
+        _: &str,
+        _: &flotilla_resources::MessageSpec,
+    ) -> Result<flotilla_resources::MessageSpec, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler compares no parties")
+    }
     async fn withdraw(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
         unreachable!("the convoy reconciler withdraws nothing")
     }

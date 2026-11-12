@@ -70,6 +70,10 @@ impl EngineMessages for RecordingMessages {
         self.admitted.lock().expect("admitted").insert(name.to_owned(), object.clone());
         Ok(object)
     }
+    async fn spelled(&self, _namespace: &str, intent: &MessageSpec) -> Result<MessageSpec, ResourceError> {
+        // Admitted intents read back as admitted.
+        Ok(intent.clone())
+    }
     async fn withdraw(&self, _namespace: &str, _record: &str, _convoy: &str) -> Result<(), String> {
         Ok(())
     }
