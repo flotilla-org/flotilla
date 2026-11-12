@@ -857,9 +857,12 @@ fn spawn_controller_loops(
     ];
     controllers.extend(spawn_environment_controller(&state, provisioning));
     controllers.extend(spawn_clone_controller(&state, provisioning));
-    controllers.extend(spawn_checkout_controller(&state, provisioning));
-    controllers.extend(spawn_terminal_controller(&state, provisioning));
-    controllers.extend(spawn_vessel_controller(&state, provisioning));
+    let checkout = spawn_checkout_controller(&state, provisioning, &mut controllers);
+    controllers.extend(checkout);
+    let terminal = spawn_terminal_controller(&state, provisioning, &mut controllers);
+    controllers.extend(terminal);
+    let vessel = spawn_vessel_controller(&state, provisioning, &mut controllers);
+    controllers.extend(vessel);
     if let Some(distributor) = &state.image_inventory {
         let distributor = Arc::clone(distributor);
         controllers.push(tokio::spawn(async move {
@@ -1110,7 +1113,11 @@ fn spawn_image_build_controller(state: &Arc<ControllerRuntimeState>, engine: &Pr
 /// The TerminalSession controller (#3108): the single writer of this home's terminal launches,
 /// starting each in its environment's terminal pool and killing it once its holder has ended. This
 /// host's probe looks at the running launches at an interval, pushing each one it finds ended.
-fn spawn_terminal_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
+fn spawn_terminal_controller(
+    state: &Arc<ControllerRuntimeState>,
+    engine: &ProvisioningLifecycles,
+    tasks: &mut Vec<JoinHandle<()>>,
+) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{
         controller::Controller,
         reads::StoreReads,
@@ -1140,7 +1147,7 @@ fn spawn_terminal_controller(state: &Arc<ControllerRuntimeState>, engine: &Provi
             let (rechecks, recheck_events) = tokio::sync::mpsc::channel(64);
             let probe =
                 TerminalProbe::new(provider, records, backings).with_progress(state.daemon.crew_progress()).with_briefs(briefs, rechecks);
-            tokio::spawn(probe.run(TERMINAL_PROBE_EVERY));
+            tasks.push(tokio::spawn(probe.run(TERMINAL_PROBE_EVERY)));
             Some(tokio::spawn(controller.run_with(backing_events, recheck_events)))
         }
         Err(error) => {
@@ -1154,7 +1161,11 @@ fn spawn_terminal_controller(state: &Arc<ControllerRuntimeState>, engine: &Provi
 /// each in its environment for its holder Convoy and removing it once that convoy has ended. The
 /// observed-checkout refresh names the launches whose paths it saw change, and each is observed
 /// again: one still there has its registration protected again, one gone is recorded lost.
-fn spawn_checkout_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
+fn spawn_checkout_controller(
+    state: &Arc<ControllerRuntimeState>,
+    engine: &ProvisioningLifecycles,
+    tasks: &mut Vec<JoinHandle<()>>,
+) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{checkout_actuator::CheckoutActuator, controller::Controller, reads::StoreReads};
     let rechecks = state.checkout_recheck_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
     let service = match state.daemon.decided_store() {
@@ -1185,14 +1196,14 @@ fn spawn_checkout_controller(state: &Arc<ControllerRuntimeState>, engine: &Provi
     match state.daemon.message_primitives() {
         Some(primitives) => {
             let inspector = Arc::new(checkouts::CheckoutInspector { inspection: Arc::clone(&actuator) as _ });
-            tokio::spawn(role_consumer::serve_role(Arc::clone(&primitives), inspector));
+            tasks.push(tokio::spawn(role_consumer::serve_role(Arc::clone(&primitives), inspector)));
             // Branch validation asks this host's forge observer to look its branch up.
             let observer = Arc::new(checkouts::ForgeObserver { daemon: Arc::clone(&state.daemon) });
-            tokio::spawn(role_consumer::serve_role(primitives, observer));
+            tasks.push(tokio::spawn(role_consumer::serve_role(primitives, observer)));
         }
         None => error!("the checkout inspector and forge observer have no Message path; requests to them here go unanswered"),
     }
-    tokio::spawn(checkouts::recheck_on_discovered_refresh(Arc::clone(state)));
+    tasks.push(tokio::spawn(checkouts::recheck_on_discovered_refresh(Arc::clone(state))));
     match Controller::start(Arc::clone(&engine.checkouts), actuator, state.daemon.clock_for_scenarios(), service) {
         Ok(controller) => Some(tokio::spawn(async move {
             // A checkout's backing is observed at a recheck, not pushed.
@@ -1219,7 +1230,11 @@ fn vessel_planning(state: &Arc<ControllerRuntimeState>, backend: &ResourceBacken
 /// The Vessel controller (#3108): the single writer of this home's vessel launches, realising each
 /// in its environment once what its planner requests for it is realised. Its holdings' commits
 /// wake it; its convoy's, its crews' bindings' and its seats' changes are told as rechecks.
-fn spawn_vessel_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
+fn spawn_vessel_controller(
+    state: &Arc<ControllerRuntimeState>,
+    engine: &ProvisioningLifecycles,
+    tasks: &mut Vec<JoinHandle<()>>,
+) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{controller::Controller, vessel_actuator::VesselActuator};
     let rechecks = state.vessel_recheck_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
     let service = match state.daemon.decided_store() {
@@ -1231,7 +1246,7 @@ fn spawn_vessel_controller(state: &Arc<ControllerRuntimeState>, engine: &Provisi
     };
     let backend = state.daemon.resource_backend();
     let planning = Arc::new(vessel_planning(state, &backend, &state.namespace));
-    tokio::spawn(
+    tasks.push(tokio::spawn(
         ConvoyVesselWake::new(
             &backend,
             &state.namespace,
@@ -1240,7 +1255,7 @@ fn spawn_vessel_controller(state: &Arc<ControllerRuntimeState>, engine: &Provisi
             state.daemon.account_records(),
         )
         .recheck(state.namespace.clone(), state.vessel_rechecks.clone()),
-    );
+    ));
     let actuator = Arc::new(VesselActuator::new(planning));
     match Controller::start(Arc::clone(&engine.vessels), actuator, state.daemon.clock_for_scenarios(), service) {
         Ok(controller) => Some(tokio::spawn(async move {

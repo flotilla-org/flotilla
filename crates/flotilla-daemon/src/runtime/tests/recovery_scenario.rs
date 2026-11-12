@@ -391,6 +391,15 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         let _ = handle.await;
     }
     pool.remove_session(&coder.metadata.name).await;
+    // A restart is a new process: the first daemon, and its Message path's homes, are gone
+    // before the second opens the same stores.
+    let stopped = Arc::downgrade(&daemon);
+    drop((state, messages, rx, daemon));
+    wait_until_with_timeout(Duration::from_secs(5), || {
+        let stopped = stopped.clone();
+        async move { stopped.upgrade().is_none() }
+    })
+    .await;
     let (daemon, pool) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry after restart");
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile after restart");
