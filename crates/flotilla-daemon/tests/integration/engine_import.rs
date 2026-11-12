@@ -341,6 +341,7 @@ async fn a_daemon_started_over_an_old_store_reads_back_what_it_imported() {
     assert!(read.differences.is_empty(), "{:?}; created {:?}", read.differences, read.created);
     assert_eq!(read.stranded_deliveries, 0, "each imported delivery names its convoy's launch");
     assert_eq!(read.created.get("AccessDelivery"), Some(&2));
+    assert_eq!(read.held.get("AccessDelivery"), Some(&2), "a delivery whose place is not found is held, not retired");
     assert!(only_old_kinds(&read.old_store), "the old store was reached for {:?}", read.old_store);
 }
 

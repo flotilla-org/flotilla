@@ -1386,6 +1386,39 @@ async fn retiring_a_convoy_removes_its_requester_state_from_the_ssh_host() {
     reconciler.retire(&record).await.expect("retiring again is a no-op");
 }
 
+// #3108: not finding an access's convoy or place is no record that it ended. A delivery whose
+// convoy or place cannot be found is held: its record and the requester state on the SSH host
+// stay. Its launch's recorded end still retires it.
+#[tokio::test]
+async fn an_unresolvable_convoy_or_place_holds_the_access_and_its_requester_state() {
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "box-a-token").expect("token");
+    let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
+    let requester_files = |host: &FakeHost| {
+        let files = host.files.lock().expect("files");
+        files.keys().filter(|path| path.components().any(|part| part.as_os_str() == "requesters")).cloned().collect::<Vec<_>>()
+    };
+    let before = requester_files(&host);
+    assert!(before.iter().any(|path| path.starts_with(bound_material(&runtime.convoy))), "the material landed: {before:?}");
+    let backend = runtime.daemon.resource_backend();
+    let records = backend.clone().using::<flotilla_resources::AccessDelivery>(NAMESPACE);
+    let [record] = records.list().await.expect("records").items.try_into().expect("one record");
+    let (_, reconciler) = super::super::access_layer::status::status_controller(Arc::clone(&runtime.state), NAMESPACE.to_string());
+    let mut convoyless = record.clone();
+    convoyless.metadata.labels.insert(flotilla_resources::CONVOY_LABEL.to_string(), "not-imported".to_string());
+    reconciler.retire(&convoyless).await.expect("held");
+    let mut placeless = record.clone();
+    placeless.spec.place = "env-not-here".to_string();
+    reconciler.retire(&placeless).await.expect("held");
+    assert_eq!(records.list().await.expect("records").items.len(), 1, "held while its convoy or place cannot be found");
+    assert_eq!(requester_files(&host), before, "the requester state stays");
+    end_convoy(&runtime.daemon, &runtime.convoy).await;
+    reconciler.retire(&record).await.expect("retire");
+    assert!(records.list().await.expect("records").items.is_empty(), "removed once its launch ended");
+    assert_eq!(requester_files(&host), Vec::<PathBuf>::new(), "its requester state goes with it");
+}
+
 // #4037 contract 2: when the refresher rotates the central login, the next redelivery pass
 // pushes the new copy into the SSH-host crew's home through its vessel agent, and its
 // access records the copy that landed. The host's own login stays untouched.

@@ -188,45 +188,56 @@ fn bounded(error: &str) -> String {
     }
 }
 
-/// Removes a record once its place or its convoy is gone; the home went with the place,
-/// and the access ended with the convoy.
+/// Removes a record once its place or its convoy is recorded as ended; the home went with the
+/// place, and the access ended with the convoy.
 pub(in crate::runtime) fn status_controller(
     state: std::sync::Arc<ControllerRuntimeState>,
     namespace: String,
 ) -> (Vec<Box<dyn SecondaryWatch<Primary = AccessDelivery>>>, AccessStatusReconciler) {
-    (Vec::new(), AccessStatusReconciler { state, namespace })
+    (Vec::new(), AccessStatusReconciler { state, namespace, held: Default::default() })
 }
 
 pub(in crate::runtime) struct AccessStatusReconciler {
     state: std::sync::Arc<ControllerRuntimeState>,
     namespace: String,
+    /// Each record held because its place or convoy cannot be found, by name, with the reason
+    /// last logged: a hold is logged when it begins or its reason changes, not at every pass.
+    held: std::sync::Mutex<BTreeMap<String, String>>,
 }
 
 impl AccessStatusReconciler {
     pub(in crate::runtime) async fn retire(&self, record: &ResourceObject<AccessDelivery>) -> Result<(), String> {
         let backend = self.state.daemon.resource_backend();
-        let gone = |found: Result<_, ResourceError>| -> Result<bool, String> {
-            match found {
-                Ok(_) => Ok(false),
-                Err(ResourceError::NotFound { .. }) => Ok(true),
-                Err(error) => Err(error.to_string()),
-            }
-        };
         let place = &record.spec.place;
-        // A place that ended is gone: its environment is not launched again.
+        let mut unresolved = Vec::new();
+        // A place that ended is gone: its environment is not launched again. One not found here
+        // is no record that it ended.
         let place_gone = *place != self.state.host_direct_environment_name
-            && self.state.environment(place).await?.is_none_or(|environment| environment.ended());
+            && match self.state.environment(place).await? {
+                Some(environment) => environment.ended(),
+                None => {
+                    unresolved.push(format!("its place `{place}` is not found"));
+                    false
+                }
+            };
         // A convoy that ended is gone too: a launch is ended, never deleted, and holds no access.
+        // One not found here is no record that it ended: its requester state stays.
         let convoy_gone = match record.metadata.labels.get(CONVOY_LABEL) {
             Some(convoy) => match backend.including_replicas::<Convoy>(&self.namespace).get(convoy).await {
                 Ok(read) => read.object.status.is_some_and(|status| status.phase.is_terminal()),
-                found => gone(found.map(drop))?,
+                Err(ResourceError::NotFound { .. }) => {
+                    unresolved.push(format!("its convoy `{convoy}` is not found"));
+                    false
+                }
+                Err(error) => return Err(error.to_string()),
             },
             None => false,
         };
         if !(place_gone || convoy_gone) {
+            self.hold(&record.metadata.name, (!unresolved.is_empty()).then(|| unresolved.join("; ")));
             return Ok(());
         }
+        self.hold(&record.metadata.name, None);
         // The access ended with its convoy: its requester state goes from an SSH host, whose
         // dirs nothing else removes. A failure keeps the record, so the next pass retries. With the
         // place gone too the host is no longer ours to drive, so the record goes without cleanup.
@@ -240,6 +251,22 @@ impl AccessStatusReconciler {
         match backend.using::<AccessDelivery>(&self.namespace).delete(&record.metadata.name).await {
             Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
             Err(error) => Err(format!("remove access delivery `{}`: {error}", record.metadata.name)),
+        }
+    }
+
+    /// Notes `name` held for `reason`, or no longer held with none; a hold is logged when it
+    /// begins or its reason changes.
+    fn hold(&self, name: &str, reason: Option<String>) {
+        let mut held = self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match reason {
+            Some(reason) if held.get(name) != Some(&reason) => {
+                tracing::warn!(namespace = %self.namespace, delivery = %name, %reason, "access delivery held: not retired, requester state kept");
+                held.insert(name.to_owned(), reason);
+            }
+            Some(_) => {}
+            None => {
+                held.remove(name);
+            }
         }
     }
 }
