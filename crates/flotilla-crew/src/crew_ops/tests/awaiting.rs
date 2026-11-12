@@ -50,6 +50,24 @@ impl EngineMessages for RecordingMessages {
         let admitted = self.admitted.lock().expect("admitted").values().cloned().collect::<Vec<_>>();
         Ok(admitted.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect())
     }
+    async fn view_to(&self, namespace: &str, receiver: &str, record: &str) -> Result<Option<ReadResourceObject<Message>>, ResourceError> {
+        Ok(self.view(namespace, record).await?.filter(|read| read.object.spec.receiver == receiver))
+    }
+    async fn view_for(
+        &self,
+        namespace: &str,
+        intent: &MessageSpec,
+        record: &str,
+    ) -> Result<Option<ReadResourceObject<Message>>, ResourceError> {
+        self.view_to(namespace, &intent.receiver, record).await
+    }
+    async fn to_receivers(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
+        Ok(self.views(namespace).await?.into_iter().filter(|read| receivers.contains(&read.object.spec.receiver)).collect())
+    }
+    async fn pending_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
+        // Nothing admitted here is delivered.
+        self.to_receivers(namespace, receivers).await
+    }
     async fn admit(&self, namespace: &str, name: &str, intent: &MessageSpec) -> Result<ResourceObject<Message>, ResourceError> {
         let object = ResourceObject {
             metadata: ObjectMeta {

@@ -635,8 +635,14 @@ impl ReconcilerWake {
             views.forges.definitions().await.map_err(|error| error.to_string())?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
         let vessels_list = views.vessels.shared_list().await.map_err(|error| error.to_string())?;
         let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        // The judge reads only the messages to the convoys' crew members.
+        let seats = available_convoys
+            .items
+            .iter()
+            .flat_map(|convoy| crate::message_port::convoy_seats(namespace, &convoy.object))
+            .collect::<Vec<_>>();
         let messages_list = std::sync::Arc::new(flotilla_resources::ReadResourceList {
-            items: primitives.views(namespace).await.map_err(|error| error.to_string())?,
+            items: primitives.to_receivers(namespace, &seats).await.map_err(|error| error.to_string())?,
         });
         // Routing helpers retain their public Store-based interface, but all
         // their reads come from the same request snapshot of the watched kinds.

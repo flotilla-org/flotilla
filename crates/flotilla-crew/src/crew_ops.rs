@@ -1453,7 +1453,7 @@ impl CrewService {
             .build();
         let escalation = self.spelled_message_intent(namespace, &escalation).await.map_err(|error| error.to_string())?;
         let found = self
-            .active_message_records(namespace, Some(&escalation.receiver))
+            .active_message_records(namespace, &escalation.receiver)
             .await
             .map_err(|error| error.to_string())?
             .into_iter()
@@ -2481,7 +2481,7 @@ impl CrewService {
         // same sender.
         let spelled = self.spelled_message_intent(namespace, &intent).await.map_err(|error| error.to_string())?;
         let prior = self
-            .active_message_records(namespace, Some(&spelled.receiver))
+            .active_message_records(namespace, &spelled.receiver)
             .await
             .map_err(|error| error.to_string())?
             .into_iter()
@@ -2532,7 +2532,9 @@ impl CrewService {
         let pending_ref =
             selected.status().crew_work.get(vessel).and_then(|crew| crew.get(role)).and_then(|state| state.pending_follow_up.as_ref());
         let pending_message = if let Some(reference) = pending_ref {
-            self.message_record(namespace, &reference.name)
+            // A follow-up is queued to the crew member it follows up.
+            let receiver = crew_role_address(selected.project(namespace), name, vessel, role);
+            self.message_to(namespace, &receiver, &reference.name)
                 .await
                 .map_err(|error| format!("follow-up Message awaits replication: {error}"))?
                 .object
@@ -2636,15 +2638,14 @@ impl CrewService {
             return Err(format!("convoy `{name}` is in terminal phase `{:?}` and cannot accept message changes", status.phase));
         }
         let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
-        let prefix = format!("{project}/{name}/");
+        let seats = crate::message_port::convoy_seats(namespace, &convoy);
         let mut messages = self
-            .active_message_records_under(namespace, &prefix)
+            .pending_message_records(namespace, &seats)
             .await
             .map_err(|error| error.to_string())?
             .into_iter()
             .filter(|message| {
-                message.object.spec.receiver.starts_with(&prefix)
-                    && message.object.spec.relation == flotilla_resources::MessageRelation::Supervisor
+                message.object.spec.relation == flotilla_resources::MessageRelation::Supervisor
                     && !message.object.spec.sender.starts_with("system:")
                     && message.object.status.as_ref().is_none_or(|status| {
                         !status.phase.is_terminal() && !status.phase.has_delivery_evidence() && status.submission.is_none()
@@ -2673,7 +2674,7 @@ impl CrewService {
                         // must not delay clearing its workflow continuation.
                         true
                     } else {
-                        self.message_record(namespace, &reference.name)
+                        self.message_to(namespace, &crew_role_address(project, name, vessel, role), &reference.name)
                             .await
                             .map_err(|error| {
                                 format!("follow-up Message awaits replication during withdrawal: {error}; last queued brief: {withdrawn:?}")
@@ -2733,7 +2734,7 @@ impl CrewService {
             &request.sender,
             &turn_message_producer_key(&request.source, &request.subject_revision),
         );
-        match self.message_record(&request.namespace, &name).await {
+        match self.message_for(&request.namespace, &intent, &name).await {
             Ok(existing) => {
                 // A repeat records what an earlier send could not (record is idempotent).
                 self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref())
@@ -2765,7 +2766,7 @@ impl CrewService {
             if holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
                 return Err("receiver-home resource mutation router unavailable".into());
             }
-            let existing = self.message_record(&request.namespace, &name).await.is_ok();
+            let existing = self.message_for(&request.namespace, &intent, &name).await.is_ok();
             let admission = self
                 .admit_message(&request.namespace, &InputMeta::builder().name(name).build(), &intent)
                 .await
@@ -2944,7 +2945,7 @@ impl CrewService {
         name: &str,
         rung: TurnDeliveryRung,
     ) -> Result<Option<CrewTurnAdmission>, String> {
-        match self.message_record(&request.namespace, name).await {
+        match self.message_for(&request.namespace, intent, name).await {
             Ok(existing) => {
                 // A repeat records what an earlier send could not (record is idempotent).
                 self.record_awaiting(&request.namespace, name, intent, self.admitted_home(&existing), request.stall_of.as_deref()).await?;
@@ -2962,7 +2963,7 @@ impl CrewService {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
-        let records = self.active_message_records(&request.namespace, Some(&intent.receiver)).await.map_err(|error| error.to_string())?;
+        let records = self.active_message_records(&request.namespace, &intent.receiver).await.map_err(|error| error.to_string())?;
         if let Some(existing) = records.iter().find(|record| {
             intent.supersedes.is_none()
                 && flotilla_resources::message_supersedes(intent, &record.object)
@@ -3506,7 +3507,7 @@ impl CrewService {
         // retry after a lost acceptance completes both.
         let crew = crew_role_address(project, &request.convoy, &request.vessel, &request.role);
         let notice = flotilla_resources::message_record_name("system:hold", sender, &format!("hold-notice:{hold_key}"));
-        let notified = match self.message_record(&request.namespace, &notice).await {
+        let notified = match self.message_to(&request.namespace, &crew, &notice).await {
             Ok(_) => true,
             Err(ResourceError::NotFound { .. }) => false,
             Err(error) => return Err(error.to_string()),

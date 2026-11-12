@@ -411,6 +411,17 @@ pub struct MessagePrimitives {
     attention_changes: tokio::sync::broadcast::Sender<()>,
     /// Signalled after a person acknowledges an attention here.
     acknowledgements: tokio::sync::broadcast::Sender<()>,
+    /// Message rows the reads loaded and converted, since this path opened.
+    loaded: std::sync::atomic::AtomicU64,
+    converted: std::sync::atomic::AtomicU64,
+}
+
+/// What this path's Message reads have cost since it opened: rows loaded from
+/// the store, and rows converted to the old shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowsRead {
+    pub loaded: u64,
+    pub converted: u64,
 }
 
 impl MessagePrimitives {
@@ -496,7 +507,33 @@ impl MessagePrimitives {
             attention_changes,
             acknowledgements: tokio::sync::broadcast::channel(16).0,
             backend: backend.downgrade(),
+            loaded: std::sync::atomic::AtomicU64::new(0),
+            converted: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// The rows this path's Message reads have loaded and converted.
+    pub fn rows_read(&self) -> RowsRead {
+        RowsRead {
+            loaded: self.loaded.load(std::sync::atomic::Ordering::Relaxed),
+            converted: self.converted.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    fn count_loaded(&self) {
+        self.loaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `resource` in the old shape on records already read, counted.
+    fn old_view_counted(
+        &self,
+        resource: &Resource<Message>,
+        namespace: &str,
+        roles: &FleetRoles,
+        records: &OldStoreRecords,
+    ) -> Result<ResourceObject<OldMessage>, String> {
+        self.converted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        old_view(resource, namespace, roles, records)
     }
 
     fn backend(&self) -> Result<ResourceBackend, String> {
@@ -787,12 +824,15 @@ impl MessagePrimitives {
     /// home this replica follows, with their homes: each is acknowledged or
     /// answered at its own home. Reading them writes no receipt.
     pub async fn person_messages(&self, namespace: &str) -> Result<Vec<(String, Resource<Message>)>, String> {
-        let inboxes = self.person_inboxes(namespace).await?;
-        Ok(self
-            .messages()?
-            .into_iter()
-            .filter(|(_, message)| *message.state() == MessageState::Pending && inboxes.contains(&message.spec().inbox))
-            .collect())
+        let mut waiting = Vec::new();
+        for inbox in self.person_inboxes(namespace).await? {
+            waiting.extend(self.pending_in(&inbox)?);
+        }
+        // Each home's messages in its admission order, as one listing.
+        let homes = self.service.homes();
+        let place = |home: &str| homes.iter().position(|followed| followed == home);
+        waiting.sort_by_key(|(home, message)| (place(home), message.spec().admitted_seq));
+        Ok(waiting)
     }
 
     /// The person acknowledges a message waiting in one of their role inboxes
@@ -1286,6 +1326,7 @@ impl MessagePrimitives {
                         let keys = read.integer_index_keys(&query, &home, after, 32)?;
                         let Some(&(_, last)) = keys.last() else { break };
                         for (id, _) in keys {
+                            self.count_loaded();
                             if let Some(loaded) = read.load::<Resource<Message>>(id)? {
                                 out.push((home.clone(), loaded.value));
                             }
@@ -1309,6 +1350,7 @@ impl MessagePrimitives {
                     loop {
                         let page = read.scan::<Resource<Message>>(&home, after, 64)?;
                         for id in page.ids {
+                            self.count_loaded();
                             if let Some(loaded) = read.load::<Resource<Message>>(id)? {
                                 out.push((home.clone(), loaded.value));
                             }
@@ -1363,12 +1405,8 @@ impl MessagePrimitives {
         let hold = flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.num_microseconds().expect("a bounded hold");
         let now = self.world.now();
         Ok(self
-            .messages()?
+            .pending_in(&inbox)?
             .iter()
-            .filter(|(_, message)| {
-                message.spec().inbox == inbox
-                    && matches!(message.state(), flotilla_state_machines::machines::message::MessageState::Pending)
-            })
             .map(|(_, message)| message.since().0.saturating_add(hold))
             .filter(|end| *end > now.0)
             .max()
@@ -1398,11 +1436,17 @@ impl MessagePrimitives {
     /// The message `record` names, and its home.
     fn load(&self, record: &str) -> Result<Option<(String, Resource<Message>)>, ResourceError> {
         let Some((id, home)) = self.locate(record).map_err(ResourceError::other)? else { return Ok(None) };
+        self.load_at(id, home)
+    }
+
+    /// The message `id` homed at `home`, and its home.
+    fn load_at(&self, id: String, home: String) -> Result<Option<(String, Resource<Message>)>, ResourceError> {
         let resource = self
             .service
             .with_store(|store| {
                 let mut read = store.read()?;
                 let Some(stored) = read.resolve(Resource::<Message>::CODE, &id, &home)? else { return Ok(None) };
+                self.count_loaded();
                 Ok(read.load::<Resource<Message>>(stored)?.map(|loaded| loaded.value))
             })
             .map_err(|error| ResourceError::other(error.to_string()))?;
@@ -1415,6 +1459,124 @@ impl MessagePrimitives {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
         let object = self.view_of(&resource, namespace, &roles).await?.map_err(ResourceError::invalid)?;
         Ok(Some(ReadResourceObject { object, provenance: self.provenance(&home) }))
+    }
+
+    /// The message `record` in `receiver`'s inbox (an old address), read by its exact identity.
+    pub async fn view_to(
+        &self,
+        namespace: &str,
+        receiver: &str,
+        record: &str,
+    ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        let records = self.records(namespace).await?;
+        let inbox = Conversion { roles: &roles, forges: &records.forges, records: &*records }.inbox(receiver);
+        self.view_in(namespace, &roles, inbox, record).await
+    }
+
+    /// The message `record` in the inbox `intent` is admitted to, read by its exact identity.
+    pub async fn view_for(
+        &self,
+        namespace: &str,
+        intent: &OldSpec,
+        record: &str,
+    ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        let records = self.records(namespace).await?;
+        let inbox = Conversion { roles: &roles, forges: &records.forges, records: &*records }.receiver(intent);
+        self.view_in(namespace, &roles, inbox, record).await
+    }
+
+    async fn view_in(
+        &self,
+        namespace: &str,
+        roles: &FleetRoles,
+        inbox: Result<Address, String>,
+        record: &str,
+    ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
+        // No message is admitted to a receiver that converts to no inbox.
+        let inbox = match inbox {
+            Ok(inbox) => inbox,
+            Err(error) => {
+                tracing::debug!(%record, %error, "a receiver with no inbox holds no message");
+                return Ok(None);
+            }
+        };
+        let Some((id, home)) = self.locate_in(&inbox, record).map_err(ResourceError::other)? else { return Ok(None) };
+        let Some((home, resource)) = self.load_at(id, home)? else { return Ok(None) };
+        let object = self.view_of(&resource, namespace, roles).await?.map_err(ResourceError::invalid)?;
+        Ok(Some(ReadResourceObject { object, provenance: self.provenance(&home) }))
+    }
+
+    /// The messages to `receivers` (old addresses) in the old shape, from one read of the
+    /// replica that converts only the messages in those receivers' inboxes. A message the held
+    /// records cannot spell is left out, not read again.
+    pub async fn to_receivers(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
+        let (roles, records, inboxes) = self.inboxes_of(namespace, receivers).await?;
+        let rows =
+            self.messages().map_err(ResourceError::other)?.into_iter().filter(|(_, message)| inboxes.contains(&message.spec().inbox));
+        Ok(self.spelled_to(rows, namespace, &roles, &records, receivers))
+    }
+
+    /// The pending messages to `receivers` (old addresses) in the old shape, read through each
+    /// inbox's pending index. A message the held records cannot spell is left out.
+    pub async fn pending_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
+        let (roles, records, inboxes) = self.inboxes_of(namespace, receivers).await?;
+        let mut rows = Vec::new();
+        for inbox in &inboxes {
+            rows.extend(self.pending_in(inbox).map_err(ResourceError::other)?);
+        }
+        Ok(self.spelled_to(rows, namespace, &roles, &records, receivers))
+    }
+
+    /// The inboxes old receivers' messages are in. A person's role depends on the message's
+    /// context, so a principal is read in every person role's inbox.
+    async fn inboxes_of(
+        &self,
+        namespace: &str,
+        receivers: &[String],
+    ) -> Result<(FleetRoles, Arc<OldStoreRecords>, BTreeSet<Address>), ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        let records = self.records(namespace).await?;
+        let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
+        let mut inboxes = BTreeSet::new();
+        for receiver in receivers {
+            if receiver.starts_with("principal:") {
+                inboxes.extend(self.person_inboxes(namespace).await.map_err(ResourceError::other)?);
+                continue;
+            }
+            match conversion.inbox(receiver) {
+                Ok(inbox) => {
+                    inboxes.insert(inbox);
+                }
+                Err(error) => tracing::debug!(%receiver, %error, "a receiver with no inbox holds no message"),
+            }
+        }
+        Ok((roles, records, inboxes))
+    }
+
+    /// `rows` in the old shape, those spelled to one of `receivers`: a convoy role's inbox is
+    /// spelled with the vessel holding it.
+    fn spelled_to(
+        &self,
+        rows: impl IntoIterator<Item = (String, Resource<Message>)>,
+        namespace: &str,
+        roles: &FleetRoles,
+        records: &OldStoreRecords,
+        receivers: &[String],
+    ) -> Vec<ReadResourceObject<OldMessage>> {
+        rows.into_iter()
+            .filter_map(|(home, resource)| match self.old_view_counted(&resource, namespace, roles, records) {
+                Ok(object) if receivers.contains(&object.spec.receiver) => {
+                    Some(ReadResourceObject { object, provenance: self.provenance(&home) })
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::debug!(message = resource.name(), %error, "engine message has no old-shaped view");
+                    None
+                }
+            })
+            .collect()
     }
 
     /// An intent with its sender and receiver as [`Self::view`] spells them once
@@ -1450,9 +1612,9 @@ impl MessagePrimitives {
         roles: &FleetRoles,
     ) -> Result<Result<ResourceObject<OldMessage>, String>, ResourceError> {
         let held = self.read_records(namespace, false).await?;
-        match old_view(resource, namespace, roles, &*held.records) {
+        match self.old_view_counted(resource, namespace, roles, &held.records) {
             Err(_) if !held.rechecked || resource.since() > held.world_at => {
-                Ok(old_view(resource, namespace, roles, &*self.read_records(namespace, true).await?.records))
+                Ok(self.old_view_counted(resource, namespace, roles, &self.read_records(namespace, true).await?.records))
             }
             view => Ok(view),
         }
@@ -1509,6 +1671,28 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     }
     async fn views(&self, namespace: &str) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
         MessagePrimitives::views(self, namespace).await
+    }
+    async fn view_to(
+        &self,
+        namespace: &str,
+        receiver: &str,
+        record: &str,
+    ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
+        MessagePrimitives::view_to(self, namespace, receiver, record).await
+    }
+    async fn view_for(
+        &self,
+        namespace: &str,
+        intent: &OldSpec,
+        record: &str,
+    ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
+        MessagePrimitives::view_for(self, namespace, intent, record).await
+    }
+    async fn to_receivers(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
+        MessagePrimitives::to_receivers(self, namespace, receivers).await
+    }
+    async fn pending_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
+        MessagePrimitives::pending_to(self, namespace, receivers).await
     }
     async fn admit(&self, namespace: &str, name: &str, intent: &OldSpec) -> Result<ResourceObject<OldMessage>, ResourceError> {
         MessagePrimitives::admit(self, namespace, name, intent).await
@@ -1574,11 +1758,11 @@ impl flotilla_messaging::CharterNotices for EngineCharterNotices {
     async fn open_to(&self, receiver: &str) -> Result<Vec<ResourceObject<OldMessage>>, ResourceError> {
         Ok(self
             .primitives
-            .views(&self.namespace)
+            .to_receivers(&self.namespace, &[receiver.to_owned()])
             .await?
             .into_iter()
             .map(|view| view.object)
-            .filter(|message| message.spec.receiver == receiver && message.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+            .filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
             .collect())
     }
     async fn admit(&self, name: &str, spec: &OldSpec, _: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {

@@ -31,6 +31,32 @@ pub trait EngineMessages: Send + Sync {
         &self,
         namespace: &str,
     ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
+    /// The message `record` in `receiver`'s inbox (an old address), local or replicated.
+    async fn view_to(
+        &self,
+        namespace: &str,
+        receiver: &str,
+        record: &str,
+    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
+    /// The message `record` in the inbox `intent` is admitted to, local or replicated.
+    async fn view_for(
+        &self,
+        namespace: &str,
+        intent: &flotilla_resources::MessageSpec,
+        record: &str,
+    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
+    /// The messages to `receivers` (old addresses), in any state, local or replicated.
+    async fn to_receivers(
+        &self,
+        namespace: &str,
+        receivers: &[String],
+    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
+    /// The messages to `receivers` (old addresses) still waiting for delivery, local or replicated.
+    async fn pending_to(
+        &self,
+        namespace: &str,
+        receivers: &[String],
+    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
     /// Admits an intent at this home, its receiver's; a repeated name is the message already admitted.
     async fn admit(
         &self,

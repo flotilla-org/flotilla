@@ -556,6 +556,36 @@ impl flotilla_messaging::EngineMessages for Turns {
     ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
+    async fn view_to(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn view_for(
+        &self,
+        _: &str,
+        _: &flotilla_resources::MessageSpec,
+        _: &str,
+    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn to_receivers(
+        &self,
+        _: &str,
+        _: &[String],
+    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn pending_to(
+        &self,
+        _: &str,
+        _: &[String],
+    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
     async fn admit(
         &self,
         _: &str,
