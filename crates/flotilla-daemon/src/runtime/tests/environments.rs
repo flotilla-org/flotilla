@@ -99,6 +99,8 @@ async fn standing_backing_inspection_accepts_local_absence_only_after_startup_ob
         )
         .await
         .expect("convoy status");
+    // A launch that holds no environment: provisioning began and its backing is unaccounted for.
+    engine(&daemon).vessels.request("quartermaster", "work", "host-test");
     let mut registry = ProviderRegistry::new();
     let sibling: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
         id: EnvironmentId::new("env-quartermaster-extra-work"),

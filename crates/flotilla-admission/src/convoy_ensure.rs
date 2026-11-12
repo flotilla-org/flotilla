@@ -95,6 +95,13 @@ pub trait StandingConvoyBackingInspector: Send + Sync {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String>;
 }
 
+/// Whether standing convoy `convoy` never began provisioning, `launched` saying whether any of its
+/// works launched a vessel. The engine's view derives no provisioning state (#3108), so its
+/// launches are the evidence; a status that says so is too.
+pub fn never_provisioned(convoy: &ResourceObject<ResourceConvoy>, launched: bool) -> bool {
+    !launched || convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted)
+}
+
 /// Default fail-closed inspection of a standing convoy's backing Environment records.
 pub struct ResourceStandingConvoyBackingInspector {
     pub resource_backend: flotilla_store::ResourceBackend,
@@ -139,9 +146,7 @@ impl StandingConvoyBackingInspector for ResourceStandingConvoyBackingInspector {
         .map_err(|error| format!("could not inspect backing environments: {error}"))?
         .map_err(|error| format!("could not inspect backing environments: {error}"))?;
         if environments.is_empty() {
-            // A convoy none of whose works launched a vessel never began provisioning (#3108: the
-            // engine's view derives no provisioning state, so the vessels are the evidence).
-            if !launched || convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted) {
+            if never_provisioned(convoy, launched) {
                 return Ok(());
             }
             return Err("no backing environment evidence is available".to_string());
