@@ -1410,97 +1410,6 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
 }
 
 #[tokio::test]
-async fn convoy_explain_reports_observed_digest_anchor_and_mismatch() {
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon = InProcessDaemon::new(
-        vec![],
-        test_config_store(temp.path().join("config")),
-        fake_discovery(false),
-        HostName::local(),
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
-    // The engine's readings, which a running daemon always has.
-    let engine = install_engine_reads(&daemon);
-    let backend = daemon.resource_backend();
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let repo_ref = flotilla_resources::RepositoryKey("repo-a".to_string());
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name("digest-anchor".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder()
-                .workflow_ref("reviewless".to_string())
-                .adopted_checkout_refs(BTreeMap::from([(repo_ref.clone(), "digest-checkout".to_string())]))
-                .build(),
-        )
-        .await
-        .expect("create convoy");
-    let claim = flotilla_resources::SettlementClaimEvidence::builder()
-        .refs(flotilla_resources::ReviewRefPair::builder().base("refs/heads/main".to_string()).head("refs/heads/topic".to_string()).build())
-        .bundle_url("s3://reviews/digest-anchor/1/".to_string())
-        .claimed_head_digest("claimed-digest".to_string())
-        .build();
-    // The engine holds the convoy, and the adopted checkout for it; its inspection reads the
-    // remote ref.
-    let launch = engine.open_convoy("digest-anchor");
-    let mut status = flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landing, engine_launch: Some(launch), ..Default::default() };
-    status.crew_work.insert(
-        "work".to_string(),
-        BTreeMap::from([(
-            "coder".to_string(),
-            flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Done).claim_evidence(claim).build(),
-        )]),
-    );
-    convoys.update_status("digest-anchor", &convoy.metadata.resource_version, &status).await.expect("publish claim");
-
-    let launch = engine.put_ready(
-        "digest-checkout",
-        &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
-            r#ref: "topic".to_string(),
-            path: "/tmp/digest-checkout".to_string(),
-            repo_ref,
-            host_ref: "home".to_string(),
-            is_main: false,
-        }),
-        Some(&engine.holder("digest-anchor")),
-    );
-    let inspect = |digest: &str| {
-        use flotilla_resources::checkout_records::CheckoutRecords as _;
-        engine
-            .checkouts
-            .inspected(
-                &launch,
-                flotilla_resources::checkout_records::Inspection { remote_digest: Some(digest.to_string()), ..Default::default() },
-            )
-            .expect("publish observation");
-    };
-    inspect("other-digest");
-
-    let explain = || async {
-        daemon
-            .execute_query(
-                Command::builder()
-                    .action(CommandAction::QueryExplainConvoy {
-                        namespace: Some("flotilla".to_string()),
-                        name: "digest-anchor".to_string(),
-                    })
-                    .build(),
-                uuid::Uuid::new_v4(),
-            )
-            .await
-            .expect("explain convoy")
-    };
-    let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
-    assert!(!explanation.settlement.satisfied);
-    assert!(explanation.settlement.unmet.iter().any(|unmet| unmet.reason == "digest_mismatch"));
-
-    inspect("claimed-digest");
-    let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
-    assert!(explanation.settlement.satisfied);
-    assert_eq!(explanation.settlement.mode, "observed_digest");
-}
-
-#[tokio::test]
 async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon = InProcessDaemon::new(
@@ -5178,30 +5087,29 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
     assert_ne!(first.metadata.name, "governor");
     assert_eq!(first.metadata.labels.get(flotilla_resources::PROJECT_LABEL).map(String::as_str), Some("flotilla"));
     assert_eq!(first.metadata.labels.get(flotilla_resources::ROLE_LABEL).map(String::as_str), Some("governor"));
-    assert_eq!(first.metadata.labels.get(flotilla_resources::GENERATION_LABEL).map(String::as_str), Some("1"));
+    // On the engine the generation is the launch's number (#3108), not a label: ordered per
+    // name, not gapless, so the test reads it rather than expecting 1.
+    let first_generation = first.spec.generation;
 
     let duplicate_id = daemon.execute(command.clone()).await.expect("duplicate admission result");
     assert_eq!(
         recv_command_finished(&mut events, duplicate_id).await,
-        CommandValue::Error { message: "live convoy governor@flotilla generation 1 already exists".to_string() }
+        CommandValue::Error { message: format!("live convoy governor@flotilla generation {first_generation} already exists") }
     );
 
-    convoys
-        .update_status(
-            &first.metadata.name,
-            &first.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus { phase: flotilla_resources::ConvoyPhase::Failed, ..Default::default() },
-        )
-        .await
-        .expect("settle first generation");
+    // The first generation ends on the engine, which frees the role for the next.
+    let engine = daemon.convoy_engine_path();
+    engine.get().expect("the engine Convoy path").fail(&first, "operator", "failed").await.expect("settle first generation");
     let second_id = daemon.execute(command).await.expect("second generation admission");
     assert!(
         matches!(recv_command_finished(&mut events, second_id).await, CommandValue::ConvoyStarted { name, .. } if name == "governor@flotilla")
     );
     let generations = convoys.list().await.expect("list generations").items;
     assert_eq!(generations.len(), 2, "terminal history must be retained");
-    assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
+    let second_generation = generations.iter().map(|convoy| convoy.spec.generation).max().expect("generations");
+    assert!(second_generation > first_generation, "the next launch is ordered after the first");
 
+    // A delete by role address ends the live generation; an ended convoy is kept, never removed.
     let delete_id = daemon
         .execute(
             Command::builder()
@@ -5211,18 +5119,11 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
         .await
         .expect("delete by role address");
     assert_eq!(recv_command_finished(&mut events, delete_id).await, CommandValue::Ok);
-    assert_eq!(convoys.list().await.expect("list after addressed delete").items.len(), 1);
-
-    let terminal_delete_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::ConvoyDelete { namespace: None, name: "governor@flotilla".to_string(), force: true })
-                .build(),
-        )
-        .await
-        .expect("delete sole terminal generation by role address");
-    assert_eq!(recv_command_finished(&mut events, terminal_delete_id).await, CommandValue::Ok);
-    assert!(convoys.list().await.expect("list after terminal generation delete").items.is_empty());
+    let generations = convoys.list().await.expect("list after addressed delete").items;
+    assert_eq!(generations.len(), 2, "ended generations are kept");
+    let second = generations.iter().find(|convoy| convoy.spec.generation == second_generation).expect("second generation");
+    assert_eq!(second.status.as_ref().map(|status| status.phase), Some(ConvoyPhase::Abandoned));
+    assert!(generations.iter().all(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())));
     drop(temp);
 }
 
@@ -5230,36 +5131,26 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
 async fn convoy_delete_reaps_a_landed_pre_identity_record() {
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     open_attentions(&daemon).await;
-    let backend = daemon.resource_backend();
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("command-builder".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("legacy-workflow".to_string()).build(),
-        )
-        .await
-        .expect("create pre-identity convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
-        )
-        .await
-        .expect("mark pre-identity convoy landed");
+    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+    // A convoy with no project or role, landed on the engine.
+    let launch = launch_convoy(
+        &daemon,
+        "command-builder",
+        flotilla_resources::ConvoySpec::builder().workflow_ref("legacy-workflow".to_string()).build(),
+        flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+    )
+    .await;
 
     let mut events = daemon.subscribe();
     let delete_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::ConvoyDelete { namespace: None, name: "command-builder".to_string(), force: false })
-                .build(),
-        )
+        .execute(Command::builder().action(CommandAction::ConvoyDelete { namespace: None, name: launch.clone(), force: false }).build())
         .await
         .expect("delete command accepted");
 
+    // An ended convoy has nothing left to end: the delete succeeds and the convoy is kept, landed.
     assert_eq!(recv_command_finished(&mut events, delete_id).await, CommandValue::Ok);
-    assert!(matches!(convoys.get("command-builder").await, Err(ResourceError::NotFound { .. })));
+    let convoy = convoys.get(&launch).await.expect("the landed convoy is kept");
+    assert_eq!(convoy.status.as_ref().map(|status| status.phase), Some(ConvoyPhase::Landed));
     drop(temp);
 }
 

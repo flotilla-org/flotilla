@@ -72,7 +72,7 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Host"), Some(KindCode::new("ho")));
     assert_eq!(held("HostObservation"), Some(KindCode::new("ob")));
     assert_eq!(held("AccessDelivery"), Some(KindCode::new("ad")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 31);
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 32);
     // The definition kinds (#3824 layer 2b), in the decided store with their writers (2b-ii).
     for (kind, code) in [
         ("Forge", "fo"),
