@@ -601,7 +601,9 @@ async fn issue_turn_delivery_fires_once_for_changed_issue() {
         if revision == changed_at.to_rfc3339()));
     let brief = actuator.requests.lock().expect("requests")[0].brief.clone();
     assert!(brief.contains("Target crew: `work/coder`"));
-    assert!(brief.contains("Decision ledger: https://example.com/ledger"));
+    // The kept ledger promise's artifact record, not the reference the coder submitted.
+    let ledger = flotilla_resources::address::artifact_slot_record_name(launch, "coder", "decision-ledger", launch).expect("ledger slot");
+    assert!(brief.contains(&format!("Decision ledger: {ledger}")), "{brief}");
     assert!(brief.contains("feature/issue"));
     let status = convoys.get(launch).await.expect("convoy").status.expect("status");
     assert_eq!(status.turn_deliveries["issue"].episodes.len(), 1);

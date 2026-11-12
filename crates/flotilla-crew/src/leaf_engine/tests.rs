@@ -1681,7 +1681,9 @@ async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
     let launch = home.admit("wake-turn", convoy_spec, status).await;
     let launch = launch.as_str();
     let vessel = home.vessel(launch, "work", "env");
-    home.seat(&backend, launch, (&vessel, "work"), ("coder", "wake-turn-coder"), CrewWorkPhase::Done).await;
+    home.seat(&backend, launch, (&vessel, "work"), ("coder", "wake-turn-coder"), CrewWorkPhase::Working).await;
+    submit_ledger(&home, &backend, launch, "https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1", base).await;
+    home.keep(&backend, launch, "work", "coder").await;
     assert_eq!(convoys.get(launch).await.expect("convoy").status.expect("status").phase, ConvoyPhase::Landing);
     let cr_name = cr_name("github.com", "flotilla-org/flotilla", 1392);
     let records = backend.clone().using::<ChangeRequest>("flotilla");
@@ -1793,7 +1795,10 @@ async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
     );
     assert!(first_brief.contains("feature/wake"));
     assert!(first_brief.contains(&format!("Durable convoy record: `flotilla/{launch}`")));
-    assert!(first_brief.contains("Decision ledger: https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1"));
+    // The ledger the brief names is the kept ledger promise's artifact record, not the reference
+    // the coder submitted.
+    let ledger = flotilla_resources::address::artifact_slot_record_name(launch, "coder", "decision-ledger", launch).expect("ledger slot");
+    assert!(first_brief.contains(&format!("Decision ledger: {ledger}")), "{first_brief}");
 }
 
 /// A subscription table whose readings serve no held checkouts; a test that holds checkouts gives
