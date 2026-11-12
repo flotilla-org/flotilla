@@ -56,17 +56,6 @@ pub(crate) fn agent_reads() -> std::sync::Arc<dyn flotilla_resources::lifecycle_
     reads_with_agent_sessions(fixture)
 }
 
-/// Readings as a daemon restarted at `watched_from` serves them: this test's AgentSessions, with
-/// none of their progress seen. Later observations through [`agents`] go to the restarted daemon.
-#[cfg(test)]
-pub(crate) fn restarted_agent_reads(
-    watched_from: chrono::DateTime<chrono::Utc>,
-) -> std::sync::Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads> {
-    let fixture = std::sync::Arc::new(agents().restarted(watched_from));
-    AGENTS.with(|agents| *agents.borrow_mut() = Some(std::sync::Arc::clone(&fixture)));
-    reads_with_agent_sessions(fixture)
-}
-
 /// Makes `fixture` the AgentSessions [`agents`] observes on this test thread, as readings built
 /// over it serve them.
 #[cfg(test)]

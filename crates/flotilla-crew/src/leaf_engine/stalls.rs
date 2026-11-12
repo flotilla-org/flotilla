@@ -1531,8 +1531,7 @@ impl ReconcilerWake {
                     if due {
                         let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
                         let delivered =
-                            off_frame(|| self.deliver_stall_nudge(tick, convoy, status, vessel, role, leaf, condition.nudge_history.len()))
-                                .await?;
+                            off_frame(|| self.deliver_stall_nudge(tick, convoy, vessel, role, leaf, condition.nudge_history.len())).await?;
                         match delivered {
                             Ok(_) => {
                                 condition.nudge_history.push(StallNudge { at: now, row: leaf.clone() });
@@ -1632,23 +1631,17 @@ impl ReconcilerWake {
     }
 
     /// Delivers a stall nudge to an idle actor; the inner error is a failed delivery.
-    #[allow(clippy::too_many_arguments)]
     async fn deliver_stall_nudge(
         &self,
         tick: StallTick<'_>,
         convoy: &ResourceObject<Convoy>,
-        status: &ConvoyStatus,
         vessel: &str,
         role: &str,
         leaf: &Leaf,
         nudges: usize,
     ) -> Result<Result<(), String>, String> {
         let StallTick { namespace, now, .. } = tick;
-        let obligation = if declared_stall(status, vessel, role).is_some() {
-            "Your stall is recorded. What changed since your report? If the blocker persists, update the stall with new evidence; if it has cleared, ask your supervisor to resume you.".into()
-        } else {
-            actor_obligation(leaf)?
-        };
+        let obligation = actor_obligation(leaf)?;
         let brief =
             format!("For {role}@{vessel} in {} (resource ref: {}):\n{obligation}", convoy_message_address(convoy), convoy.metadata.name);
         let request = CrewTurnIntent::builder()

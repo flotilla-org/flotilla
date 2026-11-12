@@ -24,16 +24,14 @@ use flotilla_resources::terminal_records::TerminalRecords as _;
 use flotilla_resources::vessel_records::VesselStep;
 use flotilla_resources::StatusPatch;
 use flotilla_resources::{
-    external_patches, Artifact, ChangeRequest, Convoy, ConvoyAttention, ConvoyEnsure, CrewCompletionRefusal, CrewCompletionRefusalCause,
-    HoldAct, Issue, LeafMaker, NudgeObligation, ObservedChecks, Project, ResourceError, RetryCeiling, StallEvidenceSource, StallRung,
-    SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Vessel, WatchEvent, WatchStart,
-    ROLE_LABEL, VESSEL_LABEL,
+    external_patches, Artifact, ChangeRequest, Convoy, ConvoyAttention, ConvoyEnsure, HoldAct, Issue, LeafMaker, NudgeObligation,
+    ObservedChecks, Project, ResourceError, RetryCeiling, StallEvidenceSource, StallRung, SupervisionTarget, TerminalAttention,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
+    TurnDeliveryRung, WatchEvent, WatchStart,
 };
 use flotilla_resources::{
     BoundChangeRequest, CheckoutSpec, ControllerRetry, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase,
-    CrewWorkState, ExitDeclaration, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementStatus, RepositoryKey, WorkPhase,
-    WorkState, WorkflowSnapshot, CONVOY_LABEL,
+    ExitDeclaration, InputMeta, ObservedCheckoutSpec, RepositoryKey, WorkPhase, WorkflowSnapshot,
 };
 use flotilla_resources::{ResourceObject, SubjectDiscoverySource};
 use flotilla_store::controller::ControllerLoop;
@@ -608,14 +606,14 @@ async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restart
     let crewed = !matches!(unavailable, GovernorUnavailable::CrewMissing);
     let case = project_supervision_case(&[]).await;
     // A governor whose workflow crews no governor seat is a governor without its crew.
-    admit_governor(&case, "governor", 1, if crewed { "governor" } else { "deputy" }).await;
+    let first = admit_governor(&case, "governor", 1, if crewed { "governor" } else { "deputy" }).await;
     let delivery = case.delivery.clone();
     let convoys = case.backend.using::<Convoy>("flotilla");
     let mut wake = case.wake.clone();
     match unavailable {
         GovernorUnavailable::DeliveryError => delivery.unavailable.store(true, Ordering::SeqCst),
         GovernorUnavailable::NoLiveGeneration => {
-            let governor = case.home.view(&case.backend, &case.governor("governor")).await;
+            let governor = case.home.view(&case.backend, &first).await;
             case.home.engine().abandon(&governor, "operator", "abandoned").await.expect("abandon the governor");
         }
         GovernorUnavailable::CrewMissing => {}
@@ -659,7 +657,7 @@ async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restart
         wake = case.restarted_wake().await;
     }
     let reachable = if crewed && !matches!(unavailable, GovernorUnavailable::NoLiveGeneration) {
-        case.governor("governor")
+        first
     } else {
         // An abandoned generation stays terminal, and a crewless one stays crewless. Startup
         // eventually reveals a new live generation rather than resurrecting the old one.
@@ -1836,7 +1834,6 @@ mod change_request_authority;
 mod interrupted_stalls;
 mod operator_stalls;
 mod settlement;
-#[cfg(any())]
 mod stalls_supervision;
 mod subscriptions;
 mod turn_delivery;

@@ -142,6 +142,11 @@ impl TerminalsFixture {
         self.step(launch, Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Refused, cause), retryable: false }));
     }
 
+    /// One retryable failed try of launch `launch`, for `cause`.
+    pub fn retry(&self, launch: &str, cause: &str) {
+        self.step(launch, Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, cause), retryable: true }));
+    }
+
     /// Releases launch `launch`.
     pub fn release(&self, launch: &str) {
         self.step(launch, Step::Released);
