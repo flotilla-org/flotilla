@@ -10,6 +10,7 @@ use flotilla_resources::{
 use flotilla_resources::{K8sWatchEvent, ResourceList, ResourceObject};
 use flotilla_store::ResourceBackend;
 use flotilla_store::StoreExt;
+use flotilla_store::REGISTERED_RESOURCE_KINDS;
 use futures::StreamExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -238,8 +239,11 @@ fn spawn_kind<T: Resource>(
     if T::REPLICATION_CLASS == ReplicationClass::None {
         return;
     }
-    // An engine-served kind reaches this home by following the peer's log.
-    if host.store().engine_serves(T::API_PATHS.kind) {
+    // An engine-served kind reaches this home by following the peer's log. An engine-held kind's
+    // old-store rows are only those a previous generation wrote, left for the cut-over import.
+    if host.store().engine_serves(T::API_PATHS.kind)
+        || REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.engine_held && kind.kind == T::API_PATHS.kind)
+    {
         return;
     }
     match transport.clone() {

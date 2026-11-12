@@ -1,15 +1,16 @@
 //! Engine behaviour through the host ports, against in-memory stores.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use flotilla_protocol::{CommandValue, NodeId, ResourceCursor, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance};
-use flotilla_resources::{Convoy, ConvoySpec, InputMeta, PartitionDigest, ResourceObject, ResourceProvenance};
-use flotilla_store::ResourceBackend;
+use flotilla_resources::engine_records::{EngineObject, EngineRecords};
+use flotilla_resources::{Artifact, ArtifactSpec, Convoy, ConvoySpec, InputMeta, PartitionDigest, ResourceObject, ResourceProvenance};
+use flotilla_store::{old_store_resource_kinds, ResourceBackend};
 
 use super::test_ports::{host, store, HealthReport, InMemoryPeers, NoRoutedPeer, RecordingHealth};
 use super::*;
@@ -20,16 +21,31 @@ fn spec(workflow: &str) -> ConvoySpec {
 }
 
 async fn author(backend: &ResourceBackend, name: &str) -> ResourceObject<Convoy> {
-    backend
-        .using::<Convoy>(REPLICATION_NAMESPACE)
-        .create(&InputMeta::builder().name(name.into()).build(), &spec("workflow"))
-        .await
-        .expect("author")
+    author_as(backend, name, &spec("workflow")).await
 }
 
-async fn replica_origins(backend: &ResourceBackend) -> Vec<(String, NodeId)> {
+async fn author_as<T: Resource>(backend: &ResourceBackend, name: &str, spec: &T::Spec) -> ResourceObject<T> {
+    backend.using::<T>(REPLICATION_NAMESPACE).create(&InputMeta::builder().name(name.into()).build(), spec).await.expect("author")
+}
+
+/// An Artifact: a kind the old store still replicates, for the tests that start replicators through
+/// a peer connect.
+fn artifact(subject: &str) -> ArtifactSpec {
+    ArtifactSpec::builder()
+        .convoy("convoy".into())
+        .producer("producer".into())
+        .kind("report".into())
+        .subject(subject.into())
+        .digest("digest".into())
+        .size(1)
+        .media_type("text/plain".into())
+        .expires_at(Utc::now() + chrono::Duration::days(1))
+        .build()
+}
+
+async fn replica_origins<T: Resource>(backend: &ResourceBackend) -> Vec<(String, NodeId)> {
     let mut rows = backend
-        .including_replicas::<Convoy>(REPLICATION_NAMESPACE)
+        .including_replicas::<T>(REPLICATION_NAMESPACE)
         .list()
         .await
         .expect("list replicas")
@@ -44,10 +60,10 @@ async fn replica_origins(backend: &ResourceBackend) -> Vec<(String, NodeId)> {
     rows
 }
 
-async fn await_replicas(backend: &ResourceBackend, expected: &[(&str, &NodeId)]) {
+async fn await_replicas<T: Resource>(backend: &ResourceBackend, expected: &[(&str, &NodeId)]) {
     let expected = expected.iter().map(|(name, origin)| (name.to_string(), (*origin).clone())).collect::<Vec<_>>();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while replica_origins(backend).await != expected {
+        while replica_origins::<T>(backend).await != expected {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -71,11 +87,11 @@ async fn direct_peer_store_replicates_snapshot_and_live_log() {
         let peer = authority_id.clone();
         async move { replicate_kind_direct::<Convoy>(remote, &holder, &peer).await }
     });
-    await_replicas(holder.store(), &[("snapshotted", &authority_id)]).await;
+    await_replicas::<Convoy>(holder.store(), &[("snapshotted", &authority_id)]).await;
     author(&authority, "live").await;
-    await_replicas(holder.store(), &[("live", &authority_id), ("snapshotted", &authority_id)]).await;
+    await_replicas::<Convoy>(holder.store(), &[("live", &authority_id), ("snapshotted", &authority_id)]).await;
     authority.using::<Convoy>(REPLICATION_NAMESPACE).delete("snapshotted").await.expect("delete");
-    await_replicas(holder.store(), &[("live", &authority_id)]).await;
+    await_replicas::<Convoy>(holder.store(), &[("live", &authority_id)]).await;
 
     assert!(health.reports().contains(&HealthReport::Healthy(authority_id.clone(), "Convoy".into())));
     // Load metrics (#3206): one snapshot, then the live create and delete as events.
@@ -91,7 +107,7 @@ async fn direct_peer_store_replicates_snapshot_and_live_log() {
 async fn supervisors_replicate_a_connected_direct_peer_until_disconnect() {
     let authority_id = NodeId::new("authority");
     let authority = store(&authority_id);
-    author(&authority, "first").await;
+    author_as::<Artifact>(&authority, "first", &artifact("first")).await;
     let peers = Arc::new(InMemoryPeers::default());
     let socket = PathBuf::from("/peers/authority.sock");
     peers.serve(socket.clone(), authority.clone());
@@ -100,19 +116,124 @@ async fn supervisors_replicate_a_connected_direct_peer_until_disconnect() {
     let mut supervisors = PeerReplicatorSupervisors::new(
         holder.clone(),
         PeerSources { direct: Arc::clone(&peers) as Arc<dyn DirectPeerConnector>, routed: Arc::new(NoRoutedPeer) },
-        ReplicationOptions::new(Some(&["Convoy"])),
+        ReplicationOptions::new(Some(&["Artifact"])),
     );
 
     supervisors.peer_connected(authority_id.clone(), 1, Some(socket.clone())).await;
-    await_replicas(holder.store(), &[("first", &authority_id)]).await;
+    await_replicas::<Artifact>(holder.store(), &[("first", &authority_id)]).await;
     assert_eq!(health.reports().first(), Some(&HealthReport::Begin(authority_id.clone())));
     assert!(peers.connections.lock().expect("connections").iter().all(|path| path == &socket));
 
     supervisors.peer_disconnected(&authority_id, 1);
     tokio::task::yield_now().await;
-    author(&authority, "after-disconnect").await;
+    author_as::<Artifact>(&authority, "after-disconnect", &artifact("after-disconnect")).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(replica_origins(holder.store()).await, vec![("first".to_string(), authority_id)]);
+    assert_eq!(replica_origins::<Artifact>(holder.store()).await, vec![("first".to_string(), authority_id)]);
+}
+
+// A peer connect starts an old-store replicator for every registered kind the old store still
+// holds, and none for a kind the engine holds: those reach this home by following the peer's log.
+#[tokio::test]
+async fn peer_connect_starts_no_old_store_replicator_for_an_engine_held_kind() {
+    connect_a_peer_of_every_kind(false).await;
+}
+
+// The registry's mark decides, not the engine views: a peer that connects before this home
+// installs them still gets no old-store replicator for a kind the engine holds.
+#[tokio::test]
+async fn peer_connected_before_the_engine_views_starts_no_replicator_for_an_engine_held_kind() {
+    connect_a_peer_of_every_kind(true).await;
+}
+
+/// No engine records: a view installed only so the store serves the engine-held kinds.
+#[derive(Debug)]
+struct EmptyEngineViews(&'static [&'static str]);
+
+#[async_trait::async_trait]
+impl EngineRecords for EmptyEngineViews {
+    fn kinds(&self) -> &'static [&'static str] {
+        self.0
+    }
+    fn home(&self) -> String {
+        "holder".into()
+    }
+    async fn get(&self, _kind: &str, _name: &str) -> Result<Option<EngineObject>, String> {
+        Ok(None)
+    }
+    async fn list(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
+        Ok(Vec::new())
+    }
+    async fn sources(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
+        Ok(Vec::new())
+    }
+    async fn apply(
+        &self,
+        _kind: &str,
+        _name: &str,
+        _labels: &BTreeMap<String, String>,
+        _annotations: &BTreeMap<String, String>,
+        _spec: serde_json::Value,
+    ) -> Result<EngineObject, String> {
+        Err("no engine writes in this test".into())
+    }
+    async fn set_status(&self, _kind: &str, _name: &str, _status: serde_json::Value) -> Result<EngineObject, String> {
+        Err("no engine writes in this test".into())
+    }
+    async fn delete(&self, _kind: &str, _name: &str) -> Result<(), String> {
+        Err("no engine writes in this test".into())
+    }
+    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
+        Ok(futures::stream::pending().boxed())
+    }
+}
+
+/// Connects a direct peer with every kind included, installing views of the engine-held kinds
+/// after the connect when `views_after`, and checks the kinds whose replicators started.
+async fn connect_a_peer_of_every_kind(views_after: bool) {
+    let authority_id = NodeId::new("authority");
+    let peers = Arc::new(InMemoryPeers::default());
+    let socket = PathBuf::from("/peers/authority.sock");
+    peers.serve(socket.clone(), store(&authority_id));
+    let health = Arc::new(RecordingHealth::default());
+    let holder = host("holder", Arc::clone(&health));
+    let mut supervisors = PeerReplicatorSupervisors::new(
+        holder.clone(),
+        PeerSources { direct: peers, routed: Arc::new(NoRoutedPeer) },
+        ReplicationOptions::default(),
+    );
+    let old_store = old_store_resource_kinds()
+        .filter(|kind| kind.replication_class != ReplicationClass::None)
+        .map(|kind| kind.kind)
+        .collect::<BTreeSet<_>>();
+    let engine_held = REGISTERED_RESOURCE_KINDS.iter().filter(|kind| kind.engine_held).map(|kind| kind.kind).collect::<Vec<_>>();
+    assert!(!engine_held.is_empty(), "the registry names the kinds the engine holds");
+
+    supervisors.peer_connected(authority_id.clone(), 1, Some(socket)).await;
+    if views_after {
+        holder.store().install_engine_records(Arc::new(EmptyEngineViews(engine_held.clone().leak())));
+        assert!(engine_held.iter().all(|kind| holder.store().engine_serves(kind)));
+    }
+    // Every replicator started reports its kind once its watch is live, or its failure.
+    let reported = || {
+        health
+            .reports()
+            .into_iter()
+            .filter_map(|report| match report {
+                HealthReport::Begin(_) => None,
+                HealthReport::Healthy(_, kind) | HealthReport::Failure(_, kind, _) => Some(kind),
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !old_store.iter().all(|kind| reported().contains(*kind)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("old-store kinds did not all report: {:?}", reported()));
+
+    let started = reported();
+    assert_eq!(started.iter().map(String::as_str).collect::<BTreeSet<_>>(), old_store, "engine-held kinds: {engine_held:?}");
 }
 
 /// A routed peer that replays scripted watch items and records requests.
@@ -191,7 +312,7 @@ async fn routed_watch_snapshot_replaces_replicas_at_the_bookmark() {
 
     replicate_kind_over_routed_watch::<Convoy>(&routed, &holder, &peer_id, None).await.expect("routed watch");
 
-    assert_eq!(replica_origins(holder.store()).await, vec![("routed".to_string(), peer_id.clone())]);
+    assert_eq!(replica_origins::<Convoy>(holder.store()).await, vec![("routed".to_string(), peer_id.clone())]);
     assert_eq!(
         routed.requests.lock().expect("requests").as_slice(),
         [RoutedWatchRequest { namespace: REPLICATION_NAMESPACE.into(), kind: "convoys".into(), replica_sources: false, cursor: None }]
@@ -221,7 +342,7 @@ async fn routed_relay_skips_local_and_peer_origins() {
 
     replicate_relay_over_routed_watch::<Convoy>(&routed, &holder, &peer_id).await.expect("relay");
 
-    assert_eq!(replica_origins(holder.store()).await, vec![("from-third".to_string(), third)]);
+    assert_eq!(replica_origins::<Convoy>(holder.store()).await, vec![("from-third".to_string(), third)]);
     assert!(routed.requests.lock().expect("requests")[0].replica_sources);
 }
 
