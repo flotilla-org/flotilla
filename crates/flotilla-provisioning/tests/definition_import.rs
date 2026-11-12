@@ -549,6 +549,67 @@ fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
     assert_eq!(report.dropped.values().sum::<usize>(), 3, "{:?}", report.dropped);
 }
 
+// Behaviour (#3108, the rehearsal's ensures): project ops materialise a ConvoyEnsure or a
+// WorkflowTemplate at each home that refreshes the project, so a name held there is imported
+// there whichever home created its copy first, with or without the ops root's stamp. An
+// operator's copies still fold into the creating home's record.
+#[test]
+fn project_ops_copies_import_at_each_home_that_holds_them() {
+    let created = |mut copy: DefinitionCopy<flotilla_resources::ConvoyEnsure>, at_seconds: i64| {
+        copy.object.metadata.creation_timestamp = at(at_seconds);
+        copy
+    };
+    let ensure = ConvoyEnsureSpec {
+        project_ref: "p".into(),
+        role: "governor".into(),
+        driver_ref: Some("kiwi".into()),
+        workflow_ref: "review".into(),
+        placement_policy: None,
+        escalation_reason: None,
+        repositories: vec![RepositoryKey("repo".into())],
+        presents_as: Some("fleet".into()),
+        agent_overrides: Vec::new(),
+    };
+    let ensure_at = |home: &str, stamp: u8, at_seconds: i64| {
+        let (labels, annotations, _) = provenance(stamp);
+        created(copy("p--governor", home, labels, annotations, ensure.clone()), at_seconds)
+    };
+    let ensure_homes = |copies: &[DefinitionCopy<flotilla_resources::ConvoyEnsure>]| {
+        let mut report = ImportReport::default();
+        let homes = import_kind::<ConvoyEnsureDefinition>(copies, &mut report).into_iter().map(|record| record.home).collect::<Vec<_>>();
+        assert!(report.refused.is_empty(), "{report:?}");
+        (homes, report)
+    };
+
+    // Project ops at two homes, the other created earlier: each home imports its own, nothing folds.
+    for stamp in [3, 6] {
+        let (homes, report) = ensure_homes(&[ensure_at("alpha", stamp, 1), ensure_at("kiwi", stamp, 5)]);
+        assert_eq!(homes, ["alpha", "kiwi"], "stamp {stamp}");
+        assert!(report.notes.is_empty(), "{report:?}");
+    }
+
+    // An operator's copies at two homes: the creating home's record; the other folds into it.
+    let (homes, report) = ensure_homes(&[ensure_at("alpha", 0, 1), ensure_at("kiwi", 0, 5)]);
+    assert_eq!(homes, ["alpha"]);
+    assert_eq!(report.notes.len(), 1, "{report:?}");
+
+    // A project ops WorkflowTemplate alike.
+    let template_at = |home: &str, at_seconds: i64| {
+        let (labels, annotations, _) = provenance(3);
+        let mut copy =
+            copy::<flotilla_resources::WorkflowTemplate>("p--review", home, labels, annotations, WorkflowTemplateSpec::builder().build());
+        copy.object.metadata.creation_timestamp = at(at_seconds);
+        copy
+    };
+    let mut report = ImportReport::default();
+    let homes = import_kind::<WorkflowTemplateDefinition>(&[template_at("alpha", 1), template_at("kiwi", 5)], &mut report)
+        .into_iter()
+        .map(|record| record.home)
+        .collect::<Vec<_>>();
+    assert_eq!(homes, ["alpha", "kiwi"]);
+    assert!(report.notes.is_empty() && report.refused.is_empty(), "{report:?}");
+}
+
 // Behaviour (#3824 layer 3b plan, the Project import's table): every Project the fleet held
 // imports, and project operations' conditions in each copy's status become a ProjectOps record at
 // that copy's home, beside a Project that imports; the dispatch queue drops, being recomputed; a

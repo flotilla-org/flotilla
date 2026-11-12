@@ -11,6 +11,7 @@
 //! | A retired ADR 0053 image layer | dropped: inert for resolution |
 //! | With a field still in merge conflict | the merged value readers see, noted with its sibling values |
 //! | Declared by a manifest at one or more homes | one record at each declaring home |
+//! | Materialised by project ops at one or more homes | one record at each materialising home |
 //! | Declared by none | one record at the home that created it; the other copies fold into it |
 //!
 //! Project (layer 3b) imports alike, with its project operations' status as records of their own
@@ -234,8 +235,16 @@ where
             continue;
         }
         let live: Vec<_> = copies.iter().copied().filter(|copy| copy.object.metadata.deletion_timestamp.is_none()).collect();
-        let declaring: Vec<_> =
-            live.iter().copied().filter(|copy| declares(&copy.object.metadata.labels, &copy.object.metadata.annotations)).collect();
+        // Project ops materialise their entries at each home that refreshes the project, as a
+        // manifest declares at each home that applies it: every such copy keeps its own record.
+        let declaring: Vec<_> = live
+            .iter()
+            .copied()
+            .filter(|copy| {
+                declares(&copy.object.metadata.labels, &copy.object.metadata.annotations)
+                    || matches!(origin(&copy.object.metadata), Ok(DefinitionOrigin::ProjectOps { .. }))
+            })
+            .collect();
         let homes = if declaring.is_empty() {
             // An undeclared name stays with the home that created it.
             live.iter()
