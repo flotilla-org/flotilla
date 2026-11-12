@@ -554,16 +554,16 @@ impl ControllerMetricsRegistry {
     }
 }
 
-/// One daemon's replication of its peers' stores.
+/// One daemon's following of its peers' change streams, directly or relayed.
 #[derive(Debug, Default)]
 pub struct ReplicationLoadMetrics {
-    /// Full snapshots taken, at first connect and after every resnapshot.
+    /// Rounds that installed a snapshot of a home.
     pub snapshots: Counter,
-    /// Watches dropped because the replicator fell behind its peer's stream.
+    /// Retired with the old store's replicator; nothing counts it.
     pub lag_resets: Counter,
-    /// Watch streams that ended in an error and were restarted.
+    /// Rounds that failed and were retried from the committed prefix.
     pub stream_failures: Counter,
-    /// Live watch events applied after the snapshot.
+    /// Log entries rounds applied after the cursor.
     pub events_applied: Counter,
 }
 

@@ -587,7 +587,7 @@ impl PeerRuntime {
             // Composition: the daemon's stores, identity and health, with
             // direct peers over forwarded sockets and routed peers over the router.
             let mut peer_replicators = PeerReplicatorSupervisors::new(
-                replication_host(&outbound_daemon).with_metrics(replication_metrics),
+                replication_host(&outbound_daemon),
                 peer_sources(Arc::clone(&outbound_daemon), outbound_remote_command_router.clone()),
                 replication_options,
             );
@@ -621,6 +621,7 @@ impl PeerRuntime {
                                 notice.resource_socket_path.clone(),
                                 outbound_remote_command_router.clone(),
                                 stream_holds.clone(),
+                                Arc::clone(&replication_metrics),
                             );
                             decided_followers
                                 .insert(notice.peer.clone(), (notice.generation, tokio_util::task::AbortOnDropHandle::new(task)));

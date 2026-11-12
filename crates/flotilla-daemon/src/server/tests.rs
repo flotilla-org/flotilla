@@ -6788,12 +6788,14 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         current.version = stamp.version;
         current.value = next;
     }
+    let metrics = Arc::new(flotilla_store::load_metrics::ReplicationLoadMetrics::default());
     let following = tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(
         Arc::clone(&local),
         "home".into(),
         None,
         router.clone(),
         Default::default(),
+        Arc::clone(&metrics),
     ));
     let failure = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -6820,6 +6822,9 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     assert!(state.last_error.unwrap().contains("home/rs/large"));
     assert!(failure.message.unwrap().contains("home/rs/large"));
     assert!(!fresh.has_watermark("home"));
+    // The failed round counts into the replication load metrics; it installed nothing.
+    assert!(metrics.stream_failures.get() >= 1);
+    assert_eq!(metrics.snapshots.get(), 0);
 
     super::change_stream::follow_round(Arc::clone(&target), "home", "home", None, &router, &Default::default()).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 176);
@@ -6856,12 +6861,14 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
             write.commit()
         })
         .unwrap();
+    let metrics = Arc::new(flotilla_store::load_metrics::ReplicationLoadMetrics::default());
     let following = tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(
         Arc::clone(&local),
         "home".into(),
         None,
         router.clone(),
         Default::default(),
+        Arc::clone(&metrics),
     ));
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -6883,6 +6890,8 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     .unwrap();
     following.abort();
     assert_eq!(fresh.watermark("home").unwrap().home_seq, 178);
+    // The recovering follower's snapshot counts into the replication load metrics.
+    assert!(metrics.snapshots.get() >= 1);
     let state = home.get_host_status_internal(environment).await.unwrap().change_stream.unwrap();
     assert_eq!(state.watermark, 178);
     assert_eq!(state.consecutive_failures, 0);

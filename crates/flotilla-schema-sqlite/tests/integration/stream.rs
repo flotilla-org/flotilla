@@ -1,6 +1,6 @@
 use flotilla_schema::{Code, Kind, Timestamp};
 use flotilla_schema_sqlite::{
-    stream::{self, Follower, Frame, Watermark},
+    stream::{self, Follower, Frame, Received, Watermark},
     Store, StoreError,
 };
 use hegel::generators as gs;
@@ -17,7 +17,7 @@ fn insert(store: &mut Store, name: &str) -> flotilla_schema_sqlite::Stamp {
     write.commit().expect("commit");
     stamp
 }
-fn sync(source: &mut Store, target: &mut Store, after: Option<u64>, time: i64) -> Result<(), StoreError> {
+fn sync(source: &mut Store, target: &mut Store, after: Option<u64>, time: i64) -> Result<Received, StoreError> {
     let home = source.home().to_owned();
     Follower::new(target).receive(&home, |sink| stream::serve(source, after, Timestamp(time), sink).map(|_| ()))
 }
@@ -60,6 +60,19 @@ fn snapshot_tail_resume_and_three_stores() {
     sync(&mut a, &mut b, Some(4), 3).expect("resume idle");
     assert_eq!(mark(&mut b, "a").home_seq, before.home_seq);
     assert_eq!(mark(&mut b, "a").applied_through, Timestamp(3));
+}
+
+// A round reports what it installed: a snapshot, then each log entry past the cursor once.
+// Entries a round re-sends at or behind the cursor are skipped and not counted.
+#[test]
+fn a_round_reports_its_snapshot_and_the_entries_it_applied() {
+    let mut a = store("a");
+    let mut b = store("b");
+    insert(&mut a, "a1");
+    assert_eq!(sync(&mut a, &mut b, None, 1).expect("snapshot"), Received { snapshot: true, applied: 0 });
+    insert(&mut a, "a2");
+    assert_eq!(sync(&mut a, &mut b, Some(2), 2).expect("tail"), Received { snapshot: false, applied: 1 });
+    assert_eq!(sync(&mut a, &mut b, Some(2), 3).expect("again"), Received { snapshot: false, applied: 0 });
 }
 
 // Expunge removes history and advances its floor in the same transaction. Rollback restores

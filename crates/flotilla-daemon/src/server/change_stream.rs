@@ -8,6 +8,7 @@ use flotilla_schema_sqlite::{
     stream::{self, Follower, Frame, Service, FRAMING, HEADER_LEN},
     StoreError,
 };
+use flotilla_store::load_metrics::ReplicationLoadMetrics;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
@@ -164,8 +165,25 @@ impl flotilla_engine_messages::ports::HomeReads for DecidedHomeReads {
     }
 }
 
-/// The homes a round's keepalive says its server holds.
-type Homes = Vec<String>;
+/// One installed round: the homes its keepalive says its server holds, and what it installed.
+#[derive(Debug, Default)]
+pub(super) struct Round {
+    homes: Vec<String>,
+    received: stream::Received,
+}
+
+/// Counts a round into the replication load metrics: a failure, or what it installed.
+fn count(metrics: &ReplicationLoadMetrics, result: &Result<Round, String>) {
+    match result {
+        Ok(round) => {
+            if round.received.snapshot {
+                metrics.snapshots.increment();
+            }
+            metrics.events_applied.add(round.received.applied);
+        }
+        Err(_) => metrics.stream_failures.increment(),
+    }
+}
 
 /// The homes whose change streams this host has paused, for routing scenarios that prove a
 /// decision does not depend on what a home writes after the pause reaching this host. A held
@@ -225,7 +243,7 @@ pub(super) async fn follow_round(
     client: Option<&reqwest::Client>,
     router: &super::remote_commands::RemoteCommandRouter,
     holds: &StreamHolds,
-) -> Result<Homes, String> {
+) -> Result<Round, String> {
     match client {
         Some(client) => {
             use flotilla_protocol::CommandValue;
@@ -243,7 +261,7 @@ pub(super) async fn follow_round(
                 return Err(format!("unexpected routed stream response: {value:?}"));
             };
             match follow_connection(Arc::clone(&service), home, peer != home, client, &session, &frame, holds).await {
-                Ok(homes) => Ok(homes),
+                Ok(round) => Ok(round),
                 Err(HttpRoundError::RouteUnavailable(error)) => {
                     tracing::debug!(%peer, %home, %error, "peer socket unavailable; using peer route for this round");
                     routed_round(service, peer, home, router, holds).await
@@ -261,7 +279,7 @@ async fn routed_round(
     home: &str,
     router: &super::remote_commands::RemoteCommandRouter,
     holds: &StreamHolds,
-) -> Result<Homes, String> {
+) -> Result<Round, String> {
     use flotilla_protocol::CommandValue;
     let after =
         service.has_watermark(home).then(|| service.watermark(home)).transpose().map_err(|e| e.to_string())?.map(|mark| mark.home_seq);
@@ -294,6 +312,7 @@ pub(super) fn follow(
     socket: Option<PathBuf>,
     router: super::remote_commands::RemoteCommandRouter,
     holds: StreamHolds,
+    metrics: Arc<ReplicationLoadMetrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use flotilla_projections::fleet::ChangeStreamUpdate;
@@ -320,6 +339,7 @@ pub(super) fn follow(
         loop {
             holds.released(&home).await;
             let result = follow_round(Arc::clone(&service), &home, &home, client.as_ref(), &router, &holds).await;
+            count(&metrics, &result);
             let watermark = service.watermark(&home).expect("cached watermark").home_seq;
             match &result {
                 Ok(_) => daemon.report_change_stream(&peer, ChangeStreamUpdate::Healthy(watermark)),
@@ -332,11 +352,19 @@ pub(super) fn follow(
             // every round in a row is given up until its link reconnects, which starts a new
             // follower.
             match result {
-                Ok(homes) => {
+                Ok(round) => {
                     failures = 0;
-                    for other in homes {
+                    for other in round.homes {
                         if other != own && other != home && relayed.insert(other.clone()) {
-                            relays.spawn(relay(Arc::clone(&service), home.clone(), other, client.clone(), router.clone(), holds.clone()));
+                            relays.spawn(relay(
+                                Arc::clone(&service),
+                                home.clone(),
+                                other,
+                                client.clone(),
+                                router.clone(),
+                                holds.clone(),
+                                Arc::clone(&metrics),
+                            ));
                         }
                     }
                 }
@@ -363,11 +391,14 @@ async fn relay(
     client: Option<reqwest::Client>,
     router: super::remote_commands::RemoteCommandRouter,
     holds: StreamHolds,
+    metrics: Arc<ReplicationLoadMetrics>,
 ) {
     let mut failures: u32 = 0;
     loop {
         holds.released(&home).await;
-        match follow_round(Arc::clone(&service), &peer, &home, client.as_ref(), &router, &holds).await {
+        let result = follow_round(Arc::clone(&service), &peer, &home, client.as_ref(), &router, &holds).await;
+        count(&metrics, &result);
+        match result {
             Ok(_) => failures = 0,
             Err(error) => {
                 failures += 1;
@@ -410,7 +441,7 @@ async fn follow_connection(
     session: &str,
     first: &[u8],
     holds: &StreamHolds,
-) -> Result<Homes, HttpRoundError> {
+) -> Result<Round, HttpRoundError> {
     // The peer-issued session fixes the cursor; HTTP only continues that round.
     let target = format!("http://flotilla.local{}", stream::PATH);
     let mut spool = tokio::fs::File::from_std(tempfile::tempfile().map_err(|e| e.to_string())?);
@@ -486,17 +517,17 @@ async fn install_spool(
     relayed: bool,
     mut spool: std::fs::File,
     holds: &StreamHolds,
-) -> Result<Homes, String> {
+) -> Result<Round, String> {
     if holds.is_held(home) {
         tracing::debug!(%home, "change stream held; dropping round");
-        return Ok(Homes::new());
+        return Ok(Round::default());
     }
     let home = home.to_owned();
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Seek};
         spool.rewind().map_err(transport)?;
         let mut held = Vec::new();
-        service.with_store(|store| {
+        let received = service.with_store(|store| {
             let mut follower = if relayed { Follower::relayed(store) } else { Follower::new(store) };
             follower.receive(&home, |sink| loop {
                 let mut header = [0; HEADER_LEN];
@@ -518,7 +549,7 @@ async fn install_spool(
                 }
             })
         })?;
-        Ok::<_, StoreError>(held)
+        Ok::<_, StoreError>(Round { homes: held, received })
     })
     .await
     .map_err(|e| e.to_string())?

@@ -277,6 +277,15 @@ fn resource_chunks(snapshot: &Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<()
     Ok(())
 }
 
+/// What one committed delivery round installed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Received {
+    /// The round installed a snapshot of the home.
+    pub snapshot: bool,
+    /// Log entries the round applied after the cursor; entries another round already applied are not counted.
+    pub applied: u64,
+}
+
 /// Receiver for one home. Dropping it rolls back an incomplete snapshot. Each delivery round
 /// commits state and sequence together; only an applied keepalive moves the time watermark.
 pub struct Follower<'a> {
@@ -300,9 +309,10 @@ impl<'a> Follower<'a> {
         &mut self,
         home: &str,
         deliver: impl FnOnce(&mut dyn FnMut(&[u8]) -> Result<(), StoreError>) -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Received, StoreError> {
         let relayed = self.relayed;
         let mut write = self.store.write()?;
+        let mut received = Received::default();
         let mut snapshot = None;
         let mut chunks: Option<Snapshot> = None;
         let mut chunk_bytes = 0usize;
@@ -359,6 +369,7 @@ impl<'a> Follower<'a> {
                     cursor.home_seq = home_seq;
                     write.advance_watermark(home, cursor)?;
                     snapshot = None;
+                    received.snapshot = true;
                 }
                 Frame::Reason(change) if change.home == home && snapshot.is_none() => {
                     // The next sequence, or a change at or before the cursor re-sent ahead of an
@@ -383,6 +394,7 @@ impl<'a> Follower<'a> {
                     write.apply(&event)?;
                     cursor.home_seq = event.home_seq;
                     write.advance_watermark(home, cursor)?;
+                    received.applied += 1;
                 }
                 // At or behind the cursor: another round may have gone further meanwhile.
                 Frame::Keepalive { home: from, watermark, .. }
@@ -398,7 +410,8 @@ impl<'a> Follower<'a> {
         if snapshot.is_some() {
             return Err(StoreError::Stream("snapshot ended before its cut was installed".into()));
         }
-        write.commit()
+        write.commit()?;
+        Ok(received)
     }
 }
 

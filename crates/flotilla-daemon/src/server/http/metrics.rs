@@ -140,7 +140,6 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
     let replication = metrics.replication.snapshot();
     for (name, value) in [
         ("snapshots", replication.snapshots),
-        ("lag_resets", replication.lag_resets),
         ("stream_failures", replication.stream_failures),
         ("events_applied", replication.events_applied),
     ] {
@@ -373,7 +372,6 @@ mod tests {
             "flotilla_controller_resyncs_total",
             "flotilla_controller_resync_enqueued_total",
             "flotilla_replication_snapshots_total",
-            "flotilla_replication_lag_resets_total",
             "flotilla_replication_events_applied_total",
             "flotilla_read_retry_recoveries_total",
             "flotilla_read_retry_failures_total",
