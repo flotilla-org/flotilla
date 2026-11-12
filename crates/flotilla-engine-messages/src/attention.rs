@@ -24,6 +24,8 @@ pub enum Cause {
     Hold { convoy: Read },
     /// A standing role's declaration differs from what its convoy was admitted with.
     Drift { role: Read, convoy: Read },
+    /// A standing role's admission is refused past the retry limit; it waits for an event.
+    Refused { role: Read },
     /// Reclaiming a finished convoy's resources is refused.
     ReclaimRefused { convoy: Read },
     /// A vessel's credentials stop refreshing.
@@ -38,7 +40,7 @@ impl Cause {
     /// The fleet role that sends it.
     pub fn sender(&self) -> FleetRole {
         match self {
-            Cause::Hold { .. } | Cause::Drift { .. } => STANDING,
+            Cause::Hold { .. } | Cause::Drift { .. } | Cause::Refused { .. } => STANDING,
             Cause::ReclaimRefused { .. } => TEARDOWN,
             Cause::CredentialRefresh { .. } => CAPABILITIES,
             Cause::DeliveryHeld { .. } => TURN_RULES,
@@ -49,7 +51,7 @@ impl Cause {
     pub fn subject(&self) -> &Read {
         match self {
             Cause::Hold { convoy } | Cause::ReclaimRefused { convoy } => convoy,
-            Cause::Drift { role, .. } => role,
+            Cause::Drift { role, .. } | Cause::Refused { role } => role,
             Cause::CredentialRefresh { vessel } => vessel,
             Cause::DeliveryHeld { role } | Cause::Stalled { role } => role,
         }
@@ -115,6 +117,7 @@ mod tests {
                 "fleet:lab/role:standing",
                 "project:flotilla/role:gui",
             ),
+            (Cause::Refused { role: read("project:flotilla/role:gui") }, "fleet:lab/role:standing", "project:flotilla/role:gui"),
             (Cause::ReclaimRefused { convoy: convoy.clone() }, "fleet:lab/role:teardown", "project:flotilla/convoy:standing-gui"),
             (
                 Cause::CredentialRefresh { vessel: read("project:flotilla/convoy:demo/vessel:work") },

@@ -22,8 +22,9 @@ use flotilla_charter::ops_entry::{
 use flotilla_protocol::{PlacementTargetHost, PrincipalRef};
 use flotilla_resources::attentions::{Attention, Attentions, Fact, OpenAttention, Sender, Subject};
 use flotilla_resources::{
-    config_changes, Clock, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyPhase, FulfilmentKind,
-    Host as ResourceHost, Project, ReadResourceObject, Repository, ResourceError, ResourceObject, ResourceProvenance, WorkflowTemplate,
+    config_changes, Clock, ControllerRetry, ControllerRetryDisposition, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec,
+    ConvoyPhase, FulfilmentKind, Host as ResourceHost, Project, ReadResourceObject, Repository, ResourceError, ResourceObject,
+    ResourceProvenance, WorkflowTemplate, LOCAL_RETRY_LIMIT,
 };
 use flotilla_store::{ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
@@ -40,7 +41,18 @@ struct EnsureAdmissionRetry {
     dependency_hash: String,
     retry: ControllerRetry,
     failure: String,
+    refused_at: DateTime<Utc>,
 }
+
+impl EnsureAdmissionRetry {
+    /// Whether the refusals reached [`LOCAL_RETRY_LIMIT`]: the role then waits for an event.
+    fn past_limit(&self) -> bool {
+        self.retry.next_attempt_at().is_none()
+    }
+}
+
+/// What a role past the refusal limit needs before it is admitted again.
+const ADMISSION_REFUSED_NEEDS: &str = "a changed declaration or dependency, an acknowledgement, or reconcile-now";
 
 /// The reason a standing role's restart-limit hold gives its person: `failures` consecutive
 /// generations of it failed.
@@ -55,11 +67,14 @@ fn record_ensure_admission_retry(
     dependency_hash: String,
     now: DateTime<Utc>,
     failure: String,
-) -> (u32, DateTime<Utc>) {
+) -> (u32, Option<DateTime<Utc>>) {
     let previous = retries.get(&key).map(|entry| &entry.retry);
-    let retry = ControllerRetry::retryable(previous, now, flotilla_resources::PROVISIONING_RETRY_BACKOFF);
-    let result = (retry.attempts, retry.next_attempt_at().expect("new admission retry is retryable"));
-    retries.insert(key, EnsureAdmissionRetry { config_hash, dependency_hash, retry, failure });
+    let mut retry = ControllerRetry::retryable(previous, now, flotilla_resources::PROVISIONING_RETRY_BACKOFF);
+    if retry.attempts >= LOCAL_RETRY_LIMIT {
+        retry.disposition = ControllerRetryDisposition::Terminal { needs: ADMISSION_REFUSED_NEEDS.to_owned() };
+    }
+    let result = (retry.attempts, retry.next_attempt_at());
+    retries.insert(key, EnsureAdmissionRetry { config_hash, dependency_hash, retry, failure, refused_at: now });
     result
 }
 
@@ -67,6 +82,11 @@ fn record_ensure_admission_retry(
 enum EnsureConvoyScope {
     Local,
     IncludingReplicas,
+}
+
+/// The standing role `ensure` declares, as its drift and refusal attentions name it.
+fn standing_subject(ensure: &ResourceObject<ConvoyEnsure>) -> Subject {
+    Subject::StandingRole { project: ensure.spec.project_ref.clone(), role: ensure.spec.role.clone() }
 }
 
 /// Whether a generation has ended: an ended one admits a successor only through the role's
@@ -428,7 +448,8 @@ impl EnsurePass<'_> {
         }
     }
 
-    /// Reset one ensure's retry budget and drive its admission synchronously.
+    /// Drive one ensure's admission synchronously, past its backoff. Below the refusal limit
+    /// that resets its retry budget; past it, a refusal waits for the next event again.
     pub async fn reconcile_convoy_ensure_now(
         &self,
         namespace: &str,
@@ -439,7 +460,6 @@ impl EnsurePass<'_> {
         let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace);
         let ensure = ensures.get(name).await.map_err(|error| error.to_string())?;
         if ensure.spec.driver_ref.is_some() {
-            self.ensure_admission_retries.lock().await.remove(&(namespace.to_string(), name.to_string()));
             return self
                 .reconcile_driver_convoy_ensure(namespace, &ensure, backing_inspector, true)
                 .await
@@ -674,24 +694,13 @@ impl EnsurePass<'_> {
         if !released && reading.strikes > 0 {
             backing_inspector.verify_backing_dead(latest.expect("strikes need a generation")).await?;
         }
-        if let Some(retry_at) = self.admission_retry_due(&retry_key, &config_hash, &dependency_hash, released).await {
-            self.due_at(namespace, retry_at);
+        if self.admission_waits(namespace, ensure, &retry_key, &config_hash, &dependency_hash, released, force_now).await? {
             return Ok(None);
         }
 
         match self.start_ensured_convoy(namespace, ensure).await {
-            Ok(_) => {
-                self.ensure_admission_retries.lock().await.remove(&retry_key);
-                Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
-            }
-            Err(error) => {
-                let (refusals, retry_at) = {
-                    let mut retries = self.ensure_admission_retries.lock().await;
-                    record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, error.clone())
-                };
-                self.due_at(namespace, retry_at);
-                Err(format!("driver admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
-            }
+            Ok(_) => self.admitted(namespace, ensure, &retry_key).await,
+            Err(error) => self.admission_refused(namespace, ensure, retry_key, config_hash, dependency_hash, now, error).await,
         }
     }
 
@@ -714,8 +723,7 @@ impl EnsurePass<'_> {
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
         let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
         let Some(latest) = generations.first() else {
-            if let Some(retry_at) = self.admission_retry_due(&retry_key, &config_hash, &dependency_hash, force_now).await {
-                self.due_at(namespace, retry_at);
+            if self.admission_waits(namespace, ensure, &retry_key, &config_hash, &dependency_hash, force_now, force_now).await? {
                 return Ok(None);
             }
             return self.restart_absent_ensured_convoy(namespace, ensure, now).await;
@@ -757,17 +765,13 @@ impl EnsurePass<'_> {
             self.due_at(namespace, until);
             return Ok(None);
         }
-        if let Some(retry_at) = self.admission_retry_due(&retry_key, &config_hash, &dependency_hash, force_now).await {
-            self.due_at(namespace, retry_at);
+        if self.admission_waits(namespace, ensure, &retry_key, &config_hash, &dependency_hash, force_now, force_now).await? {
             return Ok(None);
         }
         // The ended generation remains as history. A successful restart admits the next
         // generation under a fresh record name.
         match self.start_ensured_convoy(namespace, ensure).await {
-            Ok(_) => {
-                self.ensure_admission_retries.lock().await.remove(&retry_key);
-                Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
-            }
+            Ok(_) => self.admitted(namespace, ensure, &retry_key).await,
             Err(error) => self.admission_refused(namespace, ensure, retry_key, config_hash, dependency_hash, now, error).await,
         }
     }
@@ -779,15 +783,15 @@ impl EnsurePass<'_> {
         now: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
         self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
-        // With no running convoy, no admitted configuration can have drifted.
-        let role = Subject::StandingRole { project: ensure.spec.project_ref.clone(), role: ensure.spec.role.clone() };
-        self.attentions.clear(namespace, Sender::Standing, &role).await?;
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
+        // With no running convoy, no admitted configuration can have drifted. While refusals
+        // run, the role's attention is their own, which only an admission or a changed
+        // declaration ends.
+        if !self.ensure_admission_retries.lock().await.contains_key(&retry_key) {
+            self.attentions.clear(namespace, Sender::Standing, &standing_subject(ensure)).await?;
+        }
         match self.start_ensured_convoy(namespace, ensure).await {
-            Ok(_) => {
-                self.ensure_admission_retries.lock().await.remove(&retry_key);
-                Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
-            }
+            Ok(_) => self.admitted(namespace, ensure, &retry_key).await,
             Err(error) => {
                 let config_hash = ensure_config_hash(&ensure.spec)?;
                 let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
@@ -796,8 +800,22 @@ impl EnsurePass<'_> {
         }
     }
 
+    /// A generation was admitted: the refusal note ends, and with it the refusal attention.
+    async fn admitted(
+        &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+        retry_key: &(String, String),
+    ) -> Result<Option<String>, String> {
+        self.ensure_admission_retries.lock().await.remove(retry_key);
+        self.attentions.clear(namespace, Sender::Standing, &standing_subject(ensure)).await?;
+        Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
+    }
+
     /// Records a refused admission: a warning with its cause and the in-memory refusal note, which
-    /// backs the next attempt off. A refusal is no strike: no generation was admitted.
+    /// backs the next attempt off. At [`LOCAL_RETRY_LIMIT`] refusals in a row the role stops
+    /// retrying on time and tells a person, once while the refusals run. A refusal is no strike:
+    /// no generation was admitted.
     #[allow(clippy::too_many_arguments)]
     async fn admission_refused(
         &self,
@@ -814,27 +832,63 @@ impl EnsurePass<'_> {
             let mut retries = self.ensure_admission_retries.lock().await;
             record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, error.clone())
         };
+        let Some(retry_at) = retry_at else {
+            let fact = Fact::Refused {
+                ensure: ensure.metadata.name.clone(),
+                project: ensure.spec.project_ref.clone(),
+                role: ensure.spec.role.clone(),
+            };
+            // The same refusal is one open attention; a person's acknowledgement answers the
+            // refusals before it, and a later one tells them again.
+            self.attentions.raise(namespace, &Attention::new(fact, format!("AdmissionRefused: {error}"), now)).await?;
+            return Err(format!("admission refused ({refusals} consecutive refusals); waiting for {ADMISSION_REFUSED_NEEDS}: {error}"));
+        };
         self.due_at(namespace, retry_at);
         Err(format!("admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
     }
 
-    /// When a refused admission may next be tried, while that is still to come: `None` once it is
-    /// due, when `released`, or when the configuration or a dependency changed since the refusal.
-    async fn admission_retry_due(
+    /// Whether a refused admission still waits, telling the pass when a timed wait ends. A changed
+    /// declaration or dependency ends the wait and resets the count; a changed declaration also
+    /// withdraws the refusal attention. Below [`LOCAL_RETRY_LIMIT`] refusals the wait ends at its
+    /// deadline or when `released`. Past it, only reconcile-now (`forced`) or a person's
+    /// acknowledgement since the last refusal admits, and the note stays, so the next refusal
+    /// waits again.
+    #[allow(clippy::too_many_arguments)]
+    async fn admission_waits(
         &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
         retry_key: &(String, String),
         config_hash: &str,
         dependency_hash: &str,
         released: bool,
-    ) -> Option<DateTime<Utc>> {
-        let mut retries = self.ensure_admission_retries.lock().await;
-        let changed =
-            retries.get(retry_key).is_some_and(|retry| retry.config_hash != config_hash || retry.dependency_hash != dependency_hash);
-        if changed || released {
-            retries.remove(retry_key);
-            return None;
+        forced: bool,
+    ) -> Result<bool, String> {
+        let Some(note) = self.ensure_admission_retries.lock().await.get(retry_key).cloned() else { return Ok(false) };
+        if note.config_hash != config_hash || note.dependency_hash != dependency_hash {
+            self.ensure_admission_retries.lock().await.remove(retry_key);
+            if note.past_limit() && note.config_hash != config_hash {
+                self.attentions.clear(namespace, Sender::Standing, &standing_subject(ensure)).await?;
+            }
+            return Ok(false);
         }
-        retries.get(retry_key).and_then(|retry| retry.retry.next_attempt_at()).filter(|retry_at| *retry_at > self.clock.now())
+        if !note.past_limit() {
+            if released {
+                self.ensure_admission_retries.lock().await.remove(retry_key);
+                return Ok(false);
+            }
+            let retry_at = note.retry.next_attempt_at().expect("a note below the limit is retryable");
+            if retry_at <= self.clock.now() {
+                return Ok(false);
+            }
+            self.due_at(namespace, retry_at);
+            return Ok(true);
+        }
+        if forced {
+            return Ok(false);
+        }
+        let acknowledged = self.attentions.acknowledged(namespace, Sender::Standing, &standing_subject(ensure), note.refused_at).await?;
+        Ok(acknowledged.is_none())
     }
 
     /// The role's generations homed here, newest first.
@@ -872,7 +926,7 @@ impl EnsurePass<'_> {
             Err(ResourceError::NotFound { .. }) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         }
-        let role = Subject::StandingRole { project: ensure.spec.project_ref.clone(), role: ensure.spec.role.clone() };
+        let role = standing_subject(ensure);
         if changes.is_empty() {
             return self.attentions.clear(namespace, Sender::Standing, &role).await;
         }
@@ -1390,6 +1444,83 @@ mod tests {
         assert_eq!(role.next_attempt, None);
         assert_eq!(role.convoy.as_deref(), Some("generation-1"));
         assert_eq!(admission.commits.load(Ordering::SeqCst), 1);
+    }
+
+    // #3108: refusals with the same hashes stop retrying on time at LOCAL_RETRY_LIMIT and tell a
+    // person once. Reconcile-now and an acknowledgement each admit once more; a changed declaration
+    // withdraws the attention and resets the count; an admission ends both.
+    #[tokio::test]
+    async fn refusals_past_the_limit_wait_for_events_with_one_attention() {
+        let (controller, admission, clock) = fixture().await;
+        let messages = admission._messages.clone().expect("engine messages");
+        let refusal_messages = || {
+            messages
+                .primitives()
+                .messages()
+                .expect("messages")
+                .into_iter()
+                .filter(|(_, message)| {
+                    message.spec().subject().is_some_and(|subject| subject.address.as_str() == "project:project/role:standing")
+                })
+                .count()
+        };
+        let pass = || controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead);
+        admission.refused.store(true, Ordering::SeqCst);
+        for _ in 0..LOCAL_RETRY_LIMIT {
+            assert!(pass().await.is_err());
+            clock.advance(ChronoDuration::minutes(16));
+        }
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT);
+        assert_eq!(refusal_messages(), 1, "the limit tells a person");
+        let role = standing(&controller).await;
+        assert_eq!(role.next_attempt, None, "past the limit nothing is due on time");
+
+        // Time alone admits nothing more.
+        clock.advance(ChronoDuration::hours(6));
+        assert!(pass().await.expect("waits").is_empty());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT);
+
+        // Reconcile-now tries once; the same refusal raises no second message.
+        assert!(controller.reconcile_convoy_ensure_now(&admission, "test", "standing", &Backing::Dead).await.is_err());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 1);
+        assert!(pass().await.expect("waits again").is_empty());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 1);
+        assert_eq!(refusal_messages(), 1, "repeated refusals with the same hashes are one message");
+
+        // A person's acknowledgement admits once more; the refusal after it tells them again.
+        let (_, waiting) = messages
+            .primitives()
+            .person_messages("test")
+            .await
+            .expect("person messages")
+            .into_iter()
+            .next()
+            .expect("the refusal waits for a person");
+        let address: flotilla_address::Address = waiting.name().parse().expect("message address");
+        messages.primitives().acknowledge("test", address.name()).await.expect("acknowledged");
+        clock.advance(ChronoDuration::seconds(1));
+        assert!(pass().await.is_err());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 2);
+        assert!(pass().await.expect("waits after the answered attempt").is_empty());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 2);
+        assert_eq!(refusal_messages(), 2);
+
+        // A changed declaration withdraws the attention and tries again with a fresh count.
+        let ensures = admission.backend.using::<ConvoyEnsure>("test");
+        let ensure = ensures.get("standing").await.expect("ensure");
+        let changed = ConvoyEnsureSpec { workflow_ref: "standing-two".into(), ..ensure.spec.clone() };
+        ensures.update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &changed).await.expect("declaration changed");
+        assert!(pass().await.is_err());
+        assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 3);
+        let open = admission.backend.attentions().open("test", Some(Sender::Standing), None).await.expect("attentions");
+        assert!(open.is_empty(), "a changed declaration ends the refusal attention: {open:?}");
+        assert!(standing(&controller).await.next_attempt.is_some(), "a fresh count retries on time");
+
+        // An admission ends the note.
+        admission.refused.store(false, Ordering::SeqCst);
+        clock.advance(ChronoDuration::minutes(1));
+        assert_eq!(pass().await.expect("admits").len(), 1);
+        assert_eq!(standing(&controller).await.convoy.as_deref(), Some("generation-1"));
     }
 
     // #2220: live backing raises attention and holds admission; verified death

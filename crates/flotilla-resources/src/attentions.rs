@@ -85,6 +85,9 @@ pub enum Fact {
     Hold { ensure: String, convoy: String },
     /// A standing role's declaration differs from what its running convoy was admitted with.
     Drift { ensure: String, project: String, role: String, convoy: String },
+    /// A standing role's admission was refused [`LOCAL_RETRY_LIMIT`](crate::LOCAL_RETRY_LIMIT)
+    /// times in a row with the same declaration and dependencies; it waits for an event.
+    Refused { ensure: String, project: String, role: String },
     /// Reclaiming a finished convoy's resources is refused.
     ReclaimRefused { convoy: String },
     /// A vessel's credentials stop refreshing: each failing credential, with why.
@@ -98,7 +101,7 @@ pub enum Fact {
 impl Fact {
     pub fn sender(&self) -> Sender {
         match self {
-            Fact::Hold { .. } | Fact::Drift { .. } => Sender::Standing,
+            Fact::Hold { .. } | Fact::Drift { .. } | Fact::Refused { .. } => Sender::Standing,
             Fact::ReclaimRefused { .. } => Sender::Teardown,
             Fact::CredentialRefresh { .. } => Sender::Capabilities,
             Fact::DeliveryHeld { .. } => Sender::TurnRules,
@@ -109,7 +112,9 @@ impl Fact {
     pub fn subject(&self) -> Subject {
         match self {
             Fact::Hold { convoy, .. } | Fact::ReclaimRefused { convoy } => Subject::convoy(convoy.clone()),
-            Fact::Drift { project, role, .. } => Subject::StandingRole { project: project.clone(), role: role.clone() },
+            Fact::Drift { project, role, .. } | Fact::Refused { project, role, .. } => {
+                Subject::StandingRole { project: project.clone(), role: role.clone() }
+            }
             Fact::CredentialRefresh { convoy, vessel, .. } => Subject::Vessel { convoy: convoy.clone(), vessel: vessel.clone() },
             Fact::DeliveryHeld { convoy, role, .. } | Fact::Stalled { convoy, role } => {
                 Subject::ConvoyRole { convoy: convoy.clone(), role: role.clone() }
@@ -117,15 +122,17 @@ impl Fact {
         }
     }
 
-    /// The convoy whose dispatching principal hears it.
-    pub fn convoy(&self) -> &str {
+    /// The convoy whose dispatching principal hears it. A refused admission has none: the
+    /// principal admission would have stamped hears it.
+    pub fn convoy(&self) -> Option<&str> {
         match self {
             Fact::Hold { convoy, .. }
             | Fact::Drift { convoy, .. }
             | Fact::ReclaimRefused { convoy }
             | Fact::CredentialRefresh { convoy, .. }
             | Fact::DeliveryHeld { convoy, .. }
-            | Fact::Stalled { convoy, .. } => convoy,
+            | Fact::Stalled { convoy, .. } => Some(convoy),
+            Fact::Refused { .. } => None,
         }
     }
 }
