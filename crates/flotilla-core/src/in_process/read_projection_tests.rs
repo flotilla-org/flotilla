@@ -81,6 +81,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
             let backend = ResourceBackend::new(InMemoryBackend::default());
+            backend.install_attentions(Arc::new(flotilla_store_testkit::NoAttentions));
             let author = if replicated { ResourceBackend::new(InMemoryBackend::default()) } else { backend.clone() };
             let now = Utc::now();
             let began_at = now + ChronoDuration::seconds(if future { 10 } else { -300 });
@@ -185,7 +186,7 @@ mod tests {
                     assert_eq!(row.project_display_name.as_deref(), Some("Project display"));
                     assert_eq!(row.convoy_display_name, "implement #2");
                     assert_eq!(row.age_seconds, Some(if future { 0 } else { 300 }));
-                    assert_eq!(row.vessel.is_empty(), unrecognized);
+                    assert_eq!(row.vessel.is_none(), unrecognized);
                     assert_eq!(row.role.is_empty(), unrecognized);
                     assert_eq!(row.shared_cause_count, if shared { count * obligations_per_convoy } else { obligations_per_convoy });
                     assert_eq!(
@@ -201,7 +202,7 @@ mod tests {
                         )
                     );
                     assert_eq!(row.supervisor.as_deref(), (rung != 4).then_some("governor/control/governor"));
-                    assert_eq!(row.supervisor_absence_reason.as_deref(), (rung == 4).then_some(row.evidence.as_str()));
+                    assert_eq!(row.supervisor_absence_reason, row.evidence.clone().filter(|_| rung == 4));
                     assert_eq!(row.proposed_disposition, Some(flotilla_protocol::StallProposedDisposition::Resume));
                 }
             }
@@ -212,6 +213,7 @@ mod tests {
     #[tokio::test]
     async fn crew_stalls_retains_crew_without_current_condition() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
+        backend.install_attentions(Arc::new(flotilla_store_testkit::NoAttentions));
         let convoys = backend.using::<ResourceConvoy>("other-namespace");
         let convoy = convoys
             .create(&InputMeta::builder().name("stalled".into()).build(), &ConvoySpec::builder().workflow_ref("scratch".into()).build())
@@ -241,7 +243,7 @@ mod tests {
         assert_eq!(row.role, "coder");
         assert_eq!(row.rung, None);
         assert_eq!(row.age_seconds, None);
-        assert_eq!(row.evidence, "rate limit");
+        assert_eq!(row.evidence.as_deref(), Some("rate limit"));
         assert_eq!(row.supervisor_absence_reason.as_deref(), Some("no current stall condition recorded for this obligation"));
     }
 
@@ -251,6 +253,7 @@ mod tests {
     #[tokio::test]
     async fn an_operator_level_stall_shows_as_stalled_without_an_engine_record() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
+        backend.install_attentions(Arc::new(flotilla_store_testkit::NoAttentions));
         let convoys = backend.using::<ResourceConvoy>("flotilla");
         let convoy = convoys
             .create(&InputMeta::builder().name("demo".into()).build(), &ConvoySpec::builder().workflow_ref("scratch".into()).build())
@@ -295,7 +298,7 @@ mod tests {
         assert!(!records.stalled(&seat).expect("read"), "no engine stall record at the operator rung");
         let response = ReadProjections::crew_stalls(&backend, false, Utc::now()).await.expect("stalls");
         assert_eq!(response.rows.len(), 1, "{:?}", response.rows);
-        assert_eq!((response.rows[0].vessel.as_str(), response.rows[0].role.as_str()), ("work", "coder"));
+        assert_eq!((response.rows[0].vessel.as_deref(), response.rows[0].role.as_str()), (Some("work"), "coder"));
         assert_eq!(response.rows[0].rung, Some(flotilla_resources::StallRung::Operator));
     }
 

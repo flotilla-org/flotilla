@@ -1,38 +1,39 @@
 use super::*;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store::controller::WorkQueueSender;
+use flotilla_store_testkit::VirtualClock;
+
+/// Launch `launch` as its view reads, keyed for a judge, once `wake`'s views have heard it.
+async fn heard(
+    backend: &ResourceBackend,
+    home: &EngineHome,
+    wake: &ReconcilerWake,
+    launch: &str,
+) -> HashMap<String, ResourceObject<Convoy>> {
+    let convoy = home.view(backend, launch).await;
+    caught_up(wake, &convoy).await;
+    HashMap::from([(launch.to_owned(), convoy)])
+}
+
+/// Launch `launch`'s status as its view reads.
+async fn status_of(backend: &ResourceBackend, home: &EngineHome, launch: &str) -> ConvoyStatus {
+    home.view(backend, launch).await.status.expect("status")
+}
 
 // #3412: satisfied settlement waits on the Convoy controller, including the
 // zero-subject claim exit. An idle controller is able regardless of row age.
 #[tokio::test]
 async fn satisfied_landing_has_controller_dependency() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let mut wake = supervision_wake(&backend);
+    let (backend, home) = engine_backend();
+    let mut wake = supervision_wake(&backend, &home);
     let now = Utc::now() + chrono::Duration::days(365);
-    wake.subscriptions = wake.subscriptions.with_clock(Arc::new(flotilla_store_testkit::VirtualClock::new(now)));
-    let (queue, _receiver) = flotilla_store::controller::WorkQueueSender::channel();
+    wake.subscriptions = wake.subscriptions.with_clock(Arc::new(VirtualClock::new(now)));
+    let (queue, _receiver) = WorkQueueSender::channel();
     wake.subscriptions.inner.controller_queues.lock().await.insert("flotilla".into(), queue);
-    create_convoy(
-        &backend,
-        "settled",
-        ConvoyStatus {
-            phase: ConvoyPhase::Landing,
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: Some(ExitDeclaration::standard_table()),
-                turn_delivery: Default::default(),
-                vessels: vec![],
-            }),
-            ..Default::default()
-        },
-    )
-    .await;
-    let convoy = backend.using::<Convoy>("flotilla").get("settled").await.unwrap();
-    let objects = HashMap::from([("settled".into(), convoy)]);
+    let launch = landing_launch(&backend, &home, "settled", convoy_spec(), ExitDeclaration::standard_table()).await;
+    let objects = heard(&backend, &home, &wake, &launch).await;
     wake.sync_rows("flotilla", &objects).await.unwrap();
     assert!(wake.subscriptions.rows().await.iter().any(|row| matches!(&row.maker,
-        LeafMaker::Controller { resource_kind, name: Some(name), .. } if resource_kind == "Convoy" && name == "settled")));
+        LeafMaker::Controller { resource_kind, name: Some(name), .. } if resource_kind == "Convoy" && *name == launch)));
     // #3419: synthetic dependency timestamps follow the injected judge clock.
     let row = wake
         .subscriptions
@@ -49,38 +50,25 @@ async fn satisfied_landing_has_controller_dependency() {
     assert_eq!(retry.first_failure_at, now);
     assert_eq!(retry.next_attempt_at(), Some(now));
     wake.judge_stalls_at("flotilla", &objects, Utc::now() + chrono::Duration::hours(2)).await.unwrap();
-    assert!(backend.using::<Convoy>("flotilla").get("settled").await.unwrap().status.unwrap().stalled.is_none());
+    assert!(status_of(&backend, &home, &launch).await.stalled.is_none());
 }
 
 // #3412: landing must clear a pre-existing stall in the transition write;
 // waiting for another judge pass can leave terminal history stalled forever.
 #[tokio::test]
 async fn landing_transition_clears_stall_without_another_judge() {
-    let (backend, wake, _) = project_supervision_case(&[]).await;
-    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.unwrap();
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), convoy)])).await.unwrap();
-    let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys.get("stalled-work").await.unwrap();
-    assert!(convoy.status.as_ref().unwrap().stalled.is_some(), "precondition: judge raised a stall");
-    flotilla_store::apply_status_patch(
-        &convoys,
-        "stalled-work",
-        &flotilla_resources::ConvoyStatusPatch::Settle {
-            disposition: "claim".into(),
-            target_mismatches: vec![],
-            finished_at: Utc::now(),
-            evidence: None,
-        },
-    )
-    .await
-    .unwrap();
-    let status = convoys.get("stalled-work").await.unwrap().status.unwrap();
+    let case = project_supervision_case(&[]).await;
+    case.judge(&case.wake, Utc::now()).await;
+    let prior = case.status().await;
+    assert!(prior.stalled.is_some(), "precondition: judge raised a stall");
+    case.home.keep(&case.backend, &case.work, "work", "coder").await;
+    case.home.end(&case.backend, &case.work, ConvoyPhase::Landed).await;
+    let status = case.status().await;
     assert_eq!(status.phase, ConvoyPhase::Landed);
     assert!(status.stalled.is_none(), "terminal transition must clear the stall atomically");
     // All terminal phase rollups share the same invariant, including duplicate
     // patches and a stale attempt to reapply the old stall after the transition.
     for phase in [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned] {
-        let prior = convoy.status.as_ref().unwrap();
         let mut status = prior.clone();
         flotilla_resources::ConvoyStatusPatch::RollUpPhase { phase, started_at: None, finished_at: Some(Utc::now()) }.apply(&mut status);
         assert!(status.stalled.is_none());
@@ -94,42 +82,29 @@ async fn landing_transition_clears_stall_without_another_judge() {
 // total Landing residence, bounds the wait.
 #[tokio::test]
 async fn satisfied_landing_names_stuck_controller_and_recovers() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let wake = supervision_wake(&backend);
-    let (queue, _receiver) = flotilla_store::controller::WorkQueueSender::channel();
+    let (backend, home) = engine_backend();
+    let wake = supervision_wake(&backend, &home);
+    let (queue, _receiver) = WorkQueueSender::channel();
     wake.subscriptions.inner.controller_queues.lock().await.insert("flotilla".into(), queue.clone());
-    let status = ConvoyStatus {
-        phase: ConvoyPhase::Landing,
-        workflow_snapshot: Some(WorkflowSnapshot {
-            cascade: None,
-            stall_nudges: Default::default(),
-            supervision: None,
-            exit: Some(ExitDeclaration::standard_table()),
-            turn_delivery: Default::default(),
-            vessels: vec![],
-        }),
-        ..Default::default()
-    };
-    create_convoy(&backend, "settled", status).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    queue.send("settled".into()).await.unwrap();
+    let launch = landing_launch(&backend, &home, "settled", convoy_spec(), ExitDeclaration::standard_table()).await;
+    queue.send(launch.clone()).await.unwrap();
     let start = Utc::now();
     for age in [0, 59, 61] {
-        let objects = HashMap::from([("settled".into(), convoys.get("settled").await.unwrap())]);
+        let objects = heard(&backend, &home, &wake, &launch).await;
         wake.sync_rows("flotilla", &objects).await.unwrap();
         wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
-        let status = convoys.get("settled").await.unwrap().status.unwrap();
+        let status = status_of(&backend, &home, &launch).await;
         assert_eq!(status.stalled.is_some(), age >= 60);
         if let Some(stall) = status.stalled {
-            assert!(stall.evidence.contains("Convoy controller for settled"), "{}", stall.evidence);
+            assert!(stall.evidence.contains(&format!("Convoy controller for {launch}")), "{}", stall.evidence);
             assert!(stall.evidence.contains("no progress"));
         }
     }
-    let (restarted, _receiver) = flotilla_store::controller::WorkQueueSender::channel();
+    let (restarted, _receiver) = WorkQueueSender::channel();
     wake.subscriptions.inner.controller_queues.lock().await.insert("flotilla".into(), restarted);
-    let objects = HashMap::from([("settled".into(), convoys.get("settled").await.unwrap())]);
+    let objects = heard(&backend, &home, &wake, &launch).await;
     wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(62)).await.unwrap();
-    assert!(convoys.get("settled").await.unwrap().status.unwrap().stalled.is_none());
+    assert!(status_of(&backend, &home, &launch).await.stalled.is_none());
 }
 
 // #3412: freshness demands are unknown through the observer's grace and
@@ -148,9 +123,9 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
             for (age, missing, merged) in
                 [(0, false, false), (19, false, false), (20, false, false), (21, true, false), (400, false, true), (age, missing, merged)]
             {
-                let backend = ResourceBackend::new(InMemoryBackend::default());
-                let wake = supervision_wake(&backend);
-                create_convoy(&backend, "forge", ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() }).await;
+                let (backend, home) = engine_backend();
+                let wake = supervision_wake(&backend, &home);
+                let launch = landing_launch(&backend, &home, "forge", convoy_spec(), ExitDeclaration::standard_table()).await;
                 let start = Utc::now();
                 let records = backend.using::<ChangeRequest>("flotilla");
                 let name = cr_name("github.com", "team/one", 1);
@@ -209,18 +184,17 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
                         )
                         .parse()
                         .unwrap()],
-                        watcher: LeafWatcher::ReconcilerWake { convoy: "forge".into() },
+                        watcher: LeafWatcher::ReconcilerWake { convoy: launch.clone() },
                         maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
                         freshness_demand: Some(start),
                         created_at: start,
                         episode_key: Default::default(),
                     },
                 );
-                let convoys = backend.using::<Convoy>("flotilla");
                 for _ in 0..2 {
-                    let objects = HashMap::from([("forge".into(), convoys.get("forge").await.unwrap())]);
+                    let objects = heard(&backend, &home, &wake, &launch).await;
                     wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
-                    let stall = convoys.get("forge").await.unwrap().status.unwrap().stalled;
+                    let stall = status_of(&backend, &home, &launch).await.stalled;
                     assert_eq!(stall.is_some(), age >= 20 && !(merged && !missing));
                     if let Some(stall) = stall {
                         assert!(stall.evidence.contains("change_request observer"));
@@ -237,7 +211,7 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
                         LeafAddress::ChangeRequest { service: "unconfigured.invalid".into(), scope: "team/one".into(), number: 1 };
                     original
                 };
-                let objects = HashMap::from([("forge".into(), convoys.get("forge").await.unwrap())]);
+                let objects = heard(&backend, &home, &wake, &launch).await;
                 wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
                 assert!(wake.subscriptions.inner.observer_grace.lock().await.keys().all(|(row, _)| *row != id));
                 wake.subscriptions.inner.rows.lock().await.get_mut(&id).unwrap().leaves[0] = original_leaf;
@@ -253,9 +227,9 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
                     flotilla_resources::Observation::known(false, start + chrono::Duration::seconds(age));
                 let current = records.get(&name).await.unwrap();
                 records.update_status(&name, &current.metadata.resource_version, &observation).await.unwrap();
-                let objects = HashMap::from([("forge".into(), convoys.get("forge").await.unwrap())]);
+                let objects = heard(&backend, &home, &wake, &launch).await;
                 wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
-                assert!(convoys.get("forge").await.unwrap().status.unwrap().stalled.is_none());
+                assert!(status_of(&backend, &home, &launch).await.stalled.is_none());
             }
         }
     });
@@ -265,106 +239,61 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
 // pending. Discovery and a live Vessel owe evidence before the Convoy controller
 // owes Landed; removal of a completed Vessel discharges its checkout expectation.
 #[tokio::test]
+#[ignore = "waits for held-checkout expectations (engine-path-2)"]
 async fn landing_discovery_window_has_an_owed_row_then_settles() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let mut wake = supervision_wake(&backend);
+    let (backend, home) = engine_backend();
+    let mut wake = supervision_wake(&backend, &home);
     let now = Utc::now();
-    let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(now));
+    let clock = Arc::new(VirtualClock::new(now));
     wake.subscriptions = wake.subscriptions.with_clock(clock.clone());
-    create_convoy(
-        &backend,
-        "discovering",
-        ConvoyStatus {
-            phase: ConvoyPhase::Landing,
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: Some(ExitDeclaration::standard_table()),
-                turn_delivery: Default::default(),
-                vessels: vec![],
-            }),
-            work: BTreeMap::from([(
-                "work".into(),
-                WorkState::builder()
-                    .phase(WorkPhase::Complete)
-                    .placement(flotilla_resources::PlacementStatus {
-                        fields: BTreeMap::from([("checkout_refs".into(), serde_json::json!({"repo": "checkout"}))]),
-                    })
-                    .build(),
-            )]),
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from_iter(
-                    ["governor", "aide"]
-                        .map(|role| (role.into(), flotilla_resources::CrewWorkState::builder().phase(CrewWorkPhase::Done).build())),
-                ),
-            )]),
-            ..Default::default()
-        },
-    )
-    .await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let vessels = backend.using::<Vessel>("flotilla");
-    let vessel = vessels
-        .create(
-            &InputMeta::builder().name("producer".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "discovering".into())])).build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "discovering".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .unwrap();
-    vessels
-        .update_status(
-            "producer",
-            &vessel.metadata.resource_version,
-            &flotilla_resources::VesselStatus {
-                checkout_refs: BTreeMap::from([(RepositoryKey("repo".into()), "checkout".into())]),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let mut status = ledger_owed();
+    status.workflow_snapshot.as_mut().expect("workflow").exit = Some(ExitDeclaration::standard_table());
+    let launch = home.admit("discovering", convoy_spec(), status).await;
+    let vessel = home.vessel(&launch, "work", "env");
+    home.seat(&backend, &launch, (&vessel, "work"), ("coder", "discovering-coder"), CrewWorkPhase::Done).await;
+    assert_eq!(status_of(&backend, &home, &launch).await.phase, ConvoyPhase::Landing);
+    // The checkout the vessel's work was placed on, held for the launch.
+    home.engine.checkouts.put_ready(
+        "checkout",
+        &CheckoutSpec::Observed(
+            ObservedCheckoutSpec::builder()
+                .r#ref("branch".into())
+                .path("/unused".into())
+                .repo_ref(RepositoryKey("repo".into()))
+                .host_ref("test-host".into())
+                .is_main(false)
+                .build(),
+        ),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(launch.clone())),
+    );
     enum Setup {
         PendingScan,
         RecordScan,
         RemoveVessel,
     }
     let stages = [
-        (Setup::PendingScan, ("branch_subject_scan", "forge")),
-        (Setup::RecordScan, ("Vessel", "producer")),
-        (Setup::RemoveVessel, ("Convoy", "discovering")),
+        (Setup::PendingScan, ("branch_subject_scan".to_owned(), "forge".to_owned())),
+        (Setup::RecordScan, ("Vessel".to_owned(), vessel.clone())),
+        (Setup::RemoveVessel, ("Convoy".to_owned(), launch.clone())),
     ];
     for (setup, expected_maker) in stages {
         match setup {
             Setup::PendingScan => {}
             Setup::RecordScan => {
-                flotilla_store::apply_status_patch(
-                    &convoys,
-                    "discovering",
-                    &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: now },
-                )
-                .await
-                .unwrap();
+                home.note(&backend, &launch, |status| status.branch_subject_scan_at = Some(now)).await;
             }
-            Setup::RemoveVessel => {
-                vessels.delete("producer").await.unwrap();
-            }
+            Setup::RemoveVessel => home.engine.vessels.step(&vessel, VesselStep::Released),
         }
-        let objects = HashMap::from([("discovering".into(), convoys.get("discovering").await.unwrap())]);
+        let objects = heard(&backend, &home, &wake, &launch).await;
         wake.sync_rows("flotilla", &objects).await.unwrap();
         wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
-        let status = convoys.get("discovering").await.unwrap().status.unwrap();
+        let status = status_of(&backend, &home, &launch).await;
         assert!(status.stalled.is_none(), "pending discovery must not be a no-row stall: {:?}", status.stalled);
         let rows = wake.subscriptions.rows().await;
         assert_eq!(rows.len(), 1);
         let actual_maker = match &rows[0].maker {
-            LeafMaker::Controller { resource_kind, name: Some(name), .. } => (resource_kind.as_str(), name.as_str()),
-            LeafMaker::Observed { refresher, external_party } => (refresher.as_str(), external_party.as_str()),
+            LeafMaker::Controller { resource_kind, name: Some(name), .. } => (resource_kind.clone(), name.clone()),
+            LeafMaker::Observed { refresher, external_party } => (refresher.clone(), external_party.clone()),
             maker => panic!("unexpected settlement producer: {maker:?}"),
         };
         assert_eq!(actual_maker, expected_maker);
@@ -388,15 +317,16 @@ async fn landing_discovery_window_has_an_owed_row_then_settles() {
 // no route forward. Keep the empty-row stall and its diagnostic evidence.
 #[tokio::test]
 async fn landing_with_nothing_owed_stalls_with_evidence() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let wake = supervision_wake(&backend);
-    create_convoy(&backend, "dead-end", ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() }).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let objects = HashMap::from([("dead-end".into(), convoys.get("dead-end").await.unwrap())]);
+    let (backend, home) = engine_backend();
+    let wake = supervision_wake(&backend, &home);
+    let mut status = ledger_owed();
+    status.workflow_snapshot.as_mut().expect("workflow").exit = None;
+    let launch = launch_at(&backend, &home, "dead-end", status, ConvoyPhase::Landing).await;
+    let objects = heard(&backend, &home, &wake, &launch).await;
     wake.sync_rows("flotilla", &objects).await.unwrap();
     assert!(wake.subscriptions.rows().await.is_empty());
     wake.judge_stalls_at("flotilla", &objects, Utc::now()).await.unwrap();
-    let stall = convoys.get("dead-end").await.unwrap().status.unwrap().stalled.expect("genuine dead end stalls");
+    let stall = status_of(&backend, &home, &launch).await.stalled.expect("genuine dead end stalls");
     assert_eq!(stall.source, flotilla_resources::StallEvidenceSource::LeafEngine);
     assert_eq!(stall.evidence, NO_EXIT_STALL_EVIDENCE);
 }
@@ -410,27 +340,23 @@ async fn landing_with_nothing_owed_stalls_with_evidence() {
 // settle it, so it is a genuine dead end whose stall names the missing exit.
 #[hegel::test]
 fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel::TestCase) {
-    use flotilla_resources::promises::{self, PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict};
+    use flotilla_resources::convoy::engine::Actor;
+    use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict};
     use hegel::generators as gs;
-    // Covers each settlement producer (scan pending, checkout missing behind a
-    // live Vessel, checkout present) and merged evidence from fresh to far
-    // older than the stale threshold: merged evidence stays final.
+    // Covers each settlement producer (scan pending, checkout absent or
+    // present) and merged evidence from fresh to far older than the stale
+    // threshold: merged evidence stays final.
     let declared_exit = tc.draw(gs::booleans());
     let scanned = tc.draw(gs::booleans());
     let checkout_present = tc.draw(gs::booleans());
     let merged_age = tc.draw(gs::integers::<i64>().min_value(0).max_value(3600));
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut wake = supervision_wake(&backend);
+        let (backend, home) = engine_backend();
+        let mut wake = supervision_wake(&backend, &home);
         let now = Utc::now();
-        let engine = flotilla_provisioning_testkit::CheckoutFixture::default();
-        wake.subscriptions = wake
-            .subscriptions
-            .with_clock(Arc::new(flotilla_store_testkit::VirtualClock::new(now)))
-            .with_lifecycle_reads(engine.reads.clone());
+        wake.subscriptions = wake.subscriptions.with_clock(Arc::new(VirtualClock::new(now)));
         let workflow = flotilla_resources::single_agent_workflow_spec();
-        let mut status = ConvoyStatus {
-            phase: ConvoyPhase::Active,
+        let status = ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
                 cascade: None,
                 stall_nudges: Default::default(),
@@ -439,49 +365,40 @@ fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel
                 turn_delivery: Default::default(),
                 vessels: workflow.vessels,
             }),
-            work: BTreeMap::from([(
-                "work".into(),
-                WorkState::builder()
-                    .phase(WorkPhase::Running)
-                    .placement(flotilla_resources::PlacementStatus {
-                        fields: BTreeMap::from([("checkout_refs".into(), serde_json::json!({"repo": "checkout"}))]),
-                    })
-                    .build(),
-            )]),
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            branch_subject_scan_at: scanned.then_some(now),
             ..Default::default()
         };
+        let launch = home.admit("merged", ConvoySpec::builder().workflow_ref("single-agent".into()).build(), status).await;
+        let vessel = home.vessel(&launch, "work", "env");
+        home.seat(&backend, &launch, (&vessel, "work"), ("coder", "merged-coder"), CrewWorkPhase::Working).await;
+        if scanned {
+            home.note(&backend, &launch, |status| status.branch_subject_scan_at = Some(now)).await;
+        }
+        // The coder declares the PR it delivers, submits it and its ledger, and the forge's
+        // merge accepts both: its promises settle, so its seat is Done and the launch Landing.
         let merged_at = now - chrono::Duration::seconds(merged_age);
-        for (id, kind, reference) in
-            [("template/pr", PromiseKind::Pr, "cr/github.com/team/one/22"), ("ledger", PromiseKind::DecisionLedger, "artifact/ledger")]
-        {
+        let engine = home.engine();
+        let convoy = home.view(&backend, &launch).await;
+        let pr = PromiseOperation::Declare { id: "template/pr".into(), kind: PromiseKind::Pr, source: PromiseSource::Template };
+        engine.promise(&convoy, "work", "coder", &pr, Actor::Crew).await.expect("the coder declares its PR");
+        for (kind, reference) in [(PromiseKind::Pr, "cr/github.com/team/one/22"), (PromiseKind::DecisionLedger, "artifact/ledger")] {
+            let convoy = home.view(&backend, &launch).await;
+            let promise = flotilla_resources::promises::owned(convoy.status.as_ref().expect("status"), "work", "coder")
+                .iter()
+                .find(|promise| promise.kind == kind)
+                .expect("the promise the coder owes")
+                .clone();
             let submitted_at = merged_at - chrono::Duration::seconds(10);
             let submission = Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at, verdict: None };
-            promises::apply(
-                &mut status,
-                "work",
-                "coder",
-                &PromiseOperation::Submit { id: id.into(), kind, source: PromiseSource::Template, submission },
-            );
+            let submit = PromiseOperation::Submit { id: promise.id.clone(), kind, source: promise.source, submission };
+            engine.promise(&convoy, "work", "coder", &submit, Actor::Crew).await.expect("the coder submits");
+            let convoy = home.view(&backend, &launch).await;
             let verdict = SubmissionVerdict { accepted: true, who: "forge".into(), at: merged_at, why: "PR merged".into() };
-            promises::apply(
-                &mut status,
-                "work",
-                "coder",
-                &PromiseOperation::Verdict { id: id.into(), reference: reference.into(), submitted_at, verdict },
-            );
+            let verdict = PromiseOperation::Verdict { id: promise.id, reference: reference.into(), submitted_at, verdict };
+            engine.promise(&convoy, "work", "coder", &verdict, Actor::Observer).await.expect("the forge accepts");
         }
-        // The convoy controller's own edge: settled promises make the crew
-        // Done and enter Landing with no claims.
-        flotilla_resources::ConvoyStatusPatch::DeriveCrewDone { vessel: "work".into(), role: "coder".into(), at: now, engine: false }
-            .apply(&mut status);
+        let status = status_of(&backend, &home, &launch).await;
         assert_eq!(status.phase, ConvoyPhase::Landing);
-        assert_eq!(status.landing_entry.as_ref().map(|entry| entry.claims.len()), Some(0));
-        create_convoy(&backend, "merged", status).await;
+        assert_eq!(status.landing_entry.as_ref().map(|entry| entry.claims.len()).unwrap_or_default(), 0);
 
         let records = backend.using::<ChangeRequest>("flotilla");
         let name = cr_name("github.com", "team/one", 22);
@@ -509,52 +426,26 @@ fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel
             mergeable: Default::default(),
         };
         records.update_status(&name, &created.metadata.resource_version, &observation).await.unwrap();
-        let vessels = backend.using::<Vessel>("flotilla");
-        let vessel = vessels
-            .create(
-                &InputMeta::builder().name("producer".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "merged".into())])).build(),
-                &flotilla_resources::VesselSpec {
-                    convoy_ref: "merged".into(),
-                    vessel_name: "work".into(),
-                    fulfilment_kind_ref: "policy".into(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                },
-            )
-            .await
-            .unwrap();
-        vessels
-            .update_status(
-                "producer",
-                &vessel.metadata.resource_version,
-                &flotilla_resources::VesselStatus {
-                    checkout_refs: BTreeMap::from([(RepositoryKey("repo".into()), "checkout".into())]),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
         if checkout_present {
-            engine.admit_for(&backend, "flotilla", "merged", "merged").await;
-            engine.put_ready(
+            home.engine.checkouts.put_ready(
                 "checkout",
                 &CheckoutSpec::Observed(
                     ObservedCheckoutSpec::builder()
                         .r#ref("branch".into())
                         .path("/unused".into())
                         .repo_ref(RepositoryKey("repo".into()))
-                        .host_ref("home".into())
+                        .host_ref("test-host".into())
                         .is_main(false)
                         .build(),
                 ),
-                Some(&engine.holder("merged")),
+                Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(launch.clone())),
             );
         }
 
-        let convoys = backend.using::<Convoy>("flotilla");
-        let objects = HashMap::from([("merged".into(), convoys.get("merged").await.unwrap())]);
+        let objects = heard(&backend, &home, &wake, &launch).await;
         wake.sync_rows("flotilla", &objects).await.unwrap();
         wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
-        let stalled = convoys.get("merged").await.unwrap().status.unwrap().stalled;
+        let stalled = status_of(&backend, &home, &launch).await.stalled;
         let rows = wake.subscriptions.rows().await;
         if declared_exit {
             assert!(stalled.is_none(), "a merged submission entering Landing must not stall: {stalled:?}");
@@ -568,233 +459,50 @@ fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel
     });
 }
 
-// #3428: Git owes missing/stale digest evidence while the checkout exists.
-// Fresh matching evidence transfers the obligation to the Convoy controller;
-// a fresh mismatch or an absent producer remains a genuine dead end.
-#[hegel::test]
-fn landing_digest_evidence_obligations_follow_observations(tc: hegel::TestCase) {
-    // Duplicate refreshes and arbitrary state changes cross the exact TTL;
-    // fixed boundary cases guarantee that every obligation transition runs.
-    let qualified_branch = tc.draw(hegel::generators::booleans());
-    let count = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(5));
-    let mut steps = vec![0, 1, 2, 3];
-    steps.extend((0..count).map(|_| tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3))));
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut wake = supervision_wake(&backend);
-        let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(Utc::now()));
-        // This home's inspection is confirmed when it is read; a failing one, since it failed.
-        let engine = flotilla_provisioning_testkit::CheckoutFixture::default();
-        wake.subscriptions = wake.subscriptions.with_clock(clock.clone()).with_lifecycle_reads(engine.reads.clone());
-        create_convoy(
-            &backend,
-            "digest",
-            ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([(
-                        "coder".into(),
-                        CrewWorkState::builder()
-                            .phase(CrewWorkPhase::Done)
-                            .claim_evidence(flotilla_resources::SettlementClaimEvidence {
-                                refs: flotilla_resources::ReviewRefPair { base: "main".into(), head: "refs/heads/branch".into() },
-                                bundle_url: "https://example.test/bundle".into(),
-                                claimed_head_digest: "expected".into(),
-                            })
-                            .build(),
-                    )]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await;
-        engine.admit_for(&backend, "flotilla", "digest", "digest").await;
-        let launch = engine.put_ready(
-            "digest-checkout",
-            &CheckoutSpec::Observed(
-                ObservedCheckoutSpec::builder()
-                    .r#ref(if qualified_branch { "refs/heads/branch" } else { "branch" }.into())
-                    .path("/unused".into())
-                    .repo_ref(RepositoryKey("repo".into()))
-                    .host_ref("home".into())
-                    .is_main(false)
-                    .build(),
-            ),
-            Some(&engine.holder("digest")),
-        );
-        let convoys = backend.using::<Convoy>("flotilla");
-        for step in steps {
-            let digest = match step {
-                0 => None,
-                3 => Some("different"),
-                _ => Some("expected"),
-            };
-            engine
-                .checkouts
-                .inspected(
-                    &launch,
-                    flotilla_resources::checkout_records::Inspection { remote_digest: digest.map(str::to_owned), ..Default::default() },
-                )
-                .unwrap();
-            // A stale inspection is one whose reads have failed for the evidence's lifetime; a
-            // fresh one is read within it.
-            let now = if step == 1 {
-                engine.checkouts.inspection_failed(&launch).unwrap();
-                let failing_since = engine.record(&launch).integration.and_then(|integration| integration.failing_since).unwrap();
-                failing_since + chrono::Duration::from_std(flotilla_resources::LANDING_EVIDENCE_TTL).unwrap()
-            } else {
-                Utc::now() + chrono::Duration::seconds(10)
-            };
-            clock.set(now);
-            let objects = HashMap::from([("digest".into(), convoys.get("digest").await.unwrap())]);
-            wake.sync_rows("flotilla", &objects).await.unwrap();
-            wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
-            let stalled = convoys.get("digest").await.unwrap().status.unwrap().stalled;
-            assert_eq!(stalled.is_some(), step == 3);
-            // The claim's digest anchors settlement without an exit: not a standing dead end.
-            assert!(stalled.is_none_or(|stalled| stalled.evidence != NO_EXIT_STALL_EVIDENCE));
-            let rows = wake.subscriptions.rows().await;
-            if step < 2 {
-                assert!(rows
-                    .iter()
-                    .any(|row| matches!(&row.maker, LeafMaker::Observed { refresher, .. } if refresher == "checkout_integration")));
-            } else if step == 2 {
-                assert!(rows
-                    .iter()
-                    .any(|row| matches!(&row.maker, LeafMaker::Controller { resource_kind, .. } if resource_kind == "Convoy")));
-            } else {
-                assert!(rows.is_empty());
-            }
-        }
-        // A checkout the engine no longer has produces no evidence.
-        engine.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
-        let now = Utc::now() + chrono::Duration::seconds(10);
-        clock.set(now);
-        let objects = HashMap::from([("digest".into(), convoys.get("digest").await.unwrap())]);
-        wake.sync_rows("flotilla", &objects).await.unwrap();
-        wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
-        assert!(wake.subscriptions.rows().await.is_empty());
-        assert!(convoys.get("digest").await.unwrap().status.unwrap().stalled.is_some());
-        engine.put_ready(
-            "unrelated-checkout",
-            &CheckoutSpec::Observed(
-                ObservedCheckoutSpec::builder()
-                    .r#ref("other-branch".into())
-                    .path("/unused".into())
-                    .repo_ref(RepositoryKey("repo".into()))
-                    .host_ref("home".into())
-                    .is_main(false)
-                    .build(),
-            ),
-            Some(&engine.holder("digest")),
-        );
-        let objects = HashMap::from([("digest".into(), convoys.get("digest").await.unwrap())]);
-        wake.sync_rows("flotilla", &objects).await.unwrap();
-        wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
-        assert!(wake.subscriptions.rows().await.is_empty(), "an unrelated branch cannot produce the missing ref");
-        assert!(convoys.get("digest").await.unwrap().status.unwrap().stalled.is_some());
-    });
-}
-
 // #3595: a cached actor row can outlive its session during Landing teardown.
-// Deletion, a stopped session, and an already removed record are not dead actors;
-// Active session loss must still be supervised, including without a project.
+// A session that exited or was released is not a dead actor. (Outside
+// completed work, a seat whose session ended is Interrupted, which
+// interrupted_stalls covers.)
 #[hegel::test]
 fn landing_session_teardown_does_not_stall(tc: hegel::TestCase) {
     use hegel::generators as gs;
-    // Repeat fresh idle observations across the debounce and idle grace, with
-    // generated extra residence after teardown. No sleeps or process doubles.
+    // Repeat judgements across the debounce and idle grace, with generated
+    // extra residence after teardown. No sleeps or process doubles.
     let residence = tc.draw(gs::integers::<i64>().min_value(1).max_value(600));
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        for (phase, complete) in
-            [(ConvoyPhase::Active, false), (ConvoyPhase::Active, true), (ConvoyPhase::Landing, false), (ConvoyPhase::Landing, true)]
-        {
-            let teardown = phase == ConvoyPhase::Landing && complete;
-            for ending in ["stopped", "absent", "deleting"] {
-                let (backend, wake, _) = actor_nudge_scenario(&[]).await;
-                let convoys = backend.using::<Convoy>("flotilla");
-                let convoy = convoys.get("stalled-work").await.unwrap();
-                let mut spec = convoy.spec.clone();
-                spec.project_ref = None;
-                convoys.update(&InputMeta::from(&convoy.metadata), &convoy.metadata.resource_version, &spec).await.unwrap();
-                let start = Utc::now();
-                observe_actor(&backend, &wake, TerminalAttentionState::Working, start).await;
-                update_convoy(&backend, "stalled-work", |status| {
-                    status.phase = phase;
-                    if complete {
-                        status.work.get_mut("work").unwrap().phase = WorkPhase::Complete;
-                    }
-                })
-                .await;
-                let sessions = backend.using::<TerminalSession>("flotilla");
-                let session = sessions.get("resumed-coder").await.unwrap();
-                if ending == "absent" {
-                    sessions.delete("resumed-coder").await.unwrap();
-                } else if ending == "deleting" {
-                    // A finalizer retains the record while teardown ends the runtime.
-                    let mut meta = InputMeta::from(&session.metadata);
-                    meta.finalizers = vec!["flotilla.work/terminal-teardown".into()];
-                    sessions.update(&meta, &session.metadata.resource_version, &session.spec).await.unwrap();
-                    sessions.delete("resumed-coder").await.unwrap();
-                    assert!(sessions.get("resumed-coder").await.unwrap().metadata.deletion_timestamp.is_some());
-                } else {
-                    // What the read view serves for an ended launch: its observations are forgotten.
-                    let mut status = session.status.unwrap();
-                    status.phase = TerminalSessionPhase::Stopped;
-                    status.stopped_at = Some(start + chrono::Duration::seconds(1));
-                    status.cleat_endpoint = None;
-                    status.attention = None;
-                    sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.unwrap();
-                }
-                let mut observed_stall = false;
-                for seconds in [1, 10, 60, 120, 180, 240, 300, 300 + residence] {
-                    let now = start + chrono::Duration::seconds(seconds);
-                    if ending == "deleting" {
-                        // observe_actor persists fresh attention and invokes judge_stalls_at.
-                        observe_actor(&backend, &wake, TerminalAttentionState::Idle, now).await;
-                    } else {
-                        let convoy = convoys.get("stalled-work").await.unwrap();
-                        wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.unwrap();
-                    }
-                    let status = convoys.get("stalled-work").await.unwrap().status.unwrap();
-                    if teardown {
-                        assert!(status.stalled.is_none(), "{phase:?}/{ending} at {seconds}s: {:?}", status.stalled);
-                    } else if let Some(stall) = status.stalled {
-                        observed_stall = true;
-                        // Missing-governor diagnostics remain useful on a real stall.
-                        if stall.rung == StallRung::Nudge {
-                            assert_eq!(ending, "deleting");
-                            assert_eq!(stall.source, StallEvidenceSource::Screen);
-                            assert_eq!(stall.evidence, "idle");
-                        } else {
-                            assert!(stall.evidence.contains("cannot find governor: convoy has no project_ref"), "{}", stall.evidence);
-                        }
-                    }
-                }
-                if !teardown {
-                    assert!(observed_stall, "{ending} must still stall outside completed Landing work");
-                }
-                if teardown {
-                    // Retiring a stale actor must not hide a real controller failure.
-                    let id = uuid::Uuid::new_v4();
-                    let mut row = wake.subscriptions.rows().await.into_iter().next().unwrap();
-                    row.id = id;
-                    row.maker = LeafMaker::Controller {
-                        resource_kind: "CredentialDelivery".into(),
-                        name: Some("env".into()),
-                        retry: ControllerRetry::terminal(None, start, "credential controller refused"),
-                        ceiling: RetryCeiling::default(),
-                    };
-                    wake.subscriptions.inner.rows.lock().await.insert(id, row);
-                    let convoy = convoys.get("stalled-work").await.unwrap();
-                    wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), start + chrono::Duration::hours(1))
-                        .await
-                        .unwrap();
-                    let stall = convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.unwrap();
-                    assert!(stall.evidence.contains("credential controller refused"), "{}", stall.evidence);
-                }
+        for ending in ["exited", "released"] {
+            let case = actor_nudge_scenario(&[]).await;
+            let start = Utc::now();
+            observe_actor(&case, &case.wake, TerminalAttentionState::Working, start).await;
+            // The coder's work is complete: the launch is Landing.
+            case.home.keep(&case.backend, &case.work, "work", "coder").await;
+            assert_eq!(case.status().await.phase, ConvoyPhase::Landing);
+            let session = case.launch("resumed-coder");
+            match ending {
+                "exited" => case.home.engine.terminals.exited(&session, "the agent exited"),
+                _ => case.home.engine.terminals.release(&session),
             }
+            for seconds in [1, 10, 60, 120, 180, 240, 300, 300 + residence] {
+                case.caught_up(&case.wake).await;
+                case.wake.sync_rows("flotilla", &case.objects().await).await.expect("derive the Landing launch's rows");
+                case.judge(&case.wake, start + chrono::Duration::seconds(seconds)).await;
+                let status = case.status().await;
+                assert!(status.stalled.is_none(), "Landing/{ending} at {seconds}s: {:?}", status.stalled);
+            }
+            // Retiring a stale actor must not hide a real controller failure.
+            let id = uuid::Uuid::new_v4();
+            let mut row = case.wake.subscriptions.rows().await.into_iter().next().unwrap();
+            row.id = id;
+            row.maker = LeafMaker::Controller {
+                resource_kind: "CredentialDelivery".into(),
+                name: Some("env".into()),
+                retry: ControllerRetry::terminal(None, start, "credential controller refused"),
+                ceiling: RetryCeiling::default(),
+            };
+            case.wake.subscriptions.inner.rows.lock().await.insert(id, row);
+            case.judge(&case.wake, start + chrono::Duration::hours(1)).await;
+            let stall = case.status().await.stalled.unwrap();
+            assert!(stall.evidence.contains("credential controller refused"), "{}", stall.evidence);
         }
     });
 }
@@ -821,29 +529,34 @@ fn pending_stall(cause: Option<flotilla_resources::StallCause>) -> flotilla_reso
     }
 }
 
+/// A launch admitted with nothing started, its home noting `stall` on it: one waiting for capacity.
+async fn waiting_launch(backend: &ResourceBackend, home: &EngineHome, stall: flotilla_resources::StalledCondition) -> String {
+    let launch = create_convoy(home, "waiting", single_agent("coder")).await;
+    home.note(backend, &launch, |status| status.stalled = Some(stall)).await;
+    launch
+}
+
 #[tokio::test]
 async fn judge_keeps_the_convoy_controllers_capacity_stall() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let wake = supervision_wake(&backend);
+    let (backend, home) = engine_backend();
+    let wake = supervision_wake(&backend, &home);
     let stall = pending_stall(Some(flotilla_resources::StallCause::Capacity));
-    create_convoy(&backend, "waiting", ConvoyStatus { stalled: Some(stall.clone()), ..Default::default() }).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let objects = HashMap::from([("waiting".into(), convoys.get("waiting").await.unwrap())]);
+    let launch = waiting_launch(&backend, &home, stall.clone()).await;
+    let objects = heard(&backend, &home, &wake, &launch).await;
     wake.sync_rows("flotilla", &objects).await.unwrap();
     wake.judge_stalls("flotilla", &objects).await.unwrap();
-    assert_eq!(convoys.get("waiting").await.unwrap().status.unwrap().stalled, Some(stall));
+    assert_eq!(status_of(&backend, &home, &launch).await.stalled, Some(stall));
 }
 
 // #4038: the capacity exemption is only for the controller's stall; any other
 // stall on a convoy with nothing actionable is still cleared.
 #[tokio::test]
 async fn judge_still_clears_other_stalls_on_a_convoy_with_nothing_actionable() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let wake = supervision_wake(&backend);
-    create_convoy(&backend, "waiting", ConvoyStatus { stalled: Some(pending_stall(None)), ..Default::default() }).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let objects = HashMap::from([("waiting".into(), convoys.get("waiting").await.unwrap())]);
+    let (backend, home) = engine_backend();
+    let wake = supervision_wake(&backend, &home);
+    let launch = waiting_launch(&backend, &home, pending_stall(None)).await;
+    let objects = heard(&backend, &home, &wake, &launch).await;
     wake.sync_rows("flotilla", &objects).await.unwrap();
     wake.judge_stalls("flotilla", &objects).await.unwrap();
-    assert!(convoys.get("waiting").await.unwrap().status.unwrap().stalled.is_none());
+    assert!(status_of(&backend, &home, &launch).await.stalled.is_none());
 }

@@ -3618,6 +3618,12 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     .await
     .expect("router topology");
     let (a, b) = if source_remote { (&topology.follower, &topology.leader) } else { (&topology.leader, &topology.follower) };
+    let a_holds = if source_remote { &topology.follower_stream_holds } else { &topology.leader_stream_holds };
+    let b_home = b.decided_store().expect("governor home").home().to_owned();
+    if unavailable {
+        // The governor's launch travels B's log: until A installs it, A has no live governor.
+        a_holds.hold(&b_home);
+    }
     off_frame(|| seed_supervision_crew(a, "stalled-work", "work", "coder")).await;
     let governor = off_frame(|| seed_supervision_crew(b, "governor", "govern", "governor")).await;
     let b_backend = b.resource_backend();
@@ -3625,6 +3631,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         off_frame(|| seed_governor_subscription(a, b)).await;
     }
     off_frame(|| stall_source_crew(a, legacy_cursor, unavailable)).await;
+    a_holds.release(&b_home);
     off_frame(|| replicate_governor_to_source(a, b, stale_home)).await;
     off_frame(|| await_replicated_session(a, &governor)).await;
 
@@ -3679,13 +3686,15 @@ async fn stall_source_crew(a: &InProcessDaemon, legacy_cursor: bool, unavailable
 
 /// The governor's convoy and session replicate to `a`, with its presentation feed.
 async fn replicate_governor_to_source(a: &InProcessDaemon, b: &InProcessDaemon, stale_home: bool) {
-    // The governor's convoy and session launches, and its holder vessel, travel B's engine log.
-    flotilla_provisioning_testkit::replicate_home(
-        &b.decided_store().expect("governor home"),
-        b.node_id().as_str(),
-        &a.decided_store().expect("source home"),
-    );
+    // The governor's convoy and session launches, and its holder vessel, travel B's engine log
+    // over the topology's own change streams. A copy sent beside them races their rounds: a
+    // round staged before a launch installs after it and resets the home without it.
     let governor = governor_launch(b);
+    let convoys = a.resource_backend().including_replicas::<Convoy>("flotilla");
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "the governor's convoy should replicate to the source", || async {
+        convoys.get(&governor).await.is_ok()
+    })
+    .await;
     apply_convoy_replica_feed(a, "flotilla", &governor, b.host_name().clone()).await;
     if stale_home {
         // Ordinary Message homing follows resource provenance even when the
@@ -3711,13 +3720,14 @@ async fn await_replicated_session(a: &InProcessDaemon, crew_id: &str) {
 /// governor may issue supervision from B, which routes back to A and validates B's replicated
 /// identity at the stalled convoy's home.
 async fn replicate_stall_to_governor(a: &InProcessDaemon, b: &InProcessDaemon) {
-    apply_convoy_replica_feed(b, "flotilla", &current_launch(a, "stalled-work"), a.host_name().clone()).await;
-    // The stalled convoy's launch travels A's engine log.
-    flotilla_provisioning_testkit::replicate_home(
-        &a.decided_store().expect("source home"),
-        a.node_id().as_str(),
-        &b.decided_store().expect("governor home"),
-    );
+    let source = current_launch(a, "stalled-work");
+    apply_convoy_replica_feed(b, "flotilla", &source, a.host_name().clone()).await;
+    // The stalled convoy's launch travels A's engine log over the topology's own change streams.
+    let convoys = b.resource_backend().including_replicas::<Convoy>("flotilla");
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "the stalled convoy should replicate to the governor", || async {
+        convoys.get(&source).await.is_ok()
+    })
+    .await;
 }
 
 /// The supervised crew at `a` is working again, and the ruling replies to the escalation.
@@ -3740,6 +3750,11 @@ fn governor_launch(daemon: &InProcessDaemon) -> String {
 
 /// One convoy with a working crew member and its running session, at `daemon`.
 async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &str, role: &str) -> String {
+    seed_supervision_crew_in(daemon, "flotilla", name, vessel, role).await
+}
+
+/// [`seed_supervision_crew`] in `namespace`.
+async fn seed_supervision_crew_in(daemon: &InProcessDaemon, namespace: &str, name: &str, vessel: &str, role: &str) -> String {
     let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).role(role.into()).build();
     let snapshot = WorkflowSnapshot {
         cascade: None,
@@ -3763,7 +3778,7 @@ async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &st
     };
     // The convoy is the daemon's engine launch, its crew owing a decision ledger.
     let mut convoy = flotilla_engine_convoys_testkit::convoy(
-        "flotilla",
+        namespace,
         name,
         spec,
         ConvoyStatus {
@@ -3784,6 +3799,8 @@ async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &st
     let convoy = admit_convoy(daemon, convoy).await;
     // The crew's session is the daemon's engine launch, held for its vessel's launch.
     let held = engine(daemon).vessels.request(&convoy, vessel, daemon.node_id().as_str());
+    // The vessel is ready, so its work runs and the crew's seat is judged.
+    engine(daemon).vessels.step(&held, flotilla_resources::vessel_records::VesselStep::Realised { environment: "test-env".into() });
     let terminals = &engine(daemon).terminals;
     let launch = terminals.request(&TerminalLaunchRequest {
         session: format!("{name}-session"),
@@ -3863,7 +3880,7 @@ async fn check_supervision_escalation_pass(a: &InProcessDaemon, b: &InProcessDae
     let (source, governor) = (current_launch(a, "stalled-work"), governor_launch(b));
     a.reconcile_crew_stalls_once("flotilla").await.expect("one escalation pass");
     let stall = convoys.get(&source).await.expect("source").status.expect("status").stalled.expect("stall");
-    assert_eq!(stall.rung, flotilla_resources::StallRung::Governor);
+    assert_eq!(stall.rung, flotilla_resources::StallRung::Governor, "{}", stall.evidence);
     assert_eq!(stall.supervisor.expect("governor").convoy, governor);
     let messages = b_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver inbox");
     assert_eq!(messages.items.len(), 1, "repeat passes must not publish duplicates");
@@ -3883,7 +3900,10 @@ async fn check_supervision_escalation_pass(a: &InProcessDaemon, b: &InProcessDae
     })
     .await
     .expect("the escalation lists at A as B's");
-    assert!(a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source inbox").items.is_empty());
+    // Only the escalation's copy is at A: a person told of the stall before the governor was
+    // live holds a System attention there, not a Supervisor message.
+    let local = a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source inbox").items;
+    assert!(local.iter().all(|local| local.spec.relation != flotilla_resources::MessageRelation::Supervisor), "{local:?}");
     assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::Supervisor);
     let sender = flotilla_resources::convoy::engine::launch_address(&"project:project".parse().expect("project address"), &source)
         .expect("launch address");
@@ -4288,24 +4308,25 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
     let leader = empty_daemon_named("stall-reader").await;
     let follower = empty_daemon_named("stall-home").await;
     let remote = follower.resource_backend().using::<Convoy>("other-project-namespace");
-    let launch = admit_convoy(
-        &follower,
-        flotilla_engine_convoys_testkit::convoy(
-            "other-project-namespace",
-            "remote-stall",
-            convoy_spec("scratch", "implement"),
-            ConvoyStatus {
-                phase: ResourceConvoyPhase::Active,
-                workflow_snapshot: flotilla_engine_convoys_testkit::single_agent("coder").workflow_snapshot,
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                ..Default::default()
-            },
-        ),
-    )
-    .await;
+    // The namespace's fleet is designated, so its stall judge can tell a person.
+    flotilla_engine_messages_testkit::designate_fleet(&follower.resource_backend(), "other-project-namespace").await;
+    // The convoy's project, whose operator is told; it declares no governor.
+    follower
+        .resource_backend()
+        .definitions::<flotilla_resources::Project>("other-project-namespace")
+        .apply(
+            &InputMeta::builder().name("project".into()).build(),
+            &flotilla_resources::ProjectSpec::builder()
+                .display_name("Project".into())
+                .default_workflow_ref("scratch".into())
+                .repositories(Vec::new())
+                .build(),
+        )
+        .await
+        .expect("project");
+    // A working coder in a realised vessel, with its running session.
+    off_frame(|| seed_supervision_crew_in(&follower, "other-project-namespace", "stalled-work", "work", "coder")).await;
+    let launch = current_launch(&follower, "stalled-work");
     // A crew's stall is its home's note (#3108).
     flotilla_store::note_convoy(
         &follower.convoy_engine_path(),
@@ -4323,6 +4344,8 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
     )
     .await
     .expect("declare stall");
+    // With no governor the judge tells the operator: the attention is what reaches another host.
+    follower.reconcile_crew_stalls_once("other-project-namespace").await.expect("stall judge pass");
     let topology = spawn_in_memory_request_topology_stateful_with_surface(
         Arc::clone(&leader),
         follower,
@@ -4334,18 +4357,33 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
         leader.resource_backend().including_replicas::<Convoy>("other-project-namespace").get(&launch).await.is_ok()
     })
     .await;
-    let result = topology
-        .client
-        .execute_query(Command::builder().action(CommandAction::QueryCrewStalls { full: true }).build(), uuid::Uuid::nil())
-        .await
-        .expect("operator stalls");
-    let CommandValue::CrewStalls(response) = result else { panic!("expected stalls: {result:?}") };
-    assert_eq!(response.rows.len(), 1);
-    assert_eq!(response.rows[0].namespace, "other-project-namespace");
-    assert_eq!(response.rows[0].convoy, launch);
-    assert_eq!(response.rows[0].role, "coder");
-    assert_eq!(response.rows[0].rung, Some(flotilla_protocol::StallRung::Operator));
-    assert_eq!(response.rows[0].evidence, "GitHub rate limit");
+    let stalls = || async {
+        let result = topology
+            .client
+            .execute_query(Command::builder().action(CommandAction::QueryCrewStalls { full: true }).build(), uuid::Uuid::nil())
+            .await
+            .expect("operator stalls");
+        let CommandValue::CrewStalls(response) = result else { panic!("expected stalls: {result:?}") };
+        response
+    };
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "the reader lists the remote stall", || async {
+        !stalls().await.rows.is_empty()
+    })
+    .await;
+    let response = stalls().await;
+    // The row carries what the attention states: the convoy, the role and the operator rung. Its
+    // vessel, evidence, reason and disposition are the home's note, so they are absent here.
+    assert_eq!(response.rows.len(), 1, "{:?}", response.rows);
+    let row = &response.rows[0];
+    // The engine serves its convoys in its one namespace, whichever the launch was admitted to.
+    assert_eq!(row.namespace, "flotilla");
+    assert_eq!(row.convoy, launch);
+    assert_eq!(row.role, "coder");
+    assert_eq!(row.rung, Some(flotilla_protocol::StallRung::Operator));
+    assert_eq!((row.vessel.as_deref(), row.evidence.as_deref(), row.proposed_disposition), (None, None, None));
+    // The attention states when it was admitted, not when the stall began.
+    assert!(row.raised_at.is_some(), "{row:?}");
+    assert_eq!((row.began_at, row.age_seconds), (None, None));
 }
 
 mod change_request_observation;

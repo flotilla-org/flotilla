@@ -16,19 +16,36 @@ use flotilla_resources::{engine_records::EngineRecords, HostConnection, HostSpec
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::{Follower, Service};
 
-/// A decided store homed at `home`, in a temporary directory.
+/// A decided store homed at `home`, in its own temporary directory or beside the store it writes for.
 pub struct OtherHome {
     home: String,
     service: Arc<Service>,
-    _dir: tempfile::TempDir,
+    _dir: Option<tempfile::TempDir>,
 }
 
 impl OtherHome {
     pub fn open(home: &str) -> Self {
         let dir = tempfile::TempDir::new().expect("other home directory");
+        let mut opened = Self::open_at(&dir.path().join("decided.sqlite"), home);
+        opened._dir = Some(dir);
+        opened
+    }
+
+    /// Opens the home in `target`'s directory, so it goes when the test removes that directory.
+    fn open_beside(target: &Service, home: &str) -> Self {
+        let target_path = target
+            .with_store(|store| Ok(store.connection().path().map(std::path::PathBuf::from)))
+            .expect("the target store's path")
+            .filter(|path| !path.as_os_str().is_empty())
+            .expect("a target store in a file");
+        let directory = target_path.parent().expect("the target store's directory");
+        Self::open_at(&directory.join(format!("other-home-{home}.sqlite")), home)
+    }
+
+    fn open_at(path: &std::path::Path, home: &str) -> Self {
         let registry = flotilla_provisioning::stored::decided_registry().expect("decided registry");
-        let service = Arc::new(Service::open(&dir.path().join("decided.sqlite"), home, registry).expect("other home store"));
-        Self { home: home.to_owned(), service, _dir: dir }
+        let service = Arc::new(Service::open(path, home, registry).expect("other home store"));
+        Self { home: home.to_owned(), service, _dir: None }
     }
 
     pub fn home(&self) -> &str {
@@ -127,6 +144,22 @@ pub fn replicate_home_at(from: &Service, home: &str, target: &Service, at: DateT
         .expect("receive home");
 }
 
+/// Sends `target` the entries `from`, homed at `home`, has written since `target` last heard it,
+/// heard now: a peer's next entries arriving, as a running daemon's follower receives them. A
+/// snapshot round, as [`replicate_home`] sends, makes every follower at `target` read again.
+pub fn replicate_home_tail(from: &Service, home: &str, target: &Service) {
+    let after = target.last_sequence(home).expect("the target's sequence for the home");
+    let mut frames = Vec::new();
+    from.serve(Some(after), Timestamp::from_datetime(&Utc::now()), |frame| {
+        frames.push(frame.to_vec());
+        Ok(())
+    })
+    .expect("serve home");
+    target
+        .with_store(|store| Follower::new(store).receive(home, |sink| frames.iter().try_for_each(|frame| sink(frame))))
+        .expect("receive home");
+}
+
 /// The other homes each target has been sent, by the target and the home: a home keeps its log, so
 /// a later write reaches the target as a peer's next entries would.
 type Homes = Mutex<Vec<(Weak<Service>, String, Arc<OtherHome>)>>;
@@ -143,7 +176,8 @@ pub fn other_home_for(target: &Arc<Service>, home: &str) -> Arc<OtherHome> {
     if let Some((_, _, found)) = homes.iter().find(|(held, name, _)| held.as_ptr() == Arc::as_ptr(target) && name == home) {
         return Arc::clone(found);
     }
-    let opened = Arc::new(OtherHome::open(home));
+    // The registry outlives the test, so the home's files live with the target's, not in a directory of its own.
+    let opened = Arc::new(OtherHome::open_beside(target, home));
     homes.push((Arc::downgrade(target), home.to_owned(), Arc::clone(&opened)));
     opened
 }

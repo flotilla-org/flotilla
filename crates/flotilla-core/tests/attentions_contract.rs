@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use chrono::{DateTime, Utc};
 
 use flotilla_engine_messages::{view::record_name, MessagePrimitives};
+use flotilla_engine_messages_testkit::Served;
 use flotilla_resources::{
     attentions::{Attention, Attentions, Fact, Sender, Subject},
     Convoy, ConvoyEnsure, FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec, SystemClock, TerminalSession, Vessel,
@@ -77,7 +78,7 @@ async fn records() -> ResourceBackend {
 
 /// One implementation under the contract, and how a person acknowledges an attention there.
 enum Implementation {
-    Engine { primitives: Arc<MessagePrimitives>, _dir: tempfile::TempDir },
+    Engine { primitives: Served<Arc<MessagePrimitives>>, _dir: tempfile::TempDir },
 }
 
 impl Implementation {
@@ -87,8 +88,8 @@ impl Implementation {
             Service::open(&dir.path().join("decided.sqlite"), "home-a", flotilla_engine_store::registry().expect("registry"))
                 .expect("store"),
         );
-        let primitives = MessagePrimitives::open("home-a", service, records().await, Arc::new(SystemClock)).expect("primitives");
-        Implementation::Engine { primitives: Arc::new(primitives), _dir: dir }
+        let (_, primitives) = engine_at_store("home-a", service, records().await);
+        Implementation::Engine { primitives, _dir: dir }
     }
 
     fn attentions(&self) -> &dyn Attentions {
@@ -381,13 +382,18 @@ async fn the_engine_clears_every_attention_within_a_convoy() {
 }
 
 /// A home's engine over its own decided store.
-fn engine_at(home: &str, backend: ResourceBackend, dir: &tempfile::TempDir) -> (Arc<Service>, Arc<MessagePrimitives>) {
+fn engine_at(home: &str, backend: ResourceBackend, dir: &tempfile::TempDir) -> (Arc<Service>, Served<Arc<MessagePrimitives>>) {
     let service = Arc::new(
         Service::open(&dir.path().join(format!("{home}.sqlite")), home, flotilla_engine_store::registry().expect("registry"))
             .expect("store"),
     );
-    let primitives = MessagePrimitives::open(home, Arc::clone(&service), backend, Arc::new(SystemClock)).expect("primitives");
-    (service, Arc::new(primitives))
+    engine_at_store(home, service, backend)
+}
+
+/// A home's engine over decided store `service`, held with the backend it reads.
+fn engine_at_store(home: &str, service: Arc<Service>, backend: ResourceBackend) -> (Arc<Service>, Served<Arc<MessagePrimitives>>) {
+    let primitives = MessagePrimitives::open(home, Arc::clone(&service), backend.clone(), Arc::new(SystemClock)).expect("primitives");
+    (service, Served::new(Arc::new(primitives), backend))
 }
 
 /// One round of `from`'s stream applied at `to`, as a follower does.

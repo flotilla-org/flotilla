@@ -212,6 +212,8 @@ async fn stale_episode_reads_one_schedule_and_does_not_rewrite_lag() {
 // 320 bodies carry a 30 KB workflow/brief-sized payload; setup is outside timing.
 #[tokio::test]
 async fn replica_event_work_measurement() {
+    use flotilla_resources::convoy::engine::Actor;
+    use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource};
     use flotilla_store_testkit::ReadCountsBackendExt;
     let (backend, home) = engine_backend();
     // The launches are another daemon's, heard here as its log arrives.
@@ -221,7 +223,9 @@ async fn replica_event_work_measurement() {
     spec.instruction = Some("x".repeat(30_000));
     let mut launches = Vec::new();
     for index in 0..320 {
-        launches.push(remote.admit(&format!("replica-{index}"), spec.clone(), ledger_owed()).await);
+        let launch = remote.admit(&format!("replica-{index}"), spec.clone(), ledger_owed()).await;
+        remote.vessel(&launch, "work", "env");
+        launches.push(launch);
     }
     flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", home.service());
     let replicas = backend.including_replicas::<Convoy>("flotilla");
@@ -236,15 +240,33 @@ async fn replica_event_work_measurement() {
     let started = std::time::Instant::now();
     let other = team_one_request(1);
     for index in 0..20 {
-        // Each event is an edge on the remote's first launch: an operator links a change request,
-        // or unlinks it.
+        // Each event is an edge on the remote's first launch: its coder declares a promise, or an
+        // operator links a change request, or unlinks it. It reaches here as the remote's next
+        // log entries.
         let changed = remote.view(&remote_backend, &launches[0]).await;
-        if index % 2 == 0 {
-            remote.engine().link(&changed, &other, SubjectDiscoverySource::Operator, "operator").await.unwrap();
-        } else {
-            remote.engine().unlink(&changed, &other, "operator").await.unwrap();
+        match index % 4 {
+            0 | 2 => {
+                let operation = PromiseOperation::Declare {
+                    id: format!("event-{index}"),
+                    kind: PromiseKind::DecisionLedger,
+                    source: PromiseSource::Crew,
+                };
+                remote.engine().promise(&changed, "work", "coder", &operation, Actor::Crew).await.expect("the remote coder's promise");
+            }
+            1 => remote.engine().link(&changed, &other, SubjectDiscoverySource::Operator, "operator").await.unwrap(),
+            _ => remote.engine().unlink(&changed, &other, "operator").await.unwrap(),
         }
-        flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", home.service());
+        flotilla_provisioning_testkit::replicate_home_tail(remote.service(), "remote", home.service());
+        // The leaf's view hears the event, as the launch now reads here.
+        let heard = replicas.get(&launches[0]).await.expect("the replica").object.metadata.resource_version;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut changes = view.subscribe();
+            while !view.shared_named(&launches[0]).await.unwrap().iter().any(|read| read.object.metadata.resource_version == heard) {
+                changes.changed().await.expect("the leaf's view runs");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the leaf's view hears the remote's event {index} at {heard}"));
         assert!(wake.local_convoys("flotilla").await.unwrap().is_empty());
     }
     let copied = view.materialized_objects() - before;

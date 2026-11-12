@@ -186,8 +186,43 @@ fn a_launch_reads_its_seats_links_stalls_and_end() {
     assert_eq!(linked.relationship, Relationship::Produces);
     assert_eq!((linked.sources[0].source, linked.sources[0].at), (SubjectDiscoverySource::Claim, time(3)));
     assert_eq!(record.ended, Some((ConvoyEnd::Failed { reason: "coder failed".into() }, time(5))));
-    assert_eq!(records.at(HOME).expect("at home").len(), 1);
-    assert_eq!(records.every().expect("every").len(), 1);
+    assert_eq!(records.at(HOME).expect("at home").records.len(), 1);
+    assert_eq!(records.every().expect("every").records.len(), 1);
+}
+
+// Behaviour: a launch whose admission document does not decode is listed as unreadable, by name
+// and with why, beside the launches that read; asked for by name, it is an error naming it.
+#[test]
+fn an_undecodable_launch_is_listed_as_unreadable_beside_the_others() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(&dir);
+    let convoys = Convoys::open(HOME, &service).expect("open");
+    let records = EngineConvoyRecords::new(HOME, Arc::clone(&service), Arc::default());
+    convoys.world(|world| world.projects.put(&Ref::new(project().as_str()), ()));
+    let reserved = convoys.reserve("fix-it", Timestamp(1_000_000)).expect("reserved");
+    convoys.create_reserved(&reserved, request(), Timestamp(1_000_000)).expect("admitted");
+    let readable = convoys.get("fix-it").expect("launch").name().to_owned();
+    let broken = ConvoyRequest {
+        launch_of: "broken".into(),
+        admission: Frozen::new(AdmissionBytes::new(vec![0xff, 0x00])).expect("freeze"),
+        ..request()
+    };
+    let reserved = convoys.reserve("broken", Timestamp(2_000_000)).expect("reserved");
+    convoys.create_reserved(&reserved, broken, Timestamp(2_000_000)).expect("admitted");
+    let unreadable = convoys.get("broken").expect("launch").name().to_owned();
+
+    for listing in [records.at(HOME).expect("at home"), records.every().expect("every")] {
+        assert_eq!(listing.records.iter().map(|record| record.name.clone()).collect::<Vec<_>>(), vec![readable.clone()]);
+        let [launch] = listing.unreadable.as_slice() else { panic!("one unreadable launch: {:?}", listing.unreadable) };
+        assert_eq!(
+            (launch.name.as_str(), launch.home.as_str(), launch.launch_of.as_str(), launch.project.as_str()),
+            (unreadable.as_str(), HOME, "broken", "fleet")
+        );
+        assert!(launch.reason.contains("admission document does not decode"), "{}", launch.reason);
+    }
+    let error = records.get(&unreadable, None).expect_err("an unreadable launch is no record");
+    assert!(error.contains(&unreadable), "{error}");
+    assert_eq!(records.get(&readable, None).expect("read").map(|record| record.name), Some(readable));
 }
 
 // Behaviour: a crew that hands its work to a crew it fans out reads as handed back, under its old

@@ -340,8 +340,8 @@ pub async fn sweep_host_empty_convoy_directories(
     // before its checkouts are requested, so provisioning starts after it is listed here.
     // A late Git materialisation after the launch is gone recreates missing parents;
     // rmdir can race only while empty and cannot remove materialised files.
-    let live =
-        convoys.every()?.into_iter().map(|launch| flotilla_resources::convoy::engine::launch_slug(&launch.name)).collect::<BTreeSet<_>>();
+    // A launch that cannot be read is still held: its roots are kept too.
+    let live = convoys.every()?.names().map(flotilla_resources::convoy::engine::launch_slug).collect::<BTreeSet<_>>();
     // The host's own environments are homed here, and never released.
     let mut roots = BTreeSet::new();
     for environment in environments.live()? {

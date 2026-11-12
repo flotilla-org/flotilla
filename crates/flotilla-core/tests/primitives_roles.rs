@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use flotilla_engine_messages::MessagePrimitives;
+use flotilla_engine_messages_testkit::Served;
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
     FleetDesignation, FleetDesignationSpec, InputMeta, MessageReference, MessageRelation, MessageSpec, Project, ProjectSpec, SystemClock,
@@ -17,11 +18,11 @@ use flotilla_store_memory::InMemoryBackend;
 const NAMESPACE: &str = "flotilla";
 const CREW: &str = "flotilla/demo/work/coder";
 
-async fn primitives(dir: &tempfile::TempDir) -> MessagePrimitives {
+async fn primitives(dir: &tempfile::TempDir) -> Served<MessagePrimitives> {
     primitives_at(dir, Arc::new(SystemClock)).await
 }
 
-async fn primitives_at(dir: &tempfile::TempDir, clock: Arc<dyn flotilla_resources::Clock>) -> MessagePrimitives {
+async fn primitives_at(dir: &tempfile::TempDir, clock: Arc<dyn flotilla_resources::Clock>) -> Served<MessagePrimitives> {
     primitives_over(dir, ResourceBackend::new(InMemoryBackend::default()), clock).await
 }
 
@@ -30,7 +31,7 @@ async fn primitives_over(
     dir: &tempfile::TempDir,
     backend: ResourceBackend,
     clock: Arc<dyn flotilla_resources::Clock>,
-) -> MessagePrimitives {
+) -> Served<MessagePrimitives> {
     backend
         .clone()
         .using::<Project>(NAMESPACE)
@@ -55,7 +56,7 @@ async fn primitives_over(
     let service = Arc::new(
         Service::open(&dir.path().join("decided.sqlite"), "home-a", flotilla_engine_store::registry().expect("registry")).expect("store"),
     );
-    MessagePrimitives::open("home-a", service, backend, clock).expect("primitives")
+    Served::new(MessagePrimitives::open("home-a", service, backend.clone(), clock).expect("primitives"), backend)
 }
 
 fn intent(sender: &str, receiver: &str) -> MessageSpec {

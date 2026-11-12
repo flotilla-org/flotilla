@@ -1522,7 +1522,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                 .map(|(index, cause)| (cause, index + 1))
                 .collect();
             for row in &stalls.rows {
-                let evidence = format_stall_evidence(&row.evidence, stalls.full);
+                let evidence = row.evidence.as_deref().map(|evidence| format_stall_evidence(evidence, stalls.full));
                 let supervisor = row
                     .supervisor
                     .clone()
@@ -1534,7 +1534,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                     "{} / {} | {} / {} | {} | {} | {} | {} | group {} ({}) | {}",
                     row.project_display_name.as_deref().or(row.project.as_deref()).unwrap_or("-"),
                     row.convoy_display_name,
-                    if row.vessel.is_empty() { "-" } else { &row.vessel },
+                    row.vessel.as_deref().unwrap_or("-"),
                     if row.role.is_empty() { "-" } else { &row.role },
                     row.rung.map(|rung| rung.to_string()).unwrap_or_else(|| "unknown".into()),
                     supervisor,
@@ -1542,8 +1542,11 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                     proposed,
                     groups[row.cause_group.as_str()],
                     row.shared_cause_count,
-                    evidence
+                    evidence.as_deref().unwrap_or("-")
                 );
+                if let (true, Some(raised_at)) = (stalls.full, row.raised_at) {
+                    let _ = writeln!(output, "  operator attention raised: {}", raised_at.to_rfc3339());
+                }
                 if stalls.full && !row.artifacts.is_empty() {
                     let _ = writeln!(output, "  artifacts: {}", row.artifacts.join(", "));
                 }

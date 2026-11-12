@@ -214,3 +214,18 @@ impl EngineHome {
         self.path().get().cloned().expect("the Convoy path is installed")
     }
 }
+
+#[test]
+fn dropping_a_home_and_its_backend_closes_its_stores() {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    let stores = runtime.block_on(async {
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let home = EngineHome::install(&backend, "flotilla", "host");
+        let messages = flotilla_engine_messages_testkit::EngineMessagesHome::open("host", "flotilla", &backend);
+        [Arc::downgrade(&home.service), Arc::downgrade(messages.service())]
+    });
+    // The runtime's tasks go with it; a port the backend holds must not hold the backend back.
+    drop(runtime);
+    assert!(stores[0].upgrade().is_none(), "the home's decided store outlived it and its backend");
+    assert!(stores[1].upgrade().is_none(), "the Message path's decided store outlived it and its backend");
+}

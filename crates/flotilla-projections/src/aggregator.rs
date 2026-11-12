@@ -39,7 +39,8 @@ use flotilla_resources::{
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, FulfilmentKind,
     FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError, ResourceObject,
     ResourceProvenance, StallRung, StalledCondition, TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement,
-    WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, CONVOY_UNREADABLE_ANNOTATION, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{ReadResourceList, ResourceList, WatchEvent, WatchStart, WatchStream};
@@ -612,8 +613,13 @@ impl Aggregator {
         self.bootstrapping = false;
         self.projection_delivery = ConvoyProjectionDelivery::Coalesced { deadline: None };
         self.emitted_queries.extend(QueryId::ALWAYS_MATERIALIZED.iter().cloned());
-        self.event_sink.emit(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
-        self.event_sink.emit(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set(&None).await)));
+        // Deltas were withheld while bootstrapping: a subscriber that joined
+        // meanwhile catches up from a full set of every family.
+        for query in QueryId::ALWAYS_MATERIALIZED {
+            if let Some(set) = self.state.result_set_for(query).await {
+                self.event_sink.emit(DaemonEvent::ResultSet(Box::new(set)));
+            }
+        }
         // Publish/bootstrap scoped demand now, rather than charging the first
         // unrelated resource change for every existing project scope.
         self.emit_scoped_convoy_result_sets().await;
@@ -1577,7 +1583,7 @@ impl Aggregator {
         // A convoy whose engine read failed keeps its row until a retried projection reads it.
         let mut unread: Vec<(ResourceRef, ResourceProvenance)> = Vec::new();
         for (reference, convoy) in effective_convoys {
-            let viewed = match flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, &convoy) {
+            let viewed = match self.viewed(&convoy) {
                 Ok(viewed) => viewed,
                 Err(error) => {
                     tracing::warn!(convoy = %reference.name, %error, "the engine convoy did not read; its row stays until a retry");
@@ -1605,7 +1611,7 @@ impl Aggregator {
                 .filter_map(|key| {
                     let reference = self.convoy_key_ref(key)?;
                     let row = match self.effective_convoy_key(key) {
-                        Some(item) => match flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, item) {
+                        Some(item) => match self.viewed(item) {
                             Ok(viewed) => Some(self.summarize(&reference, &viewed)),
                             Err(error) => {
                                 // Keep the row as it is, and project it again.
@@ -2640,9 +2646,29 @@ impl Aggregator {
             .clone()
     }
 
+    /// `read` as its row summarizes it: with the engine's promises, except for a launch the
+    /// convoy views could not read, which has nothing more to read.
+    fn viewed(&self, read: &ReadResourceObject<Convoy>) -> Result<ResourceObject<Convoy>, String> {
+        if unreadable_reason(&read.object).is_some() {
+            return Ok(read.object.clone());
+        }
+        flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, read)
+    }
+
     fn summarize(&self, resource: &ResourceRef, convoy: &ResourceObject<Convoy>) -> ConvoyRow {
         #[cfg(test)]
         self.summarized_convoys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(reason) = unreadable_reason(convoy) {
+            return ConvoyRow::builder()
+                .resource(resource.clone())
+                .name(&convoy.metadata.name)
+                .unreadable(reason.clone())
+                .generation(convoy.spec.generation)
+                .workflow_ref(&convoy.spec.workflow_ref)
+                .phase(ConvoyPhase::Pending)
+                .maybe_project_ref(convoy.spec.project_ref.clone())
+                .build();
+        }
         let name = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
         let status = convoy.status.as_ref();
         let subject_conflicts = subject_relationship_conflicts(convoy);
@@ -3217,6 +3243,12 @@ fn convoy_references_repo(convoy: &ResourceObject<Convoy>, repo_identity: &RepoI
 fn is_independent_session(session: &ResourceObject<TerminalSession>) -> bool {
     !session.metadata.labels.contains_key(CONVOY_LABEL)
         && session.status.as_ref().map(|status| status.phase) == Some(TerminalSessionPhase::Running)
+}
+
+/// Why the convoy views could not read `convoy`'s launch. They list such a launch with no status
+/// and the reason; a launch they read always has a status, and never carries the reason.
+fn unreadable_reason(convoy: &ResourceObject<Convoy>) -> Option<&String> {
+    convoy.metadata.annotations.get(CONVOY_UNREADABLE_ANNOTATION).filter(|_| convoy.status.is_none())
 }
 
 fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
@@ -4238,6 +4270,61 @@ mod tests {
         assert!(awareness.rows.as_awareness().expect("awareness rows").iter().any(|node| node.label == "widgets"));
 
         assert!(!run.is_finished(), "the resource watches remain live");
+        run.abort();
+        let _ = run.await;
+    }
+
+    // Deltas computed while bootstrapping are withheld, so a subscriber that
+    // took its snapshot before they landed catches up from the full sets
+    // published when bootstrap ends.
+    #[tokio::test]
+    async fn subscriber_joining_during_bootstrap_receives_every_materialized_family() {
+        let durable = ResourceBackend::new(InMemoryBackend::default());
+        let ensure = convoy_ensure_object("governor").await;
+        durable
+            .clone()
+            .using::<ConvoyEnsure>("flotilla")
+            .create(&InputMeta::builder().name(ensure.metadata.name).build(), &ensure.spec)
+            .await
+            .expect("seed standing role");
+        let project = project_object("widgets").await;
+        durable
+            .clone()
+            .using::<Project>("flotilla")
+            .create(&InputMeta::builder().name(project.metadata.name).build(), &project.spec)
+            .await
+            .expect("seed project");
+
+        let state = AggregatorProjectionState::new();
+        let roles_query = QueryId::StandingRoles { scope: None };
+        let projects_query = QueryId::ProjectRepositories { scope: None };
+        let joined_roles = state.result_set_for(&roles_query).await.expect("standing roles snapshot");
+        let joined_projects = state.result_set_for(&projects_query).await.expect("project repositories snapshot");
+        assert!(joined_roles.rows.as_standing_roles().expect("standing role rows").is_empty());
+        assert!(joined_projects.rows.as_project_repositories().expect("project rows").is_empty());
+
+        let (event_tx, mut event_rx) = broadcast::channel(64);
+        let run_state = state.clone();
+        let run =
+            tokio::spawn(
+                async move { Aggregator::new(run_state, HostName::new("kiwi"), event_tx).run(namespace_resolvers(&durable)).await },
+            );
+
+        timeout(Duration::from_secs(1), async {
+            let (mut role, mut project) = (false, false);
+            while !(role && project) {
+                let DaemonEvent::ResultSet(set) = event_rx.recv().await.expect("aggregator bootstrap event") else { continue };
+                if let Some(rows) = set.rows.as_standing_roles() {
+                    role |= rows.iter().any(|row| row.role == "governor");
+                }
+                if let Some(rows) = set.rows.as_project_repositories() {
+                    project |= rows.iter().any(|row| row.resource.name == "widgets");
+                }
+            }
+        })
+        .await
+        .expect("bootstrap end publishes the standing role and project rows the joined subscriber missed");
+
         run.abort();
         let _ = run.await;
     }

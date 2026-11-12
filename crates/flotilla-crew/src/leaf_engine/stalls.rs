@@ -424,7 +424,14 @@ struct StallInputs {
     forges: Vec<flotilla_resources::ForgeSpec>,
     vessels_list: Arc<flotilla_resources::ReadResourceList<flotilla_resources::Vessel>>,
     messages_list: Arc<flotilla_resources::ReadResourceList<flotilla_resources::Message>>,
-    read_backend: flotilla_store::ResourceBackend,
+    receivers: flotilla_messaging::MessageReceiverSnapshot,
+    declarations: flotilla_store::CascadeDeclarations,
+}
+
+impl StallInputs {
+    fn routes(&self) -> super::supervision::SupervisionRoutes<'_> {
+        super::supervision::SupervisionRoutes { declarations: &self.declarations, receivers: &self.receivers }
+    }
 }
 
 /// What every step of one judging tick reads.
@@ -669,6 +676,7 @@ impl ReconcilerWake {
         )
         .await
         .map_err(|error| error.to_string())?;
+        let declarations = flotilla_store::CascadeDeclarations::load(&read_backend, namespace).await.map_err(|error| error.to_string())?;
         Ok(StallInputs {
             projects,
             available_convoys,
@@ -678,14 +686,14 @@ impl ReconcilerWake {
             forges,
             vessels_list,
             messages_list,
-            read_backend,
+            receivers,
+            declarations,
         })
     }
 
     /// Judges one locally authored convoy and writes its stall status.
     async fn judge_convoy_stall(&self, tick: StallTick<'_>, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
         let StallTick { namespace, .. } = tick;
-        let read_backend = &tick.inputs.read_backend;
         let projects = &tick.inputs.projects;
         let Some(status) = &convoy.status else { return Ok(()) };
         // A new turn or the launch's end may have closed a told stall since the last tick.
@@ -701,7 +709,7 @@ impl ReconcilerWake {
             able = false;
             unknown = false;
         }
-        let policy = super::supervision::supervision_policy(read_backend, namespace, convoy, &projects.items).await?;
+        let policy = super::supervision::supervision_policy(tick.inputs.routes(), convoy, &projects.items)?;
         // An exhausted cursor on a crew target is a legacy failed lookup,
         // not a consumed operator policy. Retry that target after one roll.
         let retry_exhausted = status.stalled.as_ref().is_some_and(|stalled| {
@@ -1554,8 +1562,7 @@ impl ReconcilerWake {
                     if due {
                         let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
                         let delivered =
-                            off_frame(|| self.deliver_stall_nudge(tick, convoy, status, vessel, role, leaf, condition.nudge_history.len()))
-                                .await?;
+                            off_frame(|| self.deliver_stall_nudge(tick, convoy, vessel, role, leaf, condition.nudge_history.len())).await?;
                         match delivered {
                             Ok(_) => {
                                 condition.nudge_history.push(StallNudge { at: now, row: leaf.clone() });
@@ -1655,23 +1662,17 @@ impl ReconcilerWake {
     }
 
     /// Delivers a stall nudge to an idle actor; the inner error is a failed delivery.
-    #[allow(clippy::too_many_arguments)]
     async fn deliver_stall_nudge(
         &self,
         tick: StallTick<'_>,
         convoy: &ResourceObject<Convoy>,
-        status: &ConvoyStatus,
         vessel: &str,
         role: &str,
         leaf: &Leaf,
         nudges: usize,
     ) -> Result<Result<(), String>, String> {
         let StallTick { namespace, now, .. } = tick;
-        let obligation = if declared_stall(status, vessel, role).is_some() {
-            "Your stall is recorded. What changed since your report? If the blocker persists, update the stall with new evidence; if it has cleared, ask your supervisor to resume you.".into()
-        } else {
-            actor_obligation(leaf)?
-        };
+        let obligation = actor_obligation(leaf)?;
         let brief =
             format!("For {role}@{vessel} in {} (resource ref: {}):\n{obligation}", convoy_message_address(convoy), convoy.metadata.name);
         let request = CrewTurnIntent::builder()
@@ -1708,7 +1709,6 @@ impl ReconcilerWake {
         context: String,
     ) -> Result<(), String> {
         let StallTick { namespace, .. } = tick;
-        let read_backend = &tick.inputs.read_backend;
         let (available_convoys, available_ensures) = (&tick.inputs.available_convoys, &tick.inputs.available_ensures);
         self.subscriptions.inner.supervisor_context.lock().await.remove(&context_key);
         condition.rung = StallRung::Operator;
@@ -1739,15 +1739,13 @@ impl ReconcilerWake {
         let mut operator_delivered = false;
         for (index, target) in policy.iter().enumerate().skip(start) {
             let candidate = super::supervision::resolve_target(
-                read_backend,
-                namespace,
+                &tick.inputs.receivers,
                 convoy,
                 &mut *condition,
                 target,
                 &available_convoys.items,
                 &available_ensures.items,
-            )
-            .await?;
+            )?;
             if let Some((target_convoy, target_vessel, target_role, rung)) = candidate {
                 if target_convoy == convoy.metadata.name
                     && stalled_source_actor(&*condition).is_some_and(|(vessel, role)| vessel == target_vessel && role == target_role)
@@ -1907,7 +1905,7 @@ impl ReconcilerWake {
                 continue;
             };
             let projects = &tick.inputs.projects.items;
-            let policy = match super::supervision::supervision_policy(&tick.inputs.read_backend, namespace, convoy, projects).await {
+            let policy = match super::supervision::supervision_policy(tick.inputs.routes(), convoy, projects) {
                 Ok(policy) => policy,
                 Err(error) => {
                     tracing::warn!(namespace, convoy = %name, %error, "a told stall's supervision could not be read; not noted again");

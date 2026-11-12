@@ -949,7 +949,9 @@ fn subscription_supervision_follows_live_parent_chain(tc: hegel::TestCase) {
         if local {
             routing_holder(&backend, "child", "one").await;
         }
-        let path = supervision_path(&backend, "flotilla", "child", "child/task/work/coder").await.expect("path");
+        let declarations = CascadeDeclarations::load(&backend, "flotilla").await.expect("declarations");
+        let receivers = MessageReceiverSnapshot::load(&backend, "flotilla").await.expect("receivers");
+        let path = supervision_path(&declarations, &receivers, "child", "child/task/work/coder").expect("path");
         let expected = if local {
             "child/guide"
         } else if parent {
@@ -958,7 +960,7 @@ fn subscription_supervision_follows_live_parent_chain(tc: hegel::TestCase) {
             "root/guide"
         };
         assert_eq!(path[0].address, expected);
-        let path = supervision_path(&backend, "flotilla", "child", "child/child-one/work/guide").await.expect("exclude sender");
+        let path = supervision_path(&declarations, &receivers, "child", "child/child-one/work/guide").expect("exclude sender");
         assert!(!path.iter().any(|contact| contact.address == "child/guide"));
         let before = memory.read_snapshot();
         let book = crew_address_book(&backend, "flotilla", "child/task/work/coder").await.expect("contacts");

@@ -19,7 +19,7 @@ use flotilla_resources::{
     ConvoyEnsure, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue,
     CONVOY_LABEL, ROLE_ADDRESS_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{ResourceBackend, WeakResourceBackend};
 
 use super::{convert::Conversion, roles::FleetRoles, view::old_leaf, OldStoreRecords};
 
@@ -47,13 +47,19 @@ pub trait ConditionReads: Send + Sync {
 /// `MessageReceiverSnapshot` resolves to, for a convoy role, an adopted
 /// claim and a standing role a declaration names.
 pub struct OldRoleRouting {
-    pub backend: ResourceBackend,
+    pub backend: WeakResourceBackend,
+}
+
+/// The backend a port reads, while it is alive: the backend holds the
+/// Message path, which holds these ports, so they hold it weakly.
+pub(crate) fn upgrade(backend: &WeakResourceBackend) -> Result<ResourceBackend, String> {
+    backend.upgrade().ok_or_else(|| "the resource backend serving messages is gone".to_owned())
 }
 
 #[async_trait]
 impl RoleBindings for OldRoleRouting {
     async fn holders(&self, namespace: &str, roles: &FleetRoles) -> Result<Vec<RoleHolder>, String> {
-        let backend = &self.backend;
+        let backend = &upgrade(&self.backend)?;
         let snapshot = flotilla_messaging::MessageReceiverSnapshot::load(backend, namespace).await.map_err(|error| error.to_string())?;
         let records = OldStoreRecords::load(backend, namespace).await.map_err(|error| error.to_string())?;
         let conversion = Conversion { roles, forges: &records.forges, records: &records };
@@ -112,15 +118,16 @@ impl RoleBindings for OldRoleRouting {
 /// Condition values over old-store records, through the old inbox's Leaf
 /// evaluation: the same reads the old store's gates make.
 pub struct OldStoreConditions {
-    pub backend: ResourceBackend,
+    pub backend: WeakResourceBackend,
 }
 
 #[async_trait]
 impl ConditionReads for OldStoreConditions {
     async fn value(&self, namespace: &str, condition: &Condition) -> Result<ThreeValue, String> {
-        let records = OldStoreRecords::load(&self.backend, namespace).await.map_err(|error| error.to_string())?;
+        let backend = upgrade(&self.backend)?;
+        let records = OldStoreRecords::load(&backend, namespace).await.map_err(|error| error.to_string())?;
         let leaf = old_leaf(condition, &records)?;
-        flotilla_messaging::MessageInbox::new(self.backend.clone(), namespace)
+        flotilla_messaging::MessageInbox::new(backend, namespace)
             .condition_value(&leaf, chrono::Utc::now())
             .await
             .map_err(|error| error.to_string())

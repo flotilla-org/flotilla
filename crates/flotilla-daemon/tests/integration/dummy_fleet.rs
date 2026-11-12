@@ -70,7 +70,9 @@ async fn a_lone_coder_keeps_its_change_request_promise_and_lands() {
     assert_eq!(promise.source, flotilla_resources::promises::PromiseSource::Template);
     let done = &status.crew_work["implement"]["coder"];
     assert_eq!(done.completion_authority, flotilla_resources::WorkCompletionAuthority::Promises);
-    assert!(done.finished_at.is_none());
+    // A seat whose promises are kept is Done, finished when they were kept.
+    assert_eq!(done.phase, flotilla_resources::CrewWorkPhase::Done);
+    assert!(done.finished_at.is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

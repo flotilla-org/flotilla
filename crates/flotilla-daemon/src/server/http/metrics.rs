@@ -59,6 +59,7 @@ impl Exposition {
                 "Decided store write time, from its transaction's start through its commit, local or applied, in seconds."
             }
             "flotilla_convoys_waiting_capacity" => "Convoys this home holds that wait for capacity on a host their placement chose.",
+            "flotilla_convoys_unreadable" => "Convoy launches, at any home, whose records cannot be read; each is listed with why.",
             "flotilla_dispatch_time_from_ready_seconds" => {
                 "Time from an issue entering the dispatch queue to its convoy's creation, in seconds."
             }
@@ -125,6 +126,7 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
     }
     if let Some(convoys) = daemon.engine_convoys() {
         out.number("flotilla_convoys_waiting_capacity", "gauge", "", convoys.memory().capacity_waits());
+        out.number("flotilla_convoys_unreadable", "gauge", "", convoys.memory().unreadable());
     }
     for ((project, workflow), histogram) in crate::dispatch_reconciler::DispatchMetrics::global().snapshot() {
         let labels = format!(",project=\"{}\",workflow=\"{}\"", escaped(&project), escaped(&workflow));

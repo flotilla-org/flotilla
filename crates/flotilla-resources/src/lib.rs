@@ -147,8 +147,8 @@ pub use convoy::{
     StallProposedDisposition, StallReason, StallRung, StallSupervisor, StalledCondition, SubjectDiscovery, SubjectDiscoverySource,
     SupersededCrewClaim, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryFailure, TurnDeliveryFailureKind, TurnDeliveryOutcome,
     TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation, UnresolvedChangeRequestSubject, VesselPlacementPin,
-    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, ADOPTED_CHECKOUT_ANNOTATION, ENSURED_FROM_ANNOTATION,
-    PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, ADOPTED_CHECKOUT_ANNOTATION, CONVOY_UNREADABLE_ANNOTATION,
+    ENSURED_FROM_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{
     config_changes, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec,

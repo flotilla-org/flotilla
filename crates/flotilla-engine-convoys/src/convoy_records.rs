@@ -17,7 +17,7 @@ use flotilla_provisioning::engine::{log_cursor::LogCursor, reads::StoreReads};
 use flotilla_resources::{
     address::subject_for,
     convoy::{admission::AdmissionDocument, engine::launch_address},
-    convoy_records::{ConvoyChange, ConvoyEnd, ConvoyMemory, ConvoyRecord, ConvoyRecords, SeatRecord},
+    convoy_records::{ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords, SeatRecord, UnreadableLaunch},
     lifecycle_reads::ChangeCursor,
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
@@ -80,19 +80,24 @@ impl EngineConvoyRecords {
         self.service.with_store(|store| read(&mut store.read()?)).map_err(|error| format!("engine convoys {what}: {error}"))
     }
 
-    fn scan(read: &mut Read<'_>, home: &str) -> Result<Vec<ConvoyRecord>, StoreError> {
-        let mut records = Vec::new();
+    /// Every launch at `home`. One whose record cannot be read is listed as unreadable, so it
+    /// neither hides the others nor reads as absent.
+    fn scan(read: &mut Read<'_>, home: &str) -> Result<ConvoyListing, StoreError> {
+        let mut listing = ConvoyListing::default();
         let mut after = None;
         loop {
             let page = read.scan::<Resource<Convoy>>(home, after, PAGE)?;
             for id in page.ids {
                 if let Some(loaded) = read.load::<Resource<Convoy>>(id)? {
-                    records.push(record(read, loaded.value, &loaded.home, loaded.version)?);
+                    match entry(read, loaded.value, &loaded.home, loaded.version)? {
+                        Ok(record) => listing.records.push(record),
+                        Err(unreadable) => listing.unreadable.push(unreadable),
+                    }
                 }
             }
             after = page.next;
             if after.is_none() {
-                return Ok(records);
+                return Ok(listing);
             }
         }
     }
@@ -123,18 +128,18 @@ impl ConvoyRecords for EngineConvoyRecords {
         })
     }
 
-    fn at(&self, home: &str) -> Result<Vec<ConvoyRecord>, String> {
+    fn at(&self, home: &str) -> Result<ConvoyListing, String> {
         self.read(&format!("at {home}"), |read| Self::scan(read, home))
     }
 
-    fn every(&self) -> Result<Vec<ConvoyRecord>, String> {
+    fn every(&self) -> Result<ConvoyListing, String> {
         let homes = self.service.homes();
         self.read("at every home", |read| {
-            let mut records = Vec::new();
+            let mut listing = ConvoyListing::default();
             for home in &homes {
-                records.extend(Self::scan(read, home)?);
+                listing.extend(Self::scan(read, home)?);
             }
-            Ok(records)
+            Ok(listing)
         })
     }
 
@@ -241,11 +246,35 @@ fn stalled(read: &mut Read<'_>, subject: &Address) -> Result<bool, StoreError> {
     }
 }
 
-/// `convoy`, held at `home` at `version`, as its readers take it.
+/// `convoy`, held at `home` at `version`, as its readers take it; one that cannot be read is an
+/// error naming why.
 fn record(read: &mut Read<'_>, convoy: Resource<Convoy>, home: &str, version: u64) -> Result<ConvoyRecord, StoreError> {
+    entry(read, convoy, home, version)?.map_err(|unreadable| StoreError::Stream(unreadable.reason))
+}
+
+/// `convoy`, held at `home` at `version`, as its readers take it, or as unreadable where what it
+/// holds does not read; the store's own failures are errors.
+fn entry(
+    read: &mut Read<'_>,
+    convoy: Resource<Convoy>,
+    home: &str,
+    version: u64,
+) -> Result<Result<ConvoyRecord, UnreadableLaunch>, StoreError> {
     let spec = convoy.spec();
-    let admission = AdmissionDocument::decode(convoy.name(), spec.admission.value().bytes())
-        .map_err(|error| StoreError::Stream(format!("convoy {}'s admission: {error}", convoy.name())))?;
+    let unreadable = |reason: String| UnreadableLaunch {
+        name: convoy.name().to_owned(),
+        home: home.to_owned(),
+        version,
+        launch_of: spec.launch_of.clone(),
+        launch: spec.launch,
+        project: spec.project.get(AddressKind::Project).unwrap_or_default().to_owned(),
+        workflow_ref: spec.workflow_ref.clone(),
+        reason,
+    };
+    let admission = match AdmissionDocument::decode(convoy.name(), spec.admission.value().bytes()) {
+        Ok(admission) => admission,
+        Err(error) => return Ok(Err(unreadable(format!("convoy {}'s admission: {error}", convoy.name())))),
+    };
     let id = read.resolve(<Resource<Convoy> as Kind>::CODE, convoy.name(), home)?;
     let admitted_at = match id {
         Some(id) => read.changes(id, 0, 1)?.into_iter().next().map(|created| created.change),
@@ -278,8 +307,10 @@ fn record(read: &mut Read<'_>, convoy: Resource<Convoy>, home: &str, version: u6
             let promise = &row.record;
             promise.source == PromiseSource::Template && promise.label.starts_with(&declared) && promise.owner != name
         }) || spec.seats.iter().any(|row| row.record.parent.as_ref() == Some(&name));
-        let subject = seat_address(&project, convoy.name(), &seat.role)
-            .map_err(|error| StoreError::Stream(format!("convoy {}'s seat {}: {error}", convoy.name(), seat.role)))?;
+        let subject = match seat_address(&project, convoy.name(), &seat.role) {
+            Ok(subject) => subject,
+            Err(error) => return Ok(Err(unreadable(format!("convoy {}'s seat {}: {error}", convoy.name(), seat.role)))),
+        };
         let kept_at = spec
             .promises
             .iter()
@@ -331,7 +362,7 @@ fn record(read: &mut Read<'_>, convoy: Resource<Convoy>, home: &str, version: u6
     }
     .map(|end| (end, time(convoy.since())));
 
-    Ok(ConvoyRecord {
+    Ok(Ok(ConvoyRecord {
         home: home.to_owned(),
         version,
         launch_of: spec.launch_of.clone(),
@@ -346,5 +377,5 @@ fn record(read: &mut Read<'_>, convoy: Resource<Convoy>, home: &str, version: u6
         unlinked,
         admission,
         name: convoy.name().to_owned(),
-    })
+    }))
 }

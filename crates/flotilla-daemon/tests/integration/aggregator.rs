@@ -557,6 +557,81 @@ async fn aggregator_emits_result_set_events() {
     assert_eq!(rows[0].project_ref.as_deref(), Some("my-project"));
 }
 
+// Behaviour (#3108): a launch whose admission document does not decode, held when the daemon
+// starts as after a restart, neither stops it nor hides the other convoys. It is listed with its
+// name and why, nothing of its state told and counted; a launch whose admission carries the
+// views' unreadable key still reads whole; and a launch admitted later still arrives.
+#[tokio::test]
+async fn an_undecodable_launch_is_listed_and_the_daemon_serves_the_others() {
+    use flotilla_engine_convoys::convoy_map;
+    use flotilla_resources::CONVOY_UNREADABLE_ANNOTATION;
+    use flotilla_schema::{Frozen, Timestamp};
+    use flotilla_state_machines::machines::convoy::AdmissionBytes;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    // Held before this start.
+    let readable = admit_convoy(&daemon, engine_convoy("readable", convoy_spec("w"))).await;
+    let mut forged = engine_convoy("forged", convoy_spec("w"));
+    forged.metadata.annotations.insert(CONVOY_UNREADABLE_ANNOTATION.to_owned(), "not the views' to say".to_owned());
+    let forged = admit_convoy(&daemon, forged).await;
+    let convoys = daemon.engine_convoys().expect("the Convoy path is installed");
+    let mut request = convoy_map::request(&engine_convoy("broken", convoy_spec("w"))).expect("request");
+    request.admission = Frozen::new(AdmissionBytes::new(vec![0xff, 0x00])).expect("freeze");
+    let now = Timestamp::from_datetime(&chrono::Utc::now());
+    let broken = convoys.reserve("broken", now).expect("reserve");
+    convoys.create_reserved(&broken, request, now).expect("admit an undecodable document");
+
+    let mut rx = daemon.subscribe();
+    let options = RuntimeOptions {
+        namespace: "flotilla".to_string(),
+        heartbeat_interval: Duration::from_secs(300),
+        controller_resync_interval: Duration::from_secs(300),
+        start_controllers: true,
+        ..RuntimeOptions::default()
+    };
+    let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
+    let DaemonEvent::ResultSet(bootstrap) = next_convoys_event(&mut rx, "the bootstrap result set").await else {
+        panic!("the convoys query starts with a result set")
+    };
+    let rows = convoy_rows(&bootstrap);
+    let row = |name: &str| rows.iter().find(|row| row.name == name).unwrap_or_else(|| panic!("{name} is listed: {rows:?}"));
+    let unreadable = row(&broken);
+    assert!(unreadable.unreadable.as_deref().is_some_and(|reason| reason.contains("does not decode")), "{unreadable:?}");
+    assert_eq!((&unreadable.message, &unreadable.started_at, unreadable.vessels.len()), (&None, &None, 0));
+    for name in [&readable, &forged] {
+        let row = row(name);
+        assert_eq!(row.unreadable, None, "{row:?}");
+        assert!(!row.vessels.is_empty(), "{name} reads whole: {row:?}");
+    }
+    let view = backend.clone().using::<Convoy>("flotilla").get(&forged).await.expect("the forged launch's view");
+    assert!(!view.metadata.annotations.contains_key(CONVOY_UNREADABLE_ANNOTATION));
+    assert_eq!(convoys.memory().unreadable(), 1);
+
+    let later = admit_convoy(&daemon, engine_convoy("later", convoy_spec("w"))).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let set = convoys_result_set(&daemon).await;
+            if convoy_rows(&set).iter().any(|row| row.name == later) {
+                return;
+            }
+            let _ = next_convoys_event(&mut rx, "a convoy row change").await;
+        }
+    })
+    .await
+    .expect("a launch admitted later still arrives");
+}
+
 // Behaviour (#3108): an attention the engine holds, a Message to a person, marks its convoy's row.
 // The aggregator reads attentions from the engine and nothing else, so one raised there after
 // bootstrap reaches the result set.

@@ -20,10 +20,9 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    controller_patches, Convoy, ConvoyPhase, ConvoySpec, InputMeta, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState,
-    WorkflowSnapshot, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    Convoy, ConvoySpec, ConvoyStatus, ResourceObject, VesselRequirement, WorkflowSnapshot, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
-use flotilla_store::{apply_status_patch, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use flotilla_tui::{app::App, theme::Theme};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -32,19 +31,15 @@ fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
     Arc::new(ConfigStore::with_base(dir))
 }
 
-fn convoy_meta(name: &str) -> InputMeta {
-    InputMeta {
-        name: name.to_string(),
-        labels: BTreeMap::from([
-            (PROJECT_LABEL.to_string(), "flotilla".to_string()),
-            (ROLE_LABEL.to_string(), name.to_string()),
-            (GENERATION_LABEL.to_string(), "1".to_string()),
-        ]),
-        annotations: BTreeMap::new(),
-        owner_references: vec![],
-        finalizers: vec![],
-        deletion_timestamp: None,
-    }
+/// Convoy `name` as admission hands it to the engine, with `status`'s frozen workflow.
+fn convoy(name: &str, spec: ConvoySpec, status: ConvoyStatus) -> ResourceObject<Convoy> {
+    let mut convoy = flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, status);
+    convoy.metadata.labels = BTreeMap::from([
+        (PROJECT_LABEL.to_string(), "flotilla".to_string()),
+        (ROLE_LABEL.to_string(), name.to_string()),
+        (GENERATION_LABEL.to_string(), "1".to_string()),
+    ]);
+    convoy
 }
 
 fn convoy_spec(workflow_ref: &str, role: &str) -> ConvoySpec {
@@ -107,9 +102,12 @@ async fn tui_shows_convoys_from_daemon() {
         app.handle_daemon_event(event);
     }
 
-    // Create a Convoy resource — the Aggregator should broadcast a panel snapshot.
-    let convoys = backend.using::<Convoy>("flotilla");
-    convoys.create(&convoy_meta("my-convoy"), &convoy_spec("my-workflow", "my-convoy")).await.expect("create convoy");
+    // Admit a Convoy on the engine — the Aggregator should broadcast a panel snapshot.
+    flotilla_daemon_testkit::engine::admit_convoy(
+        &daemon,
+        convoy("my-convoy", convoy_spec("my-workflow", "my-convoy"), flotilla_engine_convoys_testkit::single_agent("coder")),
+    )
+    .await;
 
     // Poll until App.convoys("flotilla") is non-empty or we time out.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -144,8 +142,6 @@ async fn tui_shows_convoys_from_daemon() {
 
 #[tokio::test]
 async fn generated_table_action_completes_work() {
-    use std::collections::BTreeMap;
-
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -168,7 +164,7 @@ async fn generated_table_action_completes_work() {
         namespace: "flotilla".to_string(),
         heartbeat_interval: Duration::from_secs(300),
         controller_resync_interval: Duration::from_secs(300),
-        // This test owns the convoy status directly so it can isolate the panel/TUI command path.
+        // This test admits the convoy itself so it can isolate the panel/TUI command path.
         // Controller integration is covered by the daemon runtime flow tests.
         start_controllers: false,
         ..RuntimeOptions::default()
@@ -184,23 +180,8 @@ async fn generated_table_action_completes_work() {
         app.handle_daemon_event(event);
     }
 
-    // Create a convoy and bootstrap its status so it has work ready for completion.
-    let convoys = backend.using::<Convoy>("flotilla");
-    convoys.create(&convoy_meta("fix-bug-123"), &convoy_spec("review-and-fix", "fix-bug-123")).await.expect("create convoy");
-
-    let mut work = BTreeMap::new();
-    work.insert(
-        "implement".to_string(),
-        WorkState {
-            phase: WorkPhase::Pending,
-            completion_authority: WorkCompletionAuthority::CrewRollup,
-            ready_at: None,
-            started_at: None,
-            finished_at: None,
-            message: None,
-            placement: None,
-        },
-    );
+    // Admit a convoy whose frozen workflow has work ready for completion: on the engine a work
+    // owes its agent seats' promises, so it has a coder's seat.
     let snapshot = WorkflowSnapshot {
         cascade: None,
         stall_nudges: Default::default(),
@@ -215,26 +196,12 @@ async fn generated_table_action_completes_work() {
             credential_refs: Default::default(),
             credential_scopes: Default::default(),
             credential_permissions: Default::default(),
-            crew: vec![],
+            crew: vec![flotilla_engine_convoys_testkit::agent("coder")],
         }],
     };
-    apply_status_patch(
-        &convoys,
-        "fix-bug-123",
-        &controller_patches::bootstrap(
-            snapshot,
-            "review-and-fix".into(),
-            BTreeMap::new(),
-            work,
-            BTreeMap::new(),
-            Vec::new(),
-            false,
-            ConvoyPhase::Active,
-            None,
-        ),
-    )
-    .await
-    .expect("bootstrap convoy");
+    let status = ConvoyStatus { workflow_snapshot: Some(snapshot), ..ConvoyStatus::default() };
+    flotilla_daemon_testkit::engine::admit_convoy(&daemon, convoy("fix-bug-123", convoy_spec("review-and-fix", "fix-bug-123"), status))
+        .await;
 
     // Drain events until the convoy's vessel appears in the App.
     let drain = |app: &mut App, daemon_rx: &mut tokio::sync::broadcast::Receiver<flotilla_protocol::DaemonEvent>| loop {

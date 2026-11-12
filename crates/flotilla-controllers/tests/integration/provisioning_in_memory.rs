@@ -102,14 +102,17 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
     let workspaces = backend.clone().using::<Vessel>(NAMESPACE);
     harness
         .wait_until(Duration::from_secs(3), || {
-            start_requested_terminals(&engine);
+            // A vessel reads Ready before its crew's terminals are requested; its limits come
+            // from the coder's terminal, so wait for that to run too.
+            let terminals_running = start_requested_terminals(&engine);
             let workspaces = workspaces.clone();
             let launch = launch.clone();
             async move {
-                matches!(
-                    workspaces.get(&launch).await.ok().and_then(|workspace| workspace.status).map(|status| status.phase),
-                    Some(VesselPhase::Ready)
-                )
+                terminals_running
+                    && matches!(
+                        workspaces.get(&launch).await.ok().and_then(|workspace| workspace.status).map(|status| status.phase),
+                        Some(VesselPhase::Ready)
+                    )
             }
         })
         .await;
@@ -529,14 +532,20 @@ async fn a_vessel_listing_leaves_out_released_launches_and_those_of_ended_convoy
 }
 
 /// Stands in for the TerminalSession controller, whose own tests cover it: each requested launch
-/// is realised, given four build jobs as a host-direct launch is.
-fn start_requested_terminals(engine: &RunningClones) {
+/// is realised, given four build jobs as a host-direct launch is. Returns whether any launch was
+/// requested: every one requested then runs.
+fn start_requested_terminals(engine: &RunningClones) -> bool {
     let facts = TerminalLaunchFacts { build_jobs: Some(4), ..Default::default() };
+    let mut requested = false;
     for record in engine.terminals.terminals.at(&engine.terminals.home).expect("terminal sessions") {
-        if !record.ended() && !record.is_running() {
-            engine.terminals.ready(&record.name, &format!("session-{}", record.session_name()), &facts);
+        if !record.ended() {
+            requested = true;
+            if !record.is_running() {
+                engine.terminals.ready(&record.name, &format!("session-{}", record.session_name()), &facts);
+            }
         }
     }
+    requested
 }
 
 /// The Vessel controller over the engine's environments, clones, checkouts, terminal sessions

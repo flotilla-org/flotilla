@@ -18,7 +18,7 @@ use flotilla_resources::{
     normalize_issue_source, resolve_project_issue_sources_from_inventory, Clock, Forge, ForgeSpec, Host, HostStatus, IssueSourceResolution,
     Project, ProjectSpec, Repository, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{ResourceBackend, WeakResourceBackend};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
 
@@ -231,25 +231,27 @@ pub(crate) async fn owns_source(backend: &ResourceBackend, namespace: &str, sour
 }
 
 /// This daemon's forge sources as its observers judge them ([`source_owner`]), for the engine's
-/// observation records to refuse a write from any other home (#3108).
+/// observation records to refuse a write from any other home (#3108). The observation records
+/// are installed in the backend, so this holds it weakly.
 #[derive(Debug)]
 pub struct DaemonSourceObservers {
-    backend: ResourceBackend,
+    backend: WeakResourceBackend,
     namespace: Arc<std::sync::RwLock<String>>,
 }
 
 impl DaemonSourceObservers {
     /// Judges sources in the daemon's current `namespace`.
-    pub fn new(backend: ResourceBackend, namespace: Arc<std::sync::RwLock<String>>) -> Self {
-        Self { backend, namespace }
+    pub fn new(backend: &ResourceBackend, namespace: Arc<std::sync::RwLock<String>>) -> Self {
+        Self { backend: backend.downgrade(), namespace }
     }
 }
 
 #[async_trait]
 impl flotilla_resources::engine_records::SourceObservers for DaemonSourceObservers {
     async fn observes(&self, service: &str, scope: &str) -> Result<bool, String> {
+        let backend = self.backend.upgrade().ok_or_else(|| "the resource backend serving these sources is gone".to_owned())?;
         let namespace = self.namespace.read().map_err(|_| "the daemon namespace lock is poisoned".to_owned())?.clone();
-        owns_source(&self.backend, &namespace, &IssueSource { service: service.to_owned(), scope: scope.to_owned() }).await
+        owns_source(&backend, &namespace, &IssueSource { service: service.to_owned(), scope: scope.to_owned() }).await
     }
 }
 

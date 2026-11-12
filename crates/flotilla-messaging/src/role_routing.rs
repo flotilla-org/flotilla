@@ -12,8 +12,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Convoy, MessageReceiverSnapshot, Project, ProjectHierarchy, ReadResourceObject, ResolvedCascade, ResourceBackend, ResourceError,
-    TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    CascadeDeclarations, Convoy, MessageReceiverSnapshot, Project, ProjectHierarchy, ReadResourceObject, ResolvedCascade, ResourceBackend,
+    ResourceError, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 pub const FLEET_STORE_SENDER: &str = "system:fleet-store";
@@ -58,18 +58,18 @@ impl CrewAddressBook {
 /// Resolve nearest-first supervision recipients, skipping absent holders. Within
 /// a Project, priorities express the charter's governor/operator/owner sequence.
 /// A source holder is excluded so a stalled governor advances rather than loops.
-pub async fn supervision_path(
-    backend: &ResourceBackend,
-    namespace: &str,
+/// A pass over many senders reads `declarations` and `receivers` once and resolves each here.
+pub fn supervision_path(
+    declarations: &CascadeDeclarations,
+    receivers: &MessageReceiverSnapshot,
     project: &str,
     sender: &str,
 ) -> Result<Vec<RoleContact>, ResourceError> {
-    topic_contacts(
-        backend,
-        namespace,
+    topic_candidates_from_declarations(
         TopicRouting::builder().project(project).topic("supervision").sender(sender).reach(TopicReach::Ancestors).build(),
+        ReceiverPresence::Current(receivers),
+        declarations,
     )
-    .await
 }
 
 /// Ordinary topics reach subtree subscribers; supervision can fall back through
@@ -119,29 +119,26 @@ async fn topic_candidates(
     routing: TopicRouting<'_>,
     receivers: ReceiverPresence<'_>,
 ) -> Result<Vec<RoleContact>, ResourceError> {
-    let hierarchy = ProjectHierarchy::load_for_inspection(backend, namespace).await?;
-    let projects = backend.definitions::<Project>(namespace).list().await?;
-    topic_candidates_from_declarations(backend, namespace, routing, receivers, &hierarchy, &projects).await
+    let declarations = CascadeDeclarations::load(backend, namespace).await?;
+    topic_candidates_from_declarations(routing, receivers, &declarations)
 }
 
-async fn topic_candidates_from_declarations(
-    backend: &ResourceBackend,
-    namespace: &str,
+fn topic_candidates_from_declarations(
     routing: TopicRouting<'_>,
     receivers: ReceiverPresence<'_>,
-    hierarchy: &ProjectHierarchy,
-    projects: &[crate::ResourceObject<Project>],
+    declarations: &CascadeDeclarations,
 ) -> Result<Vec<RoleContact>, ResourceError> {
     let TopicRouting { project, topic, sender, reach } = routing;
+    let projects = declarations.projects();
     if !projects.iter().any(|object| object.metadata.name == project) {
         return Ok(Vec::new());
     }
-    let ancestors = hierarchy.ancestors(project)?;
+    let ancestors = declarations.hierarchy().ancestors(project)?;
     let mut result = Vec::new();
     let mut seen = BTreeSet::new();
     for (depth, name) in std::iter::once(project.to_string()).chain(ancestors).enumerate() {
         let object = projects.iter().find(|object| object.metadata.name == name).ok_or_else(|| ResourceError::not_found(&name))?;
-        let cascade = ResolvedCascade::load(backend, namespace, &name, &object.spec).await?;
+        let cascade = declarations.resolve(&name, &object.spec)?;
         let mut local = Vec::new();
         for (role, definition) in &cascade.roles {
             for subscription in definition.subscriptions.iter().flatten() {

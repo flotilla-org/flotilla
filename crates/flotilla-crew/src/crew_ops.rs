@@ -1056,8 +1056,6 @@ impl CrewService {
         let context = self.resolve_crew_context_from_routing(&routing, true).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|e| e.to_string())?;
-        // With the engine holding it, the promises validated here are the engine's (#3587 layer 8).
-        let convoy = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, &convoy)?.into_owned();
         ensure_crew_work_is_defined(&convoy, &context)?;
         let status = convoy.status.as_ref().ok_or("convoy has no status")?;
         let work = status.crew_work.get(&context.vessel).and_then(|crew| crew.get(&context.caller_role)).ok_or("crew work is missing")?;
@@ -1197,9 +1195,7 @@ impl CrewService {
                 && status.attention.as_ref().is_none_or(|attention| attention.state != TerminalAttentionState::Idle)
         });
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let mut convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
-        // With the engine holding it, the promises read here are the engine's (#3587 layer 8).
-        convoy = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, &convoy)?.into_owned();
+        let convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
         ensure_crew_work_is_defined(&convoy, &context)?;
         let principal = principal.ok_or_else(|| "a forced completion requires an operator principal".to_string())?;
         let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
@@ -1528,8 +1524,20 @@ impl CrewService {
                                 .is_some_and(|message| work.resume_brief_id.as_deref() == Some(message.name.as_str()))
                     })
             });
-        let obligation_unchanged =
-            updated.crew_work.get(vessel).and_then(|crew| crew.get(role)) == status.crew_work.get(vessel).and_then(|crew| crew.get(role));
+        /// The seat without what its convoy's stall derives: a Stalled phase reads Working, and the
+        /// stall report goes. The stall is compared separately, so clearing it does not also
+        /// change the seat; a per-seat stall record would replace this.
+        fn without_stall(state: Option<&flotilla_resources::CrewWorkState>) -> Option<flotilla_resources::CrewWorkState> {
+            state.cloned().map(|mut state| {
+                if state.phase == CrewWorkPhase::Stalled {
+                    state.phase = CrewWorkPhase::Working;
+                    state.message = None;
+                }
+                state
+            })
+        }
+        let obligation_unchanged = without_stall(updated.crew_work.get(vessel).and_then(|crew| crew.get(role)))
+            == without_stall(status.crew_work.get(vessel).and_then(|crew| crew.get(role)));
         if updated.phase.is_terminal() || !obligation_unchanged || (updated.stalled != status.stalled && !local_activation) {
             return Err(
                 "stall changed during escalation; the current ruling was preserved; the next receiver may already have been notified"
@@ -1654,8 +1662,7 @@ impl CrewService {
         let merged_change_requests = if names.is_empty() {
             BTreeSet::new()
         } else {
-            let viewed = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, convoy)?;
-            let mut query = crew_change_request_query(&viewed, &forges)?;
+            let mut query = crew_change_request_query(convoy, &forges)?;
             query.field_values.entry("metadata.name".into()).or_default().extend(names);
             query.fields.insert("status.state.value".into(), "merged".into());
             let records = self

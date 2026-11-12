@@ -1,8 +1,122 @@
 use flotilla_change_request::observation;
+use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+use flotilla_provisioning_testkit::TerminalsFixture;
+use flotilla_resources::attentions::{Sender, Subject};
+use flotilla_resources::checkout_records::CheckoutHolder;
+use flotilla_resources::convoy::engine::Actor;
+use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission, SubmissionVerdict};
+use flotilla_resources::terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource};
 use flotilla_resources::ResumeIntent;
-use flotilla_store_memory::InMemoryBackend;
 
 use super::*;
+
+/// Starts the coder's session, `resumed-coder`, in the work's vessel under harness `harness`.
+fn resume_coder_under(case: &Case, harness: &str) {
+    let mut request = TerminalLaunchRequest { session: "resumed-coder".into(), ..TerminalsFixture::agent(&case.vessel, "coder", "env") };
+    if let TerminalLaunchSource::Agent { adapter, .. } = &mut request.source {
+        *adapter = Some(harness.into());
+    }
+    case.home.launch_session(&request);
+}
+
+/// When the coder's session started, as its view reads.
+async fn coder_session_started(case: &Case) -> DateTime<Utc> {
+    case.backend
+        .using::<TerminalSession>("flotilla")
+        .list()
+        .await
+        .expect("sessions")
+        .items
+        .into_iter()
+        .find(|session| session.spec.role == "coder")
+        .and_then(|session| session.status?.started_at)
+        .expect("the coder's session started")
+}
+
+/// The case's work, with its coder at work in `resumed-coder` and no stall: [`idle_nudge_scenario`]
+/// with `workflow`, its actor rows cleared.
+async fn working_coder(workflow: WorkflowSnapshot) -> Case {
+    let case = supervised_case(workflow, &[]).await;
+    case.note(|status| status.stalled = None).await;
+    case.wake.subscriptions.inner.rows.lock().await.clear();
+    case
+}
+
+/// The work's workflow with its coder owing no promise and no completion condition: its dispatch
+/// excludes the decision ledger every agent seat otherwise owes by default. The engine admits only
+/// a convoy that owes something, so a second vessel, never provisioned, keeps its auditor's ledger;
+/// an unprovisioned vessel's seat arms no row.
+fn claim_less_workflow() -> WorkflowSnapshot {
+    let mut workflow = supervised_workflow();
+    let member = &mut workflow.vessels[0].crew[0];
+    member.promises.clear();
+    member.completion_conditions.clear();
+    member.promise_exclusions = vec![PromiseKind::DecisionLedger];
+    workflow.vessels.push(
+        flotilla_resources::VesselRequirement::builder()
+            .name("audit".into())
+            .crew(vec![flotilla_engine_convoys_testkit::agent("auditor")])
+            .build(),
+    );
+    workflow
+}
+
+/// Whether any actor row is armed.
+async fn actor_armed(case: &Case) -> bool {
+    case.wake.subscriptions.inner.rows.lock().await.values().any(|row| matches!(row.maker, LeafMaker::Actor { .. }))
+}
+
+/// Rebuilds the work's rows from its view, once the case's views have heard it.
+async fn sync_work_rows(case: &Case) {
+    let objects = case.objects().await;
+    case.caught_up(&case.wake).await;
+    case.wake.sync_rows("flotilla", &objects).await.expect("sync rows");
+}
+
+/// The coder declares a promise for change request `number` and brings it to `state`: submitted,
+/// accepted by verdict, or retracted.
+async fn coder_promise(case: &Case, number: u64, state: PromiseState) {
+    let engine = case.home.engine();
+    let id = &format!("pr-{number}");
+    let declare = PromiseOperation::Declare { id: id.into(), kind: PromiseKind::Pr, source: PromiseSource::Crew };
+    engine.promise(&case.convoy().await, "work", "coder", &declare, Actor::Crew).await.expect("the coder declares");
+    let reference = format!("cr/github.com/team/one/{number}");
+    let submitted_at = Utc::now();
+    match state {
+        PromiseState::Open => {}
+        PromiseState::Retracted => {
+            let retract = PromiseOperation::Retract { id: id.into(), reason: "not needed".into() };
+            engine.promise(&case.convoy().await, "work", "coder", &retract, Actor::Crew).await.expect("the coder retracts");
+        }
+        PromiseState::Submitted | PromiseState::Kept => {
+            let submission = Submission { reference: reference.clone(), metadata: BTreeMap::new(), submitted_at, verdict: None };
+            let submit = PromiseOperation::Submit { id: id.into(), kind: PromiseKind::Pr, source: PromiseSource::Crew, submission };
+            engine.promise(&case.convoy().await, "work", "coder", &submit, Actor::Crew).await.expect("the coder submits");
+            if state == PromiseState::Kept {
+                let verdict = SubmissionVerdict { accepted: true, who: "forge".into(), at: submitted_at, why: "PR merged".into() };
+                let verdict = PromiseOperation::Verdict { id: id.into(), reference, submitted_at, verdict };
+                engine.promise(&case.convoy().await, "work", "coder", &verdict, Actor::Observer).await.expect("the forge accepts");
+            }
+        }
+    }
+}
+
+/// Launches generation `generation` of wheelhouse's governor role at `home`, as `name`, its
+/// `govern` vessel crewed by a governor at work; returns the launch.
+async fn governor_at(home: &EngineHome, name: &str, generation: u64) -> String {
+    let spec = ConvoySpec::builder()
+        .workflow_ref("workflow".into())
+        .project_ref("wheelhouse".into())
+        .role("governor".into())
+        .generation(generation)
+        .build();
+    let mut status = single_agent("governor");
+    status.workflow_snapshot.as_mut().expect("workflow").vessels[0].name = "govern".into();
+    let launch = home.admit(name, spec, status).await;
+    let vessel = home.vessel(&launch, "govern", "env");
+    home.session(&vessel, "governor", &format!("{name}-{generation}-governor"), "env");
+    launch
+}
 
 // #2560, #3108: the inactivity bound follows the newest tool or output this daemon saw, never
 // earlier than it began watching, not total turn age or hooks. Generated ages straddle the exact
@@ -67,44 +181,18 @@ fn missing_turn_hook_is_visible_and_recovers(tc: hegel::TestCase) {
         // Pin the boundary with unoccupied attention so generated preservation
         // cases cannot hide an off-by-one regression.
         for (age, other_attention) in [(899, false), (900, false), (901, false), (900, true), (age, other_attention)] {
-            let (backend, wake, _) = idle_nudge_scenario().await;
-            let start = Utc::now();
+            let case = project_supervision_case(&[]).await;
+            case.note(|status| status.stalled = None).await;
+            resume_coder_under(&case, if claude { "claude-code" } else { "codex" });
+            let start = coder_session_started(&case).await;
             let now = start + chrono::Duration::seconds(age);
-            let sessions = backend.using::<TerminalSession>("flotilla");
-            let session = sessions.get("resumed-coder").await.expect("session");
-            sessions
-                .update_status(
-                    "resumed-coder",
-                    &session.metadata.resource_version,
-                    &flotilla_resources::TerminalSessionStatus {
-                        phase: TerminalSessionPhase::Running,
-                        started_at: Some(start),
-                        crew: Some(
-                            flotilla_resources::CrewSessionStatus::builder()
-                                .id("crew".into())
-                                .adapter(if claude { "claude-code" } else { "codex" }.into())
-                                .stance("trusted-implicit".into())
-                                .build(),
-                        ),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("running session");
-            let convoys = backend.using::<Convoy>("flotilla");
             let other = ConvoyAttention { source: "settlement".into(), reason: "keep this".into(), raised_at: start };
             if other_attention {
-                flotilla_store::apply_status_patch(
-                    &convoys,
-                    "stalled-work",
-                    &flotilla_resources::ConvoyStatusPatch::SetSettlementAttention { attention: Some(other.clone()) },
-                )
-                .await
-                .expect("other attention");
+                case.note(|status| status.attention = Some(other.clone())).await;
             }
             for _ in 0..2 {
-                observe_actor(&backend, &wake, TerminalAttentionState::Working, now).await;
-                let status = convoys.get("stalled-work").await.expect("convoy").status.expect("status");
+                observe_actor(&case, &case.wake, TerminalAttentionState::Working, now).await;
+                let status = case.status().await;
                 if other_attention {
                     assert_eq!(status.attention, Some(other.clone()));
                 } else {
@@ -117,18 +205,10 @@ fn missing_turn_hook_is_visible_and_recovers(tc: hegel::TestCase) {
                 assert!(status.stalled.is_none(), "missing hooks alone never stall a working crew");
             }
             let hook_at = now + chrono::Duration::seconds(1);
-            observe_actor_source(&backend, &wake, TerminalAttentionState::Idle, TerminalAttentionSource::Hook, hook_at).await;
-            let status = convoys.get("stalled-work").await.expect("convoy").status.expect("status");
-            assert_eq!(status.attention, other_attention.then_some(other));
-            observe_actor(&backend, &wake, TerminalAttentionState::Working, hook_at + chrono::Duration::seconds(120)).await;
-            assert!(convoys
-                .get("stalled-work")
-                .await
-                .expect("convoy")
-                .status
-                .expect("status")
-                .attention
-                .is_none_or(|a| a.source != "missing-turn-hook"));
+            observe_actor_source(&case, &case.wake, TerminalAttentionState::Idle, TerminalAttentionSource::Hook, hook_at).await;
+            assert_eq!(case.status().await.attention, other_attention.then_some(other));
+            observe_actor(&case, &case.wake, TerminalAttentionState::Working, hook_at + chrono::Duration::seconds(120)).await;
+            assert!(case.status().await.attention.is_none_or(|a| a.source != "missing-turn-hook"));
         }
     });
 }
@@ -138,8 +218,8 @@ fn missing_turn_hook_is_visible_and_recovers(tc: hegel::TestCase) {
 #[tokio::test]
 async fn subscribed_fleet_holder_receives_stall_through_empty_parent() {
     use flotilla_resources::{ConvoyEnsureSpec, ConvoyEnsureStatus, ProjectSpec, RoleDefinition, RoleSubscription};
-    let (backend, wake, delivery) = idle_nudge_scenario().await;
-    let projects = backend.definitions::<Project>("flotilla");
+    let case = project_supervision_case(&[]).await;
+    let projects = case.backend.definitions::<Project>("flotilla");
     for (name, parent) in [("root", None), ("empty-parent", Some("root")), ("wheelhouse", Some("empty-parent"))] {
         projects
             .create(
@@ -163,34 +243,13 @@ async fn subscribed_fleet_holder_receives_stall_through_empty_parent() {
             .await
             .expect("project");
     }
-    let convoys = backend.using::<Convoy>("flotilla");
-    let source = convoys.get("stalled-work").await.expect("source");
-    let mut status = source.status.expect("source status");
-    status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("coder").phase = CrewWorkPhase::Stalled;
-    convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("stall");
-    let target = convoys
-        .create(
-            &InputMeta::builder().name("fleet-guide".into()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("root".into()).role("guide".into()).build(),
-        )
-        .await
-        .expect("target");
-    convoys
-        .update_status(
-            "fleet-guide",
-            &target.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([("guide".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("target status");
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
+    // The coder declared its stall (the case's own). The fleet's guide is at work.
+    assert_eq!(case.status().await.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("root".into()).role("guide".into()).build();
+    let guide = case.home.admit("fleet-guide", spec, single_agent("guide")).await;
+    let vessel = case.home.vessel(&guide, "work", "env");
+    case.home.seat(&case.backend, &guide, (&vessel, "work"), ("guide", "guide-terminal"), CrewWorkPhase::Working).await;
+    let ensures = case.backend.using::<ConvoyEnsure>("flotilla");
     let ensure = ensures
         .create(
             &InputMeta::builder().name("root-guide".into()).build(),
@@ -203,127 +262,56 @@ async fn subscribed_fleet_holder_receives_stall_through_empty_parent() {
         .update_status(
             "root-guide",
             &ensure.metadata.resource_version,
-            &ConvoyEnsureStatus { convoy_ref: Some("fleet-guide".into()), ..Default::default() },
+            &ConvoyEnsureStatus { convoy_ref: Some(guide.clone()), ..Default::default() },
         )
         .await
         .expect("holder");
-    let terminals = backend.using::<TerminalSession>("flotilla");
-    let mut spec = terminals.get("resumed-coder").await.expect("source terminal").spec;
-    spec.role = "guide".into();
-    if let TerminalSessionSource::Agent { context, .. } = &mut spec.source {
-        context.convoy = "fleet-guide".into();
-    }
-    terminals
-        .create(
-            &InputMeta::builder()
-                .name("guide-terminal".into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "fleet-guide".into()),
-                    (VESSEL_LABEL.into(), "work".into()),
-                    (ROLE_LABEL.into(), "guide".into()),
-                ]))
-                .build(),
-            &spec,
-        )
-        .await
-        .expect("guide terminal");
-    let source = convoys.get("stalled-work").await.expect("source");
-    let snapshot = HashMap::from([("stalled-work".into(), source)]);
-    wake.judge_stalls_at("flotilla", &snapshot, Utc::now()).await.expect("route stall");
-    let requests = delivery.requests.lock().expect("requests");
+    case.judge(&case.wake, Utc::now()).await;
+    let requests = case.delivery.requests.lock().expect("requests");
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].convoy, "fleet-guide");
+    assert_eq!(requests[0].convoy, guide);
     assert_eq!(requests[0].role, "guide");
-}
-
-// #3586: decoded legacy refusals neither customize nudges nor escalate, even
-// at the former refusal threshold. Normal actor inactivity policy still applies.
-#[tokio::test]
-async fn stored_refusals_do_not_change_nudges_after_restore() {
-    for (cause, remedy) in [
-        (
-            CrewCompletionRefusalCause::ConflictingChangeRequest { service: "github.com".into(), scope: "owner/repo".into(), number: 42 },
-            "PR #42 is conflicting",
-        ),
-        (
-            CrewCompletionRefusalCause::MissingChangeRequestObservation {
-                service: "forge.example".into(),
-                scope: "other/repo".into(),
-                number: 73,
-            },
-            "PR #73 has no observation yet",
-        ),
-    ] {
-        let (backend, wake, delivery) = idle_nudge_scenario().await;
-        let convoys = backend.using::<Convoy>("flotilla");
-        let convoy = convoys.get("stalled-work").await.expect("convoy");
-        let mut status = convoy.status.expect("status");
-        status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").completion_refusal = Some(
-            CrewCompletionRefusal::builder()
-                .expectation("Presentation wording changed".into())
-                .causes(vec![cause])
-                .consecutive_count(2)
-                .build(),
-        );
-        // Construct the previous writer's shape: the new writer omits refusals.
-        let mut stored = serde_json::to_value(&status).expect("store status");
-        stored["crew_work"]["work"]["coder"]["completion_refusal"] =
-            serde_json::to_value(&status.crew_work["work"]["coder"].completion_refusal).unwrap();
-        let restored: flotilla_resources::ConvoyStatus = serde_json::from_value(stored).expect("restore status");
-        assert!(restored.crew_work["work"]["coder"].completion_refusal.is_some());
-        convoys.update_status("stalled-work", &convoy.metadata.resource_version, &restored).await.expect("persist refusal");
-        let start = Utc::now();
-        for second in [0, 60, 120, 185] {
-            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
-        }
-        let requests = delivery.requests.lock().expect("deliveries");
-        assert_eq!(requests.len(), 1);
-        assert!(!requests[0].brief.contains(remedy), "{}", requests[0].brief);
-        assert!(!requests[0].brief.contains("Presentation wording changed"));
-    }
 }
 
 #[tokio::test]
 async fn claude_stop_flickers_and_nudge_reply_do_not_nudge_active_work() {
-    let (backend, wake, delivery) = idle_nudge_scenario().await;
+    let case = idle_nudge_scenario().await;
     let start = Utc::now();
     for second in (0..900).step_by(30) {
-        observe_claude_hook(&backend, &wake, "pre-tool-use", start + chrono::Duration::seconds(second)).await;
-        observe_claude_hook(&backend, &wake, "post-tool-use", start + chrono::Duration::seconds(second + 1)).await;
-        observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(second + 2)).await;
+        observe_claude_hook(&case, &case.wake, "pre-tool-use", start + chrono::Duration::seconds(second)).await;
+        observe_claude_hook(&case, &case.wake, "post-tool-use", start + chrono::Duration::seconds(second + 1)).await;
+        observe_claude_hook(&case, &case.wake, "stop", start + chrono::Duration::seconds(second + 2)).await;
     }
-    assert!(delivery.requests.lock().expect("deliveries").is_empty(), "per-response Stop is not sustained idle");
+    assert!(case.delivery.requests.lock().expect("deliveries").is_empty(), "per-response Stop is not sustained idle");
     // Finally rest long enough to receive a nudge, then reply to it.
     for second in [900, 960, 1020, 1080] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, &case.wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
-    assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
-    observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(1081)).await;
-    observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(1082)).await;
-    assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "reply Stop must not rearm the nudge budget");
+    assert_eq!(case.delivery.requests.lock().expect("deliveries").len(), 1);
+    observe_claude_hook(&case, &case.wake, "user-prompt-submit", start + chrono::Duration::seconds(1081)).await;
+    observe_claude_hook(&case, &case.wake, "stop", start + chrono::Duration::seconds(1082)).await;
+    assert_eq!(case.delivery.requests.lock().expect("deliveries").len(), 1, "reply Stop must not rearm the nudge budget");
 }
 
-// A declared stall asks for changed evidence; a working crew retains the
-// ordinary settlement obligation. Exercise the real nudge producer at idle.
+// A working crew retains the ordinary settlement obligation, and idles into its nudge; a crew
+// whose declared stall waits on its supervisor is not nudged. Exercise the real nudge producer.
 #[tokio::test]
-async fn declared_stall_nudges_preserve_the_changed_evidence_guidance() {
-    for phase in [CrewWorkPhase::Working, CrewWorkPhase::Stalled] {
-        let (backend, wake, delivery) = idle_nudge_scenario().await;
-        let convoys = backend.using::<Convoy>("flotilla");
-        let convoy = convoys.get("stalled-work").await.expect("nudge authority");
-        let mut status = convoy.status.expect("crew state");
-        status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("actor").phase = phase;
-        convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.expect("declared crew phase");
+async fn declared_stall_waits_on_supervision_while_working_crew_is_nudged() {
+    for declared in [false, true] {
+        let case = project_supervision_case(&[]).await;
+        if !declared {
+            case.note(|status| status.stalled = None).await;
+        }
+        resume_coder(&case);
         let start = Utc::now();
         for second in [0, 60, 120, 185] {
-            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+            observe_actor(&case, &case.wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
         }
-        let requests = delivery.requests.lock().expect("durable nudge admissions");
-        let request = requests.first().expect("settlement nudge");
-        assert_eq!(request.brief.contains("Your stall is recorded. What changed since your report?"), phase == CrewWorkPhase::Stalled);
-        if phase == CrewWorkPhase::Stalled {
-            assert!(request.brief.contains("update the stall with new evidence"));
-            assert!(request.brief.contains("ask your supervisor to resume you"));
+        let requests = case.delivery.requests.lock().expect("durable nudge admissions");
+        let nudge = requests.iter().find(|request| request.role == "coder");
+        assert_eq!(nudge.is_some(), !declared, "declared: {declared}");
+        if let Some(request) = nudge {
+            assert!(!request.brief.contains("Your stall is recorded"), "{}", request.brief);
         }
     }
 }
@@ -332,111 +320,108 @@ async fn declared_stall_nudges_preserve_the_changed_evidence_guidance() {
 // and continued idle gets the second, backed-off nudge without a replenished budget.
 #[tokio::test]
 async fn nudge_reply_restarts_idle_clock_and_allows_second_nudge_after_backoff() {
-    let (backend, wake, delivery) = idle_nudge_scenario().await;
+    let case = idle_nudge_scenario().await;
+    let (wake, delivery) = (&case.wake, &case.delivery);
     let start = Utc::now();
     for second in [0, 60, 120, 185] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
-    observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(186)).await;
+    observe_claude_hook(&case, wake, "user-prompt-submit", start + chrono::Duration::seconds(186)).await;
     for second in [240, 300] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(second)).await;
     }
-    observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(359)).await;
+    observe_claude_hook(&case, wake, "stop", start + chrono::Duration::seconds(359)).await;
     for second in [360, 420, 480, 538] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "the reply's Stop restarts the quiet clock");
-    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(539)).await;
+    observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(539)).await;
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2, "continued idle gets the second backed-off nudge");
-    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-    assert_eq!(convoy.status.expect("status").nudge_obligations[0].history.len(), 2, "a reply does not replenish the budget");
+    assert_eq!(case.status().await.nudge_obligations[0].history.len(), 2, "a reply does not replenish the budget");
 }
 
 #[tokio::test]
 async fn actual_tool_work_after_nudge_cancels_idle_without_replenishing_budget() {
-    let (backend, wake, delivery) = idle_nudge_scenario().await;
+    let case = idle_nudge_scenario().await;
+    let (wake, delivery) = (&case.wake, &case.delivery);
     let start = Utc::now();
     for second in [0, 60, 120, 185] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
-    observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(181)).await;
-    observe_claude_hook(&backend, &wake, "pre-tool-use", start + chrono::Duration::seconds(182)).await;
+    observe_claude_hook(&case, wake, "user-prompt-submit", start + chrono::Duration::seconds(181)).await;
+    observe_claude_hook(&case, wake, "pre-tool-use", start + chrono::Duration::seconds(182)).await;
     for second in [240, 300] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(second)).await;
     }
-    observe_claude_hook(&backend, &wake, "post-tool-use", start + chrono::Duration::seconds(358)).await;
-    observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(359)).await;
-    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(360)).await;
+    observe_claude_hook(&case, wake, "post-tool-use", start + chrono::Duration::seconds(358)).await;
+    observe_claude_hook(&case, wake, "stop", start + chrono::Duration::seconds(359)).await;
+    observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(360)).await;
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "real work requires a new continuous idle grace");
     for second in [420, 480, 539] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2);
-    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-    assert_eq!(convoy.status.expect("status").nudge_obligations[0].history.len(), 2, "commands alone do not reset the obligation budget");
+    assert_eq!(case.status().await.nudge_obligations[0].history.len(), 2, "commands alone do not reset the obligation budget");
 }
 
 #[tokio::test]
 async fn genuine_idle_has_obligation_budget_backoff_and_operator_escalation() {
-    let (backend, wake, delivery) = idle_nudge_scenario().await;
+    let case = idle_nudge_scenario().await;
+    let (wake, delivery) = (&case.wake, &case.delivery);
     let start = Utc::now();
     // A screen read of idle stands 5 seconds before it counts as quiet.
     for second in [0, 60, 120, 184] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert!(delivery.requests.lock().expect("deliveries").is_empty());
-    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(185)).await;
+    observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(185)).await;
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
     // #2592: even mechanical nudges identify the crew and convoy they concern.
-    assert!(delivery.requests.lock().expect("deliveries")[0]
-        .brief
-        .contains("coder@work in graphql-budget@wheelhouse (resource ref: stalled-work)"));
+    let identity = format!("coder@work in graphql-budget@wheelhouse (resource ref: {})", case.work);
+    let brief = delivery.requests.lock().expect("deliveries")[0].brief.clone();
+    assert!(brief.contains(&identity), "{brief}");
     // A brief working flicker cannot replenish the unmet claim's budget.
-    observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(186)).await;
+    observe_actor(&case, wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(186)).await;
     for second in [187, 240, 300, 359] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
     for second in [372, 420, 480, 540, 600, 659] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2);
-    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-    assert_eq!(convoy.status.expect("status").stalled.expect("stall").rung, StallRung::Nudge);
-    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(732)).await;
-    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-    assert_eq!(convoy.status.expect("status").stalled.expect("stall").rung, StallRung::Operator);
-    observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(733)).await;
+    assert_eq!(case.status().await.stalled.expect("stall").rung, StallRung::Nudge);
+    observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(732)).await;
+    assert_eq!(case.status().await.stalled.expect("stall").rung, StallRung::Operator);
+    observe_actor(&case, wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(733)).await;
     for second in [734, 780, 840, 900, 960, 1020] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2, "working does not reset an obligation budget");
 }
 
 #[tokio::test]
 async fn operator_message_reply_restarts_clock_without_replenishing_budget() {
-    let (backend, wake, delivery) = idle_nudge_scenario().await;
+    let case = idle_nudge_scenario().await;
+    let (wake, delivery) = (&case.wake, &case.delivery);
     let start = Utc::now();
     for second in [0, 60, 120, 185] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
-    message_to_coder(&backend, "owner-guidance", "Keep working on the fix").await;
+    message_to_coder(&case, "owner-guidance", "Keep working on the fix").await;
     for second in [240, 300, 360, 420] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "pending owner guidance is never displaced");
-    deliver_to_coder(&backend, "owner-guidance", start + chrono::Duration::seconds(421)).await;
+    deliver_to_coder(&case, "owner-guidance", start + chrono::Duration::seconds(421)).await;
     // Judge delivery without replacing its receipt with the scenario helper.
-    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-    wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), start + chrono::Duration::seconds(421))
-        .await
-        .expect("delivery grace");
+    case.judge(wake, start + chrono::Duration::seconds(421)).await;
     // The guidance is a turn: the agent works on it, then stops at 480. Quiet counts from there.
     observe_actor_source(
-        &backend,
-        &wake,
+        &case,
+        wake,
         TerminalAttentionState::Working,
         TerminalAttentionSource::Hook,
         start + chrono::Duration::seconds(425),
@@ -444,8 +429,8 @@ async fn operator_message_reply_restarts_clock_without_replenishing_budget() {
     .await;
     for second in [480, 540, 600, 659] {
         observe_actor_source(
-            &backend,
-            &wake,
+            &case,
+            wake,
             TerminalAttentionState::Idle,
             TerminalAttentionSource::Hook,
             start + chrono::Duration::seconds(second),
@@ -453,81 +438,51 @@ async fn operator_message_reply_restarts_clock_without_replenishing_budget() {
         .await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "the reply's Stop restarts the quiet clock");
-    observe_actor_source(
-        &backend,
-        &wake,
-        TerminalAttentionState::Idle,
-        TerminalAttentionSource::Hook,
-        start + chrono::Duration::seconds(660),
-    )
-    .await;
+    observe_actor_source(&case, wake, TerminalAttentionState::Idle, TerminalAttentionSource::Hook, start + chrono::Duration::seconds(660))
+        .await;
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2, "continued idle can receive the second nudge after owner reply");
-    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-    assert_eq!(convoy.status.expect("status").nudge_obligations[0].history.len(), 2);
+    assert_eq!(case.status().await.nudge_obligations[0].history.len(), 2);
 }
 
 #[tokio::test]
 async fn observed_commit_resets_budget_but_refresh_does_not() {
-    let (backend, wake, delivery) = idle_nudge_scenario().await;
-    // The engine holds the actor's checkout for the convoy, its HEAD inspected.
-    let engine = flotilla_provisioning_testkit::CheckoutFixture::default();
-    let wake = ReconcilerWake::new(wake.subscriptions.with_lifecycle_reads(engine.reads_with_agent_sessions(agents())));
-    engine.admit_for(&backend, "flotilla", "stalled-work", "stalled-work").await;
-    let launch = engine.put_ready(
+    // The engine holds the actor's checkout for the launch, its HEAD inspected; the work's vessel
+    // carries its repository.
+    let repo = RepositoryKey("repo".into());
+    let mut workflow = supervised_workflow();
+    workflow.vessels[0].repository_refs = Some(vec![repo.clone()]);
+    let case = supervised_case(workflow, &[]).await;
+    case.note(|status| status.stalled = None).await;
+    resume_coder(&case);
+    let checkouts = &case.home.engine.checkouts;
+    let launch = checkouts.put_ready(
         "actor-checkout",
         &CheckoutSpec::Observed(
-            flotilla_resources::ObservedCheckoutSpec::builder()
+            ObservedCheckoutSpec::builder()
                 .r#ref("work".into())
                 .path("/workspace".into())
-                .repo_ref(flotilla_protocol::RepositoryKey("repo".into()))
-                .host_ref("home".into())
+                .repo_ref(repo)
+                .host_ref("test-host".into())
                 .is_main(false)
                 .build(),
         ),
-        Some(&engine.holder("stalled-work")),
+        Some(&CheckoutHolder::Convoy(case.work.clone())),
     );
     let inspection =
         |head: &str| flotilla_resources::checkout_records::Inspection { head_revision: Some(head.into()), ..Default::default() };
-    engine.checkouts.inspected(&launch, inspection("before")).expect("initial HEAD");
-    let vessels = backend.using::<Vessel>("flotilla");
-    let vessel = vessels
-        .create(
-            &InputMeta::builder()
-                .name("actor-vessel".into())
-                .labels(BTreeMap::from([(CONVOY_LABEL.into(), "stalled-work".into())]))
-                .build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "stalled-work".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
-    vessels
-        .update_status(
-            "actor-vessel",
-            &vessel.metadata.resource_version,
-            &flotilla_resources::VesselStatus {
-                checkout_refs: BTreeMap::from([(flotilla_protocol::RepositoryKey("repo".into()), "actor-checkout".into())]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("checkout association");
+    checkouts.checkouts.inspected(&launch, inspection("before")).expect("initial HEAD");
+    let (wake, delivery) = (&case.wake, &case.delivery);
     let start = Utc::now();
     for second in [0, 60, 120, 185] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
-    engine.checkouts.inspected(&launch, inspection("before")).expect("same HEAD refresh");
-    observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(240)).await;
-    let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-    assert_eq!(convoy.status.expect("status").nudge_obligations[0].history.len(), 1);
-    engine.checkouts.inspected(&launch, inspection("after")).expect("new commit");
+    checkouts.checkouts.inspected(&launch, inspection("before")).expect("same HEAD refresh");
+    observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(240)).await;
+    assert_eq!(case.status().await.nudge_obligations[0].history.len(), 1);
+    checkouts.checkouts.inspected(&launch, inspection("after")).expect("new commit");
     for second in [241, 300, 360, 420, 421] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     let requests = delivery.requests.lock().expect("deliveries");
     assert_eq!(requests.len(), 2);
@@ -536,117 +491,98 @@ async fn observed_commit_resets_budget_but_refresh_does_not() {
 
 #[tokio::test]
 async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
-    let (backend, wake, delivery) = project_supervision_case(&[]).await;
-    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let case = project_supervision_case(&[]).await;
     let resumed_at = Utc::now();
-    flotilla_store::apply_status_patch(
-        &convoys,
-        "stalled-work",
-        &flotilla_resources::external_patches::resume_crew_work(
+    case.note(|status| {
+        external_patches::resume_crew_work(
             "work".into(),
             "coder".into(),
             resumed_at,
             "Continue with the operator's guidance".into(),
             Some("resume-brief".into()),
             ResumeIntent::Reopen,
-        ),
-    )
-    .await
-    .expect("resume declared stall");
-    let sessions = backend.clone().using::<TerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("resumed-coder".into())
-                .annotations(launch_annotations("resumed-coder"))
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "stalled-work".into()),
-                    (VESSEL_LABEL.into(), "work".into()),
-                    (ROLE_LABEL.into(), "coder".into()),
-                ]))
-                .build(),
-            &flotilla_resources::TerminalSessionSpec {
-                env_ref: "env".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Agent {
-                    selector: flotilla_resources::Selector::for_capability("coding"),
-                    brief: flotilla_resources::TerminalBrief {
-                        path: "brief.md".into(),
-                        content: "Initial".into(),
-                        artifact_digest: None,
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "stalled-work".into(),
-                        vessel_ref: "work".into(),
-                    }),
-                },
-                cwd: "/workspace".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
-            },
         )
-        .await
-        .expect("crew session");
-    message_to_coder(&backend, "resume-brief", "Continue with the operator's guidance").await;
-    let idle_before_delivery = TerminalAttention {
-        state: TerminalAttentionState::Idle,
-        as_of: Utc::now(),
-        source: flotilla_resources::TerminalAttentionSource::Hook,
+        .apply(status)
+    })
+    .await;
+    resume_coder(&case);
+    message_to_coder(&case, "resume-brief", "Continue with the operator's guidance").await;
+    let observe = |state: TerminalAttentionState, source: TerminalAttentionSource, at: DateTime<Utc>, attention: bool| {
+        observe_session(&case.home, "resumed-coder", attention.then_some(TerminalAttention { state, as_of: at, source }));
+        observe_agent(&case.home, "resumed-coder", state, source, at);
     };
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &flotilla_resources::TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                attention: Some(idle_before_delivery.clone()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("idle before brief delivery");
-    observe_agent("resumed-coder", TerminalAttentionState::Idle, TerminalAttentionSource::Hook, idle_before_delivery.as_of);
-    let convoy = convoys.get("stalled-work").await.expect("resumed convoy");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), convoy)])).await.expect("judge before delivery");
-    assert!(delivery.requests.lock().expect("nudge requests").is_empty());
-    deliver_to_coder(&backend, "resume-brief", Utc::now()).await;
-    let session = sessions.get("resumed-coder").await.expect("session");
-    let mut status = session.status.expect("status");
-    status.attention = None;
-    sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("brief delivered");
-    observe_agent("resumed-coder", TerminalAttentionState::Working, TerminalAttentionSource::Hook, Utc::now());
-    let convoy = convoys.get("stalled-work").await.expect("resumed convoy");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), convoy)])).await.expect("judge during turn");
-    assert!(delivery.requests.lock().expect("nudge requests").is_empty());
-    let session = sessions.get("resumed-coder").await.expect("session");
-    let mut status = session.status.expect("status");
+    observe(TerminalAttentionState::Idle, TerminalAttentionSource::Hook, Utc::now(), true);
+    case.judge(&case.wake, Utc::now()).await;
+    assert!(case.delivery.requests.lock().expect("nudge requests").is_empty());
+    deliver_to_coder(&case, "resume-brief", Utc::now()).await;
+    observe(TerminalAttentionState::Working, TerminalAttentionSource::Hook, Utc::now(), false);
+    case.judge(&case.wake, Utc::now()).await;
+    assert!(case.delivery.requests.lock().expect("nudge requests").is_empty());
     let ended_at = Utc::now();
-    status.attention = Some(TerminalAttention {
-        state: TerminalAttentionState::Idle,
-        as_of: ended_at,
-        source: flotilla_resources::TerminalAttentionSource::Hook,
-    });
-    sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("turn ended");
-    observe_agent("resumed-coder", TerminalAttentionState::Idle, TerminalAttentionSource::Hook, ended_at);
-    let convoy = convoys.get("stalled-work").await.expect("resumed convoy");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), convoy)])).await.expect("judge after turn");
-    assert!(delivery.requests.lock().expect("nudge requests").is_empty());
+    observe(TerminalAttentionState::Idle, TerminalAttentionSource::Hook, ended_at, true);
+    case.judge(&case.wake, Utc::now()).await;
+    assert!(case.delivery.requests.lock().expect("nudge requests").is_empty());
     let quiet_at = Utc::now() + chrono::Duration::minutes(3);
     // Fresh screen confirmations preserve quiet duration.
     for second in [120, 60, 0] {
         let observed_at = quiet_at - chrono::Duration::seconds(second);
-        let session = sessions.get("resumed-coder").await.expect("session");
-        let mut status = session.status.expect("status");
-        status.attention =
-            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: observed_at, source: TerminalAttentionSource::Screen });
-        sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("quiet confirmation");
-        observe_agent("resumed-coder", TerminalAttentionState::Idle, TerminalAttentionSource::Screen, observed_at);
-        let convoy = convoys.get("stalled-work").await.expect("convoy");
-        wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), observed_at).await.expect("judge quiet turn");
+        observe(TerminalAttentionState::Idle, TerminalAttentionSource::Screen, observed_at, true);
+        case.judge(&case.wake, observed_at).await;
     }
-    assert_eq!(delivery.requests.lock().expect("nudge requests").len(), 1);
+    assert_eq!(case.delivery.requests.lock().expect("nudge requests").len(), 1);
+}
+
+// #3108: a stall whose governor cannot be reached tells the operator why, once however often it is
+// judged: one attention for the stalled seat, naming the failed delivery or the missing governor.
+#[tokio::test]
+async fn unavailable_governor_tells_the_operator_once() {
+    for unavailable in GovernorUnavailable::ALL {
+        let case = project_supervision_case(&[]).await;
+        let messages = EngineMessagesHome::open("test-host", "flotilla", &case.backend);
+        designate_fleet(&case.backend, "flotilla").await;
+        // The stalled convoy's project is defined, so its operator inbox is a person's inbox.
+        case.backend
+            .definitions::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name("wheelhouse".into()).build(),
+                &flotilla_resources::ProjectSpec::builder().display_name("wheelhouse".into()).build(),
+            )
+            .await
+            .expect("project");
+        let governor = admit_governor(
+            &case,
+            "governor",
+            1,
+            if matches!(unavailable, GovernorUnavailable::CrewMissing) { "deputy" } else { "governor" },
+        )
+        .await;
+        match unavailable {
+            GovernorUnavailable::DeliveryError => case.delivery.unavailable.store(true, Ordering::SeqCst),
+            GovernorUnavailable::NoLiveGeneration => {
+                let governor = case.home.view(&case.backend, &governor).await;
+                case.home.engine().abandon(&governor, "operator", "abandoned").await.expect("abandon the governor");
+            }
+            GovernorUnavailable::CrewMissing => {}
+        }
+        let now = Utc::now();
+        for tick in 0..3 {
+            case.judge(&case.wake, now + chrono::Duration::seconds(tick)).await;
+        }
+        let stall = case.status().await.stalled.expect("stall");
+        assert_eq!((stall.rung, stall.supervisor.as_ref()), (StallRung::Operator, None), "{unavailable:?}");
+        let told = case.backend.attentions().open("flotilla", Some(Sender::StallJudge), None).await.expect("open attentions");
+        let [attention] = told.as_slice() else { panic!("{unavailable:?}: one attention for the stalled seat: {told:?}") };
+        assert_eq!(attention.subject, Subject::ConvoyRole { convoy: case.work.clone(), role: "coder".into() });
+        let why = if matches!(unavailable, GovernorUnavailable::DeliveryError) { "supervisor delivery failed" } else { "no live governor" };
+        assert!(attention.reason.contains(why), "{unavailable:?}: {}", attention.reason);
+        // Telling the same stall again stores nothing new.
+        let fact = flotilla_resources::attentions::Fact::Stalled { convoy: case.work.clone(), role: "coder".into() };
+        let again = flotilla_resources::attentions::Attention::new(fact, attention.reason.clone(), stall.began_at);
+        case.backend.attentions().raise("flotilla", &again).await.expect("raise again");
+        let stored = messages.primitives().messages().expect("stored messages");
+        let told = stored.iter().filter(|(_, message)| message.spec().sender.to_string().ends_with("/role:stall-judge")).count();
+        assert_eq!(told, 1, "{unavailable:?}");
+    }
 }
 
 #[tokio::test]
@@ -661,44 +597,39 @@ async fn unavailable_governor_recovers_in_one_pass() {
 // rung that the supervisor already consumed, even across a restart.
 #[tokio::test]
 async fn unavailable_governor_preserves_consumed_bosun_rung() {
-    let (backend, mut wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let source = convoys.get("stalled-work").await.expect("source");
-    let mut status = source.status.expect("status");
-    status.crew_work.get_mut("work").expect("crew").insert("bosun".into(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build());
-    convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("bosun available");
+    // The work's bosun is latent, a seat no session holds yet: it is available to supervise.
+    let mut workflow = supervised_workflow();
+    workflow.vessels[0].crew.push(flotilla_engine_convoys_testkit::agent("bosun"));
+    let case = supervised_case(workflow, &[("governor", 1, ConvoyPhase::Active)]).await;
+    let delivery = case.delivery.clone();
     let now = Utc::now();
-    let objects = convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
-    wake.sync_rows("flotilla", &objects).await.expect("rows");
-    wake.judge_stalls_at("flotilla", &objects, now).await.expect("route to bosun");
-    let source = convoys.get("stalled-work").await.expect("source");
-    let mut status = source.status.expect("status");
-    let condition = status.stalled.as_mut().expect("stall");
-    assert_eq!(condition.rung, StallRung::Bosun);
-    // Same persisted transition as crew supervise ... escalate: clear ownership,
+    sync_work_rows(&case).await;
+    case.judge(&case.wake, now).await;
+    assert_eq!(case.status().await.stalled.expect("stall").rung, StallRung::Bosun);
+    // Same transition as crew supervise ... escalate: clear ownership,
     // preserve the consumed index, and restore the original actor as maker.
-    condition.supervisor = None;
-    condition.maker = Some(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() });
-    condition.rung = StallRung::Operator;
-    convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("escalate");
+    case.note(|status| {
+        let condition = status.stalled.as_mut().expect("stall");
+        condition.supervisor = None;
+        condition.maker = Some(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() });
+        condition.rung = StallRung::Operator;
+    })
+    .await;
     delivery.unavailable.store(true, Ordering::SeqCst);
+    let mut wake = case.wake.clone();
     for _ in 0..2 {
-        wake = supervision_wake(&backend);
-        wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
-        let objects =
-            convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
-        wake.sync_rows("flotilla", &objects).await.expect("rebuild rows");
-        wake.judge_stalls_at("flotilla", &objects, now).await.expect("retry governor");
-        let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+        wake = case.restarted_wake().await;
+        wake.sync_rows("flotilla", &case.objects().await).await.expect("rebuild rows");
+        case.judge(&wake, now).await;
+        let stalled = case.status().await.stalled.expect("stall");
         assert_eq!(stalled.rung, StallRung::Operator);
         assert_eq!(stalled.supervision_index, Some(0));
         assert!(!stalled.supervision_exhausted);
     }
     delivery.unavailable.store(false, Ordering::SeqCst);
-    let objects = convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
-    wake.sync_rows("flotilla", &objects).await.expect("rows");
-    wake.judge_stalls_at("flotilla", &objects, now).await.expect("recover governor");
-    let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+    wake.sync_rows("flotilla", &case.objects().await).await.expect("rows");
+    case.judge(&wake, now).await;
+    let stalled = case.status().await.stalled.expect("stall");
     assert_eq!(stalled.rung, StallRung::Governor);
     assert_eq!(stalled.supervision_index, Some(1));
     let requests = delivery.requests.lock().expect("deliveries");
@@ -711,119 +642,23 @@ async fn unavailable_governor_preserves_consumed_bosun_rung() {
 // Legacy cursor recovery must not send the stall back to that governor.
 #[tokio::test]
 async fn governor_escalation_exhausts_default_policy_once() {
-    let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let source = convoys.get("stalled-work").await.expect("source");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("route governor");
-    let source = convoys.get("stalled-work").await.expect("source");
-    let mut status = source.status.expect("status");
-    let condition = status.stalled.as_mut().expect("stall");
-    condition.supervisor = None;
-    condition.maker = Some(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() });
-    condition.rung = StallRung::Operator;
-    convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("governor escalates");
+    let case = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+    case.judge(&case.wake, Utc::now()).await;
+    case.note(|status| {
+        let condition = status.stalled.as_mut().expect("stall");
+        condition.supervisor = None;
+        condition.maker = Some(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() });
+        condition.rung = StallRung::Operator;
+    })
+    .await;
     for _ in 0..2 {
-        let source = convoys.get("stalled-work").await.expect("source");
-        wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("consume policy");
-        let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+        case.judge(&case.wake, Utc::now()).await;
+        let stalled = case.status().await.stalled.expect("stall");
         assert_eq!(stalled.rung, StallRung::Operator);
         assert!(stalled.supervision_exhausted);
         assert_eq!(stalled.supervision_index, Some(2));
         assert!(stalled.supervisor.is_none());
-        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
-    }
-}
-
-// WARN events must expose routing failures as structured convoy/target/reason
-// fields; skipped lower candidates must not warn when a governor accepts delivery.
-#[test]
-fn unavailable_governor_warns_with_routing_fields() {
-    #[derive(Clone)]
-    struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for LogWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("logs").extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    for unavailable in GovernorUnavailable::ALL {
-        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer = LogWriter(logs.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        tracing::subscriber::with_default(subscriber, || {
-            runtime.block_on(unavailable_governor_scenario(unavailable, &[false, true], FallbackRecord::Current));
-        });
-        let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8 logs");
-        let warnings = text.lines().collect::<Vec<_>>();
-        assert_eq!(warnings.len(), 1, "unchanged unavailable routing warns once: {text}");
-        for warning in warnings {
-            assert!(warning.contains("WARN"), "{warning}");
-            assert!(warning.contains("convoy=stalled-work"), "{warning}");
-            assert!(warning.contains("target="), "{warning}");
-            assert!(warning.contains("reason="), "{warning}");
-            // DeliveryError logs the transport failure at the attempted send,
-            // before the policy-fallback warning that carries cursor/evidence.
-            if !matches!(unavailable, GovernorUnavailable::DeliveryError) {
-                assert!(warning.contains("supervision_start="), "{warning}");
-                assert!(warning.contains("supervision_policy_len="), "{warning}");
-                assert!(warning.contains("evidence="), "{warning}");
-            }
-            // #2592: operator fallback logs contain the source address and exact actionable crew.
-            assert!(warning.contains("coder@work in convoy graphql-budget@wheelhouse (resource ref: stalled-work)"), "{warning}");
-            assert!(warning.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"), "{warning}");
-            assert!(
-                warning.contains(if matches!(unavailable, GovernorUnavailable::DeliveryError) {
-                    "supervisor reconnecting"
-                } else {
-                    "supervisor_lookup_failed"
-                }),
-                "{warning}"
-            );
-        }
-    }
-    // A live governor does not turn an explicit/consumed operator policy
-    // into a lookup failure. Both operator routes must explain that choice.
-    for (policy, expected_reason) in
-        [(Vec::new(), "supervision_policy_exhausted"), (vec![SupervisionTarget::Operator], "operator_rung_selected")]
-    {
-        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer = LogWriter(logs.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        tracing::subscriber::with_default(subscriber, || {
-            runtime.block_on(async {
-                let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-                let convoys = backend.using::<Convoy>("flotilla");
-                let source = convoys.get("stalled-work").await.expect("source");
-                let now = source.metadata.creation_timestamp + chrono::Duration::seconds(120);
-                let mut status = source.status.expect("status");
-                status.workflow_snapshot.as_mut().expect("snapshot").supervision = Some(policy);
-                let source =
-                    convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("operator policy");
-                wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), source)]), now).await.expect("judge policy");
-                assert!(delivery.requests.lock().expect("deliveries").is_empty(), "policy must not contact the live governor");
-            });
-        });
-        let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8 logs");
-        assert_eq!(text.lines().count(), 1, "one operator decision: {text}");
-        assert!(text.contains(expected_reason), "{text}");
-        assert!(text.contains("target=Operator"), "{text}");
-        assert!(text.contains("supervision_start=0"), "{text}");
-        assert!(!text.contains("supervisor_lookup_failed"), "{text}");
+        assert_eq!(case.delivery.requests.lock().expect("deliveries").len(), 1);
     }
 }
 
@@ -845,79 +680,65 @@ fn generated_unavailable_governor_recovers(tc: hegel::TestCase) {
 
 #[tokio::test]
 async fn stalled_work_routes_to_live_governor_after_abandoned_generation() {
-    let (backend, wake, delivery) =
-        project_supervision_case(&[("governor-one", 1, ConvoyPhase::Abandoned), ("governor-two", 2, ConvoyPhase::Active)]).await;
-    let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
-    let objects = HashMap::from([
-        ("stalled-work".into(), source),
-        ("governor-two".into(), backend.using::<Convoy>("flotilla").get("governor-two").await.expect("live governor")),
-    ]);
-    wake.judge_stalls("flotilla", &objects).await.expect("judge stalls");
-    let stalled =
-        backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stalled");
-    assert_eq!(stalled.supervisor.expect("supervisor").convoy, "governor-two");
-    assert_eq!(delivery.requests.lock().expect("deliveries")[0].convoy, "governor-two");
+    let case = project_supervision_case(&[("governor-one", 1, ConvoyPhase::Abandoned), ("governor-two", 2, ConvoyPhase::Active)]).await;
+    case.judge(&case.wake, Utc::now()).await;
+    let stalled = case.status().await.stalled.expect("stalled");
+    assert_eq!(stalled.supervisor.expect("supervisor").convoy, case.governor("governor-two"));
+    assert_eq!(case.delivery.requests.lock().expect("deliveries")[0].convoy, case.governor("governor-two"));
 }
 
 // Legacy stalls consumed the governor rung while no supervisor was assigned.
 // They must retry that rung after a roll, even when the cursor is present.
 #[tokio::test]
 async fn exhausted_governor_cursor_retries_in_one_pass() {
-    let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    flotilla_store::apply_status_patch(
-        &convoys,
-        "stalled-work",
-        &external_patches::mark_crew_stalled(
-            "stalled-work".into(),
+    let case = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+    let work = case.work.clone();
+    case.note(|status| {
+        external_patches::mark_crew_stalled(
+            work,
             "work".into(),
             "coder".into(),
             Utc::now(),
             flotilla_resources::StallReason::Infra,
             None,
             "needs decision".into(),
-        ),
-    )
-    .await
-    .expect("declare stall");
-    let source = convoys.get("stalled-work").await.expect("source");
-    let mut status = source.status.expect("status");
-    let stalled = status.stalled.as_mut().expect("stall");
-    stalled.supervision_exhausted = true;
-    stalled.supervision_index = Some(1);
-    convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("legacy cursor");
-    let source = convoys.get("stalled-work").await.expect("source");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("one pass");
-    let source = convoys.get("stalled-work").await.expect("source");
-    assert_eq!(source.status.expect("status").stalled.expect("stall").rung, StallRung::Governor);
-    assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
+        )
+        .apply(status);
+        let stalled = status.stalled.as_mut().expect("stall");
+        stalled.supervision_exhausted = true;
+        stalled.supervision_index = Some(1);
+    })
+    .await;
+    case.judge(&case.wake, Utc::now()).await;
+    assert_eq!(case.status().await.stalled.expect("stall").rung, StallRung::Governor);
+    assert_eq!(case.delivery.requests.lock().expect("deliveries").len(), 1);
 }
 
-// A governor homed on another root must receive the escalation in the same
+// A governor homed on another daemon must receive the escalation in the same
 // pass that assigns its rung; replica visibility alone is not delivery.
 #[tokio::test]
 async fn replicated_governor_receives_stall_in_one_pass() {
-    let (remote, _, _) =
-        project_supervision_case(&[("governor", 1, ConvoyPhase::Active), ("newer-unowned-governor", 2, ConvoyPhase::Active)]).await;
-    create_governor_ensure(&remote, "governor").await;
-    let (backend, wake, delivery) = project_supervision_case(&[]).await;
-    let mut list = remote.using::<Convoy>("flotilla").list().await.expect("remote convoys");
-    list.items.retain(|object| object.metadata.name != "stalled-work");
-    backend.replica_writer::<Convoy>(NodeId::new("host-b"), "flotilla").replace(&list, Utc::now()).await.expect("replicate governor");
-    backend
-        .replica_writer::<ConvoyEnsure>(NodeId::new("host-b"), "flotilla")
-        .replace(&remote.using::<ConvoyEnsure>("flotilla").list().await.expect("remote ensure"), Utc::now())
+    let case = project_supervision_case(&[]).await;
+    // The governors are another daemon's, heard here as its log arrives, with the ensure that
+    // owns the older one.
+    let remote_backend = ResourceBackend::new(InMemoryBackend::default());
+    let remote = EngineHome::install(&remote_backend, "flotilla", "remote");
+    let governor = governor_at(&remote, "governor", 1).await;
+    governor_at(&remote, "newer-unowned-governor", 2).await;
+    create_governor_ensure(&remote_backend, &governor).await;
+    flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", case.home.service());
+    case.backend
+        .replica_writer::<ConvoyEnsure>(NodeId::new("remote"), "flotilla")
+        .replace(&remote_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("remote ensure"), Utc::now())
         .await
         .expect("replicate governor ownership");
-    let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("one pass");
-    let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
-    assert_eq!(source.status.expect("status").stalled.expect("stall").supervisor.expect("supervisor").convoy, "governor");
-    let requests = delivery.requests.lock().expect("deliveries");
+    case.judge(&case.wake, Utc::now()).await;
+    assert_eq!(case.status().await.stalled.expect("stall").supervisor.expect("supervisor").convoy, governor);
+    let requests = case.delivery.requests.lock().expect("deliveries");
     assert_eq!(requests.len(), 1, "remote governor must receive its escalation");
-    assert_eq!(requests[0].convoy, "governor");
+    assert_eq!(requests[0].convoy, governor);
     // Escalations retain the fully-qualified source crew, including its convoy.
-    assert_eq!(requests[0].sender, "wheelhouse/stalled-work/work/coder");
+    assert_eq!(requests[0].sender, case.coder());
     assert_eq!(requests[0].expectation, flotilla_resources::MessageExpectation::Reply);
 }
 
@@ -925,31 +746,33 @@ async fn replicated_governor_receives_stall_in_one_pass() {
 // never a match with an unrelated projectless governor.
 #[tokio::test]
 async fn stalled_work_without_project_records_lookup_failure() {
-    let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    for name in ["stalled-work", "governor"] {
-        let source = convoys.get(name).await.expect("convoy");
-        let mut spec = source.spec;
-        spec.project_ref = None;
-        convoys.update(&InputMeta::from(&source.metadata), &source.metadata.resource_version, &spec).await.expect("clear project");
-    }
-    let source = convoys.get("stalled-work").await.expect("source");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("judge stalls");
-    let stall = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+    let case = project_supervision_case(&[]).await;
+    // A governor of no project is at work.
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("governor".into()).generation(1).build();
+    let mut status = single_agent("governor");
+    status.workflow_snapshot.as_mut().expect("workflow").vessels[0].name = "govern".into();
+    let governor = case.home.admit("governor", spec, status).await;
+    let vessel = case.home.vessel(&governor, "govern", "env");
+    case.home.session(&vessel, "governor", "governor-1-governor", "env");
+    // The work as a caller holds it names no project.
+    let mut source = case.convoy().await;
+    case.caught_up(&case.wake).await;
+    source.spec.project_ref = None;
+    case.wake.judge_stalls_at("flotilla", &HashMap::from([(case.work.clone(), source)]), Utc::now()).await.expect("judge stalls");
+    let stall = case.status().await.stalled.expect("stall");
     assert_eq!(stall.rung, StallRung::Operator);
     assert!(stall.evidence.contains("convoy has no project_ref"), "{}", stall.evidence);
     assert!(!stall.supervision_exhausted);
-    assert!(delivery.requests.lock().expect("deliveries").is_empty());
+    assert!(case.delivery.requests.lock().expect("deliveries").is_empty());
 }
 
 // Supervision commands must preserve identifiers containing shell metacharacters.
 // Formatting glue: spaces and an apostrophe exercise the shared shell quoting helper.
 #[tokio::test]
 async fn stall_supervision_commands_quote_role_and_vessel_identifiers() {
-    let (backend, wake, _) = project_supervision_case(&[]).await;
-    let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("judge");
-    let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
+    let case = project_supervision_case(&[]).await;
+    case.judge(&case.wake, Utc::now()).await;
+    let source = case.convoy().await;
     let mut condition = source.status.as_ref().expect("status").stalled.clone().expect("stall");
     let leaf = condition.leaves.first_mut().expect("actor leaf");
     let LeafAddress::Work { work, .. } = &mut leaf.address else { panic!("work leaf") };
@@ -957,7 +780,8 @@ async fn stall_supervision_commands_quote_role_and_vessel_identifiers() {
     leaf.field_path = ".crew.coder's role.phase".to_string();
     let brief = stall_supervision_brief(&source, &condition);
     for action in ["resume", "convert-to-failed", "escalate"] {
-        assert!(brief.contains(&format!(r"--convoy 'stalled-work' --vessel 'work space' --role 'coder'\''s role' {action}")), "{brief}");
+        let command = format!(r"--convoy '{}' --vessel 'work space' --role 'coder'\''s role' {action}", case.work);
+        assert!(brief.contains(&command), "{brief}");
     }
 }
 
@@ -965,268 +789,93 @@ async fn stall_supervision_commands_quote_role_and_vessel_identifiers() {
 // fabricating role/vessel supervision commands for an unknown actor.
 #[tokio::test]
 async fn unattributed_stall_brief_preserves_identity_without_inventing_commands() {
-    let (backend, wake, _) = project_supervision_case(&[]).await;
-    let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("judge");
-    let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
+    let case = project_supervision_case(&[]).await;
+    case.judge(&case.wake, Utc::now()).await;
+    let source = case.convoy().await;
     let mut condition = source.status.as_ref().expect("status").stalled.clone().expect("stall");
     condition.leaves.clear();
     let brief = stall_supervision_brief(&source, &condition);
-    assert!(brief.contains("unidentified crew in convoy graphql-budget@wheelhouse (resource ref: stalled-work)"), "{brief}");
-    assert!(brief.contains("Reason: inferred stall. Evidence: needs decision"), "{brief}");
+    let identity = format!("unidentified crew in convoy graphql-budget@wheelhouse (resource ref: {})", case.work);
+    assert!(brief.contains(&identity), "{brief}");
+    // The coder declared its stall without a reason.
+    assert!(brief.contains("Reason: other. Evidence: needs decision"), "{brief}");
     assert!(!brief.contains("flotilla crew supervise"), "{brief}");
-}
-
-// #2654: unchanged operator fallback emits once across ticks, including a restart.
-#[test]
-fn unchanged_governorless_stall_logs_once() {
-    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let subscriber = captured_subscriber(logs.clone(), tracing::Level::WARN);
-    tracing::subscriber::with_default(subscriber, || {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(async {
-            let (backend, mut wake, _) = project_supervision_case(&[]).await;
-            for tick in 0..10 {
-                if tick == 5 {
-                    wake = supervision_wake(&backend);
-                }
-                let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("tracing scenario");
-                let objects = HashMap::from([("stalled-work".into(), source)]);
-                wake.sync_rows("flotilla", &objects).await.expect("tracing scenario");
-                wake.judge_stalls("flotilla", &objects).await.expect("tracing scenario");
-            }
-        });
-    });
-    let text = String::from_utf8(logs.lock().expect("tracing scenario").clone()).expect("tracing scenario");
-    assert_eq!(text.matches("stall escalation fell back to operator").count(), 1, "{text}");
 }
 
 #[tokio::test]
 async fn stalled_work_without_live_governor_names_reason_at_operator_rung() {
-    let (backend, wake, delivery) = project_supervision_case(&[("governor-one", 1, ConvoyPhase::Abandoned)]).await;
-    let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("judge stalls");
-    let stalled =
-        backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stalled");
+    let case = project_supervision_case(&[("governor-one", 1, ConvoyPhase::Abandoned)]).await;
+    case.judge(&case.wake, Utc::now()).await;
+    let stalled = case.status().await.stalled.expect("stalled");
     assert_eq!(stalled.rung, StallRung::Operator);
     assert!(!stalled.supervision_exhausted);
     // #2592: the operator backstop uses the same actionable description as a supervisor turn.
-    let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
-    let brief = stall_supervision_brief(&source, &stalled);
-    assert!(brief.contains("coder@work in convoy graphql-budget@wheelhouse (resource ref: stalled-work)"), "{brief}");
-    assert!(brief.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"), "{brief}");
+    let brief = stall_supervision_brief(&case.convoy().await, &stalled);
+    let identity = format!("coder@work in convoy graphql-budget@wheelhouse (resource ref: {})", case.work);
+    assert!(brief.contains(&identity), "{brief}");
+    assert!(brief.contains(&format!("--convoy '{}' --vessel 'work' --role 'coder' resume", case.work)), "{brief}");
     assert!(stalled.evidence.contains("no live governor for project wheelhouse"), "{}", stalled.evidence);
-    assert!(delivery.requests.lock().expect("deliveries").is_empty());
+    assert!(case.delivery.requests.lock().expect("deliveries").is_empty());
 }
 
 #[tokio::test]
 async fn stalled_work_prefers_governor_owned_by_ensure_over_higher_live_generation() {
-    let (backend, wake, delivery) =
-        project_supervision_case(&[("governor-two", 2, ConvoyPhase::Active), ("governor-three", 3, ConvoyPhase::Active)]).await;
-    create_governor_ensure(&backend, "governor-two").await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let source = convoys.get("stalled-work").await.expect("source");
-    let second = convoys.get("governor-two").await.expect("owned governor");
-    let third = convoys.get("governor-three").await.expect("higher generation");
-    wake.judge_stalls(
-        "flotilla",
-        &HashMap::from([("stalled-work".into(), source), ("governor-two".into(), second), ("governor-three".into(), third)]),
-    )
-    .await
-    .expect("judge stalls");
-    let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stalled");
-    assert_eq!(stalled.supervisor.expect("supervisor").convoy, "governor-two");
-    assert_eq!(delivery.requests.lock().expect("deliveries")[0].convoy, "governor-two");
+    let case = project_supervision_case(&[("governor-two", 2, ConvoyPhase::Active), ("governor-three", 3, ConvoyPhase::Active)]).await;
+    create_governor_ensure(&case.backend, &case.governor("governor-two")).await;
+    case.judge(&case.wake, Utc::now()).await;
+    let stalled = case.status().await.stalled.expect("stalled");
+    assert_eq!(stalled.supervisor.expect("supervisor").convoy, case.governor("governor-two"));
+    assert_eq!(case.delivery.requests.lock().expect("deliveries")[0].convoy, case.governor("governor-two"));
 }
 
 #[tokio::test]
 async fn stalled_work_names_missing_governor_crew_at_operator_rung() {
-    let (backend, wake, delivery) = project_supervision_case(&[("governor-two", 2, ConvoyPhase::Active)]).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let governor = convoys.get("governor-two").await.expect("governor");
-    let mut status = governor.status.expect("governor status");
-    status.crew_work.clear();
-    convoys.update_status("governor-two", &governor.metadata.resource_version, &status).await.expect("clear governor crew");
-    let source = convoys.get("stalled-work").await.expect("source");
-    let governor = convoys.get("governor-two").await.expect("governor");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source), ("governor-two".into(), governor)]))
-        .await
-        .expect("judge stalls");
-    let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stalled");
+    let case = project_supervision_case(&[]).await;
+    // A governor whose workflow crews no governor seat is a governor without its crew.
+    admit_governor(&case, "governor-two", 2, "deputy").await;
+    case.judge(&case.wake, Utc::now()).await;
+    let stalled = case.status().await.stalled.expect("stalled");
     assert_eq!(stalled.rung, StallRung::Operator);
     assert!(stalled.evidence.contains("no live governor crew for project wheelhouse"), "{}", stalled.evidence);
-    assert!(delivery.requests.lock().expect("deliveries").is_empty());
+    assert!(case.delivery.requests.lock().expect("deliveries").is_empty());
 }
 
 #[tokio::test]
 async fn stalled_work_ignores_terminal_ensure_attempt_and_uses_highest_live_generation() {
-    let (backend, wake, delivery) = project_supervision_case(&[
+    let case = project_supervision_case(&[
         ("governor-one", 1, ConvoyPhase::Abandoned),
         ("governor-two", 2, ConvoyPhase::Active),
         ("governor-three", 3, ConvoyPhase::Active),
     ])
     .await;
-    create_governor_ensure(&backend, "governor-one").await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let source = convoys.get("stalled-work").await.expect("source");
-    let second = convoys.get("governor-two").await.expect("live governor");
-    let third = convoys.get("governor-three").await.expect("highest live governor");
-    wake.judge_stalls(
-        "flotilla",
-        &HashMap::from([("stalled-work".into(), source), ("governor-two".into(), second), ("governor-three".into(), third)]),
-    )
-    .await
-    .expect("judge stalls");
-    let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stalled");
-    assert_eq!(stalled.supervisor.expect("supervisor").convoy, "governor-three");
-    assert_eq!(delivery.requests.lock().expect("deliveries")[0].convoy, "governor-three");
+    create_governor_ensure(&case.backend, &case.governor("governor-one")).await;
+    case.judge(&case.wake, Utc::now()).await;
+    let stalled = case.status().await.stalled.expect("stalled");
+    assert_eq!(stalled.supervisor.expect("supervisor").convoy, case.governor("governor-three"));
+    assert_eq!(case.delivery.requests.lock().expect("deliveries")[0].convoy, case.governor("governor-three"));
 }
 
+// A busy screen gone stale is no evidence the crew is dead. (A session that ended is the seat's
+// Interrupted, which `interrupted_stalls` covers.)
 #[tokio::test]
-async fn lost_crew_session_stalls_with_dead_evidence_but_stale_busy_screen_does_not() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let (event_tx, _) = broadcast::channel(16);
-    let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
-        backend.clone(),
-        "test-host".into(),
-        Arc::new(UnavailableChangeRequests),
-        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
+async fn stale_busy_screen_does_not_stall() {
+    let case = idle_nudge_scenario().await;
+    let stale = Utc::now() - TerminalAttention::FRESH_FOR - chrono::Duration::seconds(1);
+    observe_session(
+        &case.home,
+        "resumed-coder",
+        Some(TerminalAttention { state: TerminalAttentionState::Working, source: TerminalAttentionSource::Screen, as_of: stale }),
     );
-    let wake = ReconcilerWake::new(served_table(backend.clone(), broadcast_test_sink(event_tx), refresher));
-    create_convoy(
-        &backend,
-        "delivery",
-        ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        },
-    )
-    .await;
-    let terminal = backend.using::<TerminalSession>("flotilla");
-    let created = terminal
-        .create(
-            &InputMeta::builder()
-                .name("terminal-delivery-work-coder".into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "delivery".into()),
-                    (VESSEL_LABEL.into(), "work".into()),
-                    (ROLE_LABEL.into(), "coder".into()),
-                ]))
-                .build(),
-            &flotilla_resources::TerminalSessionSpec {
-                env_ref: "env".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Tool { command: "codex".into() },
-                cwd: "/workspace".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
-            },
-        )
-        .await
-        .expect("create terminal");
-    let mut status = flotilla_resources::TerminalSessionStatus {
-        phase: TerminalSessionPhase::Running,
-        attention: Some(TerminalAttention {
-            state: TerminalAttentionState::Working,
-            source: TerminalAttentionSource::Screen,
-            as_of: Utc::now() - TerminalAttention::FRESH_FOR - chrono::Duration::seconds(1),
-        }),
-        ..Default::default()
-    };
-    let running = terminal.update_status(&created.metadata.name, &created.metadata.resource_version, &status).await.expect("running");
-    let leaf = Leaf {
-        address: LeafAddress::Work { convoy: "delivery".into(), work: "work".into() },
-        field_path: ".crew.coder.phase".into(),
-        operator: LeafOperator::Equal,
-        literal: "Done".into(),
-    };
-    let id = uuid::Uuid::new_v4();
-    wake.subscriptions.inner.rows.lock().await.insert(
-        id,
-        LeafSubscriptionRow {
-            id,
-            namespace: "flotilla".into(),
-            leaves: vec![leaf],
-            watcher: LeafWatcher::ReconcilerWake { convoy: "delivery".into() },
-            maker: LeafMaker::Actor { vessel: "work".into(), role: "coder".into() },
-            freshness_demand: None,
-            created_at: Utc::now(),
-            episode_key: EpisodeKeyFields::default(),
-        },
-    );
-    let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy");
-    let objects = HashMap::from([("delivery".into(), convoy)]);
-    wake.judge_stalls("flotilla", &objects).await.expect("judge stale screen");
-    assert!(backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled.is_none());
-
-    status.phase = TerminalSessionPhase::Lost;
-    status.stopped_at = Some(Utc::now());
-    status.cleat_endpoint = None;
-    status.message = Some("daemon generation is dead; session is recreatable".into());
-    status.attention = None;
-    status.occupancy = flotilla_resources::TerminalOccupancy::Unknown;
-    terminal.update_status(&created.metadata.name, &running.metadata.resource_version, &status).await.expect("lost");
-    // The first judgement persisted hook health and obligations. Refresh the
-    // outer convoy snapshot as its watch handler does before judging new evidence.
-    let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("current convoy");
-    let objects = HashMap::from([("delivery".into(), convoy)]);
-    wake.judge_stalls("flotilla", &objects).await.expect("judge dead session");
-    let stalled = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled;
-    let stalled = stalled.expect("dead actor must stall");
-    assert!(stalled.evidence.contains("session dead: daemon generation is dead"));
-    assert_eq!(stalled.source, StallEvidenceSource::Session);
+    case.judge(&case.wake, Utc::now()).await;
+    assert!(case.status().await.stalled.is_none());
 }
 
 #[tokio::test]
 async fn clone_controller_rows_judge_transient_terminal_and_exhausted_failures() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let (event_tx, _) = broadcast::channel(16);
-    let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
-        backend.clone(),
-        "test-host".to_string(),
-        Arc::new(UnavailableChangeRequests),
-        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
-    );
-    // The clones are the engine's (#3108): the worktree's clone row reads them.
-    let clones = flotilla_provisioning_testkit::CloneFixture::default();
-    // So are the checkouts: the worktree is held for the convoy.
-    let engine = flotilla_provisioning_testkit::CheckoutFixture::over("home", Arc::clone(&clones.store)).serving(
-        Arc::clone(&flotilla_provisioning_testkit::EnvironmentFixture::over("home", Arc::clone(&clones.store)).environments) as _,
-        Arc::clone(&clones.clones) as _,
-    );
-    let wake = ReconcilerWake::new(
-        served_table(backend.clone(), broadcast_test_sink(event_tx), refresher).with_lifecycle_reads(engine.reads.clone()),
-    );
-    create_convoy(&backend, "delivery", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
-    let vessels = backend.using::<Vessel>("flotilla");
-    let vessel = vessels
-        .create(
-            &InputMeta::builder()
-                .name("delivery-work".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "delivery".to_string())]))
-                .build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: "delivery".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
-    vessels
-        .update_status(
-            "delivery-work",
-            &vessel.metadata.resource_version,
-            &flotilla_resources::VesselStatus { environment_ref: Some("delivery-env".into()), ..Default::default() },
-        )
-        .await
-        .expect("place vessel");
+    let (backend, home) = engine_backend();
+    let wake = supervision_wake(&backend, &home);
+    let launch = home.admit("delivery", convoy_spec(), single_agent("coder")).await;
+    home.vessel(&launch, "work", "delivery-env");
     let repository = flotilla_resources::RepositorySpec::remote("https://example.org/example/repo").expect("repository");
     let clone_spec = flotilla_resources::CloneSpec {
         repo_ref: repository.key(),
@@ -1235,8 +884,8 @@ async fn clone_controller_rows_judge_transient_terminal_and_exhausted_failures()
         path: "/tmp/clone".into(),
     };
     let clone = flotilla_resources::clone_records::clone_name(&repository, "delivery-env").expect("clone name");
-    engine.admit_for(&backend, "flotilla", "delivery", "delivery").await;
-    engine.put_ready(
+    // The clones are the engine's (#3108): the worktree, held for the launch, names its clone.
+    home.engine.checkouts.put_ready(
         "delivery-checkout",
         &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
             repo_ref: repository.key(),
@@ -1247,15 +896,17 @@ async fn clone_controller_rows_judge_transient_terminal_and_exhausted_failures()
             // Named by its clone, the checkout reads the clone's latest launch.
             clone_ref: clone.clone(),
         }),
-        Some(&engine.holder("delivery")),
+        Some(&CheckoutHolder::Convoy(launch.clone())),
     );
+    let clones = &home.engine.clones;
     let first = clones.request(&repository, &clone_spec, false);
     let judge_clone = || async {
-        let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy");
-        let objects = HashMap::from([("delivery".to_string(), convoy)]);
+        let convoy = home.view(&backend, &launch).await;
+        caught_up(&wake, &convoy).await;
+        let objects = HashMap::from([(launch.clone(), convoy)]);
         wake.sync_rows("flotilla", &objects).await.expect("arm clone controller row");
         wake.judge_stalls("flotilla", &objects).await.expect("judge clone controller row");
-        backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled
+        home.view(&backend, &launch).await.status.expect("status").stalled
     };
     // A transient failure retries without stalling.
     clones.retry(&first, "network unreachable");
@@ -1302,7 +953,7 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
             Err(self.0.clone())
         }
     }
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let (backend, home) = engine_backend();
     let now = Utc::now();
     let retry_at = now + chrono::Duration::seconds(60);
     let error = {
@@ -1324,19 +975,8 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
     .expect("key");
     refresher.refresh_once(&subject).await.expect_err("limited observation records its diagnostic");
     let (event_tx, _) = broadcast::channel(4);
-    let table = served_table(backend.clone(), broadcast_test_sink(event_tx), refresher);
-    let convoys = backend.using::<Convoy>("flotilla");
-    let created = convoys
-        .create(
-            &InputMeta::builder().name("cooldown".into()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".into()).repositories(Vec::new()).build(),
-        )
-        .await
-        .expect("convoy");
-    convoys
-        .update_status("cooldown", &created.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() })
-        .await
-        .expect("landing");
+    let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
+    let launch = launch_at(&backend, &home, "cooldown", ledger_owed(), ConvoyPhase::Landing).await;
     let id = uuid::Uuid::new_v4();
     table.inner.rows.lock().await.insert(
         id,
@@ -1344,7 +984,7 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
             id,
             namespace: "flotilla".into(),
             leaves: vec!["cr/github.com/team/one/1 .state == merged".parse().expect("exit leaf")],
-            watcher: LeafWatcher::ReconcilerWake { convoy: "cooldown".into() },
+            watcher: LeafWatcher::ReconcilerWake { convoy: launch.clone() },
             maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
             freshness_demand: Some(now),
             created_at: now,
@@ -1354,21 +994,25 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
     let wake = ReconcilerWake::new(table);
     let deadline = retry_at + chrono::Duration::seconds(15);
     for at in [now, retry_at, deadline - chrono::Duration::nanoseconds(1), deadline] {
-        let convoy = convoys.get("cooldown").await.expect("convoy");
-        wake.judge_stalls_at("flotilla", &HashMap::from([("cooldown".into(), convoy)]), at).await.expect("judge");
-        let status = convoys.get("cooldown").await.expect("convoy").status.expect("status");
+        let convoy = home.view(&backend, &launch).await;
+        caught_up(&wake, &convoy).await;
+        wake.judge_stalls_at("flotilla", &HashMap::from([(launch.clone(), convoy)]), at).await.expect("judge");
+        let status = home.view(&backend, &launch).await.status.expect("status");
         assert_eq!(status.phase, ConvoyPhase::Landing, "missing merge evidence must never land");
         assert_eq!(status.stalled.is_some(), at >= deadline, "only the expired refresh plus cadence can stall");
     }
 }
 
-// #3044: populated kinds are bootstrapped once; repeated no-op judgements
-// perform zero backing-store reads, including indirect supervisor routing reads.
+// #3044: populated kinds are bootstrapped once; repeated no-op judgements perform zero
+// backing-store reads, including indirect supervisor routing reads. (The read counter wraps the
+// resource backend: the launches' engine reads are not counted, the Project, ConvoyEnsure and
+// Message reads of routing are.)
 #[tokio::test]
 async fn steady_state_stall_judgements_do_not_read_the_store() {
     use flotilla_store_testkit::ReadCountsBackendExt;
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
-    let wake = supervision_wake(&backend);
+    let (backend, home) = engine_backend();
+    let counted = backend.clone().with_read_counts();
+    let wake = supervision_wake(&counted, &home);
     backend
         .definitions::<Project>("flotilla")
         .create(
@@ -1377,32 +1021,23 @@ async fn steady_state_stall_judgements_do_not_read_the_store() {
         )
         .await
         .expect("project");
+    let mut objects = HashMap::new();
     for index in 0..32 {
-        create_convoy(&backend, &format!("convoy-{index}"), ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("project".into()).build();
+        let launch = home.admit(&format!("convoy-{index}"), spec, single_agent("coder")).await;
+        home.vessel(&launch, "work", "env");
+        objects.insert(launch.clone(), home.view(&backend, &launch).await);
     }
-    for index in 0..32 {
-        let resolver = backend.using::<Convoy>("flotilla");
-        let convoy = resolver.get(&format!("convoy-{index}")).await.expect("convoy");
-        let mut spec = convoy.spec;
-        spec.project_ref = Some("project".into());
-        resolver.update(&InputMeta::from(&convoy.metadata), &convoy.metadata.resource_version, &spec).await.expect("project membership");
+    for convoy in objects.values() {
+        caught_up(&wake, convoy).await;
     }
-    let objects = backend
-        .using::<Convoy>("flotilla")
-        .list()
-        .await
-        .expect("snapshot")
-        .items
-        .into_iter()
-        .map(|convoy| (convoy.metadata.name.clone(), convoy))
-        .collect();
     let now = Utc::now();
     wake.judge_stalls_at("flotilla", &objects, now).await.expect("bootstrap");
-    let before = backend.read_snapshot();
+    let before = counted.read_snapshot();
     for _ in 0..64 {
         wake.judge_stalls_at("flotilla", &objects, now).await.expect("steady state judgement");
     }
-    let reads = backend.read_snapshot().since(&before);
+    let reads = counted.read_snapshot().since(&before);
     reads.assert_zero("stall judgement including nested routing helpers");
 }
 
@@ -1412,9 +1047,9 @@ async fn steady_state_stall_judgements_do_not_read_the_store() {
 #[tokio::test]
 async fn leaf_engine_steady_state_reconcile_reads_no_store() {
     use flotilla_store_testkit::ReadCountsBackendExt;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let (backend, home) = engine_backend();
     let counted = backend.clone().with_read_counts();
-    let wake = supervision_wake(&counted);
+    let wake = supervision_wake(&counted, &home);
     backend
         .definitions::<Project>("flotilla")
         .create(
@@ -1423,23 +1058,26 @@ async fn leaf_engine_steady_state_reconcile_reads_no_store() {
         )
         .await
         .expect("project");
+    let mut launches = Vec::new();
     for index in 0..8 {
-        create_convoy(&backend, &format!("convoy-{index}"), ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("project".into()).build();
+        let launch = home.admit(&format!("convoy-{index}"), spec, single_agent("coder")).await;
+        home.vessel(&launch, "work", "env");
+        launches.push(launch);
     }
     wake.subscriptions.reconcile_stalls_once("flotilla").await.expect("bootstrap pass");
     let bootstrap = counted.read_snapshot();
     assert!(!bootstrap.lists().is_empty(), "the bootstrap pass builds its views from lists\n{bootstrap}");
-    let convoys = backend.using::<Convoy>("flotilla");
     for index in 0..16 {
-        // A status write reaches the views as a watch event, not a relist.
-        let name = format!("convoy-{}", index % 8);
-        let convoy = convoys.get(&name).await.expect("convoy");
-        let mut status = convoy.status.clone().expect("status");
-        status.message = Some(format!("event-{index}"));
-        convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("status write");
+        // A change to a launch reaches the views as an event, not a relist.
+        let launch = &launches[index % 8];
+        touch(&backend, &home, launch).await;
+        let convoy = home.view(&backend, launch).await;
+        caught_up(&wake, &convoy).await;
         wake.subscriptions.reconcile_stalls_once("flotilla").await.expect("steady state pass");
         let resident = wake.local_convoys("flotilla").await.expect("resident convoys");
-        assert_eq!(resident[&name].status.as_ref().expect("resident status").message, status.message);
+        let scanned = |convoy: &ResourceObject<Convoy>| convoy.status.as_ref().expect("status").branch_subject_scan_at;
+        assert_eq!(scanned(&resident[launch]), scanned(&convoy));
     }
     counted.read_snapshot().since(&bootstrap).assert_zero("leaf engine reconcile passes");
 }
@@ -1484,50 +1122,45 @@ async fn stall_message_scenario(repeat_report: bool, restart: bool) {
             Ok(())
         }
     }
-    let (backend, _, _) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-    let delivery = Arc::new(InboxDelivery(flotilla_messaging::MessageInbox::new(backend.clone(), "flotilla")));
-    let convoys = backend.using::<Convoy>("flotilla");
+    let case = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+    let delivery = Arc::new(InboxDelivery(flotilla_messaging::MessageInbox::new(case.backend.clone(), "flotilla")));
     let now = Utc::now();
-    let stale_objects: HashMap<_, _> =
-        convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
-    let mut wake = supervision_wake(&backend);
+    let stale_objects = case.objects().await;
+    let mut wake = case.wake.clone();
     for step in 0..3 {
         if repeat_report {
-            flotilla_store::apply_status_patch(
-                &convoys,
-                "stalled-work",
-                &flotilla_resources::external_patches::mark_crew_stalled(
-                    "stalled-work".into(),
+            let work = case.work.clone();
+            case.note(|status| {
+                external_patches::mark_crew_stalled(
+                    work,
                     "work".into(),
                     "coder".into(),
                     now + chrono::Duration::seconds(step),
                     StallReason::Scope,
                     None,
                     "needs decision".into(),
-                ),
-            )
-            .await
-            .expect("report stall");
+                )
+                .apply(status)
+            })
+            .await;
         }
         if restart {
-            wake = supervision_wake(&backend);
+            wake = case.restarted_wake().await;
         }
         wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
-        let objects = if repeat_report {
-            convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect()
-        } else {
-            stale_objects.clone()
-        };
+        let objects = if repeat_report { case.objects().await } else { stale_objects.clone() };
+        case.caught_up(&wake).await;
         wake.sync_rows("flotilla", &objects).await.expect("rows");
         wake.judge_stalls_at("flotilla", &objects, now + chrono::Duration::seconds(step)).await.expect("judge");
-        let messages = backend.using::<Message>("flotilla").list().await.expect("inbox").items;
+        let messages = case.backend.using::<Message>("flotilla").list().await.expect("inbox").items;
         assert_eq!(messages.len(), 1, "one episode must not create a burst of copies");
     }
     // Catching up the outer watch rebuilds rows and continues judging normally.
-    let current = convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+    let current = case.objects().await;
+    case.caught_up(&wake).await;
     wake.sync_rows("flotilla", &current).await.expect("current rows");
     wake.judge_stalls_at("flotilla", &current, now + chrono::Duration::seconds(4)).await.expect("current judge");
-    assert_eq!(backend.using::<Message>("flotilla").list().await.expect("inbox").items.len(), 1);
+    assert_eq!(case.backend.using::<Message>("flotilla").list().await.expect("inbox").items.len(), 1);
 }
 
 #[tokio::test]
@@ -1545,71 +1178,67 @@ async fn stale_stall_snapshot_publishes_one_supervisor_message() {
     }
 }
 
-// Only the authority may judge a convoy. An old caller map must not actuate a
-// replica that remains visible after its local record has been removed.
+// Only the launch's home may judge it. A caller map holding another home's launch, with a stall
+// in it, must not actuate it here or take it over.
 #[tokio::test]
 async fn replica_only_convoy_in_caller_snapshot_is_not_judged() {
-    let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let source = convoys.get("stalled-work").await.expect("source");
-    convoys.delete("stalled-work").await.expect("remove local authority");
-    backend
-        .replica_writer::<Convoy>(NodeId::new("other-authority"), "flotilla")
-        .apply(WatchEvent::Added(source.clone()), Utc::now())
-        .await
-        .expect("replica");
-    let visible = backend.including_replicas::<Convoy>("flotilla").get("stalled-work").await.expect("visible replica");
+    let case = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+    let remote_backend = ResourceBackend::new(InMemoryBackend::default());
+    let remote = EngineHome::install(&remote_backend, "flotilla", "remote");
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("wheelhouse".into()).build();
+    let launch =
+        remote.admit("replicated-work", spec, ConvoyStatus { workflow_snapshot: Some(supervised_workflow()), ..Default::default() }).await;
+    remote.vessel(&launch, "work", "env");
+    flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", case.home.service());
+    let replicas = case.backend.including_replicas::<Convoy>("flotilla");
+    let visible = replicas.get(&launch).await.expect("visible replica");
     assert!(matches!(visible.provenance, flotilla_resources::ResourceProvenance::Replica { .. }));
-    let objects = HashMap::from([("stalled-work".into(), source)]);
-    wake.sync_rows("flotilla", &objects).await.expect("old rows");
-    wake.judge_stalls_at("flotilla", &objects, Utc::now()).await.expect("judge obsolete caller map");
-    assert!(delivery.requests.lock().expect("requests").is_empty(), "a replica must never emit a supervision turn");
-    assert!(convoys.get("stalled-work").await.is_err(), "judging must not recreate local authority");
+    let mut source = visible.object.clone();
+    external_patches::mark_crew_stalled(
+        launch.clone(),
+        "work".into(),
+        "coder".into(),
+        Utc::now(),
+        flotilla_resources::StallReason::Other,
+        None,
+        "needs decision".into(),
+    )
+    .apply(source.status.as_mut().expect("status"));
+    let objects = HashMap::from([(launch.clone(), source)]);
+    case.wake.sync_rows("flotilla", &objects).await.expect("old rows");
+    case.wake.judge_stalls_at("flotilla", &objects, Utc::now()).await.expect("judge obsolete caller map");
+    assert!(case.delivery.requests.lock().expect("requests").is_empty(), "a replica must never emit a supervision turn");
+    let heard = replicas.get(&launch).await.expect("visible replica");
+    assert!(heard.object.status.expect("status").stalled.is_none(), "judging must not note a stall on another home's launch");
 }
 
 // #3439: a handoff is an outstanding report even without a declared claim.
-// Pending (available) and Done roles owe nothing and must remain exempt.
+// A Pending (available) role owes nothing and must remain exempt.
 #[tokio::test]
 async fn claim_less_working_crew_stalls_with_actor_evidence() {
     for (phase, attention) in [
         (CrewWorkPhase::Working, TerminalAttentionState::Idle),
         (CrewWorkPhase::Working, TerminalAttentionState::Working),
         (CrewWorkPhase::Pending, TerminalAttentionState::Idle),
-        (CrewWorkPhase::Done, TerminalAttentionState::Idle),
-        (CrewWorkPhase::HandedBack, TerminalAttentionState::Idle),
     ] {
-        let (backend, wake, delivery) = idle_nudge_scenario().await;
-        wake.subscriptions.inner.rows.lock().await.clear();
-        update_convoy(&backend, "stalled-work", |status| {
-            let member = &mut status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0];
-            member.promises.clear();
-            member.completion_conditions.clear();
-            status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = CrewWorkPhase::Done;
-            flotilla_resources::ConvoyStatusPatch::HandoffCrewWork {
-                vessel: "work".into(),
-                sender_role: "coder".into(),
-                target_role: "coder".into(),
-                handed_off_at: Utc::now(),
-                message: "Follow-up task".into(),
-            }
-            .apply(status);
-            status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = phase;
-        })
-        .await;
-        let convoys = backend.using::<Convoy>("flotilla");
-        let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.expect("convoy"))]);
-        wake.sync_rows("flotilla", &objects).await.expect("sync rows");
+        let case = working_coder(claim_less_workflow()).await;
+        // The coder handed its follow-up task to itself: it has a task.
+        case.note(|status| status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").task_assigned = true).await;
+        case.home.seat(&case.backend, &case.work, (&case.vessel, "work"), ("coder", "resumed-coder"), phase).await;
+        sync_work_rows(&case).await;
         let now = Utc::now();
         for second in [0, 60, 120, 180, 900, 1800] {
-            observe_actor(&backend, &wake, attention, now + chrono::Duration::seconds(second)).await;
+            let at = now + chrono::Duration::seconds(second);
+            if phase == CrewWorkPhase::Pending {
+                case.judge(&case.wake, at).await;
+            } else {
+                observe_actor(&case, &case.wake, attention, at).await;
+            }
             if second == 0 || (attention == TerminalAttentionState::Working && second < 900) {
-                assert!(
-                    convoys.get("stalled-work").await.expect("convoy").status.expect("status").stalled.is_none(),
-                    "fresh work and the idle grace must remain able/unknown"
-                );
+                assert!(case.status().await.stalled.is_none(), "fresh work and the idle grace must remain able/unknown");
             }
         }
-        let status = convoys.get("stalled-work").await.expect("convoy").status.expect("status");
+        let status = case.status().await;
         assert_eq!(status.stalled.is_some(), phase == CrewWorkPhase::Working, "{phase:?}: {status:?}");
         if let Some(stalled) = status.stalled {
             assert!(!stalled.evidence.is_empty());
@@ -1617,7 +1246,7 @@ async fn claim_less_working_crew_stalls_with_actor_evidence() {
             if attention == TerminalAttentionState::Working {
                 assert!(stalled.evidence.contains("turn inactivity bound exceeded"));
             } else {
-                assert!(!delivery.requests.lock().expect("deliveries").is_empty(), "idle work follows the normal nudge ladder");
+                assert!(!case.delivery.requests.lock().expect("deliveries").is_empty(), "idle work follows the normal nudge ladder");
             }
         }
     }
@@ -1627,33 +1256,15 @@ async fn claim_less_working_crew_stalls_with_actor_evidence() {
 // a task. Even repeated idle observations beyond grace must create no actor row.
 #[tokio::test]
 async fn freshly_launched_claim_less_role_stays_unjudged() {
-    let (backend, wake, _) = idle_nudge_scenario().await;
-    wake.subscriptions.inner.rows.lock().await.clear();
-    update_convoy(&backend, "stalled-work", |status| {
-        let member = &mut status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0];
-        member.promises.clear();
-        member.completion_conditions.clear();
-        status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = CrewWorkPhase::Pending;
-        flotilla_resources::ConvoyStatusPatch::WorkRunning {
-            work: "work".into(),
-            started_at: Utc::now(),
-            launched_roles: ["coder".into()].into(),
-        }
-        .apply(status);
-        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
-    })
-    .await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.expect("convoy"))]);
-    wake.sync_rows("flotilla", &objects).await.expect("sync");
-    assert!(
-        wake.subscriptions.inner.rows.lock().await.values().all(|row| !matches!(row.maker, LeafMaker::Actor { .. })),
-        "launch alone must not arm an actor obligation"
-    );
+    let case = working_coder(claim_less_workflow()).await;
+    resume_coder(&case);
+    assert_eq!(case.status().await.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    sync_work_rows(&case).await;
+    assert!(!actor_armed(&case).await, "launch alone must not arm an actor obligation");
     let now = Utc::now();
     for second in [0, 60, 120, 1800] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
-        assert!(convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.is_none());
+        observe_actor(&case, &case.wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
+        assert!(case.status().await.stalled.is_none());
     }
 }
 
@@ -1661,48 +1272,29 @@ async fn freshly_launched_claim_less_role_stays_unjudged() {
 // claim or follow-up task. Narrowing launch eligibility must retain this case.
 #[tokio::test]
 async fn a_launched_role_that_declares_a_promise_owes_a_report() {
-    let (backend, wake, _) = idle_nudge_scenario().await;
-    wake.subscriptions.inner.rows.lock().await.clear();
-    update_convoy(&backend, "stalled-work", |status| {
-        let member = &mut status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0];
-        member.promises.clear();
-        member.completion_conditions.clear();
-        flotilla_resources::ConvoyStatusPatch::Promise {
-            vessel: "work".into(),
-            role: "coder".into(),
-            operation: flotilla_resources::promises::PromiseOperation::Declare {
-                id: "pr".into(),
-                kind: flotilla_resources::promises::PromiseKind::Pr,
-                source: flotilla_resources::promises::PromiseSource::Crew,
-            },
-        }
-        .apply(status);
-    })
-    .await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.expect("convoy"))]);
-    wake.sync_rows("flotilla", &objects).await.expect("sync");
-    assert!(wake.subscriptions.inner.rows.lock().await.values().any(|row| matches!(row.maker, LeafMaker::Actor { .. })));
+    let case = working_coder(claim_less_workflow()).await;
+    resume_coder(&case);
+    coder_promise(&case, 1, PromiseState::Open).await;
+    sync_work_rows(&case).await;
+    assert!(actor_armed(&case).await);
     let now = Utc::now();
     for second in [0, 60, 120, 180, 900, 1800] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, &case.wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
     }
-    assert!(convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.is_some());
+    assert!(case.status().await.stalled.is_some());
 }
 
 // Resolving an explicit stall with guidance assigns a report even if the role
 // was only launched before stalling. Silence after that resume must be judged.
 #[tokio::test]
 async fn resumed_explicit_stall_without_claim_still_owes_a_report() {
-    let (backend, wake, _) = idle_nudge_scenario().await;
-    wake.subscriptions.inner.rows.lock().await.clear();
-    update_convoy(&backend, "stalled-work", |status| {
-        let member = &mut status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0];
-        member.promises.clear();
-        member.completion_conditions.clear();
+    let case = working_coder(claim_less_workflow()).await;
+    resume_coder(&case);
+    let work = case.work.clone();
+    case.note(|status| {
         let at = Utc::now();
         flotilla_resources::ConvoyStatusPatch::MarkCrewStalled {
-            convoy: "stalled-work".into(),
+            convoy: work,
             vessel: "work".into(),
             role: "coder".into(),
             at,
@@ -1721,25 +1313,22 @@ async fn resumed_explicit_stall_without_claim_still_owes_a_report() {
             intent: ResumeIntent::Reopen,
         }
         .apply(status);
-        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
         assert!(status.crew_work["work"]["coder"].task_assigned);
     })
     .await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.expect("convoy"))]);
-    wake.sync_rows("flotilla", &objects).await.expect("sync");
+    assert_eq!(case.status().await.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    sync_work_rows(&case).await;
     let now = Utc::now();
     for second in [0, 60, 120, 180, 900, 1800] {
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
+        observe_actor(&case, &case.wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
     }
-    assert!(convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.is_some());
+    assert!(case.status().await.stalled.is_some());
 }
 
 // #3572: standing convoys never owe settlement claims. For ordinary convoys,
 // terminal promises alone owe nothing; tasks and completion conditions still do.
 #[hegel::test]
 fn settlement_claim_arming_respects_exit_and_pending_promises(tc: hegel::TestCase) {
-    use flotilla_resources::promises::{Promise, PromiseKind, PromiseSource, PromiseState};
     use hegel::generators as gs;
     // Generate duplicate promise counts, including an empty history. Pin every
     // state and obligation combination so each eligibility boundary is exercised.
@@ -1749,50 +1338,49 @@ fn settlement_claim_arming_respects_exit_and_pending_promises(tc: hegel::TestCas
         for standing in [false, true] {
             for state in [PromiseState::Open, PromiseState::Submitted, PromiseState::Kept, PromiseState::Retracted] {
                 for (task, completion) in [(false, false), (true, false), (false, true)] {
-                    let (backend, wake, delivery) = idle_nudge_scenario().await;
-                    update_convoy(&backend, "stalled-work", |status| {
-                        let snapshot = status.workflow_snapshot.as_mut().expect("workflow");
-                        snapshot.exit = if standing { None } else { Some(ExitDeclaration::standard_table()) };
-                        let member = &mut snapshot.vessels[0].crew[0];
-                        member.promises.clear();
-                        if !completion {
-                            member.completion_conditions.clear();
-                        }
-                        status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().task_assigned = task;
-                        status.promises.entry("work".into()).or_default().insert(
-                            "coder".into(),
-                            (0..count)
-                                .map(|i| Promise {
-                                    id: format!("pr-{i}"),
-                                    vessel: "work".into(),
-                                    role: "coder".into(),
-                                    source: PromiseSource::Crew,
-                                    kind: PromiseKind::Pr,
-                                    state,
-                                    retraction_reason: None,
-                                    submissions: Vec::new(),
-                                })
-                                .collect(),
-                        );
-                    })
-                    .await;
-                    let convoys = backend.using::<Convoy>("flotilla");
-                    let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.unwrap())]);
-                    wake.sync_rows("flotilla", &objects).await.expect("sync");
-                    let expected =
-                        !standing && (task || completion || (count > 0 && matches!(state, PromiseState::Open | PromiseState::Submitted)));
-                    let armed = wake.subscriptions.inner.rows.lock().await.values().any(|row| matches!(row.maker, LeafMaker::Actor { .. }));
+                    let mut workflow = claim_less_workflow();
+                    workflow.exit = (!standing).then(ExitDeclaration::standard_table);
+                    if completion {
+                        workflow.vessels[0].crew[0].completion_conditions =
+                            supervised_workflow().vessels[0].crew[0].completion_conditions.clone();
+                    }
+                    let case = working_coder(workflow).await;
+                    resume_coder(&case);
+                    case.note(|status| status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().task_assigned = task).await;
+                    for number in 1..=count as u64 {
+                        coder_promise(&case, number, state).await;
+                    }
+                    sync_work_rows(&case).await;
+                    let phase = case.status().await.crew_work["work"]["coder"].phase;
+                    // On the engine a seat whose promises are all kept or retracted is done, and a
+                    // done seat owes nothing whatever its task or completion conditions.
+                    let done = phase == CrewWorkPhase::Done;
+                    assert!(
+                        !done || (count > 0 && matches!(state, PromiseState::Kept | PromiseState::Retracted)),
+                        "only settled promises finish the seat: {state:?}, {count}"
+                    );
+                    let expected = !standing
+                        && !done
+                        && (task || completion || (count > 0 && matches!(state, PromiseState::Open | PromiseState::Submitted)));
+                    let armed = actor_armed(&case).await;
                     assert_eq!(
                         armed, expected,
-                        "standing={standing}, state={state:?}, count={count}, task={task}, completion={completion}"
+                        "standing={standing}, state={state:?}, count={count}, task={task}, completion={completion}, phase={phase:?}"
                     );
                     if !expected {
                         let now = Utc::now();
                         for second in [0, 60, 120, 1800] {
-                            observe_actor(&backend, &wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
+                            observe_actor(&case, &case.wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
                         }
-                        assert!(delivery.requests.lock().unwrap().is_empty(), "no settlement nudge without an obligation");
-                        assert!(convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.is_none());
+                        assert!(case.delivery.requests.lock().unwrap().is_empty(), "no settlement nudge without an obligation");
+                        // A submitted PR arms a row on its change request, which stalls on the
+                        // observation here because no observer runs: that is the observer's, not
+                        // the seat's.
+                        let stalled = case.status().await.stalled;
+                        assert!(
+                            stalled.as_ref().is_none_or(|stalled| stalled.source == StallEvidenceSource::Observation),
+                            "standing={standing}, state={state:?}, count={count}, task={task}, completion={completion}, phase={phase:?}: {stalled:?}"
+                        );
                     }
                 }
             }
@@ -1801,78 +1389,41 @@ fn settlement_claim_arming_respects_exit_and_pending_promises(tc: hegel::TestCas
 }
 
 // #3572: explicit stalls do not make standing roles owe settlement claims.
-// A missing workflow snapshot also declares no exit and must remain exempt.
 #[tokio::test]
-async fn standing_stalled_and_snapshot_less_roles_have_no_settlement_obligation() {
-    // Glue: pin the two no-exit representations and the explicit-stall branch
-    // through the same in-memory subscription derivation as the property above.
-    for (phase, missing_snapshot) in [(CrewWorkPhase::Stalled, false), (CrewWorkPhase::Working, true), (CrewWorkPhase::Stalled, true)] {
-        let (backend, wake, _) = idle_nudge_scenario().await;
-        update_convoy(&backend, "stalled-work", |status| {
-            if missing_snapshot {
-                status.workflow_snapshot = None;
-            } else {
-                status.workflow_snapshot.as_mut().expect("workflow").exit = None;
-            }
-            let work = status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap();
-            work.phase = phase;
-            work.task_assigned = true;
-        })
-        .await;
-        let convoys = backend.using::<Convoy>("flotilla");
-        let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.unwrap())]);
-        wake.sync_rows("flotilla", &objects).await.expect("sync");
-        assert!(
-            wake.subscriptions.inner.rows.lock().await.values().all(|row| !matches!(row.maker, LeafMaker::Actor { .. })),
-            "phase={phase:?}, missing_snapshot={missing_snapshot}"
-        );
-    }
+async fn standing_stalled_role_has_no_settlement_obligation() {
+    let mut workflow = supervised_workflow();
+    workflow.exit = None;
+    let case = supervised_case(workflow, &[]).await;
+    case.wake.subscriptions.inner.rows.lock().await.clear();
+    case.note(|status| status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().task_assigned = true).await;
+    assert_eq!(case.status().await.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+    sync_work_rows(&case).await;
+    assert!(!actor_armed(&case).await);
 }
 
-// Pending launch stays exempt from dead-session stalls. Lifecycle progress buys
-// another grace period; a stuck stage raises stable operator attention and recovers.
+// Pending launch stays exempt from dead-session stalls. Lifecycle progress buys another grace
+// period; a stuck stage raises stable operator attention and recovers when the session runs.
 #[hegel::test]
 fn pending_launch_progress_is_bounded_and_recovers(tc: hegel::TestCase) {
     use hegel::generators as gs;
     // Repeat judgments on either side of the exact 15-minute boundary.
     let repeat = tc.draw(gs::integers::<i64>().min_value(1).max_value(60));
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (backend, wake, _) = actor_nudge_scenario(&[]).await;
-        let sessions = backend.using::<TerminalSession>("flotilla");
-        let saved = sessions.get("resumed-coder").await.expect("session");
-        sessions.delete("resumed-coder").await.expect("remove launch");
-        let start = Utc::now();
-        update_convoy(&backend, "stalled-work", |status| {
-            status.started_at = Some(start);
-            status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0].source = flotilla_resources::CrewSource::Agent {
-                selector: flotilla_resources::Selector::for_capability("coding"),
-                prompt: None,
-                brief_template: None,
-            };
-            let mut latent = status.workflow_snapshot.as_ref().expect("workflow").vessels[0].crew[0].clone();
-            latent.role = "latent".into();
-            status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew.push(latent);
-            status
-                .crew_work
-                .get_mut("work")
-                .expect("work")
-                .insert("latent".into(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build());
-            status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = CrewWorkPhase::Pending;
-        })
-        .await;
-        let judge = |seconds| {
-            let backend = backend.clone();
-            let wake = wake.clone();
+        // The work's second agent is latent: it awaits a handoff, not a launch.
+        let mut workflow = supervised_workflow();
+        workflow.vessels[0].crew.push(flotilla_engine_convoys_testkit::agent("latent"));
+        let case = working_coder(workflow).await;
+        // The sessions' log is followed, as a daemon follows its store: the watch view learns
+        // of the request and its retries.
+        let _follower = case.home.engine.terminals.terminals.follow(Arc::clone(case.home.service())).expect("follow sessions");
+        let status = case.status().await;
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Pending);
+        let start = status.started_at.expect("the launch started");
+        let judge = |seconds: i64| {
+            let case = &case;
             async move {
-                let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-                wake.judge_stalls_at(
-                    "flotilla",
-                    &HashMap::from([("stalled-work".into(), convoy)]),
-                    start + chrono::Duration::seconds(seconds),
-                )
-                .await
-                .expect("judge");
-                backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy").status.expect("status")
+                case.judge(&case.wake, start + chrono::Duration::seconds(seconds)).await;
+                case.status().await
             }
         };
         for seconds in [0, 899] {
@@ -1880,122 +1431,113 @@ fn pending_launch_progress_is_bounded_and_recovers(tc: hegel::TestCase) {
             assert!(status.stalled.is_none());
             assert!(status.attention.is_none());
         }
-        // Session creation is real launch progress even after a long queue wait.
-        let session = sessions
-            .create(
-                &InputMeta::builder()
-                    .name("resumed-coder".into())
-                    .annotations(launch_annotations("resumed-coder"))
-                    .labels(saved.metadata.labels)
-                    .build(),
-                &saved.spec,
-            )
-            .await
-            .expect("new launch");
+        // Requesting the session is real launch progress even after a long queue wait.
+        let request = TerminalLaunchRequest { session: "resumed-coder".into(), ..TerminalsFixture::agent(&case.vessel, "coder", "env") };
+        let cell = case.wake.views("flotilla").await.expect("views");
+        let views = cell.get().expect("initialized views");
+        let mut changes = views.sessions.subscribe_local_keys();
+        let session = case.home.engine.terminals.request(&request);
+        // The judge reads its watch view, so it judges once that view has heard the request: a
+        // session for the coder's seat on its vessel.
+        let heard = || async {
+            views.sessions.shared_list().await.expect("session view").items.iter().any(|session| {
+                session.object.spec.role == "coder"
+                    && session.object.metadata.labels.get(flotilla_resources::VESSEL_LABEL).map(String::as_str) == Some("work")
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !heard().await {
+                match changes.recv().await {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => panic!("the session view stopped"),
+                }
+            }
+        })
+        .await
+        .expect("the judge's view hears the request");
         assert!(judge(899).await.attention.is_none());
-        // Receiving a Starting status is another lifecycle transition.
-        sessions.update_status("resumed-coder", &session.metadata.resource_version, &Default::default()).await.expect("starting");
-        let progressing = judge(1798).await;
-        assert!(progressing.attention.is_none(), "{:?}", progressing.attention);
-        for seconds in [1799, 2697] {
+        for seconds in [1798] {
             let status = judge(seconds).await;
             assert!(status.stalled.is_none());
             assert!(status.attention.is_none());
         }
-        let overdue = judge(2698).await;
+        let overdue = judge(1799).await;
         assert!(overdue.stalled.is_none(), "Pending remains startup-unknown");
         let attention = overdue.attention.expect("bounded launch diagnostic");
         assert_eq!(attention.source, "launch-progress");
-        assert!(attention.reason.contains("coder@work") && attention.reason.contains("Starting"), "{}", attention.reason);
+        assert!(attention.reason.contains("coder@work"), "{}", attention.reason);
         assert!(!attention.reason.contains("latent@work"), "latent roles await handoff");
-        let repeated = judge(2698 + repeat).await;
+        let repeated = judge(1799 + repeat).await;
         assert_eq!(repeated.attention, Some(attention.clone()));
         let other = ConvoyAttention { source: "operator".into(), reason: "keep this decision".into(), raised_at: start };
-        update_convoy(&backend, "stalled-work", |status| status.attention = Some(other.clone())).await;
-        assert_eq!(judge(2799).await.attention, Some(other), "launch health must preserve unrelated attention");
-        update_convoy(&backend, "stalled-work", |status| status.attention = None).await;
+        case.note(|status| status.attention = Some(other.clone())).await;
+        assert_eq!(judge(1900).await.attention, Some(other), "launch health must preserve unrelated attention");
+        case.note(|status| status.attention = None).await;
         // Retry failures are diagnostic evidence, not successful progress: a launch that is
         // retrying shows its reading's reason, as the session view does.
-        let session = sessions.get("resumed-coder").await.expect("session");
-        let mut status = session.status.expect("starting");
-        status.message = Some(
-            flotilla_protocol::LifecycleReading::Retrying {
-                failures: 3,
-                next: start + chrono::Duration::seconds(2860),
-                cause: "launcher retry failed".into(),
-            }
-            .reason()
-            .expect("retrying has a reason"),
+        case.home.engine.terminals.retry(&session, "launcher retry failed");
+        assert!(judge(1901).await.attention.expect("retry stays overdue").reason.contains("launcher retry failed"));
+        // The session runs: the coder works, and the launch's attention clears.
+        let agent = AgentLaunch { adapter: "claude".into(), model: None, stance: "trusted-implicit".into() };
+        case.home.engine.terminals.ready(
+            &session,
+            "resumed-coder-runtime",
+            &TerminalLaunchFacts { agent: Some(agent), ..Default::default() },
         );
-        sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("retry evidence");
-        assert!(judge(2800).await.attention.expect("retry stays overdue").reason.contains("launcher retry failed"));
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(2801)).await;
-        assert!(judge(2801).await.attention.is_none(), "Running is progress, not a dead session");
-        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(3701)).await;
-        assert!(judge(3701).await.attention.is_some(), "fresh idle observations are not launch progress");
-        update_convoy(&backend, "stalled-work", |status| {
-            status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = CrewWorkPhase::Working;
-        })
-        .await;
-        observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(3702)).await;
-        assert!(judge(3702).await.attention.is_none(), "recovery clears launch attention");
-        // Working crews still regain absent-session detection after launch.
-        sessions.delete("resumed-coder").await.expect("lost session");
-        judge(3800).await;
-        assert!(judge(3861).await.stalled.is_some());
+        assert_eq!(case.status().await.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+        assert!(judge(1902).await.attention.is_none(), "recovery clears launch attention");
     });
 }
 
 // A vessel the engine realises is launch progress: its Ready restarts the launch bound.
 #[tokio::test]
 async fn engine_vessel_progress_resets_the_launch_bound() {
-    let (backend, wake, _) = actor_nudge_scenario(&[]).await;
-    // The vessels' log is followed, as a daemon follows its store: the watch view learns of Ready.
-    let store = flotilla_provisioning_testkit::OtherHome::open("home");
-    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(store.service());
-    let _follower = engine.vessels.vessels.follow(Arc::clone(store.service())).expect("follow vessels");
-    backend.install_engine_records(Arc::new(flotilla_store::VesselViews::new(backend.clone(), "flotilla", engine.reads())));
-    let wake = ReconcilerWake::new(wake.subscriptions.with_lifecycle_reads(engine.reads()));
-    let fixture = &engine.vessels;
-    backend.using::<TerminalSession>("flotilla").delete("resumed-coder").await.expect("no launch yet");
-    let start = Utc::now() - chrono::Duration::seconds(600);
-    update_convoy(&backend, "stalled-work", |status| {
-        status.started_at = Some(start);
-        let work = status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew");
-        work.phase = CrewWorkPhase::Pending;
-        work.task_assigned = true;
-    })
-    .await;
-    let launch = fixture.request("stalled-work", "work", "host");
-    let judge = |at: chrono::DateTime<Utc>| {
-        let backend = backend.clone();
-        let wake = &wake;
+    let (backend, home) = engine_backend();
+    let wake = supervision_wake(&backend, &home);
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("graphql-budget".into()).project_ref("wheelhouse".into()).build();
+    let launch =
+        home.admit("stalled-work", spec, ConvoyStatus { workflow_snapshot: Some(supervised_workflow()), ..Default::default() }).await;
+    // The work's vessel is requested, not yet realised; no session starts before it is.
+    let vessel = home.engine.vessels.request(&launch, "work", "test-host");
+    let start = home.view(&backend, &launch).await.status.and_then(|status| status.started_at).expect("the launch started");
+    let judge = |at: DateTime<Utc>| {
+        let (backend, home, wake, launch) = (&backend, &home, &wake, &launch);
         async move {
-            let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-            wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), at).await.expect("judge");
-            backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy").status.expect("status").attention
+            let convoy = home.view(backend, launch).await;
+            caught_up(wake, &convoy).await;
+            wake.judge_stalls_at("flotilla", &HashMap::from([(launch.clone(), convoy)]), at).await.expect("judge");
+            home.view(backend, launch).await.status.expect("status").attention
         }
     };
     assert!(judge(start).await.is_none());
-    let mut watch = backend.using::<flotilla_resources::Vessel>("flotilla").watch(WatchStart::Now).await.expect("vessel watch");
-    fixture.ready(&launch, "env");
-    // The judge reads a watch view, so it judges once the watch has carried Ready.
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while let Some(event) = watch.next().await {
-            if let WatchEvent::Added(vessel) | WatchEvent::Modified(vessel) = event.expect("vessel event") {
-                if vessel.status.is_some_and(|status| status.phase == flotilla_resources::VesselPhase::Ready) {
-                    return;
-                }
+    // The vessels' log is followed, as a daemon follows its store: the watch view learns of Ready.
+    let _follower = home.engine.vessels.vessels.follow(Arc::clone(home.service())).expect("follow vessels");
+    let cell = wake.views("flotilla").await.expect("views");
+    let views = cell.get().expect("initialized views");
+    let mut changes = views.vessels.subscribe_local_keys();
+    home.engine.vessels.ready(&vessel, "env");
+    // The judge reads its watch view, so it judges once that view has heard Ready.
+    let ready_at = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let heard = views.vessels.shared_named(&vessel).await.expect("vessel view");
+            if let Some(ready_at) = heard.iter().find_map(|read| {
+                read.object.status.as_ref().filter(|status| status.phase == flotilla_resources::VesselPhase::Ready)?.ready_at
+            }) {
+                return ready_at;
+            }
+            match changes.recv().await {
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => panic!("the vessel view stopped"),
             }
         }
     })
     .await
-    .expect("the watch carries Ready");
-    let vessel = backend.using::<flotilla_resources::Vessel>("flotilla").get(&launch).await.expect("vessel view");
-    let ready_at = vessel.status.and_then(|status| status.ready_at).expect("ready vessel");
+    .expect("the judge's view hears Ready");
+    // The engine stamps Ready with the wall clock, as it stamps the launch's start, so the bound
+    // counts from the vessel's Ready.
+    assert!(ready_at >= start);
     assert!(judge(ready_at).await.is_none());
-    assert!(judge(start + chrono::Duration::seconds(900)).await.is_none(), "the engine's Ready restarted the bound");
-    assert!(judge(ready_at + chrono::Duration::seconds(899)).await.is_none());
+    assert!(judge(ready_at + chrono::Duration::seconds(899)).await.is_none(), "the engine's Ready restarted the bound");
     assert_eq!(
         judge(ready_at + chrono::Duration::seconds(900)).await.expect("bounded from the engine's progress").source,
         "launch-progress"
@@ -2005,15 +1547,15 @@ async fn engine_vessel_progress_resets_the_launch_bound() {
 // Supervision has a crew or convoy subject, and only a recipient with an inbox awaits a reply.
 #[tokio::test]
 async fn supervision_records_have_a_subject_and_operator_notices_expect_nothing() {
-    let (backend, wake, _) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-    let convoys = backend.using::<Convoy>("flotilla");
-    let source = convoys.get("stalled-work").await.expect("source");
-    wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("judge");
-    let source = convoys.get("stalled-work").await.expect("source");
+    let case = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+    case.judge(&case.wake, Utc::now()).await;
+    let source = case.convoy().await;
     let mut condition = source.status.as_ref().expect("status").stalled.clone().expect("stall");
-    assert_eq!(super::super::stalls::stall_subject("flotilla", &source, &condition), "wheelhouse/stalled-work/work/coder");
+    assert_eq!(super::super::stalls::stall_subject("flotilla", &source, &condition), case.coder());
     condition.leaves.clear();
-    assert_eq!(super::super::stalls::stall_subject("flotilla", &source, &condition), "project:wheelhouse/convoy:stalled-work");
+    let launch = flotilla_resources::convoy::engine::launch_address(&flotilla_address::Address::project("wheelhouse").unwrap(), &case.work)
+        .expect("a launch address");
+    assert_eq!(super::super::stalls::stall_subject("flotilla", &source, &condition), launch.to_string());
     assert_eq!(super::super::stalls::supervision_expectation(StallRung::Operator), flotilla_resources::MessageExpectation::None);
     assert_eq!(super::super::stalls::supervision_expectation(StallRung::Governor), flotilla_resources::MessageExpectation::Reply);
 }

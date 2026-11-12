@@ -1475,7 +1475,7 @@ impl InProcessDaemon {
         });
         daemon.install_decided_store(engine.service)?;
         engine.source_observers.install(Arc::new(flotilla_observation::forge_observation::DaemonSourceObservers::new(
-            daemon.resource_backend(),
+            &daemon.resource_backend,
             Arc::clone(&daemon.provisioning_namespace),
         )))?;
         daemon.install_observation_records(engine.observations, engine.observation_failures)?;
@@ -5228,11 +5228,13 @@ impl InProcessDaemon {
         receiver: &str,
         parts: &[&str],
     ) -> Result<Option<flotilla_resources::ReadResourceObject<ResourceConvoy>>, String> {
-        let [project, convoy_name, vessel, _role] = parts else { return Ok(None) };
+        let [project, segment, vessel, _role] = parts else { return Ok(None) };
+        // A standing role's launch name carries its project's address, escaped in the segment.
+        let convoy_name = flotilla_resources::convoy_of_segment(segment);
         let convoy = self
             .resource_backend
             .including_replicas::<ResourceConvoy>(namespace)
-            .get(convoy_name)
+            .get(&convoy_name)
             .await
             .map_err(|error| format!("receiver `{receiver}` has no admitted convoy: {error}"))?;
         if convoy.object.spec.project_ref.as_deref().unwrap_or(namespace) != *project {
