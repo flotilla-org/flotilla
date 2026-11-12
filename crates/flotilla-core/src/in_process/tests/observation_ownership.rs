@@ -138,7 +138,6 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         .iter()
         .map(|daemon| {
             flotilla_observation::change_request_observer::ChangeRequestRefresher::new(
-                "topology".into(),
                 daemon.resource_backend(),
                 daemon.resource_backend().local_root().unwrap().to_string(),
                 daemon.change_request_observation_source.clone(),

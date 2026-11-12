@@ -273,7 +273,6 @@ fn supervision_wake_with_limit(backend: &ResourceBackend, home: &EngineHome, lim
 fn supervision_wake_over(backend: &ResourceBackend, home: &EngineHome, reads: Arc<dyn LifecycleReads>, limit: u32) -> ReconcilerWake {
     let (event_tx, _) = broadcast::channel(16);
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         backend.clone(),
         "test-host".into(),
         Arc::new(UnavailableChangeRequests),
@@ -810,7 +809,6 @@ async fn assert_leaf_subscription_contract(backend: ResourceBackend) {
     let home = EngineHome::install(&backend, "flotilla", "test-host");
     let (event_tx, _) = broadcast::channel(16);
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         backend.clone(),
         "test-host".to_string(),
         Arc::new(UnavailableChangeRequests),
@@ -1650,7 +1648,6 @@ async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
     let (backend, home) = engine_backend();
     let (event_tx, _) = broadcast::channel(4);
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         backend.clone(),
         "authority".to_string(),
         Arc::new(UnavailableChangeRequests),

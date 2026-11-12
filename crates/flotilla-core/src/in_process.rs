@@ -1287,7 +1287,6 @@ impl InProcessDaemon {
         });
         let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(resource_backend.clone(), Arc::clone(&query_port)));
         let change_request_refresher = flotilla_observation::change_request_observer::ChangeRequestRefresher::new(
-            host_name.to_string(),
             resource_backend.clone(),
             local_node_id.to_string(),
             observation_source.clone(),

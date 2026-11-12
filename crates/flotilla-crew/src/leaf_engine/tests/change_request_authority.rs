@@ -105,13 +105,8 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
 
     let (event_tx, _) = broadcast::channel(16);
     let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default();
-    let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
-        authority.clone(),
-        "authority-root".to_string(),
-        Arc::new(UnavailableChangeRequests),
-        cadence,
-    );
+    let refresher =
+        ChangeRequestRefresher::new(authority.clone(), "authority-root".to_string(), Arc::new(UnavailableChangeRequests), cadence);
     let table = engine_table(authority.clone(), &home, broadcast_test_sink(event_tx), refresher);
     let controller = convoy_controller(&authority, &home, &table, Some(cadence.stale_after));
     // The checkout's inspection names the open change request: the convoy produces it.
@@ -154,7 +149,7 @@ async fn replayed_real_merge_observation_unblocks_wait_and_releases_demand() {
         freshness_demanded: Duration::from_secs(2),
         stale_after: Duration::from_secs(120),
     };
-    let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source, cadence);
+    let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source, cadence);
     let table = served_table(backend.clone(), broadcast_test_sink(event_tx.clone()), refresher.clone());
     let connection_id = uuid::Uuid::new_v4();
     let mut events = event_tx.subscribe();
@@ -190,7 +185,7 @@ async fn unsubscribe_stops_change_request_observation_and_freshness_tightens_cad
         freshness_demanded: Duration::from_secs(5),
         stale_after: Duration::from_secs(120),
     };
-    let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source, cadence);
+    let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source, cadence);
     let table = served_table(backend.clone(), broadcast_test_sink(event_tx), refresher.clone());
     let connection_id = uuid::Uuid::new_v4();
     let request = WaitSubscriptionRequest {
@@ -278,7 +273,6 @@ async fn replica_reading_evaluator_fires_from_authority_change_request_record() 
         .expect("replicate authority CR");
     let calls = Arc::new(AtomicUsize::new(0));
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         reader.clone(),
         "kiwi".to_string(),
         Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
@@ -327,7 +321,6 @@ async fn foreign_change_request_authority_does_not_fetch_or_write_status() {
         stale_after: Duration::from_secs(60),
     };
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         backend.clone(),
         "local-host".to_string(),
         Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
@@ -365,7 +358,6 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
     };
     let owner_calls = Arc::new(AtomicUsize::new(0));
     let owner_refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         owner.clone(),
         "owner".to_string(),
         Arc::new(CountingChangeRequests { calls: Arc::clone(&owner_calls) }),
@@ -395,7 +387,6 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
         .expect("replicate owner observation");
     let reader_calls = Arc::new(AtomicUsize::new(0));
     let reader_refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         reader.clone(),
         "reader".to_string(),
         Arc::new(CountingChangeRequests { calls: Arc::clone(&reader_calls) }),
@@ -481,7 +472,6 @@ async fn former_owner_evaluates_fresher_takeover_replica() {
         .expect("replicate takeover");
     let (event_tx, _) = broadcast::channel(16);
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         former_owner.clone(),
         "former".to_string(),
         Arc::new(UnavailableChangeRequests),
@@ -604,7 +594,6 @@ async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
         .expect("replicate stale takeover");
     let calls = Arc::new(AtomicUsize::new(0));
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         former.clone(),
         "former".to_string(),
         Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
@@ -689,7 +678,6 @@ async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
         stale_after: Duration::from_secs(2),
     };
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         reader.clone(),
         "reader".to_string(),
         Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
@@ -730,7 +718,6 @@ async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
         .expect("replicate claim to old owner");
     let owner_calls = Arc::new(AtomicUsize::new(0));
     let old_owner = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         owner.clone(),
         "owner".to_string(),
         Arc::new(CountingChangeRequests { calls: Arc::clone(&owner_calls) }),
@@ -749,7 +736,6 @@ async fn observed_issue_change_fires_wait_leaf() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, mut events) = broadcast::channel(16);
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         backend.clone(),
         "authority".into(),
         Arc::new(UnavailableChangeRequests),
@@ -835,7 +821,6 @@ async fn issue_leaf_uses_issue_refresher_staleness() {
     let created = records.update_status(&name, &created.metadata.resource_version, &stale).await.expect("stale issue");
     let (event_tx, mut events) = broadcast::channel(16);
     let change_requests = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         backend.clone(),
         "cr-owner".into(),
         Arc::new(UnavailableChangeRequests),
@@ -901,7 +886,6 @@ async fn mixed_case_repository_leaf_reads_the_record_the_observer_writes() {
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(true) });
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         backend.clone(),
         "authority".to_string(),
         source,
@@ -953,7 +937,6 @@ async fn host_and_forge_id_spellings_are_one_observation_subject() {
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(RecordingChangeRequests::default());
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         backend.clone(),
         "authority".to_string(),
         source.clone(),

@@ -103,10 +103,7 @@ struct ChangeRequestRefresherInner {
 }
 
 impl ChangeRequestRefresher {
-    // `_origin` named the convoy history this observer wrote; it has no reader now, and its
-    // callers drop it in the next change.
     pub fn new(
-        _origin: String,
         backend: ResourceBackend,
         authority: String,
         source: Arc<dyn ChangeRequestObservationSource>,
@@ -1241,7 +1238,6 @@ mod tests {
             .expect("convoy history");
 
         let refresher = ChangeRequestRefresher::new(
-            "fleet".into(),
             backend.clone(),
             "node".into(),
             Arc::new(UnavailableSource),
@@ -1272,7 +1268,6 @@ mod tests {
         use flotilla_resources::{ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, SubjectDiscoverySource};
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
-            "kiwi".into(),
             backend.clone(),
             "node".into(),
             Arc::new(UnavailableSource),
@@ -1362,7 +1357,6 @@ mod tests {
         ] {
             let source = Arc::new(RecoveringSource(Mutex::new(Err(error.clone()))));
             let refresher = ChangeRequestRefresher::new(
-                "fleet".into(),
                 ResourceBackend::new(InMemoryBackend::default()),
                 "node".into(),
                 source.clone(),
@@ -1426,7 +1420,6 @@ mod tests {
     async fn concurrent_first_demands_share_one_refresh_and_write_no_placeholder() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
-            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(UnavailableSource),
@@ -1484,13 +1477,7 @@ mod tests {
             ),
             AtomicUsize::new(0),
         ));
-        let refresher = ChangeRequestRefresher::new(
-            "fleet".into(),
-            backend.clone(),
-            "node".into(),
-            source.clone(),
-            ChangeRequestRefreshCadence::default(),
-        );
+        let refresher = ChangeRequestRefresher::new(backend.clone(), "node".into(), source.clone(), ChangeRequestRefreshCadence::default());
         let subject = test_subject(42);
         refresher.refresh_once(&subject).await.expect("initial observation");
         assert_eq!(source.1.load(Ordering::SeqCst), 1);
@@ -1527,8 +1514,7 @@ mod tests {
     async fn retained_subject_does_not_ride_along_with_demanded_sibling() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let source = Arc::new(GroupSource(Mutex::new(Vec::new())));
-        let refresher =
-            ChangeRequestRefresher::new("fleet".into(), backend, "node".into(), source.clone(), ChangeRequestRefreshCadence::default());
+        let refresher = ChangeRequestRefresher::new(backend, "node".into(), source.clone(), ChangeRequestRefreshCadence::default());
         let retained = test_subject(41);
         refresher.refresh_once(&retained).await.expect("seed retained");
         refresher.start_retained(retained).await;
@@ -1611,7 +1597,6 @@ mod tests {
         ] {
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let refresher = ChangeRequestRefresher::new(
-                "kiwi".into(),
                 backend.clone(),
                 "node".into(),
                 Arc::new(ErrorSource(error.clone())),
@@ -1664,7 +1649,6 @@ mod tests {
         runtime.block_on(async {
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let refresher = ChangeRequestRefresher::new(
-                "kiwi".into(),
                 backend.clone(),
                 "node".into(),
                 Arc::new(UnavailableSource),
@@ -1754,7 +1738,6 @@ mod tests {
         for authority in ["node", "peer"] {
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let refresher = ChangeRequestRefresher::new(
-                "fleet".into(),
                 backend.clone(),
                 "node".into(),
                 Arc::new(UnavailableSource),
@@ -1797,13 +1780,8 @@ mod tests {
         for collection_first in [false, true] {
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let source = Arc::new(PausedMissingSource { started: Notify::new(), proceed: Notify::new() });
-            let refresher = ChangeRequestRefresher::new(
-                "fleet".into(),
-                backend.clone(),
-                "node".into(),
-                source.clone(),
-                ChangeRequestRefreshCadence::default(),
-            );
+            let refresher =
+                ChangeRequestRefresher::new(backend.clone(), "node".into(), source.clone(), ChangeRequestRefreshCadence::default());
             let subject = ChangeRequestKey::new(
                 "ops",
                 flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).unwrap(),
@@ -1910,7 +1888,6 @@ mod tests {
             status.unlink_subject(&link);
             convoys.update_status(name, &convoy.metadata.resource_version, &status).await.unwrap();
             let refresher = ChangeRequestRefresher::new(
-                "kiwi".into(),
                 backend.clone(),
                 "node".into(),
                 Arc::new(UnavailableSource),
@@ -1932,13 +1909,8 @@ mod tests {
     #[tokio::test]
     async fn failed_collection_keeps_retained_monitoring() {
         let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), "invalid://resource-store"));
-        let refresher = ChangeRequestRefresher::new(
-            "kiwi".into(),
-            backend,
-            "node".into(),
-            Arc::new(UnavailableSource),
-            ChangeRequestRefreshCadence::default(),
-        );
+        let refresher =
+            ChangeRequestRefresher::new(backend, "node".into(), Arc::new(UnavailableSource), ChangeRequestRefreshCadence::default());
         let subject = ChangeRequestKey::new(
             "ops",
             flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
@@ -1967,13 +1939,8 @@ mod tests {
             )
             .expect("open");
             let source = Arc::new(MutableSource(Mutex::new(opened), AtomicUsize::new(0)));
-            let refresher = ChangeRequestRefresher::new(
-                "kiwi".into(),
-                backend.clone(),
-                "node".into(),
-                source.clone(),
-                ChangeRequestRefreshCadence::default(),
-            );
+            let refresher =
+                ChangeRequestRefresher::new(backend.clone(), "node".into(), source.clone(), ChangeRequestRefreshCadence::default());
             let subject = ChangeRequestKey::new(
                 "ops",
                 flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
@@ -2048,13 +2015,8 @@ mod tests {
             for (_, refresh) in refresher.inner.active.lock().await.drain() {
                 refresh.task.abort();
             }
-            let recovered = ChangeRequestRefresher::new(
-                "kiwi".into(),
-                backend.clone(),
-                "node".into(),
-                source.clone(),
-                ChangeRequestRefreshCadence::default(),
-            );
+            let recovered =
+                ChangeRequestRefresher::new(backend.clone(), "node".into(), source.clone(), ChangeRequestRefreshCadence::default());
             recovered.garbage_collect_orphans().await.expect("recover");
             assert!(records.get(&subject.record_name()).await.is_ok());
             source.0.lock().await.state = Observation::known(terminal, observed_at + chrono::Duration::seconds(1));
@@ -2080,7 +2042,6 @@ mod tests {
     async fn last_released_demand_garbage_collects_observed_record() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
-            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(UnavailableSource),
@@ -2109,7 +2070,6 @@ mod tests {
     async fn startup_garbage_collection_covers_non_default_namespaces() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
-            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(UnavailableSource),
@@ -2135,7 +2095,6 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
-            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(CountingSource(Arc::clone(&calls))),
@@ -2168,7 +2127,6 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
-            "fleet".to_string(),
             backend,
             "authority".to_string(),
             Arc::new(CountingSource(Arc::clone(&calls))),
@@ -2199,7 +2157,6 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
-            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(CountingSource(Arc::clone(&calls))),
@@ -2244,7 +2201,6 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
-            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(CountingSource(Arc::clone(&calls))),
@@ -2270,7 +2226,6 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
-            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(CountingSource(Arc::clone(&calls))),
@@ -2299,7 +2254,6 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
-            "fleet".to_string(),
             backend,
             "authority".to_string(),
             Arc::new(CountingSource(Arc::clone(&calls))),
@@ -2388,7 +2342,6 @@ mod tests {
         let convoy = ConvoySpec::builder().workflow_ref("dev".into()).role("coder".into()).subjects(vec![produces]).build();
         backend.using::<Convoy>("ops").create(&InputMeta::builder().name("producer".into()).build(), &convoy).await.expect("convoy");
         let refresher = ChangeRequestRefresher::new(
-            "kiwi".into(),
             backend.clone(),
             "local".into(),
             Arc::new(UnavailableSource),
@@ -2439,7 +2392,6 @@ mod tests {
     async fn the_sweep_keeps_demanded_records_and_deletes_the_rest() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
-            "fleet".into(),
             backend.clone(),
             "authority".into(),
             Arc::new(UnavailableSource),
@@ -2479,7 +2431,6 @@ mod tests {
     async fn under_the_engine_a_failed_read_is_recorded() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
-            "fleet".to_string(),
             backend,
             "authority".to_string(),
             Arc::new(UnavailableSource),
@@ -2509,7 +2460,6 @@ mod tests {
     async fn observation_failure_is_available_to_settlement_diagnostics() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
-            "fleet".to_string(),
             backend,
             "authority".to_string(),
             Arc::new(UnavailableSource),

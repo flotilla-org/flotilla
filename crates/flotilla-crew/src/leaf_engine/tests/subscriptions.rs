@@ -319,7 +319,6 @@ async fn diagnostics_retain_the_last_firing_for_an_armed_reconciler_row() {
     let (backend, home) = engine_backend();
     let (event_tx, _) = broadcast::channel(4);
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         backend.clone(),
         "authority".to_string(),
         Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) }),
@@ -400,7 +399,7 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
         freshness_demanded: Duration::from_millis(20),
         stale_after: Duration::from_secs(60),
     };
-    let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
+    let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
     let repo_ref = RepositoryKey("repo".to_string());
     let spec = ConvoySpec::builder()
@@ -482,13 +481,8 @@ async fn routing_count_contract(backend: ResourceBackend, changes: &[usize]) {
         }
     }
     let (events, mut fires) = broadcast::channel(16);
-    let refresher = ChangeRequestRefresher::new(
-        "fleet".into(),
-        backend.clone(),
-        "authority".into(),
-        Arc::new(UnavailableChangeRequests),
-        Default::default(),
-    );
+    let refresher =
+        ChangeRequestRefresher::new(backend.clone(), "authority".into(), Arc::new(UnavailableChangeRequests), Default::default());
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(events), refresher);
     let mut watchers = Vec::new();
     let mut ids = Vec::new();

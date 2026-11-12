@@ -16,7 +16,7 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
         freshness_demanded: Duration::from_millis(20),
         stale_after: Duration::from_secs(60),
     };
-    let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
+    let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
     let repo_ref = RepositoryKey("repo".to_string());
     let spec = ConvoySpec::builder()
@@ -137,13 +137,7 @@ async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
     let (backend, home) = engine_backend();
     let (event_tx, _) = broadcast::channel(16);
     let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default();
-    let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
-        backend.clone(),
-        "authority".to_string(),
-        Arc::new(UnavailableChangeRequests),
-        cadence,
-    );
+    let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), Arc::new(UnavailableChangeRequests), cadence);
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let launch = standard_landing(&backend, &home, "no-cr", convoy_spec()).await;
@@ -183,7 +177,7 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
         freshness_demanded: Duration::from_millis(20),
         stale_after: Duration::from_secs(60),
     };
-    let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
+    let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
     let spec = ConvoySpec::builder()
         .workflow_ref("workflow".to_string())

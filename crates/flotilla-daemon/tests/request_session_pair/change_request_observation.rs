@@ -173,7 +173,6 @@ async fn remote_change_request_scenario(late_watcher: bool) {
     // Each observer writes to its daemon's engine records, as composition installs them.
     let refresher = |daemon: &Arc<InProcessDaemon>, source: Arc<dyn ChangeRequestObservationSource>| {
         let refresher = ChangeRequestRefresher::new(
-            daemon.host_name().to_string(),
             daemon.resource_backend(),
             daemon.node_id().to_string(),
             source,

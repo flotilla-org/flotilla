@@ -359,7 +359,6 @@ mod tests {
             let environments =
                 EnvironmentManager::from_local_state(environment_id, host_id, Arc::clone(&runner), EnvironmentBag::new(), Arc::new(vec![]));
             let refresher = ChangeRequestRefresher::new(
-                "fleet".to_string(),
                 backend.clone(),
                 node_id.to_string(),
                 Arc::new(GhChangeRequestObservationSource::new(Arc::clone(&runner))),

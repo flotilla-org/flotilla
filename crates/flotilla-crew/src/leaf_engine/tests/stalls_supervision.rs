@@ -942,7 +942,6 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
         limit.observation_error("GraphQL".into())
     };
     let refresher = ChangeRequestRefresher::new(
-        "fleet".into(),
         backend.clone(),
         "authority".into(),
         Arc::new(LimitedSource(error)),

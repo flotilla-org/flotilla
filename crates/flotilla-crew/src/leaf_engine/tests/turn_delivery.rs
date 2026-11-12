@@ -473,7 +473,6 @@ async fn issue_turn_delivery_fires_once_for_changed_issue() {
     let (backend, home) = engine_backend();
     let (event_tx, _) = broadcast::channel(4);
     let refresher = ChangeRequestRefresher::new(
-        "fleet".to_string(),
         backend.clone(),
         "authority".into(),
         Arc::new(UnavailableChangeRequests),
@@ -971,13 +970,8 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
             let observer = ResourceBackend::new(InMemoryBackend::default());
             let (tx, _) = broadcast::channel(4);
             // External forge boundary: provider reads are unavailable; demand and replication are real.
-            let refresher = ChangeRequestRefresher::new(
-                "fleet".into(),
-                home.clone(),
-                "home".into(),
-                Arc::new(UnavailableChangeRequests),
-                Default::default(),
-            );
+            let refresher =
+                ChangeRequestRefresher::new(home.clone(), "home".into(), Arc::new(UnavailableChangeRequests), Default::default());
             let issues = IssueRefresher::new(home.clone(), "home".into(), Arc::new(UnavailableIssues), Default::default());
             let engine = EngineHome::install(&home, "flotilla", "home");
             let table = engine_table(home.clone(), &engine, broadcast_test_sink(tx), refresher.clone());

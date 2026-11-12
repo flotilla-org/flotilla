@@ -279,13 +279,8 @@ async fn build_fixture(
     let environment = EnvironmentId::new("local");
     let namespace = Arc::new(std::sync::RwLock::new("flotilla".into()));
     let engine = EngineHome::install(&backend, "flotilla", "host");
-    let refresher = ChangeRequestRefresher::new(
-        "host".into(),
-        backend.clone(),
-        "host".into(),
-        Arc::new(UnusedForge),
-        ChangeRequestRefreshCadence::default(),
-    );
+    let refresher =
+        ChangeRequestRefresher::new(backend.clone(), "host".into(), Arc::new(UnusedForge), ChangeRequestRefreshCadence::default());
     let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::new(RecordingEventSink::default()), refresher)
         .with_lifecycle_reads(engine.reads())
         .with_message_path(message_path.clone())
