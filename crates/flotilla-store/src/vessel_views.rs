@@ -29,7 +29,7 @@ use flotilla_resources::{
 
 use crate::{
     held_listing::{ticks, watched, Unwatched, Watched},
-    ResourceBackend,
+    ResourceBackend, WeakResourceBackend,
 };
 
 const KIND: &str = "Vessel";
@@ -43,7 +43,8 @@ const EXPLAIN: &str = "see it with `flotilla convoy explain`";
 /// and left the listing is read by name alone, never composed again by a pass.
 #[derive(Clone)]
 pub struct VesselViews {
-    backend: ResourceBackend,
+    /// Weak: the backend holds these views as its Vessel port.
+    backend: WeakResourceBackend,
     namespace: String,
     reads: Arc<dyn LifecycleReads>,
     listing: Arc<tokio::sync::Mutex<Listing>>,
@@ -191,12 +192,16 @@ struct Touched {
 impl VesselViews {
     pub fn new(backend: ResourceBackend, namespace: &str, reads: Arc<dyn LifecycleReads>) -> Self {
         Self {
-            backend,
+            backend: backend.downgrade(),
             namespace: namespace.to_owned(),
             reads,
             listing: Arc::default(),
             dirt: Arc::new(std::sync::Mutex::new(Dirt { all: true, ..Dirt::default() })),
         }
+    }
+
+    fn backend(&self) -> Result<ResourceBackend, ResourceError> {
+        self.backend.upgrade().ok_or_else(|| ResourceError::other("the resource backend serving these vessels is gone"))
     }
 
     /// Each work's newest launch at every home, as read sources: this home's are local, other
@@ -420,7 +425,7 @@ impl VesselViews {
     /// The convoys `records` serve, by name and home, local or replicated. One that cannot be
     /// found is left out: its vessels read without it.
     async fn convoys(&self, records: &[VesselRecord]) -> Result<BTreeMap<(String, String), ResourceObject<Convoy>>, ResourceError> {
-        let convoys = self.backend.including_replicas::<Convoy>(&self.namespace);
+        let convoys = self.backend()?.including_replicas::<Convoy>(&self.namespace);
         let mut held = BTreeMap::new();
         for record in records {
             let key = (record.convoy.clone(), record.convoy_home.clone());
@@ -578,7 +583,13 @@ impl EngineRecords for VesselViews {
     /// checkouts its view is joined with, at any home. The next pass composes again what each
     /// change touched.
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let convoys = self.backend.including_replicas::<Convoy>(&self.namespace).watch().await.map_err(|error| error.to_string())?;
+        let convoys = self
+            .backend()
+            .map_err(|error| error.to_string())?
+            .including_replicas::<Convoy>(&self.namespace)
+            .watch()
+            .await
+            .map_err(|error| error.to_string())?;
         {
             let mut held = self.dirt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             held.watching += 1;
