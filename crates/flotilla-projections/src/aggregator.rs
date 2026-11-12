@@ -597,8 +597,13 @@ impl Aggregator {
         self.bootstrapping = false;
         self.projection_delivery = ConvoyProjectionDelivery::Coalesced { deadline: None };
         self.emitted_queries.extend(QueryId::ALWAYS_MATERIALIZED.iter().cloned());
-        self.event_sink.emit(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
-        self.event_sink.emit(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set(&None).await)));
+        // Deltas were withheld while bootstrapping: a subscriber that joined
+        // meanwhile catches up from a full set of every family.
+        for query in QueryId::ALWAYS_MATERIALIZED {
+            if let Some(set) = self.state.result_set_for(query).await {
+                self.event_sink.emit(DaemonEvent::ResultSet(Box::new(set)));
+            }
+        }
         // Publish/bootstrap scoped demand now, rather than charging the first
         // unrelated resource change for every existing project scope.
         self.emit_scoped_convoy_result_sets().await;
@@ -4180,6 +4185,61 @@ mod tests {
         assert!(awareness.rows.as_awareness().expect("awareness rows").iter().any(|node| node.label == "widgets"));
 
         assert!(!run.is_finished(), "the resource watches remain live");
+        run.abort();
+        let _ = run.await;
+    }
+
+    // Deltas computed while bootstrapping are withheld, so a subscriber that
+    // took its snapshot before they landed catches up from the full sets
+    // published when bootstrap ends.
+    #[tokio::test]
+    async fn subscriber_joining_during_bootstrap_receives_every_materialized_family() {
+        let durable = ResourceBackend::new(InMemoryBackend::default());
+        let ensure = convoy_ensure_object("governor", None).await;
+        durable
+            .clone()
+            .using::<ConvoyEnsure>("flotilla")
+            .create(&InputMeta::builder().name(ensure.metadata.name).build(), &ensure.spec)
+            .await
+            .expect("seed standing role");
+        let project = project_object("widgets").await;
+        durable
+            .clone()
+            .using::<Project>("flotilla")
+            .create(&InputMeta::builder().name(project.metadata.name).build(), &project.spec)
+            .await
+            .expect("seed project");
+
+        let state = AggregatorProjectionState::new();
+        let roles_query = QueryId::StandingRoles { scope: None };
+        let projects_query = QueryId::ProjectRepositories { scope: None };
+        let joined_roles = state.result_set_for(&roles_query).await.expect("standing roles snapshot");
+        let joined_projects = state.result_set_for(&projects_query).await.expect("project repositories snapshot");
+        assert!(joined_roles.rows.as_standing_roles().expect("standing role rows").is_empty());
+        assert!(joined_projects.rows.as_project_repositories().expect("project rows").is_empty());
+
+        let (event_tx, mut event_rx) = broadcast::channel(64);
+        let run_state = state.clone();
+        let run =
+            tokio::spawn(
+                async move { Aggregator::new(run_state, HostName::new("kiwi"), event_tx).run(namespace_resolvers(&durable)).await },
+            );
+
+        timeout(Duration::from_secs(1), async {
+            let (mut role, mut project) = (false, false);
+            while !(role && project) {
+                let DaemonEvent::ResultSet(set) = event_rx.recv().await.expect("aggregator bootstrap event") else { continue };
+                if let Some(rows) = set.rows.as_standing_roles() {
+                    role |= rows.iter().any(|row| row.role == "governor");
+                }
+                if let Some(rows) = set.rows.as_project_repositories() {
+                    project |= rows.iter().any(|row| row.resource.name == "widgets");
+                }
+            }
+        })
+        .await
+        .expect("bootstrap end publishes the standing role and project rows the joined subscriber missed");
+
         run.abort();
         let _ = run.await;
     }
