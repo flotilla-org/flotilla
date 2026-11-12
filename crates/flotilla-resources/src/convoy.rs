@@ -1787,11 +1787,14 @@ pub enum CrewWorkPhase {
     Done,
     HandedBack,
     Failed,
+    /// The launch ended before the seat finished: derived by the engine's view from the end, with
+    /// the end's reason or disposition as its message. Nothing stores it.
+    Ended,
 }
 
 impl CrewWorkPhase {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Done | Self::HandedBack | Self::Failed)
+        matches!(self, Self::Done | Self::HandedBack | Self::Failed | Self::Ended)
     }
 }
 

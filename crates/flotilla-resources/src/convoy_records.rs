@@ -310,7 +310,14 @@ impl ConvoyRecord {
                     .iter()
                     .map(|(role, phase)| {
                         let noted = notes.crew.get(work).and_then(|roles| roles.get(role)).cloned().unwrap_or_default();
-                        let failed = self.seats.get(work).and_then(|seats| seats.get(role)).and_then(|seat| seat.failed.clone());
+                        // A failed seat says why it failed; a seat the end overtook says how the launch ended.
+                        let message = match phase {
+                            CrewWorkPhase::Ended => self.ended.as_ref().map(|(end, _)| match end {
+                                ConvoyEnd::Delivered { disposition } => disposition.clone(),
+                                ConvoyEnd::Failed { reason } | ConvoyEnd::Abandoned { reason } => reason.clone(),
+                            }),
+                            _ => self.seats.get(work).and_then(|seats| seats.get(role)).and_then(|seat| seat.failed.clone()),
+                        };
                         let state = CrewWorkState::builder()
                             .task_assigned(noted.task_assigned)
                             .maybe_pending_follow_up(noted.pending_follow_up)
@@ -322,7 +329,7 @@ impl ConvoyRecord {
                             })
                             .maybe_resumed_at(noted.resumed_at)
                             .maybe_resume_brief_id(noted.resume_brief_id)
-                            .maybe_message(failed)
+                            .maybe_message(message)
                             .build();
                         (role.clone(), state)
                     })
