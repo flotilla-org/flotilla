@@ -63,15 +63,8 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
         engine(&daemon);
         hosts.push(daemon);
     }
-    // Each daemon reads its image builds on the engine, as the runtime composes it (#3108).
-    let engines: Vec<_> = hosts
-        .iter()
-        .map(|host| {
-            let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&host.decided_store().expect("decided store"));
-            host.install_lifecycle_reads(engine.reads()).expect("engine reads");
-            engine
-        })
-        .collect();
+    // Each daemon reads its image builds on the engine it was composed with above (#3108).
+    let engines: Vec<_> = hosts.iter().map(|host| engine(host.as_ref())).collect();
     let home = Arc::clone(&hosts[0]);
     seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
     home.set_local_placement_capabilities(&BTreeSet::from(["codex".into()]), &["cleat".into()]).await;

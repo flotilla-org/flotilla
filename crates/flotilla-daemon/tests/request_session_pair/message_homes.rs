@@ -126,8 +126,8 @@ pub(super) struct DropStep {
 
 // Behaviour (#3317): the receiver's home holds the message; the other home
 // reads it from its replica, or at its home on a miss, marked remote with its
-// age; a reply to a fleet role is routed by subject.
-pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject(operations: &[DropStep]) {
+// age; a reply to a fleet role is routed by subject. Returns the routed request's identity.
+pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject(operations: &[DropStep]) -> String {
     // Both homes' Convoy and session replicas are written by hand below, so the
     // router replicates only Host identity. The decided stores' change streams are
     // pumped by hand too: each home's request to follow the other is dropped.
@@ -339,6 +339,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
             );
         }
     }
+    request
 }
 
 pub(super) use flotilla_daemon_testkit::engine::engine_environments;
