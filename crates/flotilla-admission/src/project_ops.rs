@@ -11,9 +11,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_charter::{
     ops_entry::{
-        parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION,
-        SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
-        VERIFICATION_PROVENANCE_ANNOTATION,
+        parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
+        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
     },
     project_declaration::{
         parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
@@ -1220,7 +1219,7 @@ impl ProjectService<'_> {
                     let role = entry.name;
                     let ensure_name = convoy_ensure_name(project_name, &role);
                     outcomes.push(format!("{}: ConvoyEnsure/{} accepted", file.path, ensure_name));
-                    let mut meta = InputMeta::builder()
+                    let meta = InputMeta::builder()
                         .name(ensure_name.clone())
                         .annotations(
                             BTreeMap::from([
@@ -1234,9 +1233,6 @@ impl ProjectService<'_> {
                             .collect(),
                         )
                         .build();
-                    if let Some(presents_as) = &ensure.presents_as {
-                        meta.annotations.insert(PRESENTS_AS_ANNOTATION.to_string(), presents_as.clone());
-                    }
                     let spec = ConvoyEnsureSpec {
                         project_ref: project_name.to_string(),
                         role: role.clone(),

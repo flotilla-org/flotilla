@@ -17,7 +17,6 @@ use flotilla_admission::repository_inspection::RepositoryInspection;
 use flotilla_admission::repository_inspection::RepositoryInspector;
 use flotilla_charter::ops_entry::materialized_workflow_name;
 use flotilla_charter::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
-use flotilla_charter::ops_entry::PRESENTS_AS_ANNOTATION;
 use flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION;
 use flotilla_charter::ops_entry::SOURCE_REPOSITORY_ANNOTATION;
 use flotilla_charter::ops_entry::VERIFICATION_PROJECT_ANNOTATION;
@@ -783,7 +782,7 @@ async fn ops_entries_materialization_scenario() {
     assert_eq!(ensure.spec.repositories, vec![operations.repo.clone()]);
     assert!(ensure.spec.agent_overrides.is_empty());
     assert_eq!(ensure.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
-    assert_eq!(ensure.metadata.annotations.get(PRESENTS_AS_ANNOTATION).map(String::as_str), Some("fleet"));
+    assert_eq!(ensure.spec.presents_as.as_deref(), Some("fleet"));
 
     let repositories = backend.using::<flotilla_resources::Repository>("flotilla");
     for source in repositories.list().await.expect("list repositories").items {
