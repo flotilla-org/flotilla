@@ -1273,7 +1273,7 @@ async fn resource_list_and_get_queries_return_wire_json() {
 }
 
 #[tokio::test]
-async fn convoy_explain_settles_with_an_ended_held_checkout_before_vessel_teardown() {
+async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon = InProcessDaemon::new(
         vec![],
@@ -1325,9 +1325,9 @@ async fn convoy_explain_settles_with_an_ended_held_checkout_before_vessel_teardo
         },
     )
     .await;
-    // The work's live launch, and the checkout the launch held, since lost.
+    // The work's live launch, and the checkout the launch holds, requested and never realised.
     let vessel = engine.vessels.request(&launch, "work", "host");
-    let checkout = engine.checkouts.request(
+    engine.checkouts.request(
         "checkout-dead",
         &flotilla_resources::CheckoutSpec::Observed(flotilla_resources::ObservedCheckoutSpec {
             r#ref: "feature".to_string(),
@@ -1338,7 +1338,6 @@ async fn convoy_explain_settles_with_an_ended_held_checkout_before_vessel_teardo
         }),
         Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(launch.clone())),
     );
-    engine.checkouts.finish(&checkout, flotilla_provisioning_testkit::Ending::Lost("gone"));
     let observed_at = chrono::Utc::now();
     let record_name = cr_name("github.com", "owner/repo", 42);
     let record = change_requests
@@ -1388,17 +1387,26 @@ async fn convoy_explain_settles_with_an_ended_held_checkout_before_vessel_teardo
             .await
             .expect("explain convoy")
     };
-    // A held checkout stays readable after it ends, so it is never missing: the merged change
-    // request settles the launch while its vessel is still live.
+    // The held checkout was never made: a live vessel keeps the expectation open.
     let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
-    assert!(explanation.settlement.satisfied, "an ended held checkout must not hold settlement: {:?}", explanation.settlement.unmet);
-    assert!(explanation.settlement.unmet.is_empty());
+    assert!(!explanation.settlement.satisfied, "a live vessel must retain its missing-checkout expectation");
+    assert!(explanation.settlement.unmet.iter().any(|unmet| unmet.reason == "missing_record" && unmet.subject == "checkout/checkout-dead"));
 
-    // Its home releases the vessel; teardown changes nothing about the settlement.
+    // Its home releases the vessel: the launch is torn down.
     engine.vessels.step(&vessel, flotilla_resources::vessel_records::VesselStep::Released);
     let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
-    assert!(explanation.settlement.satisfied, "terminal world evidence settles the torn-down launch");
+    assert!(explanation.settlement.satisfied, "terminal world evidence should discharge the torn-down vessel's checkout");
     assert!(explanation.settlement.unmet.is_empty());
+    // Explain names the expectation as dropped, not met, and the vessel whose end dropped it.
+    let [discharge] = explanation.settlement.discharged.as_slice() else {
+        panic!("one discharged expectation: {:?}", explanation.settlement.discharged)
+    };
+    assert_eq!(
+        (discharge.expectation.reason.as_str(), discharge.expectation.subject.as_str()),
+        ("missing_record", "checkout/checkout-dead")
+    );
+    let [ended] = discharge.ended_vessels.as_slice() else { panic!("the released vessel: {:?}", discharge.ended_vessels) };
+    assert_eq!((ended.launch.as_str(), ended.reading.as_str()), (vessel.as_str(), "Released"));
 }
 
 #[tokio::test]
@@ -2667,6 +2675,7 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         let settlement = flotilla_resources::evaluate_landing_settlement(
             &replacement,
             &BTreeMap::new(),
+            &[],
             &BTreeMap::new(),
             &[],
             Duration::from_secs(30),

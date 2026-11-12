@@ -1093,6 +1093,17 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             let _ = writeln!(output, "  - {}: {} — {}", unmet.reason, unmet.subject, unmet.detail);
         }
     }
+    if !explanation.settlement.discharged.is_empty() {
+        output.push_str("\nDischarged unread (no vessel left to read them):\n");
+        for discharge in &explanation.settlement.discharged {
+            let unmet = &discharge.expectation;
+            let _ = writeln!(output, "  - {}: {} — {}", unmet.reason, unmet.subject, unmet.detail);
+            for vessel in &discharge.ended_vessels {
+                let reason = vessel.reason.as_deref().map(|reason| format!(" ({reason})")).unwrap_or_default();
+                let _ = writeln!(output, "      {} {}{} at {}", vessel.launch, vessel.reading, reason, vessel.ended_at);
+            }
+        }
+    }
 
     if !explanation.unclaimed_work.is_empty() {
         output.push_str("\nCrew work needing a settlement claim:\n");

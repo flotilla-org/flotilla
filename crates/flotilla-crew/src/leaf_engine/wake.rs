@@ -763,11 +763,21 @@ impl ReconcilerWake {
             } else {
                 #[cfg(test)]
                 views.settlement_evaluations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The launch's vessel records, whose ends discharge an unread checkout.
+                let launch_vessels = if status.engine_launch.is_some() {
+                    let (reads, name) = (Arc::clone(&self.subscriptions.inner.lifecycle_reads), convoy.metadata.name.clone());
+                    tokio::task::spawn_blocking(move || reads.vessels()?.of_convoy(&name))
+                        .await
+                        .map_err(|error| format!("vessel readings: {error}"))??
+                } else {
+                    Vec::new()
+                };
                 // Use the same evaluator as the controller. Reuse the child
                 // selections above without cloning their resource bodies again.
                 let settlement = flotilla_resources::evaluate_landing_settlement(
                     convoy,
                     &checkouts,
+                    &launch_vessels,
                     &observed_change_requests,
                     &forges,
                     self.subscriptions.change_request_stale_after(),

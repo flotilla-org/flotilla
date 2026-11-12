@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use flotilla_protocol::{
-    commands::{ExplainedSubjectFact, ExplainedSubjectObservation},
+    commands::{ExplainedDischarge, ExplainedEndedVessel, ExplainedSubjectFact, ExplainedSubjectObservation},
     result_set::ConvoySubjectRow,
     CanonicalHostId, CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, EvidenceFreshness, ExplainedDecisionLedger,
-    ExplainedSettlement, ExplainedUnclaimedWork, FulfilmentAllocation, HostName, HostSnapshot, HostSummary, IssueSource, NodeId, NodeInfo,
-    PeerConnectionState, PlacementDecision, PlacementTargetHost, Relationship, StreamKey, Subject, SubjectKind, TopologyResponse,
-    TopologyRoute,
+    ExplainedSettlement, ExplainedUnclaimedWork, ExplainedUnmetExpectation, FulfilmentAllocation, HostName, HostSnapshot, HostSummary,
+    IssueSource, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementTargetHost, Relationship, StreamKey, Subject,
+    SubjectKind, TopologyResponse, TopologyRoute,
 };
 
 use super::{event_stream_seq, format_command_result, format_convoy_explanation_human, format_event_human, format_topology_dot};
@@ -283,7 +283,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 superseded: false,
             },
         ],
-        settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
+        settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new(), discharged: Vec::new() },
         account_bindings: Vec::new(),
         access_deliveries: Vec::new(),
     };
@@ -542,12 +542,33 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         unclaimed_work: Vec::new(),
         decision_ledgers: Vec::new(),
         artifacts: Vec::new(),
-        settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
+        settlement: ExplainedSettlement {
+            mode: "world_terminal".into(),
+            satisfied: true,
+            unmet: Vec::new(),
+            discharged: vec![ExplainedDischarge {
+                expectation: ExplainedUnmetExpectation {
+                    reason: "missing_status".into(),
+                    subject: "checkout/checkout-dead".into(),
+                    detail: "no inspection of the checkout has been read".into(),
+                },
+                ended_vessels: vec![ExplainedEndedVessel {
+                    launch: "triage-label-work#1".into(),
+                    reading: "Released".into(),
+                    reason: Some("released".into()),
+                    ended_at: "2026-11-12T00:00:00+00:00".into(),
+                }],
+            }],
+        },
         account_bindings: Vec::new(),
         access_deliveries: Vec::new(),
     };
 
     let output = format_convoy_explanation_human(&explanation);
+    // An unread checkout dropped rather than met is named with the vessel whose end dropped it.
+    assert!(output.contains("Discharged unread (no vessel left to read them):"), "{output}");
+    assert!(output.contains("  - missing_status: checkout/checkout-dead — no inspection of the checkout has been read"), "{output}");
+    assert!(output.contains("      triage-label-work#1 Released (released) at 2026-11-12T00:00:00+00:00"), "{output}");
     // Glue: both human surfaces print the admission diagnostic verbatim.
     assert!(output.contains(&format!("Warning: {}", explanation.warnings[0])));
     let started = super::format_command_result(&flotilla_protocol::CommandValue::ConvoyStarted {

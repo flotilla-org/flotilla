@@ -385,6 +385,23 @@ impl ConvoyReconciler {
         Ok(flotilla_resources::checkout_records::latest_launches(held))
     }
 
+    /// Every vessel launch of `obj`'s works, at any home, ended or not; none for a convoy the
+    /// engine has not launched.
+    async fn launch_vessels(
+        &self,
+        obj: &ResourceObject<Convoy>,
+    ) -> Result<Vec<flotilla_resources::vessel_records::VesselRecord>, ResourceError> {
+        if obj.status.as_ref().is_none_or(|status| status.engine_launch.is_none()) {
+            return Ok(Vec::new());
+        }
+        let reads = Arc::clone(&self.lifecycle_reads);
+        let convoy = obj.metadata.name.clone();
+        tokio::task::spawn_blocking(move || reads.vessels()?.of_convoy(&convoy))
+            .await
+            .map_err(|error| ResourceError::other(format!("read the convoy's vessels: {error}")))?
+            .map_err(ResourceError::other)
+    }
+
     /// Notes and traces each repository of `obj` whose change request landed on a target other
     /// than the one it declared, as its checkout's landing evidence shows. Nothing decides on it:
     /// it explains the convoy until its notes are dropped, and the trace keeps it.
@@ -776,10 +793,12 @@ impl Reconciler for ConvoyReconciler {
         }
 
         let mut pass = ConvoyPass::default();
+        let launch_vessels = if is_landing { self.launch_vessels(obj).await? } else { Vec::new() };
         let settlement = is_landing.then(|| {
             evaluate_landing_settlement_with_disposition(
                 obj,
                 &checkouts,
+                &launch_vessels,
                 &change_requests,
                 &forges,
                 self.change_request_stale_after,

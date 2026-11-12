@@ -397,6 +397,24 @@ pub struct ExplainedUnmetExpectation {
     pub detail: String,
 }
 
+/// An unread checkout expectation settlement dropped rather than met, and the ended vessels that
+/// let it: no vessel left could read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedDischarge {
+    pub expectation: ExplainedUnmetExpectation,
+    pub ended_vessels: Vec<ExplainedEndedVessel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedEndedVessel {
+    pub launch: String,
+    pub reading: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// RFC 3339.
+    pub ended_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainedUnclaimedWork {
     pub vessel: String,
@@ -412,6 +430,8 @@ pub struct ExplainedSettlement {
     pub satisfied: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmet: Vec<ExplainedUnmetExpectation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discharged: Vec<ExplainedDischarge>,
 }
 
 /// Provenance of the admitted convoy name only. Branch generation is independent.
