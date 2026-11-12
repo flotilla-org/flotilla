@@ -147,12 +147,7 @@ async fn remote_change_request_scenario(late_watcher: bool) {
         )
         .await
         .expect("owner heartbeat");
-    let mesh = spawn_in_memory_request_mesh_with_replication_kinds(
-        vec![owner.clone(), requester.clone()],
-        Some(&[Project::API_PATHS.kind, Host::API_PATHS.kind, Convoy::API_PATHS.kind, ChangeRequest::API_PATHS.kind]),
-    )
-    .await
-    .unwrap();
+    let mesh = spawn_in_memory_request_mesh(vec![owner.clone(), requester.clone()]).await.unwrap();
     eventually(Duration::from_secs(5), Duration::from_millis(10), "source owner replicated", || async {
         flotilla_observation::forge_observation::source_owner(&requester.resource_backend(), "flotilla", &source).await
             == Ok(Some(owner.node_id().clone()))

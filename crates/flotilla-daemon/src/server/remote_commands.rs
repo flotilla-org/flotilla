@@ -344,16 +344,6 @@ impl RemoteCommandRouter {
         self.dispatch_execute_for_caller(command, None).await
     }
 
-    pub(super) async fn dispatch_execute_for_principal(
-        &self,
-        command: Command,
-        dispatching_principal_ref: Option<flotilla_protocol::PrincipalRef>,
-    ) -> Result<u64, String> {
-        let caller =
-            dispatching_principal_ref.map(|principal_ref| flotilla_protocol::CommandCaller { principal_ref, process: None, crew: None });
-        self.dispatch_execute_for_caller(command, caller).await
-    }
-
     #[tracing::instrument(skip_all)]
     async fn dispatch_remote_command(
         &self,
@@ -596,10 +586,6 @@ impl RemoteCommandRouter {
             self.peer_manager.lock().await.project_host_list(response);
         }
         Ok(value)
-    }
-
-    pub(super) async fn dispatch_cancel(&self, command_id: u64) -> Result<(), String> {
-        self.dispatch_cancel_typed(command_id).await.map_err(|error| error.message)
     }
 
     #[tracing::instrument(skip_all)]

@@ -2766,18 +2766,6 @@ impl InProcessDaemon {
         self.fleet.report_change_stream(peer, update);
     }
 
-    pub async fn begin_peer_resource_replication(&self, peer: &NodeId) {
-        self.fleet.begin_peer_resource_replication(peer).await;
-    }
-
-    pub async fn report_resource_replication_failure(&self, peer: &NodeId, kind: &str, message: &str) {
-        self.fleet.report_resource_replication_failure(peer, kind, message).await;
-    }
-
-    pub async fn report_resource_replication_healthy(&self, peer: &NodeId, kind: &str) {
-        self.fleet.report_resource_replication_healthy(peer, kind).await;
-    }
-
     /// Legacy presentation fixtures; production descriptions come from Host status.
     pub async fn publish_peer_summary(&self, summary: HostSummary) {
         self.host_registry

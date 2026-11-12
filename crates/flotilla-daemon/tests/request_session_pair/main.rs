@@ -23,13 +23,11 @@ use flotilla_daemon_testkit::engine::{admit_convoy, current_launch, engine, run_
 use flotilla_daemon_testkit::server::apply_convoy_replica_feed;
 use flotilla_daemon_testkit::server::seed_trusted_remote_convoy_project;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_mesh;
-use flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_replication_kinds;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_caller;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_caller_and_blob_store;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_surface;
-use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_with_replication_kinds;
 use flotilla_daemon_testkit::server::InMemoryRequestMesh;
 use flotilla_daemon_testkit::server::InMemoryRequestTopology;
 use flotilla_discovery_api::EnvironmentBag;
@@ -424,17 +422,12 @@ async fn wait_for_host_resource_visibility(hosts: &[Arc<InProcessDaemon>], name:
     .await;
 }
 
-// Placement scenarios author Host capacity, a FulfilmentKind, the admitted Convoy, and a sample
-// record they delete through the router. Replicating only those keeps each rebuilt generated mesh
-// off unrelated watch fanout.
-const PLACEMENT_KINDS: &[&str] = &[Host::API_PATHS.kind, FulfilmentKind::API_PATHS.kind, Convoy::API_PATHS.kind, Sample::API_PATHS.kind];
-
 async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<String> {
     let hosts = vec![empty_daemon_named("pair-a").await, empty_daemon_named("pair-b").await, empty_daemon_named("pair-c").await];
     let home = Arc::clone(&hosts[home_index]);
     seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
     home.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
-    let mesh = spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(PLACEMENT_KINDS)).await.expect("paired world mesh");
+    let mesh = spawn_in_memory_request_mesh(hosts).await.expect("paired world mesh");
     let host_id = home.local_host_id().expect("home id").to_string();
     let policy_name = format!("host-direct-{host_id}");
     home.resource_backend()
@@ -673,9 +666,7 @@ fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
 }
 
 async fn spawn_tombstone_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
-    // This scenario authors only sample records. Keep their real routed origin and
-    // relay watches, without unrelated resource-watch fanout on every restart.
-    spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(&[Sample::API_PATHS.kind])).await
+    spawn_in_memory_request_mesh(hosts).await
 }
 
 #[hegel::test]
@@ -793,9 +784,7 @@ fn generated_session_lookup_covers_remote_home_for_local_only_fault_model() {
                     empty_daemon_named("session-b").await,
                     empty_daemon_named("session-c").await,
                 ];
-                let mesh = spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(&[TerminalSession::API_PATHS.kind]))
-                    .await
-                    .expect("request mesh");
+                let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
                 let name = "remote-session";
                 mesh.hosts[home]
                     .resource_backend()
@@ -843,7 +832,7 @@ fn generated_admission_covers_remote_placement_for_origin_first_fault_model() {
                 ];
                 let placement = Arc::clone(&hosts[placement_index]);
                 seed_host_capacity(&placement, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
-                let mesh = spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(PLACEMENT_KINDS)).await.expect("request mesh");
+                let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
                 let host_id = placement.local_host_id().expect("placement host id").to_string();
                 let policy_name = format!("host-direct-{host_id}");
                 placement
@@ -969,7 +958,7 @@ async fn codex_version_admission_row(issuer_index: usize, minor: u32) {
             .await
             .expect("agent workflow");
     }
-    let mesh = spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(PLACEMENT_KINDS)).await.expect("mesh");
+    let mesh = spawn_in_memory_request_mesh(hosts).await.expect("mesh");
     eventually(Duration::from_secs(5), Duration::from_millis(10), "Codex placement replicated", || async {
         let issuer = mesh.hosts[issuer_index].resource_backend();
         issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
@@ -1042,7 +1031,7 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
         let placement = Arc::clone(&hosts[placement_index]);
         seed_host_capacity(&placement, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
         placement.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
-        let mesh = spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(PLACEMENT_KINDS)).await.expect("request mesh");
+        let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
         let host_id = placement.local_host_id().expect("placement host identity").to_string();
         let policy_name = format!("host-direct-{host_id}");
         placement
@@ -2208,14 +2197,9 @@ impl IssueProvider for MockIssueProvider {
 async fn fleet_post_install_target_scenario(remote: bool, background_events: usize) {
     const BACKGROUND_COMMAND_ID: u64 = u64::MAX;
 
-    // Post-install reads no replicated records; Host alone keeps peer identity live.
-    let topology = spawn_in_memory_request_topology_with_replication_kinds(
-        empty_daemon_named("leader").await,
-        empty_daemon_named("follower").await,
-        &[Host::API_PATHS.kind],
-    )
-    .await
-    .expect("topology");
+    let topology = spawn_in_memory_request_topology_stateful(empty_daemon_named("leader").await, empty_daemon_named("follower").await)
+        .await
+        .expect("topology");
     let directory = tempfile::tempdir().expect("diagnostics directory");
     let command = Command::builder()
         .node_id(if remote { topology.follower.node_id().clone() } else { topology.leader.node_id().clone() })
@@ -2978,21 +2962,7 @@ async fn lagging_start_placement_scenario(explicit: bool, destination_holds_cred
         .await
         .expect("publish feta credential self-report");
 
-    // Replicate the records admission reads at either end; the rest of the fleet is unrelated.
-    let topology = spawn_in_memory_request_topology_with_replication_kinds(
-        leader,
-        follower,
-        &[
-            Host::API_PATHS.kind,
-            FulfilmentKind::API_PATHS.kind,
-            flotilla_resources::Project::API_PATHS.kind,
-            WorkflowTemplate::API_PATHS.kind,
-            CredentialSpec::API_PATHS.kind,
-            CredentialGrant::API_PATHS.kind,
-        ],
-    )
-    .await
-    .expect("spawn stateful topology");
+    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
     let placement_policy = format!("host-direct-{remote_host_id}");
     seed_target_fulfilment_kind(&topology, namespace, &placement_policy).await;
@@ -3197,15 +3167,9 @@ async fn placement_host_capacity_scenario(hold_definitions: bool) {
     follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
     // Admission runs on the placement host. Holding definition replication
     // verifies that admission needs neither definition replicated to the origin:
-    // old-store replication carries only Host and FulfilmentKind, and the engine,
-    // which replicates a home's log whole, is held from before the follower writes them.
-    let topology = if hold_definitions {
-        spawn_in_memory_request_topology_with_replication_kinds(leader, follower, &[Host::API_PATHS.kind, FulfilmentKind::API_PATHS.kind])
-            .await
-            .expect("spawn topology holding Project and WorkflowTemplate replication")
-    } else {
-        spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology")
-    };
+    // the engine, which replicates a home's log whole, is held from before the
+    // follower writes them.
+    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
     let remote_host_id = topology.follower.local_host_id().expect("follower host identity").to_string();
     let placement_policy = format!("host-direct-{remote_host_id}");
@@ -3535,15 +3499,9 @@ struct SupervisionScenario {
 
 async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     let SupervisionScenario { subscriptions, legacy_cursor, unavailable, passes, source_remote, stale_home } = scenario;
-    // The scenario writes its Convoy, session, and presence replicas by hand to
-    // model visibility lag, so the router replicates only Host identity.
-    let topology = spawn_in_memory_request_topology_with_replication_kinds(
-        empty_daemon_named("host-a").await,
-        empty_daemon_named("host-b").await,
-        &[Host::API_PATHS.kind],
-    )
-    .await
-    .expect("router topology");
+    let topology = spawn_in_memory_request_topology_stateful(empty_daemon_named("host-a").await, empty_daemon_named("host-b").await)
+        .await
+        .expect("router topology");
     let (a, b) = if source_remote { (&topology.follower, &topology.leader) } else { (&topology.leader, &topology.follower) };
     let a_holds = if source_remote { &topology.follower_stream_holds } else { &topology.leader_stream_holds };
     let b_home = b.decided_store().expect("governor home").home().to_owned();

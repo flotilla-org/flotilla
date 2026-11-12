@@ -22,7 +22,6 @@ flotilla-github-providers = { path = "../flotilla-github-providers" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
-flotilla-replication = { path = "../flotilla-replication" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }

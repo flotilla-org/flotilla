@@ -25,13 +25,6 @@ function = "refresh_convoys"
 reason = "List-then-watch subscription: the Convoy list runs only while no watch is established, then events are applied incrementally."
 
 [[allow]]
-path = "crates/flotilla-replication/src/replicator.rs"
-function = "replicate_kind_direct"
-count = 2
-reason = """Replication snapshot handoff: the origin and local lists run only when no replica cursor exists \
-(first sync or a resnapshot after the origin log cannot continue)."""
-
-[[allow]]
 path = "crates/flotilla-store/src/registry.rs"
 function = "quarantine_undecodable_stored_objects"
 reason = "Startup decode quarantine of a durable store: one list per registered kind, which is the purpose of the sweep."

@@ -867,7 +867,7 @@ impl ReadProjections<'_> {
             .load_hosts()
             .map(|hosts| hosts.hosts.into_iter().filter(|(_, host)| !host.ssh_host).collect::<HashMap<_, _>>())
             .unwrap_or_default();
-        let failures = self.fleet.replication_failures().await;
+        let failures = self.fleet.replication_failures();
         let mut replication_failures_by_host = HashMap::<HostName, Vec<ResourceReplicationFailure>>::new();
         for (peer, peer_failures) in failures {
             // Source-local snapshot alarms belong to host status, not a remote

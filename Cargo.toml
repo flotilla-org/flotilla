@@ -60,7 +60,6 @@ members = [
     "crates/flotilla-protocol-testkit",
     "crates/flotilla-relay",
     "crates/flotilla-relay-protocol",
-    "crates/flotilla-replication",
     "crates/flotilla-replay-testkit",
     "crates/flotilla-resources",
     "crates/flotilla-schema",

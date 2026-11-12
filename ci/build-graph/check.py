@@ -28,11 +28,6 @@ C_FREE_BASE = frozenset({
 RESOURCE_EXEMPTIONS = frozenset({
     "flotilla-manifest", "flotilla-tui", "flotilla",
 })
-# Composition, daemon and transport crates the replication engine must not reach.
-REPLICATION_FORBIDDEN = (
-    "flotilla-core", "flotilla-daemon", "flotilla-daemon-api", "flotilla-projections",
-    "flotilla-credentials", "flotilla-controllers", "flotilla-store-http",
-)
 # ADR 0060 step 4: capabilities read resources through the store and receive
 # higher orchestration through ports. Register each new capability here.
 CAPABILITY_CRATES = frozenset({"flotilla-executor", "flotilla-projections", "flotilla-admission", "flotilla-provisioning", "flotilla-crew"})
@@ -234,10 +229,6 @@ def violations(metadata):
         dev_core = any(d["kind"] == "dev" and d["name"] == "flotilla-core" for d in packages["flotilla-credentials"]["dependencies"])
         if reaches("flotilla-credentials", "flotilla-core") or dev_core:
             errors.append("flotilla-credentials: must not depend on flotilla-core, directly, transitively or as a dev-dependency")
-    # ADR 0060: replication syncs over dyn Store; hosts supply its ports and transports.
-    for target in REPLICATION_FORBIDDEN:
-        if "flotilla-replication" in packages and target in packages and reaches("flotilla-replication", target):
-            errors.append(f"flotilla-replication: must not depend on {target}, directly or transitively")
     def reached_from(start):
         pending, reached = list(production[start]), set()
         while pending:

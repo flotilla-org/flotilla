@@ -17,7 +17,6 @@ use flotilla_resources::{
     VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
-use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::aggregator_projection::AggregatorProjectionState;
@@ -103,7 +102,6 @@ pub struct FleetService {
     host_name: HostName,
     canonical_local_host_id: Option<CanonicalHostId>,
     change_streams: std::sync::RwLock<HashMap<NodeId, flotilla_protocol::ChangeStreamStatus>>,
-    resource_replication_failures: RwLock<HashMap<NodeId, BTreeMap<String, String>>>,
 }
 
 impl FleetService {
@@ -112,17 +110,11 @@ impl FleetService {
         host_name: HostName,
         canonical_local_host_id: Option<CanonicalHostId>,
     ) -> Self {
-        Self {
-            change_streams: Default::default(),
-            aggregator_projection_state,
-            host_name,
-            canonical_local_host_id,
-            resource_replication_failures: RwLock::new(HashMap::new()),
-        }
+        Self { change_streams: Default::default(), aggregator_projection_state, host_name, canonical_local_host_id }
     }
 
-    pub async fn replication_failures(&self) -> HashMap<NodeId, BTreeMap<String, String>> {
-        let mut failures = self.resource_replication_failures.read().await.clone();
+    pub fn replication_failures(&self) -> HashMap<NodeId, BTreeMap<String, String>> {
+        let mut failures = HashMap::<NodeId, BTreeMap<String, String>>::new();
         for (peer, state) in self.change_streams() {
             if let Some(error) = state.last_error {
                 failures.entry(peer).or_default().insert(
@@ -155,23 +147,6 @@ impl FleetService {
                 state.last_error = Some(message);
                 state.consecutive_failures = state.consecutive_failures.saturating_add(1);
             }
-        }
-    }
-
-    pub async fn begin_peer_resource_replication(&self, peer: &NodeId) {
-        self.resource_replication_failures.write().await.remove(peer);
-    }
-
-    pub async fn report_resource_replication_failure(&self, peer: &NodeId, kind: &str, message: &str) {
-        self.resource_replication_failures.write().await.entry(peer.clone()).or_default().insert(kind.to_string(), message.to_string());
-    }
-
-    pub async fn report_resource_replication_healthy(&self, peer: &NodeId, kind: &str) {
-        let mut failures = self.resource_replication_failures.write().await;
-        let Some(peer_failures) = failures.get_mut(peer) else { return };
-        peer_failures.remove(kind);
-        if peer_failures.is_empty() {
-            failures.remove(peer);
         }
     }
 

@@ -190,7 +190,6 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-schema-derive` | `Stored` generates codecs, descriptors and edge handles; `Describe` generates descriptions only. Shape attributes (`child`, `flatten`, `intern`, `code`) are separate from storage policies (#3320, ADR 0067) |
 | `flotilla-schema` | Backend-neutral `TableSet` descriptions and `Describe` traits for stored kinds and query rows, declared indexes, logical rows codec, the append-only `Records` type, the `EdgeEvent` edge event and inline CBOR documents, typed edge handles and the `Edge` builder, typed index queries (`IndexQuery`), log entries (`Event`, with named field-level `Effect`s) and write origins, timestamps, the kind-code registry and the schema review view (`render_view`); re-exports the derive |
 | `flotilla-schema-sqlite` | SQLite DDL rendering (`DdlMode`), SQL extension traits and the Rusqlite runtime for derived kinds: shared tables (`strings`, `resource_identity`, `objects`, `home_sequence`, `log`), per-kind statements, interning, owner-checked writes (creation, spec edits, `apply_edge`, delete and expunge), the per-home event log with one lowering for local writes and `apply` of other homes' events, snapshot restore, reads of entries about a master, keyset-paged index queries and the startup scan |
-| `flotilla-replication` | Store-to-store replication over `dyn Store`: list/watch/resume, origin filtering, digest scheduling; host ports for stores, identity, health and peer sources |
 | `flotilla-review-bundle-object-store` | Object-store/S3 byte adapter for the review-bundle port |
 | `rigging-tls` (external) | TLS provider selection and reqwest builders from the pinned Rigging revision |
 | `rigging-process` (external) | Command supervision, invocation macros, environment variables, filesystem/space probes, scan cache and binary/version detection |
@@ -253,9 +252,6 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-credentials/src/lib.rs` | Runtime-facing credential/material operations and agent-environment composition |
 | `crates/flotilla-messaging/src/` | Message inbox and receiver snapshots, transport delivery, conditions and charter notification routing |
 | `crates/flotilla-store/src/load_metrics.rs` | Load metrics: store queue, controller loop and replication counters and latency histograms that load drivers sample (#3206) |
-| `crates/flotilla-replication/src/replicator.rs` | Store-to-store replication engine: per-kind list/watch/resume, relay origin filtering, digest repair, peer generations |
-| `crates/flotilla-replication/src/ports.rs` | Replication host ports: local stores and node identity, health, direct and routed peer sources |
-| `crates/flotilla-daemon/src/server/replication.rs` | Daemon port implementations: `InProcessDaemon` stores/health, `HttpBackend` direct peers, routed watches over the remote command router |
 | `crates/flotilla-tui/src/app/mod.rs` | `App` struct, key/mouse dispatch, mode transitions |
 | `crates/flotilla-tui/src/app/executor.rs` | Thin executor: routes to core, interprets results into UI state |
 | `crates/flotilla-tui/src/app/key_handlers.rs` | Key handling logic per binding mode |

@@ -1,6 +1,5 @@
 use flotilla_store_http::HttpBackend;
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::{BTreeMap, HashMap},
     os::unix::fs::MetadataExt,
@@ -31,14 +30,13 @@ use flotilla_protocol::{
     RepoSelector, Request, ResourceCursor, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome,
     StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
-use flotilla_replication::replicate_kind_direct;
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, FulfilmentFacts, FulfilmentKind,
     FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
-    ResourceError, ResourceList, ResourceProvenance, Selector, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession,
+    ResourceError, ResourceProvenance, Selector, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession,
     TerminalSessionSource, TerminalSessionSpec, Vessel, WatchEvent, WatchStart,
 };
-use flotilla_store::{controller::ControllerLoop, list_resource_kind, ResourceBackend};
+use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use tokio::{
@@ -66,7 +64,6 @@ use super::remote_commands::PendingRemoteCancelMap;
 use super::remote_commands::PendingRemoteCommand;
 use super::remote_commands::PendingRemoteCommandMap;
 use super::remote_commands::RemoteCommandRouter;
-use super::replication::replication_host;
 use super::request_dispatch::RequestDispatcher;
 use super::shared::sync_peer_query_state;
 use super::shared::write_message;
@@ -90,14 +87,12 @@ use crate::testkits::server::seed_trusted_remote_convoy_project;
 
 #[tokio::test(start_paused = true)]
 async fn aborting_peer_runtime_releases_connection_and_replication_owners() {
-    use flotilla_resources::Resource;
-
     use super::{build_remote_command_router, peer_runtime::PeerRuntime};
     use crate::peer::channel_transport::channel_transport_pair_with_nodes;
     use crate::peer::PeerTransport;
 
     // Runtime teardown must release both a live connection loop and the outbound
-    // replication supervisor, even while its peer and notification sender live.
+    // change-stream task, even while its peer and notification sender live.
     let (_tmp, daemon) = empty_daemon().await;
     let manager = Arc::new(Mutex::new(crate::peer::PeerManager::new(daemon.node_id().clone())));
     let weak_manager = Arc::downgrade(&manager);
@@ -109,9 +104,8 @@ async fn aborting_peer_runtime_releases_connection_and_replication_owners() {
     manager.lock().await.add_configured_target(ConfigLabel("remote".to_string()), HostName::new("remote"), None, Box::new(local_transport));
     let router = build_remote_command_router(&daemon, &manager);
     let (inbound_tx, inbound_rx) = mpsc::channel(256);
-    let (runtime, _connected_tx) = PeerRuntime::new(Arc::clone(&daemon), Arc::clone(&manager), Some(inbound_rx), inbound_tx, router, None)
-        .with_replication_kinds(Some(&[Host::API_PATHS.kind]))
-        .spawn();
+    let (runtime, _connected_tx) =
+        PeerRuntime::new(Arc::clone(&daemon), Arc::clone(&manager), Some(inbound_rx), inbound_tx, router, None).spawn();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !daemon.get_topology().await.expect("topology").routes.iter().any(|route| route.connected) {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -304,381 +298,6 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
 
     server.abort();
     std::fs::remove_file(&socket_path).expect("remove resource HTTP socket");
-}
-
-#[tokio::test]
-async fn http_replication_resnapshots_after_quarantined_history() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let origin_path = temp.path().join("origin.sqlite");
-    let origin = ResourceBackend::new(SqliteBackend::open(&origin_path).expect("open origin store"));
-    let origin_convoys = origin.using::<Convoy>("flotilla");
-    let first = origin_convoys
-        .create(
-            &InputMeta::builder().name("superseded".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("old-workflow".to_string()).build(),
-        )
-        .await
-        .expect("create event that predates the schema change");
-    origin_convoys
-        .update(
-            &InputMeta::builder().name("superseded".to_string()).build(),
-            &first.metadata.resource_version,
-            &ConvoySpec::builder().workflow_ref("current-workflow".to_string()).build(),
-        )
-        .await
-        .expect("write a full superseding event");
-    origin_convoys
-        .create(
-            &InputMeta::builder().name("unrelated".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("healthy-workflow".to_string()).build(),
-        )
-        .await
-        .expect("write an unrelated later event");
-    drop(origin_convoys);
-    drop(origin);
-
-    let connection = rusqlite::Connection::open(&origin_path).expect("open raw origin store");
-    let body: String = connection
-        .query_row("SELECT body_json FROM resource_events WHERE event_version = 1", [], |row| row.get(0))
-        .expect("read historical event");
-    let mut body: serde_json::Value = serde_json::from_str(&body).expect("decode historical event");
-    body.pointer_mut("/spec")
-        .expect("historical event should contain a spec")
-        .as_object_mut()
-        .expect("historical spec should be an object")
-        .remove("workflow_ref");
-    connection
-        .execute(
-            "UPDATE resource_events SET body_json = ?1 WHERE event_version = 1",
-            [serde_json::to_string(&body).expect("encode old-schema event")],
-        )
-        .expect("remove a now-required field from the historical event");
-    drop(connection);
-    let origin = ResourceBackend::new(SqliteBackend::open(&origin_path).expect("reopen origin after schema upgrade"));
-
-    let holder_backend = ResourceBackend::new(InMemoryBackend::default());
-    let origin_root = NodeId::new("origin-root");
-    holder_backend
-        .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
-        .replace(&ResourceList { items: Vec::new(), resource_version: "0".to_string(), generation: None }, chrono::Utc::now())
-        .await
-        .expect("seed a pre-upgrade replica cursor");
-    let holder = InProcessDaemon::new_with_resource_backend(
-        vec![],
-        test_config_store(temp.path().join("holder")),
-        fake_discovery(false),
-        HostName::new("holder"),
-        holder_backend.clone(),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-
-    let socket_path = PathBuf::from(format!("/tmp/flotilla-event-quarantine-http-{}.sock", uuid::Uuid::new_v4()));
-    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind origin resource HTTP socket");
-    let server_backend = origin.clone();
-    let server = tokio::spawn(async move {
-        // The router keeps connections alive, so serve each one until the test ends.
-        loop {
-            let (mut stream, _) = listener.accept().await.expect("accept resource HTTP request");
-            let first_byte = tokio::io::AsyncReadExt::read_u8(&mut stream).await.expect("read HTTP preface");
-            tokio::spawn(serve_test_connection(stream, first_byte, server_backend.clone(), None));
-        }
-    });
-
-    let http = HttpBackend::from_unix_socket(&socket_path).expect("build resource HTTP client");
-    let holder_for_replication = Arc::clone(&holder);
-    let origin_for_replication = origin_root.clone();
-    let replicator = tokio::spawn(async move {
-        replicate_kind_direct::<Convoy>(ResourceBackend::new(http), &replication_host(&holder_for_replication), &origin_for_replication)
-            .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let replicas = holder_backend.including_replicas::<Convoy>("flotilla").list().await.expect("list replicated convoys");
-            let names = replicas.items.iter().map(|item| item.object.metadata.name.as_str()).collect::<Vec<_>>();
-            if names.contains(&"superseded") && names.contains(&"unrelated") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("replication should advance past the quarantined event");
-
-    let diagnostics = origin.diagnostics().await.expect("read origin diagnostics").expect("sqlite diagnostics");
-    assert_eq!(diagnostics.event_decode_quarantines.len(), 1, "resume must expose the quarantined event gap");
-
-    replicator.abort();
-    server.abort();
-    let _ = replicator.await;
-    let _ = server.await;
-    std::fs::remove_file(&socket_path).expect("remove resource HTTP socket");
-}
-
-#[tokio::test]
-async fn http_replicator_relists_after_an_origin_generation_change() {
-    let old_origin = ResourceBackend::new(InMemoryBackend::observed());
-    old_origin
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("old-generation".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create old-generation convoy");
-    let old_list = old_origin.using::<Convoy>("flotilla").list().await.expect("list old generation");
-
-    let holder_backend = ResourceBackend::new(InMemoryBackend::default());
-    let origin_root = NodeId::new("remote-root");
-    holder_backend
-        .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
-        .replace(&old_list, chrono::Utc::now())
-        .await
-        .expect("seed old-generation cursor");
-    let temp = tempfile::tempdir().expect("tempdir");
-    let holder = InProcessDaemon::new_with_resource_backend(
-        vec![],
-        test_config_store(temp.path().join("holder")),
-        fake_discovery(false),
-        HostName::new("holder"),
-        holder_backend.clone(),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-
-    let new_origin = ResourceBackend::new(InMemoryBackend::observed());
-    new_origin
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("new-generation".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create new-generation convoy");
-    let new_generation =
-        new_origin.using::<Convoy>("flotilla").list().await.expect("list new generation").generation.expect("new origin generation");
-
-    let listed = list_resource_kind(&new_origin, "flotilla", "convoys").await.expect("encode new generation list").value;
-    let listed_body = serde_json::to_vec(&listed).expect("encode new generation response");
-    let socket_path = PathBuf::from(format!("/tmp/flotilla-replicator-http-{}.sock", uuid::Uuid::new_v4()));
-    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind replicator HTTP socket");
-    let requested_targets = Arc::new(StdMutex::new(Vec::new()));
-    let server_targets = Arc::clone(&requested_targets);
-    let old_generation = old_list.generation.expect("old generation");
-    let server = tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.expect("accept replicator HTTP request");
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut buffer = [0_u8; 1024];
-                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await.expect("read replicator HTTP request");
-                assert_ne!(read, 0, "replicator HTTP request ended before its headers");
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let request = std::str::from_utf8(&request).expect("replicator HTTP request is UTF-8");
-            let target =
-                request.lines().next().and_then(|line| line.split_whitespace().nth(1)).expect("replicator HTTP request target").to_string();
-            server_targets.lock().expect("requested targets lock").push(target.clone());
-            if target.contains("watch=true") && target.contains(&format!("generation={old_generation}")) {
-                tokio::io::AsyncWriteExt::write_all(&mut stream, b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await
-                    .expect("reject expired generation");
-                continue;
-            }
-            if target.contains("watch=true") {
-                tokio::io::AsyncWriteExt::write_all(
-                    &mut stream,
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .expect("write hanging watch response");
-                std::future::pending::<()>().await;
-            }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                listed_body.len()
-            );
-            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write list response headers");
-            tokio::io::AsyncWriteExt::write_all(&mut stream, &listed_body).await.expect("write list response body");
-        }
-    });
-
-    let http = HttpBackend::from_unix_socket(&socket_path).expect("build replicator HTTP client");
-    let holder_for_replication = Arc::clone(&holder);
-    let origin_for_replication = origin_root.clone();
-    let replicator = tokio::spawn(async move {
-        replicate_kind_direct::<Convoy>(ResourceBackend::new(http), &replication_host(&holder_for_replication), &origin_for_replication)
-            .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let listed = holder_backend.including_replicas::<Convoy>("flotilla").list().await.expect("list relisted replicas");
-            if listed.items.iter().any(|item| item.object.metadata.name == "new-generation") {
-                assert!(
-                    listed.items.iter().all(|item| item.object.metadata.name != "old-generation"),
-                    "generation relist must atomically discard old rows"
-                );
-                let cursor = holder_backend
-                    .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
-                    .cursor()
-                    .await
-                    .expect("read relisted cursor")
-                    .expect("relisted cursor");
-                assert_eq!(cursor.generation.as_deref(), Some(new_generation.as_str()));
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("generation relist timeout");
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while requested_targets.lock().expect("requested targets lock").len() < 3 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("replacement watch request timeout");
-    let requested_targets = requested_targets.lock().expect("requested targets lock").clone();
-    assert_eq!(requested_targets.len(), 3);
-    assert!(requested_targets[0].contains("watch=true"), "try the proven cursor first");
-    assert!(!requested_targets[1].contains("watch=true"), "expired generation requires a snapshot");
-    assert!(requested_targets[2].contains("watch=true"));
-    assert!(
-        requested_targets[2].contains(&format!("generation={new_generation}")),
-        "the replacement watch must be scoped to the new generation: {}",
-        requested_targets[2]
-    );
-    replicator.abort();
-    server.abort();
-    let _ = replicator.await;
-    let _ = server.await;
-    std::fs::remove_file(&socket_path).expect("remove replicator HTTP socket");
-}
-
-#[tokio::test]
-async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
-    let origin = ResourceBackend::new(InMemoryBackend::observed());
-    origin
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("before-watch".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create initial convoy");
-    let initial = origin.using::<Convoy>("flotilla").list().await.expect("list initial origin");
-
-    let holder_backend = ResourceBackend::new(InMemoryBackend::default());
-    let origin_root = NodeId::new("remote-root");
-    holder_backend
-        .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
-        .replace(&initial, chrono::Utc::now())
-        .await
-        .expect("seed resumable cursor");
-    origin
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("after-watch".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create convoy after initial list");
-    let fresh_body = serde_json::to_vec(&list_resource_kind(&origin, "flotilla", "convoys").await.expect("encode fresh list").value)
-        .expect("encode fresh response");
-
-    let temp = tempfile::tempdir().expect("tempdir");
-    let holder = InProcessDaemon::new_with_resource_backend(
-        vec![],
-        test_config_store(temp.path().join("holder")),
-        fake_discovery(false),
-        HostName::new("holder"),
-        holder_backend.clone(),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-    let socket_path = PathBuf::from(format!("/tmp/flotilla-replicator-relist-{}.sock", uuid::Uuid::new_v4()));
-    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind replicator HTTP socket");
-    let requested_targets = Arc::new(StdMutex::new(Vec::new()));
-    let server_targets = Arc::clone(&requested_targets);
-    let server = tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.expect("accept replicator HTTP request");
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut buffer = [0_u8; 1024];
-                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await.expect("read replicator HTTP request");
-                assert_ne!(read, 0, "replicator HTTP request ended before its headers");
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let request = std::str::from_utf8(&request).expect("replicator HTTP request is UTF-8");
-            let target =
-                request.lines().next().and_then(|line| line.split_whitespace().nth(1)).expect("replicator HTTP request target").to_string();
-            let request_number = {
-                let mut targets = server_targets.lock().expect("requested targets lock");
-                targets.push(target.clone());
-                targets.len()
-            };
-            if target.contains("watch=true") {
-                let body = if request_number == 1 { b"not-json\n".as_slice() } else { b"".as_slice() };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write watch response headers");
-                tokio::io::AsyncWriteExt::write_all(&mut stream, body).await.expect("write watch response body");
-                if request_number > 1 {
-                    std::future::pending::<()>().await;
-                }
-                continue;
-            }
-            let body = &fresh_body;
-            let response =
-                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write list response headers");
-            tokio::io::AsyncWriteExt::write_all(&mut stream, body).await.expect("write list response body");
-        }
-    });
-
-    let http = HttpBackend::from_unix_socket(&socket_path).expect("build replicator HTTP client");
-    let holder_for_replication = Arc::clone(&holder);
-    let origin_for_replication = origin_root.clone();
-    let replicator = tokio::spawn(async move {
-        replicate_kind_direct::<Convoy>(ResourceBackend::new(http), &replication_host(&holder_for_replication), &origin_for_replication)
-            .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let listed = holder_backend.including_replicas::<Convoy>("flotilla").list().await.expect("list relisted replicas");
-            if listed.items.iter().any(|item| item.object.metadata.name == "after-watch") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("fresh relist timeout");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while requested_targets.lock().expect("requested targets lock").len() < 3 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("replacement watch request timeout");
-    let requested_targets = requested_targets.lock().expect("requested targets lock").clone();
-    assert!(requested_targets[0].contains("watch=true"), "valid prefix resumes without listing");
-    assert!(!requested_targets[1].contains("watch=true"), "a failed resumed watch triggers a fresh list");
-    assert!(requested_targets[2].contains("watch=true"));
-
-    replicator.abort();
-    server.abort();
-    let _ = replicator.await;
-    let _ = server.await;
-    std::fs::remove_file(&socket_path).expect("remove replicator HTTP socket");
 }
 
 use crate::peer::InboundPeerEnvelope;

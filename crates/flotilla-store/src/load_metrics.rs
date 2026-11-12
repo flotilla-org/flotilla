@@ -559,8 +559,6 @@ impl ControllerMetricsRegistry {
 pub struct ReplicationLoadMetrics {
     /// Rounds that installed a snapshot of a home.
     pub snapshots: Counter,
-    /// Retired with the old store's replicator; nothing counts it.
-    pub lag_resets: Counter,
     /// Rounds that failed and were retried from the committed prefix.
     pub stream_failures: Counter,
     /// Log entries rounds applied after the cursor.
@@ -571,7 +569,6 @@ impl ReplicationLoadMetrics {
     pub fn snapshot(&self) -> ReplicationLoadSnapshot {
         ReplicationLoadSnapshot {
             snapshots: self.snapshots.get(),
-            lag_resets: self.lag_resets.get(),
             stream_failures: self.stream_failures.get(),
             events_applied: self.events_applied.get(),
         }
@@ -581,7 +578,6 @@ impl ReplicationLoadMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ReplicationLoadSnapshot {
     pub snapshots: u64,
-    pub lag_resets: u64,
     pub stream_failures: u64,
     pub events_applied: u64,
 }
@@ -590,7 +586,6 @@ impl ReplicationLoadSnapshot {
     pub fn since(&self, earlier: &Self) -> Self {
         Self {
             snapshots: self.snapshots.saturating_sub(earlier.snapshots),
-            lag_resets: self.lag_resets.saturating_sub(earlier.lag_resets),
             stream_failures: self.stream_failures.saturating_sub(earlier.stream_failures),
             events_applied: self.events_applied.saturating_sub(earlier.events_applied),
         }

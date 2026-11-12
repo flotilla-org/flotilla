@@ -11,8 +11,8 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_engine_messages::MessagePrimitives;
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
-    ConvoySpec, Host, MessageExpectation, MessageReference, MessageRelation, MessageSpec, Resource, ResourceProvenance, Selector,
-    TerminalBrief, TerminalCrewContext, TerminalSessionSource, TerminalSessionSpec,
+    ConvoySpec, MessageExpectation, MessageReference, MessageRelation, MessageSpec, ResourceProvenance, Selector, TerminalBrief,
+    TerminalCrewContext, TerminalSessionSource, TerminalSessionSpec,
 };
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::{Follower, Service};
@@ -141,7 +141,6 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     });
     let mesh = flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_filter(
         vec![super::message_home_daemon("home-a").await, super::message_home_daemon("home-b").await],
-        Some(&[Host::API_PATHS.kind]),
         drop_change_streams,
     )
     .await

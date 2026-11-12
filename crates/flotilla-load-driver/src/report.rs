@@ -129,7 +129,6 @@ pub struct ControllerReport {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ReplicationReport {
     pub snapshots: u64,
-    pub lag_resets: u64,
     pub stream_failures: u64,
     pub events_per_second: f64,
     pub lag: LatencySummary,
@@ -206,7 +205,6 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
                 controllers,
                 replication: ReplicationReport {
                     snapshots: replication.snapshots,
-                    lag_resets: replication.lag_resets,
                     stream_failures: replication.stream_failures,
                     events_per_second: per_second(replication.events_applied, seconds),
                     lag: end.replication_lag.since(&start.replication_lag).summary(),
@@ -334,8 +332,8 @@ impl LoadReport {
             let _ = writeln!(out, "| Replication lag (admitted → replica) | {} |", latency(&replication.lag));
             let _ = writeln!(
                 out,
-                "| Replication | {:.1} events/s, {} snapshots, {} lag resets, {} stream failures |",
-                replication.events_per_second, replication.snapshots, replication.lag_resets, replication.stream_failures
+                "| Replication | {:.1} events/s, {} snapshots, {} stream failures |",
+                replication.events_per_second, replication.snapshots, replication.stream_failures
             );
             if let Some(bytes) = home.database_bytes {
                 let _ = writeln!(out, "| Database (with WAL) | {} |", mebibytes(bytes));

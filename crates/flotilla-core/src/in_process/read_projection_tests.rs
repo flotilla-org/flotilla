@@ -606,7 +606,10 @@ mod tests {
             .replace(&remote_hosts.list().await.expect("remote hosts"), last_sync)
             .await
             .expect("replicate host");
-        fixture.fleet.report_resource_replication_failure(&NodeId::new("remote-node"), "convoys", "connection lost").await;
+        fixture.fleet.report_change_stream(
+            &NodeId::new("remote-node"),
+            flotilla_projections::fleet::ChangeStreamUpdate::Failure { watermark: None, message: "connection lost".into() },
+        );
         let row = FleetListRow::builder()
             .convoy("example")
             .vessel("work")
@@ -620,11 +623,14 @@ mod tests {
         let response = fixture.projections().fleet_list("flotilla", vec![row], now).await.expect("fleet list");
         assert_eq!(response.replicas[0].last_sync, Some(last_sync));
         assert!(!response.replicas[0].reachable);
-        assert!(response.replicas[0].message.as_deref().is_some_and(|message| message.contains("convoys: connection lost")));
+        assert!(response.replicas[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("change-stream: ") && message.contains("connection lost")));
         assert!(matches!(
             &response.rows[0].staleness,
             FleetStaleness::Unreachable { last_sync: Some(sync), message }
-                if *sync == last_sync && message.contains("convoys: connection lost")
+                if *sync == last_sync && message.contains("change-stream: ") && message.contains("connection lost")
         ));
 
         // A local source alarm stays visible in host status, but cannot create an
@@ -651,6 +657,48 @@ mod tests {
         let summary = fixture.registry.local_host_summary().await;
         let status = fixture.projections().get_host_status(&summary.environment_id, &HashMap::new(), &summary).await.expect("local status");
         assert!(status.change_stream.unwrap().last_error.unwrap().contains("local/rs/large"));
+    }
+
+    #[tokio::test]
+    async fn host_status_shows_each_peer_homes_change_stream() {
+        use flotilla_projections::fleet::ChangeStreamUpdate;
+        let fixture = ProjectionFixture::new();
+        fixture.register_remote_host("healthy-node", "healthy", "healthy-id").await;
+        fixture.register_remote_host("failing-node", "failing", "failing-id").await;
+        fixture.fleet.report_change_stream(&NodeId::new("healthy-node"), ChangeStreamUpdate::Healthy(7));
+        fixture.fleet.report_change_stream(&NodeId::new("failing-node"), ChangeStreamUpdate::Healthy(3));
+        fixture.fleet.report_change_stream(
+            &NodeId::new("failing-node"),
+            ChangeStreamUpdate::Failure { watermark: Some(3), message: "connection lost".into() },
+        );
+        fixture.fleet.report_change_stream(
+            &NodeId::new("failing-node"),
+            ChangeStreamUpdate::Failure { watermark: None, message: "connection refused".into() },
+        );
+        let local = fixture.registry.local_host_summary().await;
+        let status = |host_id: &'static str| {
+            let projections = fixture.projections();
+            let local = local.clone();
+            async move {
+                projections
+                    .get_host_status(&EnvironmentId::host(HostId::new(host_id)), &HashMap::new(), &local)
+                    .await
+                    .expect("peer status")
+                    .change_stream
+                    .expect("peer change stream")
+            }
+        };
+
+        let healthy = status("healthy-id").await;
+        assert_eq!(healthy.watermark, 7);
+        assert_eq!(healthy.consecutive_failures, 0);
+        assert_eq!(healthy.last_error, None);
+
+        // A failing home keeps the prefix it applied and counts its failed rounds.
+        let failing = status("failing-id").await;
+        assert_eq!(failing.watermark, 3);
+        assert_eq!(failing.consecutive_failures, 2);
+        assert_eq!(failing.last_error.as_deref(), Some("connection refused"));
     }
 
     #[tokio::test]

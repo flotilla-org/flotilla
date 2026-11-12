@@ -45,8 +45,6 @@ mod overload_contract {
 #[cfg(test)]
 mod read_pressure_contract {
     use super::*;
-    use flotilla_protocol::NodeId;
-    use flotilla_replication::{replicate_kind_direct, ReplicationHealth, ReplicationHost};
     use flotilla_store::controller::{ControllerLoop, ReconcileOutcome, Reconciler};
     use std::{
         sync::{
@@ -106,35 +104,15 @@ mod read_pressure_contract {
             None
         }
     }
-    struct Health;
-    #[async_trait::async_trait]
-    impl ReplicationHealth for Health {
-        async fn begin(&self, _: &NodeId) {}
-        async fn healthy(&self, _: &NodeId, _: &str) {}
-        async fn failure(&self, _: &NodeId, _: &str, _: &str) {
-            panic!("read pressure must not restart replication");
-        }
-    }
-
     // A busy SQLite writer holds the private in-memory read connection beyond
-    // its real 2 s deadline. Both consumers stay in their original task and
-    // recover; a saved replica prefix is resumed without taking a new snapshot.
+    // its real 2 s deadline. The controller stays in its original task and
+    // recovers.
     #[tokio::test]
-    async fn busy_writer_does_not_restart_controller_or_resnapshot_replication() {
+    async fn busy_writer_does_not_restart_controller() {
         let sqlite = SqliteBackend::open_in_memory().unwrap();
         let backend = ResourceBackend::new(sqlite.clone());
-        let remote = ResourceBackend::new(SqliteBackend::open_in_memory().unwrap());
-        let records = remote.using::<Convoy>("flotilla");
         let spec = ConvoySpec::builder().workflow_ref("scratch".into()).build();
-        records.create(&InputMeta::builder().name("remote".into()).build(), &spec).await.unwrap();
         backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("local".into()).build(), &spec).await.unwrap();
-        let peer = NodeId::new("authority");
-        backend
-            .replica_writer::<Convoy>(peer.clone(), "flotilla")
-            .replace(&records.list().await.unwrap(), chrono::Utc::now())
-            .await
-            .unwrap();
-        let host = ReplicationHost::new(NodeId::new("holder"), backend.clone(), Arc::new(Health));
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let writer = sqlite.writer_for_test();
@@ -159,14 +137,8 @@ mod read_pressure_contract {
             }
             .run(),
         );
-        let replicator = tokio::spawn({
-            let host = host.clone();
-            let peer = peer.clone();
-            async move { replicate_kind_direct::<Convoy>(remote, &host, &peer).await }
-        });
         tokio::time::sleep(Duration::from_millis(2300)).await;
         assert!(!controller.is_finished(), "controller must retry its read in place");
-        assert!(!replicator.is_finished(), "replicator must retry its cursor read in place");
         release_tx.send(()).unwrap();
         blocked.await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -179,20 +151,8 @@ mod read_pressure_contract {
         })
         .await
         .unwrap();
-        records.create(&InputMeta::builder().name("after-pressure".into()).build(), &spec).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while backend.including_replicas::<Convoy>("flotilla").get("after-pressure").await.is_err() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(host.metrics().snapshot().snapshots, 0, "resume the saved prefix");
-        assert_eq!(host.metrics().snapshot().lag_resets, 0);
         assert!(!controller.is_finished());
-        assert!(!replicator.is_finished());
         controller.abort();
-        replicator.abort();
     }
     // A secondary read retry belongs to its controller. Aborting the parent
     // must drop the retry even if the backend stays permanently busy.

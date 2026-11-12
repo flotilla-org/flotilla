@@ -5,9 +5,8 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow},
-    CommandCaller, GoodbyeReason, HostName, NodeId, NodeInfo, PeerWireMessage, ResourceRef, SurfaceDeclaration,
+    CommandCaller, GoodbyeReason, HostName, NodeInfo, PeerWireMessage, ResourceRef, SurfaceDeclaration,
 };
-use flotilla_replication::{DigestControl, DigestScheduler};
 use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
@@ -94,7 +93,6 @@ impl Drop for InMemoryRequestTopology {
 /// The clients exercise the same request dispatcher and remote router as a
 /// socket client, while tests may inspect each host's authoritative store.
 pub struct InMemoryRequestMesh {
-    pub digest_driver: Option<DigestDriver>,
     pub hosts: Vec<Arc<InProcessDaemon>>,
     pub clients: Vec<Arc<SocketDaemon>>,
     pub shutdown_txs: Vec<watch::Sender<bool>>,
@@ -109,85 +107,17 @@ impl Drop for InMemoryRequestMesh {
     }
 }
 
-type DigestControls = HashMap<(NodeId, NodeId, String), Arc<DrivenDigest>>;
-
-struct DrivenDigest {
-    sender: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<Result<bool, String>>>,
-    control: Arc<DigestControl>,
-}
-
-/// Explicit digest rounds for routed test sessions. Production keeps its periodic timer.
-#[derive(Clone, Default)]
-pub struct DigestDriver {
-    controls: Arc<std::sync::Mutex<DigestControls>>,
-}
-
-impl DigestDriver {
-    fn control(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Arc<DrivenDigest> {
-        self.controls
-            .lock()
-            .expect("digest controls")
-            .entry((holder.clone(), origin.clone(), kind.to_string()))
-            .or_insert_with(|| {
-                let (sender, requests) = mpsc::unbounded_channel();
-                let (ready, _) = watch::channel(false);
-                Arc::new(DrivenDigest { sender, control: Arc::new(DigestControl { requests: Mutex::new(requests), ready }) })
-            })
-            .clone()
-    }
-
-    /// Wait until the current primary watch has applied a bookmark.
-    /// Readiness resets when it restarts; later bookmarks keep it ready.
-    pub async fn watch_ready(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Result<(), String> {
-        let control = self.control(holder, origin, kind);
-        let mut ready = control.control.ready.subscribe();
-        ready.wait_for(|ready| *ready).await.map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    /// Returns after reconciliation, including persisted cursor confirmation.
-    /// Queued requests survive unrelated watch errors and run on its replacement.
-    /// `true` means repair; errors preserve the previous replica set and cursor.
-    pub async fn round(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Result<bool, String> {
-        self.watch_ready(holder, origin, kind).await?;
-        let control = self.control(holder, origin, kind);
-        let (completion, result) = tokio::sync::oneshot::channel();
-        control.sender.send(completion).map_err(|error| error.to_string())?;
-        result.await.map_err(|error| error.to_string())?
-    }
-}
-
 pub async fn spawn_in_memory_request_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
-    spawn_in_memory_request_mesh_with_replication_kinds(hosts, None).await
-}
-
-/// Exercise the production router and replicators for the kinds a scenario authors.
-/// `None` preserves full-fleet replication; a selected set avoids starting unrelated
-/// watch commands on every connection in generated, repeatedly rebuilt meshes.
-pub async fn spawn_in_memory_request_mesh_with_replication_kinds(
-    hosts: Vec<Arc<InProcessDaemon>>,
-    replication_kinds: Option<&'static [&'static str]>,
-) -> Result<InMemoryRequestMesh, String> {
-    spawn_in_memory_request_mesh_with_filter(hosts, replication_kinds, Arc::new(Some)).await
+    spawn_in_memory_request_mesh_with_filter(hosts, Arc::new(Some)).await
 }
 
 /// A network-boundary fault injector for replication scenarios. Returning None
-/// drops one envelope; changing a request can simulate a failed authoritative list.
+/// drops one envelope; changing a request can simulate a failed stream round.
 pub async fn spawn_in_memory_request_mesh_with_filter(
     hosts: Vec<Arc<InProcessDaemon>>,
-    replication_kinds: Option<&'static [&'static str]>,
     filter: EnvelopeFilter,
 ) -> Result<InMemoryRequestMesh, String> {
-    spawn_request_mesh(hosts, replication_kinds, filter, None).await
-}
-
-/// Like the filtered mesh, with explicit digest rounds replacing test-only timers.
-pub async fn spawn_in_memory_request_mesh_with_digest_driver(
-    hosts: Vec<Arc<InProcessDaemon>>,
-    replication_kinds: Option<&'static [&'static str]>,
-    filter: EnvelopeFilter,
-) -> Result<InMemoryRequestMesh, String> {
-    spawn_request_mesh(hosts, replication_kinds, filter, Some(DigestDriver::default())).await
+    spawn_request_mesh(hosts, filter).await
 }
 
 /// A full mesh whose hosts record replication into the given metrics, one per
@@ -199,42 +129,25 @@ pub async fn spawn_in_memory_request_mesh_with_replication_metrics(
     if replication_metrics.len() != hosts.len() {
         return Err("replication metrics must name one entry per host".into());
     }
-    spawn_request_mesh_with_metrics(hosts, None, Arc::new(Some), None, replication_metrics).await
+    spawn_request_graph(hosts, Arc::new(Some), replication_metrics, |_, _| true).await
 }
 
 /// Hosts linked in a line, each only to the next: the first and last are not directly connected,
 /// so what crosses between them is passed on by the hosts between.
 pub async fn spawn_in_memory_request_line(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
     let replication_metrics = hosts.iter().map(|_| Arc::default()).collect();
-    spawn_request_graph(hosts, None, Arc::new(Some), None, replication_metrics, |left, right| right == left + 1).await
+    spawn_request_graph(hosts, Arc::new(Some), replication_metrics, |left, right| right == left + 1).await
 }
 
-async fn spawn_request_mesh(
-    hosts: Vec<Arc<InProcessDaemon>>,
-    replication_kinds: Option<&'static [&'static str]>,
-    filter: EnvelopeFilter,
-    digest_driver: Option<DigestDriver>,
-) -> Result<InMemoryRequestMesh, String> {
+async fn spawn_request_mesh(hosts: Vec<Arc<InProcessDaemon>>, filter: EnvelopeFilter) -> Result<InMemoryRequestMesh, String> {
     let replication_metrics = hosts.iter().map(|_| Arc::default()).collect();
-    spawn_request_mesh_with_metrics(hosts, replication_kinds, filter, digest_driver, replication_metrics).await
-}
-
-async fn spawn_request_mesh_with_metrics(
-    hosts: Vec<Arc<InProcessDaemon>>,
-    replication_kinds: Option<&'static [&'static str]>,
-    filter: EnvelopeFilter,
-    digest_driver: Option<DigestDriver>,
-    replication_metrics: Vec<Arc<flotilla_store::load_metrics::ReplicationLoadMetrics>>,
-) -> Result<InMemoryRequestMesh, String> {
-    spawn_request_graph(hosts, replication_kinds, filter, digest_driver, replication_metrics, |_, _| true).await
+    spawn_request_graph(hosts, filter, replication_metrics, |_, _| true).await
 }
 
 /// Hosts linked wherever `linked(left, right)` holds, for `left < right`.
 async fn spawn_request_graph(
     hosts: Vec<Arc<InProcessDaemon>>,
-    replication_kinds: Option<&'static [&'static str]>,
     filter: EnvelopeFilter,
-    digest_driver: Option<DigestDriver>,
     replication_metrics: Vec<Arc<flotilla_store::load_metrics::ReplicationLoadMetrics>>,
     linked: fn(usize, usize) -> bool,
 ) -> Result<InMemoryRequestMesh, String> {
@@ -287,8 +200,6 @@ async fn spawn_request_graph(
             router.clone(),
             None,
         )
-        .with_replication_kinds(replication_kinds)
-        .with_digest_driver(digest_driver.clone().map(|driver| Arc::new(driver) as Arc<dyn DigestScheduler>))
         .with_replication_metrics(replication_metrics)
         .spawn();
         tasks.push(runtime);
@@ -340,7 +251,7 @@ async fn spawn_request_graph(
     .await
     .map_err(|_| "timed out waiting for in-memory request mesh to connect".to_string())??;
 
-    Ok(InMemoryRequestMesh { digest_driver, hosts, clients, shutdown_txs, _tasks: tasks })
+    Ok(InMemoryRequestMesh { hosts, clients, shutdown_txs, _tasks: tasks })
 }
 
 pub async fn spawn_in_memory_request_topology(
@@ -356,17 +267,7 @@ pub async fn spawn_in_memory_request_topology_stateful(
     leader: Arc<InProcessDaemon>,
     follower: Arc<InProcessDaemon>,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None, None, None).await
-}
-
-/// Stateful pair with replication limited to the kinds authored by a scenario.
-/// Use an explicit set to hold unrelated declarations off the placement host.
-pub async fn spawn_in_memory_request_topology_with_replication_kinds(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
-    replication_kinds: &'static [&'static str],
-) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None, None, Some(replication_kinds)).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None, None).await
 }
 
 /// Stateful in-memory topology whose client declares an explicit attention
@@ -376,7 +277,7 @@ pub async fn spawn_in_memory_request_topology_stateful_with_surface(
     follower: Arc<InProcessDaemon>,
     surface: SurfaceDeclaration,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), None, None, None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), None, None).await
 }
 
 pub async fn spawn_in_memory_request_topology_stateful_with_caller(
@@ -385,7 +286,7 @@ pub async fn spawn_in_memory_request_topology_stateful_with_caller(
     surface: SurfaceDeclaration,
     caller: CommandCaller,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), None, None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), None).await
 }
 
 pub async fn spawn_in_memory_request_topology_stateful_with_caller_and_blob_store(
@@ -395,7 +296,7 @@ pub async fn spawn_in_memory_request_topology_stateful_with_caller_and_blob_stor
     caller: CommandCaller,
     blob_store: Arc<TieredBlobStore>,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), Some(blob_store), None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), Some(blob_store)).await
 }
 
 async fn spawn_in_memory_request_topology_stateful_with_options(
@@ -404,7 +305,6 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
     surface: Option<SurfaceDeclaration>,
     caller: Option<CommandCaller>,
     blob_store: Option<Arc<TieredBlobStore>>,
-    replication_kinds: Option<&'static [&'static str]>,
 ) -> Result<InMemoryRequestTopology, String> {
     let leader_host = leader.host_name().clone();
     let follower_host = follower.host_name().clone();
@@ -449,7 +349,6 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
             leader_remote_router.clone(),
             None,
         )
-        .with_replication_kinds(replication_kinds)
         .with_stream_holds(leader_stream_holds.clone())
         .spawn();
     let (follower_runtime_handle, _follower_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
@@ -461,7 +360,6 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
             follower_remote_router,
             None,
         )
-        .with_replication_kinds(replication_kinds)
         .with_stream_holds(follower_stream_holds.clone())
         .spawn();
 
@@ -588,12 +486,6 @@ impl PeerTransport for FilteredTransport {
     }
 }
 
-impl DigestScheduler for DigestDriver {
-    fn control(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Arc<DigestControl> {
-        self.control(holder, origin, kind).control.clone()
-    }
-}
-
 /// Spawn the peer networking runtime with pre-built components.
 ///
 /// Test-only entry point: callers provide a PeerManager with pre-configured
@@ -616,6 +508,5 @@ pub fn spawn_test_peer_networking(
         remote_command_router,
         None,
     )
-    .with_replication_kinds(None)
     .spawn()
 }

@@ -2530,7 +2530,6 @@ dependencies = [
  "flotilla-provisioning-testkit",
  "flotilla-relay-protocol",
  "flotilla-replay-testkit",
- "flotilla-replication",
  "flotilla-resources",
  "flotilla-review-bundle-object-store",
  "flotilla-schema",
@@ -2625,7 +2624,6 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-provider-runtime",
  "flotilla-provisioning-testkit",
- "flotilla-replication",
  "flotilla-resources",
  "flotilla-schema-sqlite",
  "flotilla-store",
@@ -3713,30 +3711,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flotilla-replication"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "flotilla-build-features",
- "flotilla-build-features-async",
- "flotilla-build-features-base",
- "flotilla-build-features-hmac",
- "flotilla-build-features-os",
- "flotilla-build-features-tracing",
- "flotilla-build-features-types",
- "flotilla-protocol",
- "flotilla-resources",
- "flotilla-store",
- "flotilla-store-memory",
- "futures",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "flotilla-resources"
 version = "0.1.0"
 dependencies = [
@@ -3999,7 +3973,6 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-protocol",
  "flotilla-relay-protocol",
- "flotilla-replication",
  "flotilla-resources",
  "flotilla-store",
  "flotilla-store-testkit",

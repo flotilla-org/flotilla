@@ -9,7 +9,6 @@ mod http;
 mod peer_connection;
 pub mod peer_runtime;
 pub mod remote_commands;
-mod replication;
 mod request_dispatch;
 mod shared;
 mod tables;
@@ -181,13 +180,13 @@ pub(crate) struct PeerConnectedNotice {
 
 /// Lifecycle event sent from connection sites to the outbound task.
 ///
-/// `Connected` drives outbound state sync and starts resource replicators
-/// for the peer's generation. `Disconnected` is sent only from a
+/// `Connected` drives outbound state sync and starts following the peer's
+/// change stream for its generation. `Disconnected` is sent only from a
 /// connection-owning task that has no retry loop of its own (inbound
 /// `PeerConnection::run`, or the outbound per-target task's terminal
 /// shutdown branch) — never from a transient, still-retrying disconnect —
-/// so the outbound task can cancel and drop that peer's resource
-/// replicators. The generation is checked against the currently tracked
+/// so the outbound task can cancel and drop that peer's change-stream
+/// follower. The generation is checked against the currently tracked
 /// generation before acting, so a stale/displaced connection's belated
 /// teardown can't cancel a newer, already-reconnected generation.
 #[visibility::make(pub)]
