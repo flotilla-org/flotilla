@@ -87,7 +87,7 @@ impl VesselRecord {
 
     /// The crew agents of `requirement` wanted running (`active`, by crew index) whose session
     /// stopped, by role, each with the session: its newest launch among `terminals` (every launch
-    /// of each session held for this launch) exited, was lost by its pool or was released, or is
+    /// of each session held for this launch) exited, failed, was lost by its pool or was released, or is
     /// relaunching. While this launch is ready, any one interrupts it until the next session runs.
     pub fn interrupted_roles(
         &self,
@@ -102,7 +102,8 @@ impl VesselRecord {
                 continue;
             }
             let Some(terminal) = newest.iter().find(|terminal| terminal.role == member.role) else { continue };
-            let stopped = matches!(terminal.reading, LifecycleReading::Lost { .. } | LifecycleReading::Released);
+            let stopped =
+                matches!(terminal.reading, LifecycleReading::Lost { .. } | LifecycleReading::Failed { .. } | LifecycleReading::Released);
             let relaunching = !matches!(terminal.reading, LifecycleReading::Ready { .. })
                 && terminals.iter().any(|earlier| {
                     earlier.home == terminal.home && earlier.session_name() == terminal.session_name() && earlier.name != terminal.name

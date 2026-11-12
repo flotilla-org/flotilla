@@ -1359,15 +1359,7 @@ fn convoy_controller(
     let mut secondaries = ConvoyReconciler::secondary_watches(backend, "flotilla", home.path());
     secondaries.push(table.reconciler_wake_watch());
     secondaries.push(Box::new(crate::convoy::EngineConvoyWake { engine: home.path() }));
-    tokio::spawn(
-        ControllerLoop {
-            primary: backend.using::<Convoy>("flotilla"),
-            secondaries,
-            reconciler,
-            backend: backend.clone(),
-        }
-        .run(),
-    )
+    tokio::spawn(ControllerLoop { primary: backend.using::<Convoy>("flotilla"), secondaries, reconciler, backend: backend.clone() }.run())
 }
 
 /// The coder of launch `launch` submits the decision ledger it owes, at `reference`, at `at`.
