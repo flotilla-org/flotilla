@@ -153,7 +153,7 @@ pub fn note<P: crate::StatusPatch<super::ConvoyStatus> + ?Sized>(
     convoy: &ResourceObject<Convoy>,
     patch: &P,
 ) -> Result<ResourceObject<Convoy>, String> {
-    let engine = path.get().ok_or("convoys are not served without the engine")?;
+    let engine = path.get().ok_or(NO_ENGINE)?;
     if !engine.holds(convoy) {
         return Err(format!("convoy `{}` is not held at this home; its notes are its home's", convoy.metadata.name));
     }
@@ -171,7 +171,7 @@ pub fn note<P: crate::StatusPatch<super::ConvoyStatus> + ?Sized>(
 /// Sets this home's notes on convoy `name` to those `status` holds: a view read before a write
 /// that failed to finish, put back, or one a writer changed whole.
 pub fn set_notes(path: &EngineConvoyPath, name: &str, status: &super::ConvoyStatus) -> Result<(), String> {
-    let engine = path.get().ok_or("convoys are not served without the engine")?;
+    let engine = path.get().ok_or(NO_ENGINE)?;
     engine.memory().update(name, |notes| notes.read_from(status));
     Ok(())
 }
@@ -179,9 +179,11 @@ pub fn set_notes(path: &EngineConvoyPath, name: &str, status: &super::ConvoyStat
 /// The old status's promises: by vessel, then role.
 pub type OldPromises = BTreeMap<String, BTreeMap<String, Vec<super::promises::Promise>>>;
 
-/// The composition root's slot for [`EngineConvoys`]: set once, at startup,
-/// when `[primitives]` is on.
+/// The composition root's slot for [`EngineConvoys`]: set once, at startup.
 pub type EngineConvoyPath = Arc<OnceLock<Arc<dyn EngineConvoys>>>;
+
+/// The refusal of a convoy read or write on a path not yet installed.
+pub const NO_ENGINE: &str = "convoys are not served without the engine";
 
 /// The engine path for `convoy`, when the switch is on and the engine holds it.
 pub fn deciding<'a>(path: &'a EngineConvoyPath, convoy: &ResourceObject<Convoy>) -> Option<&'a Arc<dyn EngineConvoys>> {

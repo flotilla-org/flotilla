@@ -414,18 +414,12 @@ async fn a_change_wakes_only_the_convoys_noted_as_waiting() {
 }
 
 // Behaviour (#3732 review): each engine edit's convoy name wakes the convoy reconciler through
-// EngineConvoyWake; with the switch off, the watch has nothing to follow and stays idle.
+// EngineConvoyWake.
 #[tokio::test]
 async fn engine_changes_wake_the_convoy_reconciler() {
     use flotilla_crew::convoy::EngineConvoyWake;
     use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
     let backend = ResourceBackend::new(InMemoryBackend::default());
-
-    let (sender, mut queue) = WorkQueueSender::channel();
-    let off: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(EngineConvoyWake { engine: EngineConvoyPath::default() });
-    let idle = tokio::time::timeout(std::time::Duration::from_millis(100), off.spawn(backend.clone(), "flotilla".into(), sender)).await;
-    assert!(idle.is_err(), "switch off: the watch never completes");
-    assert!(queue.try_recv().is_err(), "nothing queued");
 
     let (feed, _) = tokio::sync::broadcast::channel(16);
     let engine = Arc::new(Recording { holds: true, ..Default::default() });

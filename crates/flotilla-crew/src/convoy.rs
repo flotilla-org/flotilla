@@ -13,7 +13,7 @@
 use chrono::{DateTime, Utc};
 use flotilla_protocol::Subject;
 use flotilla_resources::address::record_name;
-use flotilla_resources::convoy::engine::{deciding, note, Actor, EngineConvoyPath, EngineConvoys};
+use flotilla_resources::convoy::engine::{deciding, note, Actor, EngineConvoyPath, EngineConvoys, NO_ENGINE};
 use flotilla_resources::convoy::reconcile::*;
 use flotilla_resources::*;
 use flotilla_store::{
@@ -514,8 +514,7 @@ impl<W: Resource> SecondaryWatch for NoteWake<W> {
         sender: flotilla_store::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            // Without the engine no convoy is noted as waiting.
-            let Some(engine) = self.engine.get().cloned() else { return std::future::pending().await };
+            let Some(engine) = self.engine.get().cloned() else { return Err(ResourceError::other(NO_ENGINE)) };
             let mut watch = self.changes.watch().await?;
             loop {
                 match futures::StreamExt::next(&mut watch).await {
@@ -667,15 +666,9 @@ impl SecondaryWatch for EngineConvoyWake {
         sender: flotilla_store::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            // The switch is off: there is nothing to follow. With it on, the
-            // daemon installs the engine path while it starts, before any
-            // controller (and so this watch) is spawned (runtime.rs,
-            // `open_message_primitives`), so an empty path here means off.
-            let Some(engine) = self.engine.get() else {
-                // Logged, so a startup reordering that empties the path with the switch on is visible.
-                tracing::debug!("no engine convoy path: the engine convoy wake is off");
-                return std::future::pending().await;
-            };
+            // The daemon installs the engine path while it starts, before any controller (and so
+            // this watch) is spawned (runtime.rs, `open_message_primitives`).
+            let Some(engine) = self.engine.get() else { return Err(ResourceError::other(NO_ENGINE)) };
             let mut changes = engine.changes();
             loop {
                 match changes.recv().await {
