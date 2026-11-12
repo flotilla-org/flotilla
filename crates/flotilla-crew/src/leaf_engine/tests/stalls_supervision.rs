@@ -1358,7 +1358,14 @@ fn settlement_claim_arming_respects_exit_and_pending_promises(tc: hegel::TestCas
                             observe_actor(&case, &case.wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
                         }
                         assert!(case.delivery.requests.lock().unwrap().is_empty(), "no settlement nudge without an obligation");
-                        assert!(case.status().await.stalled.is_none());
+                        // A submitted PR arms a row on its change request, which stalls on the
+                        // observation here because no observer runs: that is the observer's, not
+                        // the seat's.
+                        let stalled = case.status().await.stalled;
+                        assert!(
+                            stalled.as_ref().is_none_or(|stalled| stalled.source == StallEvidenceSource::Observation),
+                            "standing={standing}, state={state:?}, count={count}, task={task}, completion={completion}, phase={phase:?}: {stalled:?}"
+                        );
                     }
                 }
             }

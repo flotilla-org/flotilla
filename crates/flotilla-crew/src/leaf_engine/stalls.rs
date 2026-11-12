@@ -1905,7 +1905,7 @@ impl ReconcilerWake {
                 continue;
             };
             let projects = &tick.inputs.projects.items;
-            let policy = match super::supervision::supervision_policy(&tick.inputs.read_backend, namespace, convoy, projects).await {
+            let policy = match super::supervision::supervision_policy(tick.inputs.routes(), convoy, projects) {
                 Ok(policy) => policy,
                 Err(error) => {
                     tracing::warn!(namespace, convoy = %name, %error, "a told stall's supervision could not be read; not noted again");
