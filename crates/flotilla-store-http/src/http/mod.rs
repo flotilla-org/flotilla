@@ -128,25 +128,6 @@ impl HttpBackend {
         Ok(crate::ResourcePosition { resource_version: list.metadata.resource_version, generation: list.metadata.generation })
     }
 
-    pub async fn digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        query: &crate::DigestQuery,
-    ) -> Result<crate::PartitionDigest, ResourceError> {
-        let url = self.namespaced_url(resource_kind.paths, namespace, None, false);
-        let parameters = match query {
-            crate::DigestQuery::Root => vec![("digest", "root".to_string())],
-            crate::DigestQuery::Children { expected_root } => vec![("digest", "children".into()), ("expectedRoot", expected_root.clone())],
-            crate::DigestQuery::Snapshot { expected_root, bucket } => {
-                vec![("digest", "snapshot".into()), ("expectedRoot", expected_root.clone()), ("bucket", bucket.to_string())]
-            }
-        };
-        let response =
-            self.http.get(url).query(&parameters).send().await.map_err(|error| ResourceError::other(format!("GET digest: {error}")))?;
-        Self::decode_response(response, None).await
-    }
-
     pub async fn query_declared(
         &self,
         kind: ResourceKind,

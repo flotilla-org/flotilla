@@ -155,27 +155,6 @@ pub(in crate::server) async fn respond(
         };
     }
     let query = parse_query(raw_query);
-    if let Some(mode) = query.get("digest") {
-        if name.is_some() {
-            return Reply::error(400, "digests require a collection");
-        }
-        let expected_root = query.get("expectedRoot").cloned().unwrap_or_default();
-        let query = match mode.as_str() {
-            "root" => flotilla_resources::DigestQuery::Root,
-            "children" if !expected_root.is_empty() => flotilla_resources::DigestQuery::Children { expected_root },
-            "snapshot" if !expected_root.is_empty() => {
-                let Some(bucket) = query.get("bucket").and_then(|value| value.parse::<u8>().ok()) else {
-                    return Reply::error(400, "invalid digest bucket");
-                };
-                flotilla_resources::DigestQuery::Snapshot { expected_root, bucket }
-            }
-            _ => return Reply::error(400, "invalid digest query"),
-        };
-        return match flotilla_store::digest_resource_kind(&backend, namespace, kind, &query).await {
-            Ok(digest) => Reply::serialized(serde_json::to_value(digest).map_err(|error| error.to_string())),
-            Err(error) => Reply::resource_error(error),
-        };
-    }
     let include_replicas = query_flag(&query, &["includeReplicas", "include-replicas", "include_replicas"]);
     let replica_sources = query_flag(&query, &["replicaSources", "replica-sources", "replica_sources"]);
     let all_provenances = query_flag(&query, &["allProvenances", "all-provenances", "all_provenances"]);

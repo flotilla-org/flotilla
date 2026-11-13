@@ -4,7 +4,6 @@ mod controller_loop;
 mod convoy_status_patch;
 mod convoy_views;
 mod decode_once;
-mod digest;
 mod forge_identity;
 mod fulfilment_kind;
 mod host_status_coalescing;
@@ -38,8 +37,6 @@ mod backend_contract;
 mod change_request_tests;
 
 mod crew_defaults_tests;
-
-mod digest_tests;
 
 mod registry_watch_tests;
 

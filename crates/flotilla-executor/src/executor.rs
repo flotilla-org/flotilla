@@ -136,7 +136,6 @@ pub async fn build_plan(
 
     match action {
         CommandAction::QueryChangeStream { .. }
-        | CommandAction::QueryResourceDigest { .. }
         | CommandAction::QueryResourceList { .. }
         | CommandAction::QueryManifestRoots { .. }
         | CommandAction::QueryResourceGet { .. }

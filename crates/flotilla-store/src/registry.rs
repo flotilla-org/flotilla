@@ -363,22 +363,6 @@ async fn current_position_typed<T: Resource>(backend: &ResourceBackend, namespac
     backend.using::<T>(namespace).current_position().await
 }
 
-pub async fn digest_resource_kind(
-    backend: &ResourceBackend,
-    namespace: &str,
-    kind: &str,
-    query: &crate::DigestQuery,
-) -> Result<crate::PartitionDigest, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, digest_typed(backend, namespace, query).await)
-}
-async fn digest_typed<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    query: &crate::DigestQuery,
-) -> Result<crate::PartitionDigest, ResourceError> {
-    backend.using::<T>(namespace).digest(query).await
-}
-
 pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
     REGISTERED_RESOURCE_KINDS
         .iter()

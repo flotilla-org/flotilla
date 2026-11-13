@@ -6,7 +6,7 @@ use crate::Store;
 #[cfg(test)]
 use crate::StoreExt;
 use crate::{convert_read, ReadObserver, ReadOperation, ResourceKind, SerializedResource};
-use crate::{watch, DigestQuery, MessageQuery, PartitionDigest, ResourcePosition};
+use crate::{watch, MessageQuery, ResourcePosition};
 use crate::{DecodedList, DecodedObject, DecodedReadObject};
 use crate::{SerializedReadWatchEvent, SerializedWatchEvent, SerializedWatchStream, WatchAction, WatchObject, WatchPayload};
 use std::{
@@ -3739,33 +3739,6 @@ impl Store for SqliteBackend {
     }
     async fn current_position_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourcePosition, ResourceError> {
         SqliteBackend::current_position_raw(self, resource_kind, namespace).await
-    }
-    async fn digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        query: &DigestQuery,
-    ) -> Result<PartitionDigest, ResourceError> {
-        SqliteBackend::digest_raw(self, resource_kind, namespace, query).await
-    }
-    async fn confirm_replica_digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        proof: &PartitionDigest,
-        previous: &ReplicaCursor,
-    ) -> Result<(), ResourceError> {
-        SqliteBackend::confirm_replica_digest_raw(self, resource_kind, origin, namespace, proof, previous).await
-    }
-    async fn replica_digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        generation: Option<String>,
-    ) -> Result<PartitionDigest, ResourceError> {
-        SqliteBackend::replica_digest_raw(self, resource_kind, origin, namespace, generation).await
     }
     async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
         let result = SqliteBackend::list_raw(self, resource_kind, namespace).await?;

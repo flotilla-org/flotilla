@@ -227,16 +227,6 @@ async fn the_resource_commands_read_messages_from_the_engine() {
         .await;
     let CommandValue::Error { message } = deleted else { panic!("a message delete is refused: {deleted:?}") };
     assert!(message.contains("flotilla message acknowledge"), "{message}");
-    // Messages reach other homes by log following, so no digest is kept of them.
-    let digest = daemon
-        .execute(CommandAction::QueryResourceDigest {
-            namespace: "flotilla".into(),
-            kind: "Message".into(),
-            query: flotilla_protocol::ResourceDigestQuery::Root,
-        })
-        .await;
-    let CommandValue::Error { message } = digest else { panic!("a message digest is refused: {digest:?}") };
-    assert!(message.contains("log following"), "{message}");
     let report = daemon.old_store_report().expect("recorded");
     let messages = report.split("stage messages:").nth(1).unwrap_or_default();
     assert!(!messages.contains("  Message "), "Message reached the old store:\n{report}");

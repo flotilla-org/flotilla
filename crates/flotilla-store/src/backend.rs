@@ -666,24 +666,6 @@ impl<T: Resource> ReplicaWriter<T> {
         self.backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at, Some(bucket)).await
     }
 
-    /// A repaired, complete hierarchy proves a log cut. Confirm it atomically
-    /// with the cached set before advancing the direct-origin prefix.
-    pub async fn confirm_digest_position(&self, proof: &crate::PartitionDigest, previous: &ReplicaCursor) -> Result<(), ResourceError> {
-        if proof.origin != self.origin_root
-            || proof.kind != T::API_PATHS.kind
-            || proof.namespace != self.namespace
-            || proof.generation != previous.generation
-        {
-            return Err(ResourceError::invalid("digest prefix identity mismatch"));
-        }
-        self.backend.confirm_replica_digest_typed::<T>(&self.origin_root, &self.namespace, proof, previous).await
-    }
-
-    pub async fn digest(&self, generation: Option<String>) -> Result<crate::PartitionDigest, ResourceError> {
-        ensure_replication_enabled::<T>()?;
-        self.backend.replica_digest_typed::<T>(&self.origin_root, &self.namespace, generation).await
-    }
-
     pub async fn apply(&self, event: crate::WatchEvent<T>, synced_at: DateTime<Utc>) -> Result<(), ResourceError> {
         ensure_replication_enabled::<T>()?;
         let (kind, object) = match event {
@@ -840,17 +822,6 @@ impl<T: Resource> TypedResolver<T> {
             return Ok(crate::ResourcePosition { resource_version: String::new(), generation: None });
         }
         dispatch_backend!(self, current_position_typed)
-    }
-
-    pub async fn digest(&self, query: &crate::DigestQuery) -> Result<crate::PartitionDigest, ResourceError> {
-        ensure_replication_enabled::<T>()?;
-        if self.backend.engine_serves(T::API_PATHS.kind) {
-            return Err(ResourceError::invalid(format!(
-                "{} is served by the engine: it reaches other homes by log following, not digests",
-                T::API_PATHS.kind
-            )));
-        }
-        dispatch_backend!(self, digest_typed, query)
     }
 
     pub async fn list(&self) -> Result<ResourceList<T>, ResourceError> {

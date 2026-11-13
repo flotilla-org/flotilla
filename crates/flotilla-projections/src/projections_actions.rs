@@ -280,13 +280,6 @@ impl ProjectionsActions<'_> {
                     Err(message) => Ok(CommandValue::Error { message }),
                 }
             }
-            CommandAction::QueryResourceDigest { namespace, kind, query } => {
-                let result = flotilla_store::digest_resource_kind(self.resource_backend, namespace, kind, query).await;
-                match result {
-                    Ok(digest) => Ok(CommandValue::ResourceDigest(Box::new(digest.into()))),
-                    Err(error) => Ok(CommandValue::Error { message: error.to_string() }),
-                }
-            }
             CommandAction::QueryResourceList { namespace, kind, include_replicas } => {
                 let listed = if *include_replicas {
                     list_resource_kind_including_replicas(self.resource_backend, namespace, kind).await

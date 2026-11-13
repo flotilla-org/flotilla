@@ -73,14 +73,6 @@ impl Store for HttpBackend {
     async fn current_position_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourcePosition, ResourceError> {
         HttpBackend::current_position_raw(self, resource_kind, namespace).await
     }
-    async fn digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        query: &DigestQuery,
-    ) -> Result<PartitionDigest, ResourceError> {
-        HttpBackend::digest_raw(self, resource_kind, namespace, query).await
-    }
     async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
         let result = HttpBackend::list_raw(self, resource_kind, namespace).await?;
         if let Some(observer) = self.read_observer() {

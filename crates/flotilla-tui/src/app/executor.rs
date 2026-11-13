@@ -219,7 +219,6 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::DaemonLogs { .. }
         | CommandValue::ProjectExplanation(_)
         | CommandValue::ConvoyExplanation(_)
-        | CommandValue::ResourceDigest(_)
         | CommandValue::ResourceRead(_)
         | CommandValue::ResourceObject(_)
         | CommandValue::ResourceDeleted(_)

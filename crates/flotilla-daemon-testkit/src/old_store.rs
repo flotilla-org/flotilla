@@ -15,8 +15,8 @@ use std::{
 
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
-    DigestQuery, FieldOwnershipViolation, InputMeta, MergeMetadata, PartitionDigest, ReadResourceList, ReadResourceObject, ReadWatchEvent,
-    ReplicaCursor, ResourceError, ResourceList, ResourceObject, ResourcePosition, ResourceStoreDiagnostics, WatchStart,
+    FieldOwnershipViolation, InputMeta, MergeMetadata, ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceError,
+    ResourceList, ResourceObject, ResourcePosition, ResourceStoreDiagnostics, WatchStart,
 };
 use flotilla_store::{
     replica::ReplicaDeletion, watch::TombstoneWrite, DecodedList, DecodedObject, DecodedQueryResult, DecodedReadObject, MessageQuery,
@@ -304,34 +304,6 @@ impl Store for OldStore {
     }
     async fn current_position_raw(&self, kind: ResourceKind, namespace: &str) -> Result<ResourcePosition, ResourceError> {
         access!(self, "current_position", kind.paths.kind, namespace.to_owned(), current_position_raw(kind, namespace))
-    }
-    async fn digest_raw(&self, kind: ResourceKind, namespace: &str, query: &DigestQuery) -> Result<PartitionDigest, ResourceError> {
-        access!(self, "digest", kind.paths.kind, namespace.to_owned(), digest_raw(kind, namespace, query))
-    }
-    async fn confirm_replica_digest_raw(
-        &self,
-        kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        proof: &PartitionDigest,
-        previous: &ReplicaCursor,
-    ) -> Result<(), ResourceError> {
-        access!(
-            self,
-            "confirm_replica_digest",
-            kind.paths.kind,
-            namespace.to_owned(),
-            confirm_replica_digest_raw(kind, origin, namespace, proof, previous)
-        )
-    }
-    async fn replica_digest_raw(
-        &self,
-        kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        generation: Option<String>,
-    ) -> Result<PartitionDigest, ResourceError> {
-        access!(self, "replica_digest", kind.paths.kind, namespace.to_owned(), replica_digest_raw(kind, origin, namespace, generation))
     }
     async fn list_raw(&self, kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
         access!(self, "list", kind.paths.kind, namespace.to_owned(), list_raw(kind, namespace))

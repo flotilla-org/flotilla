@@ -7,10 +7,10 @@ use crate::{
 use chrono::Utc;
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
-    api_version, ApiPaths, DigestQuery, FieldOwnershipViolation, InputMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject,
-    MergeMetadata, Message, PartitionDigest, ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass,
-    Resource, ResourceError, ResourceList, ResourceObject, ResourcePosition, ResourceProvenance, ResourceStoreDiagnostics,
-    ResourceTombstone, StatusPatch, WatchEvent, WatchStart, WatchStream,
+    api_version, ApiPaths, FieldOwnershipViolation, InputMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject, MergeMetadata, Message,
+    ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, Resource, ResourceError, ResourceList,
+    ResourceObject, ResourcePosition, ResourceProvenance, ResourceStoreDiagnostics, ResourceTombstone, StatusPatch, WatchEvent, WatchStart,
+    WatchStream,
 };
 use futures::StreamExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -55,7 +55,6 @@ pub struct ResourceKind {
     validate_spec_update_fn: fn(&Value, &Value) -> Result<(), ResourceError>,
     validate_status_update_fn: fn(Option<&Value>, &Value) -> Result<(), ResourceError>,
     validate_siblings_fn: ValidateSiblings,
-    digest_fn: fn(NodeId, &str, Option<String>, String, Vec<String>) -> PartitionDigest,
 }
 impl std::fmt::Debug for ResourceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,7 +116,6 @@ impl ResourceKind {
                     &siblings.iter().map(transcode).collect::<Result<Vec<_>, _>>()?,
                 )
             },
-            digest_fn: PartitionDigest::new::<T>,
         }
     }
     /// Validate a stored tree against the registered type and expose it as
@@ -188,16 +186,6 @@ impl ResourceKind {
         siblings: &[ResourceObject<SerializedResource>],
     ) -> Result<(), ResourceError> {
         (self.validate_siblings_fn)(meta, spec, siblings)
-    }
-    pub fn partition_digest(
-        self,
-        origin: NodeId,
-        namespace: &str,
-        generation: Option<String>,
-        version: String,
-        hashes: Vec<String>,
-    ) -> PartitionDigest {
-        (self.digest_fn)(origin, namespace, generation, version, hashes)
     }
     pub fn resource_list(self, list: K8sResourceList<SerializedResource>) -> Result<ResourceList<SerializedResource>, ResourceError> {
         Ok(ResourceList {
@@ -458,27 +446,6 @@ pub trait Store: std::fmt::Debug + Send + Sync {
         name: &str,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError>;
     async fn current_position_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourcePosition, ResourceError>;
-    async fn digest_raw(&self, resource_kind: ResourceKind, namespace: &str, query: &DigestQuery)
-        -> Result<PartitionDigest, ResourceError>;
-    async fn confirm_replica_digest_raw(
-        &self,
-        _resource_kind: ResourceKind,
-        _origin: &NodeId,
-        _namespace: &str,
-        _proof: &PartitionDigest,
-        _previous: &ReplicaCursor,
-    ) -> Result<(), ResourceError> {
-        Err(self.unsupported_operation("replicas"))
-    }
-    async fn replica_digest_raw(
-        &self,
-        _resource_kind: ResourceKind,
-        _origin: &NodeId,
-        _namespace: &str,
-        _generation: Option<String>,
-    ) -> Result<PartitionDigest, ResourceError> {
-        Err(self.unsupported_operation("replicas"))
-    }
     async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError>;
     async fn list_raw_matching_labels(
         &self,
@@ -796,30 +763,6 @@ pub trait StoreExt: Store {
     }
     async fn current_position_typed<T: Resource>(&self, namespace: &str) -> Result<crate::ResourcePosition, ResourceError> {
         Ok(self.current_position_raw(ResourceKind::of::<T>(), namespace).await?)
-    }
-    async fn digest_typed<T: Resource>(
-        &self,
-        namespace: &str,
-        query: &crate::DigestQuery,
-    ) -> Result<crate::PartitionDigest, ResourceError> {
-        Ok(self.digest_raw(ResourceKind::of::<T>(), namespace, query).await?)
-    }
-    async fn confirm_replica_digest_typed<T: Resource>(
-        &self,
-        origin: &NodeId,
-        namespace: &str,
-        proof: &crate::PartitionDigest,
-        previous: &ReplicaCursor,
-    ) -> Result<(), ResourceError> {
-        Ok(self.confirm_replica_digest_raw(ResourceKind::of::<T>(), origin, namespace, proof, previous).await?)
-    }
-    async fn replica_digest_typed<T: Resource>(
-        &self,
-        origin: &NodeId,
-        namespace: &str,
-        generation: Option<String>,
-    ) -> Result<crate::PartitionDigest, ResourceError> {
-        Ok(self.replica_digest_raw(ResourceKind::of::<T>(), origin, namespace, generation).await?)
     }
     async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         self.list_decoded(ResourceKind::of::<T>(), namespace).await?.into_typed()

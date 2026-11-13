@@ -53,7 +53,6 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryDaemonLogs { .. }
         | CommandAction::QueryExplainConvoy { .. }
         | CommandAction::QueryChangeStream { .. }
-        | CommandAction::QueryResourceDigest { .. }
         | CommandAction::QueryResourceList { .. }
         | CommandAction::QueryManifestRoots { .. }
         | CommandAction::QueryResourceGet { .. }

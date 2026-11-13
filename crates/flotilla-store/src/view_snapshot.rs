@@ -218,14 +218,6 @@ impl Store for ViewSnapshot {
     async fn current_position_raw(&self, _resource_kind: ResourceKind, _namespace: &str) -> Result<ResourcePosition, ResourceError> {
         Err(self.unsupported_operation("mutating or watching view snapshots"))
     }
-    async fn digest_raw(
-        &self,
-        _resource_kind: ResourceKind,
-        _namespace: &str,
-        _query: &DigestQuery,
-    ) -> Result<PartitionDigest, ResourceError> {
-        Err(self.unsupported_operation("mutating or watching view snapshots"))
-    }
     async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
         Ok(ResourceList {
             items: self

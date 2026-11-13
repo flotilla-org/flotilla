@@ -292,8 +292,8 @@ pub use commands::{
     ExplainedCheckout, ExplainedClone, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedDeliveredNeed,
     ExplainedDeliveryRetry, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedTerminalCondition,
     ExplainedUnclaimedWork, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PromiseOwner, RepoSelector, ResourceCursor,
-    ResourceDigest, ResourceDigestQuery, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance,
-    ResourceRecordType, StallProposedDisposition, StallReason, StepStatus, TurnDeliveryRung,
+    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition,
+    StallReason, StepStatus, TurnDeliveryRung,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{

@@ -2,7 +2,7 @@
 mod message_query;
 use crate::Store;
 use crate::{convert_read, ReadObserver, ReadOperation, ResourceKind, SerializedResource};
-use crate::{watch, DigestQuery, MessageQuery, PartitionDigest, ResourcePosition};
+use crate::{watch, MessageQuery, ResourcePosition};
 use crate::{DecodedList, DecodedObject, DecodedReadObject};
 use crate::{SerializedReadWatchEvent, SerializedWatchEvent, SerializedWatchStream, WatchAction, WatchObject, WatchPayload};
 use std::{
@@ -99,7 +99,6 @@ struct ResourceStore {
     queries: crate::QueryIndex,
     messages: self::message_query::MessageIndex,
     objects: HashMap<String, Value>,
-    digest: flotilla_resources::digest::DigestIndex,
     tombstones: HashMap<String, ResourceTombstone>,
     next_version: u64,
     watchers: WatchChannel<StoredEvent>,
@@ -136,8 +135,6 @@ impl ResourceStore {
         let name = event.object["metadata"]["name"].as_str().expect("encoded event name");
         self.queries.update(name, (!matches!(event.kind, StoredEventKind::Deleted)).then_some(&event.object));
         self.messages.update(name, (!matches!(event.kind, StoredEventKind::Deleted)).then_some(&event.object));
-        let version = event.version.to_string();
-        self.digest.set(name, (!matches!(event.kind, StoredEventKind::Deleted)).then_some(version.as_str()));
         let excess = self.event_log.len().saturating_add(1).saturating_sub(max_events);
         if excess > 0 {
             if let Some(last_removed) = self.event_log.get(excess - 1) {
@@ -156,7 +153,6 @@ impl Default for ResourceStore {
             queries: Default::default(),
             messages: Default::default(),
             objects: HashMap::new(),
-            digest: flotilla_resources::digest::DigestIndex::default(),
             tombstones: HashMap::new(),
             next_version: 1,
             watchers: WatchChannel::default(),
@@ -941,80 +937,6 @@ impl InMemoryBackend {
         .await
     }
 
-    pub async fn digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        query: &crate::DigestQuery,
-    ) -> Result<crate::PartitionDigest, ResourceError> {
-        self.with_store(resource_kind, namespace, |store| {
-            let mut response = resource_kind
-                .partition_digest(
-                    self.local_root(),
-                    namespace,
-                    self.generation.clone(),
-                    store.current_version().to_string(),
-                    store.digest.hashes(),
-                )
-                .select(query)?;
-            if let crate::DigestQuery::Snapshot { bucket, .. } = query {
-                let items = store
-                    .digest
-                    .names(*bucket)
-                    .map(|name| {
-                        let value = store.objects.get(name).ok_or_else(|| ResourceError::invalid("incomplete digest index"))?;
-                        Self::decode_object(resource_kind, value.clone())?;
-                        Ok(value.clone())
-                    })
-                    .collect::<Result<Vec<_>, ResourceError>>()?;
-                response.bucket = Some(*bucket);
-                response.items = Some(items);
-            }
-            Ok(response)
-        })
-        .await
-    }
-
-    pub async fn confirm_replica_digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        proof: &crate::PartitionDigest,
-        previous: &ReplicaCursor,
-    ) -> Result<(), ResourceError> {
-        let mut replicas = self.replicas.lock().await;
-        let partition = replicas
-            .partitions
-            .get_mut(&(origin.clone(), Self::store_key(resource_kind, namespace)))
-            .ok_or_else(|| ResourceError::invalid("missing replica prefix"))?;
-        let digest = resource_kind.partition_digest(
-            origin.clone(),
-            namespace,
-            previous.generation.clone(),
-            String::new(),
-            partition.digest.hashes(),
-        );
-        if digest.root != proof.root || partition.cursor.as_ref() != Some(previous) {
-            return Err(ResourceError::invalid("replica set changed during digest repair"));
-        }
-        partition.cursor = Some(ReplicaCursor { resource_version: proof.resource_version.clone(), generation: proof.generation.clone() });
-        Ok(())
-    }
-
-    pub async fn replica_digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        generation: Option<String>,
-    ) -> Result<crate::PartitionDigest, ResourceError> {
-        let replicas = self.replicas.lock().await;
-        let empty = ReplicaPartition::default();
-        let partition = replicas.partitions.get(&(origin.clone(), Self::store_key(resource_kind, namespace))).unwrap_or(&empty);
-        Ok(resource_kind.partition_digest(origin.clone(), namespace, generation, String::new(), partition.digest.hashes()))
-    }
-
     pub async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
         let (mut items, resource_version) = self.list_rows(resource_kind, namespace, None, serialized_value).await?;
         items.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
@@ -1687,33 +1609,6 @@ impl Store for InMemoryBackend {
     }
     async fn current_position_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourcePosition, ResourceError> {
         InMemoryBackend::current_position_raw(self, resource_kind, namespace).await
-    }
-    async fn digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        query: &DigestQuery,
-    ) -> Result<PartitionDigest, ResourceError> {
-        InMemoryBackend::digest_raw(self, resource_kind, namespace, query).await
-    }
-    async fn confirm_replica_digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        proof: &PartitionDigest,
-        previous: &ReplicaCursor,
-    ) -> Result<(), ResourceError> {
-        InMemoryBackend::confirm_replica_digest_raw(self, resource_kind, origin, namespace, proof, previous).await
-    }
-    async fn replica_digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        generation: Option<String>,
-    ) -> Result<PartitionDigest, ResourceError> {
-        InMemoryBackend::replica_digest_raw(self, resource_kind, origin, namespace, generation).await
     }
     async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
         InMemoryBackend::list_raw(self, resource_kind, namespace).await
