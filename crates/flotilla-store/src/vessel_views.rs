@@ -358,15 +358,7 @@ impl VesselViews {
     /// Launch `name` at this home, else at whichever home holds it.
     pub async fn find(&self, name: &str) -> Result<Option<ReadResourceObject<Vessel>>, ResourceError> {
         let name = name.to_owned();
-        let record = self
-            .blocking(move |reads| {
-                let vessels = reads.vessels()?;
-                match vessels.get(&name, None)? {
-                    Some(record) => Ok(Some(record)),
-                    None => Ok(vessels.every()?.into_iter().find(|record| record.name == name)),
-                }
-            })
-            .await?;
+        let record = self.blocking(move |reads| reads.vessels()?.find(&name)).await?;
         Ok(self.compose(record.into_iter().collect()).await?.pop())
     }
 

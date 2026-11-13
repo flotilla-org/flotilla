@@ -550,13 +550,13 @@ impl std::fmt::Debug for EngineManifestRoots {
 const ROOT_KIND: &str = "ManifestRoot";
 
 impl EngineManifestRoots {
-    /// Every home's live root as the old store's object.
-    fn objects(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+    /// Every home's live root (named `name`, when given) as the old store's object.
+    fn objects(&self, kind: &str, name: Option<&str>) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
         if kind != ROOT_KIND {
             return Err(format!("{kind} is not served by the ManifestRoot records"));
         }
         let resident = self.refresh()?;
-        live_roots(&resident, None)
+        live_roots(&resident, name)
             .into_iter()
             .map(|(home, root)| {
                 let view = self.view(&home, root);
@@ -587,14 +587,14 @@ impl flotilla_resources::engine_records::EngineRecords for EngineManifestRoots {
     }
 
     async fn get(&self, kind: &str, name: &str) -> Result<Option<flotilla_resources::engine_records::EngineObject>, String> {
-        let mut held: Vec<_> = self.objects(kind)?.into_iter().filter(|object| object.name == name).collect();
+        let mut held = self.objects(kind, Some(name))?;
         held.sort_by_key(|object| (object.home != self.home, object.home.clone()));
         Ok(held.into_iter().next())
     }
 
     async fn list(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
         let mut by_name = BTreeMap::new();
-        let mut objects = self.objects(kind)?;
+        let mut objects = self.objects(kind, None)?;
         objects.sort_by_key(|object| (object.home != self.home, object.home.clone()));
         for object in objects {
             by_name.entry(object.name.clone()).or_insert(object);
@@ -603,7 +603,11 @@ impl flotilla_resources::engine_records::EngineRecords for EngineManifestRoots {
     }
 
     async fn sources(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
-        self.objects(kind)
+        self.objects(kind, None)
+    }
+
+    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+        self.objects(kind, Some(name))
     }
 
     async fn apply(

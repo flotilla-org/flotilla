@@ -444,6 +444,14 @@ impl EngineRecords for EngineProjects {
         Ok(names.into_iter().flat_map(|name| self.objects(&resident.records, &judged, name)).filter_map(skip_unencoded).collect())
     }
 
+    /// Every home's record `name`, read from the resident map by name.
+    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        refuse_kind(kind)?;
+        let resident = self.refresh()?;
+        let judged = locked(&self.judged);
+        Ok(self.objects(&resident.records, &judged, name).into_iter().filter_map(skip_unencoded).collect())
+    }
+
     async fn apply(
         &self,
         kind: &str,

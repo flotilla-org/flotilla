@@ -193,6 +193,13 @@ pub trait VesselRecords: Send + Sync {
     fn at(&self, home: &str) -> Result<Vec<VesselRecord>, String>;
     /// Every launch at every home this store holds.
     fn every(&self) -> Result<Vec<VesselRecord>, String>;
+    /// Launch `name` at this home, else at whichever home holds it.
+    fn find(&self, name: &str) -> Result<Option<VesselRecord>, String> {
+        match self.get(name, None)? {
+            Some(record) => Ok(Some(record)),
+            None => Ok(self.every()?.into_iter().find(|record| record.name == name)),
+        }
+    }
     /// Every launch of convoy `convoy`'s works, at every home, ended or not.
     fn of_convoy(&self, convoy: &str) -> Result<Vec<VesselRecord>, String> {
         Ok(self.every()?.into_iter().filter(|record| record.convoy == convoy).collect())

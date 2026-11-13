@@ -419,3 +419,37 @@ async fn a_dropped_read_leaves_its_changes_for_the_next() {
 
     assert!(views.get("fix-it#1").await.is_err(), "the next read composes the launch the dropped one owed");
 }
+
+/// The views converted by a read of one launch by name, with `others` unrelated launches held:
+/// its copies, then another home's launch read where this home holds none.
+async fn converted_by_one_read(others: usize) -> (u64, u64) {
+    let mut launches: Vec<_> = (0..others).map(|n| launch(&format!("other-{n}#1"), HERE)).collect();
+    launches.extend([launch("wanted#1", HERE), launch("wanted#1", "home-b"), launch("remote#1", "home-b")]);
+    let reads = Arc::new(Reads {
+        convoys: Convoys::new(launches),
+        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
+        vessels: Vessels { records: Vec::new() },
+    });
+    let views = ConvoyViews::new("flotilla", reads);
+    assert_eq!(views.sources().await.expect("fill").len(), others + 3);
+
+    let before = views.views_converted();
+    let copies = views.copies("Convoy", "wanted#1").await.expect("copies");
+    assert_eq!(copies.iter().map(|copy| copy.home.as_str()).collect::<Vec<_>>(), [HERE, "home-b"]);
+    let copies_cost = views.views_converted() - before;
+
+    let before = views.views_converted();
+    let remote = EngineRecords::get(&views, "Convoy", "remote#1").await.expect("get").expect("held at home-b");
+    assert_eq!(remote.home, "home-b");
+    (copies_cost, views.views_converted() - before)
+}
+
+// Behaviour: a read of one launch by name, as a generic Convoy get reads it, converts only that
+// name's launches into objects, however many other launches are held (#3108 read-cost audit).
+#[tokio::test]
+async fn a_read_by_name_converts_only_that_launch() {
+    let small = converted_by_one_read(10).await;
+    let large = converted_by_one_read(400).await;
+    assert_eq!(small, (2, 1), "the copies convert both homes' launches; a remote get converts one");
+    assert_eq!(large, small, "the cost does not grow with the launches held");
+}

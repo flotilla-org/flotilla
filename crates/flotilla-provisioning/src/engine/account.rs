@@ -779,6 +779,26 @@ impl EngineAccounts {
             other => Err(format!("{other} is not served by the account records")),
         }
     }
+
+    /// Every home's record `name` of `kind`: only those are converted.
+    fn named(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        let resident = self.refresh()?;
+        match kind {
+            BINDING_KIND => resident
+                .bindings
+                .iter()
+                .filter(|((_, held), _)| held == name)
+                .map(|((home, _), binding)| binding_object(binding, home))
+                .collect(),
+            PROVISION_KIND => resident
+                .provisions
+                .iter()
+                .filter(|((_, held), _)| held == name)
+                .map(|(_, provision)| provision_object(provision, &resident.bindings))
+                .collect(),
+            other => Err(format!("{other} is not served by the account records")),
+        }
+    }
 }
 
 /// Resolves each name to this home's record, else the lexically first home's.
@@ -806,7 +826,11 @@ impl EngineRecords for EngineAccounts {
     }
 
     async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        Ok(resolved(self.objects(kind)?, &self.home).into_iter().find(|object| object.name == name))
+        Ok(resolved(self.named(kind, name)?, &self.home).into_iter().next())
+    }
+
+    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        self.named(kind, name)
     }
 
     async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
@@ -831,7 +855,7 @@ impl EngineRecords for EngineAccounts {
         let spec: AccountProvisionSpec = serde_json::from_value(spec).map_err(|error| format!("decode {kind} spec: {error}"))?;
         let convoy = labels.get(CONVOY_LABEL).map(String::as_str).unwrap_or_default();
         self.record_provision("", name, convoy, &spec, true).await?;
-        let written = self.objects(kind)?.into_iter().find(|object| object.name == name && object.home == self.home);
+        let written = self.named(kind, name)?.into_iter().find(|object| object.home == self.home);
         written.ok_or_else(|| format!("{kind} {name} was written but does not read back"))
     }
 

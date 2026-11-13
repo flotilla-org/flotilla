@@ -19,7 +19,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     hash::{Hash, Hasher},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, PoisonError,
+    },
 };
 
 use chrono::DateTime;
@@ -53,6 +56,8 @@ pub struct ConvoyViews {
 struct Held {
     state: tokio::sync::Mutex<Option<HeldViews>>,
     ticks: Mutex<Option<tokio::sync::broadcast::Sender<()>>>,
+    /// Views converted into the engine port's objects, the cost of its reads.
+    converted: AtomicU64,
 }
 
 struct HeldViews {
@@ -372,6 +377,24 @@ impl ConvoyViews {
 
     async fn engine_sources(&self) -> Result<Vec<EngineObject>, String> {
         let sources = self.sources().await.map_err(|error| error.to_string())?;
+        self.engine_objects(sources)
+    }
+
+    /// Every home's launch `name`, as the engine port's objects: only those are converted.
+    async fn engine_copies(&self, name: &str) -> Result<Vec<EngineObject>, String> {
+        let name = name.to_owned();
+        let copies = self
+            .with_held(move |held| {
+                held.views.iter().filter(|((_, held_name), _)| *held_name == name).map(|(_, view)| view.clone()).collect()
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        self.engine_objects(copies)
+    }
+
+    /// `sources` as the engine port's objects, each at its home.
+    fn engine_objects(&self, sources: Vec<ReadResourceObject<Convoy>>) -> Result<Vec<EngineObject>, String> {
+        self.held.converted.fetch_add(sources.len() as u64, Ordering::Relaxed);
         sources
             .into_iter()
             .map(|source| {
@@ -382,6 +405,11 @@ impl ConvoyViews {
                 engine_object(source, home)
             })
             .collect()
+    }
+
+    /// How many views the engine port has converted into objects, for read-cost tests.
+    pub fn views_converted(&self) -> u64 {
+        self.held.converted.load(Ordering::Relaxed)
     }
 }
 
@@ -424,9 +452,13 @@ impl EngineRecords for ConvoyViews {
     async fn get(&self, _kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
         let home = self.home();
         match self.find(name, None).await.map_err(|error| error.to_string())? {
-            Some(source) => engine_object(source, home).map(Some),
-            // Another home's launch of this name reads where this home holds none.
-            None => Ok(self.list(KIND).await?.into_iter().find(|object| object.name == name)),
+            Some(source) => {
+                self.held.converted.fetch_add(1, Ordering::Relaxed);
+                engine_object(source, home).map(Some)
+            }
+            // Another home's launch of this name reads where this home holds none: the lexically
+            // first home's, as a listing chooses.
+            None => Ok(self.engine_copies(name).await?.into_iter().min_by(|a, b| a.home.cmp(&b.home))),
         }
     }
 
@@ -445,6 +477,10 @@ impl EngineRecords for ConvoyViews {
 
     async fn sources(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
         self.engine_sources().await
+    }
+
+    async fn copies(&self, _kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        self.engine_copies(name).await
     }
 
     async fn apply(

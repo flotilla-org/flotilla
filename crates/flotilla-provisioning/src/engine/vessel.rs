@@ -367,6 +367,22 @@ impl VesselRecords for EngineVessels {
             .map_err(|error| format!("engine Vessel/{name}: {error}"))
     }
 
+    /// Read by name at this home, then at each other home: launch names are unique across homes.
+    fn find(&self, name: &str) -> Result<Option<VesselRecord>, String> {
+        let here = self.home().to_owned();
+        let homes = (self.homes)();
+        self.reads
+            .read(|read| {
+                for home in std::iter::once(&here).chain(homes.iter().filter(|home| **home != here)) {
+                    if let Some(view) = keyed::<VesselKind>(read, name, home)? {
+                        return record(read, view).map(Some);
+                    }
+                }
+                Ok(None)
+            })
+            .map_err(|error| format!("engine Vessel/{name}: {error}"))
+    }
+
     fn launches(&self, convoy: &str, convoy_home: &str, launch_of: &str, home: Option<&str>) -> Result<Vec<VesselRecord>, String> {
         let home = home.unwrap_or(self.home()).to_owned();
         let query = VesselSpec::by_launch(&ConvoyId::new(convoy, convoy_home), &launch_of.to_owned());

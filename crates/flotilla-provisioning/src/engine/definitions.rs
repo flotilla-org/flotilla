@@ -289,10 +289,19 @@ fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), 
 /// `kind`'s record `name` as several homes' resolve at `home`: its own, else the lexically first
 /// home's (the map's order).
 fn resolve(records: &Records, home: &str, kind: &str, name: &str) -> Option<Held> {
-    let mut held = records.iter().filter(|((held, held_name, _), _)| *held == kind && held_name == name);
+    let mut held = named(records, kind, name);
     let first = held.next()?;
     let chosen = std::iter::once(first).chain(held).find(|((_, _, owner), _)| owner == home).unwrap_or(first);
     Some(chosen.1.clone())
+}
+
+/// Every home's record `name` of `kind`, read from the map by name.
+fn named<'a>(records: &'a Records, kind: &str, name: &'a str) -> impl Iterator<Item = (&'a (&'static str, String, String), &'a Held)> {
+    let start = DEFINITION_KINDS.iter().find(|held| **held == kind).map(|kind| (*kind, name.to_owned(), String::new()));
+    start.into_iter().flat_map(move |start| {
+        let kind = start.0;
+        records.range(start..).take_while(move |((held, held_name, _), _)| *held == kind && held_name == name)
+    })
 }
 
 /// The definition records of the decided store at one home.
@@ -460,6 +469,16 @@ impl EngineRecords for EngineDefinitions {
             .records
             .iter()
             .filter(|((held, _, _), _)| *held == kind)
+            .filter_map(|(_, held)| {
+                held.clone().map_err(|error| tracing::warn!(%error, "skipping a definition record that does not encode")).ok()
+            })
+            .collect())
+    }
+
+    /// Every home's record `name`, read from the resident map by name.
+    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+        let resident = self.refresh()?;
+        Ok(named(&resident.records, kind, name)
             .filter_map(|(_, held)| {
                 held.clone().map_err(|error| tracing::warn!(%error, "skipping a definition record that does not encode")).ok()
             })

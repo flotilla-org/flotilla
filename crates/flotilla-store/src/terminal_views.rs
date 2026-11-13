@@ -156,6 +156,11 @@ impl TerminalViews {
     /// Each session's newest launch at every home, as the engine port lists it: this home's
     /// local, other homes' replicas of their home. A released launch is listed no more.
     async fn listed(&self) -> Result<Vec<EngineObject>, ResourceError> {
+        self.listed_where(|_| true).await
+    }
+
+    /// The listed objects `keep` selects: only those are copied out of the listing.
+    async fn listed_where(&self, keep: impl Fn(&EngineObject) -> bool) -> Result<Vec<EngineObject>, ResourceError> {
         let mut listing = self.listing.lock().await;
         let held = listing.cursors.take();
         let (cursors, dirt) = self
@@ -190,7 +195,7 @@ impl TerminalViews {
                 return Err(error);
             }
         }
-        Ok(listing.sessions.values().filter_map(|entry| entry.view.clone()).collect())
+        Ok(listing.sessions.values().filter_map(|entry| entry.view.as_ref().filter(|view| keep(view)).cloned()).collect())
     }
 
     /// Composes again the sessions `dirt` touched in `listing`, and takes in their new launches.
@@ -448,7 +453,8 @@ impl EngineRecords for TerminalViews {
             let view = self.compose(vec![record]).await.map_err(|error| error.to_string())?.pop();
             return view.map(|view| engine_object(view, here)).transpose();
         }
-        Ok(self.list(KIND).await?.into_iter().find(|object| object.name == name && object.home != here))
+        let named = self.listed_where(|object| object.name == name && object.home != here).await.map_err(|error| error.to_string())?;
+        Ok(named.into_iter().min_by(|a, b| a.home.cmp(&b.home)))
     }
 
     /// Each session's newest launch, this home's where it holds one, else the lexically first
@@ -472,7 +478,7 @@ impl EngineRecords for TerminalViews {
     /// Every home's listed copy of `name`, and this home's newest launch of it however it ended.
     async fn copies(&self, _kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
         let here = self.home();
-        let mut copies = self.engine_sources().await?.into_iter().filter(|object| object.name == name).collect::<Vec<_>>();
+        let mut copies = self.listed_where(|object| object.name == name).await.map_err(|error| error.to_string())?;
         if !copies.iter().any(|object| object.home == here) {
             if let Some(found) = self.find(name, None).await.map_err(|error| error.to_string())? {
                 copies.push(engine_object(found, here)?);
