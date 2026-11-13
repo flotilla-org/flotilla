@@ -1,5 +1,33 @@
 //! Shared checkout path selection from durable and observed facts.
-use crate::{CheckoutSpec, CheckoutStatus};
+use sha2::{Digest, Sha256};
+
+use crate::{CheckoutSpec, CheckoutStatus, Convoy, ResourceObject, ACTUATOR_SOURCE_ROOT_ANNOTATION};
+
+/// The name of a managed checkout for `vessel_name`, scoped by
+/// [`checkout_placement_scope`] when it has one.
+pub fn checkout_name(vessel_name: &str, workspace_slug: &str, multi_repository: bool, placement_scope: Option<&str>) -> String {
+    let repository_suffix = if multi_repository { format!("-{workspace_slug}") } else { String::new() };
+    let placement_suffix = placement_scope.map(|scope| format!("-{scope}")).unwrap_or_default();
+    format!("checkout-{vessel_name}{repository_suffix}{placement_suffix}")
+}
+
+/// The scope of `convoy`'s managed checkouts on `host_ref`: it hashes the convoy's creation
+/// timestamp's RFC 3339 form, so a convoy keeps its checkout names only while that stamp is
+/// served exactly.
+pub fn checkout_placement_scope(convoy: &ResourceObject<Convoy>, host_ref: Option<&str>) -> Option<String> {
+    let host_ref = host_ref?;
+    let mut hash = Sha256::new();
+    hash.update(b"managed-checkout-placement-v1\0");
+    hash.update(host_ref.as_bytes());
+    hash.update([0]);
+    hash.update(convoy.metadata.creation_timestamp.to_rfc3339().as_bytes());
+    hash.update([0]);
+    if let Some(origin_root) = convoy.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION) {
+        hash.update(origin_root.as_bytes());
+    }
+    let digest = format!("{:x}", hash.finalize());
+    Some(digest[..12].to_string())
+}
 
 /// Prefer the published path, then a declared target, then the observed path.
 pub fn checkout_path_from_status_and_spec<'a>(status: Option<&'a CheckoutStatus>, spec: &'a CheckoutSpec) -> Option<&'a str> {

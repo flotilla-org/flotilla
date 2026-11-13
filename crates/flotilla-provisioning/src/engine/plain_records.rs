@@ -10,8 +10,10 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
+use super::reads::created_at;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
+use chrono::{DateTime, Utc};
 use flotilla_engine_store::{
     follow::{Followed, Follower},
     plain::{PendingChange, PlainError, PlainLog},
@@ -45,8 +47,8 @@ pub trait PlainKind: Kind + PartialEq + Send + Sync + 'static {
     /// The writer recorded on this port's writes.
     const WRITER: &'static str;
 
-    /// The old object `record` reads as, with no status.
-    fn object(name: String, home: String, version: u64, record: &Self) -> Held;
+    /// The old object `record`, created at `created_at`, reads as, with no status.
+    fn object(name: String, home: String, version: u64, created_at: DateTime<Utc>, record: &Self) -> Held;
 
     /// The record an old object's spec writes.
     fn from_spec(spec: Value) -> Result<Self, String>;
@@ -55,7 +57,10 @@ pub trait PlainKind: Kind + PartialEq + Send + Sync + 'static {
 fn reload<K: PlainKind>(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
     let key = (name.to_owned(), home.to_owned());
     match read.resolve(K::CODE, name, home)?.map(|id| read.load::<K>(id)).transpose()?.flatten() {
-        Some(loaded) => records.insert(key, K::object(loaded.name, loaded.home, loaded.version, &loaded.value)),
+        Some(loaded) => {
+            let created_at = created_at(read, loaded.id)?;
+            records.insert(key, K::object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value))
+        }
         None => records.remove(&key),
     };
     Ok(())
@@ -69,7 +74,8 @@ fn rescan<K: PlainKind>(read: &mut Read<'_>, records: &mut Records, home: &str) 
         for id in page.ids {
             if let Some(loaded) = read.load::<K>(id)? {
                 let key = (loaded.name.clone(), home.to_owned());
-                records.insert(key, K::object(loaded.name, loaded.home, loaded.version, &loaded.value));
+                let created_at = created_at(read, id)?;
+                records.insert(key, K::object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value));
             }
         }
         after = page.next;
@@ -185,7 +191,10 @@ impl<K: PlainKind> PlainRecords<K> {
                 None => self.log.create(name, value, &PendingChange::new(NewChange::new(K::WRITER, self.now()))),
             };
             match written {
-                Ok(version) => return K::object(name.to_owned(), self.home.clone(), version, value),
+                Ok(version) => {
+                    let created_at = self.log.created::<K>(name, &self.home).map_err(|error| error.to_string())?.to_datetime();
+                    return K::object(name.to_owned(), self.home.clone(), version, created_at, value);
+                }
                 Err(error @ (PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. })) => lost = Some(error),
                 Err(error) => return Err(format!("write {} {name}: {error}", K::KIND)),
             }

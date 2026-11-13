@@ -21,6 +21,8 @@ pub struct CloneRecord {
     pub spec: CloneSpec,
     /// Found already at its path by startup discovery, not cloned there.
     pub discovered: bool,
+    /// When this launch was requested.
+    pub requested_at: chrono::DateTime<chrono::Utc>,
     pub reading: LifecycleReading,
     /// The remote's default branch, as the launch found it when it was realised.
     pub default_branch: Option<String>,

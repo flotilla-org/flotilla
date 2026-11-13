@@ -32,6 +32,7 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 
 use super::provenance;
+use super::reads::created_at;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::manifest_root::ManifestRoot;
@@ -56,6 +57,8 @@ const WRITER: &str = "project-records";
 struct Held {
     project: Option<(u64, ProjectDefinition, DefinitionOrigin)>,
     ops: Option<(u64, ProjectOpsRecord)>,
+    /// When the Project's definition was created; none while none is held.
+    created: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Every home's records, by name and home.
@@ -119,6 +122,7 @@ fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Optio
             name: name.to_owned(),
             home: home.to_owned(),
             version,
+            created_at: held.created.ok_or_else(|| format!("{KIND} {name} at {home} has no creation time"))?,
             labels,
             annotations,
             spec: serde_json::to_value(project.spec()).map_err(encode)?,
@@ -163,6 +167,10 @@ fn reload(read: &mut Read<'_>, records: &mut Records, identity: &Identity) -> Re
             .transpose()?
             .flatten()
             .map(|(_, version, value, origin)| (version, value, origin));
+        held.created = match (id, &held.project) {
+            (Some(id), Some(_)) => Some(created_at(read, id)?),
+            _ => None,
+        };
     } else if identity.kind == OPS {
         held.ops = id.map(|id| read.load::<ProjectOpsRecord>(id)).transpose()?.flatten().map(|loaded| (loaded.version, loaded.value));
     }
@@ -181,7 +189,9 @@ fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), 
         let page = read.scan::<ProjectDefinition>(home, after, 64)?;
         for id in page.ids {
             if let Some((name, version, value, origin)) = load_project(read, &mut roots, id)? {
-                records.entry((name, home.to_owned())).or_default().project = Some((version, value, origin));
+                let created = created_at(read, id)?;
+                let held = records.entry((name, home.to_owned())).or_default();
+                (held.project, held.created) = (Some((version, value, origin)), Some(created));
             }
         }
         after = page.next;
@@ -532,6 +542,7 @@ mod tests {
             name: "widgets".into(),
             home: home.into(),
             version: 1,
+            created_at: chrono::DateTime::UNIX_EPOCH,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             spec: Value::Null,

@@ -2062,6 +2062,7 @@ impl HeldListingPort {
             name: name.into(),
             home: "kiwi".into(),
             version: 1,
+            created_at: chrono::DateTime::UNIX_EPOCH,
             labels: Default::default(),
             annotations: Default::default(),
             spec: serde_json::json!({ "value": "one" }),

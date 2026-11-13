@@ -413,6 +413,7 @@ fn engine_object(source: ReadResourceObject<TerminalSession>, home: String) -> R
         name: object.metadata.name,
         home,
         version: digest.finish(),
+        created_at: object.metadata.creation_timestamp,
         labels: object.metadata.labels,
         annotations: object.metadata.annotations,
         spec,

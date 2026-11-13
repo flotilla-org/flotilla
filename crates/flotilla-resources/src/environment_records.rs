@@ -25,6 +25,8 @@ pub struct EnvironmentRecord {
     pub spec: EnvironmentSpec,
     /// The vessel it is held for, if any.
     pub vessel: Option<String>,
+    /// When it was requested.
+    pub requested_at: chrono::DateTime<chrono::Utc>,
     pub reading: LifecycleReading,
     /// The facts fixed when its launch was realised; none before.
     pub launch: Option<LaunchFacts>,

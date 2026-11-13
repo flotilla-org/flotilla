@@ -1067,6 +1067,7 @@ mod tests {
                     name: "v#1".into(),
                     home: "kiwi".into(),
                     version: 1,
+                    created_at: chrono::DateTime::UNIX_EPOCH,
                     labels: BTreeMap::new(),
                     annotations: BTreeMap::new(),
                     spec: serde_json::json!({ "convoy_ref": "c", "vessel_name": "w", "fulfilment_kind_ref": "k" }),

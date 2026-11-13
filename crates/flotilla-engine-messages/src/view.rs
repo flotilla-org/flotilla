@@ -14,6 +14,7 @@ use flotilla_resources::{
     Message as OldMessage, MessageExpectation, MessagePhase, MessageReference as OldReference, MessageRelation, MessageSpec as OldSpec,
     MessageStatus, ObjectMeta, ResolvedMessageReceiver, ResourceObject,
 };
+use flotilla_schema::CreatedAt;
 use flotilla_state_machines::{
     machines::{
         consumer::Receiver,
@@ -195,24 +196,32 @@ pub fn old_reference(reference: &MessageReference, lookups: &dyn ViewLookups) ->
     }
 }
 
-/// An engine message as the old Message the convoy and crew code reads.
+/// An engine message, created at `created`, as the old Message the convoy and crew code reads.
 pub fn old_view(
     resource: &Resource<Message>,
+    created: CreatedAt,
     namespace: &str,
     roles: &FleetRoles,
     lookups: &dyn ViewLookups,
 ) -> Result<ResourceObject<OldMessage>, String> {
-    view_spelled(resource, namespace, &|address| old_address(address, roles, lookups), lookups)
+    view_spelled(resource, created, namespace, &|address| old_address(address, roles, lookups), lookups)
 }
 
-/// An engine message as the generic resource verbs show it: the old shape with each address as
-/// the engine stores it, read with no lookup ([`Stored`]).
-pub fn stored_view(resource: &Resource<Message>, namespace: &str) -> Result<ResourceObject<OldMessage>, String> {
-    view_spelled(resource, namespace, &|address| Ok(address.to_string()), &Stored { namespace: namespace.to_owned() })
+/// The old spec of an engine message, as [`old_view`] spells it.
+pub fn old_spec(resource: &Resource<Message>, namespace: &str, roles: &FleetRoles, lookups: &dyn ViewLookups) -> Result<OldSpec, String> {
+    // Only the spec is read, so the view is made at no particular creation time.
+    Ok(old_view(resource, CreatedAt(0), namespace, roles, lookups)?.spec)
+}
+
+/// An engine message, created at `created`, as the generic resource verbs show it: the old shape
+/// with each address as the engine stores it, read with no lookup ([`Stored`]).
+pub fn stored_view(resource: &Resource<Message>, created: CreatedAt, namespace: &str) -> Result<ResourceObject<OldMessage>, String> {
+    view_spelled(resource, created, namespace, &|address| Ok(address.to_string()), &Stored { namespace: namespace.to_owned() })
 }
 
 fn view_spelled(
     resource: &Resource<Message>,
+    created: CreatedAt,
     namespace: &str,
     spell: &dyn Fn(&Address) -> Result<String, String>,
     lookups: &dyn ViewLookups,
@@ -342,7 +351,7 @@ fn view_spelled(
             owner_references: Vec::new(),
             finalizers: Vec::new(),
             deletion_timestamp: None,
-            creation_timestamp: since,
+            creation_timestamp: created.to_datetime(),
             merge: None,
         },
         spec: old_spec,

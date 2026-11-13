@@ -47,6 +47,7 @@ impl MessageRecords {
             name: metadata.name,
             home,
             version: metadata.resource_version.parse().map_err(|error| format!("message version: {error}"))?,
+            created_at: metadata.creation_timestamp,
             labels: metadata.labels,
             annotations: metadata.annotations,
             spec: serde_json::to_value(&read.object.spec).map_err(|error| error.to_string())?,

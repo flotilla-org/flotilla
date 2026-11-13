@@ -207,6 +207,7 @@ mod tests {
                 home: "home".into(),
                 spec: EnvironmentSpec::default(),
                 vessel: None,
+                requested_at: chrono::DateTime::UNIX_EPOCH,
                 reading: LifecycleReading::InProgress,
                 launch: None,
             };

@@ -95,18 +95,12 @@ fn ended(convoy: &ResourceObject<ResourceConvoy>) -> bool {
     convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())
 }
 
-/// When `convoy` was admitted. The engine's view says so as its start (#3108): the old store's
-/// object built from an engine record keeps no creation time and reads as the epoch.
-fn admitted_at(convoy: &ResourceObject<ResourceConvoy>) -> DateTime<Utc> {
-    convoy.status.as_ref().and_then(|status| status.started_at).unwrap_or(convoy.metadata.creation_timestamp)
-}
-
 /// A generation as [`standing::derive`] reads it: admitted at its creation, under `declared` when
 /// its admitted configuration is the role's now, and ended as its phase says, at its finish (its
 /// admission when none was recorded).
 fn generation(convoy: &ResourceObject<ResourceConvoy>, declared: &ConvoyEnsureSpec) -> Generation {
     let status = convoy.status.as_ref();
-    let admitted_at = admitted_at(convoy);
+    let admitted_at = convoy.metadata.creation_timestamp;
     let ending = status.and_then(|status| match status.phase {
         ConvoyPhase::Failed => Some(Ending::Failed),
         ConvoyPhase::Abandoned => Some(Ending::Operator),
@@ -311,10 +305,8 @@ impl EnsurePass<'_> {
     }
 
     /// Definitions reads merge every host's copy, so local presence does not
-    /// establish home. ManifestRoots are home-bound; an undeclared definition
-    /// belongs to the home whose copy sorts first by origin, since every engine
-    /// copy reads its creation time as the epoch. A later same-name copy at a
-    /// lower-sorting home also acts; owner question open (#3108).
+    /// establish home. ManifestRoots are home-bound; undeclared definitions
+    /// belong to their earliest creation, before later local reapplications.
     async fn driverless_ensure_is_home(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<bool, ResourceError> {
         if let Some(root) = ensure.metadata.annotations.get("flotilla.work/manifest-reconciler-root") {
             if let Some(root) = self.manifest_roots.root(namespace, root).await.map_err(ResourceError::other)? {
@@ -338,8 +330,8 @@ impl EnsurePass<'_> {
             .resource_backend
             .query_declared::<ConvoyEnsure>(namespace, &StoreQuery::names([ensure.metadata.name.clone()], true))
             .await?;
-        // The engine keeps no creation time (every copy reads as the epoch), so the origin
-        // tie-break alone decides which home's copy is first.
+        // Replication preserves each origin's creation_timestamp; it never
+        // substitutes the replica's arrival time. Reapplications create later sources.
         let first = sources.items.into_iter().filter(|source| source.object.metadata.deletion_timestamp.is_none()).min_by_key(|source| {
             let origin = match &source.provenance {
                 ResourceProvenance::Local => &local_root,
@@ -668,7 +660,7 @@ impl EnsurePass<'_> {
                 if raise {
                     let latest = latest.expect("strikes need a generation");
                     let failure = restart_limit_reason(reading.strikes);
-                    self.raise_ensure_attention(ensure, latest, &failure, admitted_at(latest)).await?;
+                    self.raise_ensure_attention(ensure, latest, &failure, latest.metadata.creation_timestamp).await?;
                     return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
                 }
                 return Ok(None);
@@ -935,7 +927,7 @@ impl EnsurePass<'_> {
         let reason = format!("ConfigDrift: {}; run flotilla ensure roll {}", changes.join("; "), ensure.metadata.name);
         // A generation's drift is one episode from its admission: a person who acknowledged it
         // answered every change to this generation's declaration.
-        self.attentions.raise(namespace, &Attention::new(fact, reason, admitted_at(convoy))).await
+        self.attentions.raise(namespace, &Attention::new(fact, reason, convoy.metadata.creation_timestamp)).await
     }
 
     async fn raise_ensure_attention(

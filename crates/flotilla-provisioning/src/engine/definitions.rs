@@ -32,7 +32,10 @@ use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
 
+use chrono::{DateTime, Utc};
+
 use super::provenance;
+use super::reads::created_at;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::definition::{
@@ -202,11 +205,18 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `value` as the old object, stamped as `origin`'s writer stamps it.
-fn object<K: Definition>(name: String, home: String, version: u64, value: &K, origin: &DefinitionOrigin) -> Held {
+/// `value`, created at `created_at`, as the old object, stamped as `origin`'s writer stamps it.
+fn object<K: Definition>(
+    name: String,
+    home: String,
+    version: u64,
+    created_at: DateTime<Utc>,
+    value: &K,
+    origin: &DefinitionOrigin,
+) -> Held {
     let spec = value.spec().map_err(|error| format!("{} {name} at {home}: {error}", K::NAME))?;
     let (labels, annotations) = stamp(origin);
-    Ok(EngineObject { name, home, version, labels, annotations, spec, status: None })
+    Ok(EngineObject { name, home, version, created_at, labels, annotations, spec, status: None })
 }
 
 /// Record `id` as the old object, with the stamps its last change says.
@@ -221,7 +231,8 @@ fn record<K: Definition>(
 ) -> Result<Held, StoreError> {
     let change = read.last_change(id)?;
     let origin = provenance::origin_of(read, roots, K::NAME, &name, change.as_ref(), value.project())?;
-    Ok(object(name, home, version, value, &origin))
+    let created_at = created_at(read, id)?;
+    Ok(object(name, home, version, created_at, value, &origin))
 }
 
 /// The current row of `id` of kind `K`, if any.
@@ -417,7 +428,10 @@ impl EngineDefinitions {
                 None => self.log.create(name, &value, &change),
             };
             match written {
-                Ok(version) => return object(name.to_owned(), self.home.clone(), version, &value, &origin),
+                Ok(version) => {
+                    let created_at = self.log.created::<K>(name, &self.home).map_err(|error| error.to_string())?.to_datetime();
+                    return object(name.to_owned(), self.home.clone(), version, created_at, &value, &origin);
+                }
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
                 Err(error) => return Err(format!("write {} {name}: {error}", K::NAME)),
             }
@@ -504,6 +518,8 @@ impl EngineRecords for EngineDefinitions {
                 name: name.to_owned(),
                 home: self.home.clone(),
                 version: 0,
+                // Not stored, so created by this write.
+                created_at: self.clock.now(),
                 labels,
                 annotations,
                 spec,
@@ -535,6 +551,7 @@ mod tests {
             name: "fleet".into(),
             home: home.into(),
             version: 1,
+            created_at: chrono::DateTime::UNIX_EPOCH,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             spec: Value::Null,

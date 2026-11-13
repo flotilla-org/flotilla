@@ -26,9 +26,11 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
 
+use super::reads::created_at;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::repository::{RepositoryRecord, VerificationProvenance};
+use chrono::{DateTime, Utc};
 
 const KIND: &str = "Repository";
 const CODE: KindCode = <RepositoryRecord as Kind>::CODE;
@@ -55,7 +57,7 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// `record` as the old object: its ops data as annotations, its observations as the status.
-fn object(name: String, home: String, version: u64, record: &RepositoryRecord) -> Held {
+fn object(name: String, home: String, version: u64, created_at: DateTime<Utc>, record: &RepositoryRecord) -> Held {
     let encode = |error: serde_json::Error| format!("{KIND} {name} at {home}: {error}");
     let mut annotations = BTreeMap::new();
     if let Some(project) = &record.verification_project {
@@ -79,6 +81,7 @@ fn object(name: String, home: String, version: u64, record: &RepositoryRecord) -
         name,
         home,
         version,
+        created_at,
         labels: BTreeMap::new(),
         annotations,
     })
@@ -87,7 +90,10 @@ fn object(name: String, home: String, version: u64, record: &RepositoryRecord) -
 fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
     let key = (name.to_owned(), home.to_owned());
     match read.resolve(CODE, name, home)?.map(|id| read.load::<RepositoryRecord>(id)).transpose()?.flatten() {
-        Some(loaded) => records.insert(key, object(loaded.name, loaded.home, loaded.version, &loaded.value)),
+        Some(loaded) => {
+            let created_at = created_at(read, loaded.id)?;
+            records.insert(key, object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value))
+        }
         None => records.remove(&key),
     };
     Ok(())
@@ -101,7 +107,8 @@ fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), 
         for id in page.ids {
             if let Some(loaded) = read.load::<RepositoryRecord>(id)? {
                 let key = (loaded.name.clone(), home.to_owned());
-                records.insert(key, object(loaded.name, loaded.home, loaded.version, &loaded.value));
+                let created_at = created_at(read, id)?;
+                records.insert(key, object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value));
             }
         }
         after = page.next;
@@ -221,7 +228,11 @@ impl EngineRepositories {
                 _ => self.log.create(name, &value, &PendingChange::new(NewChange::new(WRITER, self.now()))),
             };
             match written {
-                Ok(version) => return object(name.to_owned(), self.home.clone(), version, &value),
+                Ok(version) => {
+                    let created_at =
+                        self.log.created::<RepositoryRecord>(name, &self.home).map_err(|error| error.to_string())?.to_datetime();
+                    return object(name.to_owned(), self.home.clone(), version, created_at, &value);
+                }
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
                 Err(error) => return Err(format!("write {KIND} {name}: {error}")),
             }

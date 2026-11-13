@@ -30,7 +30,10 @@ use flotilla_schema::{Identity, Kind, KindCode, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
 
+use chrono::{DateTime, Utc};
+
 use super::manifest_root_import::document_name;
+use super::reads::created_at;
 use super::watch::CommitsSeen;
 use crate::stored::manifest_root::{
     Act, Applied, DocumentName, ManifestRoot, Outcome, Rebind, RequestResolution, Resolve, Retire, RootEdge, RootRefusal, RootRequest,
@@ -59,6 +62,8 @@ type Roots = BTreeMap<(String, String), Resource<ManifestRoot>>;
 struct Resident {
     follower: Follower,
     roots: Roots,
+    /// When each held root was created, by home and engine name.
+    created: BTreeMap<(String, String), DateTime<Utc>>,
 }
 
 /// The ManifestRoots of the decided store at one home.
@@ -81,7 +86,7 @@ impl EngineManifestRoots {
         let log = StoreLog::new(service.store());
         let home = log.home().to_owned();
         let roots = open_home::<ManifestRoot>(log)?;
-        let resident = Resident { follower: Follower::new([ROOT]), roots: BTreeMap::new() };
+        let resident = Resident { follower: Follower::new([ROOT]), roots: BTreeMap::new(), created: BTreeMap::new() };
         let opened = Self {
             commits: CommitsSeen::follow(&service, [ROOT]),
             service,
@@ -213,20 +218,28 @@ fn reload(read: &mut Read<'_>, resident: &mut Resident, identity: &Identity) -> 
     }
     let key = (identity.home.clone(), identity.name.clone());
     match read.resolve(ROOT, &identity.name, &identity.home)?.map(|id| read.load::<Resource<ManifestRoot>>(id)).transpose()?.flatten() {
-        Some(loaded) => resident.roots.insert(key, loaded.value.with_identity(&loaded.name, loaded.version)),
-        None => resident.roots.remove(&key),
-    };
+        Some(loaded) => {
+            resident.created.insert(key.clone(), created_at(read, loaded.id)?);
+            resident.roots.insert(key, loaded.value.with_identity(&loaded.name, loaded.version));
+        }
+        None => {
+            resident.created.remove(&key);
+            resident.roots.remove(&key);
+        }
+    }
     Ok(())
 }
 
 /// Reads every root homed at `home` into the resident map, in place of what it held.
 fn rescan(read: &mut Read<'_>, resident: &mut Resident, home: &str) -> Result<(), StoreError> {
     resident.roots.retain(|(owner, _), _| owner != home);
+    resident.created.retain(|(owner, _), _| owner != home);
     let mut after = None;
     loop {
         let page = read.scan::<Resource<ManifestRoot>>(home, after, 64)?;
         for id in page.ids {
             if let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? {
+                resident.created.insert((home.to_owned(), loaded.name.clone()), created_at(read, id)?);
                 resident.roots.insert((home.to_owned(), loaded.name.clone()), loaded.value.with_identity(&loaded.name, loaded.version));
             }
         }
@@ -560,10 +573,17 @@ impl EngineManifestRoots {
             .into_iter()
             .map(|(home, root)| {
                 let view = self.view(&home, root);
+                // The live generation's creation: a rebind opens the next generation as a new record.
+                let created_at = resident
+                    .created
+                    .get(&(home.clone(), root.name().to_owned()))
+                    .copied()
+                    .ok_or_else(|| format!("{ROOT_KIND} {} at {home} has no creation time", root.name()))?;
                 Ok(flotilla_resources::engine_records::EngineObject {
                     name: view.name,
                     home,
                     version: root.version().0,
+                    created_at,
                     labels: BTreeMap::new(),
                     annotations: BTreeMap::new(),
                     spec: serde_json::to_value(&view.spec).map_err(|error| error.to_string())?,

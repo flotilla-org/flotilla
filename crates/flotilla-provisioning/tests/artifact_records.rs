@@ -93,6 +93,59 @@ fn home(directory: &tempfile::TempDir, home: &str) -> (Arc<Service>, Arc<EngineA
     (service, Arc::new(records))
 }
 
+#[derive(Debug)]
+struct ManualClock(std::sync::Mutex<chrono::DateTime<Utc>>);
+
+impl ManualClock {
+    fn set(&self, seconds: i64) {
+        *self.0.lock().expect("clock") = Utc.timestamp_opt(seconds, 0).single().expect("time");
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> chrono::DateTime<Utc> {
+        *self.0.lock().expect("clock")
+    }
+}
+
+/// `home`'s engine artifacts behind a backend, written at the time `clock` says.
+fn backend_at(directory: &tempfile::TempDir, home: &str, clock: &Arc<ManualClock>) -> (Arc<Service>, ResourceBackend) {
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::artifact::register(&mut kinds).expect("register");
+    let service = Arc::new(Service::open(&directory.path().join(format!("{home}.sqlite")), home, kinds).expect("store"));
+    let records = EngineArtifacts::open(Arc::clone(&service), Arc::clone(clock) as Arc<dyn Clock>).expect("open");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.install_engine_records(Arc::new(records));
+    (service, backend)
+}
+
+// Behaviour (#3108 creation time): an engine record reads the time it was created as its
+// creation timestamp, from the write's answer and from every read; a later write keeps it, and
+// another home reads the home's time, not when the record arrived there.
+#[tokio::test]
+async fn an_engine_record_reads_its_creation_time_at_every_home() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let created_at = Utc.timestamp_opt(1_000, 0).single().expect("time");
+    let clock = Arc::new(ManualClock(std::sync::Mutex::new(created_at)));
+    let (beta, beta_backend) = backend_at(&directory, "beta", &clock);
+    let (zeta, zeta_backend) = backend_at(&directory, "zeta", &clock);
+    let artifacts = beta_backend.using::<Artifact>(NS);
+    let [one, two] = ["1", "2"].map(|digit| digit.repeat(64));
+
+    let created = artifacts.create(&InputMeta::builder().name("ledger".into()).build(), &spec("demo", &one)).await.expect("put");
+    assert_eq!(created.metadata.creation_timestamp, created_at);
+    clock.set(2_000);
+    artifacts.update(&InputMeta::from(&created.metadata), &created.metadata.resource_version, &spec("demo", &two)).await.expect("replace");
+    assert_eq!(artifacts.get("ledger").await.expect("get").metadata.creation_timestamp, created_at);
+    let listed = artifacts.list().await.expect("list").items;
+    assert_eq!(listed.iter().map(|item| item.metadata.creation_timestamp).collect::<Vec<_>>(), [created_at]);
+
+    clock.set(5_000);
+    pump(&beta, "beta", &zeta, None);
+    let replica = zeta_backend.including_replicas::<Artifact>(NS).get("ledger").await.expect("read at zeta").object;
+    assert_eq!(replica.metadata.creation_timestamp, created_at);
+}
+
 /// One round of `from`'s stream applied at `to`, as a follower does; a reset round when `cursor` is none.
 fn pump(from: &Service, from_home: &str, to: &Service, cursor: Option<u64>) -> u64 {
     let mut frames = Vec::new();

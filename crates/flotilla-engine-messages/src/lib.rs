@@ -28,7 +28,7 @@ use std::{
 use self::{
     convert::{Conversion, ReferenceAddresses},
     roles::{designated_fleet_roles, FleetRoles},
-    view::{old_view, record_name, ViewLookups},
+    view::{old_spec, old_view, record_name, ViewLookups},
 };
 use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_engine_store::StoreLog;
@@ -39,8 +39,8 @@ use flotilla_resources::{
     Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, MessageSpec as OldSpec, Project,
     ReadResourceObject, Repository, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionSource,
 };
-use flotilla_schema::{IndexQuery, Kind as StoredKind, Timestamp};
-use flotilla_schema_sqlite::stream::Service;
+use flotilla_schema::{CreatedAt, Identity, IndexQuery, Kind as StoredKind, Timestamp};
+use flotilla_schema_sqlite::{stream::Service, StoreError};
 use flotilla_state_machines::{
     machines::{
         agent_session::{AgentSession, MemoryAgentSessionWorld, Receive},
@@ -576,19 +576,38 @@ impl MessagePrimitives {
         }
     }
 
-    /// `resources` in the old shape, each read on the records it names.
+    /// `resources`, each with when it was created, in the old shape, each read on the records it
+    /// names.
     pub async fn old_views(
         &self,
         namespace: &str,
         roles: &FleetRoles,
-        resources: &[Resource<Message>],
+        resources: &[(CreatedAt, Resource<Message>)],
     ) -> Result<Vec<Result<ResourceObject<OldMessage>, String>>, ResourceError> {
         let mut records = OldStoreRecords::empty(namespace);
         let views = self
-            .spell(&mut records, |records| resources.iter().map(|resource| old_view(resource, namespace, roles, records)).collect())
+            .spell(&mut records, |records| {
+                resources.iter().map(|(created, resource)| old_view(resource, *created, namespace, roles, records)).collect()
+            })
             .await?;
         self.count_converted(resources.len());
         Ok(views)
+    }
+
+    /// When each of `messages`, held with its home, was created, read by its identity.
+    fn created_of(&self, messages: &[(String, Resource<Message>)]) -> Result<Vec<CreatedAt>, ResourceError> {
+        self.service
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let mut created = Vec::with_capacity(messages.len());
+                for (home, message) in messages {
+                    let identity = Identity { kind: Resource::<Message>::CODE, name: message.name().to_owned(), home: home.clone() };
+                    let id = read.resolve(identity.kind, &identity.name, home)?.ok_or(StoreError::NotCreated { identity })?;
+                    created.push(read.creation_time(id)?);
+                }
+                Ok(created)
+            })
+            .map_err(|error| ResourceError::other(error.to_string()))
     }
 
     /// The records the messages `ids` held here name, read by key, for spelling them later.
@@ -600,7 +619,7 @@ impl MessagePrimitives {
         let mut records = OldStoreRecords::empty(namespace);
         self.spell(&mut records, |records| {
             resources.iter().for_each(|resource| {
-                let _ = old_view(resource, namespace, roles, records);
+                let _ = old_spec(resource, namespace, roles, records);
             })
         })
         .await?;
@@ -1304,9 +1323,10 @@ impl MessagePrimitives {
         let Some(read) = reads.find(Resource::<Message>::CODE, id.as_str()).await.map_err(ResourceError::other)? else { return Ok(None) };
         let Some(snapshot) = read.value else { return Ok(None) };
         let home = snapshot.home.clone();
+        let created = snapshot.created_at.ok_or_else(|| ResourceError::other(format!("message {id} at {home} has no creation time")))?;
         let resource = snapshot.into_value::<Resource<Message>>().map_err(|error| ResourceError::decode(error.to_string()))?;
         tracing::info!(message = %id, %home, remote = read.remote, age_micros = read.age_micros, "replica miss read at the message's home");
-        let object = self.view_of(&resource, namespace, &roles).await?.map_err(ResourceError::invalid)?;
+        let object = self.view_of(created, &resource, namespace, &roles).await?.map_err(ResourceError::invalid)?;
         let synced = chrono::Utc::now() - chrono::Duration::microseconds(read.age_micros);
         Ok(Some(ReadResourceObject {
             object,
@@ -1589,14 +1609,16 @@ impl MessagePrimitives {
                         let mut loaded = Vec::with_capacity(page.ids.len());
                         for id in page.ids {
                             self.count_loaded();
-                            loaded.extend(read.load::<Resource<Message>>(id)?.map(|loaded| loaded.value));
+                            if let Some(message) = read.load::<Resource<Message>>(id)? {
+                                loaded.push((read.creation_time(id)?, message.value));
+                            }
                         }
                         Ok((loaded, page.next))
                     })
                     .map_err(|error| ResourceError::other(error.to_string()))?;
                 let (messages, next) = page;
-                for resource in messages {
-                    let object = view::stored_view(&resource, namespace).map_err(ResourceError::invalid)?;
+                for (created, resource) in messages {
+                    let object = view::stored_view(&resource, created, namespace).map_err(ResourceError::invalid)?;
                     out.push(ReadResourceObject { object, provenance: self.provenance(&home) });
                 }
                 match next {
@@ -1616,8 +1638,8 @@ impl MessagePrimitives {
             return Ok(self.verb_listing(namespace)?.into_iter().find(|read| read.object.metadata.name == name));
         }
         for home in self.service.homes() {
-            if let Some((home, resource)) = self.load_at(name.to_owned(), home)? {
-                let object = view::stored_view(&resource, namespace).map_err(ResourceError::invalid)?;
+            if let Some((home, created, resource)) = self.load_at(name.to_owned(), home)? {
+                let object = view::stored_view(&resource, created, namespace).map_err(ResourceError::invalid)?;
                 return Ok(Some(ReadResourceObject { object, provenance: self.provenance(&home) }));
             }
         }
@@ -1629,28 +1651,30 @@ impl MessagePrimitives {
     /// receiver that is no address has none.
     pub(crate) fn verb_open_to(&self, namespace: &str, receiver: &str) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
         let Ok(inbox) = receiver.parse::<Address>() else { return Ok(Vec::new()) };
-        self.open_in(&inbox)
-            .map_err(ResourceError::other)?
-            .into_iter()
-            .map(|(home, resource)| {
-                let object = view::stored_view(&resource, namespace).map_err(ResourceError::invalid)?;
+        let rows = self.open_in(&inbox).map_err(ResourceError::other)?;
+        let created = self.created_of(&rows)?;
+        rows.into_iter()
+            .zip(created)
+            .map(|((home, resource), created)| {
+                let object = view::stored_view(&resource, created, namespace).map_err(ResourceError::invalid)?;
                 Ok(ReadResourceObject { object, provenance: self.provenance(&home) })
             })
             .collect()
     }
 
-    /// The message `id` homed at `home`, and its home.
-    fn load_at(&self, id: String, home: String) -> Result<Option<(String, Resource<Message>)>, ResourceError> {
+    /// The message `id` homed at `home`, with its home and when it was created.
+    fn load_at(&self, id: String, home: String) -> Result<Option<(String, CreatedAt, Resource<Message>)>, ResourceError> {
         let resource = self
             .service
             .with_store(|store| {
                 let mut read = store.read()?;
                 let Some(stored) = read.resolve(Resource::<Message>::CODE, &id, &home)? else { return Ok(None) };
                 self.count_loaded();
-                Ok(read.load::<Resource<Message>>(stored)?.map(|loaded| loaded.value))
+                let Some(loaded) = read.load::<Resource<Message>>(stored)? else { return Ok(None) };
+                Ok(Some((read.creation_time(stored)?, loaded.value)))
             })
             .map_err(|error| ResourceError::other(error.to_string()))?;
-        Ok(resource.map(|resource| (home, resource)))
+        Ok(resource.map(|(created, resource)| (home, created, resource)))
     }
 
     /// The message `id` homed at `home`, in the old shape.
@@ -1661,8 +1685,8 @@ impl MessagePrimitives {
         id: String,
         home: String,
     ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
-        let Some((home, resource)) = self.load_at(id, home)? else { return Ok(None) };
-        let object = self.view_of(&resource, namespace, roles).await?.map_err(ResourceError::invalid)?;
+        let Some((home, created, resource)) = self.load_at(id, home)? else { return Ok(None) };
+        let object = self.view_of(created, &resource, namespace, roles).await?.map_err(ResourceError::invalid)?;
         Ok(Some(ReadResourceObject { object, provenance: self.provenance(&home) }))
     }
 
@@ -1765,7 +1789,7 @@ impl MessagePrimitives {
                 }
             };
             if let Some((id, home)) = self.locate_in(&inbox, record).map_err(ResourceError::other)? {
-                self.load_at(id, home)?.into_iter().for_each(&mut keep);
+                self.load_at(id, home)?.map(|(home, _, message)| (home, message)).into_iter().for_each(&mut keep);
             }
         }
         let receivers: Vec<String> = receivers.iter().cloned().chain(named.iter().map(|(receiver, _)| receiver.clone())).collect();
@@ -1813,7 +1837,9 @@ impl MessagePrimitives {
         roles: &FleetRoles,
         receivers: &[String],
     ) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
-        let messages: Vec<Resource<Message>> = rows.iter().map(|(_, resource)| resource.clone()).collect();
+        let created = self.created_of(&rows)?;
+        let messages: Vec<(CreatedAt, Resource<Message>)> =
+            created.into_iter().zip(&rows).map(|(created, (_, resource))| (created, resource.clone())).collect();
         let views = self.old_views(namespace, roles, &messages).await?;
         Ok(rows
             .into_iter()
@@ -1846,14 +1872,15 @@ impl MessagePrimitives {
         .map_err(ResourceError::invalid)
     }
 
-    /// A message in the old shape, on the records it names, read now.
+    /// A message created at `created` in the old shape, on the records it names, read now.
     async fn view_of(
         &self,
+        created: CreatedAt,
         resource: &Resource<Message>,
         namespace: &str,
         roles: &FleetRoles,
     ) -> Result<Result<ResourceObject<OldMessage>, String>, ResourceError> {
-        Ok(self.old_views(namespace, roles, std::slice::from_ref(resource)).await?.pop().expect("one view per message"))
+        Ok(self.old_views(namespace, roles, &[(created, resource.clone())]).await?.pop().expect("one view per message"))
     }
 }
 

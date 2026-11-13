@@ -276,6 +276,7 @@ impl LiveEnvironments {
                 docker: None,
             },
             vessel: None,
+            requested_at: chrono::DateTime::UNIX_EPOCH,
             reading: LifecycleReading::Ready { identity: root.to_str().expect("root path").into() },
             launch: None,
         };

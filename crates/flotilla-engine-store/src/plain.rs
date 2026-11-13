@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use flotilla_schema::{ChangeHeader, Kind, KindRegistry, NewChange, RegistryError};
+use flotilla_schema::{ChangeHeader, CreatedAt, Kind, KindRegistry, NewChange, RegistryError};
 use flotilla_schema_sqlite::{ChangeId, Loaded, StoreError, StoreHandle, Write};
 
 use crate::lock_store;
@@ -241,6 +241,14 @@ impl PlainLog {
         let mut read = store.read()?;
         let Some(id) = read.resolve(K::CODE, name, home)? else { return Ok(None) };
         Ok(read.load::<K>(id)?.map(plain))
+    }
+
+    /// When `name` of `K` homed at `home` was last created.
+    pub fn created<K: Kind>(&self, name: &str, home: &str) -> Result<CreatedAt, PlainError> {
+        let mut store = lock_store(&self.store);
+        let mut read = store.read()?;
+        let id = read.resolve(K::CODE, name, home)?.ok_or_else(|| missing::<K>(name))?;
+        Ok(read.creation_time(id)?)
     }
 
     /// Every live resource of `K` homed at `home`, in id order.

@@ -126,7 +126,7 @@ fn newest_checkout_launches(records: Vec<CheckoutRecord>) -> Vec<CheckoutRecord>
 /// `record`'s launch as its read view shows it, under the checkout's name.
 fn checkout_object(record: CheckoutRecord) -> Result<EngineObject, String> {
     let view = record.read_view();
-    let mut object = object(view.metadata.name, record.home, &view.spec, &view.status)?;
+    let mut object = object(view.metadata.name, record.home, record.requested_at, &view.spec, &view.status)?;
     // A later launch showing the same spec and status is still a change.
     let mut digest = std::hash::DefaultHasher::new();
     (object.version, &record.name, &view.metadata.labels).hash(&mut digest);
@@ -158,7 +158,7 @@ fn clone_object(record: CloneRecord) -> Result<Option<EngineObject>, String> {
     let status =
         CloneStatus { phase, default_branch: record.default_branch.clone(), message: cause(&record.reading), ..Default::default() };
     let name = launched(&record.name).to_owned();
-    object(name, record.home, &record.spec, &status).map(Some)
+    object(name, record.home, record.requested_at, &record.spec, &status).map(Some)
 }
 
 /// `record` as the old Environment it shows: none once released. Its identity reads as the
@@ -186,12 +186,18 @@ fn environment_object(record: EnvironmentRecord) -> Result<Option<EngineObject>,
         message: cause(&record.reading),
         ..Default::default()
     };
-    object(record.name, record.home, &record.spec, &status).map(Some)
+    object(record.name, record.home, record.requested_at, &record.spec, &status).map(Some)
 }
 
-/// An old object of `spec` and `status`, its version a digest of what it shows, so a watcher
-/// sees each change.
-fn object(name: String, home: String, spec: &impl serde::Serialize, status: &impl serde::Serialize) -> Result<EngineObject, String> {
+/// An old object of `spec` and `status`, created at `created_at`, its version a digest of what it
+/// shows, so a watcher sees each change.
+fn object(
+    name: String,
+    home: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    spec: &impl serde::Serialize,
+    status: &impl serde::Serialize,
+) -> Result<EngineObject, String> {
     let spec = serde_json::to_value(spec).map_err(|error| error.to_string())?;
     let status = serde_json::to_value(status).map_err(|error| error.to_string())?;
     let mut digest = std::hash::DefaultHasher::new();
@@ -200,6 +206,7 @@ fn object(name: String, home: String, spec: &impl serde::Serialize, status: &imp
         name,
         home,
         version: digest.finish(),
+        created_at,
         labels: BTreeMap::new(),
         annotations: BTreeMap::new(),
         spec,

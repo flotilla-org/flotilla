@@ -21,7 +21,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreHandle};
 use flotilla_state_machines::Resource;
 
 use super::{
-    reads::{indexed, keyed, latest, requested_at, view, ReadError, StoreReads, View},
+    reads::{indexed, keyed, latest, view, ReadError, StoreReads, View},
     EngineError, Lifecycles,
 };
 use crate::stored::{
@@ -156,7 +156,7 @@ pub(crate) fn record(read: &mut Read<'_>, view: View<TerminalSessionKind>) -> Re
         Some(id) => read.load::<TerminalLaunchFacts>(id)?.map(|loaded| facts_view(&loaded.value)),
         None => None,
     };
-    let requested_at = requested_at::<Resource<TerminalSession>>(read, &view.name, &view.home)?.map(time).unwrap_or(DateTime::UNIX_EPOCH);
+    let requested_at = view.created;
     let request = &view.request;
     Ok(TerminalRecord {
         environment: request.environment.name.clone(),

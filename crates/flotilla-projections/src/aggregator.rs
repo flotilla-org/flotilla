@@ -7184,6 +7184,7 @@ mod tests {
                     .path("/work/ops".into())
                     .build(),
                 discovered: false,
+                requested_at: chrono::DateTime::UNIX_EPOCH,
                 reading,
                 default_branch: None,
             }))

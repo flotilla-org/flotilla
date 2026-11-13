@@ -30,6 +30,7 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 
 use super::provenance;
+use super::reads::created_at;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::{manifest_root::ManifestRoot, placement::FulfilmentKindDefinition};
@@ -118,8 +119,9 @@ fn object(
 ) -> Result<Held, StoreError> {
     let change = read.last_change(id)?;
     let (labels, annotations) = stamps(read, roots, &name, change.as_ref())?;
+    let created_at = created_at(read, id)?;
     let spec = serde_json::to_value(value.spec()).map_err(|error| format!("{KIND} {name} at {home}: {error}"));
-    Ok(spec.map(|spec| EngineObject { name, home, version, labels, annotations, spec, status: None }))
+    Ok(spec.map(|spec| EngineObject { name, home, version, created_at, labels, annotations, spec, status: None }))
 }
 
 fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
@@ -277,10 +279,12 @@ impl EngineKinds {
             match written {
                 Ok(version) => {
                     let spec = serde_json::to_value(value.spec()).map_err(|error| format!("{KIND} {name}: {error}"))?;
+                    let created = self.log.created::<FulfilmentKindDefinition>(name, &self.home).map_err(|error| error.to_string())?;
                     return Ok(EngineObject {
                         name: name.to_owned(),
                         home: self.home.clone(),
                         version,
+                        created_at: created.to_datetime(),
                         labels: labels.clone(),
                         annotations: annotations.clone(),
                         spec,

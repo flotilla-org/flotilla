@@ -400,6 +400,77 @@ fn an_imported_convoy_is_created_at_its_old_creation_time() {
     assert_eq!(read.creation_time(id).expect("created"), created, "write_into");
 }
 
+// Behaviour (#3108 creation time): an imported convoy's readers see the old record's creation
+// timestamp exactly, sub-microsecond digits included, at its home and at a replica that installed
+// it from the home's snapshot or applied its create: the managed checkout name hashes its RFC 3339
+// form, so the name the old store gave its checkouts is the name every home computes.
+#[test]
+fn an_imported_convoy_reads_its_old_creation_timestamp_at_home_and_on_replicas() {
+    use std::sync::Arc;
+
+    use flotilla_engine_convoys::convoy_records::EngineConvoyRecords;
+    use flotilla_resources::{
+        checkout_path::{checkout_name, checkout_placement_scope},
+        convoy_records::{ConvoyJoins, ConvoyRecords},
+    };
+    use flotilla_schema::Timestamp;
+    use flotilla_schema_sqlite::stream::{Follower, Service};
+    let old = stamped_to_the_nanosecond();
+    let expected = old.metadata.creation_timestamp.to_rfc3339();
+    let old_name = checkout_name("work", "flotilla", false, checkout_placement_scope(&old, Some("feta-host")).as_deref());
+    let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let open = |home: &str| {
+        Arc::new(
+            Service::open(&dir.path().join(format!("{home}.sqlite")), home, flotilla_engine_store::registry().expect("registry"))
+                .expect("store"),
+        )
+    };
+    let home = open(HOME);
+    let written =
+        home.with_store(|store| Ok(flotilla_engine_convoys::convoy_import::write(store, &convoy))).expect("store").expect("written");
+    // `after` none serves the home's snapshot; `Some(0)` serves its entries, the create among them.
+    let replica = |at: &str, after: Option<u64>| {
+        let mut frames = Vec::new();
+        home.serve(after, Timestamp(1), |frame| {
+            frames.push(frame.to_vec());
+            Ok(())
+        })
+        .expect("serve");
+        let replica = open(at);
+        replica
+            .with_store(|store| {
+                Follower::new(store).receive(HOME, |sink| {
+                    for frame in &frames {
+                        sink(frame)?;
+                    }
+                    Ok(())
+                })
+            })
+            .expect("follow");
+        replica
+    };
+    let readers = [
+        ("home", HOME, Arc::clone(&home)),
+        ("snapshot replica", "home-b", replica("home-b", None)),
+        ("event replica", "home-c", replica("home-c", Some(0))),
+    ];
+    for (which, at, service) in readers {
+        let records = EngineConvoyRecords::new(at, service, Arc::default());
+        let record = records.get(written.name(), Some(HOME)).expect("read").expect("held");
+        assert_eq!(record.admitted_at, old.metadata.creation_timestamp, "{which}: the old stamp exactly");
+        let works = BTreeMap::new();
+        let working = std::collections::BTreeSet::new();
+        let view = record.read_view("flotilla", ConvoyJoins { works: &works, working: &working, notes: None });
+        assert_eq!(view.metadata.creation_timestamp.to_rfc3339(), expected, "{which}: the RFC 3339 form the old store served");
+        assert_eq!(
+            checkout_name("work", "flotilla", false, checkout_placement_scope(&view, Some("feta-host")).as_deref()),
+            old_name,
+            "{which}: the managed checkout name the old store gave"
+        );
+    }
+}
+
 // Behaviour (the pre-roll rehearsal): every Convoy the stored-record corpus holds is imported,
 // stays on the old path, or is refused by name, and every imported one writes and reads back.
 // Every unfinished, bootstrapped convoy is imported or refused; ended ones stay old. (The current

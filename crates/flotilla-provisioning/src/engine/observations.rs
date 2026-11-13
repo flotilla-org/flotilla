@@ -33,6 +33,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
 
+use super::reads::created_at;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
@@ -48,24 +49,30 @@ const BRANCH_PAGE: u32 = 64;
 /// The writer the plain-kind port records for the observer's writes.
 const WRITER: &str = "forge-observer";
 
-/// One home's record of either kind, at its version.
+/// One home's record of either kind, at its version, with when it was created.
 #[derive(Clone)]
 enum Held {
-    ChangeRequest(u64, ChangeRequestRecord),
-    Issue(u64, IssueRecord),
+    ChangeRequest(u64, DateTime<Utc>, ChangeRequestRecord),
+    Issue(u64, DateTime<Utc>, IssueRecord),
 }
 
 impl Held {
     fn failing_since(&self) -> Option<Timestamp> {
         match self {
-            Self::ChangeRequest(_, record) => record.failing_since,
-            Self::Issue(_, record) => record.failing_since,
+            Self::ChangeRequest(_, _, record) => record.failing_since,
+            Self::Issue(_, _, record) => record.failing_since,
         }
     }
 
     fn version(&self) -> u64 {
         match self {
-            Self::ChangeRequest(version, _) | Self::Issue(version, _) => *version,
+            Self::ChangeRequest(version, _, _) | Self::Issue(version, _, _) => *version,
+        }
+    }
+
+    fn created(&self) -> DateTime<Utc> {
+        match self {
+            Self::ChangeRequest(_, created, _) | Self::Issue(_, created, _) => *created,
         }
     }
 }
@@ -191,12 +198,16 @@ fn kind_of(kind: &str) -> Result<&'static str, String> {
 }
 
 fn load(read: &mut Read<'_>, kind: &'static str, id: ResourceId) -> Result<Option<(String, String, Held)>, StoreError> {
-    Ok(match kind {
-        CHANGE_REQUEST => read
-            .load::<ChangeRequestRecord>(id)?
-            .map(|loaded| (loaded.name, loaded.home, Held::ChangeRequest(loaded.version, loaded.value))),
-        _ => read.load::<IssueRecord>(id)?.map(|loaded| (loaded.name, loaded.home, Held::Issue(loaded.version, loaded.value))),
-    })
+    match kind {
+        CHANGE_REQUEST => match read.load::<ChangeRequestRecord>(id)? {
+            Some(loaded) => Ok(Some((loaded.name, loaded.home, Held::ChangeRequest(loaded.version, created_at(read, id)?, loaded.value)))),
+            None => Ok(None),
+        },
+        _ => match read.load::<IssueRecord>(id)? {
+            Some(loaded) => Ok(Some((loaded.name, loaded.home, Held::Issue(loaded.version, created_at(read, id)?, loaded.value)))),
+            None => Ok(None),
+        },
+    }
 }
 
 fn code_kind(code: KindCode) -> Option<&'static str> {
@@ -395,12 +406,12 @@ impl EngineObservations {
         let confirmed = self.confirmed_at(home, held.failing_since());
         let encode = |value: serde_json::Result<Value>| value.map_err(|error| format!("{name} at {home}: {error}"));
         let (version, spec, status) = match held {
-            Held::ChangeRequest(version, record) => (
+            Held::ChangeRequest(version, _, record) => (
                 *version,
                 encode(serde_json::to_value(record.old_spec(home)))?,
                 encode(serde_json::to_value(record.old_status(confirmed)))?,
             ),
-            Held::Issue(version, record) => {
+            Held::Issue(version, _, record) => {
                 let status = record.old_status(confirmed).map_err(|error| format!("{name} at {home}: {error}"))?;
                 (*version, encode(serde_json::to_value(record.old_spec(home)))?, encode(serde_json::to_value(status))?)
             }
@@ -409,6 +420,7 @@ impl EngineObservations {
             name: name.to_owned(),
             home: home.to_owned(),
             version,
+            created_at: held.created(),
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             spec,

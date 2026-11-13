@@ -50,7 +50,7 @@ use flotilla_state_machines::{
 
 use super::{
     evidence,
-    reads::{indexed, keyed, requested_at, view, ReadError, StoreReads, View},
+    reads::{indexed, keyed, view, ReadError, StoreReads, View},
     EngineError, Lifecycles, Step,
 };
 
@@ -343,7 +343,7 @@ impl EngineVessels {
     ) -> Result<Vec<VesselRecord>, String> {
         let records: Vec<VesselRecord> = self
             .reads
-            .read(|read| views(read)?.into_iter().map(|view| record(read, view)).collect())
+            .read(|read| Ok(views(read)?.into_iter().map(record).collect()))
             .map_err(|error| format!("engine vessels {what}: {error}"))?;
         self.launches_read.fetch_add(records.len() as u64, Ordering::Relaxed);
         Ok(records)
@@ -393,7 +393,7 @@ impl VesselRecords for EngineVessels {
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<VesselRecord>, String> {
         let home = home.unwrap_or(self.home()).to_owned();
         self.reads
-            .read(|read| keyed::<VesselKind>(read, name, &home)?.map(|view| record(read, view)).transpose())
+            .read(|read| Ok(keyed::<VesselKind>(read, name, &home)?.map(record)))
             .map_err(|error| format!("engine Vessel/{name}: {error}"))
     }
 
@@ -405,7 +405,7 @@ impl VesselRecords for EngineVessels {
             .read(|read| {
                 for home in std::iter::once(&here).chain(homes.iter().filter(|home| **home != here)) {
                     if let Some(view) = keyed::<VesselKind>(read, name, home)? {
-                        return record(read, view).map(Some);
+                        return Ok(Some(record(view)));
                     }
                 }
                 Ok(None)
@@ -435,7 +435,7 @@ impl VesselRecords for EngineVessels {
                     for work in &admission.workflow_snapshot.vessels {
                         let launch_of = flotilla_resources::vessel_resource_name(flotilla_resources::convoy::launch_of(convoy), &work.name);
                         for view in indexed::<VesselKind, _>(read, &VesselSpec::by_launch(&id, &launch_of))? {
-                            launches.push(record(read, view)?);
+                            launches.push(record(view));
                         }
                     }
                 }
@@ -466,7 +466,7 @@ impl VesselRecords for EngineVessels {
         let query = VesselSpec::by_launch(&ConvoyId::new(convoy, convoy_home), &launch_of.to_owned());
         self.reads
             .read(|read| match read.integer_index_keys_before(&query, home, i64::MAX, 1)?.first() {
-                Some((id, _)) => view::<VesselKind>(read, *id)?.map(|view| record(read, view)).transpose(),
+                Some((id, _)) => Ok(view::<VesselKind>(read, *id)?.map(record)),
                 None => Ok(None),
             })
             .map_err(|error| format!("engine Vessel {launch_of} of convoy {convoy}@{convoy_home}: {error}"))
@@ -524,11 +524,11 @@ impl VesselRecords for EngineVessels {
 }
 
 /// `view` as a reader sees it.
-fn record(read: &mut Read<'_>, view: View<VesselKind>) -> Result<VesselRecord, ReadError> {
+fn record(view: View<VesselKind>) -> VesselRecord {
     let time = |at: Timestamp| at.to_datetime().unwrap_or(DateTime::UNIX_EPOCH);
-    let requested_at = requested_at::<Resource<Vessel>>(read, &view.name, &view.home)?.map(time).unwrap_or(DateTime::UNIX_EPOCH);
+    let requested_at = view.created;
     let request = view.request;
-    Ok(VesselRecord {
+    VesselRecord {
         convoy: request.convoy.name,
         convoy_home: request.convoy.home,
         launch_of: request.launch_of,
@@ -538,7 +538,7 @@ fn record(read: &mut Read<'_>, view: View<VesselKind>) -> Result<VesselRecord, R
         reading: view.judgement.reading(),
         name: view.name,
         home: view.home,
-    })
+    }
 }
 
 /// What a followed write of the kinds tells readers.

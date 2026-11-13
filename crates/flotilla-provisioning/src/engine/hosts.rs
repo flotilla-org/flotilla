@@ -42,6 +42,7 @@ use futures::stream::BoxStream;
 use serde_json::{json, Value};
 
 use super::host_import;
+use super::reads::created_at;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::host::{Class, Condition, HostObservation, HostRecord, Readiness};
@@ -61,7 +62,8 @@ const OBSERVER: &str = "host-observer";
 /// One home's records of one Host, as the resident map holds them.
 #[derive(Clone, Debug)]
 struct Held {
-    host: Option<(HostRecord, u64)>,
+    /// The Host record, its version and when it was created.
+    host: Option<(HostRecord, u64, DateTime<Utc>)>,
     observation: Option<(HostObservation, u64)>,
 }
 
@@ -79,7 +81,10 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
     let host = match read.resolve(HOST, name, home)? {
-        Some(id) => read.load::<HostRecord>(id)?.map(|loaded| (loaded.value, loaded.version)),
+        Some(id) => match read.load::<HostRecord>(id)? {
+            Some(loaded) => Some((loaded.value, loaded.version, created_at(read, id)?)),
+            None => None,
+        },
         None => None,
     };
     let observation = match read.resolve(OBSERVATION, name, home)? {
@@ -384,7 +389,7 @@ impl EngineHosts {
 
     /// `held`, at `home`, as the old object; None for an observation whose Host is gone.
     fn object(&self, name: &str, home: &str, held: &Held) -> Option<Result<EngineObject, String>> {
-        let (host, host_version) = held.host.as_ref()?;
+        let (host, host_version, created_at) = held.host.as_ref()?;
         let spec = host.spec();
         let status = held.observation.as_ref().map(|(observation, _)| status(name, home, &spec, observation, self.heard(home), self.now()));
         let encoded = serde_json::to_value(&spec)
@@ -397,6 +402,7 @@ impl EngineHosts {
             // moves with each write of either record. Delete ends both, and a Host made again
             // starts as a new object.
             version: host_version + held.observation.as_ref().map_or(0, |(_, version)| *version),
+            created_at: *created_at,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             spec,
@@ -408,10 +414,14 @@ impl EngineHosts {
     fn own(&self, name: &str) -> Result<Held, String> {
         let host = self.log.get::<HostRecord>(name, &self.home).map_err(|error| error.to_string())?;
         let observation = self.log.get::<HostObservation>(name, &self.home).map_err(|error| error.to_string())?;
-        Ok(Held {
-            host: host.map(|host| (host.spec, host.version)),
-            observation: observation.map(|observation| (observation.spec, observation.version)),
-        })
+        let host = match host {
+            Some(host) => {
+                let created = self.log.created::<HostRecord>(name, &self.home).map_err(|error| error.to_string())?;
+                Some((host.spec, host.version, created.to_datetime()))
+            }
+            None => None,
+        };
+        Ok(Held { host, observation: observation.map(|observation| (observation.spec, observation.version)) })
     }
 
     fn own_object(&self, name: &str) -> Result<EngineObject, String> {
@@ -552,7 +562,7 @@ impl EngineRecords for EngineHosts {
         refuse_kind(kind)?;
         let status: HostStatus = serde_json::from_value(status).map_err(|error| format!("{KIND} status: {error}"))?;
         let _writing = self.writing.lock().await;
-        let Some((host, _)) = self.own(name)?.host else {
+        let Some((host, _, _)) = self.own(name)?.host else {
             return Err(format!("{KIND} {name} is not held at {}", self.home));
         };
         self.write_observation(name, &host.spec(), &status)?;
@@ -571,7 +581,7 @@ impl EngineRecords for EngineHosts {
         if let Some((_, version)) = held.observation {
             deleted(self.log.delete::<HostObservation>(name, version, &change))?;
         }
-        if let Some((_, version)) = held.host {
+        if let Some((_, version, _)) = held.host {
             deleted(self.log.delete::<HostRecord>(name, version, &change))?;
         }
         Ok(())

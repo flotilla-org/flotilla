@@ -54,6 +54,7 @@ fn record(read: &mut Read<'_>, view: View<CloneKind>) -> Result<CloneRecord, Rea
         reading: view.judgement.reading(),
         spec: spec_of(&view.request),
         discovered: view.request.discovered,
+        requested_at: view.created,
         name: view.name,
         home: view.home,
         default_branch,

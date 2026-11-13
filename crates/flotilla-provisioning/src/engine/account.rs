@@ -33,6 +33,9 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
 use futures::stream::BoxStream;
 
+use chrono::{DateTime, Utc};
+
+use super::reads::created_at;
 use super::watch::CommitsSeen;
 use super::watch::EngineWatch;
 use crate::stored::account::{
@@ -55,6 +58,7 @@ struct Resident {
     follower: Follower,
     bindings: Bindings,
     provisions: Provisions,
+    created: Created,
 }
 
 /// The account records of the decided store at one home.
@@ -89,7 +93,12 @@ impl EngineAccounts {
         let home = log.home().to_owned();
         let bindings = open_home::<AccountBinding>(log)?;
         let provisions = PlainLog::new(service.store());
-        let resident = Resident { follower: Follower::new([BINDING, PROVISION]), bindings: BTreeMap::new(), provisions: BTreeMap::new() };
+        let resident = Resident {
+            follower: Follower::new([BINDING, PROVISION]),
+            bindings: BTreeMap::new(),
+            provisions: BTreeMap::new(),
+            created: BTreeMap::new(),
+        };
         let accounts = Self {
             commits: CommitsSeen::follow(&service, [BINDING, PROVISION]),
             service,
@@ -187,43 +196,66 @@ impl EngineAccounts {
 fn reload(read: &mut Read<'_>, resident: &mut Resident, identity: &Identity) -> Result<(), StoreError> {
     let key = (identity.home.clone(), identity.name.clone());
     let id = read.resolve(identity.kind, &identity.name, &identity.home)?;
+    let created_key = (identity.kind, identity.home.clone(), identity.name.clone());
+    let mut held = false;
     if identity.kind == BINDING {
         match id.map(|id| read.load::<Resource<AccountBinding>>(id)).transpose()?.flatten() {
-            Some(loaded) => resident.bindings.insert(key, loaded.value.with_identity(&loaded.name, loaded.version)),
-            None => resident.bindings.remove(&key),
-        };
+            Some(loaded) => {
+                resident.bindings.insert(key, loaded.value.with_identity(&loaded.name, loaded.version));
+                held = true;
+            }
+            None => {
+                resident.bindings.remove(&key);
+            }
+        }
     } else if identity.kind == PROVISION {
         match id.map(|id| read.load::<ProvisionSpec>(id)).transpose()?.flatten() {
             Some(loaded) => {
-                resident.provisions.insert(key, Plain { name: loaded.name, home: loaded.home, version: loaded.version, spec: loaded.value })
+                resident
+                    .provisions
+                    .insert(key, Plain { name: loaded.name, home: loaded.home, version: loaded.version, spec: loaded.value });
+                held = true;
             }
-            None => resident.provisions.remove(&key),
-        };
+            None => {
+                resident.provisions.remove(&key);
+            }
+        }
     }
+    // Only a held record has a creation time: an identity named before its create has none.
+    match id.filter(|_| held) {
+        Some(id) => resident.created.insert(created_key, created_at(read, id)?),
+        None => resident.created.remove(&created_key),
+    };
     Ok(())
 }
 
 type Bindings = BTreeMap<(String, String), Resource<AccountBinding>>;
 type Provisions = BTreeMap<(String, String), Plain<ProvisionSpec>>;
+/// When each held record was created, by kind, home and name.
+type Created = BTreeMap<(KindCode, String, String), DateTime<Utc>>;
 
 /// Reads every account record homed at `home` into the resident maps, in place of what they held.
 fn rescan(read: &mut Read<'_>, resident: &mut Resident, home: &str) -> Result<(), StoreError> {
-    let (bindings, provisions) = scan_home(read, home)?;
+    let (bindings, provisions, created) = scan_home(read, home)?;
     resident.bindings.retain(|(owner, _), _| owner != home);
     resident.provisions.retain(|(owner, _), _| owner != home);
+    resident.created.retain(|(_, owner, _), _| owner != home);
     resident.bindings.extend(bindings);
     resident.provisions.extend(provisions);
+    resident.created.extend(created);
     Ok(())
 }
 
-/// Every account record homed at `home`.
-fn scan_home(read: &mut Read<'_>, home: &str) -> Result<(Bindings, Provisions), StoreError> {
+/// Every account record homed at `home`, and when each was created.
+fn scan_home(read: &mut Read<'_>, home: &str) -> Result<(Bindings, Provisions, Created), StoreError> {
     let mut bindings = Bindings::new();
+    let mut created = Created::new();
     let mut after = None;
     loop {
         let page = read.scan::<Resource<AccountBinding>>(home, after, 64)?;
         for id in page.ids {
             if let Some(loaded) = read.load::<Resource<AccountBinding>>(id)? {
+                created.insert((BINDING, home.to_owned(), loaded.name.clone()), created_at(read, id)?);
                 bindings.insert((home.to_owned(), loaded.name.clone()), loaded.value.with_identity(&loaded.name, loaded.version));
             }
         }
@@ -238,6 +270,7 @@ fn scan_home(read: &mut Read<'_>, home: &str) -> Result<(Bindings, Provisions), 
         let page = read.scan::<ProvisionSpec>(home, after, 64)?;
         for id in page.ids {
             if let Some(loaded) = read.load::<ProvisionSpec>(id)? {
+                created.insert((PROVISION, home.to_owned(), loaded.name.clone()), created_at(read, id)?);
                 provisions.insert(
                     (home.to_owned(), loaded.name.clone()),
                     Plain { name: loaded.name, home: loaded.home, version: loaded.version, spec: loaded.value },
@@ -246,7 +279,7 @@ fn scan_home(read: &mut Read<'_>, home: &str) -> Result<(Bindings, Provisions), 
         }
         after = page.next;
         if after.is_none() {
-            return Ok((bindings, provisions));
+            return Ok((bindings, provisions, created));
         }
     }
 }
@@ -570,7 +603,7 @@ fn provision_convoy(read: &mut Read<'_>, provision: &ProvisionSpec) -> Result<Op
 
 /// A change for every account record homed at `home`.
 fn rescanned(read: &mut Read<'_>, home: &str) -> Result<Vec<AccountChange>, StoreError> {
-    let (bindings, provisions) = scan_home(read, home)?;
+    let (bindings, provisions, _) = scan_home(read, home)?;
     let mut changes: Vec<_> =
         bindings.iter().map(|((_, name), binding)| AccountChange::Binding { name: name.clone(), convoy: convoy_of(binding) }).collect();
     for ((_, name), provision) in &provisions {
@@ -734,8 +767,9 @@ const PROVISION_KIND: &str = "AccountProvision";
 
 /// A binding as the old store's object: labelled by its own name, its credential and its
 /// requester's convoy, as its readers find it.
-fn binding_object(binding: &Resource<AccountBinding>, home: &str) -> Result<EngineObject, String> {
+fn binding_object(binding: &Resource<AccountBinding>, home: &str, created: &Created) -> Result<EngineObject, String> {
     let record = record(binding, home);
+    let created_at = created_of(created, BINDING, home, &record.name)?;
     let mut labels = BTreeMap::from([
         (ACCOUNT_BINDING_LABEL.to_owned(), record.name.clone()),
         (ACCOUNT_CREDENTIAL_LABEL.to_owned(), record.spec.credential.0.clone()),
@@ -745,6 +779,7 @@ fn binding_object(binding: &Resource<AccountBinding>, home: &str) -> Result<Engi
         name: record.name,
         home: record.home,
         version: binding.version().0,
+        created_at,
         labels,
         annotations: BTreeMap::new(),
         spec: serde_json::to_value(&record.spec).map_err(|error| error.to_string())?,
@@ -752,10 +787,16 @@ fn binding_object(binding: &Resource<AccountBinding>, home: &str) -> Result<Engi
     })
 }
 
+/// When the held record `name` of `kind` at `home` was created.
+fn created_of(created: &Created, kind: KindCode, home: &str, name: &str) -> Result<DateTime<Utc>, String> {
+    created.get(&(kind, home.to_owned(), name.to_owned())).copied().ok_or_else(|| format!("{kind} {name} at {home} has no creation time"))
+}
+
 /// A provision as the old store's object: labelled by its binding, and its convoy while this
 /// store holds the binding.
-fn provision_object(provision: &Plain<ProvisionSpec>, bindings: &Bindings) -> Result<EngineObject, String> {
+fn provision_object(provision: &Plain<ProvisionSpec>, bindings: &Bindings, created: &Created) -> Result<EngineObject, String> {
     let record = provision_record(provision);
+    let created_at = created_of(created, PROVISION, &provision.home, &provision.name)?;
     let mut labels = BTreeMap::from([(ACCOUNT_BINDING_LABEL.to_owned(), record.spec.binding.name.clone())]);
     let binding = bindings.get(&(record.spec.binding.home.clone(), record.spec.binding.name.clone()));
     labels.extend(binding.and_then(convoy_of).map(|convoy| (CONVOY_LABEL.to_owned(), convoy)));
@@ -763,6 +804,7 @@ fn provision_object(provision: &Plain<ProvisionSpec>, bindings: &Bindings) -> Re
         name: record.name,
         home: record.home,
         version: provision.version,
+        created_at,
         labels,
         annotations: BTreeMap::new(),
         spec: serde_json::to_value(&record.spec).map_err(|error| error.to_string())?,
@@ -775,8 +817,10 @@ impl EngineAccounts {
     fn objects(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
         let resident = self.refresh()?;
         match kind {
-            BINDING_KIND => resident.bindings.iter().map(|((home, _), binding)| binding_object(binding, home)).collect(),
-            PROVISION_KIND => resident.provisions.values().map(|provision| provision_object(provision, &resident.bindings)).collect(),
+            BINDING_KIND => resident.bindings.iter().map(|((home, _), binding)| binding_object(binding, home, &resident.created)).collect(),
+            PROVISION_KIND => {
+                resident.provisions.values().map(|provision| provision_object(provision, &resident.bindings, &resident.created)).collect()
+            }
             other => Err(format!("{other} is not served by the account records")),
         }
     }
@@ -789,13 +833,13 @@ impl EngineAccounts {
                 .bindings
                 .iter()
                 .filter(|((_, held), _)| held == name)
-                .map(|((home, _), binding)| binding_object(binding, home))
+                .map(|((home, _), binding)| binding_object(binding, home, &resident.created))
                 .collect(),
             PROVISION_KIND => resident
                 .provisions
                 .iter()
                 .filter(|((_, held), _)| held == name)
-                .map(|(_, provision)| provision_object(provision, &resident.bindings))
+                .map(|(_, provision)| provision_object(provision, &resident.bindings, &resident.created))
                 .collect(),
             other => Err(format!("{other} is not served by the account records")),
         }

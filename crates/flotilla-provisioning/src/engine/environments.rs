@@ -197,7 +197,8 @@ fn record(read: &mut Read<'_>, view: View<EnvironmentKind>) -> Result<Environmen
     let launch = stored_facts(read, &view.name, &view.home)?;
     let spec = spec_of(&view.request).map_err(ReadError)?;
     let vessel = view.request.holder.as_ref().and_then(|holder| holder.0.strip_prefix("vessel:")).map(str::to_owned);
-    Ok(EnvironmentRecord { reading: view.judgement.reading(), name: view.name, home: view.home, spec, vessel, launch })
+    let requested_at = view.created;
+    Ok(EnvironmentRecord { reading: view.judgement.reading(), name: view.name, home: view.home, spec, vessel, requested_at, launch })
 }
 
 /// The [`EnvironmentRecords`] port over one decided store: this home's environments through its

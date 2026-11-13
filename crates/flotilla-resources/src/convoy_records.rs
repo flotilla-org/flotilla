@@ -98,6 +98,8 @@ pub struct UnreadableLaunch {
     /// The project it belongs to, by name.
     pub project: String,
     pub workflow_ref: String,
+    /// When it was created: its record's creation time.
+    pub created_at: DateTime<Utc>,
     pub reason: String,
 }
 
@@ -136,7 +138,7 @@ impl UnreadableLaunch {
                 owner_references: Vec::new(),
                 finalizers: Vec::new(),
                 deletion_timestamp: None,
-                creation_timestamp: DateTime::UNIX_EPOCH,
+                creation_timestamp: self.created_at,
                 merge: None,
             },
             spec: ConvoySpec::builder()

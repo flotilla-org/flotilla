@@ -21,7 +21,7 @@ use flotilla_resources::{
     lifecycle_reads::ChangeCursor,
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
-use flotilla_schema::{Kind, KindCode, Timestamp};
+use flotilla_schema::{Identity, Kind, KindCode, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{
     machines::{
@@ -261,6 +261,9 @@ fn entry(
     version: u64,
 ) -> Result<Result<ConvoyRecord, UnreadableLaunch>, StoreError> {
     let spec = convoy.spec();
+    let identity = Identity { kind: <Resource<Convoy> as Kind>::CODE, name: convoy.name().to_owned(), home: home.to_owned() };
+    let id = read.resolve(identity.kind, &identity.name, home)?.ok_or(StoreError::NotCreated { identity })?;
+    let admitted_at = read.creation_time(id)?.to_datetime();
     let unreadable = |reason: String| UnreadableLaunch {
         name: convoy.name().to_owned(),
         home: home.to_owned(),
@@ -269,22 +272,13 @@ fn entry(
         launch: spec.launch,
         project: spec.project.get(AddressKind::Project).unwrap_or_default().to_owned(),
         workflow_ref: spec.workflow_ref.clone(),
+        created_at: admitted_at,
         reason,
     };
     let admission = match AdmissionDocument::decode(convoy.name(), spec.admission.value().bytes()) {
         Ok(admission) => admission,
         Err(error) => return Ok(Err(unreadable(format!("convoy {}'s admission: {error}", convoy.name())))),
     };
-    let id = read.resolve(<Resource<Convoy> as Kind>::CODE, convoy.name(), home)?;
-    let admitted_at = match id {
-        Some(id) => read.changes(id, 0, 1)?.into_iter().next().map(|created| created.change),
-        None => None,
-    };
-    let admitted_at = match admitted_at {
-        Some(change) => read.change(home, change)?.map(|change| time(change.at)),
-        None => None,
-    }
-    .unwrap_or(DateTime::UNIX_EPOCH);
 
     let status = ConvoyStatus { workflow_snapshot: Some(admission.workflow_snapshot.clone()), ..ConvoyStatus::default() };
     let crews = map::Crews::of(&status);
@@ -334,11 +328,7 @@ fn entry(
             unlinked.push(subject);
             continue;
         }
-        let at = match id {
-            Some(id) => written_at(read, id, home, row.version)?.map(time),
-            None => None,
-        }
-        .unwrap_or(admitted_at);
+        let at = written_at(read, id, home, row.version)?.map(time).unwrap_or(admitted_at);
         let relationship = match link.subject.kind() {
             AddressKind::Issue => Relationship::WorksOn,
             _ => Relationship::Produces,

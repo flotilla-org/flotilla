@@ -16,7 +16,7 @@ pub type EngineArtifacts = PlainRecords<ArtifactRecord>;
 impl PlainKind for ArtifactRecord {
     const WRITER: &'static str = "artifact-records";
 
-    fn object(name: String, home: String, version: u64, record: &Self) -> Held {
+    fn object(name: String, home: String, version: u64, created_at: chrono::DateTime<chrono::Utc>, record: &Self) -> Held {
         let kind = <Self as Kind>::KIND;
         let spec = record.spec().map_err(|error| format!("{kind} {name} at {home}: {error}"))?;
         Ok(EngineObject {
@@ -25,6 +25,7 @@ impl PlainKind for ArtifactRecord {
             name,
             home,
             version,
+            created_at,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
         })

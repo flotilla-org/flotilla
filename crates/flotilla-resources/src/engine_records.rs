@@ -18,6 +18,8 @@ pub struct EngineObject {
     pub home: String,
     /// The record's version at its home; it moves with each write.
     pub version: u64,
+    /// When the record was created at its home: the time of the change that created it.
+    pub created_at: chrono::DateTime<chrono::Utc>,
     pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
     pub spec: serde_json::Value,

@@ -730,8 +730,7 @@ pub(crate) fn select_reads<T: Resource>(
 }
 
 /// An engine record as the old store's object in `namespace`: the labels and annotations its
-/// port rebuilds, and no merge metadata, owner references or finalizers. The engine keeps no
-/// creation time, so it reads as the epoch.
+/// port rebuilds, its creation time, and no merge metadata, owner references or finalizers.
 pub(crate) fn engine_object<T: Resource>(namespace: &str, record: EngineObject) -> Result<ResourceObject<T>, ResourceError> {
     let decode =
         |what: &str, error: serde_json::Error| ResourceError::decode(format!("{} {} {what}: {error}", T::API_PATHS.kind, record.name));
@@ -747,7 +746,7 @@ pub(crate) fn engine_object<T: Resource>(namespace: &str, record: EngineObject) 
             owner_references: Vec::new(),
             finalizers: Vec::new(),
             deletion_timestamp: None,
-            creation_timestamp: DateTime::<Utc>::UNIX_EPOCH,
+            creation_timestamp: record.created_at,
             merge: None,
         },
         spec,

@@ -23,6 +23,11 @@ use crate::stored::{
     Holder, Launches,
 };
 
+/// When held resource `id` was last created, as an old object's creation time.
+pub(crate) fn created_at(read: &mut Read<'_>, id: ResourceId) -> Result<chrono::DateTime<chrono::Utc>, StoreError> {
+    Ok(read.creation_time(id)?.to_datetime())
+}
+
 /// How a provisioning resource stands now: a judgement over its stored state, never stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Judgement {
@@ -54,6 +59,8 @@ pub struct View<K: LifecycleKind> {
     pub state: LifecycleState,
     /// When the current state was entered.
     pub since: Timestamp,
+    /// When it was requested: its creation time.
+    pub created: chrono::DateTime<chrono::Utc>,
     pub judgement: Judgement,
 }
 
@@ -304,6 +311,7 @@ where
     };
     Ok(Some(View {
         judgement,
+        created: created_at(read, id)?,
         name: loaded.name,
         home: loaded.home,
         request: loaded.value.spec().clone(),
@@ -335,13 +343,6 @@ where
             }
         }
     }
-}
-
-/// When `name` of kind `R` homed at `home` was requested: the time of the change that created it.
-pub(crate) fn requested_at<R: Kind>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<Timestamp>, ReadError> {
-    let Some(id) = read.resolve(R::CODE, name, home)? else { return Ok(None) };
-    let Some(created) = read.changes(id, 0, 1)?.into_iter().next() else { return Ok(None) };
-    Ok(read.change(home, created.change)?.map(|change| change.at))
 }
 
 pub(crate) fn keyed<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<View<K>>, ReadError>

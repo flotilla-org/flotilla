@@ -25,9 +25,12 @@ use flotilla_resources::{
     ResourceProvenance, TerminalSession, Vessel, VesselImage, ACTUATOR_SOURCE_ROOT_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV,
     CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND,
 };
-use flotilla_resources::{clone_records::CloneRecords, realisation_settings};
+use flotilla_resources::{
+    checkout_path::{checkout_name, checkout_placement_scope},
+    clone_records::CloneRecords,
+    realisation_settings,
+};
 use flotilla_store::{controller::SecondaryWatch, ReplicaReadResolver, ResourceBackend, TypedResolver};
-use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 /// A vessel older than this still waiting for its convoy's snapshot is stuck, not racing admission.
@@ -1560,27 +1563,6 @@ fn environment_name(launch: &str) -> String {
     format!("env-{}", launch_slug(launch))
 }
 
-fn checkout_name(vessel_name: &str, workspace_slug: &str, multi_repository: bool, placement_scope: Option<&str>) -> String {
-    let repository_suffix = if multi_repository { format!("-{workspace_slug}") } else { String::new() };
-    let placement_suffix = placement_scope.map(|scope| format!("-{scope}")).unwrap_or_default();
-    format!("checkout-{vessel_name}{repository_suffix}{placement_suffix}")
-}
-
-fn checkout_placement_scope(convoy: &ResourceObject<Convoy>, host_ref: Option<&str>) -> Option<String> {
-    let host_ref = host_ref?;
-    let mut hash = Sha256::new();
-    hash.update(b"managed-checkout-placement-v1\0");
-    hash.update(host_ref.as_bytes());
-    hash.update([0]);
-    hash.update(convoy.metadata.creation_timestamp.to_rfc3339().as_bytes());
-    hash.update([0]);
-    if let Some(origin_root) = convoy.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION) {
-        hash.update(origin_root.as_bytes());
-    }
-    let digest = format!("{:x}", hash.finalize());
-    Some(digest[..12].to_string())
-}
-
 fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &str, branch_slug: &str) -> String {
     format!("{}/{}/{}.{}", repo_default_dir.trim_end_matches('/'), convoy_slug, repo_slug, branch_slug)
 }
@@ -1691,9 +1673,11 @@ mod tests {
     };
     use flotilla_store::ResourceBackend;
 
+    use flotilla_resources::checkout_path::{checkout_name, checkout_placement_scope};
+
     use super::{
-        checkout_name, checkout_placement_scope, configure_contained_tracking, environment_provider_labels, environment_with_credentials,
-        legible_waiting_for, placement_strategy, PlacementStrategy, VesselPlanning,
+        configure_contained_tracking, environment_provider_labels, environment_with_credentials, legible_waiting_for, placement_strategy,
+        PlacementStrategy, VesselPlanning,
     };
 
     /// The account records a planner reads: none of these tests binds an account.

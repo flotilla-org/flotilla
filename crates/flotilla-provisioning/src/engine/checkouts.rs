@@ -33,7 +33,7 @@ use flotilla_state_machines::{
 
 use super::{
     launch_log::StagedFacts,
-    reads::{indexed, keyed, latest, requested_at, view, ReadError, StoreReads, View},
+    reads::{indexed, keyed, latest, view, ReadError, StoreReads, View},
     EngineError, Lifecycles,
 };
 use crate::stored::{
@@ -301,9 +301,8 @@ impl EngineCheckouts {
             },
             None => None,
         };
-        let requested_at = requested_at::<Resource<Checkout>>(read, &view.name, &view.home)?.and_then(time).unwrap_or(DateTime::UNIX_EPOCH);
         Ok(CheckoutRecord {
-            requested_at,
+            requested_at: view.created,
             reading: view.judgement.reading(),
             spec: spec_of(&view.request),
             holder: view.request.holder.as_ref().and_then(checkout_holder),
