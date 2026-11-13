@@ -20,6 +20,7 @@ use std::{
 };
 
 use flotilla_credentials::{CredentialStore, GithubAppRefreshWake, GithubAppScope};
+use flotilla_crew::crew_capabilities::CardScope;
 use flotilla_resources::{
     environment_records::EnvironmentChange,
     vessel_records::{environment_vessels, EnvironmentVessel, EnvironmentVessels, VesselWithoutConvoy},
@@ -60,6 +61,8 @@ struct Pending {
     definitions: bool,
     /// The central Codex login rotated: every crew's copy follows it.
     codex_rotated: bool,
+    /// Capability cards to refresh besides those of the environments delivered.
+    cards: CardScope,
 }
 
 /// A request to deliver one environment now, answered once it has been tried.
@@ -213,6 +216,10 @@ impl CredentialDelivery {
                     let _busy = metrics.busy();
                     self.failures.remove(&request.environment);
                     let result = self.deliver(Some(&BTreeSet::from([request.environment.clone()])), false).await;
+                    // The environment's cards follow what was delivered at the next pass.
+                    self.events.record(|pending| {
+                        pending.cards.environments.insert(request.environment.clone());
+                    });
                     let _ = request.reply.send(result);
                     continue;
                 }
@@ -234,13 +241,18 @@ impl CredentialDelivery {
 
     /// One pass over what woke it and what fell due.
     async fn pass(&mut self) -> Result<(), String> {
-        let pending = self.events.take();
+        let mut pending = self.events.take();
         let now = tokio::time::Instant::now();
         let mut environments = pending.environments.clone();
         // Environments whose timed retry fell due.
         environments.extend(
             self.failures.iter().filter(|(_, failure)| failure.next_at.is_some_and(|next| next <= now)).map(|(name, _)| name.clone()),
         );
+        // The cards of every environment an event named or a retry reached, delivered or still in
+        // backoff; every card when every environment is delivered or the Codex login rotated.
+        let mut cards = std::mem::take(&mut pending.cards);
+        cards.every |= pending.all || pending.definitions || pending.codex_rotated;
+        cards.environments.extend(environments.iter().cloned());
         let result = if pending.all || pending.definitions {
             if pending.definitions {
                 self.failures.clear();
@@ -267,7 +279,7 @@ impl CredentialDelivery {
             warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
         }
         // Cards read committed delivery observations, never the preparation index.
-        if let Err(error) = self.state.daemon.refresh_capability_cards(&self.namespace).await {
+        if let Err(error) = self.state.daemon.refresh_capability_cards(&self.namespace, &cards).await {
             warn!(%error, "failed to refresh session capability cards");
         }
         self.tell_refresh_failures().await;

@@ -6,7 +6,10 @@
 //! it has ended starts the next launch. The TerminalSession controller writes every edge after the
 //! request, and the launch's facts in the transaction that realises it.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
@@ -184,6 +187,8 @@ pub struct EngineTerminals {
     homes: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     changes: tokio::sync::broadcast::Sender<TerminalChange>,
     observations: TerminalObservations,
+    /// Launches read into records by listing, index and scan reads, the cost of those reads.
+    launches_read: AtomicU64,
 }
 
 /// How many changes a slow follower may fall behind by; one that lags rereads everything.
@@ -205,7 +210,13 @@ impl EngineTerminals {
             homes: Arc::new(homes),
             changes: tokio::sync::broadcast::channel(CHANGES).0,
             observations: TerminalObservations::default(),
+            launches_read: AtomicU64::new(0),
         }
+    }
+
+    /// How many launches listing, index and scan reads have read, for read-cost tests.
+    pub fn launches_read(&self) -> u64 {
+        self.launches_read.load(Ordering::Relaxed)
     }
 
     /// The port over `service`'s store and homes.
@@ -241,9 +252,12 @@ impl EngineTerminals {
         what: &str,
         views: impl FnOnce(&mut Read<'_>) -> Result<Vec<View<TerminalSessionKind>>, ReadError>,
     ) -> Result<Vec<TerminalRecord>, String> {
-        self.reads
+        let records: Vec<TerminalRecord> = self
+            .reads
             .read(|read| views(read)?.into_iter().map(|view| record(read, view)).collect())
-            .map_err(|error| format!("engine terminal sessions {what}: {error}"))
+            .map_err(|error| format!("engine terminal sessions {what}: {error}"))?;
+        self.launches_read.fetch_add(records.len() as u64, Ordering::Relaxed);
+        Ok(records)
     }
 
     fn scan(read: &mut Read<'_>, home: &str) -> Result<Vec<View<TerminalSessionKind>>, ReadError> {

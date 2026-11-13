@@ -9,10 +9,12 @@ use flotilla_agent::adapter::CAPABILITIES_HEADING;
 use flotilla_capability_contract::{credential_card, CredentialCapability, SessionCapabilitySource};
 use flotilla_resources::account_access::AccountRecords;
 use flotilla_resources::lifecycle_reads::LifecycleReads;
+use flotilla_resources::terminal_records::{newest_launches, TerminalRecord};
+use flotilla_resources::vessel_records::VesselRecord;
 use flotilla_resources::{
     message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, Message, MessageReference,
     MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, Vessel,
+    TerminalSessionSpec, Vessel, VESSEL_PLACEMENTS_ANNOTATION,
 };
 use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
@@ -45,6 +47,43 @@ pub async fn session_card(
     accounts: &dyn AccountRecords,
 ) -> Result<String, String> {
     let convoy = backend.including_replicas::<Convoy>(namespace).get(convoy_name).await.map_err(|error| error.to_string())?.object;
+    let work = match &spec.source {
+        TerminalSessionSource::Agent { context, .. } => Some(
+            backend
+                .including_replicas::<Vessel>(namespace)
+                .get(&context.vessel_ref)
+                .await
+                .map_err(|error| error.to_string())?
+                .object
+                .spec
+                .vessel_name,
+        ),
+        _ => None,
+    };
+    let card = CardRead { backend, namespace, convoy: &convoy, work: work.as_deref() };
+    render_card(&card, spec, credentials, endpoints, reads, accounts).await
+}
+
+/// What a card is read from besides its session: the session's convoy and, for a crew, the work
+/// its vessel serves in it.
+#[derive(Clone, Copy)]
+struct CardRead<'a> {
+    backend: &'a ResourceBackend,
+    namespace: &'a str,
+    convoy: &'a ResourceObject<Convoy>,
+    work: Option<&'a str>,
+}
+
+async fn render_card(
+    read: &CardRead<'_>,
+    spec: &TerminalSessionSpec,
+    credentials: &[CredentialCapability],
+    endpoints: &BTreeMap<String, String>,
+    reads: Arc<dyn LifecycleReads>,
+    accounts: &dyn AccountRecords,
+) -> Result<String, String> {
+    let CardRead { backend, namespace, convoy, work } = *read;
+    let convoy_name = convoy.metadata.name.as_str();
     let mut text = format!(
         "{}\n\nYou act as `{}` in project `{}`.\n\n### Repositories in scope\n",
         CAPABILITIES_HEADING.trim_start(),
@@ -54,11 +93,9 @@ pub async fn session_card(
     for repository in &convoy.spec.repositories {
         text.push_str(&format!("- {} ({})\n", repository.url, repository.repo_ref));
     }
-    let repository_scope = match &spec.source {
-        TerminalSessionSource::Agent { context, .. } => {
-            let vessel =
-                backend.including_replicas::<Vessel>(namespace).get(&context.vessel_ref).await.map_err(|error| error.to_string())?.object;
-            let policy = vessel_placement_pin(&convoy, &vessel.spec.vessel_name).map(|pin| pin.decision.kind).or_else(|| {
+    let repository_scope = match work {
+        Some(work) => {
+            let policy = vessel_placement_pin(convoy, work).map(|pin| pin.decision.kind).or_else(|| {
                 convoy.status.as_ref().and_then(|status| status.placement_decision.as_ref().map(|decision| decision.kind.clone()))
             });
             if let Some(policy) = policy {
@@ -80,10 +117,10 @@ pub async fn session_card(
                 .status
                 .as_ref()
                 .and_then(|status| status.workflow_snapshot.as_ref())
-                .and_then(|workflow| workflow.vessels.iter().find(|requirement| requirement.name == vessel.spec.vessel_name))
+                .and_then(|workflow| workflow.vessels.iter().find(|requirement| requirement.name == work))
                 .and_then(|requirement| requirement.repository_refs.clone())
         }
-        _ => None,
+        None => None,
     };
     let checkouts = flotilla_agent::adapter::multi_repository_checkouts(
         &convoy.spec,
@@ -281,14 +318,40 @@ pub fn card_delta(previous: &str, current: &str) -> String {
 /// annotation CAS retries; delivery evidence advances the agent's delta baseline.
 /// It publishes through the Message path installed at startup.
 #[derive(Default)]
-pub struct CapabilityCardTracker(Mutex<BTreeMap<(String, String), SessionCardObservation>>, crate::ports::MessagePath);
+pub struct CapabilityCardTracker(
+    Mutex<BTreeMap<(String, String), SessionCardObservation>>,
+    crate::ports::MessagePath,
+    /// By namespace and convoy, the digest of what the cards last read of the convoy
+    /// ([`convoy_card_digest`]); none while a card holds a reading not yet compared.
+    std::sync::Mutex<BTreeMap<(String, String), Option<String>>>,
+    /// By namespace, the sessions whose last card refresh failed.
+    std::sync::Mutex<BTreeMap<String, BTreeSet<String>>>,
+);
 
 type SessionCardObservation = Arc<Mutex<CardObservation>>;
 
 impl CapabilityCardTracker {
     /// A tracker publishing through `path` (the composition root's slot).
     pub fn with_message_path(path: crate::ports::MessagePath) -> Self {
-        Self(Mutex::default(), path)
+        Self(Mutex::default(), path, std::sync::Mutex::default(), std::sync::Mutex::default())
+    }
+
+    fn convoys_read(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, String), Option<String>>> {
+        self.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn failed(&self, namespace: &str) -> BTreeSet<String> {
+        self.3.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(namespace).cloned().unwrap_or_default()
+    }
+
+    fn set_failed(&self, namespace: &str, failed: BTreeSet<String>) {
+        self.3.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(namespace.to_owned(), failed);
+    }
+
+    /// The convoys whose cards this tracker holds a reading of, in `namespace`: those a change
+    /// may make a card stale.
+    pub fn convoys(&self, namespace: &str) -> Vec<String> {
+        self.convoys_read().keys().filter(|(space, _)| space == namespace).map(|(_, convoy)| convoy.clone()).collect()
     }
 
     fn primitives(&self) -> Result<Arc<dyn flotilla_messaging::EngineMessages>, ResourceError> {
@@ -340,6 +403,18 @@ pub async fn observe_card(
     card: &str,
     tracker: &CapabilityCardTracker,
 ) -> Result<(), String> {
+    observe(backend, namespace, session, card, tracker, None).await
+}
+
+/// [`observe_card`], with the session's crew address when the caller has read it already.
+async fn observe(
+    backend: &ResourceBackend,
+    namespace: &str,
+    session: &ResourceObject<TerminalSession>,
+    card: &str,
+    tracker: &CapabilityCardTracker,
+    receiver: Option<&str>,
+) -> Result<(), String> {
     let observation = tracker.observation(namespace, &session.metadata.name).await;
     let mut observation = observation.lock().await;
     let observed = card_digest(card);
@@ -352,10 +427,13 @@ pub async fn observe_card(
     if previous == observed {
         return Ok(());
     }
+    let receiver = match receiver {
+        Some(receiver) => receiver.to_owned(),
+        None => card_receiver(backend, namespace, session).await?,
+    };
     // Pending notices supersede one another. Promote only snapshots the inbox delivered.
     let mut retired = Vec::new();
     let pending = observation.pending.clone();
-    let receiver = if pending.is_empty() { String::new() } else { card_receiver(backend, namespace, session).await? };
     for (revision, (name, snapshot)) in &pending {
         let message = match message_by_name(namespace, &receiver, name, tracker).await {
             Ok(message) => message,
@@ -383,7 +461,7 @@ pub async fn observe_card(
     let body = observation.delivered.as_ref().map(|baseline| card_delta(baseline, card)).unwrap_or_else(|| card.to_string());
     let supersedes = observation.message.clone();
     let published = CardRevision { revision, card, body: &body, supersedes };
-    let (name, digest) = publish_card_revision(backend, namespace, session, published, tracker).await?;
+    let (name, digest) = publish_card_revision(namespace, session, &receiver, published, tracker).await?;
     if digest == observed {
         observation.pending.insert(revision, (name.clone(), card.to_string()));
     }
@@ -419,21 +497,20 @@ struct CardRevision<'a> {
 }
 
 async fn publish_card_revision(
-    backend: &ResourceBackend,
     namespace: &str,
     session: &ResourceObject<TerminalSession>,
+    receiver: &str,
     CardRevision { revision, card, body, supersedes }: CardRevision<'_>,
     tracker: &CapabilityCardTracker,
 ) -> Result<(String, String), String> {
-    let receiver = card_receiver(backend, namespace, session).await?;
     let sender = "system:capabilities";
-    let name = message_record_name(&receiver, sender, &format!("{}:capabilities@{revision}", session.metadata.name));
+    let name = message_record_name(receiver, sender, &format!("{}:capabilities@{revision}", session.metadata.name));
     let subject = MessageReference::ControlRecord {
         resource: ResourceRef::new("flotilla.work/v1", "TerminalSession", namespace, &session.metadata.name),
         revision: format!("capabilities@{revision}"),
     };
     let supersedes = match supersedes {
-        Some(name) => match message_by_name(namespace, &receiver, &name, tracker).await {
+        Some(name) => match message_by_name(namespace, receiver, &name, tracker).await {
             Ok(_) => Some(name),
             Err(ResourceError::NotFound { .. }) => None, // Reaped audit data cannot be a predecessor.
             Err(error) => return Err(error.to_string()),
@@ -442,14 +519,14 @@ async fn publish_card_revision(
     };
     let requested = MessageSpec::builder()
         .sender(sender.into())
-        .receiver(receiver.clone())
+        .receiver(receiver.to_owned())
         .relation(MessageRelation::System)
         .body(body.to_string())
         .references(vec![subject.clone()])
         .subject(subject)
         .maybe_supersedes(supersedes)
         .build();
-    let recovered = recover_published_revision(namespace, &receiver, &name, tracker).await?;
+    let recovered = recover_published_revision(namespace, receiver, &name, tracker).await?;
     let digest = recovered
         .as_ref()
         .and_then(|message| message.metadata.annotations.get(DIGEST_ANNOTATION))
@@ -497,6 +574,10 @@ pub async fn observe_launch_card(
 ) -> Result<(), String> {
     let session = backend.clone().using::<TerminalSession>(namespace).get(name).await.map_err(|error| error.to_string())?;
     observe_card(backend, namespace, &session, card, tracker).await?;
+    if let TerminalSessionSource::Agent { context, .. } = &session.spec.source {
+        // The card read its convoy, though no refresh has: the convoy's next change is compared.
+        tracker.convoys_read().entry((namespace.to_owned(), context.convoy.clone())).or_insert(None);
+    }
     let observation = tracker.observation(namespace, name).await;
     let mut observation = observation.lock().await;
     observation.delivered = Some(card.to_string());
@@ -504,31 +585,104 @@ pub async fn observe_launch_card(
     Ok(())
 }
 
-async fn refresh_session_card(
-    backend: &ResourceBackend,
-    namespace: &str,
-    source: &dyn SessionCapabilitySource,
-    session: &ResourceObject<TerminalSession>,
-    tracker: &CapabilityCardTracker,
-    reads: Arc<dyn LifecycleReads>,
-    accounts: &dyn AccountRecords,
-) -> Result<(), String> {
-    let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return Ok(()) };
-    let credentials = source.credentials(&session.spec.env_ref, &credential_references(backend, namespace, session).await?).await?;
-    let card = session_card(
-        backend,
-        namespace,
-        &context.convoy,
-        &session.spec,
-        &credentials,
-        &source.endpoints(&session.spec.env_ref, &session.metadata.name).await?,
-        reads,
-        accounts,
-    )
-    .await?;
-    observe_card(backend, namespace, session, &card, tracker).await
+/// What a card reads of its convoy: a change to anything else in the convoy changes no card.
+fn convoy_card_digest(convoy: &ResourceObject<Convoy>) -> String {
+    let status = convoy.status.as_ref();
+    let read = serde_json::json!({
+        "project": convoy.spec.project_ref,
+        "repositories": convoy.spec.repositories,
+        "ref": convoy.spec.r#ref,
+        "pins": convoy.metadata.annotations.get(VESSEL_PLACEMENTS_ANNOTATION),
+        "decision": status.and_then(|status| status.placement_decision.as_ref()).map(|decision| &decision.kind),
+        "vessels": status.and_then(|status| status.workflow_snapshot.as_ref()).map(|workflow| {
+            workflow.vessels.iter().map(|vessel| (&vessel.name, &vessel.repository_refs, &vessel.credential_refs)).collect::<Vec<_>>()
+        }),
+    });
+    format!("{:x}", Sha256::digest(read.to_string()))
 }
 
+/// Whether what the cards read of convoy `convoy` changed since they last read it, remembering
+/// what they read now. A convoy no card has read counts as changed; one that is gone, as not.
+pub async fn convoy_card_changed(
+    backend: &ResourceBackend,
+    namespace: &str,
+    tracker: &CapabilityCardTracker,
+    convoy: &str,
+) -> Result<bool, String> {
+    let key = (namespace.to_owned(), convoy.to_owned());
+    let read = match backend.including_replicas::<Convoy>(namespace).get(convoy).await {
+        Ok(read) => read.object,
+        Err(ResourceError::NotFound { .. }) => {
+            tracker.convoys_read().remove(&key);
+            return Ok(false);
+        }
+        Err(error) => return Err(format!("read convoy {convoy}: {error}")),
+    };
+    let digest = convoy_card_digest(&read);
+    let before = tracker.convoys_read().insert(key, Some(digest.clone()));
+    Ok(before != Some(Some(digest)))
+}
+
+/// Which of this home's sessions' cards a refresh reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CardScope {
+    /// Every session's.
+    pub every: bool,
+    /// The sessions' in these environments.
+    pub environments: BTreeSet<String>,
+    /// The sessions' of these convoys' vessels.
+    pub convoys: BTreeSet<String>,
+}
+
+impl CardScope {
+    /// Every session's card.
+    pub fn every() -> Self {
+        Self { every: true, ..Self::default() }
+    }
+
+    /// Whether it names no card.
+    pub fn is_empty(&self) -> bool {
+        !self.every && self.environments.is_empty() && self.convoys.is_empty()
+    }
+}
+
+/// The newest launch of each of this home's sessions that `scope` names or `retried` names, and
+/// the vessel launches read finding them, by name.
+fn sessions_in(
+    reads: &dyn LifecycleReads,
+    scope: &CardScope,
+    retried: &BTreeSet<String>,
+) -> Result<(Vec<TerminalRecord>, BTreeMap<String, VesselRecord>), String> {
+    let terminals = reads.terminals()?;
+    let here = terminals.home().to_owned();
+    let mut vessels = BTreeMap::new();
+    if scope.every {
+        return Ok((newest_launches(terminals.at(&here)?).into_values().collect(), vessels));
+    }
+    let mut found = Vec::new();
+    for environment in &scope.environments {
+        found.extend(terminals.of_environment(environment, &here)?);
+    }
+    for convoy in &scope.convoys {
+        for vessel in reads.vessels()?.of_convoy(convoy)? {
+            found.extend(terminals.of_vessel(&vessel.name)?);
+            vessels.insert(vessel.name.clone(), vessel);
+        }
+    }
+    // A launch found may not be its session's newest, which is read by the session's name.
+    let mut named =
+        found.iter().filter(|record| record.home == here).map(|record| record.session_name().to_owned()).collect::<BTreeSet<_>>();
+    named.extend(retried.iter().cloned());
+    let mut sessions = Vec::new();
+    for name in named {
+        sessions.extend(terminals.get(&name, None)?);
+    }
+    Ok((sessions, vessels))
+}
+
+/// Refreshes the cards of the running crew sessions at this home that `scope` names, and of those
+/// whose last refresh failed, and forgets the cards of those that ended. Each card reads its
+/// session's vessel and convoy once, by key.
 pub async fn refresh_cards(
     backend: &ResourceBackend,
     namespace: &str,
@@ -536,35 +690,136 @@ pub async fn refresh_cards(
     tracker: &CapabilityCardTracker,
     reads: Arc<dyn LifecycleReads>,
     accounts: &dyn AccountRecords,
+    scope: &CardScope,
 ) -> Result<(), String> {
-    let mut errors = Vec::new();
-    let sessions = backend.clone().using::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?;
+    let retried = tracker.failed(namespace);
+    if scope.is_empty() && retried.is_empty() {
+        return Ok(());
+    }
+    let (sessions, mut vessels) = {
+        let (reads, scope, retried) = (Arc::clone(&reads), scope.clone(), retried.clone());
+        tokio::task::spawn_blocking(move || sessions_in(reads.as_ref(), &scope, &retried))
+            .await
+            .map_err(|error| format!("read the sessions for capability cards: {error}"))??
+    };
+    let phase = |record: &TerminalRecord| record.read_view(namespace, None, None, None).status.map(|status| status.phase);
     let live = sessions
-        .items
         .iter()
-        .filter(|session| {
-            session
-                .status
-                .as_ref()
-                .is_none_or(|status| matches!(status.phase, TerminalSessionPhase::Starting | TerminalSessionPhase::Running))
-        })
-        .map(|session| session.metadata.name.as_str())
+        .filter(|record| phase(record).is_none_or(|phase| matches!(phase, TerminalSessionPhase::Starting | TerminalSessionPhase::Running)))
+        .map(|record| record.session_name())
         .collect::<BTreeSet<_>>();
-    tracker.0.lock().await.retain(|(space, name), _| space != namespace || live.contains(name.as_str()));
-    for session in sessions.items {
-        if !session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running) {
+    let named = sessions.iter().map(|record| record.session_name()).collect::<BTreeSet<_>>();
+    tracker
+        .0
+        .lock()
+        .await
+        .retain(|(space, name), _| space != namespace || live.contains(name.as_str()) || (!scope.every && !named.contains(name.as_str())));
+    let mut errors = Vec::new();
+    let mut failed = BTreeSet::new();
+    // What each convoy's cards read of it: none once one of its cards failed.
+    let mut read_convoys = BTreeMap::<String, Option<String>>::new();
+    for record in &sessions {
+        if !record.is_agent() || phase(record) != Some(TerminalSessionPhase::Running) {
             continue;
         }
-        if let Err(error) = refresh_session_card(backend, namespace, source, &session, tracker, Arc::clone(&reads), accounts).await {
-            warn!(session = %session.metadata.name, %error, "failed to refresh session capability card");
-            errors.push(format!("{}: {error}", session.metadata.name));
+        let refreshed = refresh_record_card(backend, namespace, source, tracker, Arc::clone(&reads), accounts, record, &mut vessels).await;
+        let digest = refreshed.result.as_ref().ok().cloned();
+        if let Some(convoy) = refreshed.convoy {
+            let held = read_convoys.entry(convoy).or_insert_with(|| digest.clone());
+            if digest.is_none() {
+                *held = None;
+            }
+        }
+        if let Err(error) = refreshed.result {
+            warn!(session = %record.session_name(), %error, "failed to refresh session capability card");
+            errors.push(format!("{}: {error}", record.session_name()));
+            failed.insert(record.session_name().to_owned());
         }
     }
+    {
+        let mut held = tracker.convoys_read();
+        if scope.every {
+            // A convoy no running card read is compared again only once a card reads it.
+            held.retain(|(space, convoy), digest| space != namespace || read_convoys.contains_key(convoy) || digest.is_none());
+        }
+        for (convoy, digest) in read_convoys {
+            held.insert((namespace.to_owned(), convoy), digest);
+        }
+    }
+    // A failed card is tried again at the next refresh, whatever it names; one that ended is not.
+    tracker.set_failed(namespace, failed);
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors.join("; "))
     }
+}
+
+/// How refreshing one card went, and the convoy it read, once known: the digest of what the card
+/// read of the convoy, or why it was not refreshed.
+struct Refreshed {
+    convoy: Option<String>,
+    result: Result<String, String>,
+}
+
+/// Refreshes the card of running crew launch `record`, reading its vessel from `vessels` when a
+/// convoy's reading found it, else by key, and its convoy by key.
+#[allow(clippy::too_many_arguments)]
+async fn refresh_record_card(
+    backend: &ResourceBackend,
+    namespace: &str,
+    source: &dyn SessionCapabilitySource,
+    tracker: &CapabilityCardTracker,
+    reads: Arc<dyn LifecycleReads>,
+    accounts: &dyn AccountRecords,
+    record: &TerminalRecord,
+    vessels: &mut BTreeMap<String, VesselRecord>,
+) -> Refreshed {
+    let name = record.vessel.clone().unwrap_or_default();
+    let vessel = match vessels.get(&name) {
+        Some(vessel) => Ok(Some(vessel.clone())),
+        None => reads.vessels().and_then(|held| match held.get(&name, Some(&record.home))? {
+            Some(vessel) => Ok(Some(vessel)),
+            None => held.get(&name, None),
+        }),
+    };
+    let vessel = match vessel {
+        Ok(Some(vessel)) => vessel,
+        Ok(None) => return Refreshed { convoy: None, result: Err(format!("read vessel {name}: not found")) },
+        Err(error) => return Refreshed { convoy: None, result: Err(format!("read vessel {name}: {error}")) },
+    };
+    vessels.insert(name, vessel.clone());
+    let result = async {
+        let convoy = backend
+            .including_replicas::<Convoy>(namespace)
+            .get(&vessel.convoy)
+            .await
+            .map_err(|error| format!("read convoy {}: {error}", vessel.convoy))?
+            .object;
+        let work = vessel.work();
+        let credential_refs = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .and_then(|snapshot| snapshot.vessels.iter().find(|requirement| requirement.name == work))
+            .map(|requirement| requirement.credential_refs.clone())
+            .ok_or_else(|| format!("vessel {work} missing from convoy {}'s snapshot", convoy.metadata.name))?;
+        let session = record.read_view(namespace, Some(&vessel.terminal_holder()), None, None);
+        let credentials = source.credentials(&session.spec.env_ref, &credential_refs).await?;
+        let endpoints = source.endpoints(&session.spec.env_ref, &session.metadata.name).await?;
+        let read = CardRead { backend, namespace, convoy: &convoy, work: Some(work) };
+        let card = render_card(&read, &session.spec, &credentials, &endpoints, reads, accounts).await?;
+        let receiver = flotilla_resources::crew_role_address(
+            convoy.spec.project_ref.as_deref().unwrap_or(namespace),
+            &vessel.convoy,
+            work,
+            &session.spec.role,
+        );
+        observe(backend, namespace, &session, &card, tracker, Some(&receiver)).await?;
+        Ok(convoy_card_digest(&convoy))
+    }
+    .await;
+    Refreshed { convoy: Some(vessel.convoy), result }
 }
 
 #[cfg(test)]

@@ -4778,7 +4778,13 @@ impl InProcessDaemon {
             .await
     }
 
-    pub async fn refresh_capability_cards(&self, namespace: &str) -> Result<(), String> {
+    /// Refreshes the capability cards of the running crew sessions `scope` names, and of those
+    /// whose last refresh failed.
+    pub async fn refresh_capability_cards(
+        &self,
+        namespace: &str,
+        scope: &flotilla_crew::crew_capabilities::CardScope,
+    ) -> Result<(), String> {
         let source = self.crew.capability_source().read().await.clone().ok_or("session capability source unavailable")?;
         flotilla_crew::crew_capabilities::refresh_cards(
             &self.resource_backend,
@@ -4787,8 +4793,19 @@ impl InProcessDaemon {
             self.crew.capability_cards(),
             self.lifecycle_reads(),
             &*self.accounts,
+            scope,
         )
         .await
+    }
+
+    /// Whether what the capability cards read of convoy `convoy` changed since they read it.
+    pub async fn convoy_card_changed(&self, namespace: &str, convoy: &str) -> Result<bool, String> {
+        flotilla_crew::crew_capabilities::convoy_card_changed(&self.resource_backend, namespace, self.crew.capability_cards(), convoy).await
+    }
+
+    /// The convoys the capability cards hold a reading of.
+    pub fn card_convoys(&self, namespace: &str) -> Vec<String> {
+        self.crew.capability_cards().convoys(namespace)
     }
 
     pub async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {

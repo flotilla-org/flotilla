@@ -96,6 +96,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
             &crew.capability_cards,
             held.engine.reads(),
             &flotilla_store_testkit::OldStoreAccounts::new(backend.clone()),
+            &crate::crew_capabilities::CardScope::every(),
         )
         .await
         .expect_err("aggregate error");
@@ -219,7 +220,7 @@ async fn an_unseen_session_gets_a_full_card_once_then_delivered_deltas() {
 // published observation untouched: refresh errors rather than publishing an empty card.
 #[tokio::test]
 async fn failing_source_never_publishes_an_empty_card() {
-    use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker};
+    use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker, CardScope};
     use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
     use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Message};
     // Credential/endpoint delivery is the runtime I/O boundary; resources use the real memory backend.
@@ -256,6 +257,7 @@ async fn failing_source_never_publishes_an_empty_card() {
         &tracker,
         held.engine.reads(),
         &flotilla_store_testkit::OldStoreAccounts::new(backend.clone()),
+        &CardScope::every(),
     )
     .await
     .expect("initial baseline");
@@ -267,6 +269,7 @@ async fn failing_source_never_publishes_an_empty_card() {
         &tracker,
         held.engine.reads(),
         &flotilla_store_testkit::OldStoreAccounts::new(backend.clone()),
+        &CardScope::every(),
     )
     .await
     .expect_err("reconstruction gap");

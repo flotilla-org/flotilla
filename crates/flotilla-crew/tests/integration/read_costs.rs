@@ -8,7 +8,12 @@ use std::{
 };
 
 use chrono::Utc;
-use flotilla_crew::{convoy::ConvoyReconciler, reconcilers::vessel::ConvoyVesselWake};
+use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
+use flotilla_crew::{
+    convoy::ConvoyReconciler,
+    crew_capabilities::{refresh_cards, CapabilityCardTracker, CardScope},
+    reconcilers::vessel::ConvoyVesselWake,
+};
 use flotilla_engine_convoys_testkit::{convoy, single_agent, EngineConvoysHome, KeyedGets};
 use flotilla_provisioning::engine::checkouts::CheckoutConvoyWake;
 use flotilla_provisioning_testkit::{EngineFixture, OtherHome, TerminalsFixture};
@@ -16,8 +21,10 @@ use flotilla_resources::{
     account_access::AccountRecords,
     address::{artifact_address, record_name},
     checkout_records::CheckoutHolder,
+    terminal_records::TerminalLaunchFacts,
     vessel_records::{environment_vessels, EnvironmentVessel},
-    Artifact, ArtifactSpec, CheckoutSpec, Convoy, ConvoySpec, ObservedCheckoutSpec, RepositoryKey, SystemClock,
+    Artifact, ArtifactSpec, CheckoutSpec, Convoy, ConvoySpec, EnvironmentSpec, HostDirectEnvironmentSpec, ObservedCheckoutSpec,
+    RepositoryKey, SystemClock,
 };
 use flotilla_store::{
     controller::{Reconciler, SecondaryWatch, WorkQueueSender},
@@ -307,6 +314,76 @@ async fn an_environments_credential_vessels_are_read_without_the_others() {
         small_gets,
         KeyedGets { environments: 1, vessels: 4, convoys: 2, terminals: 0 },
         "the environment, each of its two vessels and that vessel's newest launch, and their two convoys are got"
+    );
+    assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
+}
+
+/// Credentials and endpoints as delivered: none.
+struct NothingDelivered;
+
+#[async_trait::async_trait]
+impl SessionCapabilitySource for NothingDelivered {
+    async fn credentials(&self, _: &str, _: &BTreeSet<String>) -> Result<Vec<CredentialCapability>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// The terminal and vessel launches read, and the keyed gets made, refreshing the capability
+/// cards of the shared environment's sessions, with `others` other convoys each holding a running
+/// crew in an environment of its own. Two convoys' crews run in the shared environment.
+async fn read_by_one_environments_cards(others: usize) -> (u64, u64, KeyedGets) {
+    let store = OtherHome::open("home");
+    let engine = EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
+    let host_direct = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+        ..Default::default()
+    };
+    engine.environments.request("shared", &host_direct, None);
+    for n in 0..others + 2 {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let launch = convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
+        let vessel = engine.vessels.request(&launch, "work", "host");
+        let environment = if n < 2 { "shared".to_owned() } else { format!("env-{n}") };
+        if n >= 2 {
+            engine.environments.request(&environment, &host_direct, None);
+        }
+        let session = engine.terminals.request(&TerminalsFixture::agent(&vessel, "coder", &environment));
+        engine.terminals.ready(&session, &format!("{session}-runtime"), &TerminalLaunchFacts::default());
+    }
+    // The convoy views are filled once, at their first read, as a running daemon's already are.
+    backend.clone().using::<Convoy>(NAMESPACE).list().await.expect("the convoy views");
+    let tracker = CapabilityCardTracker::default();
+    let accounts = OldStoreAccounts::new(backend.clone());
+    let scope = CardScope { environments: BTreeSet::from(["shared".to_owned()]), ..CardScope::default() };
+
+    let before = (engine.terminals.terminals.launches_read(), engine.vessels.vessels.launches_read(), keyed_gets(&convoys, &engine));
+    refresh_cards(&backend, NAMESPACE, &NothingDelivered, &tracker, Arc::clone(convoys.reads()), &accounts, &scope)
+        .await
+        .expect("the shared environment's cards are refreshed");
+    (
+        engine.terminals.terminals.launches_read() - before.0,
+        engine.vessels.vessels.launches_read() - before.1,
+        keyed_gets(&convoys, &engine) - before.2,
+    )
+}
+
+// Behaviour: refreshing one environment's capability cards reads that environment's sessions
+// through its index, and each one's newest launch, vessel, convoy and environment by key, not
+// every session at this home.
+#[tokio::test]
+async fn an_environments_cards_are_refreshed_without_the_others() {
+    let (small_terminals, small_vessels, small_gets) = read_by_one_environments_cards(5).await;
+    let (large_terminals, large_vessels, large_gets) = read_by_one_environments_cards(60).await;
+    assert_eq!(small_terminals, 2, "only the shared environment's two launches are read through its index");
+    assert_eq!(large_terminals, small_terminals, "the cost does not grow with the other environments' sessions");
+    assert_eq!(small_vessels, 0, "each vessel is read by key: no vessel launch is listed, scanned or read through an index");
+    assert_eq!(large_vessels, small_vessels, "the vessel launches read do not grow with the other convoys");
+    assert_eq!(
+        small_gets,
+        KeyedGets { vessels: 2, convoys: 0, environments: 2, terminals: 2 },
+        "each card gets its session's newest launch, its vessel and its environment once; its convoy's view is held composed"
     );
     assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
 }
