@@ -393,6 +393,11 @@ impl TestDaemon {
         read.records.into_iter().filter_map(|record| record.object).map(decode).collect()
     }
 
+    /// The operator's resource client, as `flotilla watch` uses it.
+    pub fn resources(&self) -> &ResourceClient {
+        &self.operator.resources
+    }
+
     /// Every `T` the old store itself holds. The resource commands refuse a
     /// kind the engine serves through a port of its own, so a scenario that
     /// checks nothing reached the old store reads it here.

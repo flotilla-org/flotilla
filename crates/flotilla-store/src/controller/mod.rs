@@ -338,15 +338,13 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelMappedWatch<W, P> {
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let resolver = backend.using::<W>(&namespace);
+            // Watch before listing (see `spawn_primary_watch`).
+            let mut watch =
+                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.watch(WatchStart::Now)).await?;
             let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.list()).await?;
             for object in &listed.items {
                 Self::enqueue_from_object(self.label_key, &sender, object).await?;
             }
-
-            let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
-                resolver.watch(WatchStart::resuming_from(&listed))
-            })
-            .await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -381,14 +379,14 @@ impl<W: Resource, P: Resource> SecondaryWatch for ResolverLabelMappedWatch<W, P>
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
+            // Watch before listing (see `spawn_primary_watch`).
+            let mut watch =
+                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.watch(WatchStart::Now))
+                    .await?;
             let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.list()).await?;
             for object in &listed.items {
                 LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, object).await?;
             }
-            let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
-                self.resolver.watch(WatchStart::resuming_from(&listed))
-            })
-            .await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -489,15 +487,13 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelJoinWatch<W, P> {
         Box::pin(async move {
             let watched = backend.clone().using::<W>(&namespace);
             let primaries = backend.using::<P>(&namespace);
+            // Watch before listing (see `spawn_primary_watch`).
+            let mut watch =
+                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || watched.watch(WatchStart::Now)).await?;
             let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || watched.list()).await?;
             for object in &listed.items {
                 Self::enqueue_matching_primaries(self.label_key, &sender, object, &primaries).await?;
             }
-
-            let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
-                watched.watch(WatchStart::resuming_from(&listed))
-            })
-            .await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -585,6 +581,13 @@ impl<R: Reconciler> ControllerLoop<R> {
                 tokio::time::sleep(backoff).await;
             }
             let result = async {
+                // Watch before listing: an engine-served kind's watch cannot resume from a listing,
+                // so a change between the two is in the list, the watch or both. Every event only
+                // queues a name for a reconcile of its current state, so one seen twice costs a
+                // repeated reconcile, never a wrong one.
+                let mut watch =
+                    crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.watch(WatchStart::Now))
+                        .await?;
                 let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.list()).await?;
                 for object in &listed.items {
                     sender
@@ -592,11 +595,6 @@ impl<R: Reconciler> ControllerLoop<R> {
                         .await
                         .map_err(|_| ResourceError::other("controller queue closed while forwarding initial primary list"))?;
                 }
-
-                let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
-                    primary.watch(WatchStart::resuming_from(&listed))
-                })
-                .await?;
                 while let Some(event) = watch.next().await {
                     match event? {
                         WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {

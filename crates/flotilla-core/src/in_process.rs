@@ -1498,8 +1498,9 @@ impl InProcessDaemon {
                 let namespace = daemon.provisioning_namespace().await;
                 let repositories = daemon.resource_backend.clone().using::<Repository>(&namespace);
                 let setup = async {
+                    // Watch before listing: an engine-served kind's watch cannot resume from a list.
+                    let watch = repositories.watch(WatchStart::Now).await?;
                     let listed = repositories.list().await?;
-                    let watch = repositories.watch(WatchStart::resuming_from(&listed)).await?;
                     Ok::<_, flotilla_resources::ResourceError>((listed, watch))
                 }
                 .await;

@@ -1022,9 +1022,17 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
+        if self.backend.engine_records(T::API_PATHS.kind).is_some() {
+            // An engine-served kind's lists carry no position, so a resume cannot be honoured:
+            // refuse it as expired, and the caller watches from now and lists again.
+            if let WatchStart::FromVersion(requested_version)
+            | WatchStart::FromVersionInGeneration { resource_version: requested_version, .. } = start
+            {
+                return Err(ResourceError::WatchExpired { requested_version, compacted_through: None });
+            }
+        }
         if let Some(watch) = self.backend.definitions::<T>(&self.namespace).engine_watch().await {
-            // An engine-served kind streams every home's changes; there is no position to resume
-            // from, so a watcher lists again on each start.
+            // An engine-served kind streams every home's changes from now.
             let (_, stream) = watch?;
             let events = stream.map(|event| {
                 event.map(|event| match event {

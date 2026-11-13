@@ -272,3 +272,68 @@ async fn a_vendor_refusing_to_provision_fails_its_convoy() {
     let accepted = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
     daemon.wait("Landed", in_phase(&accepted, ConvoyPhase::Landed)).await;
 }
+
+/// A resource watch's records up to its bookmark, by name, and the bookmark's cursor.
+async fn watched_snapshot(
+    watch: &mut flotilla_client::resource::ResourceWatch,
+) -> (std::collections::BTreeMap<String, serde_json::Value>, flotilla_protocol::ResourceCursor) {
+    let mut records = std::collections::BTreeMap::new();
+    loop {
+        let envelope = watch.next().await.expect("the watch reads").expect("the watch is open");
+        for record in envelope.records {
+            match (record.record_type, record.object) {
+                (flotilla_protocol::ResourceRecordType::Bookmark, _) => return (records, envelope.cursor),
+                (_, Some(object)) => {
+                    let name = object["metadata"]["name"].as_str().expect("a named record").to_owned();
+                    records.insert(name, object);
+                }
+                (_, None) => {}
+            }
+        }
+    }
+}
+
+// A client whose watch of an engine-served kind drops reconnects with its cursor: the engine keeps
+// no position to resume from, so the resume is refused as expired, and the client's fresh watch
+// converges on the records as they are, with an update and a delete made in the gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resource_watch_reconnecting_after_a_gap_converges_on_the_records() {
+    use flotilla_client::resource::ResourceWatchRequest;
+    use flotilla_resources::{FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec};
+
+    let daemon = TestDaemon::builder().start().await;
+    let base = daemon.get::<FulfilmentKind>(DUMMY_FULFILMENT_KIND).await.expect("the dummy fulfilment kind").spec;
+    daemon.apply::<FulfilmentKind>("watched-kept", base.clone()).await;
+    daemon.apply::<FulfilmentKind>("watched-gone", base.clone()).await;
+    let request = || ResourceWatchRequest::builder().kind("FulfilmentKind".into()).namespace(NAMESPACE.into());
+
+    let mut watch = daemon.resources().watch(request().build()).await.expect("watch");
+    let (records, cursor) = watched_snapshot(&mut watch).await;
+    assert!(records.contains_key("watched-kept") && records.contains_key("watched-gone"), "{:?}", records.keys());
+    watch.cancel().await.expect("disconnect");
+
+    let mut updated = base.clone();
+    updated.grants.insert(FulfilmentGrant::network("watched".into()));
+    daemon.apply::<FulfilmentKind>("watched-kept", updated.clone()).await;
+    let deleted = daemon
+        .execute(CommandAction::ResourceDelete {
+            namespace: NAMESPACE.into(),
+            kind: "FulfilmentKind".into(),
+            name: "watched-gone".into(),
+            replica_origin: None,
+        })
+        .await;
+    assert!(matches!(deleted, CommandValue::ResourceDeleted(_)), "delete: {deleted:?}");
+
+    let mut resumed = daemon.resources().watch(request().cursor(cursor).build()).await.expect("reconnect");
+    let refused = resumed.next().await.expect_err("a resume from the engine's records is refused");
+    assert!(refused.contains("expired"), "the refusal says the cursor expired: {refused}");
+
+    let mut fresh = daemon.resources().watch(request().build()).await.expect("watch again");
+    let (records, _) = watched_snapshot(&mut fresh).await;
+    assert!(!records.contains_key("watched-gone"), "the record deleted in the gap is gone: {:?}", records.keys());
+    let kept: FulfilmentKindSpec =
+        serde_json::from_value(records.get("watched-kept").expect("the updated record is present")["spec"].clone()).expect("spec");
+    assert_eq!(kept.grants, updated.grants, "the record holds the update made in the gap");
+    fresh.cancel().await.expect("cancel");
+}

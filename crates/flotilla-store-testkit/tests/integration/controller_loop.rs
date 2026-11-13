@@ -2041,3 +2041,130 @@ async fn a_failing_reconcile_without_a_policy_parks_after_ten_tries_and_a_change
     assert_eq!(metrics.snapshot().parked, 0, "the gauge drops it");
     harness.shutdown().await;
 }
+
+/// Primaries served as the engine serves a kind: every listing reads the records, and each write
+/// ticks the watchers. The controller's own list, the first listing that is not a watch's
+/// opening one (taken right after it subscribes), holds once it has read, until the test
+/// releases it, whichever of its list and watch the controller opens first.
+#[derive(Debug, Default)]
+struct HeldListingPort {
+    records: Mutex<Vec<flotilla_resources::engine_records::EngineObject>>,
+    subscribers: Mutex<Vec<futures::channel::mpsc::UnboundedSender<()>>>,
+    subscribed: AtomicBool,
+    listed: AtomicBool,
+    held: Notify,
+    release: Notify,
+}
+
+impl HeldListingPort {
+    fn put(&self, name: &str) {
+        let record = flotilla_resources::engine_records::EngineObject {
+            name: name.into(),
+            home: "kiwi".into(),
+            version: 1,
+            labels: Default::default(),
+            annotations: Default::default(),
+            spec: serde_json::json!({ "value": "one" }),
+            status: None,
+        };
+        self.records.lock().expect("records").push(record);
+        for subscriber in self.subscribers.lock().expect("subscribers").iter() {
+            subscriber.unbounded_send(()).ok();
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl flotilla_resources::engine_records::EngineRecords for HeldListingPort {
+    fn kinds(&self) -> &'static [&'static str] {
+        &["TestPrimary"]
+    }
+    fn home(&self) -> String {
+        "kiwi".into()
+    }
+    async fn get(&self, _kind: &str, name: &str) -> Result<Option<flotilla_resources::engine_records::EngineObject>, String> {
+        Ok(self.records.lock().expect("records").iter().find(|record| record.name == name).cloned())
+    }
+    async fn list(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+        self.sources(kind).await
+    }
+    async fn sources(&self, _kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+        let listed = self.records.lock().expect("records").clone();
+        let opening = self.subscribed.swap(false, Ordering::SeqCst);
+        if !opening && !self.listed.swap(true, Ordering::SeqCst) {
+            self.held.notify_one();
+            self.release.notified().await;
+        }
+        Ok(listed)
+    }
+    async fn apply(
+        &self,
+        _kind: &str,
+        _name: &str,
+        _labels: &std::collections::BTreeMap<String, String>,
+        _annotations: &std::collections::BTreeMap<String, String>,
+        _spec: serde_json::Value,
+    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+        Err("read only".into())
+    }
+    async fn set_status(
+        &self,
+        _kind: &str,
+        _name: &str,
+        _status: serde_json::Value,
+    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+        Err("read only".into())
+    }
+    async fn delete(&self, _kind: &str, _name: &str) -> Result<(), String> {
+        Err("read only".into())
+    }
+    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
+        let (sender, receiver) = futures::channel::mpsc::unbounded();
+        self.subscribers.lock().expect("subscribers").push(sender);
+        self.subscribed.store(true, Ordering::SeqCst);
+        Ok(futures::StreamExt::boxed(receiver))
+    }
+}
+
+// Behaviour: an engine-served primary's watch cannot resume from a listing, so a change committed
+// after the controller's list read the records, and before that list returned, still reaches a
+// reconcile. Listing before watching loses it: the watch opens on a listing that already holds it.
+#[tokio::test]
+async fn controller_loop_reconciles_an_engine_change_committed_during_its_initial_list() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let port = Arc::new(HeldListingPort::default());
+    port.put("alpha");
+    backend.install_engine_records(Arc::clone(&port) as Arc<dyn flotilla_resources::engine_records::EngineRecords>);
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: backend.clone().using::<PrimaryResource>("flotilla"),
+            secondaries: Vec::new(),
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(5), port.held.notified()).await.expect("the controller lists");
+    port.put("beta");
+    port.release.notify_one();
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let reconciled = reconciled.lock().expect("reconciled lock");
+                if ["alpha", "beta"].iter().all(|name| reconciled.iter().any(|reconciled| reconciled == name)) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the listed primary and the one committed during the list are both reconciled");
+
+    harness.shutdown().await;
+}

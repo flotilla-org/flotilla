@@ -93,9 +93,11 @@ async fn run_with_inhibitor<I: SleepInhibitor, P: SleepCapabilityProbe>(
     let canonical_host_id = flotilla_protocol::CanonicalHostId::resolved(&host_id);
     let mut active_convoys = ActiveConvoys::from_objects(&listed, &canonical_host_id);
 
+    // Vessels are engine-served, whose watches cannot resume from a list either. An event queued
+    // before the list replays a name onto the set in order, so the set ends at the last event.
+    let mut vessel_watch = vessels.watch(WatchStart::Now).await?;
     let listed_vessels = vessels.list().await?;
     let mut active_vessels = ActiveVessels::from_objects(&listed_vessels.items);
-    let mut vessel_watch = vessels.watch(WatchStart::resuming_from(&listed_vessels)).await?;
     maintain_and_publish(
         &mut inhibitor,
         effective_inhibition_required(active_convoys.required() || active_vessels.required(), sleep_capability),

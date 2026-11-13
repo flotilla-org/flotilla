@@ -14,7 +14,7 @@ use crate::{
     CredentialGrant, CredentialSpec, CrewDefaults, Environment, FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild, ImageLayer,
     InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project, ReadResourceList, ReadWatchEvent, ReplicaCursor,
     ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
-    TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
+    TerminalSession, Vessel, WatchEvent, WatchStart, WatchStream, WorkflowTemplate, WriterIdentity,
 };
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
@@ -1228,6 +1228,14 @@ async fn watch_typed<T: Resource>(
             };
             (resource_version, generation, Vec::new(), start)
         }
+        None if backend.engine_serves(T::API_PATHS.kind) => {
+            // An engine-served kind's watch cannot resume from a list: watch first, so a change
+            // between the two is in the list, the stream or both.
+            let watch = resolver.watch(WatchStart::Now).await?;
+            let listed = resolver.list().await?;
+            let initial = listed.items.iter().map(|object| watch_event_value("ADDED", object)).collect::<Result<Vec<_>, _>>()?;
+            return Ok(dynamic_watch::<T>(namespace, listed.resource_version, listed.generation, initial, watch));
+        }
         None => {
             let listed = resolver.list().await?;
             let initial = listed.items.iter().map(|object| watch_event_value("ADDED", object)).collect::<Result<Vec<_>, _>>()?;
@@ -1235,9 +1243,19 @@ async fn watch_typed<T: Resource>(
         }
     };
     let watch = resolver.watch(start).await?;
+    Ok(dynamic_watch::<T>(namespace, resource_version, generation, initial, watch))
+}
+
+fn dynamic_watch<T: Resource>(
+    namespace: &str,
+    resource_version: String,
+    generation: Option<String>,
+    initial: Vec<Value>,
+    watch: WatchStream<T>,
+) -> DynamicResourceWatch {
     let stream_generation = watch.generation().map(ToOwned::to_owned).or(generation);
     let stream = watch.map(|event| event.and_then(|event| typed_watch_event_value(&event))).boxed();
-    Ok(DynamicResourceWatch {
+    DynamicResourceWatch {
         kind: T::API_PATHS.kind.to_string(),
         plural: T::API_PATHS.plural.to_string(),
         namespace: namespace.to_string(),
@@ -1245,7 +1263,7 @@ async fn watch_typed<T: Resource>(
         generation: stream_generation,
         initial,
         stream,
-    })
+    }
 }
 
 async fn watch_typed_including_replicas<T: Resource>(
