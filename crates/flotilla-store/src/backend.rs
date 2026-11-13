@@ -253,12 +253,20 @@ impl ResourceBackend {
     }
 
     /// Every namespace with an authored or replicated record, by kind plural: a kind the engine
-    /// serves answers from the engine, every other from the store.
+    /// serves answers from the engine, every other from the store. A kind the engine does not
+    /// read as resources is in no namespace; a kind whose read fails names itself in the error.
     pub async fn stored_namespace_inventory(&self) -> Result<std::collections::BTreeMap<String, Vec<String>>, ResourceError> {
         let mut inventory = self.store.namespace_inventory().await?;
         for kind in crate::declared_resource_kinds() {
             if let Some(records) = self.engine_records(kind.paths.kind) {
-                inventory.insert(kind.paths.plural.to_string(), self.engine_kind_namespaces(kind.paths.kind, &*records, false).await?);
+                let namespaces = if records.reads(kind.paths.kind) {
+                    self.engine_kind_namespaces(kind.paths.kind, &*records, false)
+                        .await
+                        .map_err(|error| ResourceError::other(format!("namespaces of {}: {error}", kind.paths.kind)))?
+                } else {
+                    Vec::new()
+                };
+                inventory.insert(kind.paths.plural.to_string(), namespaces);
             }
         }
         Ok(inventory)
@@ -1049,5 +1057,90 @@ impl std::ops::Deref for ResourceBackend {
 impl<S: crate::Store + 'static> From<S> for ResourceBackend {
     fn from(store: S) -> Self {
         Self::from_arc(std::sync::Arc::new(store))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use flotilla_resources::engine_records::{EngineObject, EngineRecords};
+    use futures::stream::BoxStream;
+
+    /// A port serving `kinds`: one Vessel record, ImageBuild only to refuse it, and every read of
+    /// a kind in `failing` failed.
+    #[derive(Debug)]
+    struct Port {
+        kinds: &'static [&'static str],
+        failing: &'static [&'static str],
+    }
+
+    #[async_trait::async_trait]
+    impl EngineRecords for Port {
+        fn kinds(&self) -> &'static [&'static str] {
+            self.kinds
+        }
+        fn reads(&self, kind: &str) -> bool {
+            kind != "ImageBuild"
+        }
+        fn home(&self) -> String {
+            "kiwi".into()
+        }
+        async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
+            Ok(self.sources(kind).await?.into_iter().find(|record| record.name == name))
+        }
+        async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
+            self.sources(kind).await
+        }
+        async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
+            match kind {
+                "ImageBuild" => Err("ImageBuild is not read through the resource commands".into()),
+                failing if self.failing.contains(&failing) => Err("the records could not be read".into()),
+                _ => Ok(vec![EngineObject {
+                    name: "v#1".into(),
+                    home: "kiwi".into(),
+                    version: 1,
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    spec: serde_json::json!({ "convoy_ref": "c", "vessel_name": "w", "fulfilment_kind_ref": "k" }),
+                    status: None,
+                }]),
+            }
+        }
+        async fn apply(
+            &self,
+            _kind: &str,
+            _name: &str,
+            _labels: &BTreeMap<String, String>,
+            _annotations: &BTreeMap<String, String>,
+            _spec: serde_json::Value,
+        ) -> Result<EngineObject, String> {
+            Err("read only".into())
+        }
+        async fn set_status(&self, _kind: &str, _name: &str, _status: serde_json::Value) -> Result<EngineObject, String> {
+            Err("read only".into())
+        }
+        async fn delete(&self, _kind: &str, _name: &str) -> Result<(), String> {
+            Err("read only".into())
+        }
+        async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
+            Err("no changes".into())
+        }
+    }
+
+    // Behaviour: kind discovery lists a kind the engine serves only to refuse in no namespace,
+    // and a kind whose read fails fails discovery naming that kind.
+    #[tokio::test]
+    async fn namespace_inventory_lists_refused_kinds_empty_and_names_a_failing_kind() {
+        let backend = crate::test_store::memory_backend();
+        backend.serve_engine_in("flotilla");
+        backend.install_engine_records(Arc::new(Port { kinds: &["Vessel", "ImageBuild"], failing: &[] }));
+        let inventory = backend.stored_namespace_inventory().await.expect("inventory");
+        assert_eq!(inventory.get("imagebuilds"), Some(&Vec::new()), "image builds are in no namespace: {inventory:?}");
+        assert_eq!(inventory.get("vessels"), Some(&vec!["flotilla".to_owned()]), "{inventory:?}");
+
+        backend.install_engine_records(Arc::new(Port { kinds: &["Artifact"], failing: &["Artifact"] }));
+        let error = backend.stored_namespace_inventory().await.expect_err("a failing kind fails discovery").to_string();
+        assert!(error.contains("Artifact") && error.contains("could not be read"), "the failing kind is named: {error}");
     }
 }

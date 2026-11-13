@@ -31,6 +31,11 @@ pub struct EngineObject {
 pub trait EngineRecords: Send + Sync + std::fmt::Debug {
     /// The resource kinds this port serves.
     fn kinds(&self) -> &'static [&'static str];
+    /// Whether `kind`'s records are read through this port; a kind it serves only to refuse
+    /// holds none as resources, so lists in no namespace.
+    fn reads(&self, _kind: &str) -> bool {
+        true
+    }
     /// This home: the writer of the records it holds.
     fn home(&self) -> String;
     /// `kind`'s record `name`, as several homes' resolve.

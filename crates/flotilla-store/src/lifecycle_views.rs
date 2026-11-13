@@ -213,6 +213,10 @@ impl EngineRecords for LifecycleViews {
         &[CLONE, ENVIRONMENT, CHECKOUT, IMAGE_BUILD]
     }
 
+    fn reads(&self, kind: &str) -> bool {
+        kind != IMAGE_BUILD
+    }
+
     fn home(&self) -> String {
         self.here()
     }
