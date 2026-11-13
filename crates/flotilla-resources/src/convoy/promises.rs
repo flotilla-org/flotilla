@@ -1,5 +1,5 @@
 //! Promise state machine shared by commands and discovery. Verdicts retain every attempt.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -759,6 +759,40 @@ pub fn next_observation(
     None
 }
 
+/// The artifacts [`next_observation`] reads for `convoy`'s decision ledger promises: each open
+/// promise's ledger slot, and each submitted one's submitted artifact.
+pub fn ledger_artifact_names(status: &ConvoyStatus, convoy: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    if status.phase.is_terminal() {
+        return names;
+    }
+    for crew in status.promises.values() {
+        for (role, promises) in crew {
+            for promise in promises.iter().filter(|promise| promise.kind == PromiseKind::DecisionLedger) {
+                match promise.state {
+                    PromiseState::Open => {
+                        names.extend(crate::address::artifact_slot_record_name(convoy, role, "decision-ledger", convoy).ok())
+                    }
+                    PromiseState::Submitted => {
+                        names.extend(promise.submissions.last().map(|submission| submitted_artifact(submission).to_owned()))
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The record name of the artifact `submission` references.
+fn submitted_artifact(submission: &Submission) -> &str {
+    submission
+        .reference
+        .strip_prefix("artifact/")
+        .map(|reference| reference.rsplit('/').next().unwrap_or(reference))
+        .unwrap_or(&submission.reference)
+}
+
 fn ledger_submission(
     promise: &Promise,
     convoy: &str,
@@ -801,12 +835,7 @@ fn observed_verdict(
         // Kept verifies artifact existence/provenance, not the quality of its
         // decisions. Ledger validation remains the artifact intake boundary.
         PromiseKind::DecisionLedger => {
-            let name = submission
-                .reference
-                .strip_prefix("artifact/")
-                .map(|reference| reference.rsplit('/').next().unwrap_or(reference))
-                .unwrap_or(&submission.reference);
-            let artifact = artifacts.get(name)?;
+            let artifact = artifacts.get(submitted_artifact(submission))?;
             if artifact.spec.kind != "decision-ledger"
                 || artifact.spec.producer != submission.metadata.get("producer").map(String::as_str).unwrap_or(role)
                 || submission.metadata.get("digest").is_some_and(|digest| *digest != artifact.spec.digest)

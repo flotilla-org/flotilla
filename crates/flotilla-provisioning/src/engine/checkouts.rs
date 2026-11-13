@@ -581,24 +581,25 @@ impl flotilla_store::controller::SecondaryWatch for CheckoutRepositoryWake {
     }
 }
 
-/// The old convoys whose engine launch is among `holders`: each generation by the launch it became.
+/// The convoys whose engine launch is among `holders`. A launch's convoy is named for the launch,
+/// so each holder is read by its name.
 async fn holder_convoys(
     backend: &flotilla_store::ResourceBackend,
     namespace: &str,
     holders: &std::collections::BTreeSet<String>,
 ) -> Result<std::collections::BTreeSet<String>, flotilla_resources::ResourceError> {
-    Ok(backend
-        .including_replicas::<flotilla_resources::Convoy>(namespace)
-        .list()
-        .await?
-        .items
-        .into_iter()
-        .filter(|convoy| {
-            flotilla_resources::convoy::engine::checkout_holder(&convoy.object)
+    let convoys = backend.including_replicas::<flotilla_resources::Convoy>(namespace);
+    let mut held = std::collections::BTreeSet::new();
+    for holder in holders {
+        for convoy in convoys.get_all(holder).await?.items {
+            if flotilla_resources::convoy::engine::checkout_holder(&convoy.object)
                 .is_some_and(|CheckoutHolder::Convoy(launch)| holders.contains(&launch))
-        })
-        .map(|convoy| convoy.object.metadata.name)
-        .collect())
+            {
+                held.insert(convoy.object.metadata.name);
+            }
+        }
+    }
+    Ok(held)
 }
 
 /// The convoy holders of the checkouts the next batch of followed log entries changed, and

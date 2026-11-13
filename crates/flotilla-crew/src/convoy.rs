@@ -759,8 +759,19 @@ impl Reconciler for ConvoyReconciler {
         }
 
         let artifacts = match &self.artifacts {
+            // Only the artifacts its ledger promises name, each by its name.
             Some(artifacts) if needs_ledger => {
-                artifacts.list().await?.items.into_iter().map(|item| (item.object.metadata.name.clone(), item.object)).collect()
+                let mut held = BTreeMap::new();
+                for name in flotilla_resources::convoy::promises::ledger_artifact_names(status, &obj.metadata.name) {
+                    match artifacts.get(&name).await {
+                        Ok(read) => {
+                            held.insert(name, read.object);
+                        }
+                        Err(ResourceError::NotFound { .. }) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                held
             }
             _ => BTreeMap::new(),
         };

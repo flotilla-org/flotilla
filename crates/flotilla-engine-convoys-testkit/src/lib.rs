@@ -22,6 +22,7 @@ use flotilla_store::{ConvoyViews, ResourceBackend};
 /// One home's engine Convoy path; a decided store it opened lives as long as this value.
 pub struct EngineConvoysHome {
     convoys: Arc<Convoys>,
+    views: Arc<ConvoyViews>,
     path: EngineConvoyPath,
     _dir: Option<tempfile::TempDir>,
 }
@@ -43,11 +44,17 @@ impl EngineConvoysHome {
         let records = EngineConvoyRecords::new(&home, Arc::clone(service), Arc::clone(convoys.memory()));
         // The views hear their changes from the store's log, on the test's runtime.
         drop(records.follow().expect("follow the convoy log"));
-        backend.install_engine_records(Arc::new(ConvoyViews::new(namespace, Arc::new(WithConvoys { reads, records }))));
+        let views = Arc::new(ConvoyViews::new(namespace, Arc::new(WithConvoys { reads, records })));
+        backend.install_engine_records(Arc::clone(&views) as _);
         let path: EngineConvoyPath = Arc::new(OnceLock::new());
         let engine: Arc<dyn EngineConvoys> = Arc::new(ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), clock));
         assert!(path.set(engine).is_ok(), "a new path is empty");
-        Self { convoys, path, _dir: None }
+        Self { convoys, views, path, _dir: None }
+    }
+
+    /// The Convoy views `backend` serves, for read-cost tests.
+    pub fn views(&self) -> &Arc<ConvoyViews> {
+        &self.views
     }
 
     /// [`Self::over`] a new decided store at `home`, which lives as long as the value.

@@ -20,6 +20,7 @@ use flotilla_resources::{
 };
 use flotilla_store::{controller::Reconciler, ResourceBackend};
 use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadOperation, ReadSnapshot};
 
 const NAMESPACE: &str = "flotilla";
 
@@ -151,17 +152,23 @@ async fn ledger_convoy(backend: &ResourceBackend) -> ResourceObject<Convoy> {
         .create(&InputMeta::builder().name("c".to_string()).build(), &ConvoySpec::builder().workflow_ref("w".to_string()).build())
         .await
         .expect("convoy");
-    let name = record_name(&artifact_address("c", "coder", "decision-ledger", "c").expect("address")).expect("record name");
+    publish_ledger(backend, "c").await;
+    convoys.update_status("c", &created.metadata.resource_version, &status).await.expect("status")
+}
+
+/// Publishes convoy `convoy`'s coder's decision ledger artifact.
+async fn publish_ledger(backend: &ResourceBackend, convoy: &str) {
+    let name = record_name(&artifact_address(convoy, "coder", "decision-ledger", convoy).expect("address")).expect("record name");
     backend
         .clone()
         .using::<Artifact>(NAMESPACE)
         .create(
             &InputMeta::builder().name(name).build(),
             &ArtifactSpec::builder()
-                .convoy("c".to_string())
+                .convoy(convoy.to_string())
                 .producer("coder".to_string())
                 .kind("decision-ledger".to_string())
-                .subject("c".to_string())
+                .subject(convoy.to_string())
                 .digest(blob_digest_of(b"ledger"))
                 .size(1)
                 .media_type("text/markdown".to_string())
@@ -170,7 +177,28 @@ async fn ledger_convoy(backend: &ResourceBackend) -> ResourceObject<Convoy> {
         )
         .await
         .expect("artifact");
-    convoys.update_status("c", &created.metadata.resource_version, &status).await.expect("status")
+}
+
+/// The reads one pass over the ledger convoy makes, with `others` other convoys' ledgers held.
+async fn ledger_pass_reads(others: usize) -> ReadSnapshot {
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let convoy = ledger_convoy(&backend).await;
+    for n in 0..others {
+        publish_ledger(&backend, &format!("other-{n}")).await;
+    }
+    let reconciler = reconciler(&backend, Arc::new(Recording { holds: true, ..Default::default() }));
+    let before = backend.read_snapshot();
+    reconciler.prepare(&convoy).await.expect("prepare");
+    backend.read_snapshot().since(&before)
+}
+
+// Behaviour: a pass reads the artifacts its ledger promises name, each by its name, not every
+// convoy's artifacts.
+#[tokio::test]
+async fn a_pass_reads_only_its_ledgers_artifacts() {
+    let reads = assert_flat_reads([0, 40], ledger_pass_reads).await;
+    assert_eq!(reads.calls("Artifact", ReadOperation::List), 0, "{reads}");
+    assert_eq!(reads.objects("Artifact", ReadOperation::Get), 1, "{reads}");
 }
 
 fn reconciler(backend: &ResourceBackend, engine: Arc<Recording>) -> ConvoyReconciler {

@@ -9,12 +9,14 @@ use std::{
 use chrono::Utc;
 use flotilla_crew::reconcilers::vessel::ConvoyVesselWake;
 use flotilla_engine_convoys_testkit::{convoy, single_agent, EngineConvoysHome};
+use flotilla_provisioning::engine::checkouts::CheckoutConvoyWake;
 use flotilla_provisioning_testkit::{EngineFixture, OtherHome};
 use flotilla_resources::{
     account_access::AccountRecords,
     address::{artifact_address, record_name},
+    checkout_records::CheckoutHolder,
     vessel_records::VesselRecords,
-    Artifact, ArtifactSpec, ConvoySpec, SystemClock,
+    Artifact, ArtifactSpec, CheckoutSpec, ConvoySpec, ObservedCheckoutSpec, RepositoryKey, SystemClock,
 };
 use flotilla_store::{
     controller::{SecondaryWatch, WorkQueueSender},
@@ -133,6 +135,75 @@ async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64) {
     }
     waking.abort();
     (names, vessels.launches_read() - before)
+}
+
+/// The convoys queued, and the convoy views converted, when a checkout held for one convoy is
+/// requested, with `others` other convoys launched.
+async fn queued_by_one_checkout(others: usize) -> (Vec<String>, u64) {
+    let store = OtherHome::open("home");
+    let engine = EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
+    let mut launches = Vec::new();
+    for n in 0..=others + 1 {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        launches.push(convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await);
+    }
+    let checkout = |name: &str| {
+        CheckoutSpec::Observed(ObservedCheckoutSpec {
+            r#ref: name.into(),
+            path: format!("/work/{name}"),
+            repo_ref: RepositoryKey("github.com/o/r".into()),
+            host_ref: "home".into(),
+            is_main: false,
+        })
+    };
+
+    let (sender, mut queued) = WorkQueueSender::channel();
+    let waking =
+        tokio::spawn(Box::new(CheckoutConvoyWake::new(Arc::clone(store.service()))).spawn(backend.clone(), NAMESPACE.to_owned(), sender));
+
+    // The wake follows the log from when it starts: the first convoy's checkouts are requested
+    // until one is heard.
+    let warm = &launches[0];
+    let heard = tokio::time::timeout(Duration::from_secs(5), async {
+        for n in 0.. {
+            let name = format!("warm-{n}");
+            engine.checkouts.request(&name, &checkout(&name), Some(&CheckoutHolder::Convoy(warm.clone())));
+            if let Ok(Some(name)) = tokio::time::timeout(Duration::from_millis(50), queued.recv()).await {
+                return name;
+            }
+        }
+        unreachable!()
+    })
+    .await
+    .expect("the wake hears a checkout");
+    assert_eq!(&heard, warm);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while queued.try_recv().is_ok() {}
+
+    let before = convoys.views().views_converted();
+    let changed = &launches[1];
+    engine.checkouts.request("changed", &checkout("changed"), Some(&CheckoutHolder::Convoy(changed.clone())));
+    let mut names = vec![tokio::time::timeout(Duration::from_secs(5), queued.recv()).await.expect("queued").expect("open queue")];
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while let Ok(name) = queued.try_recv() {
+        names.push(name);
+    }
+    waking.abort();
+    (names, convoys.views().views_converted() - before)
+}
+
+// Behaviour: a checkout's change queues the convoy it is held for, read by that convoy's launch
+// name, not by converting every convoy.
+#[tokio::test]
+async fn a_checkout_queues_only_its_holders_convoy() {
+    let (small, small_read) = queued_by_one_checkout(5).await;
+    let (large, large_read) = queued_by_one_checkout(60).await;
+    assert_eq!(small.len(), 1, "only the holder's convoy is queued: {small:?}");
+    assert_eq!(large.len(), 1, "only the holder's convoy is queued: {large:?}");
+    assert_eq!(small_read, 1, "only that convoy's view is converted");
+    assert_eq!(large_read, small_read, "the cost does not grow with the other convoys");
 }
 
 // Behaviour: a brief artifact queues only the vessels of the convoy it belongs to, read by that
