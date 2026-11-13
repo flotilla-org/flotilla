@@ -274,10 +274,12 @@ impl CredentialDelivery {
         };
         self.follow_codex_login(pending.codex_rotated, now).await;
         let wake = GithubAppRefreshWake { projects: pending.projects, retry_given_up: pending.definitions };
-        let errors = self.store.refresh_github_app_tokens(&wake).await;
-        for error in &errors {
+        let refreshed = self.store.refresh_github_app_tokens(&wake).await;
+        for error in &refreshed.errors {
             warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
         }
+        // A re-mint, failed or not, may change what its environment reports delivered.
+        cards.environments.extend(refreshed.environments);
         // Cards read committed delivery observations, never the preparation index.
         if let Err(error) = self.state.daemon.refresh_capability_cards(&self.namespace, &cards).await {
             warn!(%error, "failed to refresh session capability cards");

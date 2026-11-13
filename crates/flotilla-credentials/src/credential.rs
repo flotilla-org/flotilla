@@ -392,6 +392,16 @@ pub struct GithubAppRefreshWake {
     pub retry_given_up: bool,
 }
 
+/// What a GitHub App refresh pass did.
+#[derive(Debug, Default)]
+pub struct GithubAppRefresh {
+    /// Its failures, and late refreshes that succeeded.
+    pub errors: Vec<CredentialRefreshError>,
+    /// The environments with a delivery it re-minted or failed to: what they report delivered
+    /// may have changed, a failure past expiry dropping the credential.
+    pub environments: BTreeSet<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GithubAppScope {
     pub fixed_repositories: BTreeSet<RepositoryKey>,
@@ -1488,18 +1498,18 @@ impl CredentialStore {
     /// Re-mints and atomically replaces the GitHub App files whose refresh is due; vessels receive
     /// only the resulting file and never the App signing material.
     pub fn refresh_due_github_app_tokens(&self) -> BoxFuture<'_, Vec<CredentialRefreshError>> {
-        Box::pin(async move { self.refresh_github_app_tokens(&GithubAppRefreshWake::default()).await })
+        Box::pin(async move { self.refresh_github_app_tokens(&GithubAppRefreshWake::default()).await.errors })
     }
 
     /// One refresh pass: the deliveries whose refresh or retry is due, those whose scope `wake`
-    /// names or that were given a new scope, and, when `wake` says so, those that gave up. The
-    /// errors are this pass's failures, and late refreshes that succeeded.
-    pub fn refresh_github_app_tokens<'a>(&'a self, wake: &'a GithubAppRefreshWake) -> BoxFuture<'a, Vec<CredentialRefreshError>> {
+    /// names or that were given a new scope, and, when `wake` says so, those that gave up.
+    pub fn refresh_github_app_tokens<'a>(&'a self, wake: &'a GithubAppRefreshWake) -> BoxFuture<'a, GithubAppRefresh> {
         Box::pin(async move {
             let now = self.clock.now();
             let deliveries =
                 self.github_app_deliveries.lock().await.iter().map(|(key, delivery)| (key.clone(), delivery.clone())).collect::<Vec<_>>();
             let mut errors = Vec::new();
+            let mut reminted = BTreeSet::new();
             for (key, delivery) in deliveries {
                 let touched = delivery.scope_dirty
                     || delivery.scope.as_ref().is_some_and(|scope| scope.projects.iter().any(|project| wake.projects.contains(project)));
@@ -1572,8 +1582,11 @@ impl CredentialStore {
                 }
                 drop(deliveries);
                 self.record_delivered_capabilities(std::slice::from_ref(&key)).await;
+                reminted.insert(key.0);
             }
-            errors
+            // Each failure names its delivery's environment.
+            reminted.extend(errors.iter().map(|error: &CredentialRefreshError| error.environment_ref.clone()));
+            GithubAppRefresh { errors, environments: reminted }
         })
     }
 
@@ -3234,12 +3247,84 @@ mod tests {
         assert!(store.refresh_due_github_app_tokens().await.is_empty(), "no timed retry after giving up");
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 2);
         let event = GithubAppRefreshWake { retry_given_up: true, ..GithubAppRefreshWake::default() };
-        let errors = store.refresh_github_app_tokens(&event).await;
+        let errors = store.refresh_github_app_tokens(&event).await.errors;
         // It recovers, reporting that the refresh came after expiry.
         assert!(errors.len() == 1 && errors[0].message.contains("refresh started inside the expiry margin"), "{errors:?}");
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 3);
         assert!(store.github_app_refresh_failures().await.is_empty());
         assert!(store.next_github_app_refresh_at().await.is_some());
+    }
+
+    // A re-mint names its environment whether it fails or not, so its cards read the delivery
+    // again: the failure at expiry drops the credential from what the environment reports, and
+    // from the card section rendered from it.
+    #[tokio::test]
+    async fn a_failed_re_mint_past_expiry_names_its_environment_and_drops_the_credential() {
+        use flotilla_capability_contract::SessionCapabilitySource;
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let clock = Arc::new(VirtualClock::new(now));
+        let minter = Arc::new(FakeGithubAppTokenMinter {
+            tokens: StdMutex::new(VecDeque::from([
+                Ok(GithubAppToken { permissions: None, value: "refreshed".to_string(), expires_at: now + Duration::hours(1) }),
+                Err("outage 1".to_string()),
+                Err("outage 2".to_string()),
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_github_app_minter(
+            ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
+            PathBuf::from("/state"),
+        );
+        let key = ("vessel".to_string(), "github-app".to_string());
+        store.github_app_deliveries.lock().await.insert(
+            key.clone(),
+            GithubAppDelivery {
+                effective_permissions: None,
+                generation: uuid::Uuid::new_v4(),
+                request: GithubAppMintRequest {
+                    installation_id: 1,
+                    app_id_path: "app-id".to_string(),
+                    private_key_path: "key".to_string(),
+                    repositories: vec!["flotilla".to_string()],
+                    permissions: None,
+                },
+                runner,
+                token_file: PathBuf::from("/state/credentials/github-app/token"),
+                issued_at: now - Duration::hours(1),
+                expires_at: now,
+                refresh_failures: 0,
+                next_refresh_attempt_at: None,
+                first_refresh_failure_at: None,
+                last_refresh_error: None,
+                installation_repository: None,
+                scope: None,
+                scope_dirty: false,
+            },
+        );
+        store.record_delivered_capabilities(std::slice::from_ref(&key)).await;
+        let references = BTreeSet::from(["github-app".to_string()]);
+        let card =
+            || async { flotilla_capability_contract::credential_card(&store.credentials("vessel", &references).await.expect("observed")) };
+        let named = || async { store.refresh_github_app_tokens(&GithubAppRefreshWake::default()).await.environments };
+        assert_eq!(named().await, BTreeSet::from(["vessel".to_string()]), "a re-mint that succeeds names its environment");
+        assert!(card().await.contains("github-app"));
+        // A failure before expiry names it too, and the credential is still delivered.
+        clock.advance(Duration::minutes(59) + Duration::seconds(50));
+        assert_eq!(named().await, BTreeSet::from(["vessel".to_string()]));
+        assert!(card().await.contains("github-app"));
+        // The failure at expiry gives up and names it; the card no longer lists the credential.
+        clock.advance(Duration::seconds(10));
+        assert_eq!(named().await, BTreeSet::from(["vessel".to_string()]));
+        assert_eq!(store.next_github_app_refresh_at().await, None, "an expired delivery schedules no attempt");
+        assert!(store.credentials("vessel", &references).await.expect("observed").is_empty());
+        assert!(!card().await.contains("github-app"), "{}", card().await);
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 3);
     }
 
     #[tokio::test]
