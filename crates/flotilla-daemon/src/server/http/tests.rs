@@ -60,7 +60,10 @@ impl Incarnation {
     }
 
     fn with_origin(origin: ListenerOrigin) -> Self {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        Self::over(ResourceBackend::new(InMemoryBackend::default()), origin)
+    }
+
+    fn over(backend: ResourceBackend, origin: ListenerOrigin) -> Self {
         let clock = Arc::new(ManualClock(Mutex::new(DateTime::parse_from_rfc3339("2026-10-19T12:00:00Z").expect("time").into())));
         let logins = Arc::new(LoginStore::new(clock.clone()));
         let router =
@@ -400,6 +403,119 @@ async fn resource_http_honors_declared_selectors() {
     let response = request(parameters).await;
     assert!(response.starts_with("HTTP/1.1 200"), "distinct query and selector predicates are combined");
     assert_eq!(items(&response).as_array().unwrap().len(), 1);
+}
+
+/// An engine port serving every registered kind, holding no records.
+#[derive(Debug)]
+struct EveryKindEmpty;
+
+static EVERY_KIND: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| flotilla_store::REGISTERED_RESOURCE_KINDS.iter().map(|registered| registered.kind).collect());
+
+#[async_trait::async_trait]
+impl flotilla_resources::engine_records::EngineRecords for EveryKindEmpty {
+    fn kinds(&self) -> &'static [&'static str] {
+        EVERY_KIND.as_slice()
+    }
+    fn home(&self) -> String {
+        "home-a".into()
+    }
+    async fn get(&self, _: &str, _: &str) -> Result<Option<flotilla_resources::engine_records::EngineObject>, String> {
+        Ok(None)
+    }
+    async fn list(&self, _: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+        Ok(Vec::new())
+    }
+    async fn sources(&self, _: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+        Ok(Vec::new())
+    }
+    async fn apply(
+        &self,
+        _: &str,
+        _: &str,
+        _: &std::collections::BTreeMap<String, String>,
+        _: &std::collections::BTreeMap<String, String>,
+        _: serde_json::Value,
+    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+        Err("read only".into())
+    }
+    async fn set_status(&self, _: &str, _: &str, _: serde_json::Value) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+        Err("read only".into())
+    }
+    async fn delete(&self, _: &str, _: &str) -> Result<(), String> {
+        Err("read only".into())
+    }
+    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
+        Err("no changes".into())
+    }
+}
+
+// Kind discovery on the engine's home answers from the engine alone: an old store that refuses
+// every access is never reached.
+#[tokio::test]
+async fn kind_discovery_on_the_engine_home_reads_no_old_store() {
+    use flotilla_daemon_testkit::old_store::{OldStore, OldStoreAccesses};
+
+    let accesses = Arc::new(OldStoreAccesses::default());
+    let backend = ResourceBackend::new(OldStore::unavailable(Arc::clone(&accesses)));
+    backend.compose_as_engine_home();
+    backend.serve_engine_in("flotilla");
+    backend.install_engine_records(Arc::new(EveryKindEmpty));
+    let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
+    let reply = daemon.call(CallerAuth::Socket(None), get("/apis/flotilla.work/v1")).await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    assert!(accesses.accesses().is_empty(), "{}", accesses.report());
+}
+
+// A Message query reads the engine's messages and answers with only those it selects, with or
+// without other homes' copies: a receiver's open messages, every open message, and the replies to
+// one message.
+#[tokio::test]
+async fn message_queries_answer_only_the_engine_messages_they_select() {
+    use flotilla_resources::{MessageRelation, MessageSpec};
+    use flotilla_store::MessageQuery;
+
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
+    let home = flotilla_engine_messages_testkit::EngineMessagesHome::open("home-a", "flotilla", &backend);
+    let intent = |sender: &str, receiver: &str, body: &str| {
+        MessageSpec::builder().sender(sender.into()).receiver(receiver.into()).relation(MessageRelation::Peer).body(body.into()).build()
+    };
+    let primitives = home.primitives();
+    for (name, spec) in [
+        ("to-coder-a", intent("flotilla/reviewer", "flotilla/coder", "a")),
+        ("to-coder-b", intent("flotilla/reviewer", "flotilla/coder", "b")),
+        ("to-reviewer", intent("flotilla/coder", "flotilla/reviewer", "c")),
+        ("answer", MessageSpec { in_reply_to: Some("to-coder-a".into()), ..intent("flotilla/coder", "flotilla/reviewer", "d") }),
+    ] {
+        primitives.admit("flotilla", name, &spec).await.unwrap_or_else(|error| panic!("admit {name}: {error}"));
+    }
+    let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
+    let names = |reply: Reply| {
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+        let mut names = reply.json()["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["metadata"]["name"].as_str().expect("name").to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let coder = "project:flotilla/role:coder".to_owned();
+    for include_replicas in [true, false] {
+        let query = |query: MessageQuery| {
+            let parameters = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("messageQuery", &serde_json::to_string(&query).expect("query"))
+                .append_pair("includeReplicas", &include_replicas.to_string())
+                .finish();
+            get(&format!("/apis/flotilla.work/v1/namespaces/flotilla/messages?{parameters}"))
+        };
+        let call = |request| daemon.call(CallerAuth::Socket(None), request);
+        assert_eq!(names(call(query(MessageQuery::Active { receiver: Some(coder.clone()) })).await), ["to-coder-a", "to-coder-b"]);
+        assert_eq!(names(call(query(MessageQuery::active())).await), ["answer", "to-coder-a", "to-coder-b", "to-reviewer"]);
+        assert_eq!(names(call(query(MessageQuery::ReplyTo { name: "to-coder-a".into() })).await), ["answer"]);
+    }
 }
 
 /// A TCP listener over one incarnation's router, bound on 127.0.0.1 with a chosen port.

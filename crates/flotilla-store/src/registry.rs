@@ -496,7 +496,8 @@ pub async fn delete_resource_kind(
 /// The stored delete is timestamped and relayed like an ordinary replica
 /// tombstone, so stale copies from other peers cannot immediately resurrect
 /// the object. A later update from the original authority remains newer and
-/// can recreate it.
+/// can recreate it. A kind the engine serves has no copy here to collect: its records are
+/// deleted at their home, and the request is refused naming it.
 pub async fn collect_resource_replica_kind(
     backend: &ResourceBackend,
     namespace: &str,
@@ -1118,6 +1119,14 @@ async fn collect_replica_typed<T: Resource>(
                 && matches!(&source.provenance, ResourceProvenance::Replica { origin_root: source_origin, .. } if source_origin == origin_root)
         })
         .ok_or_else(|| ResourceError::not_found(name))?;
+    if backend.engine_serves(T::API_PATHS.kind) {
+        // The engine holds one record at its home and follows it everywhere else: there is no
+        // copy here to collect, and a delete anywhere but the home would not stop the following.
+        return Err(ResourceError::invalid(format!(
+            "{} {name} is held by home {origin_root}; it is deleted at its home, not as a replica here",
+            T::API_PATHS.kind
+        )));
+    }
     let value = read_object_value(&replica)?;
     backend.replica_writer::<T>(origin_root.clone(), namespace).apply(WatchEvent::Deleted(replica.object), Utc::now()).await?;
     Ok(DynamicResourceObject {

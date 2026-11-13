@@ -256,7 +256,9 @@ impl ResourceBackend {
     /// serves answers from the engine, every other from the store. A kind the engine does not
     /// read as resources is in no namespace; a kind whose read fails names itself in the error.
     pub async fn stored_namespace_inventory(&self) -> Result<std::collections::BTreeMap<String, Vec<String>>, ResourceError> {
-        let mut inventory = self.store.namespace_inventory().await?;
+        // The engine's home answers every kind from the engine; its store holds none of them.
+        let home = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).home;
+        let mut inventory = if home { std::collections::BTreeMap::new() } else { self.store.namespace_inventory().await? };
         for kind in crate::declared_resource_kinds() {
             if let Some(records) = self.engine_records(kind.paths.kind) {
                 let namespaces = if records.reads(kind.paths.kind) {

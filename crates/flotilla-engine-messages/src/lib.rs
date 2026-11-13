@@ -1624,6 +1624,21 @@ impl MessagePrimitives {
         Ok(None)
     }
 
+    /// The open messages to `receiver`, as [`Self::verb_listing`] shows them: Pending then Awaiting,
+    /// read through the inbox's index. The listing spells each receiver as its inbox address, so a
+    /// receiver that is no address has none.
+    pub(crate) fn verb_open_to(&self, namespace: &str, receiver: &str) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
+        let Ok(inbox) = receiver.parse::<Address>() else { return Ok(Vec::new()) };
+        self.open_in(&inbox)
+            .map_err(ResourceError::other)?
+            .into_iter()
+            .map(|(home, resource)| {
+                let object = view::stored_view(&resource, namespace).map_err(ResourceError::invalid)?;
+                Ok(ReadResourceObject { object, provenance: self.provenance(&home) })
+            })
+            .collect()
+    }
+
     /// The message `id` homed at `home`, and its home.
     fn load_at(&self, id: String, home: String) -> Result<Option<(String, Resource<Message>)>, ResourceError> {
         let resource = self

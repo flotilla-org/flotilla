@@ -425,6 +425,66 @@ async fn a_peer_relays_another_origins_project_definition() {
     drop(feta_gouda);
 }
 
+// A record the engine holds is deleted at its home: with its home disconnected, a replica
+// delete of another home's Host is refused naming that home, and the Host is still followed.
+#[tokio::test]
+async fn a_replica_delete_of_an_engine_record_is_refused_naming_its_home() {
+    use flotilla_daemon_api::daemon::DaemonHandle;
+    use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+    let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    let feta_host_id = feta.local_host_summary().await.environment_id.host_id().expect("feta host id").to_string();
+    feta.resource_backend()
+        .using::<Host>("flotilla")
+        .create(&InputMeta::builder().name(feta_host_id).build(), &HostSpec::default())
+        .await
+        .expect("create feta's Host at its home");
+    let link = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect kiwi and feta");
+    let host = await_host_replica(&kiwi, &feta).await;
+    // A replica delete is offered only for a disconnected origin. Dropping the in-memory link
+    // stops both peer runtimes, which leaves no runtime to publish the loss, so it is published
+    // here as the runtime publishes it on a lost link.
+    drop(link);
+    kiwi.publish_peer_connection_status(
+        &flotilla_protocol::NodeInfo::new(feta.node_id().clone(), "feta".to_string()),
+        PeerConnectionState::Disconnected,
+    )
+    .await;
+
+    let mut events = kiwi.subscribe();
+    let command_id = kiwi
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".into(),
+                    kind: "hosts".into(),
+                    name: host.metadata.name.clone(),
+                    replica_origin: Some(feta.node_id().clone()),
+                })
+                .build(),
+        )
+        .await
+        .expect("submit the replica delete");
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let DaemonEvent::CommandFinished { command_id: id, result, .. } = events.recv().await.expect("delete event") {
+                if id == command_id {
+                    return result;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the replica delete finishes");
+    let CommandValue::Error { message } = result else { panic!("a replica delete of an engine record is refused: {result:?}") };
+    let refusal =
+        format!("Host {} is held by home {}; it is deleted at its home, not as a replica here", host.metadata.name, feta.node_id());
+    assert!(message.contains(&refusal), "{message}");
+    assert_eq!(await_host_replica(&kiwi, &feta).await.metadata.name, host.metadata.name, "the Host is still followed");
+}
+
 // #742: another host's adopted checkouts and independent attach targets reach it by following
 // its log, including updates and removals.
 #[tokio::test]

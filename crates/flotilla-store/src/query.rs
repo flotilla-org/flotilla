@@ -275,7 +275,7 @@ impl StoreQuery {
 }
 impl<T: Resource> TypedResolver<T> {
     pub async fn query_declared(&self, query: &StoreQuery) -> Result<ReadResourceList<T>, ResourceError> {
-        if let Some(reads) = self.backend.definitions::<T>(&self.namespace).engine_reads().await {
+        if let Some(reads) = self.backend.definitions::<T>(&self.namespace).engine_reads_for(query).await {
             // The query decides whether other homes' rows count, as it does for the old store.
             return Ok(ReadResourceList { items: crate::definition::select_reads(reads?, query)? });
         }
@@ -285,7 +285,7 @@ impl<T: Resource> TypedResolver<T> {
 }
 impl ResourceBackend {
     pub async fn query_declared<T: Resource>(&self, namespace: &str, query: &StoreQuery) -> Result<ReadResourceList<T>, ResourceError> {
-        if let Some(reads) = self.definitions::<T>(namespace).engine_reads().await {
+        if let Some(reads) = self.definitions::<T>(namespace).engine_reads_for(query).await {
             return Ok(ReadResourceList { items: crate::definition::select_reads(reads?, query)? });
         }
         Ok(ReadResourceList { items: self.store().query_decoded(ResourceKind::of::<T>(), namespace, query).await?.into_typed()? })

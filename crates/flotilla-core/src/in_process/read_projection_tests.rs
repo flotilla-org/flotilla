@@ -2005,6 +2005,29 @@ mod tests {
             assert_eq!(views.iter().map(|view| view.name.as_str()).collect::<Vec<_>>(), expected, "{}", convoy.metadata.name);
         }
     }
+
+    // Explain's message list, read with no Message evidence, answers with the engine's open
+    // messages alone: one delivered and settled is not listed.
+    #[tokio::test]
+    async fn message_views_without_evidence_list_only_open_engine_messages() {
+        use flotilla_resources::{MessageRelation, MessageSpec};
+
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
+        let home = flotilla_engine_messages_testkit::EngineMessagesHome::open("home-a", "flotilla", &backend);
+        for name in ["waiting", "settled"] {
+            let intent = MessageSpec::builder()
+                .sender("system:turn-rules".into())
+                .receiver("flotilla/coder".into())
+                .relation(MessageRelation::System)
+                .body(name.into())
+                .build();
+            home.primitives().admit("flotilla", name, &intent).await.expect("admit");
+        }
+        home.deliver_turn("flotilla/coder", "settled", "session-coder").await;
+        let views = super::crew_message_views(&backend, "flotilla").await.expect("message views");
+        assert_eq!(views.iter().map(|view| view.name.as_str()).collect::<Vec<_>>(), ["waiting"]);
+    }
 }
 
 #[cfg(test)]

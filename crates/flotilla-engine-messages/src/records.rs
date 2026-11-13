@@ -93,6 +93,12 @@ impl EngineRecords for MessageRecords {
         Ok(self.get(kind, name).await?.into_iter().collect())
     }
 
+    /// Pending, then Awaiting, in the receiver's inbox: read down its index.
+    async fn open_to(&self, _kind: &str, receiver: &str) -> Option<Result<Vec<EngineObject>, String>> {
+        let views = self.primitives.verb_open_to(&self.namespace(), receiver).map_err(|error| error.to_string());
+        Some(views.and_then(|views| views.into_iter().map(|read| self.object(read)).collect()))
+    }
+
     async fn apply(
         &self,
         _kind: &str,

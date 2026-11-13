@@ -80,6 +80,18 @@ impl<T: Resource> DefinitionResolver<T> {
         Some(self.read_all(&*records).await)
     }
 
+    /// [`Self::engine_reads`] for `query`: a query for one receiver's open messages reads them
+    /// through the port's index when it keeps one, and every other reads them all.
+    pub(crate) async fn engine_reads_for(&self, query: &crate::StoreQuery) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
+        let records = self.records()?;
+        if let Some(receiver) = query.message.as_ref().and_then(crate::MessageQuery::open_receiver) {
+            if let Some(open) = records.open_to(T::API_PATHS.kind, receiver).await {
+                return Some(open.map_err(ResourceError::other).and_then(|open| self.reads(&records.home(), open, None)));
+            }
+        }
+        Some(self.read_all(&*records).await)
+    }
+
     async fn read_all(&self, records: &dyn EngineRecords) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
         // Every home's copy, as the old store's replica reads return each origin's.
         let listed = records.sources(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
@@ -702,14 +714,19 @@ pub(crate) fn select_reads<T: Resource>(
         .filter(|read| query.merged_definitions || !flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, &read.object.metadata.name))
         .collect();
     let mut index = crate::QueryIndex::default();
+    let mut messages = BTreeSet::new();
     for read in &reads {
-        index.update(
-            &read.object.metadata.name,
-            Some(&serde_json::to_value(read.object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?),
-        );
+        let value = serde_json::to_value(read.object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?;
+        if query.message.as_ref().is_none_or(|message| message.selects(&value)) {
+            messages.insert(read.object.metadata.name.clone());
+        }
+        index.update(&read.object.metadata.name, Some(&value));
     }
     let selected = index.names(query);
-    Ok(reads.into_iter().filter(|read| selected.contains(&read.object.metadata.name)).collect())
+    Ok(reads
+        .into_iter()
+        .filter(|read| selected.contains(&read.object.metadata.name) && messages.contains(&read.object.metadata.name))
+        .collect())
 }
 
 /// An engine record as the old store's object in `namespace`: the labels and annotations its
