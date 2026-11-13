@@ -922,7 +922,7 @@ async fn daemon_for_plain_dir_with_discovery(discovery: DiscoveryRuntime) -> (te
 async fn daemon_for_plain_dir_with_engine(
     discovery: DiscoveryRuntime,
 ) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, flotilla_provisioning_testkit::EngineFixture) {
-    plain_dir_daemon(discovery, install_engine).await
+    plain_dir_daemon(discovery, false).await
 }
 
 /// [`daemon_for_plain_dir_with_engine`], its engine over the daemon's decided store: what the
@@ -930,12 +930,12 @@ async fn daemon_for_plain_dir_with_engine(
 async fn daemon_for_plain_dir_with_decided_engine(
     discovery: DiscoveryRuntime,
 ) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, flotilla_provisioning_testkit::EngineFixture) {
-    plain_dir_daemon(discovery, install_decided_engine).await
+    plain_dir_daemon(discovery, true).await
 }
 
 async fn plain_dir_daemon(
     discovery: DiscoveryRuntime,
-    install: fn(&InProcessDaemon) -> flotilla_provisioning_testkit::EngineFixture,
+    decided: bool,
 ) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, flotilla_provisioning_testkit::EngineFixture) {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
@@ -950,7 +950,7 @@ async fn plain_dir_daemon(
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let engine = install(&daemon);
+    let engine = if decided { install_decided_engine(&daemon).await } else { install_engine(&daemon) };
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     (temp, repo, daemon, engine)
 }
@@ -963,8 +963,9 @@ fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
 
 /// Installs the engine over `daemon`'s decided store as its readings, as the daemon's runtime
 /// does: its terminal sessions are read at every home the store holds, so another daemon's
-/// arrive as that daemon's log is replicated in.
-fn install_decided_engine(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EngineFixture {
+/// arrive as that daemon's log is replicated in. Its Message path opens first, as at startup.
+async fn install_decided_engine(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EngineFixture {
+    open_attentions(daemon).await;
     let service = daemon.decided_store().expect("decided store");
     let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&service);
     // Its vessels' and terminal sessions' watchers hear each launch change, as the runtime's do;
@@ -1284,7 +1285,7 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
     )
     .await;
     // The engine's readings, which a running daemon always has, homed with its convoys.
-    let engine = install_decided_engine(&daemon);
+    let engine = install_decided_engine(&daemon).await;
     let backend = daemon.resource_backend();
     let change_requests = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
     let repo_ref = flotilla_resources::RepositoryKey("repo-a".to_string());
@@ -8623,7 +8624,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let authority_engine = install_decided_engine(&authority);
+    let authority_engine = install_decided_engine(&authority).await;
     let terminal_host = InProcessDaemon::new(
         vec![],
         test_config_store(terminal_temp.path().join("config")),
@@ -8633,7 +8634,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let terminal_engine = install_decided_engine(&terminal_host);
+    let terminal_engine = install_decided_engine(&terminal_host).await;
     let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
         Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
@@ -8768,7 +8769,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     let inbox = terminal_host.resource_backend().using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
     assert_eq!(inbox.items.len(), 1);
     assert!(inbox.items[0].spec.body.contains("Review this"));
-    assert_eq!(inbox.items[0].spec.sender, format!("flotilla/{convoy}/work/coder"));
+    assert_eq!(inbox.items[0].spec.sender, format!("project:flotilla/convoy:{}/role:coder", convoy.replace('#', "%23")));
 }
 
 #[tokio::test]
@@ -8784,7 +8785,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let authority_engine = install_decided_engine(&authority);
+    let authority_engine = install_decided_engine(&authority).await;
     let terminal_host = InProcessDaemon::new(
         vec![],
         test_config_store(terminal_temp.path().join("config")),
@@ -8794,7 +8795,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let terminal_engine = install_decided_engine(&terminal_host);
+    let terminal_engine = install_decided_engine(&terminal_host).await;
     let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
         Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
@@ -8874,7 +8875,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     let inbox = terminal_host.resource_backend().using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
     assert_eq!(inbox.items.len(), 1);
     assert!(inbox.items[0].spec.body.contains("Continue"));
-    assert_eq!(inbox.items[0].spec.sender, "principal:implicit");
+    assert_eq!(inbox.items[0].spec.sender, "project:flotilla/role:operator");
 }
 
 #[tokio::test]
@@ -8904,8 +8905,8 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
     let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
     let first = backend.using::<flotilla_resources::Message>("flotilla").get(&reference.name).await.unwrap();
     assert_eq!(first.spec.body, "Check the edge case");
-    assert_eq!(first.spec.receiver, format!("flotilla/{launch}/work/coder"));
-    assert_eq!(first.spec.sender, "principal:implicit");
+    assert_eq!(first.spec.receiver, format!("project:flotilla/convoy:{}/role:coder", launch.replace('#', "%23")));
+    assert_eq!(first.spec.sender, "project:flotilla/role:operator");
     let outcome = daemon
         .convoy_resume_internal("flotilla", &launch, "Use the newer instruction", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
@@ -9022,31 +9023,21 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
 
     assert!(terminal_pool.delivered.lock().await.is_empty(), "agent messages should await reconciled delivery confirmation");
     let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap().items;
-    assert!(records.iter().any(|message| message.spec.receiver.ends_with("/review/qa") && message.spec.body.ends_with("Start the review")));
-    assert!(records.iter().any(|message| message.spec.receiver.ends_with("/work/coder") && message.spec.body == "Finish the current turn"));
+    assert!(records.iter().any(|message| message.spec.receiver.ends_with("/role:qa") && message.spec.body.ends_with("Start the review")));
+    assert!(records.iter().any(|message| message.spec.receiver.ends_with("/role:coder") && message.spec.body == "Finish the current turn"));
     let accepted = backend.using::<flotilla_resources::Message>("flotilla").get(&first.metadata.name).await.expect("queued follow-up");
-    assert_eq!(accepted.status.expect("admitted status").phase, flotilla_resources::MessagePhase::Accepted);
+    let admitted = accepted.status.expect("admitted status");
+    assert_eq!(admitted.phase, flotilla_resources::MessagePhase::Deliverable);
+    assert!(admitted.resolved_receiver.is_none(), "admission carries no receiver receipt or delivered time");
     let waiting = convoys.get(&launch).await.expect("crew awaiting receipt").status.expect("status");
     assert!(waiting.crew_work["work"]["coder"].message.is_none(), "admission is not a receiver receipt");
     assert_eq!(waiting.crew_work["work"]["coder"].pending_follow_up.as_ref().expect("queued intent").name, first.metadata.name);
-    // Stand in only for the receiver transport receipt. The ordinary admission
-    // and workflow continuation use the real daemon and resource status patches.
-    let receipt_at = chrono::Utc::now();
-    apply_status_patch(
-        &backend.using::<flotilla_resources::Message>("flotilla"),
-        &first.metadata.name,
-        &flotilla_resources::MessageStatusPatch::Delivered {
-            receiver: flotilla_resources::ResolvedMessageReceiver::builder()
-                .crew_id("idle-crew".into())
-                .session("idle-coder".into())
-                .delivered_at(receipt_at)
-                .evidence("explicit receiver transport receipt".into())
-                .build(),
-            at: receipt_at,
-        },
-    )
-    .await
-    .expect("receiver delivery receipt");
+    // Stand in only for the receiver transport receipt, recorded on the daemon's engine Message
+    // path. The ordinary admission and workflow continuation use the real daemon.
+    let primitives = daemon.message_primitives().expect("the engine Message path");
+    let before_receipt = chrono::Utc::now();
+    flotilla_engine_messages_testkit::deliver_turn(&primitives, &first.metadata.name, "idle-coder", before_receipt).await;
+    let after_receipt = chrono::Utc::now();
     daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("continue after receiver receipt");
     let status = convoys.get(&launch).await.expect("read resumed convoy").status.expect("convoy status");
     assert!(status.pending_brief().is_none());
@@ -9056,7 +9047,17 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     assert!(status.crew_work["work"]["coder"].pending_follow_up.is_none());
     let delivered = backend.using::<flotilla_resources::Message>("flotilla").get(&first.metadata.name).await.expect("delivered turn");
     assert_eq!(delivered.spec.body, "Finish the current turn");
-    assert_eq!(delivered.status.expect("delivered status").phase, flotilla_resources::MessagePhase::Delivered);
+    // A message expecting nothing settles at delivery on the engine; its receipt names the session.
+    let receipt = delivered.status.expect("delivered status");
+    assert_eq!(receipt.phase, flotilla_resources::MessagePhase::Satisfied);
+    let receiver = receipt.resolved_receiver.expect("receiver receipt");
+    assert_eq!(receiver.session, "idle-coder");
+    // The inbox stamps the receipt from its own clock, during the delivery.
+    let delivered_at = receiver.delivered_at.timestamp_micros();
+    assert!(
+        (before_receipt.timestamp_micros()..=after_receipt.timestamp_micros()).contains(&delivered_at),
+        "the receipt carries when it was delivered"
+    );
 }
 
 #[tokio::test]

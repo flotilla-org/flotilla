@@ -85,7 +85,8 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    // Composed with its engine, as the runtime composes a daemon.
+    // Composed with its Message path and engine, as the runtime composes a daemon.
+    daemon.open_message_primitives().expect("the engine Message path");
     flotilla_daemon_testkit::engine::engine(&daemon);
     // The inventory is the engine's launches: one in eight active, the rest landed.
     let path = daemon.convoy_engine_path();
