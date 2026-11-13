@@ -16,7 +16,10 @@ use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        Arc,
+    },
     time::Duration,
 };
 const LIMIT: usize = 200;
@@ -430,9 +433,23 @@ pub(crate) struct Resume {
 
 #[derive(Clone)]
 pub(crate) enum TableSource {
-    Resource { backend: ResourceBackend, name: String },
-    Decided { service: Arc<flotilla_schema_sqlite::stream::Service>, name: String },
-    Derived { derived: Arc<DerivedSet>, name: String, incarnation: String },
+    /// A resource kind's table. `subscription` (the daemon run and this opening) and `reads`
+    /// stand in for the position an engine-served kind's listing does not carry.
+    Resource {
+        backend: ResourceBackend,
+        name: String,
+        subscription: String,
+        reads: Arc<AtomicU64>,
+    },
+    Decided {
+        service: Arc<flotilla_schema_sqlite::stream::Service>,
+        name: String,
+    },
+    Derived {
+        derived: Arc<DerivedSet>,
+        name: String,
+        incarnation: String,
+    },
     Query(query::Source),
 }
 pub(crate) struct Description {
@@ -463,7 +480,9 @@ impl TableSource {
     }
     pub(crate) fn open(name: String, catalog: &Catalog) -> Result<Self, Failure> {
         if resource_tables().any(|kind| kind.plural == name) {
-            return Ok(Self::Resource { backend: catalog.backend.clone(), name });
+            static OPENED: AtomicU64 = AtomicU64::new(0);
+            let subscription = format!("{}~{}", catalog.incarnation, OPENED.fetch_add(1, AtomicOrdering::Relaxed));
+            return Ok(Self::Resource { backend: catalog.backend.clone(), name, subscription, reads: Arc::default() });
         }
         if let Some(derived) = catalog.derived.iter().find(|derived| derived.table(&name).is_some()) {
             return Ok(Self::Derived { derived: Arc::clone(derived), name, incarnation: catalog.incarnation.clone() });
@@ -495,6 +514,11 @@ impl TableSource {
             Self::Resource { name, .. } | Self::Decided { name, .. } | Self::Derived { name, .. } => name,
             Self::Query(source) => source.name(),
         }
+    }
+    /// Whether this is a resource kind's table the engine serves.
+    fn engine_served(&self) -> bool {
+        let Self::Resource { backend, name, .. } = self else { return false };
+        resource_tables().find(|kind| kind.plural == *name).is_some_and(|kind| backend.engine_serves(kind.kind))
     }
     pub(crate) async fn describe(&self) -> Result<Description, Failure> {
         match self {
@@ -591,11 +615,22 @@ impl TableSource {
     }
     async fn read(&self, table: &Table, query: &Query) -> Result<Snapshot, Failure> {
         match self {
-            Self::Resource { backend, name } => {
+            Self::Resource { backend, name, subscription, reads } => {
                 let declared = flotilla_store::declared_resource_kinds().into_iter().find(|entry| entry.paths.plural == *name);
                 let queryable = declared.map_or(&[][..], |entry| entry.queryable_fields);
                 let filter = filter::pushdown(query.filter.as_ref(), &query.fields, queryable);
                 let document = query_resource_kind(backend, &query.namespace, name, &filter).await.map_err(source_failure)?;
+                if self.engine_served() {
+                    // The engine's listing carries no position, so a resume cannot be honoured: the
+                    // sequence counts this subscription's reads, and the incarnation names the
+                    // subscription, so another one's cursor gets a fresh snapshot.
+                    return Ok(Snapshot {
+                        rows: resource_rows(&document, table)?.into_iter().filter(|row| query.keeps(row)).collect(),
+                        sequence: reads.fetch_add(1, AtomicOrdering::Relaxed) + 1,
+                        incarnation: subscription.clone(),
+                        start: WatchStart::Now,
+                    });
+                }
                 let sequence = snapshot_sequence(&document)?;
                 let generation = document.pointer("/metadata/generation").and_then(Value::as_str).map(str::to_owned);
                 let start = generation.clone().map_or_else(
@@ -631,16 +666,37 @@ impl TableSource {
             }
         }
     }
+    /// A snapshot and the events that follow it. An engine-served kind's events cannot resume from
+    /// a snapshot, so they are opened before it: a change committed during the read wakes a read.
+    async fn watched(&self, table: &Table, query: &Query) -> Result<(Snapshot, BoxStream<'static, Result<(), String>>), Failure> {
+        if let Self::Resource { backend, name, .. } = self {
+            if self.engine_served() {
+                let watch = watch_resource_kind_from(backend, &query.namespace, name, WatchStart::Now).await.map_err(source_failure)?;
+                let snapshot = self.snapshot(table, query).await?;
+                return Ok((snapshot, self.resource_events(query, WatchStart::Now, Some(watch.stream))));
+            }
+        }
+        let snapshot = self.snapshot(table, query).await?;
+        let events = self.events(query, &snapshot);
+        Ok((snapshot, events))
+    }
+    fn resource_events(
+        &self,
+        query: &Query,
+        start: WatchStart,
+        opened: Option<BoxStream<'static, Result<Value, flotilla_resources::ResourceError>>>,
+    ) -> BoxStream<'static, Result<(), String>> {
+        let Self::Resource { backend, name, .. } = self else { unreachable!("a resource table's events") };
+        let (backend, name, namespace) = (backend.clone(), name.clone(), query.namespace.clone());
+        let opener: Opener = Box::new(move |start| {
+            let (backend, name, namespace) = (backend.clone(), name.clone(), namespace.clone());
+            Box::pin(async move { watch_resource_kind_from(&backend, &namespace, &name, start).await })
+        });
+        resource_events(opener, start, opened, !self.engine_served()).boxed()
+    }
     fn events(&self, query: &Query, snapshot: &Snapshot) -> BoxStream<'static, Result<(), String>> {
         match self {
-            Self::Resource { backend, name } => {
-                let (backend, name, namespace) = (backend.clone(), name.clone(), query.namespace.clone());
-                let opener: Opener = Box::new(move |start| {
-                    let (backend, name, namespace) = (backend.clone(), name.clone(), namespace.clone());
-                    Box::pin(async move { watch_resource_kind_from(&backend, &namespace, &name, start).await })
-                });
-                resource_events(opener, snapshot.start.clone()).boxed()
-            }
+            Self::Resource { .. } => self.resource_events(query, snapshot.start.clone(), None),
             Self::Decided { service, .. } => {
                 // The store's commit wake: each commit moving the table's home wakes a read of its
                 // sequence. The first read covers commits between the snapshot and the listener.
@@ -700,7 +756,12 @@ impl TableSource {
                 return Err(bad("unsupported_log_paging", "log reads support only bounded sequence-order snapshots without counts"));
             }
         }
-        let snapshot = self.snapshot(&description.table, &query).await?;
+        let (snapshot, events) = if query.watch {
+            let (snapshot, events) = self.watched(&description.table, &query).await?;
+            (snapshot, Some(events))
+        } else {
+            (self.snapshot(&description.table, &query).await?, None)
+        };
         let resumed =
             resume.as_ref().is_some_and(|resume| resume.incarnation == snapshot.incarnation && resume.sequence == snapshot.sequence);
         let initial = match resume {
@@ -719,10 +780,9 @@ impl TableSource {
             }
             None => page(self.name(), description.schema.clone(), &query, &snapshot)?,
         };
-        if !query.watch {
+        let Some(events) = events else {
             return Ok(futures::stream::iter(initial).boxed());
-        }
-        let events = self.events(&query, &snapshot);
+        };
         let quiet = tokio::time::Instant::now() + PROGRESS;
         let state = Live { source: self, description, query, snapshot, events, pending: initial.into(), failures: 0, done: false, quiet };
         Ok(live(state))
@@ -800,8 +860,8 @@ fn live(state: Live) -> BoxStream<'static, Message> {
                     let mut fresh = state.query.clone();
                     fresh.cursor = None;
                     fresh.offset = 0;
-                    match state.source.snapshot(&state.description.table, &fresh).await {
-                        Ok(snapshot) => {
+                    match state.source.watched(&state.description.table, &fresh).await {
+                        Ok((snapshot, events)) => {
                             match page(state.source.name(), state.description.schema.clone(), &fresh, &snapshot) {
                                 Ok(messages) => state.pending.extend(messages),
                                 Err(error) => {
@@ -809,7 +869,7 @@ fn live(state: Live) -> BoxStream<'static, Message> {
                                     state.done = true;
                                 }
                             }
-                            state.events = state.source.events(&state.query, &snapshot);
+                            state.events = events;
                             state.snapshot = snapshot;
                         }
                         Err(error) => {
@@ -915,10 +975,17 @@ fn diff(previous: &Snapshot, next: &Snapshot, query: &Query) -> Result<Vec<Messa
 }
 type WatchReply = Result<flotilla_store::DynamicResourceWatch, flotilla_resources::ResourceError>;
 type Opener = Box<dyn FnMut(WatchStart) -> futures::future::BoxFuture<'static, WatchReply> + Send>;
-fn resource_events(opener: Opener, start: WatchStart) -> impl futures::Stream<Item = Result<(), String>> + Send {
+/// A resource kind's change events, from `opened` when the watch is already open. A watch that is
+/// not `resumable` reopens from now and wakes a read, which covers whatever the gap held.
+fn resource_events(
+    opener: Opener,
+    start: WatchStart,
+    opened: Option<BoxStream<'static, Result<Value, flotilla_resources::ResourceError>>>,
+    resumable: bool,
+) -> impl futures::Stream<Item = Result<(), String>> + Send {
     futures::stream::unfold(
-        (opener, start, None::<BoxStream<'static, Result<Value, flotilla_resources::ResourceError>>>, 0u8, false),
-        |(mut opener, mut start, mut stream, mut failures, mut done)| async move {
+        (opener, start, opened, 0u8, false),
+        move |(mut opener, mut start, mut stream, mut failures, mut done)| async move {
             if done {
                 return None;
             }
@@ -928,8 +995,12 @@ fn resource_events(opener: Opener, start: WatchStart) -> impl futures::Stream<It
                         Ok(watch) => stream = Some(watch.stream),
                         Err(error) => return Some((Err(error.to_string()), (opener, start, stream, failures, true))),
                     }
+                    if !resumable && failures > 0 {
+                        return Some((Ok(()), (opener, start, stream, failures, false)));
+                    }
                 }
                 match stream.as_mut().expect("opened").next().await {
+                    Some(Ok(_)) if !resumable => return Some((Ok(()), (opener, start, stream, 0, false))),
                     Some(Ok(event)) => {
                         if let Some(version) = event["object"].pointer("/metadata/resourceVersion").and_then(Value::as_str) {
                             let previous = match &start {
@@ -1039,8 +1110,12 @@ mod properties {
                     .build())
             })
         });
-        let events =
-            resource_events(opener, WatchStart::FromVersionInGeneration { generation: "same".into(), resource_version: "0".into() });
+        let events = resource_events(
+            opener,
+            WatchStart::FromVersionInGeneration { generation: "same".into(), resource_version: "0".into() },
+            None,
+            true,
+        );
         futures::pin_mut!(events);
         assert!(events.next().await.unwrap().is_ok());
         assert!(events.next().await.unwrap().is_ok());
@@ -1072,7 +1147,7 @@ mod properties {
                     .build())
             })
         });
-        let stream = resource_events(opener, WatchStart::FromVersion("0".into()));
+        let stream = resource_events(opener, WatchStart::FromVersion("0".into()), None, true);
         futures::pin_mut!(stream);
         let started = tokio::time::Instant::now();
         assert!(tokio::time::timeout(Duration::from_secs(1), stream.next()).await.expect("bounded retries").unwrap().is_err());
@@ -1213,6 +1288,8 @@ mod source_contract_tests {
             TableSource::Resource {
                 backend: ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
                 name: "convoys".into(),
+                subscription: "test".into(),
+                reads: Arc::default(),
             },
             TableSource::Decided { service: service.clone(), name: "feed_sample".into() },
         ] {

@@ -337,3 +337,36 @@ async fn a_resource_watch_reconnecting_after_a_gap_converges_on_the_records() {
     assert_eq!(kept.grants, updated.grants, "the record holds the update made in the gap");
     fresh.cancel().await.expect("cancel");
 }
+
+// A table over an engine-served kind opens on its records, though the engine's listing carries no
+// position, and streams a record created after it opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_over_an_engine_kind_opens_and_streams_a_later_change() {
+    use flotilla_protocol::table::Message;
+    use flotilla_resources::{FulfilmentKind, Resource};
+
+    let daemon = TestDaemon::builder().start().await;
+    let base = daemon.get::<FulfilmentKind>(DUMMY_FULFILMENT_KIND).await.expect("the dummy fulfilment kind").spec;
+    daemon.apply::<FulfilmentKind>("tabled-before", base.clone()).await;
+
+    let mut watch = daemon.watch_table(FulfilmentKind::API_PATHS.plural).await;
+    let mut names = Vec::new();
+    loop {
+        match watch.next().await {
+            Message::Rows { rows, .. } => names.extend(rows.iter().map(|row| text(row, "metadata.name").to_owned())),
+            Message::Synced { .. } => break,
+            Message::Resync { reason } => panic!("the table opens without a resync: {reason}"),
+            _ => {}
+        }
+    }
+    assert!(names.iter().any(|name| name == "tabled-before"), "the table opens on the records: {names:?}");
+
+    daemon.apply::<FulfilmentKind>("tabled-after", base).await;
+    loop {
+        match watch.next().await {
+            Message::Upsert { row, .. } if text(&row, "metadata.name") == "tabled-after" => break,
+            Message::Resync { reason } => panic!("the table streams the change without a resync: {reason}"),
+            _ => {}
+        }
+    }
+}

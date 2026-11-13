@@ -528,6 +528,31 @@ impl TestDaemon {
         rows
     }
 
+    /// A watch of the table `table`, as an operator streams it from
+    /// `/tables/{table}/rows?watch=true`.
+    pub async fn watch_table(&self, table: &str) -> TableWatch {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+        let serving = tokio::spawn(flotilla_daemon::server::serve_local_http(server, Arc::clone(&self.daemon)));
+        let request = format!(
+            "GET /tables/{table}/rows?limit=10000&watch=true HTTP/1.1\r\nHost: flotilla.local\r\nAccept: application/x-ndjson\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await.expect("send request");
+        let mut body = tokio::io::BufReader::new(client);
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            tokio::time::timeout(WAIT, body.read_line(&mut line)).await.expect("response head in time").expect("read response head");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            head.push_str(&line.to_ascii_lowercase());
+        }
+        assert!(head.starts_with("http/1.1 200"), "GET /tables/{table}/rows?watch=true: {head}");
+        let chunked = head.lines().any(|line| line.starts_with("transfer-encoding:") && line.contains("chunked"));
+        TableWatch { body, chunked, buffer: Vec::new(), serving }
+    }
+
     /// Wait until some row of `table` satisfying `condition` also satisfies
     /// `done`, and return it. The wait fails with the table's last rows.
     pub fn wait_row<'a>(&'a self, what: &'a str, table: &'a str, condition: &'a str, done: impl Fn(&Row) -> bool + 'a) -> Wait<'a, Row> {
@@ -690,6 +715,51 @@ impl TestDaemon {
 /// Two peered daemons; dropping it disconnects them.
 pub struct Peering {
     _topology: super::server::InMemoryRequestTopology,
+}
+
+/// A table watch over the daemon's local HTTP surface; dropping it disconnects.
+pub struct TableWatch {
+    body: tokio::io::BufReader<tokio::net::UnixStream>,
+    chunked: bool,
+    /// Bytes read past the last whole message.
+    buffer: Vec<u8>,
+    serving: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl Drop for TableWatch {
+    fn drop(&mut self) {
+        self.serving.abort();
+    }
+}
+
+impl TableWatch {
+    /// The next message, within the usual wait.
+    pub async fn next(&mut self) -> TableMessage {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        loop {
+            if let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.buffer.drain(..=end).collect();
+                if line.len() > 1 {
+                    return serde_json::from_slice(&line).unwrap_or_else(|error| panic!("table message: {error}"));
+                }
+                continue;
+            }
+            let mut data = Vec::new();
+            if self.chunked {
+                let mut size = String::new();
+                tokio::time::timeout(WAIT, self.body.read_line(&mut size)).await.expect("a table message in time").expect("chunk size");
+                let size = usize::from_str_radix(size.split(';').next().unwrap_or_default().trim(), 16).expect("chunk size");
+                assert_ne!(size, 0, "the table watch ended");
+                data.resize(size + 2, 0);
+                self.body.read_exact(&mut data).await.expect("chunk");
+                data.truncate(size);
+            } else {
+                let read = tokio::time::timeout(WAIT, self.body.read_until(b'\n', &mut data)).await.expect("a table message in time");
+                assert_ne!(read.expect("read table message"), 0, "the table watch ended");
+            }
+            self.buffer.extend(data);
+        }
+    }
 }
 
 fn shown(value: &(impl serde::Serialize + ?Sized)) -> String {
