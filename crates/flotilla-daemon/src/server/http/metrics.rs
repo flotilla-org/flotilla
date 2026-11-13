@@ -9,19 +9,14 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use flotilla_store::load_metrics::{ControllerMetricsRegistry, HistogramSnapshot, ReplicationLoadMetrics, StoreLoadMetrics};
+use flotilla_store::load_metrics::{ControllerMetricsRegistry, HistogramSnapshot, ReplicationLoadMetrics};
 
 use super::RouterState;
 
+#[derive(Default)]
 pub(in crate::server) struct LoadMetrics {
-    pub store: Arc<StoreLoadMetrics>,
     pub controllers: OnceLock<Arc<ControllerMetricsRegistry>>,
     pub replication: Arc<ReplicationLoadMetrics>,
-}
-impl LoadMetrics {
-    pub fn new(store: Arc<StoreLoadMetrics>) -> Self {
-        Self { store, controllers: OnceLock::new(), replication: Arc::default() }
-    }
 }
 
 pub(super) async fn handle(State(RouterState(state)): State<RouterState>) -> Response {
@@ -52,7 +47,6 @@ impl Exposition {
     fn family(&mut self, name: &str, kind: &str) {
         self.current = name.to_owned();
         let help = match name {
-            "flotilla_store_read_contention_total" => "Busy read refusals returned to callers; each refusal counts once.",
             "flotilla_store_queue_wait_seconds" => {
                 "Time queued before a store read or write starts (the decided store: waiting for its lock), in seconds."
             }
@@ -91,23 +85,15 @@ impl Exposition {
 }
 fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDaemon) -> String {
     let mut out = Exposition { current: String::new(), host: escaped(daemon.host_name().as_str()), families: Default::default() };
-    let store = metrics.store.snapshot();
-    // The resource store queues its reads and writes; the decided store's are its lock's holds.
+    // The decided store's waits and executions are its lock's holds.
     let decided = daemon.decided_store_metrics().snapshot();
-    for (name, snapshot) in [("resources", &store), ("decided", &decided)] {
-        for (operation, wait, execution) in
-            [("read", &snapshot.read_wait, &snapshot.read_execution), ("write", &snapshot.write_wait, &snapshot.write_execution)]
-        {
-            let labels = format!(",store=\"{name}\",operation=\"{operation}\"");
-            out.histogram("flotilla_store_queue_wait_seconds", &labels, wait);
-            out.histogram("flotilla_store_execution_seconds", &labels, execution);
-        }
+    for (operation, wait, execution) in
+        [("read", &decided.read_wait, &decided.read_execution), ("write", &decided.write_wait, &decided.write_execution)]
+    {
+        let labels = format!(",store=\"decided\",operation=\"{operation}\"");
+        out.histogram("flotilla_store_queue_wait_seconds", &labels, wait);
+        out.histogram("flotilla_store_execution_seconds", &labels, execution);
     }
-    for (operation, peak) in [("read", store.read_queue_peak), ("write", store.write_queue_peak)] {
-        out.number("flotilla_store_queue_peak", "gauge", &format!(",operation=\"{operation}\""), peak);
-    }
-    out.number("flotilla_store_reads_shed_total", "counter", "", store.reads_shed);
-    out.number("flotilla_store_read_contention_total", "counter", "", store.read_contention);
     if let Some(controllers) = metrics.controllers.get() {
         // Kinds are registered by the compiled controller set, never resource IDs.
         for (kind, snapshot) in controllers.snapshot() {
@@ -213,14 +199,13 @@ mod tests {
         let daemon_config = config.load_daemon_config().unwrap();
         let mut discovery = flotilla_discovery_testkit::fake_discovery_with_host_directories(dir.path());
         let fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, &mut discovery).unwrap();
-        let sqlite = flotilla_store_sqlite::SqliteBackend::open_in_memory().unwrap();
-        let metrics = Arc::new(LoadMetrics::new(sqlite.load_metrics()));
+        let metrics = Arc::new(LoadMetrics::default());
         let daemon = flotilla_core::in_process::InProcessDaemon::new_with_resource_backend(
             vec![],
             config.clone(),
             discovery,
             flotilla_protocol::HostName::new("metrics-host"),
-            flotilla_store::ResourceBackend::new(sqlite),
+            crate::server::build_embedded_resource_backend(),
             Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
@@ -350,14 +335,11 @@ mod tests {
         for family in [
             "flotilla_store_queue_wait_seconds",
             "flotilla_store_execution_seconds",
-            "flotilla_store_read_contention_total",
             "flotilla_controller_reconcile_seconds",
             "flotilla_replication_stream_failures_total",
             "flotilla_read_retry_retries_total",
             "flotilla_forge_budget_calls_total",
             "flotilla_forge_budget_window_calls",
-            "flotilla_store_queue_peak",
-            "flotilla_store_reads_shed_total",
             "flotilla_store_queue_wait_seconds_max",
             "flotilla_store_execution_seconds_max",
             "flotilla_controller_queue_wait_seconds",
@@ -430,14 +412,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("daemon.toml"), "machine_id = \"metrics-policy\"\n").unwrap();
         let config = Arc::new(flotilla_config::ConfigStore::with_base(dir.path().to_path_buf()));
-        let sqlite = flotilla_store_sqlite::SqliteBackend::open_in_memory().unwrap();
-        let metrics = Arc::new(LoadMetrics::new(sqlite.load_metrics()));
+        let metrics = Arc::new(LoadMetrics::default());
         let daemon = flotilla_core::in_process::InProcessDaemon::new_with_resource_backend(
             vec![],
             config,
             flotilla_discovery_testkit::fake_discovery(false),
             flotilla_protocol::HostName::new("metrics-policy"),
-            flotilla_store::ResourceBackend::new(sqlite),
+            crate::server::build_embedded_resource_backend(),
             Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;

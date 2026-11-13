@@ -419,6 +419,58 @@ async fn a_daemon_started_over_an_old_store_reads_back_what_it_imported() {
     assert!(read.old_store.is_empty(), "the old store was reached for {:?}", read.old_store);
 }
 
+/// Each file of the old store in `dir`, by name, with its bytes.
+fn old_store_files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .expect("state dir")
+        .map(|entry| entry.expect("entry").file_name().into_string().expect("utf-8 name"))
+        .filter(|name| name.starts_with(OLD_STORE))
+        .map(|name| {
+            let bytes = std::fs::read(dir.join(&name)).expect("old store file");
+            (name, bytes)
+        })
+        .collect()
+}
+
+// Behaviour (#3108): a daemon server started in production order over an old store imports it
+// at its first start and never writes to it: the old store's files are byte-identical after the
+// start and after a restart, and no file is added beside them.
+#[tokio::test]
+async fn a_daemon_server_started_over_an_old_store_leaves_it_byte_identical() {
+    let populated_dir = tempfile::tempdir().expect("tempdir");
+    drop(populated(populated_dir.path()).await);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let old = dir.path().join(OLD_STORE);
+    // A consistent copy, so the populating store's closing writes cannot reach the file compared.
+    rusqlite::Connection::open(populated_dir.path().join(OLD_STORE))
+        .expect("populated old store")
+        .execute("VACUUM INTO ?1", [old.to_str().expect("utf-8 path")])
+        .expect("copy the old store");
+    let machine_id = "old-store-host";
+    std::fs::write(dir.path().join("daemon.toml"), format!("machine_id = \"{machine_id}\"\n")).expect("config");
+    if let Some(host_id) = Source::read(&old, "local").expect("read the old store").own_daemon_host("local") {
+        std::fs::create_dir_all(dir.path().join(machine_id)).expect("identity dir");
+        std::fs::write(dir.path().join(machine_id).join("host-id"), format!("{host_id}\n")).expect("host-id");
+    }
+    let before = old_store_files(dir.path());
+    let config = Arc::new(ConfigStore::with_base(dir.path().to_path_buf()));
+    let socket = dir.path().join("flotilla.sock");
+    for start in ["first", "second"] {
+        let server = flotilla_daemon::server::DaemonServer::new(
+            vec![],
+            Arc::clone(&config),
+            fake_discovery(false),
+            socket.clone(),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{start} start: {error}"));
+        assert!(dir.path().join(ENGINE_STORE).exists(), "{start} start: the first start imported into the engine store");
+        drop(server);
+        assert!(old_store_files(dir.path()) == before, "{start} start: the old store's files changed");
+    }
+}
+
 // Rehearsal (#3108): the same over a copy of a real frozen-fleet store, named by
 // `FLOTILLA_IMPORT_REHEARSAL_STORE`. The copy stays where it is, and this prints counts by kind
 // and refusal reasons only.

@@ -1,4 +1,4 @@
-use flotilla_store_sqlite::SqliteBackend;
+use flotilla_store_memory::InMemoryBackend;
 mod caller;
 pub mod change_stream;
 mod client_connection;
@@ -54,7 +54,7 @@ use self::{
 };
 use crate::{
     peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport, SshTransportPaths},
-    startup::{phase, result_phase, retry_phase},
+    startup::{phase, result_phase},
     DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH,
 };
 
@@ -251,25 +251,13 @@ fn build_peer_manager(
     Ok(Arc::new(Mutex::new(peer_manager)))
 }
 
-async fn build_embedded_resource_backend(
-    config: &ConfigStore,
-) -> Result<(ResourceBackend, Arc<flotilla_store::load_metrics::StoreLoadMetrics>), String> {
-    let path = config.state_dir().as_path().join("resources.sqlite");
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|err| format!("create embedded resource store directory {}: {err}", parent.display()))?;
-    }
-    SqliteBackend::open_async(&path)
-        .await
-        .map(|store| {
-            let metrics = store.load_metrics();
-            // The durable store is the engine's home: it holds none of the kinds the engine holds.
-            let backend = ResourceBackend::new(store);
-            backend.compose_as_engine_home();
-            (backend, metrics)
-        })
-        .map_err(|err| format!("open embedded resource store {}: {err}", path.display()))
+/// The resource API's backend, the engine's home: the engine holds every registered kind, so
+/// its store holds nothing and is not durable. The old `resources.sqlite` is never opened here;
+/// only the first start's import reads it, read-only.
+fn build_embedded_resource_backend() -> ResourceBackend {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.compose_as_engine_home();
+    backend
 }
 
 pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &ConfigStore) -> Result<tokio::task::JoinHandle<()>, String> {
@@ -502,8 +490,8 @@ impl DaemonServer {
     ) -> Result<Self, String> {
         let daemon_config = config.load_daemon_config()?;
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
-        let (resource_backend, store_metrics) = retry_phase("open_resource_backend", || build_embedded_resource_backend(&config)).await?;
-        let load_metrics = Arc::new(http::metrics::LoadMetrics::new(store_metrics));
+        let resource_backend = build_embedded_resource_backend();
+        let load_metrics = Arc::new(http::metrics::LoadMetrics::default());
         let engine = crate::runtime::engine_opener(&config);
         let daemon = phase(
             "initialize_in_process_daemon",

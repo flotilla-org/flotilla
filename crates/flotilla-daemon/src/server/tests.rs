@@ -768,7 +768,7 @@ fn dropped_daemon_releases_its_stores() {
     let config = test_config_store(tmp.path().join("config"));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
     let (backend, decided) = runtime.block_on(async {
-        let (backend, _metrics) = super::build_embedded_resource_backend(&config).await.expect("backend");
+        let backend = super::build_embedded_resource_backend();
         let daemon = InProcessDaemon::new_composed(
             Vec::new(),
             Arc::clone(&config),
@@ -817,18 +817,20 @@ fn dropped_daemon_releases_the_engine_a_test_installed() {
     assert!(decided.upgrade().is_none(), "the dropped daemon's decided store is still held");
 }
 
+/// A fresh host keeps its resources in the engine store across a restart, and never creates the
+/// old resource store.
 #[tokio::test]
-async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
+async fn daemon_server_keeps_resources_across_restart_without_an_old_store() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(tmp.path().join("config"));
     let socket_path = tmp.path().join("flotilla.sock");
+    let old_store = config.state_dir().as_path().join(crate::engine_import::OLD_STORE);
 
     let server = DaemonServer::new(Vec::new(), Arc::clone(&config), fake_discovery(false), socket_path.clone(), StdDuration::from_secs(30))
         .await
         .expect("server should start");
     let backend = server.daemon().resource_backend();
-    assert!(backend.durable_local());
-    assert!(config.state_dir().as_path().join("resources.sqlite").exists());
+    assert!(!old_store.exists(), "a fresh host's daemon created the old resource store");
 
     use flotilla_resources::{
         CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
@@ -862,6 +864,7 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
         .expect("credential declaration should survive restart");
 
     assert_eq!(fetched.spec.source, CredentialSource::Env { name: "PERSISTED_TOKEN".into() });
+    assert!(!old_store.exists(), "the restarted daemon created the old resource store");
 }
 
 #[test]
