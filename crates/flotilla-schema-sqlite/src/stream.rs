@@ -263,6 +263,7 @@ fn resource_chunks(snapshot: &Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<()
                 version: snapshot.version,
                 rows: chunk,
                 cause: snapshot.cause.clone(),
+                created_at: snapshot.created_at,
             };
             let bytes = FRAMING.encode(&Frame::ResourceChunk { value, last: sent == total }).map_err(|error| {
                 if matches!(error.kind(), flotilla_cbor::ErrorKind::MessageLimit | flotilla_cbor::ErrorKind::ElementLimit) {
@@ -641,7 +642,15 @@ mod tests {
     fn snapshot(value: Value) -> Snapshot {
         let mut rows = Rows::with_tables(1);
         rows.tables[0].push(Row { key: Vec::new(), values: vec![value] });
-        Snapshot { kind: KindCode::new("test"), name: "resource".into(), home: "home".into(), version: 0, rows, cause: None }
+        Snapshot {
+            kind: KindCode::new("test"),
+            name: "resource".into(),
+            home: "home".into(),
+            version: 0,
+            rows,
+            cause: None,
+            created_at: None,
+        }
     }
 
     // Splitting rows cannot repair an invalid byte string. Refuse before sending even

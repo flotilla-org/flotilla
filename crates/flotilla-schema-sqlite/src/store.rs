@@ -30,10 +30,11 @@ use crate::{
         check_kind_codes, check_kind_columns, has_string_domain, log_predates_changes, schema_ddl, sync_indexes, sync_views, CHANGE_APPEND,
         CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_NAMED, CHANGE_NAMING, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE,
         HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_CREATED, IDENTITY_DELETE,
-        IDENTITY_INSERT, IDENTITY_NAMED, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_CREATED, IDENTITY_SET_SEQ,
-        LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE, LOG_EXPUNGED_AFTER,
-        LOG_LAST_CHANGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE,
-        SHARED_STATEMENTS, SNAPSHOT_CAUSE_DELETE, SNAPSHOT_CAUSE_GET, SNAPSHOT_CAUSE_PUT, STRING_ID, STRING_INSERT, WATERMARK_PUT,
+        IDENTITY_INSERT, IDENTITY_NAMED, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_RESTORE_CREATED, IDENTITY_SEQ, IDENTITY_SET_CREATED,
+        IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
+        LOG_EXPUNGED_AFTER, LOG_LAST_CHANGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT,
+        SEQUENCE_RAISE, SHARED_STATEMENTS, SNAPSHOT_CAUSE_DELETE, SNAPSHOT_CAUSE_GET, SNAPSHOT_CAUSE_PUT, STRING_ID, STRING_INSERT,
+        WATERMARK_PUT,
     },
     sql::{KindSql, TableSql},
 };
@@ -111,6 +112,10 @@ pub struct Snapshot {
     /// crosses hosts by snapshot keeps the reason it was written (#3108).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<ChangeHeader>,
+    /// When the resource was created at its home: a restore records it, so a replica installed
+    /// from a snapshot reads the home's creation time, not the time it was installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<CreatedAt>,
 }
 
 impl Snapshot {
@@ -1824,6 +1829,9 @@ impl Ctx<'_> {
         if !self.record(event.kind, id, &event.home, header, event.prev_seq, (&event.effect, &bytes), sequence, stored)? {
             return Err(StoreError::NotFound { id });
         }
+        if event.cause == Cause::Create {
+            self.set_created(id, &event.home, event.change)?;
+        }
         // The log explains the record again from its first entry here.
         self.conn.prepare_cached(SNAPSHOT_CAUSE_DELETE)?.execute([id.0])?;
         let home = self.intern(HOME_DOMAIN, &event.home)?;
@@ -1901,6 +1909,9 @@ impl Ctx<'_> {
         self.check_objects(&ops, &snapshot.rows.objects)?;
         self.execute(snapshot.kind, id, &ops, sequence, None)?;
         self.set_identity_seq(id, sequence)?;
+        if let Some(created_at) = snapshot.created_at {
+            self.conn.prepare_cached(IDENTITY_RESTORE_CREATED)?.execute(params![created_at.0, id.0])?;
+        }
         if let Some(cause) = &snapshot.cause {
             // A record's changes are its home's: a cause from elsewhere, or later than the
             // snapshot's version, is not this record's.
@@ -2390,13 +2401,15 @@ impl Ctx<'_> {
             }
         }
         rows.sort();
-        Ok(Some(Snapshot { kind: identity.kind, name: identity.name, home: identity.home, version, rows, cause: None }))
+        Ok(Some(Snapshot { kind: identity.kind, name: identity.name, home: identity.home, version, rows, cause: None, created_at: None }))
     }
 
-    /// [`Self::snapshot`] with the resource's cause: what a snapshot sends, and what a restore records.
+    /// [`Self::snapshot`] with the resource's cause and creation time: what a snapshot sends, and
+    /// what a restore records.
     fn snapshot_with_cause(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
         let Some(mut snapshot) = self.snapshot(id)? else { return Ok(None) };
         snapshot.cause = self.last_change(id)?;
+        snapshot.created_at = self.created(id)?;
         Ok(Some(snapshot))
     }
 

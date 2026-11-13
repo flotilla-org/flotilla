@@ -802,6 +802,7 @@ mod tests {
                     ..Default::default()
                 },
                 cause: None,
+                created_at: None,
             });
             let remote = value.clone();
             let peer = tokio::spawn(async move {

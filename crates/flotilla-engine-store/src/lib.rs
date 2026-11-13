@@ -308,8 +308,15 @@ impl Rehearsal {
             return Err(format!("homed at `{REHEARSAL_HOME}`, the rehearsal's own home"));
         }
         let rows = Encoder::encode(value).map_err(|error| error.to_string())?;
-        let snapshot =
-            flotilla_schema_sqlite::Snapshot { kind: K::CODE, name: name.to_owned(), home: home.to_owned(), version, rows, cause: None };
+        let snapshot = flotilla_schema_sqlite::Snapshot {
+            kind: K::CODE,
+            name: name.to_owned(),
+            home: home.to_owned(),
+            version,
+            rows,
+            cause: None,
+            created_at: None,
+        };
         let mut write = self.store.write().map_err(|error| error.to_string())?;
         write.restore(&snapshot).map_err(|error| error.to_string())?;
         write.commit().map_err(|error| error.to_string())?;

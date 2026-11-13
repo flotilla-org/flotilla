@@ -2,13 +2,30 @@
 //! its identity and read by `Read::created`.
 
 use flotilla_schema::{ChangeItem, CreatedAt, Edge, EdgeEvent, Identity, Kind, NewChange, State, Timestamp};
-use flotilla_schema_sqlite::{ResourceId, Store, StoreError};
+use flotilla_schema_sqlite::{stream, ResourceId, Store, StoreError};
+use rusqlite::Connection;
 
 use crate::fixtures::{
-    store,
+    registry, store,
     synthetic::{DossierEdge, DossierState},
     Dossier, Payload, LOCAL,
 };
+
+/// A store homed at `home`.
+fn store_at(home: &str) -> Store {
+    Store::open(Connection::open_in_memory().expect("memory"), home, registry()).expect("store")
+}
+
+/// Streams `source`'s home to `target`: a snapshot when `after` is none, else the entries after it.
+fn sync(source: &mut Store, target: &mut Store, after: Option<u64>) {
+    let home = source.home().to_owned();
+    stream::Follower::new(target).receive(&home, |sink| stream::serve(source, after, Timestamp(9_999), sink).map(|_| ())).expect("sync");
+}
+
+fn created_at(store: &mut Store, name: &str, home: &str) -> Option<CreatedAt> {
+    let id = store.read().expect("read").resolve(Dossier::CODE, name, home).expect("resolve").expect("held");
+    created(store, id)
+}
 
 fn at(time: i64) -> NewChange {
     NewChange::new("test", Timestamp(time))
@@ -85,4 +102,28 @@ fn a_referenced_identity_has_no_creation_time_until_its_create() {
     write.commit().expect("commit");
     assert_eq!(stamp.id, id);
     assert_eq!(created(&mut store, id), widened(200));
+}
+
+// Behaviour (replication): a replica reads the home's creation time, whether it installed the
+// resource from the home's snapshot or applied the home's create event, and an edit it applies
+// keeps it.
+#[test]
+fn a_replica_reads_the_homes_creation_time() {
+    let mut home = store_at("home");
+    let mut replica = store_at("replica");
+    let mut write = home.write().expect("write");
+    let first = write.insert("first", &Dossier::sample(0), &at(100)).expect("insert");
+    write.commit().expect("commit");
+    sync(&mut home, &mut replica, None);
+    assert_eq!(created_at(&mut replica, "first", "home"), widened(100), "installed from the snapshot");
+
+    let after = home.read().expect("read").last_sequence("home").expect("last");
+    let mut write = home.write().expect("write");
+    write.insert("second", &Dossier::sample(0), &at(300)).expect("insert");
+    let current = write.load::<Dossier>(first.id).expect("load").expect("present");
+    write.update(&current, &Dossier::sample(1), &at(400)).expect("edit");
+    write.commit().expect("commit");
+    sync(&mut home, &mut replica, Some(after));
+    assert_eq!(created_at(&mut replica, "second", "home"), widened(300), "applied from the create event");
+    assert_eq!(created_at(&mut replica, "first", "home"), widened(100), "an applied edit keeps it");
 }

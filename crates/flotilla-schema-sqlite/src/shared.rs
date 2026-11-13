@@ -199,6 +199,7 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("identity_named", IDENTITY_NAMED),
     ("identity_insert", IDENTITY_INSERT),
     ("identity_set_created", IDENTITY_SET_CREATED),
+    ("identity_restore_created", IDENTITY_RESTORE_CREATED),
     ("identity_created", IDENTITY_CREATED),
     ("identity_of", IDENTITY_OF),
     ("identity_delete", IDENTITY_DELETE),
@@ -280,6 +281,8 @@ pub(crate) const IDENTITY_INSERT: &str = "INSERT INTO resource_identity (kind, n
 /// widened from microseconds to nanoseconds.
 pub(crate) const IDENTITY_SET_CREATED: &str =
     "UPDATE resource_identity SET created_at = (SELECT at * 1000 FROM change WHERE home = ?2 AND seq = ?3) WHERE id = ?1";
+/// A creation time given outright: one a snapshot carries from the home.
+pub(crate) const IDENTITY_RESTORE_CREATED: &str = "UPDATE resource_identity SET created_at = ?1 WHERE id = ?2";
 pub(crate) const IDENTITY_CREATED: &str = "SELECT created_at FROM resource_identity WHERE id = ?1";
 pub(crate) const IDENTITY_OF: &str =
     "SELECT i.kind, n.s, h.s FROM resource_identity i JOIN strings n ON n.id = i.name JOIN strings h ON h.id = i.home WHERE i.id = ?1";
