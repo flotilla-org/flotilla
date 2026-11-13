@@ -1353,10 +1353,9 @@ fn legible_waiting_for(mut waiting_for: String, placement_decision: Option<&Plac
 
 /// What woke [`ConvoyVesselWake`].
 enum ConvoyWoken {
-    /// Something of convoy `0` changed: its vessels plan again.
+    /// Something of convoy `0` changed, or a brief artifact of it replicated: its vessels plan,
+    /// and seat their crews, again.
     Convoy(String),
-    /// A brief artifact may have replicated: each ready vessel seats its crews again.
-    Briefs,
     /// What changed is unknown: every vessel plans again.
     Every,
 }
@@ -1411,8 +1410,28 @@ impl ConvoyVesselWake {
                 }
             })
             .boxed();
-        let artifacts =
-            if briefs { self.artifacts.watch().await?.map(|_| ConvoyWoken::Briefs).boxed() } else { futures::stream::pending().boxed() };
+        // An artifact wakes the vessels of the convoy it belongs to. One deleted by name names no
+        // convoy, and its absence seats no crew.
+        let artifacts = if briefs {
+            self.artifacts
+                .watch()
+                .await?
+                .filter_map(|event| async move {
+                    match event {
+                        Ok(ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) | ReadWatchEvent::Deleted(read)) => {
+                            Some(ConvoyWoken::Convoy(read.object.spec.convoy))
+                        }
+                        Ok(ReadWatchEvent::DeletedByName { .. }) => None,
+                        Err(error) => {
+                            warn!(%error, "the vessels' brief artifact watch failed");
+                            Some(ConvoyWoken::Every)
+                        }
+                    }
+                })
+                .boxed()
+        } else {
+            futures::stream::pending().boxed()
+        };
         let accounts = self
             .accounts
             .changes(namespace)
@@ -1448,7 +1467,7 @@ impl ConvoyVesselWake {
         let reads = Arc::clone(&self.reads);
         let woken = match woken {
             ConvoyWoken::Convoy(convoy) => Some(convoy.clone()),
-            _ => None,
+            ConvoyWoken::Every => None,
         };
         tokio::task::spawn_blocking(move || {
             let vessels = reads.vessels()?;
