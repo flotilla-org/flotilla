@@ -608,12 +608,27 @@ pub struct ConvoyMemory {
     changes: tokio::sync::broadcast::Sender<String>,
     /// How many launches, at any home, the convoy views last listed as unreadable.
     unreadable: AtomicU64,
+    /// The evidence records each launch's last pass read: a change of one wakes only the
+    /// launches that read it. Kept apart from the notes, which readers see.
+    evidence: Mutex<EvidenceReads>,
 }
 
 impl Default for ConvoyMemory {
     fn default() -> Self {
-        Self { notes: Mutex::default(), changes: tokio::sync::broadcast::channel(256).0, unreadable: AtomicU64::new(0) }
+        Self {
+            notes: Mutex::default(),
+            changes: tokio::sync::broadcast::channel(256).0,
+            unreadable: AtomicU64::new(0),
+            evidence: Mutex::default(),
+        }
     }
+}
+
+/// Which evidence records each launch reads, by kind and record name, both ways round.
+#[derive(Debug, Default)]
+struct EvidenceReads {
+    by_launch: BTreeMap<(String, &'static str), BTreeSet<String>>,
+    by_record: BTreeMap<(&'static str, String), BTreeSet<String>>,
 }
 
 impl ConvoyMemory {
@@ -669,6 +684,34 @@ impl ConvoyMemory {
     pub fn waiting(&self, waiting: fn(&ConvoyNotes) -> bool) -> Vec<String> {
         let held = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
         held.iter().filter(|(_, notes)| waiting(notes)).map(|(name, _)| name.clone()).collect()
+    }
+
+    /// Notes that launch `name` reads the `kind` records named `records`, in place of what it read
+    /// before. A pass notes them before reading, so a change after its read still wakes it.
+    pub fn note_evidence(&self, name: &str, kind: &'static str, records: BTreeSet<String>) {
+        let mut held = self.evidence.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = held.by_launch.remove(&(name.to_owned(), kind)).unwrap_or_default();
+        for record in before.difference(&records) {
+            let key = (kind, record.clone());
+            if let Some(launches) = held.by_record.get_mut(&key) {
+                launches.remove(name);
+                if launches.is_empty() {
+                    held.by_record.remove(&key);
+                }
+            }
+        }
+        for record in records.difference(&before) {
+            held.by_record.entry((kind, record.clone())).or_default().insert(name.to_owned());
+        }
+        if !records.is_empty() {
+            held.by_launch.insert((name.to_owned(), kind), records);
+        }
+    }
+
+    /// The launches whose last pass read the `kind` record `record`.
+    pub fn reading(&self, kind: &'static str, record: &str) -> Vec<String> {
+        let held = self.evidence.lock().unwrap_or_else(PoisonError::into_inner);
+        held.by_record.get(&(kind, record.to_owned())).map(|launches| launches.iter().cloned().collect()).unwrap_or_default()
     }
 
     /// Drops the notes on launch `name`, once it has ended and its home no longer judges it.

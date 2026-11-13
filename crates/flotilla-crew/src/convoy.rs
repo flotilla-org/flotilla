@@ -20,7 +20,11 @@ use flotilla_store::{
     controller::{LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
     DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, TypedResolver,
 };
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    marker::PhantomData,
+    sync::Arc,
+};
 /// The principal this controller acts as on the engine.
 const CONVOY_CONTROLLER: &str = "convoy-controller";
 
@@ -161,20 +165,14 @@ impl ConvoyReconciler {
                 engine: Arc::clone(&engine),
                 waiting: capacity,
             }),
+            Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(namespace), engine: Arc::clone(&engine) }),
+            Box::new(EvidenceWake { evidence: backend.including_replicas::<Artifact>(namespace), engine: Arc::clone(&engine) }),
             Box::new(NoteWake::<Message> {
                 changes: WakeOn::MessageCommits(messages),
                 engine,
                 waiting: flotilla_resources::convoy_records::ConvoyNotes::holds_delivery,
             }),
             Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
-            Box::new(EvidenceWake {
-                evidence: backend.including_replicas::<ChangeRequest>(namespace),
-                convoys: backend.including_replicas::<Convoy>(namespace),
-            }),
-            Box::new(EvidenceWake {
-                evidence: backend.including_replicas::<Artifact>(namespace),
-                convoys: backend.including_replicas::<Convoy>(namespace),
-            }),
         ]
     }
 
@@ -535,19 +533,19 @@ impl<W: Resource> SecondaryWatch for NoteWake<W> {
     }
 }
 
-/// Wakes every open convoy when a record its promises are observed from changes: a ChangeRequest
-/// (a submission, its landing) or an Artifact (a decision ledger). Neither names its convoy, so
-/// each open convoy is reconciled again and reads the evidence it waits on; one waiting on none
-/// finds nothing to do. Freshness rides on the same events: an observer that sees the record
-/// again writes it again.
+/// Wakes the convoys that read a record their promises are observed from when it changes: a
+/// ChangeRequest (a submission, its landing) or an Artifact (a decision ledger). Neither names
+/// its convoy, so each pass notes in the home's memory which records it reads, and a change
+/// wakes only those convoys. Freshness rides on the same events: an observer that sees the
+/// record again writes it again.
 pub struct EvidenceWake<W: Resource> {
     pub evidence: ReplicaReadResolver<W>,
-    pub convoys: ReplicaReadResolver<Convoy>,
+    pub engine: EngineConvoyPath,
 }
 
 impl<W: Resource> std::clone::Clone for EvidenceWake<W> {
     fn clone(&self) -> Self {
-        Self { evidence: self.evidence.clone(), convoys: self.convoys.clone() }
+        Self { evidence: self.evidence.clone(), engine: Arc::clone(&self.engine) }
     }
 }
 
@@ -565,81 +563,32 @@ impl<W: Resource> SecondaryWatch for EvidenceWake<W> {
         sender: flotilla_store::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
+            let Some(engine) = self.engine.get().cloned() else { return Err(ResourceError::other(NO_ENGINE)) };
             // What is already held was read by the convoys' own first pass; only changes wake.
             let mut watch = self.evidence.watch().await?;
-            // The open convoys are read once and kept current by their own watch, opened before
-            // the read so no change falls between them.
-            let mut convoy_watch = self.convoys.watch().await?;
-            let mut open = OpenConvoys::default();
-            for convoy in self.convoys.list().await?.items {
-                open.apply(ReadWatchEvent::Added(convoy));
-            }
             loop {
-                tokio::select! {
-                    event = futures::StreamExt::next(&mut convoy_watch) => match event {
-                        Some(Ok(event)) => open.apply(event),
-                        Some(Err(error)) => {
-                            tracing::warn!(%error, "a convoy evidence wake's convoy watch failed");
-                            return Err(error);
-                        }
-                        None => return Ok(()),
-                    },
-                    event = futures::StreamExt::next(&mut watch) => match event {
-                        Some(Ok(_)) => {
-                            for name in open.names() {
-                                if sender.send(name.clone()).await.is_err() {
-                                    return Ok(());
-                                }
+                match futures::StreamExt::next(&mut watch).await {
+                    Some(Ok(event)) => {
+                        let record = match event {
+                            ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) | ReadWatchEvent::Deleted(read) => {
+                                read.object.metadata.name
+                            }
+                            ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name,
+                        };
+                        for name in engine.memory().reading(W::API_PATHS.kind, &record) {
+                            if sender.send(name).await.is_err() {
+                                return Ok(());
                             }
                         }
-                        Some(Err(error)) => {
-                            tracing::warn!(%error, kind = W::API_PATHS.kind, "a convoy evidence watch failed");
-                            return Err(error);
-                        }
-                        None => return Ok(()),
-                    },
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, kind = W::API_PATHS.kind, "a convoy evidence watch failed");
+                        return Err(error);
+                    }
+                    None => return Ok(()),
                 }
             }
         })
-    }
-}
-
-/// The convoys an evidence change wakes: each name with a copy (this home's or a replica) that is
-/// not terminal. Waking a convoy whose chosen copy is terminal finds nothing to do.
-#[derive(Default)]
-struct OpenConvoys {
-    copies: BTreeMap<String, std::collections::BTreeSet<Option<flotilla_protocol::NodeId>>>,
-}
-
-impl OpenConvoys {
-    fn apply(&mut self, event: ReadWatchEvent<Convoy>) {
-        let (name, copy, open) = match event {
-            ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) => {
-                let open = !read.object.status.as_ref().is_some_and(|status| status.phase.is_terminal());
-                (read.object.metadata.name, Self::copy(read.provenance), open)
-            }
-            ReadWatchEvent::Deleted(read) => (read.object.metadata.name, Self::copy(read.provenance), false),
-            ReadWatchEvent::DeletedByName { tombstone, provenance } => (tombstone.name, Self::copy(provenance), false),
-        };
-        if open {
-            self.copies.entry(name).or_default().insert(copy);
-        } else if let Some(copies) = self.copies.get_mut(&name) {
-            copies.remove(&copy);
-            if copies.is_empty() {
-                self.copies.remove(&name);
-            }
-        }
-    }
-
-    fn copy(provenance: ResourceProvenance) -> Option<flotilla_protocol::NodeId> {
-        match provenance {
-            ResourceProvenance::Local => None,
-            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root),
-        }
-    }
-
-    fn names(&self) -> impl Iterator<Item = &String> {
-        self.copies.keys()
     }
 }
 
@@ -697,6 +646,10 @@ impl Reconciler for ConvoyReconciler {
         let Some(status) = obj.status.as_ref() else { return Ok(ConvoyPass::default()) };
         let now = self.clock.now();
         if status.phase.is_terminal() {
+            // An ended convoy reads no evidence, so no change of it wakes the convoy.
+            let memory = engine.memory();
+            memory.note_evidence(&obj.metadata.name, ChangeRequest::API_PATHS.kind, BTreeSet::new());
+            memory.note_evidence(&obj.metadata.name, Artifact::API_PATHS.kind, BTreeSet::new());
             if status.finished_at.is_none() {
                 // The view derived the failure from a failed work; the launch has not ended yet.
                 let reason = status.message.clone().unwrap_or_else(|| format!("the convoy's work {:?}", status.phase));
@@ -735,12 +688,19 @@ impl Reconciler for ConvoyReconciler {
             status,
             flotilla_resources::convoy::promises::PromiseKind::DecisionLedger,
         );
+        // What the pass reads is noted first: a change after the note wakes the convoy again, and
+        // one before it is in the read.
+        let change_request_names = match &self.change_requests {
+            Some(_) if needs_pr => change_request_record_names(obj, &checkouts, &forges),
+            _ => BTreeSet::new(),
+        };
+        engine.memory().note_evidence(&obj.metadata.name, ChangeRequest::API_PATHS.kind, change_request_names.clone());
         let change_requests = match &self.change_requests {
             // Only the change requests the pass looks up, each by its record name: every home's
             // copy of it, selected as the listing selected them.
             Some(change_requests) if needs_pr => {
                 let mut sources = Vec::new();
-                for name in change_request_record_names(obj, &checkouts, &forges) {
+                for name in change_request_names {
                     sources.extend(change_requests.get_all(&name).await?.items);
                 }
                 select_change_requests(sources.iter().map(|source| &source.object))
@@ -768,11 +728,16 @@ impl Reconciler for ConvoyReconciler {
             }
         }
 
+        let artifact_names = match &self.artifacts {
+            Some(_) if needs_ledger => flotilla_resources::convoy::promises::ledger_artifact_names(status, &obj.metadata.name),
+            _ => BTreeSet::new(),
+        };
+        engine.memory().note_evidence(&obj.metadata.name, Artifact::API_PATHS.kind, artifact_names.clone());
         let artifacts = match &self.artifacts {
             // Only the artifacts its ledger promises name, each by its name.
             Some(artifacts) if needs_ledger => {
                 let mut held = BTreeMap::new();
-                for name in flotilla_resources::convoy::promises::ledger_artifact_names(status, &obj.metadata.name) {
+                for name in artifact_names {
                     match artifacts.get(&name).await {
                         Ok(read) => {
                             held.insert(name, read.object);
