@@ -7,58 +7,16 @@ use std::{
 };
 
 use async_trait::async_trait;
-use axum::{
-    body::Body,
-    extract::{Path, State},
-    http::Uri,
-    response::{IntoResponse, Response},
-    routing::get,
-    Json, Router,
-};
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
     Convoy, InputMeta, OwnerReference, ReadResourceList, ReadWatchEvent, ResourceError, ResourceList, ResourceProvenance, WatchStart,
     WatchStream,
 };
 use flotilla_store::{LocalViewSource, OwnerQuery, ResourceBackend, StoreQuery, StoreViewSource, ViewSource, WatchView};
-use flotilla_store_http::HttpBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 use flotilla_store_testkit::fixtures::{convoy_meta, convoy_spec};
 use futures::{stream::BoxStream, StreamExt};
-
-// HTTP boundary stand-in enforces the actual query and resumable watch protocol
-// against a real memory backend; it never substitutes an arbitrary response.
-async fn endpoint(State(backend): State<ResourceBackend>, Path((namespace, kind)): Path<(String, String)>, uri: Uri) -> Response {
-    let query: BTreeMap<String, String> = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()).into_owned().collect();
-    if let Some(query) = query.get("storeQuery") {
-        let query: StoreQuery = serde_json::from_str(query).unwrap();
-        return Json(flotilla_store::query_resource_kind(&backend, &namespace, &kind, &query).await.unwrap()).into_response();
-    }
-    if query.is_empty() {
-        return Json(flotilla_store::list_resource_kind(&backend, &namespace, &kind).await.unwrap().value).into_response();
-    }
-    assert_eq!(query.get("watch").map(String::as_str), Some("true"));
-    let events = if query.get("replicaSources").map(String::as_str) == Some("true") {
-        flotilla_store::watch_resource_kind_replica_sources(&backend, &namespace, &kind).await.unwrap()
-    } else {
-        let version = query.get("resourceVersion").expect("local watch must resume from snapshot").clone();
-        let start = match query.get("generation") {
-            Some(generation) => WatchStart::FromVersionInGeneration { generation: generation.clone(), resource_version: version },
-            None => WatchStart::FromVersion(version),
-        };
-        flotilla_store::watch_resource_kind_from(&backend, &namespace, &kind, start).await.unwrap()
-    };
-    let body = events.stream.map(|event| {
-        let value = match event {
-            Ok(value) => value,
-            Err(ResourceError::WatchExpired { .. }) => serde_json::json!({"type":"ERROR", "object":{"code":410,"message":"expired"}}),
-            Err(error) => panic!("unexpected watch error: {error}"),
-        };
-        Ok::<_, std::io::Error>(format!("{value}\n"))
-    });
-    Body::from_stream(body).into_response()
-}
 
 struct GapSource {
     source: StoreViewSource<Convoy>,
@@ -291,20 +249,6 @@ async fn sqlite_watch_view_contract() {
     let backend =
         ResourceBackend::new(SqliteBackend::open(directory.path().join("store.db")).unwrap()).with_local_root(NodeId::new("local-root"));
     contract(backend.clone(), backend).await;
-}
-#[tokio::test]
-#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "requires TCP bind")]
-async fn http_watch_view_contract() {
-    let writer = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("local-root"));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let app = Router::new().route("/apis/flotilla.work/v1/namespaces/{namespace}/{kind}", get(endpoint)).with_state(writer.clone());
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    let reader = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), url));
-    contract(reader, writer).await;
-    server.abort();
 }
 
 // Across empty inventories, duplicate names, label changes and deletes, shared

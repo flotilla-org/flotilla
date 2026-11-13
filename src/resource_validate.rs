@@ -1313,6 +1313,76 @@ mod tests {
         }
     }
 
+    // `resource validate` decodes every home's copy through the replica-source list: another
+    // home's Project, relayed to the served daemon, comes back with that home as its origin.
+    #[tokio::test]
+    async fn replica_source_list_serves_another_homes_definition() {
+        rigging_tls::install_default_provider();
+        let root = std::env::temp_dir().join(format!("flotilla-replica-sources-{}", uuid::Uuid::new_v4()));
+        for (dir, machine) in [("config", "served-machine"), ("other", "other-machine")] {
+            std::fs::create_dir_all(root.join(dir)).expect("create daemon directory");
+            std::fs::write(root.join(dir).join("daemon.toml"), format!("machine_id = \"{machine}\"\n")).expect("write daemon identity");
+        }
+        let socket_dir = TestSocketDir::new();
+        let socket = socket_dir.socket_path("daemon.sock");
+        let config = Arc::new(ConfigStore::with_base(root.join("config")));
+        let server = DaemonServer::new(vec![], config, fake_discovery(false), socket.clone(), Duration::from_secs(30))
+            .await
+            .expect("build in-process daemon server");
+        let other = flotilla_core::in_process::InProcessDaemon::new_with_resource_backend(
+            vec![],
+            Arc::new(ConfigStore::with_base(root.join("other"))),
+            fake_discovery(false),
+            flotilla_protocol::HostName::new("other"),
+            flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        other
+            .resource_backend()
+            .using::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name("theirs".to_string()).build(),
+                &ProjectSpec::builder().display_name("Theirs".to_string()).default_workflow_ref("default".to_string()).build(),
+            )
+            .await
+            .expect("create Project on the other home");
+        let served = server.daemon();
+        let _link = flotilla_daemon_testkit::server::spawn_in_memory_request_topology(Arc::clone(&other), Arc::clone(&served))
+            .await
+            .expect("connect the other home");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while served.resource_backend().definitions::<Project>("flotilla").get("theirs").await.is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the other home's Project reaches the served daemon");
+        let task = tokio::spawn(async move { server.run().await });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = reqwest::Client::builder().unix_socket(socket.as_path()).build().expect("resource socket client");
+        let listed = client
+            .get("http://flotilla.local/apis/flotilla.work/v1/namespaces/flotilla/projects?replicaSources=true")
+            .send()
+            .await
+            .expect("replica-source list");
+        assert_eq!(listed.status(), reqwest::StatusCode::OK);
+        let listed = listed.json::<Value>().await.expect("replica-source list document");
+        let theirs = listed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["metadata"]["name"] == "theirs")
+            .expect("the other home's Project is listed");
+        assert_eq!(theirs["metadata"]["annotations"][flotilla_store::replica::ORIGIN_ROOT_ANNOTATION], other.node_id().to_string());
+        task.abort();
+    }
+
     #[tokio::test]
     async fn validates_mixed_kinds_from_an_in_process_daemon() {
         rigging_tls::install_default_provider();

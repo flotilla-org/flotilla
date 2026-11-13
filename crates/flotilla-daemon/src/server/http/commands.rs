@@ -1041,7 +1041,6 @@ mod tests {
                     kind: "convoy".into(),
                     name: None,
                     include_replicas: false,
-                    replica_sources: false,
                     cursor: None,
                 })
                 .build(),

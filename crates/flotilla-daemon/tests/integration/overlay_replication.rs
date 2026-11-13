@@ -15,7 +15,7 @@ use flotilla_resources::{
     ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey, ResourceProvenance, TerminalSession, TerminalSessionSource,
     TerminalSessionSpec,
 };
-use flotilla_store::{watch_resource_kind_replica_sources, ResourceBackend};
+use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend};
 use futures::StreamExt;
 
 fn config(path: std::path::PathBuf, machine_id: &str) -> Arc<ConfigStore> {
@@ -415,9 +415,9 @@ async fn a_peer_relays_another_origins_project_definition() {
         "relay must preserve the kiwi origin instead of re-authoring on gouda"
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut raw_project_watch = watch_resource_kind_replica_sources(&feta.resource_backend(), "flotilla", "projects")
+    let mut raw_project_watch = watch_resource_kind_including_replicas(&feta.resource_backend(), "flotilla", "projects")
         .await
-        .expect("watch raw Project replica sources");
+        .expect("watch every home's Projects");
     assert!(
         tokio::time::timeout(Duration::from_millis(150), raw_project_watch.stream.next()).await.is_err(),
         "peers must not echo an unchanged third-origin Project indefinitely"

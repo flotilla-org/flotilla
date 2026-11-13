@@ -9,8 +9,7 @@ use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::{
     get_resource_kind, get_resource_kind_all_provenances, get_resource_kind_including_replicas, list_resource_kind,
     list_resource_kind_including_replicas, list_resource_kind_replica_sources, registered_resource_namespaces, watch_resource_kind,
-    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceWatch,
-    ResourceBackend, REGISTERED_RESOURCE_KINDS,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, DynamicResourceWatch, ResourceBackend, REGISTERED_RESOURCE_KINDS,
 };
 
 /// What the resource API answers, before it is written to a connection.
@@ -264,13 +263,10 @@ pub(in crate::server) async fn respond(
         };
     }
 
-    let watched = if replica_sources {
-        if query.contains_key("resourceVersion") {
-            Err(ResourceError::invalid("replica-source watches do not support resourceVersion resume"))
-        } else {
-            watch_resource_kind_replica_sources(&backend, namespace, kind).await
-        }
-    } else if include_replicas {
+    if replica_sources {
+        return Reply::error(400, "replica sources are a collection read, not a watch");
+    }
+    let watched = if include_replicas {
         if query.contains_key("resourceVersion") {
             Err(ResourceError::invalid("include-replicas watches do not support resourceVersion resume"))
         } else {

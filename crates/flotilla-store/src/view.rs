@@ -56,21 +56,6 @@ impl<T: Resource> ViewSource<T> for StoreViewSource<T> {
         let store = self.backend.store();
         let replicas = if T::REPLICATION_CLASS == ReplicationClass::None {
             futures::stream::pending().boxed()
-        } else if self.backend.serves_read_views() {
-            crate::retry_store_read(|| store.watch_replica_sources_typed::<T>(&self.namespace))
-                .await?
-                .filter_map(|event| async move {
-                    match event {
-                        Ok(ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item))
-                            if matches!(item.provenance, ResourceProvenance::Local) =>
-                        {
-                            None
-                        }
-                        Ok(ReadWatchEvent::DeletedByName { provenance: ResourceProvenance::Local, .. }) => None,
-                        event => Some(event),
-                    }
-                })
-                .boxed()
         } else {
             crate::retry_store_read(|| store.watch_replicas_typed::<T>(&self.namespace)).await?
         };
@@ -514,11 +499,6 @@ impl<T: Resource> WatchView<T> {
     }
     pub async fn start(backend: ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
         let root = backend.local_root()?;
-        Self::start_at_root(backend, namespace, root).await
-    }
-    /// HTTP stores do not expose the serving root through Store::local_root;
-    /// callers supply that identity to preserve self-origin replica shadowing.
-    pub async fn start_at_root(backend: ResourceBackend, namespace: &str, root: NodeId) -> Result<Self, ResourceError> {
         Self::from_source(Arc::new(StoreViewSource::<T>::new(backend, namespace)), Some(root)).await
     }
     /// Initial setup retries expired handoffs but fails fast on other errors,

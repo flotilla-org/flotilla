@@ -576,14 +576,6 @@ pub async fn list_resource_kind_replica_sources(
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, list_typed_replica_sources(backend, namespace).await)
 }
 
-pub async fn watch_resource_kind_replica_sources(
-    backend: &ResourceBackend,
-    namespace: &str,
-    requested_kind: &str,
-) -> Result<DynamicResourceWatch, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed_replica_sources(backend, namespace).await)
-}
-
 pub async fn apply_resource_document(
     backend: &ResourceBackend,
     default_namespace: &str,
@@ -1262,48 +1254,6 @@ async fn watch_typed_including_replicas<T: Resource>(
     })
 }
 
-async fn watch_typed_replica_sources<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-) -> Result<DynamicResourceWatch, ResourceError> {
-    let resolver = backend.including_replicas::<T>(namespace);
-    let stream = resolver.watch_sources().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
-    let mut initial = resolver
-        .list_sources()
-        .await?
-        .items
-        .iter()
-        .map(|object| Ok(json!({"type": "ADDED", "object": read_object_value(object)?})))
-        .collect::<Result<Vec<_>, ResourceError>>()?;
-    // Subscribe before reading both live rows and deletion fences. Events that
-    // race either read are replayed afterwards with their original sync stamp.
-    // Receivers compare those stamps, not arrival order: an older fence cannot
-    // remove a newer recreation, including when it appears later in this batch.
-    for deleted in backend.list_replica_deletions_raw(crate::ResourceKind::of::<T>(), namespace).await? {
-        let event = ReadWatchEvent::<T>::DeletedByName {
-            tombstone: crate::ResourceTombstone {
-                name: deleted.name,
-                namespace: namespace.to_string(),
-                // A relay fence proves no origin log position. Relay apply is
-                // ordered by last-synced-at and never advances the direct cursor.
-                resource_version: "overlay".to_string(),
-                annotations: Default::default(),
-            },
-            provenance: ResourceProvenance::Replica { origin_root: deleted.origin_root, last_synced_at: deleted.last_synced_at },
-        };
-        initial.push(read_watch_event_value(&event)?);
-    }
-    Ok(DynamicResourceWatch {
-        kind: T::API_PATHS.kind.to_string(),
-        plural: T::API_PATHS.plural.to_string(),
-        namespace: namespace.to_string(),
-        resource_version: "overlay".to_string(),
-        generation: None,
-        initial,
-        stream,
-    })
-}
-
 async fn apply_typed<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
@@ -1515,7 +1465,6 @@ mod tests {
     async fn replica_source_wire_provenance_comes_from_the_store() {
         let backend = ResourceBackend::new(crate::test_store::memory_backend());
         let local = backend.using::<Convoy>("flotilla");
-        let mut watch = watch_resource_kind_replica_sources(&backend, "flotilla", "convoys").await.expect("watch sources");
         let stale_annotations = BTreeMap::from([
             (ORIGIN_ROOT_ANNOTATION.to_string(), "wrong-root".to_string()),
             (LAST_SYNCED_AT_ANNOTATION.to_string(), "not-a-timestamp".to_string()),
@@ -1534,15 +1483,11 @@ mod tests {
                 .await
                 .expect("author copied manifest");
             let listed = list_resource_kind_replica_sources(&backend, "flotilla", "convoys").await.expect("list sources");
-            let added = watch.stream.next().await.expect("added event").expect("encode added event");
             local.delete("copied").await.expect("delete copied manifest");
-            let deleted = watch.stream.next().await.expect("deleted event").expect("encode deleted event");
-            for object in [&listed.value["items"][0], &added["object"], &deleted["object"]] {
-                let wire = &object["metadata"]["annotations"];
-                assert!(wire.get(ORIGIN_ROOT_ANNOTATION).is_none(), "local records must not masquerade as replicas");
-                assert!(wire.get(LAST_SYNCED_AT_ANNOTATION).is_none(), "partial provenance must not poison relay decoding");
-                assert_eq!(wire.get("example.com/note").and_then(Value::as_str), annotations.get("example.com/note").map(String::as_str));
-            }
+            let wire = &listed.value["items"][0]["metadata"]["annotations"];
+            assert!(wire.get(ORIGIN_ROOT_ANNOTATION).is_none(), "local records must not masquerade as replicas");
+            assert!(wire.get(LAST_SYNCED_AT_ANNOTATION).is_none(), "partial provenance must not poison relay decoding");
+            assert_eq!(wire.get("example.com/note").and_then(Value::as_str), annotations.get("example.com/note").map(String::as_str));
         }
 
         let synced_at = Utc::now();

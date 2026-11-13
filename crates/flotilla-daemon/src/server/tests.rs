@@ -1501,7 +1501,6 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
                     kind: "convoys".into(),
                     name: Some("demo".into()),
                     include_replicas: false,
-                    replica_sources: false,
                     cursor: Some(cursor.clone()),
                 })
                 .node_id(node("feta"))
@@ -1527,7 +1526,6 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
                         kind: "convoys".into(),
                         name: Some("demo".into()),
                         include_replicas: false,
-                        replica_sources: false,
                         cursor: Some(cursor),
                     })
                     .node_id(node("feta"))

@@ -259,14 +259,6 @@ impl HttpBackend {
         Ok(ReadResourceList { items })
     }
 
-    pub async fn list_replica_sources_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-    ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
-        self.list_read_view_raw(resource_kind, namespace, "replicaSources").await
-    }
-
     async fn list_read_view_raw(
         &self,
         resource_kind: ResourceKind,
@@ -297,14 +289,6 @@ impl HttpBackend {
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
         self.watch_read_view_raw(resource_kind, namespace, "includeReplicas").await
-    }
-
-    pub async fn watch_replica_sources_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
-        self.watch_read_view_raw(resource_kind, namespace, "replicaSources").await
     }
 
     async fn watch_read_view_raw(

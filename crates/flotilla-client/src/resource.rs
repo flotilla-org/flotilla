@@ -279,7 +279,6 @@ impl ResourceClient {
                     kind: request.kind,
                     name: request.name,
                     include_replicas: request.include_replicas,
-                    replica_sources: false,
                     cursor: request.cursor,
                 },
             })

@@ -19,8 +19,8 @@ use flotilla_resources::{
     ResourceList, ResourceObject, ResourcePosition, ResourceStoreDiagnostics, WatchStart,
 };
 use flotilla_store::{
-    replica::ReplicaDeletion, watch::TombstoneWrite, DecodedList, DecodedObject, DecodedQueryResult, DecodedReadObject, MessageQuery,
-    QueryResult, ReadObserver, ResourceKind, SerializedReadWatchEvent, SerializedResource, SerializedWatchStream, Store, StoreQuery,
+    watch::TombstoneWrite, DecodedList, DecodedObject, DecodedQueryResult, DecodedReadObject, MessageQuery, QueryResult, ReadObserver,
+    ResourceKind, SerializedReadWatchEvent, SerializedResource, SerializedWatchStream, Store, StoreQuery,
 };
 use futures::stream::BoxStream;
 use serde_json::Value;
@@ -466,13 +466,6 @@ impl Store for OldStore {
             get_all_including_replicas_raw(kind, namespace, name)
         )
     }
-    async fn list_replica_sources_raw(
-        &self,
-        kind: ResourceKind,
-        namespace: &str,
-    ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
-        access!(self, "list_replica_sources", kind.paths.kind, namespace.to_owned(), list_replica_sources_raw(kind, namespace))
-    }
     async fn list_read_view_raw(
         &self,
         kind: ResourceKind,
@@ -487,16 +480,6 @@ impl Store for OldStore {
         namespace: &str,
     ) -> Result<BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
         access!(self, "watch_including_replicas", kind.paths.kind, namespace.to_owned(), watch_including_replicas_raw(kind, namespace))
-    }
-    async fn list_replica_deletions_raw(&self, kind: ResourceKind, namespace: &str) -> Result<Vec<ReplicaDeletion>, ResourceError> {
-        access!(self, "list_replica_deletions", kind.paths.kind, namespace.to_owned(), list_replica_deletions_raw(kind, namespace))
-    }
-    async fn watch_replica_sources_raw(
-        &self,
-        kind: ResourceKind,
-        namespace: &str,
-    ) -> Result<BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
-        access!(self, "watch_replica_sources", kind.paths.kind, namespace.to_owned(), watch_replica_sources_raw(kind, namespace))
     }
     async fn watch_read_view_raw(
         &self,

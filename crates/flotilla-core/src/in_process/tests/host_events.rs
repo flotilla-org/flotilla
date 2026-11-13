@@ -70,7 +70,6 @@ async fn event_publication_preserves_spawned_watch_order() {
                     kind: "convoy".into(),
                     name: None,
                     include_replicas: false,
-                    replica_sources: false,
                     cursor: None,
                 })
                 .build(),

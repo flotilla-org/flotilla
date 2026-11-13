@@ -1312,8 +1312,6 @@ pub enum CommandAction {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         include_replicas: bool,
-        #[serde(default, skip_serializing_if = "is_false")]
-        replica_sources: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<ResourceCursor>,
     },
@@ -1966,7 +1964,6 @@ mod tests {
                     kind: "convoys".into(),
                     name: None,
                     include_replicas: false,
-                    replica_sources: false,
                     cursor: None,
                 })
                 .node_id(NodeId::new("feta"))

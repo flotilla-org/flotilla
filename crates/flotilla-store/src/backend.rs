@@ -534,7 +534,9 @@ impl<T: Resource> ReplicaReadResolver<T> {
             let backend = &self.backend;
             return backend.watch_including_replicas_typed::<T>(&self.namespace).await;
         }
-        let raw = self.watch_sources().await?;
+        let replicas = { self.backend.watch_replicas_typed::<T>(&self.namespace).await? };
+        let local = self.backend.using::<T>(&self.namespace).watch(WatchStart::Now).await?.map(|event| event.map(ReadWatchEvent::local));
+        let raw = stream::select(local, replicas);
         if T::REPLICATION_CLASS != crate::ReplicationClass::Definitions && self.suppress_self_origin {
             let backend = self.backend.clone();
             let namespace = self.namespace.clone();
@@ -618,22 +620,6 @@ impl<T: Resource> ReplicaReadResolver<T> {
                 }
             })
             .boxed())
-    }
-
-    pub(crate) async fn watch_sources(
-        &self,
-    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
-        ensure_replication_enabled::<T>()?;
-        if let Some(watch) = self.backend.definitions::<T>(&self.namespace).engine_watch().await {
-            // Every home's records stream their changes; the current ones are read by `list_sources`.
-            return watch.map(|(_, stream)| stream);
-        }
-        if self.backend.serves_read_views() {
-            return Err(ResourceError::invalid("HTTP replica-source watches use the resource API"));
-        }
-        let replicas = { self.backend.watch_replicas_typed::<T>(&self.namespace).await? };
-        let local = self.backend.using::<T>(&self.namespace).watch(WatchStart::Now).await?.map(|event| event.map(ReadWatchEvent::local));
-        Ok(stream::select(local, replicas).boxed())
     }
 }
 

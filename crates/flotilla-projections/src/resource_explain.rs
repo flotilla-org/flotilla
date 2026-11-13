@@ -8,10 +8,7 @@ use flotilla_protocol::{
     ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StepStatus,
 };
 use flotilla_resources::{ConditionValue, IntegrationCondition, ResourceError, ResourceProvenance, WatchStart};
-use flotilla_store::{
-    watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources,
-    ResourceBackend,
-};
+use flotilla_store::{watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, ResourceBackend};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +21,6 @@ pub struct ResourceWatchCommandContext {
     kind: String,
     name: Option<String>,
     include_replicas: bool,
-    replica_sources: bool,
     cursor: Option<ResourceCursor>,
     command_id: u64,
     node_id: NodeId,
@@ -45,13 +41,11 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
     // This routed continuous consumer owns retry; raw registry APIs keep their
     // bounded read deadline. Cancellation below also drops any partial setup.
     let setup = flotilla_store::retry_store_read(|| async {
-        match (context.replica_sources, context.include_replicas, start.clone()) {
-            (true, _, Some(_)) => Err(ResourceError::invalid("replica-source watches do not support cursor resume")),
-            (true, _, None) => watch_resource_kind_replica_sources(&context.backend, &context.namespace, &context.kind).await,
-            (false, true, Some(_)) => Err(ResourceError::invalid("include-replicas watches do not support cursor resume")),
-            (false, true, None) => watch_resource_kind_including_replicas(&context.backend, &context.namespace, &context.kind).await,
-            (false, false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
-            (false, false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,
+        match (context.include_replicas, start.clone()) {
+            (true, Some(_)) => Err(ResourceError::invalid("include-replicas watches do not support cursor resume")),
+            (true, None) => watch_resource_kind_including_replicas(&context.backend, &context.namespace, &context.kind).await,
+            (false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
+            (false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,
         }
     });
     let result = tokio::select! {
@@ -313,7 +307,6 @@ mod cancellation_tests {
             .namespace("flotilla".into())
             .kind("not-a-registered-kind".into())
             .include_replicas(false)
-            .replica_sources(false)
             .command_id(1)
             .node_id(NodeId::new("local"))
             .repo_identity(RepoIdentity { authority: String::new(), path: String::new() })

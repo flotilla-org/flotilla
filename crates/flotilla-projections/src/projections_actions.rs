@@ -125,7 +125,7 @@ pub struct ProjectionsActions<'a> {
 impl ProjectionsActions<'_> {
     pub async fn execute_action_resource_watch(&self, id: u64, command: &Command, command_node_id: &NodeId) -> Result<u64, String> {
         let command_node_id = command_node_id.clone();
-        if let CommandAction::ResourceWatch { namespace, kind, name, include_replicas, replica_sources, cursor } = command.action.clone() {
+        if let CommandAction::ResourceWatch { namespace, kind, name, include_replicas, cursor } = command.action.clone() {
             let repo_identity = empty_repo_identity();
             let description = format!("watch resource {namespace}/{kind}");
             let token = CancellationToken::new();
@@ -152,7 +152,6 @@ impl ProjectionsActions<'_> {
                         .kind(kind)
                         .maybe_name(name)
                         .include_replicas(include_replicas)
-                        .replica_sources(replica_sources)
                         .maybe_cursor(cursor)
                         .command_id(id)
                         .node_id(command_node_id.clone())

@@ -792,7 +792,6 @@ async fn commands_started_over_http_report_progress_on_the_socket() {
             kind: "convoy".into(),
             name: None,
             include_replicas: false,
-            replica_sources: false,
             cursor: None,
         })
         .build();

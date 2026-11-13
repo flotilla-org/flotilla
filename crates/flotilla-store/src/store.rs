@@ -201,8 +201,8 @@ impl ResourceKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReadOperation {
     /// Every object of a kind in one namespace: local rows, replica rows or
-    /// both (`list_raw`, `list_replicas_raw`, `list_including_replicas_raw`,
-    /// `list_replica_sources_raw`). Its cost grows with the whole kind.
+    /// both (`list_raw`, `list_replicas_raw`, `list_including_replicas_raw`).
+    /// Its cost grows with the whole kind.
     List,
     /// Rows selected by a declared query: indexed fields, labels, owners,
     /// names, Message history or a named read view.
@@ -542,13 +542,6 @@ pub trait Store: std::fmt::Debug + Send + Sync {
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
         Err(self.unsupported_operation("replicas"))
     }
-    async fn list_replica_sources_raw(
-        &self,
-        _resource_kind: ResourceKind,
-        _namespace: &str,
-    ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
-        Err(self.unsupported_operation("replicas"))
-    }
     async fn list_read_view_raw(
         &self,
         _resource_kind: ResourceKind,
@@ -558,25 +551,6 @@ pub trait Store: std::fmt::Debug + Send + Sync {
         Err(self.unsupported_operation("replicas"))
     }
     async fn watch_including_replicas_raw(
-        &self,
-        _resource_kind: ResourceKind,
-        _namespace: &str,
-    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
-        Err(self.unsupported_operation("replicas"))
-    }
-    /// Retained replica deletion fences for a relay's initial snapshot.
-    /// Ordinary list/query APIs continue to return only live objects. This
-    /// initial catch-up result contains one metadata fence per deleted
-    /// origin/name pair in the partition, with no fixed count bound. Live
-    /// delivery uses deltas.
-    async fn list_replica_deletions_raw(
-        &self,
-        _resource_kind: ResourceKind,
-        _namespace: &str,
-    ) -> Result<Vec<crate::replica::ReplicaDeletion>, ResourceError> {
-        Err(self.unsupported_operation("replica deletions"))
-    }
-    async fn watch_replica_sources_raw(
         &self,
         _resource_kind: ResourceKind,
         _namespace: &str,
@@ -868,9 +842,6 @@ pub trait StoreExt: Store {
     ) -> Result<ReadResourceList<T>, ResourceError> {
         typed_read_list(self.get_all_including_replicas_raw(ResourceKind::of::<T>(), namespace, name).await?)
     }
-    async fn list_replica_sources_typed<T: Resource>(&self, namespace: &str) -> Result<ReadResourceList<T>, ResourceError> {
-        typed_read_list(self.list_replica_sources_raw(ResourceKind::of::<T>(), namespace).await?)
-    }
     async fn list_read_view_typed<T: Resource>(&self, namespace: &str, query_key: &str) -> Result<ReadResourceList<T>, ResourceError> {
         typed_read_list(self.list_read_view_raw(ResourceKind::of::<T>(), namespace, query_key).await?)
     }
@@ -879,12 +850,6 @@ pub trait StoreExt: Store {
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
         Ok(self.watch_including_replicas_raw(ResourceKind::of::<T>(), namespace).await?.map(|e| e.and_then(typed_read_watch)).boxed())
-    }
-    async fn watch_replica_sources_typed<T: Resource>(
-        &self,
-        namespace: &str,
-    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
-        Ok(self.watch_replica_sources_raw(ResourceKind::of::<T>(), namespace).await?.map(|e| e.and_then(typed_read_watch)).boxed())
     }
     async fn watch_read_view_typed<T: Resource>(
         &self,
