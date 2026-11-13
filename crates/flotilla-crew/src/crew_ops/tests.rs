@@ -199,12 +199,18 @@ async fn fixture_with_message_path(
     phase: CrewWorkPhase,
     message_path: crate::ports::MessagePath,
 ) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    build_fixture(phase, message_path, crew_spec(), &[], |_, _| {}).await
+    build_fixture(phase, message_path, None, crew_spec(), &[], |_, _| {}).await
 }
 
 /// [`fixture`], its convoy admitted with `spec`.
 async fn spec_fixture(phase: CrewWorkPhase, spec: ConvoySpec) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    build_fixture(phase, Default::default(), spec, &[], |_, _| {}).await
+    build_fixture(phase, Default::default(), None, spec, &[], |_, _| {}).await
+}
+
+/// [`fixture`], its convoy in Project `work`, declared at the home before anything watches it.
+async fn project_fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).project_ref("work".into()).build();
+    build_fixture(phase, Default::default(), Some("work"), spec, &[], |_, _| {}).await
 }
 
 /// The fixture convoy's spec: workflow `workflow`, for role `crew`.
@@ -228,14 +234,15 @@ async fn prelude_fixture(
     prelude: &[Crewed<'_>],
     shape: impl FnOnce(&mut WorkflowSnapshot, &[(String, String)]),
 ) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    build_fixture(phase, Default::default(), crew_spec(), prelude, shape).await
+    build_fixture(phase, Default::default(), None, crew_spec(), prelude, shape).await
 }
 
-/// The fixture at a home whose fleet is designated, its crew service on `message_path`, or on
-/// the home's Message path when that is not set.
+/// The fixture at a home whose fleet is designated and which declares `project`, its crew
+/// service on `message_path`, or on the home's Message path when that is not set.
 async fn build_fixture(
     phase: CrewWorkPhase,
     message_path: crate::ports::MessagePath,
+    project: Option<&str>,
     spec: ConvoySpec,
     prelude: &[Crewed<'_>],
     shape: impl FnOnce(&mut WorkflowSnapshot, &[(String, String)]),
@@ -247,6 +254,20 @@ async fn build_fixture(
     let namespace = Arc::new(std::sync::RwLock::new("flotilla".into()));
     let engine = EngineHome::install(&backend, "flotilla", "host");
     designate_fleet(&backend, "flotilla").await;
+    if let Some(project) = project {
+        backend
+            .definitions::<flotilla_resources::Project>("flotilla")
+            .apply(
+                &InputMeta::builder().name(project.into()).build(),
+                &flotilla_resources::ProjectSpec::builder()
+                    .display_name(project.into())
+                    .default_workflow_ref("workflow".into())
+                    .repositories(Vec::new())
+                    .build(),
+            )
+            .await
+            .expect("the convoy's project");
+    }
     if message_path.get().is_none() {
         let _ = message_path.set(engine.messages.messages());
     }

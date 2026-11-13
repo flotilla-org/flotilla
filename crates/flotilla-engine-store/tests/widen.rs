@@ -69,7 +69,12 @@ fn message(id: &str, kind: ConsumerKind, relation: Relation) -> Resource<Message
         )
     };
     let receiver = Receiver { kind, id: format!("{id}-consumer"), host: HOME.into() };
-    Resource::<Message>::stored(&name, spec, State::new(MessageState::Awaiting { receiver }, Timestamp(1)), Version(0))
+    Resource::<Message>::stored(
+        &name,
+        spec,
+        State::new(MessageState::Awaiting { receiver, delivered_at: Timestamp(1) }, Timestamp(1)),
+        Version(0),
+    )
 }
 
 fn insert(store: &mut Store, value: &Resource<Message>) -> Result<flotilla_schema_sqlite::ResourceId, StoreError> {

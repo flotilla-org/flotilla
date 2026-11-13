@@ -7,24 +7,6 @@ use flotilla_resources::{InputMeta, Message, MessageSpec, ReadResourceObject, Re
 
 use crate::crew_ops::CrewService;
 
-/// The crew members' addresses a convoy's frozen workflow declares: the receivers its crew
-/// Messages are sent to.
-pub(crate) fn convoy_seats(namespace: &str, convoy: &flotilla_resources::ResourceObject<flotilla_resources::Convoy>) -> Vec<String> {
-    let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
-    convoy
-        .status
-        .iter()
-        .flat_map(|status| &status.workflow_snapshot)
-        .flat_map(|workflow| &workflow.vessels)
-        .flat_map(|vessel| {
-            vessel
-                .crew
-                .iter()
-                .map(|member| flotilla_resources::crew_role_address(project, &convoy.metadata.name, &vessel.name, &member.role))
-        })
-        .collect()
-}
-
 impl CrewService {
     pub(crate) fn message_primitives(&self) -> Result<std::sync::Arc<dyn flotilla_messaging::EngineMessages>, ResourceError> {
         crate::ports::installed_messages(&self.message_path)
@@ -42,11 +24,6 @@ impl CrewService {
             Ok(primitives) => primitives.resolve_in_reply_to(namespace, intent).await,
             Err(error) => flotilla_messaging::MessageResolution::Unknown(error.to_string()),
         }
-    }
-
-    /// One Message by name, local or replicated.
-    pub(crate) async fn message_record(&self, namespace: &str, name: &str) -> Result<ReadResourceObject<Message>, ResourceError> {
-        self.message_primitives()?.view(namespace, name).await?.ok_or_else(|| ResourceError::not_found(name))
     }
 
     /// The Message `name` in `receiver`'s inbox, local or replicated.
@@ -75,13 +52,7 @@ impl CrewService {
         namespace: &str,
         receiver: &str,
     ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        Ok(self
-            .message_primitives()?
-            .to_receivers(namespace, &[receiver.to_owned()])
-            .await?
-            .into_iter()
-            .filter(|record| record.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
-            .collect())
+        self.message_primitives()?.open_to(namespace, &[receiver.to_owned()]).await
     }
 
     /// The Messages still waiting for delivery to `receivers`, local or replicated.
@@ -93,16 +64,17 @@ impl CrewService {
         self.message_primitives()?.pending_to(namespace, receivers).await
     }
 
-    /// The Messages with these names, local or replicated; one with no view is left out.
+    /// The Messages with these names, each a (receiver, name) pair read in its receiver's inbox,
+    /// local or replicated; one with no view is left out.
     pub(crate) async fn named_message_records(
         &self,
         namespace: &str,
-        names: &[String],
+        named: &[(String, String)],
     ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
         let primitives = self.message_primitives()?;
         let mut records = Vec::new();
-        for name in names {
-            match primitives.view(namespace, name).await {
+        for (receiver, name) in named {
+            match primitives.view_to(namespace, receiver, name).await {
                 Ok(Some(record)) => records.push(record),
                 Ok(None) => {}
                 Err(ResourceError::Invalid { message }) => tracing::debug!(%name, %message, "engine message has no old-shaped view"),

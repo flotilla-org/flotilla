@@ -109,7 +109,10 @@ fn port_round_trips_every_message_edge_at_the_home_sequence() {
 
     messages.apply(&answered, Deliver { receiver: session(), transport: Transport::Turn }, &world, Timestamp(4)).expect("deliver");
     assert_eq!(messages.get(&answered).expect("message").version().0, last_sequence(&store));
-    assert_eq!(*messages.get(&answered).expect("message").state(), MessageState::Awaiting { receiver: session() });
+    assert_eq!(
+        *messages.get(&answered).expect("message").state(),
+        MessageState::Awaiting { receiver: session(), delivered_at: Timestamp(4) }
+    );
 
     world.reply.put(&Ref::new(answered.as_str()), ());
     messages.apply(&answered, Settle { by: Settlement::Answered }, &world, Timestamp(5)).expect("settle");

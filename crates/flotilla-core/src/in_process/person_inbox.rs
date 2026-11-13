@@ -62,12 +62,7 @@ impl InProcessDaemon {
                 Ok(CommandValue::Ok)
             }
             CommandAction::PersonAnswer { message, body, .. } => {
-                let original = primitives
-                    .view(&namespace, message)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| format!("message `{message}` is not in this home's replica"))?
-                    .object;
+                let original = primitives.view_for_person(&namespace, message).await?.object;
                 primitives.acknowledge(&namespace, message).await?;
                 // The person answers as the role the message was addressed to, back to its sender.
                 let reply = MessageSpec::builder()
@@ -81,7 +76,7 @@ impl InProcessDaemon {
                 let name = flotilla_address::message_record_name(&reply.receiver, &reply.sender, &format!("answer:{message}"));
                 // One answer per message: repeating it is a no-op, and a different one is refused
                 // rather than dropped by the engine's keyed admission.
-                if let Some(sent) = primitives.view(&namespace, &name).await.map_err(|error| error.to_string())? {
+                if let Some(sent) = primitives.view_to(&namespace, &reply.receiver, &name).await.map_err(|error| error.to_string())? {
                     if sent.object.spec.body != reply.body {
                         return Err(format!("message `{message}` was already answered as `{name}`; one answer per message"));
                     }

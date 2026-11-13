@@ -473,6 +473,13 @@ impl Read<'_> {
         self.ctx().page(query, after, limit)
     }
 
+    /// [`Self::page`] from the top: up to `limit` resources in `query`'s index below `before`, in
+    /// descending `order..., id` order, so rows tied on the order continue by id across pages. The
+    /// first page (`None`) starts at the highest row; pass `next` back as `before`.
+    pub fn page_back<K>(&mut self, query: &IndexQuery<K>, before: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
+        self.ctx().page_back(query, before, limit)
+    }
+
     /// Key-only read of a declared single-integer-order index, restricted to one home.
     /// Returns ids and their order values strictly greater than `after`, without decoding bodies.
     /// The bound is an order value, not a store-local cursor. Rows tied at the bound are excluded;

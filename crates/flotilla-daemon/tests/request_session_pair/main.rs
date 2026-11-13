@@ -4322,8 +4322,9 @@ async fn run_message_role_waiting_home_case(remote: bool, admitted: bool) {
         if remote && name == "reply" {
             // The reply is routed by its original, which the caller reads once it follows the home's log.
             let caller = topology.leader.message_primitives().expect("caller message path");
+            let inbox = caller.inbox_for("flotilla", "flotilla/governor").await.expect("the request's inbox");
             tokio::time::timeout(Duration::from_secs(5), async {
-                while caller.locate("request").expect("locate").is_none() {
+                while caller.locate_in(&inbox, "request").expect("locate").is_none() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             })

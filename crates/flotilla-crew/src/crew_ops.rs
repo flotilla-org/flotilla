@@ -2245,7 +2245,7 @@ impl CrewService {
         }
         .await;
         if let (Err(_), Ok(engine)) = (&handed_off, self.message_primitives()) {
-            if let Err(error) = engine.withdraw(&context.namespace, &message_name, &context.convoy).await {
+            if let Err(error) = engine.withdraw(&context.namespace, &intent.receiver, &message_name, &context.convoy).await {
                 tracing::warn!(convoy = %context.convoy, message = %message_name, %error, "a failed handoff's admitted turn was not withdrawn");
             }
         }
@@ -2638,7 +2638,7 @@ impl CrewService {
             return Err(format!("convoy `{name}` is in terminal phase `{:?}` and cannot accept message changes", status.phase));
         }
         let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
-        let seats = crate::message_port::convoy_seats(namespace, &convoy);
+        let seats = flotilla_resources::convoy_crew_seats(namespace, &convoy);
         let mut messages = self
             .pending_message_records(namespace, &seats)
             .await
@@ -2657,7 +2657,7 @@ impl CrewService {
         let mut closed = BTreeSet::new();
         let primitives = self.message_primitives().map_err(|error| error.to_string())?;
         for message in messages {
-            if let Err(error) = primitives.withdraw(namespace, &message.object.metadata.name, name).await {
+            if let Err(error) = primitives.withdraw(namespace, &message.object.spec.receiver, &message.object.metadata.name, name).await {
                 return Err(format!(
                     "withdrawal of {} failed: {error}; already withdrawn: {closed:?}; last queued brief: {withdrawn:?}",
                     message.object.metadata.name
@@ -3274,17 +3274,17 @@ impl CrewService {
     async fn reconcile_pending_supervisor_turns_selected(&self, namespace: &str, name: Option<&str>) -> Result<(), String> {
         let convoys = self.resource_backend.using::<ResourceConvoy>(namespace);
         let candidates = convoys.query_declared(&convoy_names_query(name, false)).await.map_err(|error| error.to_string())?.items;
-        let mut references = BTreeMap::<String, Vec<String>>::new();
+        // Each follow-up is read in its seat's inbox: the crew member it was sent to.
+        let mut references = BTreeMap::<String, Vec<(String, String)>>::new();
         for source in &candidates {
-            for reference in source
-                .object
-                .status
-                .iter()
-                .flat_map(|status| status.crew_work.values())
-                .flat_map(|crew| crew.values())
-                .filter_map(|state| state.pending_follow_up.as_ref())
-            {
-                references.entry(reference.namespace.clone()).or_default().push(reference.name.clone());
+            let convoy = &source.object;
+            let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+            for (vessel, crew) in convoy.status.iter().flat_map(|status| &status.crew_work) {
+                for (role, state) in crew {
+                    let Some(reference) = &state.pending_follow_up else { continue };
+                    let receiver = flotilla_resources::crew_role_address(project, &convoy.metadata.name, vessel, role);
+                    references.entry(reference.namespace.clone()).or_default().push((receiver, reference.name.clone()));
+                }
             }
         }
         let mut messages = BTreeMap::new();
@@ -3363,7 +3363,7 @@ impl CrewService {
         name: &str,
         intent: &flotilla_resources::MessageSpec,
     ) -> Result<ResourceRef, String> {
-        match self.message_record(namespace, name).await {
+        match self.message_for(namespace, intent, name).await {
             Ok(existing) => {
                 // A repeat records what an earlier send could not (record is idempotent).
                 self.record_awaiting(namespace, name, intent, self.admitted_home(&existing), None).await?;
@@ -3532,7 +3532,7 @@ impl CrewService {
         // Producer identity follows the persisted hold, independent of receiver changes
         // or new observations racing a lost acceptance response.
         let name = flotilla_resources::message_record_name("system:hold", sender, &format!("hold:{hold_key}"));
-        match self.message_record(&request.namespace, &name).await {
+        match self.message_to(&request.namespace, &receiver, &name).await {
             Ok(_) => return Ok(()),
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),

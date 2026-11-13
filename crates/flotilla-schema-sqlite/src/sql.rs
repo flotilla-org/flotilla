@@ -91,9 +91,9 @@ pub(crate) struct KindSql {
     pub edge_state: Option<(String, Vec<Code>)>,
 }
 
-/// One index's page queries. Both select `id` then the order columns, filter by the index's own
-/// predicate (rendered as the DDL renders it, so SQLite can use the partial index), bind the `eq`
-/// values as `?1..`, and order by `order..., id`.
+/// One index's page queries. Each selects `id` then the order columns, filters by the index's own
+/// predicate (rendered as the DDL renders it, so SQLite can use the partial index), binds the `eq`
+/// values as `?1..`, and orders by `order..., id`: ascending, or descending for `last` and `before`.
 pub(crate) struct IndexSql {
     /// The schema object name, `<table>_<name>`.
     pub object: String,
@@ -103,6 +103,10 @@ pub(crate) struct IndexSql {
     pub first: String,
     /// A later page: eq values, the cursor's order values and id, then the limit.
     pub after: String,
+    /// The first page from the top, highest first: parameters as `first`.
+    pub last: String,
+    /// A later page from the top, below the cursor: parameters as `after`.
+    pub before: String,
     /// Home-scoped keys after an exclusive integer order bound; only single integer orders.
     pub integer_keys: Option<String>,
     /// Home-scoped keys below an exclusive integer order bound, highest first; only single
@@ -196,6 +200,8 @@ impl KindSql {
         for index in self.indexes.values() {
             out.push((format!("index {} first", index.object), index.first.clone()));
             out.push((format!("index {} after", index.object), index.after.clone()));
+            out.push((format!("index {} last", index.object), index.last.clone()));
+            out.push((format!("index {} before", index.object), index.before.clone()));
             if let Some(sql) = &index.integer_keys {
                 out.push((format!("index {} integer keys", index.object), sql.clone()));
             }
@@ -223,18 +229,25 @@ impl IndexSql {
             let column = root.columns.iter().find(|column| column.name == index.order[0]).expect("validated index column");
             first.push(format!("{} >= {}", order[0], lowest(&column.ty)));
         }
-        let mut after = terms;
-        if order.is_empty() {
-            after.push(format!("\"id\" > ?{next}"));
-        } else {
-            let cursor = placeholders(next, order.len() + 1);
-            after.push(format!("({}, \"id\") > ({cursor})", order.join(", ")));
-        }
-        let limit = |params: usize| {
-            let mut by = order.clone();
-            by.push("\"id\"".to_owned());
-            format!("ORDER BY {} LIMIT ?{params}", by.join(", "))
+        // Beyond a cursor on `order..., id`, so rows tied on the order continue by id.
+        let beyond = |bound: &str| {
+            let mut terms = terms.clone();
+            if order.is_empty() {
+                terms.push(format!("\"id\" {bound} ?{next}"));
+            } else {
+                let cursor = placeholders(next, order.len() + 1);
+                terms.push(format!("({}, \"id\") {bound} ({cursor})", order.join(", ")));
+            }
+            terms
         };
+        let (after, before) = (beyond(">"), beyond("<"));
+        let by = |direction: &str| {
+            let mut by: Vec<String> = order.iter().map(|column| format!("{column}{direction}")).collect();
+            by.push(format!("\"id\"{direction}"));
+            by.join(", ")
+        };
+        let limit = |params: usize| format!("ORDER BY {} LIMIT ?{params}", by(""));
+        let limit_down = |params: usize| format!("ORDER BY {} LIMIT ?{params}", by(" DESC"));
         let select = format!("SELECT \"id\"{} FROM {table} WHERE", prefixed(&order));
         let integer =
             index.order.len() == 1 && root.columns.iter().any(|column| column.name == index.order[0] && column.ty == ColumnType::Integer);
@@ -268,6 +281,8 @@ impl IndexSql {
             order: order.len(),
             first: format!("{select} {} {}", first.join(" AND "), limit(next)),
             after: format!("{select} {} {}", after.join(" AND "), limit(next + order.len() + 1)),
+            last: format!("{select} {} {}", first.join(" AND "), limit_down(next)),
+            before: format!("{select} {} {}", before.join(" AND "), limit_down(next + order.len() + 1)),
         }
     }
 }

@@ -1,6 +1,7 @@
 //! A receiver's waiting messages and a message by name are read without loading the rest of the
-//! replica (#3108): with thousands of settled messages held, a pending read, a by-name read and a
-//! delivery hold each load and convert only the messages they answer with.
+//! replica (#3108): with thousands of settled messages held, each read through an inbox's index or
+//! by name loads and converts only the messages it answers with. The generic verb's listing is the
+//! one read that loads the whole table.
 
 use flotilla_address::Address;
 use flotilla_engine_messages::RowsRead;
@@ -15,6 +16,7 @@ use flotilla_store_memory::InMemoryBackend;
 const NAMESPACE: &str = "flotilla";
 const BUSY: &str = "flotilla/coder";
 const QUIET: &str = "flotilla/reviewer";
+const PERSON: &str = "principal:alice";
 const SETTLED: usize = 2000;
 
 fn intent(receiver: &str, body: &str) -> MessageSpec {
@@ -47,6 +49,15 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
         primitives.inbox().receive(&session, &id, Transport::Turn).await.expect("receipt");
         primitives.inbox().deliver(&id, Deliver { receiver: session.clone(), transport: Transport::Turn }).await.expect("deliver");
     }
+    // Two more settle after a mark, for the read of those settled since.
+    let mark = Timestamp::from_datetime(&chrono::Utc::now());
+    for n in 0..2 {
+        let name = format!("late-{n}");
+        primitives.admit(NAMESPACE, &name, &intent(BUSY, &name)).await.expect("admit");
+        let (id, _) = primitives.locate_in(&inbox, &name).expect("locate").expect("admitted");
+        primitives.inbox().receive(&session, &id, Transport::Turn).await.expect("receipt");
+        primitives.inbox().deliver(&id, Deliver { receiver: session.clone(), transport: Transport::Turn }).await.expect("deliver");
+    }
     for n in 0..3 {
         let name = format!("waiting-{n}");
         primitives.admit(NAMESPACE, &name, &intent(BUSY, &name)).await.expect("admit");
@@ -55,6 +66,9 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
         let name = format!("quiet-{n}");
         primitives.admit(NAMESPACE, &name, &intent(QUIET, &name)).await.expect("admit");
     }
+    let to_person = MessageSpec { sender: "system:stall-judge".into(), ..intent(PERSON, "stalled") };
+    primitives.admit(NAMESPACE, "for-a-person", &to_person).await.expect("admit");
+    let total = SETTLED + 2 + 3 + 2 + 1;
 
     let before = primitives.rows_read();
     let waiting = primitives.pending_to(NAMESPACE, &[BUSY.to_owned()]).await.expect("pending read");
@@ -81,4 +95,43 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     let held = primitives.delivery_held_until(NAMESPACE, BUSY).await.expect("hold read");
     assert!(held.is_some(), "the waiting messages hold delivery");
     assert_eq!(cost(before, primitives.rows_read()).0, 3, "a delivery hold loads only the waiting messages");
+
+    let before = primitives.rows_read();
+    let open = primitives.open_to(NAMESPACE, &[BUSY.to_owned()]).await.expect("open read");
+    assert_eq!(open.len(), 3, "the waiting messages are the open ones");
+    assert_eq!(cost(before, primitives.rows_read()), (3, 3), "an open read loads and converts only the open messages");
+
+    // A seat's open messages, its newest settled and delivered (here one message), and a named one.
+    let before = primitives.rows_read();
+    let seat =
+        primitives.seat_messages(NAMESPACE, &[BUSY.to_owned()], &[(QUIET.to_owned(), "quiet-0".to_owned())]).await.expect("seat read");
+    let mut names = seat.iter().map(|read| read.object.metadata.name.clone()).collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["late-1", "quiet-0", "waiting-0", "waiting-1", "waiting-2"]);
+    assert_eq!(cost(before, primitives.rows_read()), (6, 5), "a seat read loads each row it answers with once per read of it");
+
+    let before = primitives.rows_read();
+    let newest = primitives.newest_delivered(&inbox).expect("newest delivered").expect("delivered");
+    assert!(newest.1.name().ends_with("/message:late-1"), "{}", newest.1.name());
+    assert_eq!(cost(before, primitives.rows_read()).0, 1, "the newest delivered loads one message");
+
+    let before = primitives.rows_read();
+    let late = primitives.settled_since(&inbox, mark).expect("settled since");
+    assert_eq!(late.len(), 2, "two settled after the mark");
+    assert_eq!(cost(before, primitives.rows_read()).0, 3, "a settled-since read loads those and the one that ends it");
+
+    let before = primitives.rows_read();
+    assert_eq!(primitives.person_messages(NAMESPACE).await.expect("person messages").len(), 1);
+    assert_eq!(cost(before, primitives.rows_read()).0, 1, "a person's waiting messages load only those");
+
+    let before = primitives.rows_read();
+    let named = primitives.view_for_person(NAMESPACE, "for-a-person").await.expect("a person's message");
+    assert_eq!(named.object.metadata.name, "for-a-person");
+    assert_eq!(cost(before, primitives.rows_read()), (1, 1), "a person's message by name loads and converts one");
+
+    // The generic verb's listing is the one Message read proportional to the table.
+    let before = primitives.rows_read();
+    let listed = backend.using::<flotilla_resources::Message>(NAMESPACE).list().await.expect("verb listing").items;
+    assert_eq!(listed.len(), total);
+    assert_eq!(cost(before, primitives.rows_read()).0, total as u64, "the verb's listing loads every message once");
 }

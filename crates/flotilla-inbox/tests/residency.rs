@@ -225,12 +225,14 @@ async fn watch_replays_historical_states_after_eviction() {
             states.push(state);
         }
     }
+    // Settling keeps the time it was delivered.
+    let delivered_at = states[1].delivered_at().expect("delivered");
     assert_eq!(
         states,
         vec![
             MessageState::Pending,
-            MessageState::Awaiting { receiver: consumer("a") },
-            MessageState::Settled { receiver: Some(consumer("a")) }
+            MessageState::Awaiting { receiver: consumer("a"), delivered_at },
+            MessageState::Settled { receiver: Some(consumer("a")), delivered_at: Some(delivered_at) }
         ]
     );
 }
@@ -311,7 +313,7 @@ async fn watch_pages_preserve_large_changes_and_followers() {
         expected.push((message.clone(), MessageState::Pending));
         let reason = DropReason::Withdrawn { by: address("project:test/role:sender"), authority: authority.clone() };
         backend.drop(&message, reason.clone()).await.expect("drop");
-        expected.push((message, MessageState::Dropped { reason, receiver: None, watermark: None }));
+        expected.push((message, MessageState::Dropped { reason, receiver: None, delivered_at: None, watermark: None }));
     }
     let events =
         backend.watch(&inbox(), Some(Cursor(0))).await.expect("watch").take(expected.len()).try_collect::<Vec<_>>().await.expect("stream");

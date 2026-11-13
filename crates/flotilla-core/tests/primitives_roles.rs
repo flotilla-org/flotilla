@@ -68,9 +68,18 @@ fn intent(sender: &str, receiver: &str) -> MessageSpec {
         .build()
 }
 
-fn engine_message(primitives: &MessagePrimitives, record: &str) -> flotilla_state_machines::Resource<Message> {
-    let (id, _) = primitives.locate(record).expect("locate").expect("admitted");
-    primitives.messages().expect("messages").into_iter().map(|(_, message)| message).find(|message| message.name() == id).expect("stored")
+/// The engine record of `record`, admitted to `receiver` (an old address), read in its inbox.
+async fn engine_message(primitives: &MessagePrimitives, receiver: &str, record: &str) -> flotilla_state_machines::Resource<Message> {
+    let inbox = primitives.inbox_for(NAMESPACE, receiver).await.expect("the receiver's inbox");
+    let (id, _) = primitives.locate_in(&inbox, record).expect("locate").expect("admitted");
+    let messages = primitives.inbox_messages(&inbox).expect("messages");
+    messages.into_iter().map(|(_, message)| message).find(|message| message.name() == id).expect("stored")
+}
+
+/// The id of `record`, admitted to `receiver` (an old address), and its home.
+async fn located(primitives: &MessagePrimitives, receiver: &str, record: &str) -> (String, String) {
+    let inbox = primitives.inbox_for(NAMESPACE, receiver).await.expect("the receiver's inbox");
+    primitives.locate_in(&inbox, record).expect("locate").expect("admitted")
 }
 
 // Behaviour: each `system:` producer sends as its declared fleet role under
@@ -84,7 +93,7 @@ async fn system_producers_send_as_their_fleet_roles() {
         let sender = format!("system:{role}");
         let record = flotilla_resources::message_record_name(CREW, &sender, role);
         primitives.admit(NAMESPACE, &record, &intent(&sender, CREW)).await.expect("admitted");
-        let message = engine_message(&primitives, &record);
+        let message = engine_message(&primitives, CREW, &record).await;
         assert_eq!(message.spec().sender.as_str(), format!("fleet:lab/role:{role}"));
         assert_eq!(message.spec().inbox.as_str(), "project:flotilla/convoy:demo/role:coder");
         assert_eq!(message.name(), format!("project:flotilla/convoy:demo/role:coder/message:{record}"));
@@ -92,11 +101,12 @@ async fn system_producers_send_as_their_fleet_roles() {
     // The held turn's name keys on `system:hold`; it sends as turn-rules.
     let held = flotilla_resources::message_record_name("system:hold", "system:turn-rules", "hold:demo:work:coder:rule:1");
     primitives.admit(NAMESPACE, &held, &intent("system:turn-rules", CREW)).await.expect("held turn");
-    assert_eq!(engine_message(&primitives, &held).spec().sender.as_str(), "fleet:lab/role:turn-rules");
+    assert_eq!(engine_message(&primitives, CREW, &held).await.spec().sender.as_str(), "fleet:lab/role:turn-rules");
     // A repeated key is the same message: nothing more is admitted.
-    let count = primitives.messages().expect("messages").len();
+    let inbox = primitives.inbox_for(NAMESPACE, CREW).await.expect("the crew's inbox");
+    let count = primitives.inbox_messages(&inbox).expect("messages").len();
     primitives.admit(NAMESPACE, &held, &intent("system:turn-rules", CREW)).await.expect("repeat");
-    assert_eq!(primitives.messages().expect("messages").len(), count);
+    assert_eq!(primitives.inbox_messages(&inbox).expect("messages").len(), count);
 }
 
 // Behaviour: a crew's reply to a fleet role's message lands in that role's
@@ -115,10 +125,10 @@ async fn a_reply_to_a_fleet_role_reaches_its_inbox() {
     reply.relation = MessageRelation::Peer;
     reply.in_reply_to = Some(original.clone());
     primitives.admit(NAMESPACE, &reply_name, &reply).await.expect("reply");
-    let stored = engine_message(&primitives, &reply_name);
+    let stored = engine_message(&primitives, "system:nudge", &reply_name).await;
     assert_eq!(stored.spec().inbox.as_str(), "fleet:lab/role:nudge");
     assert_eq!(stored.spec().sender.as_str(), "project:flotilla/convoy:demo/role:coder");
-    let (original_id, home) = primitives.locate(&original).expect("locate").expect("original");
+    let (original_id, home) = located(&primitives, CREW, &original).await;
     let in_reply_to = stored.spec().in_reply_to.as_ref().expect("names the original");
     assert_eq!((in_reply_to.name.as_str(), in_reply_to.home.as_str()), (original_id.as_str(), home.as_str()));
     assert_eq!(*stored.state(), MessageState::Pending);
@@ -146,7 +156,7 @@ async fn the_sweep_reconciles_receipts_and_settles_replies_from_open_messages_on
     turn.expectation = flotilla_resources::MessageExpectation::Reply;
     let record = flotilla_resources::message_record_name(CREW, "system:turn-rules", "rule@1");
     primitives.admit(NAMESPACE, &record, &turn).await.expect("turn");
-    let message = engine_message(&primitives, &record);
+    let message = engine_message(&primitives, CREW, &record).await;
     let consumer = primitives.register("crew-session", flotilla_schema::Timestamp(1)).await.expect("consumer");
     let inbox = primitives.inbox();
     inbox.bind(message.spec().inbox.clone(), consumer.clone()).await.expect("bind");
@@ -162,7 +172,7 @@ async fn the_sweep_reconciles_receipts_and_settles_replies_from_open_messages_on
     let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
     let report = primitives.sweep(NAMESPACE, now, &mut open).await.expect("sweep");
     assert_eq!(report.reconciled, 1);
-    assert!(matches!(engine_message(&primitives, &record).state(), MessageState::Awaiting { .. }));
+    assert!(matches!(engine_message(&primitives, CREW, &record).await.state(), MessageState::Awaiting { .. }));
     // The crew answers; the sweep settles the original from the log since its last pass.
     let mut answer = intent(CREW, "system:turn-rules");
     answer.relation = MessageRelation::Peer;
@@ -171,8 +181,8 @@ async fn the_sweep_reconciles_receipts_and_settles_replies_from_open_messages_on
     primitives.admit(NAMESPACE, &answer_name, &answer).await.expect("answer");
     let report = primitives.sweep(NAMESPACE, now, &mut open).await.expect("sweep");
     assert_eq!(report.answered, 1);
-    assert!(matches!(engine_message(&primitives, &record).state(), MessageState::Settled { .. }));
-    let (answer_id, _) = primitives.locate(&answer_name).expect("locate").expect("answer");
+    assert!(matches!(engine_message(&primitives, CREW, &record).await.state(), MessageState::Settled { .. }));
+    let (answer_id, _) = located(&primitives, "system:turn-rules", &answer_name).await;
     assert_eq!(open.open().collect::<Vec<_>>(), [answer_id.as_str()], "only open messages are swept again");
 }
 
@@ -216,9 +226,9 @@ async fn the_sweep_settles_held_outcomes_and_withdraws_on_a_false_delivery_condi
     let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
     let report = primitives.sweep(NAMESPACE, now, &mut open).await.expect("sweep");
     assert_eq!((report.outcomes, report.withdrawn), (1, 1));
-    assert!(matches!(engine_message(&primitives, &met).state(), MessageState::Settled { .. }), "the outcome holds");
-    assert_eq!(*engine_message(&primitives, &unmet).state(), MessageState::Pending, "the outcome does not hold yet");
-    let moot = engine_message(&primitives, &moot);
+    assert!(matches!(engine_message(&primitives, CREW, &met).await.state(), MessageState::Settled { .. }), "the outcome holds");
+    assert_eq!(*engine_message(&primitives, CREW, &unmet).await.state(), MessageState::Pending, "the outcome does not hold yet");
+    let moot = engine_message(&primitives, CREW, &moot).await;
     let Some(DropReason::Withdrawn { by, authority }) = moot.state().drop_reason() else { panic!("withdrawn: {:?}", moot.state()) };
     assert_eq!(by.as_str(), "fleet:lab/role:turn-rules");
     assert!(authority.as_str().contains("demo"), "the condition is the authority: {authority}");
@@ -263,7 +273,7 @@ async fn a_fresh_sweep_index_seeds_open_messages_from_a_scan() {
     for key in ["early@1", "early@2"] {
         let record = flotilla_resources::message_record_name(CREW, "system:nudge", key);
         primitives.admit(NAMESPACE, &record, &intent("system:nudge", CREW)).await.expect("admit");
-        names.push(primitives.locate(&record).expect("locate").expect("admitted").0);
+        names.push(located(&primitives, CREW, &record).await.0);
     }
     let mut restarted = OpenMessages::default();
     restarted.refresh(&primitives).expect("seed");
@@ -525,7 +535,7 @@ async fn an_undelivered_turn_holds_delivery_for_one_hold() {
     let delivered = flotilla_resources::message_record_name(other, "system:nudge", "delivered");
     primitives.admit(NAMESPACE, &delivered, &intent("system:nudge", other)).await.expect("admitted");
     assert!(primitives.delivery_held_until(NAMESPACE, other).await.expect("read").is_some());
-    let message = engine_message(&primitives, &delivered);
+    let message = engine_message(&primitives, other, &delivered).await;
     let consumer = primitives.register("reviewer-session", flotilla_schema::Timestamp(1)).await.expect("consumer");
     let inbox = primitives.inbox();
     inbox.bind(message.spec().inbox.clone(), consumer.clone()).await.expect("bind");

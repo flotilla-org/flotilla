@@ -58,7 +58,7 @@ impl Held {
     /// Whether a person acknowledged it at or after `began_at`: a settled message's time is when
     /// it settled.
     fn answers(&self, began_at: DateTime<Utc>) -> bool {
-        matches!(self.message.state(), MessageState::Settled { receiver: Some(receiver) } if receiver.kind == ConsumerKind::Person)
+        matches!(self.message.state(), MessageState::Settled { receiver: Some(receiver), .. } if receiver.kind == ConsumerKind::Person)
             && self.message.since() >= Timestamp::from_datetime(&began_at)
     }
 }
@@ -80,14 +80,21 @@ fn child(parent: &Address, kind: Kind, name: &str) -> Result<Address, String> {
 }
 
 impl MessagePrimitives {
-    /// Every attention message in this replica: from an attention's sender to a person role,
-    /// about one subject.
-    async fn held(&self, namespace: &str) -> Result<Vec<Held>, String> {
+    /// The attention messages in the person roles' inboxes, from an attention's sender, about
+    /// one subject: those pending, read through each inbox's index, and with `answered_since`
+    /// those a person settled at or after it, read down each inbox's settled index to it.
+    async fn held(&self, namespace: &str, answered_since: Option<DateTime<Utc>>) -> Result<Vec<Held>, String> {
         // Raising an attention names its sender's fleet role, so an undesignated fleet holds
         // none: clearing one then has nothing to clear, rather than failing the caller.
         let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(Vec::new()) };
-        let people = self.person_inboxes(namespace).await?;
-        Ok(attentions_among(&roles, self.messages()?.into_iter().filter(|(_, message)| people.contains(&message.spec().inbox))))
+        let mut messages = Vec::new();
+        for inbox in self.person_inboxes(namespace).await? {
+            messages.extend(self.pending_in(&inbox)?);
+            if let Some(since) = answered_since {
+                messages.extend(self.settled_since(&inbox, Timestamp::from_datetime(&since))?);
+            }
+        }
+        Ok(attentions_among(&roles, messages.into_iter()))
     }
 
     /// The open attentions about `scope`: for a subject in a convoy, only the pending messages
@@ -96,11 +103,11 @@ impl MessagePrimitives {
     async fn open_about(&self, namespace: &str, scope: Option<&Subject>) -> Result<Vec<Held>, String> {
         let convoy = match scope {
             Some(Subject::Convoy { convoy } | Subject::Vessel { convoy, .. } | Subject::ConvoyRole { convoy, .. }) => convoy,
-            _ => return Ok(self.held(namespace).await?.into_iter().filter(Held::pending).collect()),
+            _ => return self.held(namespace, None).await,
         };
         let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(Vec::new()) };
         let Some(inbox) = self.convoy_attention_inbox(namespace, convoy, &roles).await? else {
-            return Ok(self.held(namespace).await?.into_iter().filter(Held::pending).collect());
+            return self.held(namespace, None).await;
         };
         Ok(attentions_among(&roles, self.pending_in(&inbox)?.into_iter()))
     }
@@ -153,8 +160,17 @@ fn attentions_among(roles: &FleetRoles, messages: impl Iterator<Item = (String, 
 }
 
 impl MessagePrimitives {
-    async fn about(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<Vec<Held>, String> {
-        Ok(self.held(namespace).await?.into_iter().filter(|held| held.sender == sender && &held.subject == subject).collect())
+    /// The attentions from `sender` about `subject`: pending, and with `answered_since` those
+    /// answered at or after it.
+    async fn about(
+        &self,
+        namespace: &str,
+        sender: Sender,
+        subject: &Subject,
+        answered_since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Held>, String> {
+        let held = self.held(namespace, answered_since).await?;
+        Ok(held.into_iter().filter(|held| held.sender == sender && &held.subject == subject).collect())
     }
 
     /// The engine's cause and person inbox for a fact, read from the records it names.
@@ -238,7 +254,7 @@ impl MessagePrimitives {
 impl Attentions for MessagePrimitives {
     async fn raise(&self, namespace: &str, attention: &attentions::Attention) -> Result<(), String> {
         let (sender, subject) = (attention.fact.sender(), attention.fact.subject());
-        let about = self.about(namespace, sender, &subject).await?;
+        let about = self.about(namespace, sender, &subject, Some(attention.began_at)).await?;
         if about.iter().any(|held| held.answers(attention.began_at)) {
             return Ok(());
         }
@@ -267,11 +283,11 @@ impl Attentions for MessagePrimitives {
     }
 
     async fn clear(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<(), String> {
-        self.withdraw_open(self.about(namespace, sender, subject).await?).await
+        self.withdraw_open(self.about(namespace, sender, subject, None).await?).await
     }
 
     async fn clear_within(&self, namespace: &str, scope: &Subject) -> Result<(), String> {
-        let within = self.held(namespace).await?.into_iter().filter(|held| held.subject.within(scope)).collect();
+        let within = self.held(namespace, None).await?.into_iter().filter(|held| held.subject.within(scope)).collect();
         self.withdraw_open(within).await
     }
 
@@ -294,7 +310,7 @@ impl Attentions for MessagePrimitives {
         subject: &Subject,
         began_at: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
-        let about = self.about(namespace, sender, subject).await?;
+        let about = self.about(namespace, sender, subject, Some(began_at)).await?;
         let latest = about.iter().filter(|held| held.answers(began_at)).max_by_key(|held| (held.message.since(), held.message.name()));
         Ok(latest.map(Held::reason))
     }

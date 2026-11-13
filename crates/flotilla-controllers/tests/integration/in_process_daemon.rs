@@ -9036,7 +9036,15 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     // path. The ordinary admission and workflow continuation use the real daemon.
     let primitives = daemon.message_primitives().expect("the engine Message path");
     let before_receipt = chrono::Utc::now();
-    flotilla_engine_messages_testkit::deliver_turn(&primitives, &first.metadata.name, "idle-coder", before_receipt).await;
+    flotilla_engine_messages_testkit::deliver_turn(
+        &primitives,
+        "flotilla",
+        &first.spec.receiver,
+        &first.metadata.name,
+        "idle-coder",
+        before_receipt,
+    )
+    .await;
     let after_receipt = chrono::Utc::now();
     daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("continue after receiver receipt");
     let status = convoys.get(&launch).await.expect("read resumed convoy").status.expect("convoy status");

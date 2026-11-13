@@ -15,7 +15,6 @@ use flotilla_resources::{
     CONVOY_LABEL, FLEET_DESIGNATION_NAME, ROLE_LABEL,
 };
 use flotilla_schema_sqlite::stream::Service;
-use flotilla_state_machines::machines::message::MessageState;
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 use hegel::{generators as gs, TestCase};
@@ -103,10 +102,11 @@ impl Implementation {
             Implementation::Engine { primitives, .. } => {
                 let sender = format!("fleet:lab/role:{}", fact.sender().role());
                 let pending: Vec<_> = primitives
-                    .messages()
+                    .person_messages(NAMESPACE)
+                    .await
                     .expect("messages")
                     .into_iter()
-                    .filter(|(_, message)| *message.state() == MessageState::Pending && message.spec().sender.as_str() == sender)
+                    .filter(|(_, message)| message.spec().sender.as_str() == sender)
                     .collect();
                 for (_, message) in pending {
                     let about = message.spec().subject().expect("subject").address.clone();
@@ -327,7 +327,13 @@ impl Implementation {
     /// How many records this implementation stores, open or not.
     async fn stored(&self) -> usize {
         match self {
-            Implementation::Engine { primitives, .. } => primitives.messages().expect("messages").len(),
+            Implementation::Engine { primitives, .. } => {
+                let mut stored = 0;
+                for inbox in primitives.person_inboxes(NAMESPACE).await.expect("person inboxes") {
+                    stored += primitives.inbox_messages(&inbox).expect("messages").len();
+                }
+                stored
+            }
         }
     }
 }
@@ -440,13 +446,7 @@ async fn another_homes_attentions_signal_their_readers_when_they_arrive() {
     let seen = b.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open at home b");
     assert_eq!(seen.len(), 1, "home b reads home a's hold");
 
-    let message = a
-        .messages()
-        .expect("messages")
-        .into_iter()
-        .map(|(_, message)| message)
-        .find(|message| *message.state() == MessageState::Pending)
-        .expect("the hold");
+    let (_, message) = a.person_messages(NAMESPACE).await.expect("messages").into_iter().next().expect("the hold");
     a.acknowledge(NAMESPACE, &record_name(message.name()).expect("record")).await.expect("acknowledge at home a");
     follow(&a_store, "home-a", &b_store, &mut cursor);
     signal.try_recv().expect("the acknowledgement's entries signal home b's readers");

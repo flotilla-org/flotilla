@@ -41,7 +41,8 @@ async fn turn_admission_returns_the_canonical_suppressed_message() {
         .expectation(MessageExpectation::Reply)
         .build();
     let first = crew.deliver_turn(&request).await.expect("first admission");
-    held.messages().deliver_turn(&first.message.name, "session").await;
+    let coder = flotilla_resources::crew_role_address("flotilla", &held.launch, "work", "coder");
+    held.messages().deliver_turn(&coder, &first.message.name, "session").await;
     let before = held.convoy(&backend).await.status;
     let staging_calls = probe.calls.load(Ordering::SeqCst);
     let mut successor = request.clone();
@@ -67,7 +68,8 @@ async fn follow_up_reference_releases_from_message_evidence() {
     let pending = coder().await.pending_follow_up.unwrap();
     crew.reconcile_pending_supervisor_turns_once("flotilla").await.unwrap();
     assert_eq!(coder().await.pending_follow_up.as_ref(), Some(&pending));
-    held.messages().deliver_turn(&pending.name, "session").await;
+    let receiver = flotilla_resources::crew_role_address("flotilla", &held.launch, "work", "coder");
+    held.messages().deliver_turn(&receiver, &pending.name, "session").await;
     crew.reconcile_pending_supervisor_turns_once("flotilla").await.unwrap();
     let state = coder().await;
     assert!(state.pending_follow_up.is_none());

@@ -306,15 +306,16 @@ fn view_spelled(
             DropReason::Undeliverable | DropReason::ConsumerUnreachable { .. } => MessagePhase::DeadLettered,
         },
     };
-    // The delivered receiver is the inbox's holder; a receipt's time is the
-    // state's `since` (Awaiting, or Settled straight from delivery).
+    // The delivered receiver is the inbox's holder; a receipt's time is when it was delivered,
+    // kept through settling and dropping.
+    let delivered_at = state.delivered_at().and_then(|at| at.to_datetime()).unwrap_or(since);
     let resolved_receiver = state.receiver().map(|consumer| {
         let (crew_id, session) = lookups.session(consumer).unwrap_or_else(|| (consumer.id.clone(), consumer.id.clone()));
         ResolvedMessageReceiver {
             role_address: Some(receiver.clone()),
             crew_id,
             session,
-            delivered_at: since,
+            delivered_at,
             evidence: format!("Receive on AgentSession {}", consumer.id),
             // The engine path types through cleat outside the transport router (#3545).
             transport: None,

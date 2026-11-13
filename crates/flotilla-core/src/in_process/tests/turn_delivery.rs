@@ -68,7 +68,7 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
         .build();
     daemon.deliver_standing_turn(&request).await.expect("first intent");
     let message = crew_messages(&daemon, "flotilla").await.remove(0);
-    receive_turn(&daemon, &message.metadata.name, "old-session", Utc::now()).await;
+    receive_turn(&daemon, &message.spec.receiver, &message.metadata.name, "old-session", Utc::now()).await;
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let terminals = &probe.engine.terminals;
     let lost = terminals.record("resume-staging-session").name;
@@ -231,7 +231,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             for (cooldown_seconds, desired_rung) in [(1, StallRung::Nudge), (2, StallRung::Operator)] {
                 for nudge in crew_messages(&daemon, "flotilla").await {
                     if nudge.status.as_ref().is_some_and(|status| status.phase.is_waiting()) {
-                        receive_turn(&daemon, &nudge.metadata.name, "resume-staging-session", clock.now()).await;
+                        receive_turn(&daemon, &nudge.spec.receiver, &nudge.metadata.name, "resume-staging-session", clock.now()).await;
                     }
                 }
                 // First observe delivery; only a later idle observation is a reply

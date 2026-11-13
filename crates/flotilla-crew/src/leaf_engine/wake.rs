@@ -264,8 +264,9 @@ impl ReconcilerWake {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
-        let seats = crate::message_port::convoy_seats(namespace, convoy);
-        let messages = primitives.to_receivers(namespace, &seats).await.map_err(|error| error.to_string())?;
+        let seats = flotilla_resources::convoy_crew_seats(namespace, convoy);
+        let named = flotilla_resources::convoy_seat_turns(namespace, convoy);
+        let messages = primitives.seat_messages(namespace, &seats, &named).await.map_err(|error| error.to_string())?;
         self.observe_queued_turns_from_messages(namespace, convoy, sessions, &messages, now).await
     }
 

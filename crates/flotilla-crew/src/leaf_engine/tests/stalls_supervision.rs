@@ -564,8 +564,9 @@ async fn unavailable_governor_tells_the_operator_once() {
         let fact = flotilla_resources::attentions::Fact::Stalled { convoy: case.work.clone(), role: "coder".into() };
         let again = flotilla_resources::attentions::Attention::new(fact, attention.reason.clone(), stall.began_at);
         case.backend.attentions().raise("flotilla", &again).await.expect("raise again");
-        let stored = case.home.messages.primitives().messages().expect("stored messages");
-        let told = stored.iter().filter(|(_, message)| message.spec().sender.to_string().ends_with("/role:stall-judge")).count();
+        // The generic verb lists each message as the engine stores it, its sender an address.
+        let stored = case.backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("stored messages").items;
+        let told = stored.iter().filter(|message| message.spec.sender.ends_with("/role:stall-judge")).count();
         assert_eq!(told, 1, "{unavailable:?}");
     }
 }

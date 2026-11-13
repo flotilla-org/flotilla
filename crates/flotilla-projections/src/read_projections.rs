@@ -86,6 +86,8 @@ pub trait MessageReceiverRead: Send + Sync {
 
 /// Resolve receiver evidence through the messaging resolver at the composition boundary.
 /// The supplied backend is the request snapshot: implementations must read only from it.
+/// On the engine path the evidence carries the messages to `receivers` (old addresses) and each
+/// `named` (receiver, record) message, read through the inboxes' indexes and by key.
 #[async_trait]
 pub trait MessageReceiverLoader: Send + Sync {
     async fn load(
@@ -94,6 +96,8 @@ pub trait MessageReceiverLoader: Send + Sync {
         namespace: &str,
         convoys: Vec<ReadResourceObject<ResourceConvoy>>,
         terminals: Vec<ReadResourceObject<ResourceTerminalSession>>,
+        receivers: &[String],
+        named: &[(String, String)],
     ) -> Result<Box<dyn MessageReceiverRead>, String>;
 }
 
@@ -2123,7 +2127,11 @@ pub async fn convoy_receiver_evidence(
         let defaults = project_ops::read_definition_catalog::<CrewDefaults>(backend, namespace).await?;
         snapshot.insert_definitions(defaults)?;
     }
-    let receivers = loader.load(&snapshot.finish(), namespace, convoys.to_vec(), terminals.items).await?;
+    // The messages this convoy's view reads: those to its crew seats and aliases, and the turns
+    // its status names.
+    let seats = flotilla_resources::convoy_crew_seats(namespace, convoy).into_iter().chain(aliases.iter().cloned()).collect::<Vec<_>>();
+    let named = flotilla_resources::convoy_seat_turns(namespace, convoy);
+    let receivers = loader.load(&snapshot.finish(), namespace, convoys.to_vec(), terminals.items, &seats, &named).await?;
     Ok((receivers, project, aliases))
 }
 

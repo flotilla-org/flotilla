@@ -279,7 +279,13 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .expect("closed dependency watch resubscribes without a timer");
     }
     // The receiver's Messages as the crew reads them.
-    let records = placement_daemon.message_primitives().expect("placement message path").views("flotilla").await.expect("receiver inbox");
+    let records = flotilla_engine_messages_testkit::views(
+        &placement_daemon.message_primitives().expect("placement message path"),
+        &placement_daemon.resource_backend(),
+        "flotilla",
+    )
+    .await
+    .expect("receiver inbox");
     assert_eq!(records.len(), 1);
     let nudge = &records[0].object;
     assert_eq!(nudge.spec.sender, "system:nudge");

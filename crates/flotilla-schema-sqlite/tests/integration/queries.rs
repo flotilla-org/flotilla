@@ -39,6 +39,32 @@ fn collect<K>(store: &mut Store, query: &IndexQuery<K>, limit: u32) -> Vec<Resou
     panic!("paging {} did not end", query.index());
 }
 
+/// Every id of `query` from the top, page by page with `limit`, under the same page rules.
+fn collect_back<K>(store: &mut Store, query: &IndexQuery<K>, limit: u32) -> Vec<ResourceId> {
+    let mut read = store.read().expect("read");
+    let mut ids = Vec::new();
+    let mut before: Option<Cursor> = None;
+    for _ in 0..1_000 {
+        let page = read.page_back(query, before.as_ref(), limit).expect("page back");
+        assert!(page.ids.len() <= limit as usize);
+        if page.next.is_some() {
+            assert_eq!(page.ids.len(), limit as usize, "only a full page has a successor");
+        }
+        ids.extend(page.ids);
+        match page.next {
+            Some(cursor) => before = Some(cursor),
+            None => return ids,
+        }
+    }
+    panic!("paging {} back did not end", query.index());
+}
+
+/// `collect` and `collect_back` both match `want`, the one ascending and the other reversed.
+fn both_ways<K>(store: &mut Store, query: &IndexQuery<K>, limit: u32, want: Vec<ResourceId>, what: &str) {
+    assert_eq!(collect(store, query, limit), want, "{what}");
+    assert_eq!(collect_back(store, query, limit), want.into_iter().rev().collect::<Vec<_>>(), "{what} from the top");
+}
+
 /// Every id the startup scan returns for `home`, page by page.
 fn scan_all<K: Kind>(store: &mut Store, home: &str, limit: u32) -> Vec<ResourceId> {
     let mut read = store.read().expect("read");
@@ -95,20 +121,20 @@ fn check_messages(tc: &TestCase, store: &mut Store, model: &BTreeMap<ResourceId,
         let inbox = project(inbox);
         for label in [MessageLabel::Pending, MessageLabel::Awaiting, MessageLabel::Settled] {
             let want = expected(model, |m| *m.state().label() == label && m.spec().inbox == inbox, |m| m.spec().admitted_seq);
-            assert_eq!(collect(store, &MessageSpec::by_inbox(&inbox, &label), limit), want, "by_inbox {inbox} {label:?}");
+            both_ways(store, &MessageSpec::by_inbox(&inbox, &label), limit, want, &format!("by_inbox {inbox} {label:?}"));
         }
         let want = expected(
             model,
             |m| m.state().delivered_at().is_some() && m.spec().inbox == inbox,
             |m| m.state().delivered_at().map(Timestamp::micros),
         );
-        assert_eq!(collect(store, &MessageSpec::delivered_by_inbox(&inbox), limit), want, "delivered_by_inbox {inbox}");
+        both_ways(store, &MessageSpec::delivered_by_inbox(&inbox), limit, want, &format!("delivered_by_inbox {inbox}"));
         let settled = |m: &Resource<Message>| matches!(m.state(), MessageState::Settled { .. });
         let want = expected(model, |m| settled(m) && m.spec().inbox == inbox, |m| m.since().micros());
-        assert_eq!(collect(store, &MessageSpec::settled_by_inbox(&inbox), limit), want, "settled_by_inbox {inbox}");
+        both_ways(store, &MessageSpec::settled_by_inbox(&inbox), limit, want, &format!("settled_by_inbox {inbox}"));
     }
     let want = expected(model, |m| open(m) && m.spec().deadline.is_some(), |m| m.spec().deadline.map(Timestamp::micros));
-    assert_eq!(collect(store, &MessageSpec::deadline(), limit), want, "deadline");
+    both_ways(store, &MessageSpec::deadline(), limit, want, "deadline");
     let all: Vec<ResourceId> = model.keys().copied().collect();
     assert_eq!(scan_all::<Resource<Message>>(store, LOCAL, limit), all, "scan");
     assert_eq!(scan_all::<Resource<Message>>(store, "elsewhere", limit), Vec::<ResourceId>::new());
@@ -410,6 +436,30 @@ fn insert_messages(store: &mut Store, count: usize, value: impl Fn(usize) -> Res
         write.insert(&format!("m{n}"), &value(n), &origin()).expect("insert");
     }
     write.commit().expect("commit");
+}
+
+// Behaviour: rows tied on a Timestamp order (messages delivered in the same microsecond) continue by
+// id across a page boundary both ways: every row once, none skipped at the tie, ascending from the
+// bottom and descending from the top.
+#[test]
+fn rows_tied_on_delivered_at_page_across_the_boundary_both_ways() {
+    let mut store = store();
+    let at = |n: usize| Timestamp(if (1..=4).contains(&n) { 50 } else { n as i64 * 10 });
+    insert_messages(&mut store, 6, |n| {
+        message::sample().with_state(State::new(
+            MessageState::Awaiting { receiver: message::agent(&format!("s{n}"), LOCAL), delivered_at: at(n) },
+            at(n),
+        ))
+    });
+    let mut read = store.read().expect("read");
+    let ids: Vec<ResourceId> =
+        (0..6).map(|n| read.resolve(Resource::<Message>::CODE, &format!("m{n}"), LOCAL).expect("resolve").expect("present")).collect();
+    drop(read);
+    // m0 at 0, m1..m4 tied at 50, m5 at 50 too (5 * 10): five rows tied, ordered by id.
+    let want = ids.clone();
+    for limit in [1, 2, 3] {
+        both_ways(&mut store, &MessageSpec::delivered_by_inbox(&project("inbox")), limit, want.clone(), &format!("tied, limit {limit}"));
+    }
 }
 
 // Behaviour (DESIGN queries): an `eq` argument this store has never seen (an unknown inbox, an

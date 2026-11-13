@@ -30,6 +30,5 @@ async fn a_placeholder_identity_is_not_a_held_message() {
     assert!(home.service().homes().contains(&"home-b".to_owned()), "home A follows home B");
 
     let primitives = home.primitives();
-    assert_eq!(primitives.locate("request").expect("scan"), None, "a placeholder found by scan is not held");
     assert_eq!(primitives.locate_in(&inbox, "request").expect("exact"), None, "a placeholder found by identity is not held");
 }

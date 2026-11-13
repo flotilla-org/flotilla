@@ -1453,16 +1453,20 @@ mod tests {
     async fn refusals_past_the_limit_wait_for_events_with_one_attention() {
         let (controller, admission, clock) = fixture().await;
         let messages = admission._messages.clone().expect("engine messages");
-        let refusal_messages = || {
-            messages
-                .primitives()
-                .messages()
-                .expect("messages")
-                .into_iter()
-                .filter(|(_, message)| {
-                    message.spec().subject().is_some_and(|subject| subject.address.as_str() == "project:project/role:standing")
-                })
-                .count()
+        let refusal_messages = || async {
+            let primitives = messages.primitives();
+            let mut count = 0;
+            for inbox in primitives.person_inboxes("test").await.expect("person inboxes") {
+                count += primitives
+                    .inbox_messages(&inbox)
+                    .expect("messages")
+                    .into_iter()
+                    .filter(|(_, message)| {
+                        message.spec().subject().is_some_and(|subject| subject.address.as_str() == "project:project/role:standing")
+                    })
+                    .count();
+            }
+            count
         };
         let pass = || controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead);
         admission.refused.store(true, Ordering::SeqCst);
@@ -1471,7 +1475,7 @@ mod tests {
             clock.advance(ChronoDuration::minutes(16));
         }
         assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT);
-        assert_eq!(refusal_messages(), 1, "the limit tells a person");
+        assert_eq!(refusal_messages().await, 1, "the limit tells a person");
         let role = standing(&controller).await;
         assert_eq!(role.next_attempt, None, "past the limit nothing is due on time");
 
@@ -1485,7 +1489,7 @@ mod tests {
         assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 1);
         assert!(pass().await.expect("waits again").is_empty());
         assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 1);
-        assert_eq!(refusal_messages(), 1, "repeated refusals with the same hashes are one message");
+        assert_eq!(refusal_messages().await, 1, "repeated refusals with the same hashes are one message");
 
         // A person's acknowledgement admits once more; the refusal after it tells them again.
         let (_, waiting) = messages
@@ -1503,7 +1507,7 @@ mod tests {
         assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 2);
         assert!(pass().await.expect("waits after the answered attempt").is_empty());
         assert_eq!(admission.prepares.load(Ordering::SeqCst), LOCAL_RETRY_LIMIT + 2);
-        assert_eq!(refusal_messages(), 2);
+        assert_eq!(refusal_messages().await, 2);
 
         // A changed declaration withdraws the attention and tries again with a fresh count.
         let ensures = admission.backend.using::<ConvoyEnsure>("test");

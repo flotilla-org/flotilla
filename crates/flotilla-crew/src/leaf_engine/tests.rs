@@ -471,7 +471,7 @@ async fn message_to_coder(case: &Case, name: &str, body: &str) {
 
 /// Records Message `name` delivered to the coder's session at `at`, as its delivery does.
 async fn deliver_to_coder(case: &Case, name: &str, at: DateTime<Utc>) {
-    case.home.deliver_turn_at(name, &case.launch("resumed-coder"), at).await;
+    case.home.deliver_turn_at(&case.coder(), name, &case.launch("resumed-coder"), at).await;
 }
 
 async fn idle_nudge_scenario() -> Case {

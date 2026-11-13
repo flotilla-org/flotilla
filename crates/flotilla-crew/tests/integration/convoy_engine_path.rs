@@ -544,19 +544,6 @@ struct Turns {
 
 #[async_trait]
 impl flotilla_messaging::EngineMessages for Turns {
-    async fn view(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
-        unreachable!("the convoy reconciler reads no message views")
-    }
-    async fn views(
-        &self,
-        _: &str,
-    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
-        unreachable!("the convoy reconciler reads no message views")
-    }
     async fn view_to(
         &self,
         _: &str,
@@ -573,10 +560,18 @@ impl flotilla_messaging::EngineMessages for Turns {
     ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
-    async fn to_receivers(
+    async fn open_to(
         &self,
         _: &str,
         _: &[String],
+    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn seat_messages(
+        &self,
+        _: &str,
+        _: &[String],
+        _: &[(String, String)],
     ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
@@ -605,7 +600,7 @@ impl flotilla_messaging::EngineMessages for Turns {
     async fn resolve_in_reply_to(&self, _: &str, _: &flotilla_resources::MessageSpec) -> flotilla_messaging::MessageResolution {
         unreachable!("the convoy reconciler links no replies")
     }
-    async fn withdraw(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+    async fn withdraw(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), String> {
         unreachable!("the convoy reconciler withdraws nothing")
     }
     fn home(&self) -> String {

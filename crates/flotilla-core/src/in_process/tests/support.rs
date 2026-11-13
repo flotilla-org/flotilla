@@ -961,13 +961,22 @@ pub(in crate::in_process) async fn crew_messages(
     daemon: &InProcessDaemon,
     namespace: &str,
 ) -> Vec<ResourceObject<flotilla_resources::Message>> {
-    let views = install_engine_messages(daemon).views(namespace).await.expect("crew Message views");
+    let primitives = install_engine_messages(daemon);
+    let views =
+        flotilla_engine_messages_testkit::views(&primitives, &daemon.resource_backend, namespace).await.expect("crew Message views");
     views.into_iter().map(|read| read.object).collect()
 }
 
-/// Records the Message `record` as a turn crew `session` received `at`, through `daemon`'s inbox.
-pub(in crate::in_process) async fn receive_turn(daemon: &InProcessDaemon, record: &str, session: &str, at: chrono::DateTime<Utc>) {
-    flotilla_engine_messages_testkit::deliver_turn(&install_engine_messages(daemon), record, session, at).await;
+/// Records the Message `record` to `receiver` as a turn crew `session` received `at`, through
+/// `daemon`'s inbox.
+pub(in crate::in_process) async fn receive_turn(
+    daemon: &InProcessDaemon,
+    receiver: &str,
+    record: &str,
+    session: &str,
+    at: chrono::DateTime<Utc>,
+) {
+    flotilla_engine_messages_testkit::deliver_turn(&install_engine_messages(daemon), "flotilla", receiver, record, session, at).await;
 }
 
 /// Declare and designate the fleet whose roles the engine's Message delivery reads.

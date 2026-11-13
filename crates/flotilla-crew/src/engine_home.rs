@@ -69,11 +69,11 @@ impl EngineHome {
         path
     }
 
-    /// Records the message `record` names as a turn `session` confirmed at `at`, as its delivery
-    /// does.
-    pub async fn deliver_turn_at(&self, record: &str, session: &str, at: DateTime<Utc>) {
+    /// Records the message `record` sent to `receiver` as a turn `session` confirmed at `at`, as
+    /// its delivery does.
+    pub async fn deliver_turn_at(&self, receiver: &str, record: &str, session: &str, at: DateTime<Utc>) {
         *self.message_clock.pinned.lock().expect("message clock") = Some(at);
-        self.messages.deliver_turn(record, session).await;
+        self.messages.deliver_turn(receiver, record, session).await;
         *self.message_clock.pinned.lock().expect("message clock") = None;
     }
 

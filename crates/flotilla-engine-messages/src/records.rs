@@ -71,13 +71,15 @@ impl EngineRecords for MessageRecords {
         self.primitives.home().to_owned()
     }
 
+    /// By its full engine address, a keyed read; by a bare record name, which names no inbox,
+    /// through the listing.
     async fn get(&self, _kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        let view = self.primitives.stored_view(&self.namespace(), name).map_err(|error| error.to_string())?;
+        let view = self.primitives.verb_get(&self.namespace(), name).map_err(|error| error.to_string())?;
         view.map(|read| self.object(read)).transpose()
     }
 
     async fn list(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
-        let views = self.primitives.stored_views(&self.namespace()).map_err(|error| error.to_string())?;
+        let views = self.primitives.verb_listing(&self.namespace()).map_err(|error| error.to_string())?;
         views.into_iter().map(|read| self.object(read)).collect()
     }
 
@@ -101,8 +103,8 @@ impl EngineRecords for MessageRecords {
     ) -> Result<EngineObject, String> {
         let namespace = self.namespace();
         let spec: OldSpec = serde_json::from_value(spec).map_err(|error| format!("Message spec: {error}"))?;
-        self.primitives.admit(&namespace, name, &spec).await.map_err(|error| error.to_string())?;
-        let view = self.primitives.stored_view(&namespace, name).map_err(|error| error.to_string())?;
+        let (id, _) = self.primitives.admit_at(&namespace, name, &spec).await.map_err(|error| error.to_string())?;
+        let view = self.primitives.verb_get(&namespace, &id).map_err(|error| error.to_string())?;
         self.object(view.ok_or_else(|| format!("Message {name} is not readable after its admission"))?)
     }
 

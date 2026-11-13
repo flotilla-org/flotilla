@@ -229,10 +229,19 @@ impl InProcessDaemon {
                 }
             }
             // A person's receipt is written at the message's home (#3938).
-            A::PersonAcknowledge { message, .. } | A::PersonAnswer { message, .. } => {
-                let located =
-                    self.message_primitives().map(|engine| engine.locate(message)).transpose().map_err(TargetError::RecordHome)?;
-                match located.flatten() {
+            // The message is found by its name in each person role's inbox.
+            A::PersonAcknowledge { namespace, message, .. } | A::PersonAnswer { namespace, message, .. } => {
+                let located = match self.message_primitives() {
+                    Some(engine) => {
+                        let namespace = match namespace {
+                            Some(namespace) => namespace.clone(),
+                            None => self.provisioning_namespace().await,
+                        };
+                        off_frame(|| engine.locate_for_person(&namespace, message)).await.map_err(TargetError::RecordHome)?
+                    }
+                    None => None,
+                };
+                match located {
                     Some((_, home)) if home != self.node_id().as_str() => TargetHost::Node(NodeId::new(home)),
                     _ => {
                         reason = TargetReason::LocalMutation;

@@ -20,17 +20,6 @@ pub enum MessageResolution {
 /// the old store's, unchanged.
 #[async_trait]
 pub trait EngineMessages: Send + Sync {
-    /// One message by its old record name, local or replicated.
-    async fn view(
-        &self,
-        namespace: &str,
-        record: &str,
-    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
-    /// Every message in this home's replica.
-    async fn views(
-        &self,
-        namespace: &str,
-    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
     /// The message `record` in `receiver`'s inbox (an old address), local or replicated.
     async fn view_to(
         &self,
@@ -45,11 +34,21 @@ pub trait EngineMessages: Send + Sync {
         intent: &flotilla_resources::MessageSpec,
         record: &str,
     ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
-    /// The messages to `receivers` (old addresses), in any state, local or replicated.
-    async fn to_receivers(
+    /// The open messages to `receivers` (old addresses), local or replicated.
+    async fn open_to(
         &self,
         namespace: &str,
         receivers: &[String],
+    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
+    /// What the stall judge reads of crew seats' inboxes, local or replicated: for each of
+    /// `receivers` (old crew addresses), its open messages, the last one admitted among those
+    /// settled and the one delivered last and not dropped since; then each `named` (receiver,
+    /// record) message by its exact identity.
+    async fn seat_messages(
+        &self,
+        namespace: &str,
+        receivers: &[String],
+        named: &[(String, String)],
     ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
     /// The messages to `receivers` (old addresses) still waiting for delivery, local or replicated.
     async fn pending_to(
@@ -77,8 +76,9 @@ pub trait EngineMessages: Send + Sync {
     /// reads it: in this home's replica, or at its home on a miss. With no
     /// `in_reply_to` it is absent.
     async fn resolve_in_reply_to(&self, namespace: &str, intent: &flotilla_resources::MessageSpec) -> MessageResolution;
-    /// An operator withdraws a queued message homed here, on the convoy's authority.
-    async fn withdraw(&self, namespace: &str, record: &str, convoy: &str) -> Result<(), String>;
+    /// An operator withdraws a queued message to `receiver` (an old address) homed here, on the
+    /// convoy's authority.
+    async fn withdraw(&self, namespace: &str, receiver: &str, record: &str, convoy: &str) -> Result<(), String>;
     /// The home this path admits at: this daemon's.
     fn home(&self) -> String;
     /// Records the sender's half of a send expecting a reply or an outcome,

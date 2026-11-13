@@ -99,7 +99,7 @@ This is an ownership model, not a measured whole-process RSS guarantee.
 |---|---|---|
 | enqueue | resident binding/clock and read set; transaction-assigned admission | source sequence for opaque name; one create transaction; no pre-read for admission |
 | reply/supersede/dead-letter existence | resident identity or source resolve | resolve only, never terminal body/history |
-| pending | complete cached inbox order, or declared `pending_by_inbox` fallback | cache: one keyed load per absent item; fallback: one home-scoped indexed resource above the last admission per pull; indexed receipts for cold values |
+| pending | complete cached inbox order, or declared `by_inbox` (Pending) fallback | cache: one keyed load per absent item; fallback: one home-scoped indexed resource above the last admission per pull; indexed receipts for cold values |
 | receive/deliver/settle/drop | typed cached value and receipts/evidence | keyed `resolve` + `load`, receipt `about` if needed; no Settled/Dropped or source-history read for steady-state delivery |
 | bind | same Pending cache/fallback; inspect candidates until receipt hit | one value read + receipt query per absent candidate; linear backlog under writer, then receipt wait outside lock (#3491) |
 | unbind | resident binding | no store read |

@@ -123,6 +123,9 @@ fn the_enumeration_covers_every_kind_and_index() {
         "index message_delivered_by_inbox after",
         "index message_settled_by_inbox first",
         "index message_settled_by_inbox after",
+        "index message_delivered_by_inbox last",
+        "index message_delivered_by_inbox before",
+        "index message_deadline last",
         "index terminal_session_by_vessel integer keys",
         "index referral_by_session integer keys",
         "index vessel_by_launch integer keys",
@@ -153,7 +156,7 @@ fn the_enumeration_covers_every_kind_and_index() {
     ] {
         assert!(labels.contains(&expected), "missing {expected}");
     }
-    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 19 + 2 * 5);
+    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 4 * 19 + 2 * 5);
     assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 11);
     assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(

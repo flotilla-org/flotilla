@@ -355,8 +355,9 @@ pub async fn observe_card(
     // Pending notices supersede one another. Promote only snapshots the inbox delivered.
     let mut retired = Vec::new();
     let pending = observation.pending.clone();
+    let receiver = if pending.is_empty() { String::new() } else { card_receiver(backend, namespace, session).await? };
     for (revision, (name, snapshot)) in &pending {
-        let message = match message_by_name(namespace, name, tracker).await {
+        let message = match message_by_name(namespace, &receiver, name, tracker).await {
             Ok(message) => message,
             Err(ResourceError::NotFound { .. }) => {
                 // An audit record can be reaped before the next capability change.
@@ -397,10 +398,11 @@ pub async fn observe_card(
 /// key's digest, the same revision of the same session's card.
 async fn recover_published_revision(
     namespace: &str,
+    receiver: &str,
     name: &str,
     tracker: &CapabilityCardTracker,
 ) -> Result<Option<ResourceObject<Message>>, String> {
-    match message_by_name(namespace, name, tracker).await {
+    match message_by_name(namespace, receiver, name, tracker).await {
         Ok(existing) => Ok(Some(existing)),
         Err(ResourceError::NotFound { .. }) => Ok(None),
         Err(error) => Err(error.to_string()),
@@ -423,17 +425,7 @@ async fn publish_card_revision(
     CardRevision { revision, card, body, supersedes }: CardRevision<'_>,
     tracker: &CapabilityCardTracker,
 ) -> Result<(String, String), String> {
-    let TerminalSessionSource::Agent { context, .. } = &session.spec.source else {
-        return Err("capability Messages require an agent session".into());
-    };
-    let convoy = backend.including_replicas::<Convoy>(namespace).get(&context.convoy).await.map_err(|error| error.to_string())?.object;
-    let vessel = backend.including_replicas::<Vessel>(namespace).get(&context.vessel_ref).await.map_err(|error| error.to_string())?.object;
-    let receiver = flotilla_resources::crew_role_address(
-        convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-        &context.convoy,
-        &vessel.spec.vessel_name,
-        &session.spec.role,
-    );
+    let receiver = card_receiver(backend, namespace, session).await?;
     let sender = "system:capabilities";
     let name = message_record_name(&receiver, sender, &format!("{}:capabilities@{revision}", session.metadata.name));
     let subject = MessageReference::ControlRecord {
@@ -441,7 +433,7 @@ async fn publish_card_revision(
         revision: format!("capabilities@{revision}"),
     };
     let supersedes = match supersedes {
-        Some(name) => match message_by_name(namespace, &name, tracker).await {
+        Some(name) => match message_by_name(namespace, &receiver, &name, tracker).await {
             Ok(_) => Some(name),
             Err(ResourceError::NotFound { .. }) => None, // Reaped audit data cannot be a predecessor.
             Err(error) => return Err(error.to_string()),
@@ -450,14 +442,14 @@ async fn publish_card_revision(
     };
     let requested = MessageSpec::builder()
         .sender(sender.into())
-        .receiver(receiver)
+        .receiver(receiver.clone())
         .relation(MessageRelation::System)
         .body(body.to_string())
         .references(vec![subject.clone()])
         .subject(subject)
         .maybe_supersedes(supersedes)
         .build();
-    let recovered = recover_published_revision(namespace, &name, tracker).await?;
+    let recovered = recover_published_revision(namespace, &receiver, &name, tracker).await?;
     let digest = recovered
         .as_ref()
         .and_then(|message| message.metadata.annotations.get(DIGEST_ANNOTATION))
@@ -470,9 +462,29 @@ async fn publish_card_revision(
     Ok((name, digest))
 }
 
-/// A capability Message by name.
-async fn message_by_name(namespace: &str, name: &str, tracker: &CapabilityCardTracker) -> Result<ResourceObject<Message>, ResourceError> {
-    tracker.primitives()?.view(namespace, name).await?.map(|view| view.object).ok_or_else(|| ResourceError::not_found(name))
+/// The crew address a session's capability Messages are sent to: its role in its convoy's vessel.
+async fn card_receiver(backend: &ResourceBackend, namespace: &str, session: &ResourceObject<TerminalSession>) -> Result<String, String> {
+    let TerminalSessionSource::Agent { context, .. } = &session.spec.source else {
+        return Err("capability Messages require an agent session".into());
+    };
+    let convoy = backend.including_replicas::<Convoy>(namespace).get(&context.convoy).await.map_err(|error| error.to_string())?.object;
+    let vessel = backend.including_replicas::<Vessel>(namespace).get(&context.vessel_ref).await.map_err(|error| error.to_string())?.object;
+    Ok(flotilla_resources::crew_role_address(
+        convoy.spec.project_ref.as_deref().unwrap_or(namespace),
+        &context.convoy,
+        &vessel.spec.vessel_name,
+        &session.spec.role,
+    ))
+}
+
+/// A capability Message to `receiver` by name.
+async fn message_by_name(
+    namespace: &str,
+    receiver: &str,
+    name: &str,
+    tracker: &CapabilityCardTracker,
+) -> Result<ResourceObject<Message>, ResourceError> {
+    tracker.primitives()?.view_to(namespace, receiver, name).await?.map(|view| view.object).ok_or_else(|| ResourceError::not_found(name))
 }
 
 /// Advisory launch observation: callers can warn and still launch with the card.

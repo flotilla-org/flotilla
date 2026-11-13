@@ -101,18 +101,18 @@ impl EngineCrew {
         MessageDelivery::new(Arc::clone(&self.state), Arc::clone(&self.primitives), NAMESPACE.into(), RuntimeHealth::default())
     }
 
+    /// The crew member turns are sent to.
+    fn receiver(&self) -> String {
+        flotilla_resources::crew_role_address(NAMESPACE, &self.convoy, "work", "coder")
+    }
+
     async fn send(&self, name: &str, sender: &str, relation: MessageRelation, body: &str) {
-        let intent = MessageSpec::builder()
-            .sender(sender.into())
-            .receiver(flotilla_resources::crew_role_address(NAMESPACE, &self.convoy, "work", "coder"))
-            .relation(relation)
-            .body(body.into())
-            .build();
+        let intent = MessageSpec::builder().sender(sender.into()).receiver(self.receiver()).relation(relation).body(body.into()).build();
         self.daemon.publish_message(NAMESPACE, name, &intent).await.expect("send the turn");
     }
 
     async fn phase(&self, name: &str) -> Option<MessagePhase> {
-        let message = self.primitives.view(NAMESPACE, name).await.expect("message view")?;
+        let message = self.primitives.view_to(NAMESPACE, &self.receiver(), name).await.expect("message view")?;
         message.object.status.as_ref().map(|status| status.phase)
     }
 
@@ -242,7 +242,7 @@ async fn a_sessions_pending_messages_are_typed_as_one_turn() {
     // Each message framed as the engine holds it: a person sends as the role they hold (#3938).
     let mut expected = Vec::new();
     for (name, ..) in &sent {
-        let view = crew.primitives.view(NAMESPACE, name).await.expect("message view").expect("admitted");
+        let view = crew.primitives.view_to(NAMESPACE, &crew.receiver(), name).await.expect("message view").expect("admitted");
         expected.push(flotilla_messaging::frame_message(&view.object.spec));
     }
     assert_eq!(inputs[0], expected.join("\n\n"));

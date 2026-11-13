@@ -5102,8 +5102,9 @@ impl InProcessDaemon {
         let roles = primitives.roles(namespace).await?;
         let records = primitives.records(namespace).await.map_err(|error| error.to_string())?;
         let conversion = flotilla_engine_messages::convert::Conversion { roles: &roles, forges: &records.forges, records: &*records };
+        let inbox = conversion.sender_of(reply).map_err(|error| format!("the replying role has no inbox: {error}"))?;
         let original = primitives
-            .read_view(namespace, original_id, conversion.sender_of(reply).ok())
+            .read_view(namespace, original_id, inbox)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("replied-to message `{original_id}` is neither in this home's replica nor at a reachable home"))?;

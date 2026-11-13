@@ -6,7 +6,7 @@ use flotilla_schema::{Address, Cause, Change as StoredChange, Decoder, Element, 
 use flotilla_state_machines::{
     machines::{
         consumer::Receiver,
-        message::{Message, MessageSpec, MessageState, Receipts},
+        message::{Message, MessageLabel, MessageSpec, MessageState, Receipts},
     },
     Ref, Resource, Source,
 };
@@ -76,8 +76,9 @@ impl InboxLog for MessageLog {
         let mut store = self.store().lock().expect("store writer");
         let mut read = store.read().map_err(storage)?;
         let after = i64::try_from(after).map_err(storage)?;
-        let keys =
-            read.integer_index_keys(&MessageSpec::pending_by_inbox(inbox), self.home(), after, limit.clamp(1, 32)).map_err(storage)?;
+        let keys = read
+            .integer_index_keys(&MessageSpec::by_inbox(inbox, &MessageLabel::Pending), self.home(), after, limit.clamp(1, 32))
+            .map_err(storage)?;
         keys.into_iter()
             .map(|(id, seq)| {
                 let (identity, _) = read.identity(id).map_err(storage)?.ok_or_else(|| Error::Storage("Pending identity missing".into()))?;
@@ -89,7 +90,8 @@ impl InboxLog for MessageLog {
         let mut store = self.store().lock().expect("store writer");
         let mut read = store.read().map_err(storage)?;
         let after = i64::try_from(after).map_err(storage)?;
-        let keys = read.integer_index_keys(&MessageSpec::pending_by_inbox(inbox), self.home(), after, 1).map_err(storage)?;
+        let keys =
+            read.integer_index_keys(&MessageSpec::by_inbox(inbox, &MessageLabel::Pending), self.home(), after, 1).map_err(storage)?;
         let Some((id, _)) = keys.first() else { return Ok(None) };
         Ok(read.load::<Resource<Message>>(*id).map_err(storage)?.map(|loaded| loaded.value))
     }

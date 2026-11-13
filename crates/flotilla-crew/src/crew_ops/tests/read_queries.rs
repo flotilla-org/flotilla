@@ -23,7 +23,8 @@ fn command_context(held: &Held) -> CrewCommandContext {
 async fn interactive_crew_reads_ignore_unrelated_resources() {
     use flotilla_store_testkit::{assert_flat_reads, ReadBudget, ReadOperation, ReadSnapshot};
     async fn request_reads(request: &str, unrelated: u64) -> ReadSnapshot {
-        let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
+        // A convoy always belongs to a declared Project.
+        let (crew, backend, _probe, held) = project_fixture(CrewWorkPhase::Working).await;
         for n in 0..unrelated {
             let name = format!("unrelated-{n}");
             held.engine
@@ -124,11 +125,13 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
         (
             "orientation",
             // The open credential attentions about the vessel: the convoy, for the inbox its
-            // attentions go to, and the FleetDesignation naming the roles that send them.
+            // attentions go to, and the FleetDesignation naming the roles that send them. The
+            // convoy's Project is read twice: for the orientation and for that inbox.
             ReadBudget::new()
                 .objects("Convoy", Get, 2, 2)
                 .calls("Demand", Query, 1)
                 .objects("FleetDesignation", Get, 2, 1)
+                .objects("Project", Get, 4, 2)
                 .objects("TerminalSession", Query, 2, 1)
                 .objects("Vessel", Get, 2, 2),
         ),

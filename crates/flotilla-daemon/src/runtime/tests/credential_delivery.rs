@@ -2,7 +2,6 @@ use super::*;
 use crate::testkits::engine::{engine, runtime_terminals};
 use flotilla_engine_messages::view::record_name;
 use flotilla_resources::attentions::Subject;
-use flotilla_state_machines::machines::message::MessageState;
 use flotilla_store_memory::InMemoryBackend;
 
 #[tokio::test]
@@ -58,10 +57,8 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     // A person acknowledges every open attention: each is a Message pending at this home.
     let primitives = daemon.message_primitives().expect("message path");
     let acknowledge_all = || async {
-        for (_, message) in primitives.messages().expect("messages") {
-            if *message.state() == MessageState::Pending {
-                primitives.acknowledge(NAMESPACE, &record_name(message.name()).expect("record")).await.expect("acknowledge attention");
-            }
+        for (_, message) in primitives.person_messages(NAMESPACE).await.expect("messages") {
+            primitives.acknowledge(NAMESPACE, &record_name(message.name()).expect("record")).await.expect("acknowledge attention");
         }
     };
     reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[transient])

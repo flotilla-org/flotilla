@@ -71,6 +71,15 @@ impl Ctx<'_> {
     }
 
     pub(crate) fn page<K>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
+        self.page_toward(query, after, limit, false)
+    }
+
+    pub(crate) fn page_back<K>(&mut self, query: &IndexQuery<K>, before: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
+        self.page_toward(query, before, limit, true)
+    }
+
+    /// One page of `query`'s index beyond `after`: ascending, or descending when `down`.
+    fn page_toward<K>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32, down: bool) -> Result<Page, StoreError> {
         let kind = query.kind();
         let limit = page_limit(limit)?;
         let eq = query.eq()?;
@@ -102,7 +111,12 @@ impl Ctx<'_> {
         // One row beyond the limit tells whether another page follows.
         params.push(SqlValue::Integer(limit + 1));
         let index = &self.sql(kind)?.indexes[query.index()];
-        let statement = if after.is_some() { &index.after } else { &index.first };
+        let statement = match (down, after.is_some()) {
+            (false, false) => &index.first,
+            (false, true) => &index.after,
+            (true, false) => &index.last,
+            (true, true) => &index.before,
+        };
         let mut rows: Vec<(ResourceId, Vec<SqlValue>)> = self
             .conn
             .prepare_cached(statement)?

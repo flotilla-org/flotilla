@@ -284,9 +284,9 @@ pub use message::{
     MessageStatusPatch, MessageSubmission, OperatorMessageDelivery, ResolvedMessageReceiver, STALL_KIND,
 };
 pub use message_inbox::{
-    convoy_of_segment, convoy_segment, crew_role_address, message_expectation_open, message_supersedes, parse_crew_role_address,
-    parse_topic_address, qualify_message_address, qualify_message_spec, validate_message_address, MessageAddressContext,
-    ROLE_ADDRESS_ANNOTATION,
+    convoy_crew_seats, convoy_of_segment, convoy_seat_turns, convoy_segment, crew_role_address, message_expectation_open,
+    message_supersedes, parse_crew_role_address, parse_topic_address, qualify_message_address, qualify_message_spec,
+    validate_message_address, MessageAddressContext, ROLE_ADDRESS_ANNOTATION,
 };
 pub use message_migration::{legacy_message_sender, legacy_message_spec};
 pub use workflow_template::{

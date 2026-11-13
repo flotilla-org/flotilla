@@ -18,6 +18,7 @@ use flotilla_resources::{
     Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation,
     MessageSpec, MessageStatus, ObjectMeta, RepositorySpec, ResolvedMessageReceiver, ResourceObject,
 };
+use flotilla_schema::Timestamp;
 use flotilla_state_machines::machines::{
     consumer::{ConsumerKind, Receiver},
     message::{DropReason, MessageState},
@@ -66,6 +67,11 @@ fn delivered() -> ResolvedMessageReceiver {
         evidence: "turn confirmed".into(),
         transport: None,
     }
+}
+
+/// When [`delivered`] says the message was delivered.
+fn delivered_at() -> Timestamp {
+    Timestamp::from_datetime(&at(20))
 }
 
 fn status(phase: MessagePhase, sequence: Option<u64>, receiver: Option<ResolvedMessageReceiver>) -> MessageStatus {
@@ -159,7 +165,24 @@ fn delivered_imports_as_awaiting_its_session() {
         spec(RECEIVER, "system:nudge", MessageExpectation::Reply),
         status(MessagePhase::Delivered, Some(1), Some(delivered())),
     )];
-    assert_eq!(*imported(&records, "message-a").resource.state(), MessageState::Awaiting { receiver: session_receiver() });
+    assert_eq!(
+        *imported(&records, "message-a").resource.state(),
+        MessageState::Awaiting { receiver: session_receiver(), delivered_at: delivered_at() }
+    );
+}
+
+// Behaviour: a message delivered and then settled keeps when it was delivered, from its
+// receiver's receipt, apart from when it settled.
+#[test]
+fn delivered_then_settled_keeps_when_it_was_delivered() {
+    let records = [record(
+        "message-a",
+        spec(RECEIVER, "system:nudge", MessageExpectation::Reply),
+        status(MessagePhase::Answered, Some(1), Some(delivered())),
+    )];
+    let message = imported(&records, "message-a").resource;
+    assert_eq!(*message.state(), MessageState::Settled { receiver: Some(session_receiver()), delivered_at: Some(delivered_at()) });
+    assert_eq!(message.since(), Timestamp::from_datetime(&at(30)), "settled when its status says, after the delivery");
 }
 
 // Behaviour: Satisfied, Answered and OutcomeMet become Settled, keeping their receiver.
@@ -173,7 +196,7 @@ fn settled_phases_import_as_settled() {
         let records = [record("message-a", spec(RECEIVER, "system:turn-rules", expectation), status(phase, Some(1), Some(delivered())))];
         assert_eq!(
             *imported(&records, "message-a").resource.state(),
-            MessageState::Settled { receiver: Some(session_receiver()) },
+            MessageState::Settled { receiver: Some(session_receiver()), delivered_at: Some(delivered_at()) },
             "{phase:?}"
         );
     }
@@ -187,7 +210,7 @@ fn expired_imports_as_dropped_expired() {
     let records = [record("message-a", expiring, status(MessagePhase::Expired, Some(1), None))];
     assert_eq!(
         *imported(&records, "message-a").resource.state(),
-        MessageState::Dropped { reason: DropReason::Expired, receiver: None, watermark: None }
+        MessageState::Dropped { reason: DropReason::Expired, receiver: None, delivered_at: None, watermark: None }
     );
 }
 
@@ -207,7 +230,7 @@ fn superseded_imports_as_dropped_by_its_successor() {
     let by = format!("{INBOX}/message:message-new").parse().expect("successor address");
     assert_eq!(
         *imported(&records, "message-old").resource.state(),
-        MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: None, watermark: None }
+        MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: None, delivered_at: None, watermark: None }
     );
     let successor = imported(&records, "message-new");
     assert_eq!(
@@ -226,7 +249,7 @@ fn dead_lettered_imports_as_dropped_undeliverable() {
     )];
     assert_eq!(
         *imported(&records, "message-a").resource.state(),
-        MessageState::Dropped { reason: DropReason::Undeliverable, receiver: None, watermark: None }
+        MessageState::Dropped { reason: DropReason::Undeliverable, receiver: None, delivered_at: None, watermark: None }
     );
 }
 
@@ -267,7 +290,10 @@ fn delivered_expecting_nothing_imports_as_settled() {
         spec(RECEIVER, "system:turn-rules", MessageExpectation::None),
         status(MessagePhase::Delivered, Some(1), Some(delivered())),
     )];
-    assert_eq!(*imported(&records, "message-a").resource.state(), MessageState::Settled { receiver: Some(session_receiver()) });
+    assert_eq!(
+        *imported(&records, "message-a").resource.state(),
+        MessageState::Settled { receiver: Some(session_receiver()), delivered_at: Some(delivered_at()) }
+    );
 }
 
 fn settled(record: &ResourceObject<Message>) -> bool {

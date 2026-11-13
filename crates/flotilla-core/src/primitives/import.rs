@@ -184,15 +184,22 @@ fn convert(
         Ok(Receiver { kind: ConsumerKind::AgentSession, id, host })
     };
     let kept = || status.resolved_receiver.as_ref().map(|_| receiver()).transpose();
+    // The receiver's receipt carries when the message was delivered.
+    let delivered_at = status.resolved_receiver.as_ref().map(|resolved| timestamp(&resolved.delivered_at));
     let state = match status.phase {
         MessagePhase::Accepted | MessagePhase::WaitingOnReferences | MessagePhase::Deliverable => MessageState::Pending,
-        MessagePhase::Delivered if settled(old.record) => MessageState::Settled { receiver: Some(receiver()?) },
-        MessagePhase::Delivered => MessageState::Awaiting { receiver: receiver()? },
-        MessagePhase::Satisfied | MessagePhase::Answered | MessagePhase::OutcomeMet => MessageState::Settled { receiver: kept()? },
+        MessagePhase::Delivered if settled(old.record) => MessageState::Settled { receiver: Some(receiver()?), delivered_at },
+        MessagePhase::Delivered => MessageState::Awaiting {
+            receiver: receiver()?,
+            delivered_at: delivered_at.ok_or_else(|| "a delivered phase without its receiver".to_owned())?,
+        },
+        MessagePhase::Satisfied | MessagePhase::Answered | MessagePhase::OutcomeMet => {
+            MessageState::Settled { receiver: kept()?, delivered_at }
+        }
         MessagePhase::Expired if spec.deadline.is_none() => {
             return Err(missing("expired without a deadline", "expired without a deadline"))
         }
-        MessagePhase::Expired => MessageState::Dropped { reason: DropReason::Expired, receiver: kept()?, watermark: None },
+        MessagePhase::Expired => MessageState::Dropped { reason: DropReason::Expired, receiver: kept()?, delivered_at, watermark: None },
         MessagePhase::Superseded => {
             let by = match world.successor(record) {
                 Some(successor) => successor.record.metadata.name.clone(),
@@ -206,9 +213,11 @@ fn convert(
                 world.message(&by).ok_or_else(|| missing("its successor is gone", format!("its successor `{by}` was not read")))?;
             let inbox = conversion.receiver(&successor.record.spec)?;
             let by = imported_name(&inbox, &by)?.parse().map_err(|error: flotilla_address::Error| error.to_string())?;
-            MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: kept()?, watermark: None }
+            MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: kept()?, delivered_at, watermark: None }
         }
-        MessagePhase::DeadLettered => MessageState::Dropped { reason: DropReason::Undeliverable, receiver: kept()?, watermark: None },
+        MessagePhase::DeadLettered => {
+            MessageState::Dropped { reason: DropReason::Undeliverable, receiver: kept()?, delivered_at, watermark: None }
+        }
     };
     let state = StoredState::<Machine>::new(state, timestamp(&status.since));
     let resource = Resource::stored(name, spec, state, flotilla_state_machines::Version(version));
@@ -236,7 +245,8 @@ pub fn check(resource: &Resource<Machine>) -> Result<(), String> {
     }
     let target = resource.state();
     let receiver = target.receiver().cloned();
-    let at = Timestamp(1);
+    // Delivered when the state records it was, so the replay records the same time.
+    let at = target.delivered_at().unwrap_or(Timestamp(1));
     if let Some(receiver) = &receiver {
         world.receipts.put(&Ref::new(name), [(receiver.clone(), Transport::Turn)].into());
         home.apply(name, Deliver { receiver: receiver.clone(), transport: Transport::Turn }, &world, at).map_err(refused("delivery"))?;
@@ -282,8 +292,8 @@ pub fn check(resource: &Resource<Machine>) -> Result<(), String> {
     }
     let reached = home.get(name).expect("created").state();
     let comparable = |state: &MessageState| match state {
-        MessageState::Dropped { reason, receiver, .. } => {
-            MessageState::Dropped { reason: reason.clone(), receiver: receiver.clone(), watermark: None }
+        MessageState::Dropped { reason, receiver, delivered_at, .. } => {
+            MessageState::Dropped { reason: reason.clone(), receiver: receiver.clone(), delivered_at: *delivered_at, watermark: None }
         }
         other => other.clone(),
     };

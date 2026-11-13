@@ -38,20 +38,25 @@ impl RecordingMessages {
             ended: Mutex::default(),
         })
     }
+
+    /// The admitted messages to `receivers`; nothing admitted here is delivered.
+    fn admitted_to(&self, receivers: &[String]) -> Vec<ReadResourceObject<Message>> {
+        let admitted = self.admitted.lock().expect("admitted").values().cloned().collect::<Vec<_>>();
+        admitted
+            .into_iter()
+            .filter(|object| receivers.contains(&object.spec.receiver))
+            .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
+            .collect()
+    }
 }
 
 #[async_trait]
 impl EngineMessages for RecordingMessages {
-    async fn view(&self, _namespace: &str, record: &str) -> Result<Option<ReadResourceObject<Message>>, ResourceError> {
+    async fn view_to(&self, _namespace: &str, receiver: &str, record: &str) -> Result<Option<ReadResourceObject<Message>>, ResourceError> {
         let admitted = self.admitted.lock().expect("admitted").get(record).cloned();
-        Ok(admitted.map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }))
-    }
-    async fn views(&self, _namespace: &str) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        let admitted = self.admitted.lock().expect("admitted").values().cloned().collect::<Vec<_>>();
-        Ok(admitted.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect())
-    }
-    async fn view_to(&self, namespace: &str, receiver: &str, record: &str) -> Result<Option<ReadResourceObject<Message>>, ResourceError> {
-        Ok(self.view(namespace, record).await?.filter(|read| read.object.spec.receiver == receiver))
+        Ok(admitted
+            .filter(|object| object.spec.receiver == receiver)
+            .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }))
     }
     async fn view_for(
         &self,
@@ -61,12 +66,19 @@ impl EngineMessages for RecordingMessages {
     ) -> Result<Option<ReadResourceObject<Message>>, ResourceError> {
         self.view_to(namespace, &intent.receiver, record).await
     }
-    async fn to_receivers(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        Ok(self.views(namespace).await?.into_iter().filter(|read| receivers.contains(&read.object.spec.receiver)).collect())
+    async fn open_to(&self, _namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
+        Ok(self.admitted_to(receivers))
     }
-    async fn pending_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        // Nothing admitted here is delivered.
-        self.to_receivers(namespace, receivers).await
+    async fn seat_messages(
+        &self,
+        _namespace: &str,
+        receivers: &[String],
+        _named: &[(String, String)],
+    ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
+        Ok(self.admitted_to(receivers))
+    }
+    async fn pending_to(&self, _namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
+        Ok(self.admitted_to(receivers))
     }
     async fn admit(&self, namespace: &str, name: &str, intent: &MessageSpec) -> Result<ResourceObject<Message>, ResourceError> {
         let object = ResourceObject {
@@ -100,7 +112,7 @@ impl EngineMessages for RecordingMessages {
             _ => flotilla_messaging::MessageResolution::Absent,
         }
     }
-    async fn withdraw(&self, _namespace: &str, _record: &str, _convoy: &str) -> Result<(), String> {
+    async fn withdraw(&self, _namespace: &str, _receiver: &str, _record: &str, _convoy: &str) -> Result<(), String> {
         Ok(())
     }
     fn home(&self) -> String {

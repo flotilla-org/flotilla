@@ -390,8 +390,7 @@ async fn a_persons_message_traces_its_principal_and_records_its_role() {
             .body("ruling".into())
             .build();
         primitives.admit("flotilla", name, &intent).await.expect("admitted");
-        let stored = primitives.stored_view("flotilla", name).expect("read").expect("stored");
-        assert_eq!(stored.object.spec.sender, "fleet:lab/role:operator", "the record names the role");
+        assert_eq!(stored_sender(&primitives, "system:turn-rules", name).await, "fleet:lab/role:operator", "the record names the role");
         let logged = String::from_utf8(lines.0.lock().expect("lines").clone()).expect("UTF-8");
         assert!(logged.contains(&format!("message.principal=\"{traced}\"")), "{logged}");
     }
@@ -429,9 +428,20 @@ async fn a_declared_principal_reads_back_under_its_own_name() {
         .body("approved".into())
         .build();
     primitives.admit("flotilla", "from-alice", &intent).await.expect("admitted");
-    let stored = primitives.stored_view("flotilla", "from-alice").expect("read").expect("stored");
-    assert_eq!(stored.object.spec.sender, "project:flotilla/role:owner", "the record names the role");
-    let viewed = primitives.views("flotilla").await.expect("crew views");
-    let viewed = viewed.iter().find(|read| read.object.metadata.name == "from-alice").expect("the crew's view spells it");
+    assert_eq!(
+        stored_sender(&primitives, "flotilla/gui-approver", "from-alice").await,
+        "project:flotilla/role:owner",
+        "the record names the role"
+    );
+    let viewed = primitives.view_to("flotilla", "flotilla/gui-approver", "from-alice").await.expect("crew view").expect("the crew's view");
     assert_eq!(viewed.object.spec.sender, "principal:alice");
+}
+
+/// The sender the engine record of `record`, admitted to `receiver` and still pending, names.
+async fn stored_sender(primitives: &flotilla_engine_messages::MessagePrimitives, receiver: &str, record: &str) -> String {
+    let inbox = primitives.inbox_for("flotilla", receiver).await.expect("the receiver's inbox");
+    let (id, _) = primitives.locate_in(&inbox, record).expect("locate").expect("stored");
+    let pending = primitives.pending_in(&inbox).expect("pending");
+    let (_, stored) = pending.into_iter().find(|(_, message)| message.name() == id).expect("pending");
+    stored.spec().sender.to_string()
 }

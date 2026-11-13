@@ -364,8 +364,8 @@ pub trait CharterNotices: Send + Sync {
     fn namespace(&self) -> &str;
     fn pass(&self) -> std::sync::Arc<tokio::sync::Mutex<()>>;
     fn admission(&self) -> std::sync::Arc<tokio::sync::Mutex<()>>;
-    /// Whether `name` exists, repairing one stored without admission.
-    async fn existing(&self, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError>;
+    /// Whether `name`, sent to `receiver`, exists, repairing one stored without admission.
+    async fn existing(&self, receiver: &str, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError>;
     /// The open Messages to `receiver`.
     async fn open_to(&self, receiver: &str) -> Result<Vec<ResourceObject<Message>>, ResourceError>;
     async fn admit(&self, name: &str, spec: &crate::MessageSpec, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError>;
@@ -382,7 +382,7 @@ impl CharterNotices for crate::MessageInbox {
     fn admission(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         std::sync::Arc::clone(&self.admission)
     }
-    async fn existing(&self, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError> {
+    async fn existing(&self, _: &str, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError> {
         repair_existing_charter_notification(self, name, now).await
     }
     async fn open_to(&self, receiver: &str) -> Result<Vec<ResourceObject<Message>>, ResourceError> {
@@ -478,7 +478,7 @@ async fn reconcile_charter_notifications_from_receivers(
         {
             let admission = inbox.admission();
             let _admission = admission.lock().await;
-            if inbox.existing(&name, now).await? {
+            if inbox.existing(&receiver, &name, now).await? {
                 continue;
             }
         }
@@ -507,7 +507,7 @@ async fn reconcile_charter_notifications_from_receivers(
         // snapshot reads never block ordinary inbox producers.
         let admission = inbox.admission();
         let _admission = admission.lock().await;
-        if inbox.existing(&name, now).await? {
+        if inbox.existing(&receiver, &name, now).await? {
             continue;
         }
         let predecessor = inbox.open_to(&receiver).await?

@@ -77,11 +77,12 @@ async fn a_capability_card_is_admitted_about_its_sessions_seat() {
         .build();
     primitives.admit(NAMESPACE, &name, &card).await.expect("the card is admitted");
 
-    let (id, _) = primitives.locate(&name).expect("locate").expect("the admitted card");
-    let stored = primitives.messages().expect("messages").into_iter().find(|(_, message)| message.name() == id).expect("stored").1;
+    let inbox = primitives.inbox_for(NAMESPACE, receiver).await.expect("the receiver's inbox");
+    let (id, _) = primitives.locate_in(&inbox, &name).expect("locate").expect("the admitted card");
+    let stored = primitives.pending_in(&inbox).expect("pending").into_iter().find(|(_, message)| message.name() == id).expect("stored").1;
     let stored_subject = stored.spec().subject().expect("a subject");
     assert_eq!(stored_subject.address.to_string(), "project:flotilla/convoy:crew/role:coder");
     assert_eq!(stored_subject.revision, "capabilities@7");
-    let view = primitives.view(NAMESPACE, &name).await.expect("view").expect("the card's view").object;
+    let view = primitives.view_to(NAMESPACE, receiver, &name).await.expect("view").expect("the card's view").object;
     assert_eq!(view.spec.subject, Some(subject));
 }

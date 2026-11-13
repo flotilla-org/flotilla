@@ -1,4 +1,4 @@
-use crate::{Message, MessageExpectation, MessagePhase, MessageSpec, ResourceError, ResourceObject};
+use crate::{Convoy, Message, MessageExpectation, MessagePhase, MessageSpec, ResourceError, ResourceObject, TurnDeliveryOutcome};
 pub const ROLE_ADDRESS_ANNOTATION: &str = "flotilla.work/role-address";
 
 /// Creation context for convoy-relative role addresses.
@@ -41,6 +41,35 @@ pub fn validate_message_address(address: &str) -> Result<(), ResourceError> {
 /// Old 4-part spelling; goes when crew compares engine addresses (#3108 gate task).
 pub fn crew_role_address(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
     format!("{project}/{}/{vessel}/{role}", convoy_segment(convoy))
+}
+
+/// The crew members' addresses a convoy's frozen workflow declares: the receivers its crew
+/// Messages are sent to.
+pub fn convoy_crew_seats(namespace: &str, convoy: &ResourceObject<Convoy>) -> Vec<String> {
+    let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+    convoy
+        .status
+        .iter()
+        .flat_map(|status| &status.workflow_snapshot)
+        .flat_map(|workflow| &workflow.vessels)
+        .flat_map(|vessel| vessel.crew.iter().map(|member| crew_role_address(project, &convoy.metadata.name, &vessel.name, &member.role)))
+        .collect()
+}
+
+/// The turns a convoy's status names by Message, each with the crew member it was sent to: its
+/// queued turn deliveries and its crew's resume briefs.
+pub fn convoy_seat_turns(namespace: &str, convoy: &ResourceObject<Convoy>) -> Vec<(String, String)> {
+    let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+    let seat = |vessel: &str, role: &str| crew_role_address(project, &convoy.metadata.name, vessel, role);
+    let Some(status) = &convoy.status else { return Vec::new() };
+    let queued = status.turn_deliveries.values().flat_map(|delivery| &delivery.episodes).filter_map(|episode| match &episode.outcome {
+        TurnDeliveryOutcome::Queued { vessel, role, message_id, .. } => Some((seat(vessel, role), message_id.clone())),
+        _ => None,
+    });
+    let briefs = status.crew_work.iter().flat_map(|(vessel, crew)| {
+        crew.iter().filter_map(move |(role, work)| work.resume_brief_id.as_ref().map(|brief| (vessel, role, brief.clone())))
+    });
+    queued.chain(briefs.map(|(vessel, role, brief)| (seat(vessel, role), brief))).collect()
 }
 
 /// The project, launch, vessel and role a 4-part role address names, its convoy segment unescaped;

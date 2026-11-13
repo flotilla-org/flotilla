@@ -146,8 +146,11 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     assert!(messages.iter().any(|message| Some(&message.metadata.name) == latest.spec.supersedes.as_ref()));
     // The engine stores the card's subject as the session's seat, with the card's revision.
     let primitives = held.messages().primitives();
-    let (id, _) = primitives.locate(&latest.metadata.name).expect("locate").expect("the latest card");
-    let stored = primitives.messages().expect("messages").into_iter().find(|(_, message)| message.name() == id).expect("stored card").1;
+    let receiver = flotilla_resources::crew_role_address("flotilla", &held.launch, "work", "coder");
+    let inbox = primitives.inbox_for("flotilla", &receiver).await.expect("the coder's inbox");
+    let (id, _) = primitives.locate_in(&inbox, &latest.metadata.name).expect("locate").expect("the latest card");
+    let stored =
+        primitives.open_in(&inbox).expect("open messages").into_iter().find(|(_, message)| message.name() == id).expect("stored card").1;
     let subject = stored.spec().subject().expect("a subject");
     let project = flotilla_address::Address::project("flotilla").expect("project address");
     let seat = flotilla_resources::convoy::engine::launch_address(&project, &held.launch)
@@ -155,7 +158,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
         .expect("seat address");
     assert_eq!(subject.address, seat);
     // The crew reads it in the old shape, naming the session.
-    let latest = primitives.view("flotilla", &latest.metadata.name).await.expect("view").expect("the latest card").object;
+    let latest = primitives.view_to("flotilla", &receiver, &latest.metadata.name).await.expect("view").expect("the latest card").object;
     let Some(MessageReference::ControlRecord { revision: latest_revision, .. }) = &latest.spec.subject else { panic!("revision subject") };
     assert_eq!(latest_revision, &subject.revision);
     assert_eq!(latest.spec.sender, "system:capabilities");
@@ -193,7 +196,8 @@ async fn an_unseen_session_gets_a_full_card_once_then_delivered_deltas() {
     let all = messages.list().await.expect("messages").items;
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].spec.body, first);
-    held.messages().deliver_turn(&all[0].metadata.name, "terminal").await;
+    let receiver = flotilla_resources::crew_role_address("flotilla", &held.launch, "work", "coder");
+    held.messages().deliver_turn(&receiver, &all[0].metadata.name, "terminal").await;
     let second = "## Your capabilities\n### Credentials\n- known\n- added\n";
     observe_card(&backend, "flotilla", &session, second, &tracker).await.expect("delta");
     let all = messages.list().await.expect("messages").items;

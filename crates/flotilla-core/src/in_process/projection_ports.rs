@@ -131,11 +131,13 @@ impl flotilla_projections::read_projections::MessageReceiverLoader for MessageRe
         namespace: &str,
         convoys: Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>,
         terminals: Vec<flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>>,
+        receivers: &[String],
+        named: &[(String, String)],
     ) -> Result<Box<dyn flotilla_projections::read_projections::MessageReceiverRead>, String> {
         let messages = match self.0.get() {
             // No message reads in the old shape until the fleet is designated.
             Some(primitives) if primitives.delivery_wait(namespace).await?.is_some() => Some(Vec::new()),
-            Some(primitives) => Some(primitives.views(namespace).await.map_err(|e| e.to_string())?),
+            Some(primitives) => Some(primitives.seat_messages(namespace, receivers, named).await.map_err(|e| e.to_string())?),
             None => None,
         };
         Ok(Box::new(MessageReceiverEvidence(

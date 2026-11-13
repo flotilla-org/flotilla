@@ -121,7 +121,7 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
             let records: Vec<_> = if remote {
                 home.using::<Message>("flotilla").list().await.expect("receiver inbox").items
             } else {
-                held.messages().messages().views("flotilla").await.expect("receiver inbox").into_iter().map(|read| read.object).collect()
+                held.messages().views().await.expect("receiver inbox").into_iter().map(|read| read.object).collect()
             };
             assert_eq!(records.len(), index + 1, "each handoff is distinct even when its body repeats");
             for record in records {
@@ -195,7 +195,7 @@ async fn operator_supervision_messages_working_crew() {
     assert_eq!(messages.len(), 1);
     // The engine stores a person as the role they send in; the principal goes to the trace.
     assert_eq!(messages[0].spec.sender, "project:flotilla/role:operator");
-    let viewed = held.messages().messages().views("flotilla").await.expect("inbox");
+    let viewed = held.messages().views().await.expect("inbox");
     assert_eq!(viewed[0].object.spec.receiver, held.receiver("work", "coder"));
     assert_eq!(messages[0].spec.relation, flotilla_resources::MessageRelation::Supervisor);
     assert_eq!(messages[0].spec.body, "please follow up");
@@ -299,7 +299,7 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
         })
         .await
         .expect("governor ruling");
-        let records = messages.views("flotilla").await.expect("messages");
+        let records = held.messages().views().await.expect("messages");
         assert_eq!(records.len(), 1 + usize::from(escalation_visible) + usize::from(action == CrewSupervisionAction::Escalate));
         let reply = records
             .iter()
@@ -373,7 +373,7 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
         })
         .await
         .expect_err("the ruling cannot apply to an ended convoy");
-        let records = messages.views("flotilla").await.expect("decisions");
+        let records = held.messages().views().await.expect("decisions");
         assert_eq!(records.len(), if action == flotilla_protocol::CrewSupervisionAction::Escalate { 2 } else { 1 });
         let ruling =
             records.iter().map(|record| &record.object).find(|record| record.spec.body == "durable ruling").expect("durable ruling");
@@ -419,7 +419,7 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
         let convoy = held.convoy(&backend).await;
         assert_eq!(convoy.status.expect("status").attention.expect("attention").reason, "episode limit");
         let messages: Vec<_> =
-            held.messages().messages().views("flotilla").await.expect("messages").into_iter().map(|read| read.object).collect();
+            held.messages().views().await.expect("messages").into_iter().map(|read| read.object).collect();
         assert_eq!(messages.len(), 2, "retries cannot duplicate the supervisor signal or the crew notice");
         // #3565: the held crew is told why its wakes stopped.
         let coder = held.receiver("work", "coder");
@@ -781,8 +781,7 @@ async fn run_escalation_scenarios(
             })
             .await;
         let after = held.convoy(&backend).await.status.expect("status").stalled;
-        let records: Vec<_> =
-            held.messages().messages().views("flotilla").await.expect("messages").into_iter().map(|read| read.object).collect();
+        let records: Vec<_> = held.messages().views().await.expect("messages").into_iter().map(|read| read.object).collect();
         if bound && reachable && conflict {
             assert!(result.is_err(), "a concurrent ruling must refuse the ownership transfer: {result:?}");
             // The ruling failed the coder's seat and so the launch: its view shows no stall, and
@@ -871,8 +870,7 @@ async fn collocated_escalation_refuses_a_concurrent_change_to_the_seat() {
         assert!(error.contains("stall changed during escalation"), "{error}");
         let status = held.convoy(&backend).await.status.expect("status");
         assert!(status.stalled.as_ref().is_none_or(|stall| stall.supervisor.as_ref().is_none_or(|owner| owner.role != "deputy")));
-        let records: Vec<_> =
-            held.messages().messages().views("flotilla").await.expect("messages").into_iter().map(|read| read.object).collect();
+        let records: Vec<_> = held.messages().views().await.expect("messages").into_iter().map(|read| read.object).collect();
         assert_ruling_unlinked(&records, &held);
     }
 }
@@ -951,7 +949,7 @@ async fn resume_with_an_unreadable_recorded_escalation_goes_unlinked() {
     })
     .await
     .expect("the ruling is admitted without its link");
-    let records = held.messages().messages().views("flotilla").await.expect("messages");
+    let records = held.messages().views().await.expect("messages");
     assert_ruling_unlinked(&records.into_iter().map(|record| record.object).collect::<Vec<_>>(), &held);
 }
 

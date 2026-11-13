@@ -35,6 +35,18 @@ pub(super) async fn engine(daemon: &Arc<InProcessDaemon>) -> (Arc<Service>, Arc<
     (service, primitives)
 }
 
+/// The message `record` sent to `receiver` (an old address) that `engine` holds, with its home:
+/// read in the receiver's inbox.
+async fn homed(
+    engine: &MessagePrimitives,
+    receiver: &str,
+    record: &str,
+) -> Option<(String, flotilla_state_machines::Resource<flotilla_state_machines::machines::message::Message>)> {
+    let inbox = engine.inbox_for(NS, receiver).await.expect("the receiver's inbox");
+    let (id, _) = engine.locate_in(&inbox, record).expect("locate")?;
+    engine.inbox_messages(&inbox).expect("messages").into_iter().find(|(_, message)| message.name() == id)
+}
+
 /// The fleet the engine's Message delivery reads its roles from: Project `fleet`, designated.
 pub(super) async fn seed_fleet(backend: &flotilla_store::ResourceBackend) {
     flotilla_engine_messages_testkit::designate_fleet(backend, NS).await;
@@ -188,13 +200,10 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         .expectation(MessageExpectation::Reply)
         .build();
     a.publish_message(NS, &request, &intent).await.expect("routed send");
-    let homed = |engine: &MessagePrimitives, record: &str| {
-        engine.messages().expect("messages").into_iter().find(|(_, message)| message.name().ends_with(&format!("/message:{record}")))
-    };
-    let (home, sent) = homed(&engine_b, &request).expect("the message is created at the receiver's home");
+    let (home, sent) = homed(&engine_b, &receiver, &request).await.expect("the message is created at the receiver's home");
     assert_eq!(home, home_b);
     assert_eq!(sent.spec().sender.as_str(), "fleet:lab/role:turn-rules");
-    assert!(homed(&engine_a, &request).is_none(), "the sender's home authors nothing");
+    assert!(homed(&engine_a, &receiver, &request).await.is_none(), "the sender's home authors nothing");
 
     // B delivers it to the crew's AgentSession, receipt first.
     let consumer = engine_b.register(&launch, Timestamp(1)).await.expect("consumer");
@@ -207,7 +216,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     }
     inbox_b.receive(&consumer, sent.name(), Transport::Turn).await.expect("receipt");
     inbox_b.deliver(sent.name(), Deliver { receiver: consumer.clone(), transport: Transport::Turn }).await.expect("deliver");
-    assert!(matches!(homed(&engine_b, &request).expect("sent").1.state(), MessageState::Awaiting { .. }));
+    assert!(matches!(homed(&engine_b, &receiver, &request).await.expect("sent").1.state(), MessageState::Awaiting { .. }));
     // A's replica has not caught up: the reply's admission at A reads the
     // original at B, its home, marked remote with its age.
     let reads = Arc::new(StoreReads { home: Arc::clone(&store_b), served: Default::default() });
@@ -224,12 +233,12 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     // Routing by subject and the admission each read the original at B.
     let served = reads.served.lock().expect("served").clone();
     assert!(!served.is_empty() && served.iter().all(|name| name == sent.name()), "the misses were read at B: {served:?}");
-    let (reply_home, replied) = homed(&engine_a, &reply).expect("the reply is homed at X's home");
+    let (reply_home, replied) = homed(&engine_a, "system:turn-rules", &reply).await.expect("the reply is homed at X's home");
     assert_eq!(reply_home, home_a);
     assert_eq!(replied.spec().inbox.as_str(), "fleet:lab/role:turn-rules");
     assert_eq!(replied.spec().in_reply_to.as_ref().map(|original| original.home.as_str()), Some(home_b.as_str()));
     assert_eq!(*replied.state(), MessageState::Pending, "nobody is bound to turn-rules yet");
-    let read = engine_a.read_message(&request, Some(sent.spec().inbox.clone())).await.expect("routed read");
+    let read = engine_a.read_message(&request, sent.spec().inbox.clone()).await.expect("routed read");
     assert!(read.remote && read.age_micros >= 0 && read.home == home_b, "{read:?}");
     // A reply link resolves at the original's home; a name no home holds is absent, not unknown.
     assert_eq!(engine_a.resolve_in_reply_to(NS, &answer).await, flotilla_messaging::MessageResolution::Found);
@@ -240,23 +249,24 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     pump(&store_b, &home_b, &store_a, &mut b_to_a);
 
     // A reads B's message from its replica, delivered, in convoy explain.
-    let (replica_home, replica) = homed(&engine_a, &request).expect("A's replica holds B's message");
-    assert_eq!((replica_home.as_str(), replica.state()), (home_b.as_str(), &MessageState::Awaiting { receiver: consumer.clone() }));
-    let view = engine_a.view(NS, &request).await.expect("view").expect("present");
+    let (replica_home, replica) = homed(&engine_a, &receiver, &request).await.expect("A's replica holds B's message");
+    assert_eq!(replica_home, home_b);
+    assert!(matches!(replica.state(), MessageState::Awaiting { receiver, .. } if *receiver == consumer), "{:?}", replica.state());
+    let view = engine_a.view_to(NS, &receiver, &request).await.expect("view").expect("present");
     assert!(matches!(view.provenance, ResourceProvenance::Replica { ref origin_root, .. } if origin_root.as_str() == home_b));
     let explained = a.explain_convoy_internal(Some(NS), &crew).await.expect("explain on A");
     let shown = explained.messages.iter().find(|message| message.name == request).expect("convoy explain shows B's message");
     assert_eq!((shown.phase.as_str(), shown.session.as_deref()), ("delivered", Some("sess-b")));
 
-    let local = engine_a.read_message(&request, None).await.expect("replica read");
+    let local = engine_a.read_message(&request, sent.spec().inbox.clone()).await.expect("replica read");
     assert!(!local.remote && local.home == home_b, "after following B, A reads its replica: {local:?}");
 
     // B observes the reply through its replica and settles its message.
     pump(&store_a, &home_a, &store_b, &mut a_to_b);
-    assert!(homed(&engine_b, &reply).is_some(), "B follows A's log");
+    assert!(homed(&engine_b, "system:turn-rules", &reply).await.is_some(), "B follows A's log");
     engine_b.world().update(|world| world.reply.put(&flotilla_state_machines::Ref::new(sent.name()), ()));
     inbox_b.settle(sent.name(), Settle { by: Settlement::Answered }).await.expect("answered");
-    assert!(matches!(homed(&engine_b, &request).expect("sent").1.state(), MessageState::Settled { .. }));
+    assert!(matches!(homed(&engine_b, &receiver, &request).await.expect("sent").1.state(), MessageState::Settled { .. }));
     use flotilla_engine_messages::sweep::OpenMessages;
     use flotilla_state_machines::machines::{awaiting_reply::AwaitingReplyLabel, message::MessageRef};
     let mut observer = OpenMessages::default();
@@ -290,7 +300,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         .expect("receiver admission finishes");
         assert!(matches!(result, flotilla_protocol::CommandValue::ResourceObject(_)), "{result:?}");
 
-        let (_, message) = homed(&engine_b, &name).expect("receiver admitted");
+        let (_, message) = homed(&engine_b, &cancel.receiver, &name).await.expect("receiver admitted");
         let reference = MessageRef::new(message.name(), &home_b);
         assert!(engine_a.awaiting().get(&reference).is_none(), "sender continuation has not written its record yet");
         if !*late_record {
@@ -306,12 +316,15 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
                 successor.supersedes = Some(name.clone());
                 a.publish_message(NS, &next, &successor).await.expect("routed supersession");
             }
-            DropAction::Withdraw => engine_b.withdraw(NS, &name, &crew).await.expect("receiver withdrawal"),
+            DropAction::Withdraw => engine_b.withdraw(NS, &cancel.receiver, &name, &crew).await.expect("receiver withdrawal"),
             DropAction::Expire => {
                 engine_b.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut OpenMessages::default()).await.expect("receiver expiry");
             }
         }
-        assert!(matches!(homed(&engine_b, &name).expect("receiver message").1.state(), MessageState::Dropped { .. }));
+        assert!(matches!(
+            homed(&engine_b, &cancel.receiver, &name).await.expect("receiver message").1.state(),
+            MessageState::Dropped { .. }
+        ));
         if !*late_record {
             assert_eq!(
                 engine_a.awaiting().get(&reference).expect("sender record").label(),

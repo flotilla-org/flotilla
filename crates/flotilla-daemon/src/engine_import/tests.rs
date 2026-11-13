@@ -483,7 +483,7 @@ fn an_in_flight_message_names_the_launch_its_crew_session_imported_as() {
     let name = flotilla_core::primitives::import::imported_name(&inbox, "in-flight").expect("name");
     let id = read.resolve(<MessageResource as Kind>::CODE, &name, HERE).expect("resolve").expect("message");
     let message = read.load::<MessageResource>(id).expect("load").expect("message").value;
-    let flotilla_state_machines::machines::message::MessageState::Awaiting { receiver } = message.state() else {
+    let flotilla_state_machines::machines::message::MessageState::Awaiting { receiver, .. } = message.state() else {
         panic!("still awaiting its reply: {:?}", message.state())
     };
     assert_eq!(receiver.id, launch, "the crew's consumer is named by its launch");

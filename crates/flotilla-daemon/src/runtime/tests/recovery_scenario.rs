@@ -335,8 +335,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     assert_eq!(wait_for_command_result(&mut rx, hand_back_id).await, CommandValue::Ok);
     // Messages are the engine's: read them through the Message path's views.
     let messages = daemon.message_primitives().expect("the engine Message path");
-    let coder_delivery_id = messages
-        .views(NAMESPACE)
+    let backend = daemon.resource_backend();
+    let coder_delivery_id = flotilla_engine_messages_testkit::views(&messages, &backend, NAMESPACE)
         .await
         .unwrap()
         .into_iter()
@@ -360,10 +360,10 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     pool.set_captured_screen(&coder.metadata.name, "• Working (1s • esc to interrupt)\n› Ask Codex to do anything").await;
     wait_until_with_timeout(Duration::from_secs(5), || {
         let messages = Arc::clone(&messages);
+        let backend = backend.clone();
         let coder_delivery_id = coder_delivery_id.clone();
         async move {
-            messages
-                .views(NAMESPACE)
+            flotilla_engine_messages_testkit::views(&messages, &backend, NAMESPACE)
                 .await
                 .ok()
                 .and_then(|views| views.into_iter().find(|message| message.object.metadata.name == coder_delivery_id))

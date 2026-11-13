@@ -8,10 +8,10 @@ use flotilla_engine_messages::{records::MessageRecords, MessagePrimitives};
 use flotilla_inbox::InboxBackend;
 use flotilla_messaging::EngineMessages;
 use flotilla_resources::{
-    attentions::Attentions, Clock, FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec, SystemClock,
-    FLEET_DESIGNATION_NAME,
+    attentions::Attentions, Clock, FleetDesignation, FleetDesignationSpec, InputMeta, Message as OldMessage, Project, ProjectSpec,
+    ReadResourceObject, ResourceError, SystemClock, FLEET_DESIGNATION_NAME,
 };
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Address, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{machines::message::Deliver, Transport};
 use flotilla_store::ResourceBackend;
@@ -41,6 +41,8 @@ impl<T> std::ops::Deref for Served<T> {
 pub struct EngineMessagesHome {
     primitives: Arc<MessagePrimitives>,
     service: Arc<Service>,
+    namespace: String,
+    backend: ResourceBackend,
     _dir: tempfile::TempDir,
 }
 
@@ -60,7 +62,7 @@ impl EngineMessagesHome {
             Arc::new(MessagePrimitives::open(home, Arc::clone(&service), backend.clone(), clock).expect("engine Message path"));
         backend.install_attentions(Arc::clone(&primitives) as Arc<dyn Attentions>);
         backend.install_engine_records(Arc::new(MessageRecords::new(Arc::clone(&primitives), Arc::new(RwLock::new(namespace.to_owned())))));
-        Self { primitives, service, _dir: dir }
+        Self { primitives, service, namespace: namespace.to_owned(), backend: backend.clone(), _dir: dir }
     }
 
     pub fn primitives(&self) -> &Arc<MessagePrimitives> {
@@ -72,11 +74,17 @@ impl EngineMessagesHome {
         &self.service
     }
 
-    /// Records the message `record` names as a turn crew `session` confirmed, the way the daemon's
-    /// delivery records one: the session registered and bound to the message's inbox, then its
-    /// receipt, then its deliver.
-    pub async fn deliver_turn(&self, record: &str, session: &str) {
-        deliver_turn(&self.primitives, record, session, chrono::Utc::now()).await;
+    /// Records the message `record` sent to `receiver` (an old address) as a turn crew `session`
+    /// confirmed, the way the daemon's delivery records one: the session registered and bound to
+    /// the message's inbox, then its receipt, then its deliver.
+    pub async fn deliver_turn(&self, receiver: &str, record: &str, session: &str) {
+        deliver_turn(&self.primitives, &self.namespace, receiver, record, session, chrono::Utc::now()).await;
+    }
+
+    /// Every message this home holds, in the old shape the crew reads: listed by the generic
+    /// resource verb, each then read in the inbox it names.
+    pub async fn views(&self) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
+        views(&self.primitives, &self.backend, &self.namespace).await
     }
 
     /// The path as the crew's Message port.
@@ -85,15 +93,41 @@ impl EngineMessagesHome {
     }
 }
 
-/// [`EngineMessagesHome::deliver_turn`] on any home's Message path, such as a daemon's, the
-/// session registered `at`.
-pub async fn deliver_turn(primitives: &MessagePrimitives, record: &str, session: &str, at: chrono::DateTime<chrono::Utc>) {
-    let (id, _) = primitives.locate(record).expect("locate").unwrap_or_else(|| panic!("no message `{record}`"));
-    let messages = primitives.messages().expect("messages");
-    let (_, message) = messages.iter().find(|(_, message)| message.name() == id).expect("the located message");
+/// [`EngineMessagesHome::views`] on any home's Message path in `namespace`, such as a daemon's,
+/// listed through `backend`'s generic resource verb.
+pub async fn views(
+    primitives: &MessagePrimitives,
+    backend: &ResourceBackend,
+    namespace: &str,
+) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
+    let listed = backend.using::<OldMessage>(namespace).list().await?.items;
+    let mut views = Vec::with_capacity(listed.len());
+    for stored in listed {
+        let inbox: Address = stored.spec.receiver.parse().map_err(|error| ResourceError::invalid(format!("{error}")))?;
+        views.extend(primitives.read_view(namespace, &stored.metadata.name, inbox).await?);
+    }
+    Ok(views)
+}
+
+/// [`EngineMessagesHome::deliver_turn`] on any home's Message path in `namespace`, such as a
+/// daemon's, the session registered `at`. `receiver` is an old address, or the inbox's engine
+/// address as the generic verbs show it.
+pub async fn deliver_turn(
+    primitives: &MessagePrimitives,
+    namespace: &str,
+    receiver: &str,
+    record: &str,
+    session: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    let address = match receiver.parse::<Address>() {
+        Ok(inbox) => inbox,
+        Err(_) => primitives.inbox_for(namespace, receiver).await.expect("the receiver's inbox"),
+    };
+    let (id, _) = primitives.locate_in(&address, record).expect("locate").unwrap_or_else(|| panic!("no message `{record}`"));
     let consumer = primitives.register(session, Timestamp::from_datetime(&at)).await.expect("register the session");
     let inbox = primitives.inbox();
-    inbox.bind(message.spec().inbox.clone(), consumer.clone()).await.expect("bind the session");
+    inbox.bind(address, consumer.clone()).await.expect("bind the session");
     inbox.receive(&consumer, &id, Transport::Turn).await.expect("receipt");
     inbox.deliver(&id, Deliver { receiver: consumer, transport: Transport::Turn }).await.expect("deliver");
 }
