@@ -1,8 +1,10 @@
 use super::*;
-use crate::testkits::engine::{engine, runtime_terminals};
+use crate::testkits::engine::{admit_convoy, engine, runtime_terminals};
+use flotilla_crew::crew_capabilities::CardScope;
 use flotilla_engine_messages::view::record_name;
 use flotilla_resources::attentions::Subject;
 use flotilla_store_memory::InMemoryBackend;
+use tokio_util::task::AbortOnDropHandle;
 
 #[tokio::test]
 async fn credential_refresh_attention_appears_and_clears_on_recovery() {
@@ -1022,4 +1024,165 @@ async fn credential_attention_reads_only_live_convoys() {
     .await;
     result.expect("attention");
     assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&10));
+}
+
+/// Counts each session's card readings and delivers nothing.
+#[derive(Default)]
+struct CountedCards(std::sync::Mutex<BTreeMap<String, u32>>);
+
+impl CountedCards {
+    fn readings(&self, session: &str) -> u32 {
+        self.0.lock().expect("readings").get(session).copied().unwrap_or_default()
+    }
+
+    /// `session`'s readings once more than `after` were made and none more for a second: the
+    /// passes the controller's watches woke as they opened have ended.
+    async fn settled(&self, session: &str, after: u32) -> u32 {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut last = self.readings(session);
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let now = self.readings(session);
+                if now > after && now == last {
+                    return now;
+                }
+                last = now;
+            }
+        })
+        .await
+        .expect("the controller's first passes end")
+    }
+}
+
+#[async_trait]
+impl flotilla_capability_contract::SessionCapabilitySource for CountedCards {
+    async fn credentials(&self, _: &str, _: &BTreeSet<String>) -> Result<Vec<flotilla_capability_contract::CredentialCapability>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn endpoints(&self, _: &str, session: &str) -> Result<BTreeMap<String, String>, String> {
+        *self.0.lock().expect("readings").entry(session.to_owned()).or_default() += 1;
+        Ok(BTreeMap::new())
+    }
+}
+
+/// The credential delivery controller running over two crews, `cards-session-0` and
+/// `cards-session-1`, each in a convoy and host-direct environment of its own; the first convoy's
+/// coder is bound to an account. Each card was read once before the controller started.
+struct RunningCards {
+    daemon: Arc<InProcessDaemon>,
+    source: Arc<CountedCards>,
+    convoys: Vec<String>,
+    _controller: AbortOnDropHandle<()>,
+    _temp: TempDir,
+}
+
+impl RunningCards {
+    async fn start() -> Self {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"capability-cards-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        daemon.open_message_primitives().expect("message path");
+        designate_fleet(&daemon).await;
+        let fixture = engine(&daemon);
+        let host = daemon.local_host_id().expect("local host").to_string();
+        let mut convoys = Vec::new();
+        for n in 0..2 {
+            let status = ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".to_string())
+                        .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                        .build()],
+                }),
+                ..ConvoyStatus::default()
+            };
+            let spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+            let launch =
+                admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, &format!("cards-{n}"), spec, status)).await;
+            let vessel = fixture.vessels.request(&launch, "work", &host);
+            let environment = format!("cards-env-{n}");
+            engine_environments(&daemon).request(
+                &environment,
+                &EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+                    ..Default::default()
+                },
+                Some(&vessel),
+            );
+            fixture.vessels.ready(&vessel, &environment);
+            create_credential_test_session(&fixture.terminals, &format!("cards-session-{n}"), &vessel, &environment);
+            convoys.push(launch);
+        }
+        bind_account(&daemon, &convoys[0], "coder", "claude-max", "a@example.com").await;
+        let source = Arc::new(CountedCards::default());
+        daemon.set_session_capability_source(Arc::clone(&source) as Arc<dyn flotilla_capability_contract::SessionCapabilitySource>).await;
+        daemon.refresh_capability_cards(NAMESPACE, &CardScope::every()).await.expect("the cards' first reading");
+        let store = Arc::new(CredentialStore::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::default()),
+            EnvironmentBag::new(),
+            Arc::new(ProcessCommandRunner),
+            temp.path().to_path_buf(),
+        ));
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                Arc::clone(&daemon),
+                config,
+                passthrough_registry(),
+                None,
+                "test-host".to_string(),
+                "host-direct-test".to_string(),
+            )
+            .with_credential_store(store),
+        );
+        let mut delivery = CredentialDelivery::new(Arc::clone(&state)).expect("a credential store");
+        delivery.start().await.expect("nothing to deliver");
+        let controller = AbortOnDropHandle::new(tokio::spawn(delivery.run(state.controller_metrics.for_kind("CredentialDelivery"))));
+        Self { daemon, source, convoys, _controller: controller, _temp: temp }
+    }
+
+    /// The capability Message to convoy `n`'s coder whose body names `text`.
+    async fn card_naming(&self, n: usize, text: &str) -> flotilla_resources::MessageSpec {
+        let receiver = flotilla_resources::crew_role_address(NAMESPACE, &self.convoys[n], "work", "coder");
+        let primitives = self.daemon.message_primitives().expect("message path");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let open = primitives.open_to(NAMESPACE, std::slice::from_ref(&receiver)).await.expect("the coder's messages");
+                if let Some(message) = open
+                    .into_iter()
+                    .find(|message| message.object.spec.sender == "system:capabilities" && message.object.spec.body.contains(text))
+                {
+                    return message.object.spec;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("a capability Message naming {text} reaches convoy {n}'s coder"))
+    }
+}
+
+// Behaviour: rebinding a convoy's account refreshes that convoy's running crew's card, with no
+// other event, and no other convoy's.
+#[tokio::test]
+async fn a_rebind_reaches_a_running_sessions_card_with_no_other_event() {
+    let cards = RunningCards::start().await;
+    let other = cards.source.settled("cards-session-1", 1).await;
+    let now = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + chrono::Duration::seconds(1)));
+    let reopened = super::launch_support::pending_binding(&cards.convoys[0], "coder", "claude-b", "b@example.com", now);
+    cards.daemon.account_records().rebind(NAMESPACE, reopened, None, now).await.expect("rebind");
+
+    let card = cards.card_naming(0, "credential `claude-b` (account b@example.com)").await;
+    assert!(!card.body.contains("claude-max"), "{}", card.body);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(cards.source.readings("cards-session-1"), other, "the other convoy's card is not read again");
 }

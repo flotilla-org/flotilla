@@ -8,6 +8,10 @@
 //! only through one deadline: the earliest GitHub App refresh or retry, the earliest retry of a
 //! failed environment, or the earliest retry of a Codex login push.
 //!
+//! Each pass also refreshes the capability cards its events touch: those of the environments it
+//! delivered or re-minted for, of a convoy whose account binding changed, and of a convoy whose
+//! change touched what its cards read; every card when it delivered every environment.
+//!
 //! A failed delivery is retried at a backoff a finite number of times, then waits for an event
 //! naming its environment. Failures are traced and, for refreshes, told to a person as an
 //! attention; nothing about them is stored on the vessel or the environment. A restart rebuilds
@@ -22,6 +26,8 @@ use std::{
 use flotilla_credentials::{CredentialStore, GithubAppRefreshWake, GithubAppScope};
 use flotilla_crew::crew_capabilities::CardScope;
 use flotilla_resources::{
+    account_access::AccountChange,
+    convoy_records::ConvoyChange,
     environment_records::EnvironmentChange,
     vessel_records::{environment_vessels, EnvironmentVessel, EnvironmentVessels, VesselWithoutConvoy},
     CredentialGrant, CredentialSpec, Project, ReadWatchEvent, Repository, RepositoryKey, RepositoryTrust, TerminalSession,
@@ -63,6 +69,10 @@ struct Pending {
     codex_rotated: bool,
     /// Capability cards to refresh besides those of the environments delivered.
     cards: CardScope,
+    /// Convoys that changed: their sessions' cards are refreshed when what a card reads of them did.
+    convoys: BTreeSet<String>,
+    /// Convoys may have changed unheard: every one a card has read is compared.
+    convoys_rescanned: bool,
 }
 
 /// A request to deliver one environment now, answered once it has been tried.
@@ -207,6 +217,8 @@ impl CredentialDelivery {
         sources.spawn(watch_named::<CredentialGrant>(backend, self.namespace.clone(), Arc::clone(&self.events), |pending, _| {
             pending.definitions = true;
         }));
+        sources.spawn(watch_bindings(Arc::clone(&self.state), self.namespace.clone(), Arc::clone(&self.events)));
+        sources.spawn(watch_convoys(Arc::clone(&self.state), Arc::clone(&self.events)));
         loop {
             let deadline = self.next_deadline().await;
             tokio::select! {
@@ -253,6 +265,9 @@ impl CredentialDelivery {
         let mut cards = std::mem::take(&mut pending.cards);
         cards.every |= pending.all || pending.definitions || pending.codex_rotated;
         cards.environments.extend(environments.iter().cloned());
+        if !cards.every {
+            self.changed_convoys(&mut pending, &mut cards).await;
+        }
         let result = if pending.all || pending.definitions {
             if pending.definitions {
                 self.failures.clear();
@@ -315,6 +330,31 @@ impl CredentialDelivery {
                     rotated.then(|| tokio::time::Instant::now() + RETRY_INITIAL)
                 }
             };
+        }
+    }
+
+    /// Adds to `cards` each changed convoy whose cards read something of it that changed, each
+    /// read once by name: those `pending` names, or every convoy a card has read after a rescan.
+    async fn changed_convoys(&self, pending: &mut Pending, cards: &mut CardScope) {
+        let mut convoys = std::mem::take(&mut pending.convoys);
+        if pending.convoys_rescanned {
+            convoys.extend(self.state.daemon.card_convoys(&self.namespace));
+        }
+        for convoy in convoys {
+            if cards.convoys.contains(&convoy) {
+                continue;
+            }
+            match self.state.daemon.convoy_card_changed(&self.namespace, &convoy).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    cards.convoys.insert(convoy);
+                }
+                Err(error) => {
+                    // Unread, it may have changed: its cards read it themselves.
+                    debug!(%convoy, %error, "credential delivery could not compare a convoy with its cards");
+                    cards.convoys.insert(convoy);
+                }
+            }
         }
     }
 
@@ -596,6 +636,66 @@ async fn watch_environments(state: Arc<ControllerRuntimeState>, events: Arc<Cred
             }),
             Ok(EnvironmentChange::Rescanned) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 events.record(|pending| pending.all = true)
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Names the convoy of each changed account binding: its sessions' cards list their bindings. A
+/// watch that reopened may have missed changes, so every card is refreshed.
+async fn watch_bindings(state: Arc<ControllerRuntimeState>, namespace: String, events: Arc<CredentialEvents>) {
+    let accounts = state.daemon.account_records();
+    let mut failures = 0_u32;
+    loop {
+        match accounts.changes(&namespace).await {
+            Ok(mut changes) => {
+                events.record(|pending| pending.cards.every = true);
+                while let Some(change) = changes.next().await {
+                    match change {
+                        Ok(AccountChange::Binding { convoy: Some(convoy), .. }) => {
+                            failures = 0;
+                            events.record(|pending| {
+                                pending.cards.convoys.insert(convoy);
+                            });
+                        }
+                        // A binding is ended, which is a change, before it is removed; no card
+                        // reads a provision.
+                        Ok(_) => failures = 0,
+                        Err(error) => {
+                            debug!(%error, "credential delivery account binding watch failed");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(error) => debug!(%error, "credential delivery account binding watch did not open"),
+        }
+        failures = failures.saturating_add(1);
+        if failures > WATCH_RETRY_LIMIT {
+            warn!(failures, "credential delivery stops watching account bindings; other events still wake it");
+            return;
+        }
+        tokio::time::sleep(RETRY_INITIAL.min(Duration::from_secs(u64::from(failures)))).await;
+    }
+}
+
+/// Names each convoy whose record changed, at any home, and tells of a rescan.
+async fn watch_convoys(state: Arc<ControllerRuntimeState>, events: Arc<CredentialEvents>) {
+    let mut changes = match state.daemon.lifecycle_reads().convoys() {
+        Ok(convoys) => convoys.changes(),
+        Err(error) => {
+            warn!(%error, "credential delivery cannot follow convoys; other events still wake it");
+            return;
+        }
+    };
+    loop {
+        match changes.recv().await {
+            Ok(ConvoyChange::Changed { name, .. }) => events.record(|pending| {
+                pending.convoys.insert(name);
+            }),
+            Ok(ConvoyChange::Rescanned) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                events.record(|pending| pending.convoys_rescanned = true)
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
