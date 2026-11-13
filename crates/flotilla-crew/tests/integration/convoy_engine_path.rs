@@ -646,36 +646,174 @@ fn change_request_name(number: u64) -> String {
     record_name(&stored_change_request_address("github.com", "org/repo", number, &[]).expect("address")).expect("record name")
 }
 
-// Behaviour: a pass notes in its home's memory the evidence records it reads, the change request
-// its PR promise names and the artifact its ledger promise names, and an ended convoy reads none.
-#[tokio::test]
-async fn a_pass_notes_the_evidence_it_reads() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let mut convoy = ledger_convoy(&backend).await;
+/// The record name of convoy `convoy`'s coder's decision ledger slot.
+fn ledger_name(convoy: &str) -> String {
+    record_name(&artifact_address(convoy, "coder", "decision-ledger", convoy).expect("address")).expect("record name")
+}
+
+/// [`ledger_convoy`], whose coder has also submitted PR `number`.
+async fn pr_ledger_convoy(backend: &ResourceBackend, number: u64) -> ResourceObject<Convoy> {
+    let mut convoy = ledger_convoy(backend).await;
+    submit_pr(&mut convoy, number);
+    convoy
+}
+
+/// The coder of `convoy` submits PR `number`.
+fn submit_pr(convoy: &mut ResourceObject<Convoy>, number: u64) {
     let submit = PromiseOperation::Submit {
         id: "pr".into(),
         kind: PromiseKind::Pr,
         source: PromiseSource::Crew,
         submission: Submission {
-            reference: "cr/github.com/org/repo/1".into(),
+            reference: format!("cr/github.com/org/repo/{number}"),
             metadata: BTreeMap::new(),
             submitted_at: chrono::Utc::now(),
             verdict: None,
         },
     };
     promises::apply(convoy.status.as_mut().expect("status"), "work", "coder", &submit);
+}
+
+/// An engine path holding `engine`, for a wake beside the reconciler that reads through it.
+fn engine_path(engine: &Arc<Recording>) -> EngineConvoyPath {
+    let path: EngineConvoyPath = Arc::new(OnceLock::new());
+    let shared: Arc<dyn EngineConvoys> = Arc::clone(engine) as Arc<dyn EngineConvoys>;
+    assert!(path.set(shared).is_ok());
+    path
+}
+
+/// The names queued within 100 ms of the first, which comes within 5 s.
+async fn woken(queue: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> BTreeSet<String> {
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), queue.recv()).await.expect("woken").expect("queue");
+    let mut woken = BTreeSet::from([first]);
+    while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(100), queue.recv()).await {
+        woken.insert(name);
+    }
+    woken
+}
+
+// Behaviour: a pass notes in its home's memory the evidence records it reads, the change request
+// its PR promise names and the artifact its ledger promise names, and an ended convoy reads none.
+#[tokio::test]
+async fn a_pass_notes_the_evidence_it_reads() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut convoy = pr_ledger_convoy(&backend, 1).await;
     let engine = Arc::new(Recording { holds: true, ..Default::default() });
     let reconciler = reconciler(&backend, Arc::clone(&engine))
         .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
     reconciler.prepare(&convoy).await.expect("prepare");
-    let ledger = record_name(&artifact_address("c", "coder", "decision-ledger", "c").expect("address")).expect("record name");
     assert_eq!(engine.memory.reading("ChangeRequest", &change_request_name(1)), ["c"]);
-    assert_eq!(engine.memory.reading("Artifact", &ledger), ["c"]);
+    assert_eq!(engine.memory.reading("Artifact", &ledger_name("c")), ["c"]);
 
     convoy.status.as_mut().expect("status").phase = ConvoyPhase::Failed;
     reconciler.prepare(&convoy).await.expect("prepare");
     assert!(engine.memory.reading("ChangeRequest", &change_request_name(1)).is_empty(), "an ended convoy reads no evidence");
-    assert!(engine.memory.reading("Artifact", &ledger).is_empty(), "an ended convoy reads no evidence");
+    assert!(engine.memory.reading("Artifact", &ledger_name("c")).is_empty(), "an ended convoy reads no evidence");
+}
+
+// Behaviour: a pass notes the names it looks up, found or not, so a change request or ledger
+// artifact created later under one of them wakes the convoy, and a convoy that read other records
+// is not woken. A ledger's artifact is looked up by its slot's record name (convoy, role, kind
+// and subject), so an artifact the convoy has never seen reaches it under that name.
+#[tokio::test]
+async fn a_record_created_after_the_pass_wakes_the_convoy_that_looked_for_it() {
+    use flotilla_crew::convoy::EvidenceWake;
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    // The convoy's view is built on a backend of its own, so neither its ledger nor its PR exists
+    // where the pass looks.
+    let convoy = pr_ledger_convoy(&ResourceBackend::new(InMemoryBackend::default()), 1).await;
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    engine.memory.note_evidence("unrelated", "ChangeRequest", [change_request_name(2)].into());
+    engine.memory.note_evidence("unrelated", "Artifact", [ledger_name("unrelated")].into());
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
+    reconciler.prepare(&convoy).await.expect("prepare");
+    assert!(engine.promises.lock().expect("promises").is_empty(), "the pass found nothing to observe");
+
+    // Probes a third convoy reads, written until each wake has started and heard one.
+    engine.memory.note_evidence("probe", "ChangeRequest", (10_000..10_500).map(change_request_name).collect());
+    engine.memory.note_evidence("probe", "Artifact", (0..500).map(|n| ledger_name(&format!("probe-{n}"))).collect());
+    // A queue holds a name until the controller takes it, which a test never does, so each wake
+    // has its own queue.
+    let (change_request_sender, mut change_request_queue) = WorkQueueSender::channel();
+    let (artifact_sender, mut artifact_queue) = WorkQueueSender::channel();
+    let wakes: Vec<(Box<dyn SecondaryWatch<Primary = Convoy>>, WorkQueueSender)> = vec![
+        (
+            Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(NAMESPACE), engine: engine_path(&engine) }),
+            change_request_sender,
+        ),
+        (
+            Box::new(EvidenceWake { evidence: backend.including_replicas::<Artifact>(NAMESPACE), engine: engine_path(&engine) }),
+            artifact_sender,
+        ),
+    ];
+    let watches =
+        wakes.into_iter().map(|(wake, sender)| tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender))).collect::<Vec<_>>();
+    let mut probe = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            publish_merged_change_request(&backend, 10_000 + probe).await;
+            probe += 1;
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), change_request_queue.recv()).await {
+                assert_eq!(name, "probe");
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the change request wake heard a probe");
+    let mut probe = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            publish_ledger(&backend, &format!("probe-{probe}")).await;
+            probe += 1;
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), artifact_queue.recv()).await {
+                assert_eq!(name, "probe");
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the artifact wake heard a probe");
+
+    publish_merged_change_request(&backend, 1).await;
+    assert_eq!(woken(&mut change_request_queue).await, BTreeSet::from(["c".to_string()]), "the PR the convoy looked for wakes it alone");
+    publish_ledger(&backend, "c").await;
+    assert_eq!(woken(&mut artifact_queue).await, BTreeSet::from(["c".to_string()]), "the ledger the convoy looked for wakes it alone");
+    watches.iter().for_each(tokio::task::JoinHandle::abort);
+}
+
+// Behaviour: after a restart the home's memory is empty, so a change before a convoy's first
+// pass wakes nothing; that pass, which the controller queues for every convoy from its initial
+// listing (store-testkit controller_loop_reconciles_existing_primary_objects_from_initial_list),
+// reads the change, and notes the record so the next change wakes it.
+#[tokio::test]
+async fn after_a_restart_the_first_pass_reads_what_changed_before_it() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    // Only the PR promise, so the pass's one observation is its verdict.
+    let mut convoy = ledger_convoy(&backend).await;
+    convoy.status.as_mut().expect("status").promises.clear();
+    submit_pr(&mut convoy, 1);
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    publish_merged_change_request(&backend, 1).await;
+    assert!(engine.memory.reading("ChangeRequest", &change_request_name(1)).is_empty(), "nothing is noted before the first pass");
+
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
+    reconciler.prepare(&convoy).await.expect("prepare");
+    let verdicts = engine
+        .promises
+        .lock()
+        .expect("promises")
+        .iter()
+        .filter_map(|(_, _, operation, _)| match operation {
+            PromiseOperation::Verdict { verdict, .. } => Some((verdict.accepted, verdict.why.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(verdicts, [(true, "PR merged".to_string())], "the first pass reads the merge that came before it");
+    assert_eq!(engine.memory.reading("ChangeRequest", &change_request_name(1)), ["c"]);
 }
 
 /// What hearing one change of convoy c's change request reads, from when the wake has started,
@@ -724,11 +862,7 @@ async fn evidence_wake_reads(others: usize) -> (ReadSnapshot, usize, BTreeSet<St
     let before = backend.read_snapshot();
     publish_merged_change_request(&backend, 1).await;
     // The queue holds a name once until it is taken, so its creation and status may wake it once.
-    let first = tokio::time::timeout(std::time::Duration::from_secs(5), queue.recv()).await.expect("woken").expect("queue");
-    let mut woken = BTreeSet::from([first]);
-    while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(100), queue.recv()).await {
-        woken.insert(name);
-    }
+    let woken = woken(&mut queue).await;
     let reads = backend.read_snapshot().since(&before);
     watch.abort();
     (reads, convoy_reads, woken)
