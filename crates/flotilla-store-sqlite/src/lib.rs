@@ -106,27 +106,37 @@ mod read_pressure_contract {
     }
     // A busy SQLite writer holds the private in-memory read connection beyond
     // its real 2 s deadline. The controller stays in its original task and
-    // recovers.
+    // recovers. The controller registers its watch on the writer before its
+    // first list, so the writer is blocked between the two: the list is the
+    // read that waits out the deadline.
     #[tokio::test]
     async fn busy_writer_does_not_restart_controller() {
-        let sqlite = SqliteBackend::open_in_memory().unwrap();
+        let mut sqlite = SqliteBackend::open_in_memory().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let block = std::sync::Mutex::new(Some((sqlite.writer_for_test(), release_rx, blocked_tx)));
+        sqlite.pause_after_watch_registered(move || {
+            let block = block.lock().unwrap().take();
+            Box::pin(async move {
+                let Some((writer, release_rx, blocked_tx)) = block else { return };
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let blocked = tokio::spawn(async move {
+                    writer
+                        .call(move |_| {
+                            entered_tx.send(()).unwrap();
+                            let _ = release_rx.blocking_recv();
+                            Ok::<_, ResourceError>(())
+                        })
+                        .await
+                        .unwrap();
+                });
+                blocked_tx.send(blocked).unwrap();
+                entered_rx.await.unwrap();
+            })
+        });
         let backend = ResourceBackend::new(sqlite.clone());
         let spec = ConvoySpec::builder().workflow_ref("scratch".into()).build();
         backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("local".into()).build(), &spec).await.unwrap();
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let writer = sqlite.writer_for_test();
-        let blocked = tokio::spawn(async move {
-            writer
-                .call(move |_| {
-                    entered_tx.send(()).unwrap();
-                    let _ = release_rx.blocking_recv();
-                    Ok::<_, ResourceError>(())
-                })
-                .await
-                .unwrap();
-        });
-        entered_rx.await.unwrap();
         let reconciles = Arc::new(AtomicUsize::new(0));
         let controller = tokio::spawn(
             ControllerLoop {
@@ -137,6 +147,7 @@ mod read_pressure_contract {
             }
             .run(),
         );
+        let blocked = blocked_rx.await.unwrap();
         tokio::time::sleep(Duration::from_millis(2300)).await;
         assert!(!controller.is_finished(), "controller must retry its read in place");
         release_tx.send(()).unwrap();
