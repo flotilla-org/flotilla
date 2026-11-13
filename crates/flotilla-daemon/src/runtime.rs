@@ -1371,6 +1371,8 @@ async fn open_provisioning_lifecycles(
     // Every vessel reader goes through the engine's launches; this home's are written only here.
     let vessels = Arc::new(EngineVessels::over(Arc::clone(&lifecycles.vessels), daemon.decided_store()?));
     let vessel_changes = vessels.follow(daemon.decided_store()?)?;
+    // Capability cards follow a build's launches: a built image's verified tools are on them.
+    let image_build_changes = lifecycles.image_build_records.follow(daemon.decided_store()?)?;
     daemon.install_lifecycle_reads(Arc::new(
         LifecycleReadPort::new(StoreReads::new(store), home)
             .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>)
@@ -1382,7 +1384,7 @@ async fn open_provisioning_lifecycles(
             .with_terminals(terminals as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>)
             .with_vessels(vessels as Arc<dyn flotilla_resources::vessel_records::VesselRecords>),
     ))?;
-    Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes, terminal_changes, vessel_changes]))
+    Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes, terminal_changes, vessel_changes, image_build_changes]))
 }
 
 /// Daemon-owned image build state: the owned builder's Buildx state, build

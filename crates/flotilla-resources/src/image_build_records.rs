@@ -42,8 +42,22 @@ impl ImageBuildRecord {
     }
 }
 
+/// What changed among the builds' launches, at any home.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageBuildChange {
+    /// A launch of the build of this name changed.
+    Changed(String),
+    /// Any of them may have changed: a home's log was read afresh.
+    Rescanned,
+}
+
 /// The image build port. Every read is keyed or indexed.
 pub trait ImageBuildRecords: Send + Sync {
+    /// The builds' launch changes from now on, as their records are written or replicated here.
+    /// Where none are followed, the channel is closed.
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<ImageBuildChange> {
+        tokio::sync::broadcast::channel(1).1
+    }
     /// The newest launch of build `name`, at whichever home builds it; `None` before its builder
     /// has launched it.
     fn get(&self, name: &str) -> Result<Option<ImageBuildRecord>, String>;

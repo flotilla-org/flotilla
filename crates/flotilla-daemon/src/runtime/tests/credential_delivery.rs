@@ -1066,13 +1066,18 @@ impl flotilla_capability_contract::SessionCapabilitySource for CountedCards {
     }
 }
 
+/// The fulfilment kind both crews of [`RunningCards`] were placed by.
+const CARDS_KIND: &str = "cards-kind";
+
 /// The credential delivery controller running over two crews, `cards-session-0` and
-/// `cards-session-1`, each in a convoy and host-direct environment of its own; the first convoy's
-/// coder is bound to an account. Each card was read once before the controller started.
+/// `cards-session-1`, each in a convoy and environment of its own, both placed by [`CARDS_KIND`].
+/// The first convoy's coder is bound to an account, and its Docker environment runs the image of
+/// `build`, launched and not yet built. Each card was read once before the controller started.
 struct RunningCards {
     daemon: Arc<InProcessDaemon>,
     source: Arc<CountedCards>,
     convoys: Vec<String>,
+    build: String,
     _controller: AbortOnDropHandle<()>,
     _temp: TempDir,
 }
@@ -1087,10 +1092,33 @@ impl RunningCards {
         designate_fleet(&daemon).await;
         let fixture = engine(&daemon);
         let host = daemon.local_host_id().expect("local host").to_string();
+        daemon
+            .resource_backend()
+            .using::<FulfilmentKind>(NAMESPACE)
+            .create(
+                &empty_meta(CARDS_KIND),
+                &FulfilmentKindSpec {
+                    host_ref: host.clone(),
+                    pool: "test".to_string(),
+                    cost_class: Default::default(),
+                    grants: BTreeSet::from([flotilla_resources::FulfilmentGrant("network:scoped".to_string())]),
+                    realisation: FulfilmentRealisation::HostDirect,
+                },
+            )
+            .await
+            .expect("fulfilment kind");
+        fixture.image_builds.host("builder", "amd64");
+        let build = fixture.image_builds.put(&flotilla_provisioning_testkit::image_build_spec());
         let mut convoys = Vec::new();
         for n in 0..2 {
             let status = ConvoyStatus {
                 phase: ConvoyPhase::Active,
+                placement_decision: Some(
+                    PlacementDecision::builder()
+                        .kind(CARDS_KIND.to_string())
+                        .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host.clone()), display_name: host.clone() })
+                        .build(),
+                ),
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                     cascade: None,
                     stall_nudges: Default::default(),
@@ -1109,14 +1137,17 @@ impl RunningCards {
                 admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, &format!("cards-{n}"), spec, status)).await;
             let vessel = fixture.vessels.request(&launch, "work", &host);
             let environment = format!("cards-env-{n}");
-            engine_environments(&daemon).request(
-                &environment,
-                &EnvironmentSpec {
+            let spec = if n == 0 {
+                let mut spec = docker_environment_spec(&host, BTreeSet::new());
+                spec.docker.as_mut().expect("docker").image_build_ref = Some(build.clone());
+                spec
+            } else {
+                EnvironmentSpec {
                     host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
                     ..Default::default()
-                },
-                Some(&vessel),
-            );
+                }
+            };
+            engine_environments(&daemon).request(&environment, &spec, Some(&vessel));
             fixture.vessels.ready(&vessel, &environment);
             create_credential_test_session(&fixture.terminals, &format!("cards-session-{n}"), &vessel, &environment);
             convoys.push(launch);
@@ -1147,7 +1178,7 @@ impl RunningCards {
         let mut delivery = CredentialDelivery::new(Arc::clone(&state)).expect("a credential store");
         delivery.start().await.expect("nothing to deliver");
         let controller = AbortOnDropHandle::new(tokio::spawn(delivery.run(state.controller_metrics.for_kind("CredentialDelivery"))));
-        Self { daemon, source, convoys, _controller: controller, _temp: temp }
+        Self { daemon, source, convoys, build, _controller: controller, _temp: temp }
     }
 
     /// The capability Message to convoy `n`'s coder whose body names `text`.
@@ -1185,4 +1216,30 @@ async fn a_rebind_reaches_a_running_sessions_card_with_no_other_event() {
     assert!(!card.body.contains("claude-max"), "{}", card.body);
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(cards.source.readings("cards-session-1"), other, "the other convoy's card is not read again");
+}
+
+// Behaviour: a change to the grants of the fulfilment kind a crew was placed by reaches its
+// running card, with no other event.
+#[tokio::test]
+async fn a_fulfilment_kinds_grants_reach_a_running_sessions_card_with_no_other_event() {
+    let cards = RunningCards::start().await;
+    cards.source.settled("cards-session-0", 1).await;
+    let kinds = cards.daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
+    let kind = kinds.get(CARDS_KIND).await.expect("fulfilment kind");
+    let mut spec = kind.spec.clone();
+    spec.grants.insert(flotilla_resources::FulfilmentGrant("network:host".to_string()));
+    kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("grant host networking");
+
+    cards.card_naming(0, "You can use host networking and its available egress.").await;
+}
+
+// Behaviour: an image build becoming built reaches the running card of a crew on its image, with
+// no other event: the card lists the image's verified tools.
+#[tokio::test]
+async fn a_built_image_reaches_a_running_sessions_card_with_no_other_event() {
+    let cards = RunningCards::start().await;
+    cards.source.settled("cards-session-0", 1).await;
+    engine(&cards.daemon).image_builds.finish(&cards.build, flotilla_provisioning_testkit::Ending::Ready("sha256:built"));
+
+    cards.card_naming(0, "Verified tools and runtimes: tool:verified.").await;
 }

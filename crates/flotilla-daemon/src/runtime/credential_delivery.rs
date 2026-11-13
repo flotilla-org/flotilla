@@ -10,7 +10,9 @@
 //!
 //! Each pass also refreshes the capability cards its events touch: those of the environments it
 //! delivered or re-minted for, of a convoy whose account binding changed, and of a convoy whose
-//! change touched what its cards read; every card when it delivered every environment.
+//! change touched what its cards read; every card when it delivered every environment, a
+//! fulfilment kind's grants changed, or an image build became built or stopped being built. A
+//! card's endpoints change only at its session's launch, which renders the card itself.
 //!
 //! A failed delivery is retried at a backoff a finite number of times, then waits for an event
 //! naming its environment. Failures are traced and, for refreshes, told to a person as an
@@ -29,9 +31,10 @@ use flotilla_resources::{
     account_access::AccountChange,
     convoy_records::ConvoyChange,
     environment_records::EnvironmentChange,
+    image_build_records::ImageBuildChange,
     vessel_records::{environment_vessels, EnvironmentVessel, EnvironmentVessels, VesselWithoutConvoy},
-    CredentialGrant, CredentialSpec, Project, ReadWatchEvent, Repository, RepositoryKey, RepositoryTrust, TerminalSession,
-    TerminalSessionPhase, WatchEvent,
+    CredentialGrant, CredentialSpec, FulfilmentGrant, FulfilmentKind, Project, ReadWatchEvent, Repository, RepositoryKey, RepositoryTrust,
+    TerminalSession, TerminalSessionPhase, WatchEvent,
 };
 use flotilla_store::load_metrics::ControllerLoadMetrics;
 use futures::StreamExt;
@@ -219,6 +222,8 @@ impl CredentialDelivery {
         }));
         sources.spawn(watch_bindings(Arc::clone(&self.state), self.namespace.clone(), Arc::clone(&self.events)));
         sources.spawn(watch_convoys(Arc::clone(&self.state), Arc::clone(&self.events)));
+        sources.spawn(watch_fulfilment_kinds(self.state.daemon.resource_backend(), self.namespace.clone(), Arc::clone(&self.events)));
+        sources.spawn(watch_image_builds(Arc::clone(&self.state), Arc::clone(&self.events)));
         loop {
             let deadline = self.next_deadline().await;
             tokio::select! {
@@ -696,6 +701,97 @@ async fn watch_convoys(state: Arc<ControllerRuntimeState>, events: Arc<Credentia
             }),
             Ok(ConvoyChange::Rescanned) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 events.record(|pending| pending.convoys_rescanned = true)
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Refreshes every card when a fulfilment kind's grants change, at any home: a card lists the
+/// grants of its work's placement. Kinds change rarely, so no card is singled out.
+async fn watch_fulfilment_kinds(backend: flotilla_store::ResourceBackend, namespace: String, events: Arc<CredentialEvents>) {
+    // Each kind's grants as last seen; a kind not seen since the watch opened counts as changed.
+    let mut grants = BTreeMap::<String, BTreeSet<FulfilmentGrant>>::new();
+    let mut failures = 0_u32;
+    loop {
+        match backend.including_replicas::<FulfilmentKind>(&namespace).watch().await {
+            Ok(mut changes) => {
+                // Changes may have been missed while the watch was closed.
+                grants.clear();
+                events.record(|pending| pending.cards.every = true);
+                while let Some(change) = changes.next().await {
+                    let changed = match change {
+                        Ok(ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read)) => {
+                            let now = read.object.spec.grants;
+                            grants.insert(read.object.metadata.name, now.clone()).is_none_or(|before| before != now)
+                        }
+                        Ok(ReadWatchEvent::Deleted(read)) => {
+                            grants.remove(&read.object.metadata.name);
+                            true
+                        }
+                        Ok(ReadWatchEvent::DeletedByName { tombstone, .. }) => {
+                            grants.remove(&tombstone.name);
+                            true
+                        }
+                        Err(error) => {
+                            debug!(%error, "credential delivery fulfilment kind watch failed");
+                            break;
+                        }
+                    };
+                    failures = 0;
+                    if changed {
+                        events.record(|pending| pending.cards.every = true);
+                    }
+                }
+            }
+            Err(error) => debug!(%error, "credential delivery fulfilment kind watch did not open"),
+        }
+        failures = failures.saturating_add(1);
+        if failures > WATCH_RETRY_LIMIT {
+            warn!(failures, "credential delivery stops watching fulfilment kinds; other events still wake it");
+            return;
+        }
+        tokio::time::sleep(RETRY_INITIAL.min(Duration::from_secs(u64::from(failures)))).await;
+    }
+}
+
+/// Refreshes every card when a build becomes built or stops being built: a card lists a built
+/// image's verified tools. No index finds the environments on one image, so no card is singled
+/// out; a launch's other steps refresh none.
+async fn watch_image_builds(state: Arc<ControllerRuntimeState>, events: Arc<CredentialEvents>) {
+    let reads = state.daemon.lifecycle_reads();
+    let mut changes = match reads.image_builds() {
+        Ok(builds) => builds.changes(),
+        Err(error) => {
+            warn!(%error, "credential delivery cannot follow image builds; other events still wake it");
+            return;
+        }
+    };
+    // Whether each build was built when last read; a build not read yet counts as changed.
+    let mut built = BTreeMap::<String, bool>::new();
+    loop {
+        match changes.recv().await {
+            Ok(ImageBuildChange::Changed(name)) => {
+                let (reads, read) = (Arc::clone(&reads), name.clone());
+                let read = tokio::task::spawn_blocking(move || reads.image_builds()?.get(&read))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("image build read: {error}")));
+                let now = match read {
+                    Ok(build) => build.is_some_and(|build| build.digest().is_some()),
+                    Err(error) => {
+                        debug!(%error, build = %name, "credential delivery could not read an image build; refreshing every card");
+                        built.remove(&name);
+                        events.record(|pending| pending.cards.every = true);
+                        continue;
+                    }
+                };
+                if built.insert(name, now) != Some(now) {
+                    events.record(|pending| pending.cards.every = true);
+                }
+            }
+            Ok(ImageBuildChange::Rescanned) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                built.clear();
+                events.record(|pending| pending.cards.every = true);
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }

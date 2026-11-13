@@ -14,7 +14,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use flotilla_engine_store::plain::{PendingChange, PlainError, PlainLog};
 use flotilla_protocol::LifecycleReading;
 use flotilla_resources::{
-    image_build_records::{ImageBuildRecord, ImageBuildRecords},
+    clone_records::launched,
+    image_build_records::{ImageBuildChange, ImageBuildRecord, ImageBuildRecords},
     ImageBuildReservation, ImageBuildSpec, ImageDelivery,
 };
 use flotilla_schema::{Frozen, Kind, NewChange, Ref, Timestamp};
@@ -209,7 +210,11 @@ pub struct EngineImageBuilds {
     reads: StoreReads,
     log: PlainLog,
     homes: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    changes: tokio::sync::broadcast::Sender<ImageBuildChange>,
 }
+
+/// How many changes a slow follower may fall behind by; one that lags rereads what it holds.
+const CHANGES: usize = 256;
 
 impl EngineImageBuilds {
     /// The port over `store`, whose homes `homes` names.
@@ -218,13 +223,36 @@ impl EngineImageBuilds {
         store: Arc<StoreHandle>,
         homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
-        Self { lifecycles, reads: StoreReads::new(Arc::clone(&store)), log: PlainLog::new(store), homes: Box::new(homes) }
+        Self {
+            lifecycles,
+            reads: StoreReads::new(Arc::clone(&store)),
+            log: PlainLog::new(store),
+            homes: Box::new(homes),
+            changes: tokio::sync::broadcast::channel(CHANGES).0,
+        }
     }
 
     /// The port over `service`'s store and homes.
     pub fn over(lifecycles: Arc<dyn Lifecycles<ImageBuildKind>>, service: Arc<Service>) -> Self {
         let store = service.store();
         Self::new(lifecycles, store, move || service.homes())
+    }
+
+    /// Follows the builds' launches in `service`'s log, at every home, telling
+    /// [`ImageBuildRecords::changes`] of each. It runs at the store's commits.
+    pub fn follow(&self, service: Arc<Service>) -> Result<tokio::task::JoinHandle<()>, String> {
+        let mut watch = EngineWatch::start(service, [<Resource<ImageBuild> as Kind>::CODE]).map_err(|error| error.to_string())?;
+        let changes = self.changes.clone();
+        Ok(tokio::spawn(async move {
+            loop {
+                let followed = watch.next(|_, followed| Ok(followed.into_iter().map(image_build_change).collect::<Vec<_>>())).await;
+                match followed {
+                    // No follower is no reason to stop: one may subscribe later.
+                    Ok(followed) => followed.into_iter().for_each(|change| drop(changes.send(change))),
+                    Err(error) => tracing::warn!(%error, "the image builds' changes could not be read from the log; retrying"),
+                }
+            }
+        }))
     }
 
     fn home(&self) -> &str {
@@ -240,7 +268,19 @@ impl EngineImageBuilds {
     }
 }
 
+/// What a followed write of a build's launch tells readers: the build it is a launch of.
+fn image_build_change(followed: flotilla_engine_store::follow::Followed) -> ImageBuildChange {
+    match followed {
+        flotilla_engine_store::follow::Followed::Changed(identity) => ImageBuildChange::Changed(launched(&identity.name).to_owned()),
+        flotilla_engine_store::follow::Followed::Rescan(_) => ImageBuildChange::Rescanned,
+    }
+}
+
 impl ImageBuildRecords for EngineImageBuilds {
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<ImageBuildChange> {
+        self.changes.subscribe()
+    }
+
     fn get(&self, name: &str) -> Result<Option<ImageBuildRecord>, String> {
         let homes = (self.homes)();
         self.reads

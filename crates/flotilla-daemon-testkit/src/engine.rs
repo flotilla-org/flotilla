@@ -43,13 +43,14 @@ pub fn engine(daemon: &InProcessDaemon) -> Arc<EngineFixture> {
         return engine;
     }
     let engine = Arc::new(EngineFixture::over_service(&service));
-    // Its terminal sessions', vessels', environments' and checkouts' readers and watchers hear each
+    // Its terminal sessions', vessels', environments', checkouts' and image builds' readers and watchers hear each
     // launch change, as the runtime's do. The followers run on the test's runtime and end with it.
     if tokio::runtime::Handle::try_current().is_ok() {
         drop(engine.terminals.terminals.follow(Arc::clone(&service)).expect("follow the terminal sessions"));
         drop(engine.vessels.vessels.follow(Arc::clone(&service)).expect("follow the vessels"));
         drop(engine.environments.environments.follow(Arc::clone(&service)).expect("follow the environments"));
         drop(engine.checkouts.checkouts.follow(Arc::clone(&service)).expect("follow the checkouts"));
+        drop(engine.image_builds.builds.follow(Arc::clone(&service)).expect("follow the image builds"));
     }
     daemon
         .install_lifecycle_reads(Arc::new(Held { reads: engine.reads(), _engine: Arc::clone(&engine) }))
