@@ -27,9 +27,10 @@ use flotilla_resources::{
     CharterPointer, CharterSource, CharterStoreBinding, ConvoyEnsureSpec, CredentialConsumer, CredentialGrantSelector, CredentialGrantSpec,
     CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpecSpec, CrewDefaultsSpec,
     DeclarationRefusedCondition, DispatchQueueAttention, FleetDesignationSpec, ForgeKind, ForgeSpec, HostActionSelector, HostImageAction,
-    ImageCacheBinding, ImageLayerResourceSpec, ImageSelection, LandingCredentialScope, ObjectMeta, OperationalEntriesCondition, Project,
-    ProjectRepositorySpec, ProjectSpec, ProjectStatus, RepositoryKey, RepositoryTrust, Resource, ResourceObject, RoleDefinition,
-    RoleSubscription, WorkflowTemplateSpec, BOOTSTRAP_PATH_ANNOTATION, MANAGED_BY_LABEL, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
+    ImageCacheBinding, ImageLayerResourceSpec, ImageSelection, LandingCredentialScope, ManifestRoot, ManifestRootSpec, ObjectMeta,
+    OperationalEntriesCondition, Project, ProjectRepositorySpec, ProjectSpec, ProjectStatus, RepositoryKey, RepositoryTrust, Resource,
+    ResourceObject, RoleDefinition, RoleSubscription, WorkflowTemplateSpec, BOOTSTRAP_PATH_ANNOTATION, MANAGED_BY_LABEL,
+    PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
 };
 use hegel::{generators as gs, TestCase};
 
@@ -64,6 +65,15 @@ fn copy<R: Resource>(
         object: ResourceObject { metadata: meta(name, labels, annotations, 1), spec, status: None },
         home: home.to_owned(),
     }
+}
+
+/// The old ManifestRoots the stamps in these tests name, each at its home.
+fn held_roots() -> Vec<(ResourceObject<ManifestRoot>, String)> {
+    let root = |name: &str, home: &str| {
+        let spec = ManifestRootSpec::builder().host(home.to_owned()).path(format!("/{name}")).source("src".to_owned()).build();
+        (ResourceObject { metadata: meta(name, BTreeMap::new(), BTreeMap::new(), 1), spec, status: None }, home.to_owned())
+    };
+    vec![root("root", "alpha"), root("a-root", "alpha"), root("b-root", "beta")]
 }
 
 fn pick<'a, T>(tc: &TestCase, items: &'a [T]) -> &'a T {
@@ -364,21 +374,25 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
         workflow_templates: vec![copy("template", "alpha", labels.clone(), annotations.clone(), template.clone())],
         convoy_ensures: vec![copy("ensure", "alpha", labels.clone(), annotations.clone(), ensure.clone())],
         projects: vec![copy("project", "alpha", labels.clone(), annotations.clone(), project_spec.clone())],
+        manifest_roots: held_roots(),
     };
     let report = rehearse_definitions(&copies);
     assert!(report.refused.is_empty(), "{:?}", report.refused);
     assert_eq!(report.imported.values().sum::<usize>(), 9, "{report:?}");
 
     let mut report = ImportReport::default();
-    let forge = only_imported(import_kind::<ForgeDefinition>(&copies.forges, &mut report));
-    let fleet = only_imported(import_kind::<FleetDesignationDefinition>(&copies.fleet_designations, &mut report));
-    let credential_record = only_imported(import_kind::<CredentialSpecDefinition>(&copies.credential_specs, &mut report));
-    let grant_record = only_imported(import_kind::<CredentialGrantDefinition>(&copies.credential_grants, &mut report));
-    let defaults_record = only_imported(import_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, &mut report));
-    let layer_record = only_imported(import_kind::<ImageLayerDefinition>(&copies.image_layers, &mut report));
-    let template_record = only_imported(import_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, &mut report));
-    let project_record = only_imported(import_kind::<ProjectDefinition>(&copies.projects, &mut report));
-    let ensure_record = only_imported(import_kind::<ConvoyEnsureDefinition>(&copies.convoy_ensures, &mut report));
+    let forge = only_imported(import_kind::<ForgeDefinition>(&copies.forges, &copies.manifest_roots, &mut report));
+    let fleet = only_imported(import_kind::<FleetDesignationDefinition>(&copies.fleet_designations, &copies.manifest_roots, &mut report));
+    let credential_record =
+        only_imported(import_kind::<CredentialSpecDefinition>(&copies.credential_specs, &copies.manifest_roots, &mut report));
+    let grant_record =
+        only_imported(import_kind::<CredentialGrantDefinition>(&copies.credential_grants, &copies.manifest_roots, &mut report));
+    let defaults_record = only_imported(import_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, &copies.manifest_roots, &mut report));
+    let layer_record = only_imported(import_kind::<ImageLayerDefinition>(&copies.image_layers, &copies.manifest_roots, &mut report));
+    let template_record =
+        only_imported(import_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, &copies.manifest_roots, &mut report));
+    let project_record = only_imported(import_kind::<ProjectDefinition>(&copies.projects, &copies.manifest_roots, &mut report));
+    let ensure_record = only_imported(import_kind::<ConvoyEnsureDefinition>(&copies.convoy_ensures, &copies.manifest_roots, &mut report));
     assert_eq!(ensure_record.record.spec(), ensure);
     for record_origin in [
         &ensure_record.origin,
@@ -460,7 +474,7 @@ fn forge_spec(url: &str) -> ForgeSpec {
 fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
     let homes = |copies: &[DefinitionCopy<flotilla_resources::Forge>]| {
         let mut report = ImportReport::default();
-        let records = import_kind::<ForgeDefinition>(copies, &mut report);
+        let records = import_kind::<ForgeDefinition>(copies, &held_roots(), &mut report);
         (records.into_iter().map(|record| (record.namespace, record.name, record.home)).collect::<Vec<_>>(), report)
     };
     let row = |namespace: &str, name: &str, home: &str, created: i64| (namespace.to_owned(), name.to_owned(), home.to_owned(), created);
@@ -497,7 +511,7 @@ fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
     // Two homes' concurrent values: a conflict, imported with the merged value and noted.
     let conflicting = [at_home("alpha", None, forge_spec("https://x"), 1), at_home("beta", None, forge_spec("https://y"), 1)];
     let mut report = ImportReport::default();
-    let records = import_kind::<ForgeDefinition>(&conflicting, &mut report);
+    let records = import_kind::<ForgeDefinition>(&conflicting, &[], &mut report);
     let merged = flotilla_store::merge_definition_copies(
         conflicting.iter().map(|copy| (copy.object.clone(), flotilla_protocol::NodeId::new(copy.home.clone()))).collect(),
     )
@@ -576,7 +590,8 @@ fn project_ops_copies_import_at_each_home_that_holds_them() {
     };
     let ensure_homes = |copies: &[DefinitionCopy<flotilla_resources::ConvoyEnsure>]| {
         let mut report = ImportReport::default();
-        let homes = import_kind::<ConvoyEnsureDefinition>(copies, &mut report).into_iter().map(|record| record.home).collect::<Vec<_>>();
+        let homes =
+            import_kind::<ConvoyEnsureDefinition>(copies, &[], &mut report).into_iter().map(|record| record.home).collect::<Vec<_>>();
         assert!(report.refused.is_empty(), "{report:?}");
         (homes, report)
     };
@@ -602,7 +617,7 @@ fn project_ops_copies_import_at_each_home_that_holds_them() {
         copy
     };
     let mut report = ImportReport::default();
-    let homes = import_kind::<WorkflowTemplateDefinition>(&[template_at("alpha", 1), template_at("kiwi", 5)], &mut report)
+    let homes = import_kind::<WorkflowTemplateDefinition>(&[template_at("alpha", 1), template_at("kiwi", 5)], &[], &mut report)
         .into_iter()
         .map(|record| record.home)
         .collect::<Vec<_>>();

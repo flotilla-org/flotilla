@@ -34,8 +34,8 @@ use flotilla_protocol::NodeId;
 use flotilla_resources::{
     builtins::is_builtin,
     definitions::{declares, DefinitionOrigin},
-    ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, ObjectMeta,
-    Project, Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
+    ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec,
+    ManifestRoot as OldRoot, ObjectMeta, Project, Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use flotilla_schema::{CreatedAt, Kind, Timestamp};
 use flotilla_store::{definition_is_live, merge_definition_copies};
@@ -43,7 +43,7 @@ use flotilla_store::{definition_is_live, merge_definition_copies};
 use super::{
     import::{ImportRefusal, ImportReport, RowOutcome},
     project_import::write_project_ops,
-    provenance::change_of,
+    provenance::{change_of, legacy_root, stamped_root, DeclaringRoot},
 };
 use crate::stored::{
     definition::{
@@ -131,6 +131,9 @@ pub struct DefinitionCopies {
     pub convoy_ensures: Vec<DefinitionCopy<ConvoyEnsure>>,
     /// Project (layer 3b), with its ProjectOps records from the copies' statuses.
     pub projects: Vec<DefinitionCopy<Project>>,
+    /// Every home's old ManifestRoots, each with its home, imported or not: a previous-generation
+    /// stamp naming its host is matched against the roots of the copy's home.
+    pub manifest_roots: Vec<(ResourceObject<OldRoot>, String)>,
 }
 
 /// Maps every copy in `copies` onto the engine, restores each record into one temporary store
@@ -150,15 +153,16 @@ pub fn rehearse_definitions(copies: &DefinitionCopies) -> ImportReport {
 /// imports, each through the change its origin's writer makes, into `report`. A name is
 /// reported only where a copy of it is held at a home `target` imports.
 pub fn import_definitions(copies: &DefinitionCopies, target: &mut impl ImportTarget, report: &mut ImportReport) {
-    write_kind::<ForgeDefinition>(&copies.forges, target, report);
-    write_kind::<FleetDesignationDefinition>(&copies.fleet_designations, target, report);
-    write_kind::<CredentialSpecDefinition>(&copies.credential_specs, target, report);
-    write_kind::<CredentialGrantDefinition>(&copies.credential_grants, target, report);
-    write_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, target, report);
-    write_kind::<ImageLayerDefinition>(&copies.image_layers, target, report);
-    write_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, target, report);
-    write_kind::<ConvoyEnsureDefinition>(&copies.convoy_ensures, target, report);
-    let projects = write_kind::<ProjectDefinition>(&copies.projects, target, report);
+    let roots = &copies.manifest_roots;
+    write_kind::<ForgeDefinition>(&copies.forges, roots, target, report);
+    write_kind::<FleetDesignationDefinition>(&copies.fleet_designations, roots, target, report);
+    write_kind::<CredentialSpecDefinition>(&copies.credential_specs, roots, target, report);
+    write_kind::<CredentialGrantDefinition>(&copies.credential_grants, roots, target, report);
+    write_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, roots, target, report);
+    write_kind::<ImageLayerDefinition>(&copies.image_layers, roots, target, report);
+    write_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, roots, target, report);
+    write_kind::<ConvoyEnsureDefinition>(&copies.convoy_ensures, roots, target, report);
+    let projects = write_kind::<ProjectDefinition>(&copies.projects, roots, target, report);
     write_project_ops(&copies.projects, &projects, target, report);
 }
 
@@ -176,19 +180,26 @@ pub struct ImportedDefinition<S> {
 }
 
 /// Maps the copies of `D`'s kind onto engine records, one group of copies per namespace and name.
-/// Drops are counted and refusals listed in `report`.
-pub fn import_kind<D: DefinitionKind>(copies: &[DefinitionCopy<D::Old>], report: &mut ImportReport) -> Vec<ImportedDefinition<D::Stored>>
+/// Drops are counted and refusals listed in `report`. A manifest stamp is resolved against
+/// `roots`, every home's old ManifestRoots.
+pub fn import_kind<D: DefinitionKind>(
+    copies: &[DefinitionCopy<D::Old>],
+    roots: &[(ResourceObject<OldRoot>, String)],
+    report: &mut ImportReport,
+) -> Vec<ImportedDefinition<D::Stored>>
 where
     ResourceObject<D::Old>: Clone,
 {
-    import_kind_at::<D>(copies, &|_| true, report)
+    import_kind_at::<D>(copies, roots, &|_| true, report)
 }
 
 /// [`import_kind`] for the homes `imports` accepts: every copy is merged, but only records homed
 /// at an accepted home are made, and a name is counted, noted or refused only where an accepted
-/// home holds a copy of it.
+/// home holds a copy of it. A previous-generation stamp is resolved against `roots`, every
+/// home's old ManifestRoots.
 pub fn import_kind_at<D: DefinitionKind>(
     copies: &[DefinitionCopy<D::Old>],
+    roots: &[(ResourceObject<OldRoot>, String)],
     imports: &dyn Fn(&str) -> bool,
     report: &mut ImportReport,
 ) -> Vec<ImportedDefinition<D::Stored>>
@@ -276,7 +287,7 @@ where
             ));
         }
         for copy in homes.into_iter().filter(|copy| imports(&copy.home)) {
-            let origin = match origin(&copy.object.metadata) {
+            let origin = match origin(&copy.object.metadata).and_then(|origin| legacy_root_at(origin, &copy.home, roots)) {
                 Ok(origin) => origin,
                 Err(reason) => {
                     report.refused.push(refuse(format!("at `{}`: {reason}", copy.home)));
@@ -329,6 +340,7 @@ where
 /// Writes the records `copies` import to, and returns the `(namespace, name)` of each written.
 fn write_kind<D: DefinitionKind>(
     copies: &[DefinitionCopy<D::Old>],
+    roots: &[(ResourceObject<OldRoot>, String)],
     target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) -> BTreeSet<(String, String)>
@@ -338,7 +350,7 @@ where
 {
     let kind = <D::Stored as Kind>::KIND;
     let mut written = BTreeSet::new();
-    for imported in import_kind_at::<D>(copies, &|home| target.imports(home), report) {
+    for imported in import_kind_at::<D>(copies, roots, &|home| target.imports(home), report) {
         let change = change_of(&imported.origin, &imported.home, Timestamp::from_datetime(&imported.created))
             .created_at(CreatedAt::from_datetime(&imported.created));
         match target.write(&imported.home, &imported.name, &change, &imported.record) {
@@ -350,6 +362,22 @@ where
         }
     }
     written
+}
+
+/// [`legacy_root`] for a copy at `home`: the stamp of a root `roots` holds at any home is left as
+/// it is; else it is matched against the live roots `roots` holds at `home`, imported in this run
+/// or not, so the outcome does not depend on the order kinds import.
+fn legacy_root_at(origin: DefinitionOrigin, home: &str, roots: &[(ResourceObject<OldRoot>, String)]) -> Result<DefinitionOrigin, String> {
+    let Some(root) = stamped_root(&origin) else { return Ok(origin) };
+    if roots.iter().any(|(held, _)| held.metadata.name == root) {
+        return Ok(origin);
+    }
+    let here: Vec<_> = roots
+        .iter()
+        .filter(|(held, held_home)| held_home == home && held.metadata.deletion_timestamp.is_none())
+        .map(|(held, _)| DeclaringRoot { name: held.metadata.name.clone(), host: held.spec.host.clone(), source: held.spec.source.clone() })
+        .collect();
+    legacy_root(origin, &here)
 }
 
 /// An origin's label, as the report counts it.

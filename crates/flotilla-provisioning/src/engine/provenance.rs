@@ -26,10 +26,10 @@ use flotilla_resources::{
     DocumentKey, RepositorySpec,
 };
 use flotilla_schema::{ChangeHeader, ChangeItem, Identity, Kind, KindCode, NewChange, Timestamp};
-use flotilla_schema_sqlite::{Loaded, Read, StoreError};
+use flotilla_schema_sqlite::{stream::Service, Loaded, Read, StoreError};
 use flotilla_state_machines::Resource;
 
-use super::manifest_root::generation_name;
+use super::manifest_root::{base, generation_name};
 use crate::stored::{
     manifest_root::{ManifestRoot, RootState},
     project::ProjectDefinition,
@@ -119,6 +119,86 @@ pub(crate) fn change_of(origin: &DefinitionOrigin, home: &str, at: Timestamp) ->
         DefinitionOrigin::Snapshot => (ADMISSION, Vec::new()),
     };
     NewChange::new(writer, at).with_items(items)
+}
+
+/// A live root a previous-generation stamp may name by its host: its name, host and source.
+pub(crate) struct DeclaringRoot {
+    pub name: String,
+    pub host: String,
+    pub source: String,
+}
+
+/// The root a manifest `origin` names, when it names one.
+pub(crate) fn stamped_root(origin: &DefinitionOrigin) -> Option<&str> {
+    match origin {
+        DefinitionOrigin::Manifest { root, .. } => Some(root),
+        _ => None,
+    }
+}
+
+/// ADR 0047 N→N+1: previous-generation provenance named the declaring host, not its ManifestRoot.
+/// For a manifest `origin` whose root names no root at any home, the stamp is read as such a host:
+/// the root becomes the one among `here`, the live roots of the record's home, with that host and
+/// the origin's source, as the convoy-ensure reconciler's fallback matches it. No such root, or
+/// several, is refused with which. Remove after one roll, with that fallback.
+pub(crate) fn legacy_root(mut origin: DefinitionOrigin, here: &[DeclaringRoot]) -> Result<DefinitionOrigin, String> {
+    let DefinitionOrigin::Manifest { root, source, .. } = &mut origin else { return Ok(origin) };
+    let source = source.as_deref().unwrap_or_default();
+    let matching: Vec<&str> =
+        here.iter().filter(|held| held.host == *root && held.source == source).map(|held| held.name.as_str()).collect();
+    match matching.as_slice() {
+        [name] => {
+            *root = (*name).to_owned();
+            Ok(origin)
+        }
+        [] => Err(format!(
+            "its manifest stamp names `{root}`, no root: as a previous-generation host stamp, no live root at its home declares host `{root}` with source `{source}`"
+        )),
+        several => Err(format!(
+            "its manifest stamp names `{root}`, no root: as a previous-generation host stamp, {} live roots at its home declare host `{root}` with source `{source}`: {}",
+            several.len(),
+            several.join(", ")
+        )),
+    }
+}
+
+/// [`legacy_root`] against `service`'s store, for a record written at `home`: a root of the
+/// stamped name at any home is a root, and leaves `origin` as it is; else this home's bound roots
+/// are read, which only a previous-generation stamp does.
+pub(crate) fn resolve_legacy_root(service: &Service, home: &str, origin: DefinitionOrigin) -> Result<DefinitionOrigin, String> {
+    let Some(root) = stamped_root(&origin) else { return Ok(origin) };
+    let here = service
+        .with_store(|store| {
+            let mut read = store.read()?;
+            if !read.resolve_named(ROOT, root)?.is_empty() {
+                return Ok(None);
+            }
+            let mut here = Vec::new();
+            let mut after = None;
+            loop {
+                let page = read.scan::<Resource<ManifestRoot>>(home, after, 64)?;
+                for id in page.ids {
+                    let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? else { continue };
+                    if matches!(loaded.value.state(), RootState::Bound { .. }) {
+                        let spec = loaded.value.spec();
+                        here.push(DeclaringRoot {
+                            name: base(&loaded.name).to_owned(),
+                            host: spec.host.clone(),
+                            source: spec.source.clone(),
+                        });
+                    }
+                }
+                after = page.next;
+                if after.is_none() {
+                    return Ok(Some(here));
+                }
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    match here {
+        Some(here) => legacy_root(origin, &here),
+        None => Ok(origin),
+    }
 }
 
 /// The project a workflow template written with `origin` is materialised for: its `project` column.

@@ -1075,3 +1075,116 @@ async fn placement_rows_import_as_kinds_and_none_stay_on_the_old_store() {
         assert!(holds::<flotilla_provisioning::stored::placement::FulfilmentKindDefinition>(&mut store, name, HERE), "{name}");
     }
 }
+
+// Behaviour (ADR 0047, #3108): a previous-generation manifest stamp named the declaring host, not
+// its root. Imported at its home with the root in the same import, the record names the root that
+// host and its source declare, and reads back with the root's source and the document's path; a
+// read re-applies, and a ConvoyEnsure's root resolves as this home's. A host stamp no live root
+// here matches, or several match, is refused, each with its own reason.
+#[tokio::test]
+async fn a_host_named_manifest_stamp_imports_as_the_root_it_names() {
+    use std::sync::Arc;
+
+    use flotilla_provisioning::engine::{definitions::EngineDefinitions, manifest_root::EngineManifestRoots, projects::EngineProjects};
+    use flotilla_resources::{
+        definition_provenance::{
+            MANIFEST_MANAGED_BY_VALUE, MANIFEST_PATH_ANNOTATION, MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION,
+            MANIFEST_SOURCE_ANNOTATION,
+        },
+        engine_records::EngineRecords,
+        manifest_roots::ManifestRoots,
+        DocumentKey, DocumentPhase, DocumentState, ManifestRootStatus, MANAGED_BY_LABEL,
+    };
+
+    let root_name = |path: &str, source: &str| crate::resource_manifest::manifest_root_name(HERE, Path::new(path), source);
+    let root = |path: &str, source: &str, declared: &[(&str, &str, &str)]| {
+        let documents = declared
+            .iter()
+            .map(|(document, kind, name)| {
+                let key = DocumentKey { path: (*document).into(), kind: (*kind).into(), namespace: NS.into(), name: (*name).into() };
+                let state = DocumentState {
+                    phase: DocumentPhase::Applied,
+                    reason: None,
+                    live_hash: Some("h".into()),
+                    desired_hash: Some("h".into()),
+                    baseline_hash: Some("h".into()),
+                    observed_at: "2026-10-19T00:00:00Z".parse().expect("time"),
+                    resolved_token: None,
+                    resolution_outcome: None,
+                    removed_in: None,
+                };
+                (key, state)
+            })
+            .collect();
+        let status = ManifestRootStatus { applied_revision: Some("rev-1".into()), source_error: None, documents, stalled: None };
+        document(
+            "ManifestRoot",
+            &root_name(path, source),
+            json!({"host": HERE, "path": path, "source": source}),
+            serde_json::to_value(status).expect("status"),
+        )
+    };
+    let stamped = |mut record: Value, source: &str, path: &str| {
+        record["metadata"]["labels"] = json!({ (MANAGED_BY_LABEL): MANIFEST_MANAGED_BY_VALUE });
+        record["metadata"]["annotations"] = json!({
+            (MANIFEST_RECONCILER_ROOT_ANNOTATION): HERE,
+            (MANIFEST_SOURCE_ANNOTATION): source,
+            (MANIFEST_PATH_ANNOTATION): path,
+            (MANIFEST_REVISION_ANNOTATION): "rev-1",
+        });
+        record
+    };
+    let ensure =
+        document("ConvoyEnsure", "quartermaster", json!({"project_ref": "app", "role": "quartermaster", "repositories": []}), Value::Null);
+    // The records come before their root: the outcome does not depend on the order rows are read.
+    let source = rows(vec![
+        stamped(project("app", "2026-10-19T00:00:00Z", json!([])), "project-map", "projects/app.yaml"),
+        stamped(ensure, "project-map", "ensures/quartermaster.yaml"),
+        stamped(project("unmatched", "2026-10-19T00:00:00Z", json!([])), "elsewhere", "projects/unmatched.yaml"),
+        stamped(project("doubled", "2026-10-19T00:00:00Z", json!([])), "twice", "projects/doubled.yaml"),
+        root(
+            "/ops",
+            "project-map",
+            &[("projects/app.yaml", "Project", "app"), ("ensures/quartermaster.yaml", "ConvoyEnsure", "quartermaster")],
+        ),
+        root("/first", "twice", &[]),
+        root("/second", "twice", &[]),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(ENGINE_STORE);
+    let mut target = Import::create(&path, HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&source, &mut target);
+    drop(target);
+    assert_eq!(summary.kinds["Project"].imported, 1, "{summary:?}");
+    assert_eq!(summary.kinds["ConvoyEnsure"].imported, 1, "{summary:?}");
+    let reasons: BTreeMap<&str, &str> = summary
+        .refusals
+        .iter()
+        .filter(|refusal| refusal.kind == "Project")
+        .map(|refusal| (refusal.name.as_str(), refusal.reason.as_str()))
+        .collect();
+    assert!(reasons["unmatched"].contains("no live root at its home declares host"), "{reasons:?}");
+    assert!(reasons["doubled"].contains("2 live roots at its home declare host"), "{reasons:?}");
+    assert_eq!(reasons.len(), 2, "{:?}", summary.refusals);
+
+    let declared = root_name("/ops", "project-map");
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(&path, HERE, crate::runtime::decided_registry().expect("registry")).expect("store"),
+    );
+    let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(flotilla_resources::SystemClock);
+    let projects = EngineProjects::open(service.clone(), clock.clone()).expect("projects");
+    let app = projects.get("Project", "app").await.expect("read").expect("imported");
+    // The manifest reconciler's "claimed by two sources" check passes once the stamp is its root's name.
+    assert_eq!(app.annotations[MANIFEST_RECONCILER_ROOT_ANNOTATION], declared);
+    assert_eq!(app.annotations[MANIFEST_SOURCE_ANNOTATION], "project-map");
+    assert_eq!(app.annotations[MANIFEST_PATH_ANNOTATION], "projects/app.yaml");
+    projects.apply("Project", "app", &app.labels, &app.annotations, app.spec.clone()).await.expect("a read re-applies");
+
+    let definitions = EngineDefinitions::open(service.clone(), clock.clone()).expect("definitions");
+    let ensure = definitions.get("ConvoyEnsure", "quartermaster").await.expect("read").expect("imported");
+    assert_eq!(ensure.annotations[MANIFEST_RECONCILER_ROOT_ANNOTATION], declared);
+    assert_eq!(ensure.annotations[MANIFEST_PATH_ANNOTATION], "ensures/quartermaster.yaml");
+    // The acting-home check's primary path: the stamped root, read as this home's.
+    let roots = EngineManifestRoots::open(service, clock).expect("roots");
+    assert!(roots.root(NS, &declared).await.expect("root").expect("held").local);
+}

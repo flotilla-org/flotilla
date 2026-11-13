@@ -8,7 +8,8 @@ use flotilla_provisioning::engine::{
     import::ImportReport,
 };
 use flotilla_resources::{
-    ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, Project, Resource, WorkflowTemplate,
+    ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ManifestRoot, Project, Resource,
+    WorkflowTemplate,
 };
 
 use super::{Carried, Source};
@@ -51,6 +52,8 @@ pub(super) fn definitions(source: &Source, target: &mut Import, _: &mut Carried,
         workflow_templates: copies::<WorkflowTemplate>(source, "workflowtemplates", target, report),
         convoy_ensures,
         projects: copies::<Project>(source, "projects", target, report),
+        // Read beside: the root step imports them, before or after.
+        manifest_roots: source.context::<ManifestRoot>("manifestroots", None).into_iter().map(|root| (root.object, root.home)).collect(),
     };
     import_definitions(&copies, target, report);
 }

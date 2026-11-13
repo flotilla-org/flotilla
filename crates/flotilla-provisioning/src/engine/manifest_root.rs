@@ -43,7 +43,7 @@ use crate::stored::manifest_root::{
 const ROOT: KindCode = <Resource<ManifestRoot> as Kind>::CODE;
 
 /// The name `name` was declared under: a generation's name without its `.<n>`.
-fn base(name: &str) -> &str {
+pub(crate) fn base(name: &str) -> &str {
     name.split_once('.').map_or(name, |(base, _)| base)
 }
 

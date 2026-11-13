@@ -41,7 +41,8 @@ fn manifest(revision: &str) -> DefinitionOrigin {
 
 /// Whether `read` says it is the manifest root's at `revision`. The root and revision are what both
 /// stores hold of the origin; on the engine the source and the document's path are read from the
-/// ManifestRoot record, which this contract does not hold.
+/// ManifestRoot record. The engine runs hold that root, because the engine refuses a stamp naming
+/// a root it does not hold; the old store holds none.
 fn assert_manifest(read: &flotilla_resources::ResourceObject<Forge>, revision: &str) {
     let found = origin(&read.metadata.labels, &read.metadata.annotations);
     let found = found.as_ref().map(|origin| match origin {
@@ -125,7 +126,7 @@ async fn the_old_store_keeps_the_definition_contract() {
     contract(&ResourceBackend::new(InMemoryBackend::default())).await;
 }
 
-fn engine_backend(directory: &tempfile::TempDir) -> ResourceBackend {
+async fn engine_backend(directory: &tempfile::TempDir) -> ResourceBackend {
     let mut kinds = flotilla_schema::KindRegistry::new();
     flotilla_provisioning::stored::definition::register(&mut kinds).expect("register");
     // The kinds a definition's change items name.
@@ -133,10 +134,22 @@ fn engine_backend(directory: &tempfile::TempDir) -> ResourceBackend {
     flotilla_provisioning::stored::repository::register(&mut kinds).expect("register repositories");
     flotilla_provisioning::stored::project::register(&mut kinds).expect("register projects");
     let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
+    hold_root(&service).await;
     let records = EngineDefinitions::open(service, Arc::new(SystemClock) as Arc<dyn Clock>).expect("open");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend.install_engine_records(Arc::new(records));
     backend
+}
+
+/// Declares the live root [`manifest`] stamps, at this home with its source.
+async fn hold_root(service: &Arc<Service>) {
+    use flotilla_provisioning::engine::manifest_root::EngineManifestRoots;
+    use flotilla_resources::manifest_roots::{ManifestRoots, RootDeclaration};
+
+    let roots = EngineManifestRoots::open(Arc::clone(service), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open roots");
+    let declaration =
+        RootDeclaration { host: "alpha".into(), path: "/manifests".into(), source: "project-map".into(), binding: None, ops: false };
+    roots.declare(NS, "manifest-0011223344556677", declaration).await.expect("declare");
 }
 
 // Behaviour (ADR 0053, ADR 0047): a previous generation's retired image layer still applies on the
@@ -145,7 +158,7 @@ fn engine_backend(directory: &tempfile::TempDir) -> ResourceBackend {
 #[tokio::test]
 async fn on_the_engine_a_retired_layer_applies_and_holds_nothing() {
     let directory = tempfile::tempdir().expect("temp dir");
-    let backend = engine_backend(&directory);
+    let backend = engine_backend(&directory).await;
     let layers = backend.definitions::<flotilla_resources::ImageLayer>(NS);
     let builtin = flotilla_resources::builtins::builtin_definitions("ImageLayer").expect("built-ins")[0].spec.clone();
     let current: flotilla_resources::ImageLayerResourceSpec = serde_json::from_value(builtin).expect("layer");
@@ -160,7 +173,7 @@ async fn on_the_engine_a_retired_layer_applies_and_holds_nothing() {
 #[tokio::test]
 async fn the_engine_keeps_the_definition_contract() {
     let directory = tempfile::tempdir().expect("temp dir");
-    let backend = engine_backend(&directory);
+    let backend = engine_backend(&directory).await;
     contract(&backend).await;
     // Nothing reached the old store.
     assert!(backend.store().list_raw(flotilla_store::ResourceKind::of::<Forge>(), NS).await.expect("old rows").items.is_empty());
@@ -180,6 +193,7 @@ async fn on_the_engine_one_root_revision_is_one_change() {
     flotilla_provisioning::stored::repository::register(&mut kinds).expect("register repositories");
     flotilla_provisioning::stored::project::register(&mut kinds).expect("register projects");
     let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
+    hold_root(&service).await;
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend.install_engine_records(Arc::new(
         EngineDefinitions::open(Arc::clone(&service), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open"),
@@ -256,6 +270,52 @@ async fn a_manifest_definition_reads_the_source_of_its_roots_live_generation() {
     forges.apply(&meta("lab", &manifest("r1")), &forge("lab")).await.expect("apply");
     let read = forges.get("lab").await.expect("get");
     assert_eq!(read.metadata.annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str), Some("third-map"));
+}
+
+// Behaviour (ADR 0047): a previous-generation stamp named the declaring host, not its root. An
+// apply carrying one is written under the one live root here with that host and source, and reads
+// back with that root's name; a host no live root here matches with that source, or several do,
+// is refused, each with its own reason.
+#[tokio::test]
+async fn an_apply_stamped_with_a_host_names_the_root_that_host_declares() {
+    use flotilla_provisioning::engine::manifest_root::EngineManifestRoots;
+    use flotilla_resources::manifest_roots::{ManifestRoots, RootDeclaration};
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::definition::register(&mut kinds).expect("register");
+    flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
+    flotilla_provisioning::stored::repository::register(&mut kinds).expect("register repositories");
+    flotilla_provisioning::stored::project::register(&mut kinds).expect("register projects");
+    let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
+    let clock = Arc::new(SystemClock) as Arc<dyn Clock>;
+    let roots = EngineManifestRoots::open(Arc::clone(&service), Arc::clone(&clock)).expect("open roots");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.install_engine_records(Arc::new(EngineDefinitions::open(service, clock).expect("open")));
+    for (name, path, source) in [
+        ("manifest-0011223344556677", "/manifests", "project-map"),
+        ("manifest-8899aabbccddeeff", "/first", "twice"),
+        ("manifest-0123456789abcdef", "/second", "twice"),
+    ] {
+        let declaration = RootDeclaration { host: "feta".into(), path: path.into(), source: source.into(), binding: None, ops: false };
+        roots.declare(NS, name, declaration).await.expect("declare");
+    }
+    let legacy = |source: &str| DefinitionOrigin::Manifest {
+        root: "feta".into(),
+        source: Some(source.into()),
+        path: Some("forges/lab.yaml".into()),
+        revision: "r1".into(),
+        charter: None,
+        materialized_project: None,
+    };
+
+    let forges = backend.definitions::<Forge>(NS);
+    forges.apply(&meta("lab", &legacy("project-map")), &forge("lab")).await.expect("apply");
+    assert_manifest(&forges.get("lab").await.expect("get"), "r1");
+    let unmatched = forges.apply(&meta("other", &legacy("elsewhere")), &forge("other")).await.expect_err("no root matches");
+    assert!(unmatched.to_string().contains("no live root at its home declares host `feta`"), "{unmatched}");
+    let doubled = forges.apply(&meta("other", &legacy("twice")), &forge("other")).await.expect_err("two roots match");
+    assert!(doubled.to_string().contains("2 live roots at its home declare host `feta`"), "{doubled}");
 }
 
 // Behaviour (#3108 item B): every watcher of the definitions on a daemon is woken by one shared

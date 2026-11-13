@@ -472,7 +472,7 @@ impl EngineRecords for EngineProjects {
     ) -> Result<EngineObject, String> {
         refuse_kind(kind)?;
         let spec: ProjectSpec = serde_json::from_value(spec).map_err(|error| format!("{KIND} spec: {error}"))?;
-        let origin = origin(labels, annotations)?;
+        let origin = provenance::resolve_legacy_root(&self.service, &self.home, origin(labels, annotations)?)?;
         let value = ProjectDefinition::new(&spec).map_err(|error| format!("{KIND} {name}: {error}"))?;
         let _writing = locked(&self.writing);
         if self.log.get::<ProjectDefinition>(name, &self.home).map_err(|error| error.to_string())?.is_none() {
