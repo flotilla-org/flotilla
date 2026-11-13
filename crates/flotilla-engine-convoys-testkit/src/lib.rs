@@ -5,15 +5,14 @@
 
 use std::sync::{Arc, OnceLock};
 
+mod counted;
+
+pub use counted::KeyedGets;
+use counted::{Meter, WithConvoys};
 use flotilla_engine_convoys::{convoy_engine::ConvoyEngine, convoy_records::EngineConvoyRecords, convoys::Convoys};
-use flotilla_protocol::LifecycleReading;
 use flotilla_resources::{
     convoy::engine::{engine_name, set_notes, EngineConvoyPath, EngineConvoys, VerdictScope},
-    convoy_records::ConvoyRecords,
-    environment_records::EnvironmentRecords,
-    lifecycle_reads::{LifecycleReads, ProvisioningKind},
-    terminal_records::TerminalRecords,
-    vessel_records::VesselRecords,
+    lifecycle_reads::LifecycleReads,
     Clock, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, ObjectMeta, ResourceObject, Selector, VesselRequirement,
     WorkflowSnapshot,
 };
@@ -25,6 +24,7 @@ pub struct EngineConvoysHome {
     convoys: Arc<Convoys>,
     views: Arc<ConvoyViews>,
     reads: Arc<dyn LifecycleReads>,
+    meter: Arc<Meter>,
     path: EngineConvoyPath,
     _dir: Option<tempfile::TempDir>,
 }
@@ -46,13 +46,19 @@ impl EngineConvoysHome {
         let records = EngineConvoyRecords::new(&home, Arc::clone(service), Arc::clone(convoys.memory()));
         // The views hear their changes from the store's log, on the test's runtime.
         drop(records.follow().expect("follow the convoy log"));
-        let reads: Arc<dyn LifecycleReads> = Arc::new(WithConvoys { reads, records });
+        let meter = Arc::new(Meter::default());
+        let reads: Arc<dyn LifecycleReads> = Arc::new(WithConvoys::new(reads, records, Arc::clone(&meter)));
         let views = Arc::new(ConvoyViews::new(namespace, Arc::clone(&reads)));
         backend.install_engine_records(Arc::clone(&views) as _);
         let path: EngineConvoyPath = Arc::new(OnceLock::new());
         let engine: Arc<dyn EngineConvoys> = Arc::new(ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), clock));
         assert!(path.set(engine).is_ok(), "a new path is empty");
-        Self { convoys, views, reads, path, _dir: None }
+        Self { convoys, views, reads, meter, path, _dir: None }
+    }
+
+    /// The keyed gets made through [`Self::reads`] so far, for read-cost tests.
+    pub fn keyed_gets(&self) -> KeyedGets {
+        self.meter.gets()
     }
 
     /// The Convoy views `backend` serves, for read-cost tests.
@@ -184,33 +190,5 @@ pub fn single_agent(role: &str) -> ConvoyStatus {
             supervision: None,
         }),
         ..ConvoyStatus::default()
-    }
-}
-
-/// A test's lifecycle reads, with the engine's convoys added.
-struct WithConvoys {
-    reads: Arc<dyn LifecycleReads>,
-    records: EngineConvoyRecords,
-}
-
-impl LifecycleReads for WithConvoys {
-    fn try_reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Result<Option<LifecycleReading>, String> {
-        self.reads.try_reading(kind, name, origin)
-    }
-
-    fn vessels(&self) -> Result<&dyn VesselRecords, String> {
-        self.reads.vessels()
-    }
-
-    fn terminals(&self) -> Result<&dyn TerminalRecords, String> {
-        self.reads.terminals()
-    }
-
-    fn environments(&self) -> Result<&dyn EnvironmentRecords, String> {
-        self.reads.environments()
-    }
-
-    fn convoys(&self) -> Result<&dyn ConvoyRecords, String> {
-        Ok(&self.records)
     }
 }

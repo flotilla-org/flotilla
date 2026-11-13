@@ -14,6 +14,7 @@ flotilla-resources = { path = "../flotilla-resources" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-store = { path = "../flotilla-store" }
 tempfile = { workspace = true }
+tokio = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]

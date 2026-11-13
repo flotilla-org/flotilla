@@ -275,6 +275,8 @@ pub struct EngineVessels {
     changes: tokio::sync::broadcast::Sender<VesselChange>,
     /// Launches read into records by listing, index and scan reads, the cost of those reads.
     launches_read: AtomicU64,
+    /// Convoy records [`VesselRecords::of_convoy`] reads by name, for its works.
+    convoys_read: AtomicU64,
 }
 
 /// How many changes a slow follower may fall behind by; one that lags rereads everything.
@@ -293,12 +295,18 @@ impl EngineVessels {
             homes: Arc::new(homes),
             changes: tokio::sync::broadcast::channel(CHANGES).0,
             launches_read: AtomicU64::new(0),
+            convoys_read: AtomicU64::new(0),
         }
     }
 
     /// How many launches listing, index and scan reads have read, for read-cost tests.
     pub fn launches_read(&self) -> u64 {
         self.launches_read.load(Ordering::Relaxed)
+    }
+
+    /// How many convoy records [`VesselRecords::of_convoy`] has read by name, for read-cost tests.
+    pub fn convoys_read(&self) -> u64 {
+        self.convoys_read.load(Ordering::Relaxed)
     }
 
     /// The port over `service`'s store and homes.
@@ -419,6 +427,7 @@ impl VesselRecords for EngineVessels {
                 }
                 let mut launches = Vec::new();
                 for id in convoys {
+                    self.convoys_read.fetch_add(1, Ordering::Relaxed);
                     let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
                     let admission = AdmissionDocument::decode(convoy, loaded.value.spec().admission.value().bytes())
                         .map_err(|error| ReadError(format!("convoy {convoy}'s admission: {error}")))?;
