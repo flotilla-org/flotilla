@@ -133,7 +133,7 @@ impl ResourceBackend {
         if let Some(port) = engines.ports.get(kind) {
             return Some(std::sync::Arc::clone(port));
         }
-        let held = crate::REGISTERED_RESOURCE_KINDS.iter().any(|registered| registered.engine_held && registered.kind == kind);
+        let held = crate::REGISTERED_RESOURCE_KINDS.iter().any(|registered| registered.kind == kind);
         (engines.home && held).then(|| {
             std::sync::Arc::new(crate::uncomposed_records::Uncomposed { kind: kind.to_owned() })
                 as std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>

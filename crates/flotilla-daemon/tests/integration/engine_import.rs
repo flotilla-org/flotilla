@@ -289,12 +289,6 @@ impl std::fmt::Display for EnsureOrigins {
     }
 }
 
-/// Whether every kind the daemon reached the old resource store for is one the registry still
-/// keeps there (#3108): once none is, the read-back starts with the old store unavailable.
-fn only_old_kinds(reached: &std::collections::BTreeSet<&'static str>) -> bool {
-    reached.iter().all(|kind| flotilla_store::old_store_resource_kinds().any(|old| old.kind == *kind))
-}
-
 /// Starts a daemon over a copy of the old store at `store`, so its first start imports the copy,
 /// and reads back through its tables each kind the import wrote: the records its log created up
 /// to the import's last write, as the daemon's own writes follow it. The old resource store
@@ -422,7 +416,7 @@ async fn a_daemon_started_over_an_old_store_reads_back_what_it_imported() {
     assert_eq!(read.stranded_deliveries, 0, "each imported delivery names its convoy's launch");
     assert_eq!(read.created.get("AccessDelivery"), Some(&2));
     assert_eq!(read.held.get("AccessDelivery"), Some(&2), "a delivery whose place is not found is held, not retired");
-    assert!(only_old_kinds(&read.old_store), "the old store was reached for {:?}", read.old_store);
+    assert!(read.old_store.is_empty(), "the old store was reached for {:?}", read.old_store);
 }
 
 // Rehearsal (#3108): the same over a copy of a real frozen-fleet store, named by
@@ -466,5 +460,5 @@ async fn a_daemon_started_over_a_real_old_store_reads_back_what_it_imported() {
     // requester state removed, while the crew still runs.
     assert_eq!(read.stranded_deliveries, 0, "imported AccessDeliveries name convoys not held here");
     assert_eq!(read.held.get("AccessDelivery"), read.created.get("AccessDelivery"), "imported AccessDeliveries were retired at start");
-    assert!(only_old_kinds(&read.old_store), "the old store was reached for {:?}", read.old_store);
+    assert!(read.old_store.is_empty(), "the old store was reached for {:?}", read.old_store);
 }

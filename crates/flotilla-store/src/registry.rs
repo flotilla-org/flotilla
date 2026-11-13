@@ -24,9 +24,6 @@ pub struct RegisteredResourceKind {
     pub kind: &'static str,
     pub plural: &'static str,
     pub replication_class: ReplicationClass,
-    /// The engine holds this kind's records; the old store keeps only rows a previous generation
-    /// wrote, for the cut-over import to read. Nothing else reads or watches the kind here.
-    pub engine_held: bool,
     aliases: &'static [&'static str],
     resource: RegisteredResource,
 }
@@ -96,45 +93,45 @@ pub struct DynamicResourceWatch {
 }
 
 pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
-    engine_kind::<Artifact>(RegisteredResource::Artifact, &[]),
-    engine_kind::<ChangeRequest>(RegisteredResource::ChangeRequest, &["cr", "change_request", "change-request"]),
-    engine_kind::<Issue>(RegisteredResource::Issue, &[]),
-    engine_kind::<Checkout>(RegisteredResource::Checkout, &[]),
-    engine_kind::<CloneResource>(RegisteredResource::Clone, &[]),
-    engine_kind::<Convoy>(RegisteredResource::Convoy, &[]),
-    engine_kind::<ConvoyEnsure>(RegisteredResource::ConvoyEnsure, &["convoyensure", "convoy_ensure", "convoy-ensure"]),
-    engine_kind::<CredentialGrant>(
+    kind::<Artifact>(RegisteredResource::Artifact, &[]),
+    kind::<ChangeRequest>(RegisteredResource::ChangeRequest, &["cr", "change_request", "change-request"]),
+    kind::<Issue>(RegisteredResource::Issue, &[]),
+    kind::<Checkout>(RegisteredResource::Checkout, &[]),
+    kind::<CloneResource>(RegisteredResource::Clone, &[]),
+    kind::<Convoy>(RegisteredResource::Convoy, &[]),
+    kind::<ConvoyEnsure>(RegisteredResource::ConvoyEnsure, &["convoyensure", "convoy_ensure", "convoy-ensure"]),
+    kind::<CredentialGrant>(
         RegisteredResource::CredentialGrant,
         &["credentialgrant", "credential_grant", "credential_grants", "credential-grant", "credential-grants"],
     ),
-    engine_kind::<CredentialSpec>(
+    kind::<CredentialSpec>(
         RegisteredResource::CredentialSpec,
         &["credentialspec", "credential_spec", "credential_specs", "credential-spec", "credential-specs"],
     ),
-    engine_kind::<CrewDefaults>(RegisteredResource::CrewDefaults, &["crew-defaults"]),
-    engine_kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
-    engine_kind::<ImageLayer>(RegisteredResource::ImageLayer, &["image-layer"]),
-    engine_kind::<AccountBinding>(RegisteredResource::AccountBinding, &["account-binding"]),
-    engine_kind::<AccountProvision>(RegisteredResource::AccountProvision, &["account-provision"]),
-    engine_kind::<AccessDelivery>(RegisteredResource::AccessDelivery, &["access-delivery"]),
-    engine_kind::<Environment>(RegisteredResource::Environment, &[]),
-    engine_kind::<FleetDesignation>(RegisteredResource::FleetDesignation, &["fleet-designation"]),
-    engine_kind::<Forge>(RegisteredResource::Forge, &[]),
-    engine_kind::<FulfilmentKind>(
+    kind::<CrewDefaults>(RegisteredResource::CrewDefaults, &["crew-defaults"]),
+    kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
+    kind::<ImageLayer>(RegisteredResource::ImageLayer, &["image-layer"]),
+    kind::<AccountBinding>(RegisteredResource::AccountBinding, &["account-binding"]),
+    kind::<AccountProvision>(RegisteredResource::AccountProvision, &["account-provision"]),
+    kind::<AccessDelivery>(RegisteredResource::AccessDelivery, &["access-delivery"]),
+    kind::<Environment>(RegisteredResource::Environment, &[]),
+    kind::<FleetDesignation>(RegisteredResource::FleetDesignation, &["fleet-designation"]),
+    kind::<Forge>(RegisteredResource::Forge, &[]),
+    kind::<FulfilmentKind>(
         RegisteredResource::FulfilmentKind,
         &["fulfilmentkind", "fulfilment_kind", "fulfilment_kinds", "fulfilment-kind", "fulfilment-kinds"],
     ),
-    engine_kind::<Host>(RegisteredResource::Host, &[]),
-    engine_kind::<ManifestRoot>(RegisteredResource::ManifestRoot, &["manifest-root", "manifest_root"]),
-    engine_kind::<Message>(RegisteredResource::Message, &[]),
-    engine_kind::<Project>(RegisteredResource::Project, &[]),
-    engine_kind::<Repository>(RegisteredResource::Repository, &[]),
-    engine_kind::<TerminalSession>(
+    kind::<Host>(RegisteredResource::Host, &[]),
+    kind::<ManifestRoot>(RegisteredResource::ManifestRoot, &["manifest-root", "manifest_root"]),
+    kind::<Message>(RegisteredResource::Message, &[]),
+    kind::<Project>(RegisteredResource::Project, &[]),
+    kind::<Repository>(RegisteredResource::Repository, &[]),
+    kind::<TerminalSession>(
         RegisteredResource::TerminalSession,
         &["terminalsession", "terminal_session", "terminal_sessions", "terminal-session", "terminal-sessions"],
     ),
-    engine_kind::<Vessel>(RegisteredResource::Vessel, &[]),
-    engine_kind::<WorkflowTemplate>(
+    kind::<Vessel>(RegisteredResource::Vessel, &[]),
+    kind::<WorkflowTemplate>(
         RegisteredResource::WorkflowTemplate,
         &["workflowtemplate", "workflow_template", "workflow_templates", "workflow-template", "workflow-templates"],
     ),
@@ -194,20 +191,9 @@ const fn kind<T: Resource>(resource: RegisteredResource, aliases: &'static [&'st
         kind: T::API_PATHS.kind,
         plural: T::API_PATHS.plural,
         replication_class: T::REPLICATION_CLASS,
-        engine_held: false,
         aliases,
         resource,
     }
-}
-
-const fn engine_kind<T: Resource>(resource: RegisteredResource, aliases: &'static [&'static str]) -> RegisteredResourceKind {
-    RegisteredResourceKind { engine_held: true, ..kind::<T>(resource, aliases) }
-}
-
-/// The registered kinds whose records the old store still holds: every kind but those the engine
-/// holds.
-pub fn old_store_resource_kinds() -> impl Iterator<Item = &'static RegisteredResourceKind> {
-    REGISTERED_RESOURCE_KINDS.iter().filter(|kind| !kind.engine_held)
 }
 
 macro_rules! poll_typed_resource {
