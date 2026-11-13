@@ -749,10 +749,13 @@ fn connector_projects_replicated_observations_and_removes_deleted_records() {
     assert!(state.rebuild(&mint()).iter().any(|patch| patch.target == cr));
     let mut deleted = envelope;
     deleted.records[0].record_type = ResourceRecordType::Deleted;
-    deleted.records[0].object = Some(serde_json::json!({"metadata": {"name": "cr-42", "namespace": "flotilla"}}));
+    deleted.records[0].object = Some(serde_json::json!({"metadata": {"name": CR_42, "namespace": "flotilla"}}));
     state.apply_resource_records(&deleted).expect("deletion");
     assert!(state.rebuild(&mint()).iter().any(|patch| patch.target == cr && patch.unset.contains(&"flotilla.subject_of".to_string())));
 }
+
+/// The record name of `github.com/org/flotilla` change request 42, named for its subject.
+const CR_42: &str = "cr-6769746875622e636f6d-6f72672f666c6f74696c6c61-42";
 
 fn subject_envelope() -> flotilla_protocol::ResourceReadEnvelope {
     use flotilla_protocol::{ResourceCursor, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType};
@@ -769,7 +772,7 @@ fn subject_envelope() -> flotilla_protocol::ResourceReadEnvelope {
                 last_synced_at: "2026-10-02T12:00:00Z".into(),
             },
             object: Some(serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"ChangeRequest",
-                "metadata":{"name":"cr-42", "namespace":"flotilla", "resourceVersion":"1", "creationTimestamp":"2026-10-02T12:00:00Z"},
+                "metadata":{"name":CR_42, "namespace":"flotilla", "resourceVersion":"1", "creationTimestamp":"2026-10-02T12:00:00Z"},
                 "spec":{"service":"github.com", "scope":"org/flotilla", "number":42, "observing_authority":"kiwi"},
                 "status":{"state":{"value":"open", "observed_at":"2026-10-02T12:00:00Z"},
                     "head_sha":{"value":null,"observed_at":"2026-10-02T12:00:00Z"},
@@ -1258,7 +1261,7 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
         assert_eq!(state.single_namespace_kinds.get(kind).map(String::as_str), Some("flotilla"), "{kind} is the engine's");
     }
     assert_eq!(tasks.len(), opened + resources::KINDS.len() - state.single_namespace_kinds.len());
-    // The first namespace's watch follows cr-42's creation.
+    // The first namespace's watch follows change request 42's creation.
     tokio::time::timeout(Duration::from_secs(2), async {
         while state.resources.projection().change_requests.is_empty() {
             rx.recv().await.expect("update channel").expect("watch event").apply(&mut state).expect("apply");
@@ -1266,7 +1269,7 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
     })
     .await
     .expect("creation followed");
-    // cr-42 is held once, in the engine's namespace, and stays there as its events arrive.
+    // Change request 42 is held once, in the engine's namespace, and stays there as its events arrive.
     let held_once = |state: &ConnectorState| {
         let held = &state.resources.projection().change_requests;
         assert_eq!(held.len(), 1, "one change request held");
