@@ -28,7 +28,7 @@ use flotilla_provider_runtime::HttpClient;
 use flotilla_provider_runtime::ReqwestHttpClient;
 use flotilla_resources::{Clock, SystemClock};
 use futures::future::BoxFuture;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncWriteExt, sync::mpsc};
@@ -296,8 +296,11 @@ impl CodexCentralRefresher {
         let directory = self.auth_path.parent()?;
         let name = self.auth_path.file_name()?.to_owned();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            // An error may hide a change: read the file again.
-            if event.map_or(true, |event| event.paths.iter().any(|path| path.file_name() == Some(&name))) {
+            // An error may hide a change: read the file again. An access cannot change it, and
+            // inotify reports this refresher's own reads as opens, so acting on one would spin.
+            if event.map_or(true, |event| {
+                !matches!(event.kind, EventKind::Access(_)) && event.paths.iter().any(|path| path.file_name() == Some(&name))
+            }) {
                 let _ = changes.send(());
             }
         });
@@ -568,8 +571,17 @@ mod tests {
     /// Runs the refresher over `path` on a clock that moves with tokio's, reporting each rotation
     /// on the returned channel.
     fn run(path: PathBuf, refresher: Arc<FakeCodexTokenRefresher>) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedReceiver<()>) {
+        run_on(path, refresher, Arc::new(PausedClock::start()))
+    }
+
+    /// [`run`] on `clock`, for a test that writes a login's expiry after time has moved.
+    fn run_on(
+        path: PathBuf,
+        refresher: Arc<FakeCodexTokenRefresher>,
+        clock: Arc<PausedClock>,
+    ) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedReceiver<()>) {
         let (rotations, rotated) = mpsc::unbounded_channel();
-        let central = CodexCentralRefresher::new_with_refresher(path, refresher, Arc::new(PausedClock::start()));
+        let central = CodexCentralRefresher::new_with_refresher(path, refresher, clock);
         (
             tokio::spawn(central.run(move || {
                 let _ = rotations.send(());
@@ -640,14 +652,15 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = write_auth_file(&dir, "refresh-token-one", &jwt_with_exp(Utc::now() - Duration::seconds(1)));
         let refresher = fake(vec![Err(CodexRefreshFailure::Transient("connection reset".into()))]);
-        let (task, mut rotated) = run(path, refresher.clone());
+        let clock = Arc::new(PausedClock::start());
+        let (task, mut rotated) = run_on(path, refresher.clone(), clock.clone());
 
         tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
         assert_eq!(requests(&refresher), 1, "a failure after expiry is not retried on a timer");
         assert!(!task.is_finished());
 
         // An operator logs in again: the crews' copies follow it.
-        write_auth_file(&dir, "refresh-token-new", &jwt_with_exp(Utc::now() + Duration::hours(8)));
+        write_auth_file(&dir, "refresh-token-new", &jwt_with_exp(clock.now() + Duration::hours(8)));
         rotated.recv().await.expect("the new login is announced");
         assert_eq!(requests(&refresher), 1, "a fresh login is not refreshed until halfway through its life");
         task.abort();
@@ -658,13 +671,14 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("auth.json");
         let refresher = fake(vec![]);
-        let (task, mut rotated) = run(path, refresher.clone());
+        let clock = Arc::new(PausedClock::start());
+        let (task, mut rotated) = run_on(path, refresher.clone(), clock.clone());
 
         tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
         assert_eq!(requests(&refresher), 0);
         assert!(!task.is_finished(), "a missing login waits, never panics the daemon");
 
-        write_auth_file(&dir, "refresh-token-one", &jwt_with_exp(Utc::now() + Duration::hours(8)));
+        write_auth_file(&dir, "refresh-token-one", &jwt_with_exp(clock.now() + Duration::hours(8)));
         rotated.recv().await.expect("the first login is announced");
         task.abort();
     }
@@ -763,5 +777,23 @@ mod tests {
         let failure = refresher.refresh("refresh-token").await.expect_err("refresh fails");
 
         assert!(matches!(failure, CodexRefreshFailure::Transient(_)));
+    }
+
+    // Real time and the real watcher: inotify reports opens, and `run` rereads the file on each
+    // wake, so a read that woke the refresher would wake it again without end.
+    #[tokio::test]
+    async fn reading_the_login_does_not_wake_the_refresher() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = write_auth_file(&dir, "refresh-token-one", &jwt_with_exp(Utc::now() + Duration::hours(8)));
+        let central = CodexCentralRefresher::new_with_refresher(path.clone(), fake(vec![]), Arc::new(SystemClock));
+        let (changes, mut changed) = mpsc::unbounded_channel();
+        let _watcher = central.watch(changes).expect("the directory is watched");
+
+        for _ in 0..3 {
+            read_held(&path).await.expect("the login is readable");
+        }
+
+        let woken = tokio::time::timeout(std::time::Duration::from_secs(1), changed.recv()).await;
+        assert!(woken.is_err(), "a read woke the refresher");
     }
 }
