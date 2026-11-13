@@ -626,13 +626,16 @@ pub(super) fn spawn_host_description_projection_task(
 pub fn spawn_pending_supervisor_turn_task(daemon: Arc<InProcessDaemon>, namespace: String) -> (JoinHandle<()>, oneshot::Receiver<()>) {
     let backend = daemon.resource_backend();
     let watch_namespace = namespace.clone();
+    let message_path = daemon.crew_message_path();
     spawn_pending_supervisor_turn_task_with_watches(daemon, namespace, move || {
         let backend = backend.clone();
         let namespace = watch_namespace.clone();
+        let message_path = Arc::clone(&message_path);
         async move {
             let convoys = backend.including_replicas::<Convoy>(&namespace).watch().await?;
             let sessions = backend.including_replicas::<TerminalSession>(&namespace).watch().await?;
-            let messages = backend.including_replicas::<flotilla_resources::Message>(&namespace).watch().await?;
+            // The Message path's commits, which list no message to hear one.
+            let messages = message_path.get().ok_or_else(|| ResourceError::other("the Message path is not installed"))?.changes()?.map(Ok);
             Ok((
                 futures::stream::select(convoys.map(|event| event.map(|_| ())), messages.map(|event| event.map(|_| ()))).boxed(),
                 sessions.map(|event| event.map(|_| ())).boxed(),

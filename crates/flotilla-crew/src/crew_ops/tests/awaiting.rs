@@ -149,6 +149,9 @@ impl EngineMessages for RecordingMessages {
     async fn delivery_wait(&self, _namespace: &str) -> Result<Option<String>, String> {
         Ok(None)
     }
+    fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, ResourceError> {
+        Ok(Box::pin(futures::stream::pending()))
+    }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
         Box::new(flotilla_messaging::MessageInbox::new(self.backend.clone(), namespace))
     }

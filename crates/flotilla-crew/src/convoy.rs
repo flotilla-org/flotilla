@@ -132,11 +132,12 @@ impl ConvoyReconciler {
     /// What wakes a convoy besides its engine records: its sessions (a turn's delivery holds its
     /// landing), the evidence its promises are observed from, and, for a convoy its home notes as
     /// waiting, what it waits on: capacity on a host (Host, Vessel, Environment and Convoy
-    /// changes) or a crew turn's delivery (Message changes).
+    /// changes) or a crew turn's delivery (commits to `messages`).
     pub fn secondary_watches(
         backend: &flotilla_store::ResourceBackend,
         namespace: &str,
         engine: EngineConvoyPath,
+        messages: crate::ports::MessagePath,
     ) -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
         let capacity = flotilla_resources::convoy_records::ConvoyNotes::waits_for_capacity;
         vec![
@@ -160,8 +161,8 @@ impl ConvoyReconciler {
                 engine: Arc::clone(&engine),
                 waiting: capacity,
             }),
-            Box::new(NoteWake {
-                changes: WakeOn::Replicas(backend.including_replicas::<Message>(namespace)),
+            Box::new(NoteWake::<Message> {
+                changes: WakeOn::MessageCommits(messages),
                 engine,
                 waiting: flotilla_resources::convoy_records::ConvoyNotes::holds_delivery,
             }),
@@ -461,11 +462,13 @@ pub struct NoteWake<W: Resource> {
     pub waiting: fn(&flotilla_resources::convoy_records::ConvoyNotes) -> bool,
 }
 
-/// Where a wake hears a kind's changes: the replicas of a kind that replicates, or the engine of a
-/// kind it alone serves, such as Environment, which streams every home's changes.
+/// Where a wake hears a kind's changes: the replicas of a kind that replicates, the engine of a
+/// kind it alone serves, such as Environment, which streams every home's changes, or the Message
+/// path's commits, which list no message.
 pub enum WakeOn<W: Resource> {
     Replicas(ReplicaReadResolver<W>),
     Engine(TypedResolver<W>),
+    MessageCommits(crate::ports::MessagePath),
 }
 
 impl<W: Resource> std::clone::Clone for WakeOn<W> {
@@ -473,6 +476,7 @@ impl<W: Resource> std::clone::Clone for WakeOn<W> {
         match self {
             WakeOn::Replicas(resolver) => WakeOn::Replicas(resolver.clone()),
             WakeOn::Engine(resolver) => WakeOn::Engine(resolver.clone()),
+            WakeOn::MessageCommits(path) => WakeOn::MessageCommits(Arc::clone(path)),
         }
     }
 }
@@ -484,6 +488,7 @@ impl<W: Resource> WakeOn<W> {
         Ok(match self {
             WakeOn::Replicas(resolver) => resolver.watch().await?.map(|event| event.map(drop)).boxed(),
             WakeOn::Engine(resolver) => resolver.watch(WatchStart::Now).await?.map(|event| event.map(drop)).boxed(),
+            WakeOn::MessageCommits(path) => crate::ports::installed_messages(path)?.changes()?.map(Ok).boxed(),
         })
     }
 }

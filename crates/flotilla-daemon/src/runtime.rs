@@ -821,7 +821,12 @@ fn spawn_controller_loops(
             let daemon = Arc::clone(&state.daemon);
             move |backend: ResourceBackend, namespace_string: String| {
                 let daemon = Arc::clone(&daemon);
-                let mut secondaries = ConvoyReconciler::secondary_watches(&backend, &namespace_string, daemon.convoy_engine_path());
+                let mut secondaries = ConvoyReconciler::secondary_watches(
+                    &backend,
+                    &namespace_string,
+                    daemon.convoy_engine_path(),
+                    daemon.crew_message_path(),
+                );
                 secondaries.push(daemon.reconciler_wake_watch());
                 secondaries.push(Box::new(flotilla_crew::convoy::EngineConvoyWake { engine: daemon.convoy_engine_path() }));
                 // A convoy's checkouts are the engine's: their changes wake the convoy holding them.

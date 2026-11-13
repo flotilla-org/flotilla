@@ -103,6 +103,9 @@ pub trait EngineMessages: Send + Sync {
     /// Until when messages to `receiver` (a crew role address), admitted at this home and not
     /// yet delivered, hold its delivery; None when none does (#3894).
     async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String>;
+    /// A tick for each change to the messages after this call, local or replicated, heard from
+    /// the store's commits: nothing is listed to hear it.
+    fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, flotilla_resources::ResourceError>;
     /// Where charter notifications are admitted on this path.
     fn charter_notices(self: std::sync::Arc<Self>, namespace: &str) -> Box<dyn crate::CharterNotices>;
 }

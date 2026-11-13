@@ -405,6 +405,8 @@ pub struct MessagePrimitives {
     attention_changes: tokio::sync::broadcast::Sender<()>,
     /// Signalled after a person acknowledges an attention here.
     acknowledgements: tokio::sync::broadcast::Sender<()>,
+    /// One follower of the Message log, shared by every reader woken by its commits.
+    changes: flotilla_engine_store::watch::SharedChanges,
     /// Message rows the reads loaded and converted, since this path opened.
     loaded: std::sync::atomic::AtomicU64,
     converted: std::sync::atomic::AtomicU64,
@@ -460,8 +462,11 @@ impl MessagePrimitives {
                 let _ = replicated.send(());
             }
         }));
+        let changes =
+            flotilla_engine_store::watch::SharedChanges::new(Arc::clone(&service), [<Resource<Message> as StoredKind>::CODE], "messages");
         Ok(Self {
             home: home.to_owned(),
+            changes,
             service,
             inbox,
             sessions,
@@ -531,6 +536,11 @@ impl MessagePrimitives {
     }
     pub fn service(&self) -> &Arc<Service> {
         &self.service
+    }
+    /// A tick for each commit after this call that writes a Message, this home's or one applied
+    /// from another home's log, read from the log rather than by listing the messages.
+    pub fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, ResourceError> {
+        self.changes.subscribe().map_err(|error| ResourceError::other(format!("Message changes: {error}")))
     }
     /// The bindings port: who holds each role inbox, from today's role routing.
     pub fn bindings(&self) -> &Arc<dyn ports::RoleBindings> {
@@ -1933,6 +1943,9 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     }
     async fn delivery_wait(&self, namespace: &str) -> Result<Option<String>, String> {
         MessagePrimitives::delivery_wait(self, namespace).await
+    }
+    fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, ResourceError> {
+        MessagePrimitives::changes(self)
     }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
         Box::new(EngineCharterNotices { primitives: self, namespace: namespace.to_owned() })
