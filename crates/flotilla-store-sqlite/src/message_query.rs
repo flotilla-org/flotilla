@@ -14,8 +14,6 @@ impl MessageQuerySql for MessageQuery {
             (true, Self::Active { receiver: Some(_) }) => "replica_objects_message_active",
             (false, Self::ReplyTo { .. }) => "resource_objects_message_reply",
             (true, Self::ReplyTo { .. }) => "replica_objects_message_reply",
-            (false, Self::Batch { .. }) => "resource_objects_message_batch",
-            (true, Self::Batch { .. }) => "replica_objects_message_batch",
             (false, Self::AuditBefore { .. }) => "message_audit_age",
             (true, Self::AuditBefore { .. }) => "replica_message_audit_age",
         }
@@ -34,7 +32,6 @@ impl MessageQuerySql for MessageQuery {
             Self::Active { receiver: Some(receiver) } => (format!("{active} AND json_extract(body_json, '$.spec.receiver') = ?{argument_index}"), Some(receiver.clone())),
             Self::ReplyTo { name } => (format!("json_extract(body_json, '$.spec.in_reply_to') = ?{argument_index}"), Some(name.clone())),
             Self::AuditBefore { before } => (format!("COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') IN ({terminal}) AND json_extract(body_json, '$.spec.body_digest') IS NULL AND julianday(json_extract(body_json, '$.status.since')) < julianday(?{argument_index})"), Some(before.to_rfc3339())),
-            Self::Batch { id } => (format!("json_extract(body_json, '$.status.submission.batch_id') = ?{argument_index}"), Some(id.clone())),
         }
     }
 }

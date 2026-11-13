@@ -11,7 +11,6 @@ use crate::{Message, ReadResourceObject, ResourceBackend, ResourceError, Resourc
 pub enum MessageQuery {
     Active { receiver: Option<String> },
     ReplyTo { name: String },
-    Batch { id: String },
     AuditBefore { before: chrono::DateTime<chrono::Utc> },
 }
 
@@ -39,7 +38,6 @@ impl MessageQuery {
         match self {
             Self::Active { receiver } => active && receiver.as_deref().is_none_or(|receiver| text("/spec/receiver") == Some(receiver)),
             Self::ReplyTo { name } => text("/spec/in_reply_to") == Some(name.as_str()),
-            Self::Batch { id } => text("/status/submission/batch_id") == Some(id.as_str()),
             Self::AuditBefore { before } => {
                 !active
                     && message.pointer("/spec/body_digest").is_none_or(Value::is_null)

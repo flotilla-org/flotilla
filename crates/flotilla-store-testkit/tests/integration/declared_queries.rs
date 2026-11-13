@@ -655,7 +655,6 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
         (MessageQuery::Active { receiver: Some("flotilla/receiver".into()) }, 1),
         (MessageQuery::Active { receiver: Some("flotilla/other".into()) }, 0),
         (MessageQuery::ReplyTo { name: "parent".into() }, 2),
-        (MessageQuery::Batch { id: "batch".into() }, 1),
         (MessageQuery::AuditBefore { before: chrono::DateTime::from_timestamp(1, 0).unwrap() }, 0),
         (MessageQuery::AuditBefore { before: chrono::DateTime::from_timestamp(2, 0).unwrap() }, 1),
     ] {

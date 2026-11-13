@@ -4542,7 +4542,6 @@ mod tests {
                                 crate::MessageQuery::active(),
                                 crate::MessageQuery::Active { receiver: Some("r".into()) },
                                 crate::MessageQuery::ReplyTo { name: "n".into() },
-                                crate::MessageQuery::Batch { id: "b".into() },
                                 crate::MessageQuery::AuditBefore { before: Utc::now() },
                             ] {
                                 let index = message.sql_index(replicas).to_string();
@@ -4627,7 +4626,6 @@ mod tests {
                                         crate::MessageQuery::active(),
                                         crate::MessageQuery::Active { receiver: Some("r".into()) },
                                         crate::MessageQuery::ReplyTo { name: "n".into() },
-                                        crate::MessageQuery::Batch { id: "b".into() },
                                         crate::MessageQuery::AuditBefore { before: Utc::now() },
                                     ] {
                                         let index = message.sql_index(replicas).to_string();
@@ -4759,7 +4757,6 @@ mod message_query_plan_tests {
                 (crate::MessageQuery::active(), "resource_objects_message_inbox"),
                 (crate::MessageQuery::Active { receiver: Some("project/role".into()) }, "resource_objects_message_active"),
                 (crate::MessageQuery::ReplyTo { name: "request".into() }, "resource_objects_message_reply"),
-                (crate::MessageQuery::Batch { id: "batch".into() }, "resource_objects_message_batch"),
                 (crate::MessageQuery::AuditBefore { before: Utc::now() }, "message_audit_age"),
             ] {
                 let (predicate, argument) = query.sql();

@@ -788,7 +788,6 @@ async fn indexed_message_history_and_retention_contract() {
                 .build(),
         );
         resolver.update_status("active", &active.metadata.resource_version, &status).await.unwrap();
-        assert_eq!(resolver.query(&MessageQuery::Batch { id: "recovery".into() }).await.unwrap().len(), 1);
         let replay = inbox.accept(&InputMeta::builder().name("history-1".into()).build(), &intent, at(90000)).await.unwrap();
         assert!(matches!(replay, flotilla_messaging::MessageAdmission::Accepted(_)));
         let suppressed = inbox.accept(&InputMeta::builder().name("history-2".into()).build(), &intent, at(90000)).await.unwrap();
