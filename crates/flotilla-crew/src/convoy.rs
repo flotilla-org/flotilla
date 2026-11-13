@@ -391,6 +391,19 @@ impl ConvoyReconciler {
             .map_err(ResourceError::other)
     }
 
+    /// Whether a vessel of `obj` is placed at any home: the newest launch of one of its works at a
+    /// home that is not released, as the vessel listing shows a live convoy's vessels.
+    async fn has_vessel(&self, obj: &ResourceObject<Convoy>) -> Result<bool, ResourceError> {
+        let mut newest = BTreeMap::<(String, String, String), flotilla_resources::vessel_records::VesselRecord>::new();
+        for record in self.launch_vessels(obj).await? {
+            let work = (record.home.clone(), record.convoy_home.clone(), record.launch_of.clone());
+            if newest.get(&work).is_none_or(|held| held.launch_number() < record.launch_number()) {
+                newest.insert(work, record);
+            }
+        }
+        Ok(newest.values().any(|record| record.reading != flotilla_protocol::LifecycleReading::Released))
+    }
+
     /// Notes and traces each repository of `obj` whose change request landed on a target other
     /// than the one it declared, as its checkout's landing evidence shows. Nothing decides on it:
     /// it explains the convoy until its notes are dropped, and the trace keeps it.
@@ -813,14 +826,10 @@ impl Reconciler for ConvoyReconciler {
             memory.note_evidence_unread(&obj.metadata.name, ChangeRequest::API_PATHS.kind, convoy_change_request_names(obj, &[]));
         }
 
-        let vessels = match &self.vessels {
-            Some(vessels) => select_convoy_children(obj, &vessels.list().await?.items),
-            None => BTreeMap::new(),
-        };
         // A convoy waits for capacity until its first vessel is placed. The hosts its placement
         // chose are noted before they are read, so a change of one after the read wakes it, and
         // after the read only the host it waits on stays noted.
-        let capacity = if vessels.is_empty() {
+        let capacity = if !self.has_vessel(obj).await? {
             let chosen = chosen_candidates(obj).into_iter().map(|candidate| candidate.host).collect();
             memory.note_evidence(&obj.metadata.name, Host::API_PATHS.kind, chosen);
             self.capacity(obj).await?

@@ -8,7 +8,7 @@ use std::{
 };
 
 use chrono::Utc;
-use flotilla_crew::reconcilers::vessel::ConvoyVesselWake;
+use flotilla_crew::{convoy::ConvoyReconciler, reconcilers::vessel::ConvoyVesselWake};
 use flotilla_engine_convoys_testkit::{convoy, single_agent, EngineConvoysHome, KeyedGets};
 use flotilla_provisioning::engine::checkouts::CheckoutConvoyWake;
 use flotilla_provisioning_testkit::{EngineFixture, OtherHome, TerminalsFixture};
@@ -17,10 +17,10 @@ use flotilla_resources::{
     address::{artifact_address, record_name},
     checkout_records::CheckoutHolder,
     vessel_records::{environment_vessels, EnvironmentVessel},
-    Artifact, ArtifactSpec, CheckoutSpec, ConvoySpec, ObservedCheckoutSpec, RepositoryKey, SystemClock,
+    Artifact, ArtifactSpec, CheckoutSpec, Convoy, ConvoySpec, ObservedCheckoutSpec, RepositoryKey, SystemClock,
 };
 use flotilla_store::{
-    controller::{SecondaryWatch, WorkQueueSender},
+    controller::{Reconciler, SecondaryWatch, WorkQueueSender},
     ResourceBackend,
 };
 use flotilla_store_memory::InMemoryBackend;
@@ -66,6 +66,41 @@ async fn launches_read_by_of_convoy(others: usize) -> (u64, KeyedGets) {
 async fn a_convoys_vessels_are_read_without_the_others() {
     let (small, small_gets) = launches_read_by_of_convoy(5).await;
     let (large, large_gets) = launches_read_by_of_convoy(60).await;
+    assert_eq!(small, 1, "only the convoy's one launch is read");
+    assert_eq!(large, small, "the cost does not grow with the other convoys' launches");
+    assert_eq!(small_gets, KeyedGets { convoys: 1, ..KeyedGets::default() }, "only the convoy's own record is got, for its works");
+    assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
+}
+
+/// The launches read, and the keyed gets made, by one convoy's pass finding its placed vessel,
+/// with `others` other convoys each holding a launch of its work.
+async fn launches_read_by_a_pass(others: usize) -> (u64, KeyedGets) {
+    let store = OtherHome::open("home");
+    let engine = EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
+    let mut launches = Vec::new();
+    for n in 0..=others {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let launch = convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
+        engine.vessels.request(&launch, "work", "host");
+        launches.push(launch);
+    }
+    let passed = backend.clone().using::<Convoy>(NAMESPACE).get(&launches[0]).await.expect("the convoy's view");
+    let reconciler = ConvoyReconciler::new(Arc::clone(convoys.reads())).with_engine(convoys.path());
+
+    let vessels = &engine.vessels.vessels;
+    let before = (vessels.launches_read(), keyed_gets(&convoys, &engine));
+    reconciler.prepare(&passed).await.expect("prepare");
+    (vessels.launches_read() - before.0, keyed_gets(&convoys, &engine) - before.1)
+}
+
+// Behaviour: a pass finds whether its convoy has a vessel by its works' launch index, not by
+// listing every vessel at every home and keeping its own.
+#[tokio::test]
+async fn a_pass_reads_its_convoys_vessels_without_the_others() {
+    let (small, small_gets) = launches_read_by_a_pass(5).await;
+    let (large, large_gets) = launches_read_by_a_pass(60).await;
     assert_eq!(small, 1, "only the convoy's one launch is read");
     assert_eq!(large, small, "the cost does not grow with the other convoys' launches");
     assert_eq!(small_gets, KeyedGets { convoys: 1, ..KeyedGets::default() }, "only the convoy's own record is got, for its works");

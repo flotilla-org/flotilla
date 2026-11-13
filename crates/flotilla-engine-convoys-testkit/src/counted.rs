@@ -10,8 +10,12 @@ use std::sync::{
 use flotilla_engine_convoys::convoy_records::EngineConvoyRecords;
 use flotilla_protocol::LifecycleReading;
 use flotilla_resources::{
+    agent_activity::AgentSessionReads,
+    checkout_records::CheckoutRecords,
+    clone_records::CloneRecords,
     convoy_records::{ConvoyChange, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords},
     environment_records::{EnvironmentChange, EnvironmentObservations, EnvironmentRecord, EnvironmentRecords},
+    image_build_records::ImageBuildRecords,
     lifecycle_reads::{ChangeCursor, LifecycleReads, ProvisioningKind},
     terminal_records::{TerminalChange, TerminalLaunchRequest, TerminalObservations, TerminalRecord, TerminalRecords, TerminalRenewal},
     vessel_records::{VesselChange, VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep},
@@ -107,6 +111,23 @@ impl LifecycleReads for WithConvoys {
 
     fn convoys(&self) -> Result<&dyn ConvoyRecords, String> {
         Ok(&self.convoys)
+    }
+
+    // The kinds no read-cost test counts yet are served as the test's reads serve them.
+    fn clones(&self) -> Result<&dyn CloneRecords, String> {
+        self.reads.clones()
+    }
+
+    fn checkouts(&self) -> Result<&dyn CheckoutRecords, String> {
+        self.reads.checkouts()
+    }
+
+    fn image_builds(&self) -> Result<&dyn ImageBuildRecords, String> {
+        self.reads.image_builds()
+    }
+
+    fn agent_sessions(&self) -> Result<&dyn AgentSessionReads, String> {
+        self.reads.agent_sessions()
     }
 }
 
