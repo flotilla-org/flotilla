@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use flotilla_cbor::ErrorKind;
-use flotilla_schema::{Cause, Change, Code, Effect, Event, Hash, Identity, KindCode, Named, Step, Value, LOG_LIMITS};
+use flotilla_schema::{Cause, Change, Code, CreatedAt, Effect, Event, Hash, Identity, KindCode, Named, Step, Value, LOG_LIMITS};
 use hegel::{generators as gs, TestCase};
 
 /// Every variant, with integers across the whole `i64` range (bounds included), empty and
@@ -79,6 +79,7 @@ fn effect(tc: &TestCase) -> Effect {
             .map(|_| (hash(tc), tc.draw(gs::binary().max_size(16))))
             .collect(),
         expunged: tc.draw(gs::booleans()).then(|| identity(tc)),
+        created: tc.draw(gs::booleans()).then(|| CreatedAt(tc.draw(gs::integers::<i64>()))),
     }
 }
 
@@ -122,7 +123,7 @@ fn append(n: u32) -> Change {
 fn limits_admit_a_maximal_frozen_document_with_its_rows() {
     let bytes = vec![7u8; 1024 * 1024];
     let effect =
-        Effect { changes: (0..10_000).map(append).collect(), objects: BTreeMap::from([(Hash::of(&bytes), bytes)]), expunged: None };
+        Effect { changes: (0..10_000).map(append).collect(), objects: BTreeMap::from([(Hash::of(&bytes), bytes)]), ..Effect::default() };
     let encoded = effect.encode().expect("a maximal document fits");
     assert_eq!(Effect::decode(&encoded).expect("decode"), effect);
 
@@ -156,6 +157,33 @@ fn objects_travel_without_a_media_code() {
     expected.extend([1; 32]);
     assert_eq!(encoded, expected);
     assert_eq!(flotilla_cbor::from_slice::<Effect>(&encoded, &LOG_LIMITS).expect("decode"), effect);
+}
+
+/// A create's effect setting root field `f` to `v = 1`.
+fn create_effect(created: Option<CreatedAt>) -> Effect {
+    let values = BTreeMap::from([("v".to_owned(), Value::Int(1))]);
+    Effect { changes: vec![Change::Set { row: Vec::new(), field: "f".into(), values }], created, ..Effect::default() }
+}
+
+// Behaviour (#3108 creation time): a create's effect carries a creation time only when it is an
+// import's (`t`, in nanoseconds); any other create's encodes exactly as before `t` existed, so an
+// effect stored without it decodes, with no creation time of its own.
+#[test]
+fn only_an_imports_create_carries_its_creation_time() {
+    // `{"c": [{"s": {"f": "f", "v": {"v": {"i": 1}}}}]}`: the bytes a create's effect is stored as
+    // today, and was before `t`.
+    let today =
+        [0xa1, 0x61, b'c', 0x81, 0xa1, 0x61, b's', 0xa2, 0x61, b'f', 0x61, b'f', 0x61, b'v', 0xa1, 0x61, b'v', 0xa1, 0x61, b'i', 0x01];
+    assert_eq!(create_effect(None).encode().expect("encode"), today, "a local create's effect is unchanged");
+    assert_eq!(Effect::decode(&today).expect("decode"), create_effect(None), "a stored effect without `t` decodes");
+
+    // The same with `"t": 1700000000123456789` after it, in canonical key order.
+    let created = CreatedAt(1_700_000_000_123_456_789);
+    let mut imported = vec![0xa2];
+    imported.extend(&today[1..]);
+    imported.extend([0x61, b't', 0x1b, 0x17, 0x97, 0x9c, 0xfe, 0x3d, 0x85, 0xcd, 0x15]);
+    assert_eq!(create_effect(Some(created)).encode().expect("encode"), imported, "an import's create carries `t`");
+    assert_eq!(Effect::decode(&imported).expect("decode"), create_effect(Some(created)));
 }
 
 // Behaviour (#3392 G8): the cause column holds the five texts its CHECK allows.

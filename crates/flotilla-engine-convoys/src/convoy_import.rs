@@ -36,7 +36,7 @@ use flotilla_resources::{
     convoy::reconcile::is_ensured, promises::PromiseState as OldState, Convoy as OldConvoy, ConvoyPhase, CrewSource, ForgeSpec,
     ResourceObject, WorkCompletionAuthority,
 };
-use flotilla_schema::{Records, State, Timestamp};
+use flotilla_schema::{CreatedAt, NewChange, Records, State, Timestamp};
 use flotilla_state_machines::{
     kinds::{stock, Catalog},
     machines::{
@@ -117,12 +117,22 @@ pub struct ImportedConvoy {
     pub home: String,
     /// The old record it was imported from: what its checkouts were held for.
     pub record: String,
+    /// The old record's creation time, exactly as the old store stamped it: the import's change
+    /// is made at it and creates the convoy at it, so the convoy reads it as its creation time.
+    pub created: CreatedAt,
     pub resource: Resource<Convoy>,
     pub history: ClaimHistory,
     pub stall: Option<ImportedStall>,
     /// An open stall the import did not record, and why: an operator-level
     /// stall (no record until #3457), or one with no supervision message.
     pub unrecorded_stall: Option<String>,
+}
+
+impl ImportedConvoy {
+    /// The import's change for this convoy: made at its old creation time, and creating it then.
+    pub fn change(&self) -> NewChange {
+        NewChange::new(flotilla_engine_store::IMPORT_WRITER, timestamp(&self.created.to_datetime())).created_at(self.created)
+    }
 }
 
 /// What the import made of one old convoy.
@@ -408,6 +418,7 @@ pub fn import_convoy(
     Ok(ImportOutcome::Imported(Box::new(ImportedConvoy {
         home: home.to_owned(),
         record: convoy.metadata.name.clone(),
+        created: CreatedAt::from_datetime(&convoy.metadata.creation_timestamp),
         resource,
         history,
         stall,
@@ -551,13 +562,12 @@ pub fn stall_record(convoy: &ImportedConvoy) -> Result<Option<Resource<AwaitingR
 pub fn write(store: &mut flotilla_schema_sqlite::Store, convoy: &ImportedConvoy) -> Result<Resource<Convoy>, String> {
     let stall = stall_record(convoy)?;
     let mut write = store.write().map_err(|error| error.to_string())?;
-    let change =
-        write.open_change(&flotilla_schema::NewChange::new("import", convoy.resource.since())).map_err(|error| error.to_string())?;
+    let change = write.open_change(&convoy.change()).map_err(|error| error.to_string())?;
     let next = write.last_sequence(&convoy.home).map_err(|error| error.to_string())? + 1;
     let resource = convoy.resource.clone().numbered(next);
-    write.insert(resource.name(), &resource, change).map_err(|error| error.to_string())?;
+    write.insert_created(resource.name(), &resource, change, convoy.created).map_err(|error| error.to_string())?;
     if let Some(stall) = &stall {
-        write.insert(stall.name(), stall, change).map_err(|error| format!("stall `{}`: {error}", stall.name()))?;
+        write.insert_created(stall.name(), stall, change, convoy.created).map_err(|error| format!("stall `{}`: {error}", stall.name()))?;
     }
     write.commit().map_err(|error| error.to_string())?;
     Ok(resource)
@@ -583,11 +593,11 @@ fn stamped(spec: &ConvoySpec, version: u64) -> ConvoySpec {
     ConvoySpec { seats, promises, ..spec.clone() }
 }
 
-/// Writes one imported convoy into `target` through the creation path, at its `since` as [`write`]
-/// does, and its open stall record beside it; the convoy as written.
+/// Writes one imported convoy into `target` through the creation path, at the old record's
+/// creation time as [`write`] does, and its open stall record beside it; the convoy as written.
 pub fn write_into(target: &mut impl flotilla_engine_store::ImportTarget, convoy: &ImportedConvoy) -> Result<Resource<Convoy>, String> {
     let stall = stall_record(convoy)?;
-    let change = flotilla_schema::NewChange::new(flotilla_engine_store::IMPORT_WRITER, convoy.resource.since());
+    let change = convoy.change();
     // A launch, numbered by the home sequence its create takes, as any launch is.
     let (_, written) = target.write_named_with(&convoy.home, &change, convoy.resource.version().0, |version| {
         let resource = Resource::stored(

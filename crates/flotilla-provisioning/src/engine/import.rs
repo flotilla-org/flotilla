@@ -50,7 +50,7 @@ use flotilla_resources::{
     EnvironmentStatus, ImageBuild as OldImageBuild, ImageBuildFailureClass, ImageBuildPhase, ResourceObject,
     TerminalSession as OldTerminalSession, TerminalSessionPhase, Vessel as OldVessel, VesselPhase, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
-use flotilla_schema::{Kind, NewChange, Ref, State, Timestamp};
+use flotilla_schema::{CreatedAt, Kind, NewChange, Ref, State, Timestamp};
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
@@ -85,6 +85,16 @@ pub struct ImportedResource<K: LifecycleKind> {
     pub record: String,
     pub home: String,
     pub resource: Resource<Lifecycle<K>>,
+    /// The old record's creation time, exactly as the old store stamped it.
+    pub created: CreatedAt,
+}
+
+impl<K: LifecycleKind> ImportedResource<K> {
+    /// The import's change for this record: made at its state's time, creating it at the old
+    /// record's creation time.
+    pub fn change(&self) -> NewChange {
+        NewChange::new(IMPORT_WRITER, self.resource.since()).created_at(self.created)
+    }
 }
 
 /// A record the import refuses, named.
@@ -231,9 +241,11 @@ pub fn label(state: &LifecycleState) -> &'static str {
     }
 }
 
-/// The import's change for old record `obj`: made at its creation time.
+/// The import's change for old record `obj`: made at its creation time, and creating the record
+/// at that time exactly, nanoseconds included.
 pub fn created<R: flotilla_resources::Resource>(obj: &ResourceObject<R>) -> NewChange {
-    NewChange::new(IMPORT_WRITER, Timestamp::from_datetime(&obj.metadata.creation_timestamp))
+    let at = &obj.metadata.creation_timestamp;
+    NewChange::new(IMPORT_WRITER, Timestamp::from_datetime(at)).created_at(CreatedAt::from_datetime(at))
 }
 
 /// A temporary store holding the provisioning stored kinds, TerminalSession and the engine's crew
@@ -263,9 +275,13 @@ where
         .iter()
         .enumerate()
         .filter_map(|(index, resource)| {
-            let change = NewChange::new(IMPORT_WRITER, resource.resource.since());
-            let mut resource =
-                ImportedResource { record: resource.record.clone(), home: resource.home.clone(), resource: resource.resource.clone() };
+            let change = resource.change();
+            let mut resource = ImportedResource {
+                record: resource.record.clone(),
+                home: resource.home.clone(),
+                resource: resource.resource.clone(),
+                created: resource.created,
+            };
             write_imported(&mut rehearsal, &mut resource, &change).err().map(|reason| refuse(index, reason))
         })
         .collect()
@@ -315,7 +331,7 @@ pub fn import_vessels(
             report.notes.push(format!("Vessel `{name}` is Pending with a recorded placement: imported as requested"));
         }
         let result = import_vessel(vessel, home).and_then(|mut imported| {
-            let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+            let change = imported.change();
             write_imported(target, &mut imported, &change).map(|()| imported).map_err(|reason| ImportRefusal {
                 kind: VesselKind::NAME,
                 record: name.clone(),
@@ -354,6 +370,7 @@ pub fn import_vessel(obj: &ResourceObject<OldVessel>, home: &str) -> Result<Impo
         record: obj.metadata.name.clone(),
         home: home.to_owned(),
         resource: Resource::stored(launch_of, request, State::new(state, since), Version(1)),
+        created: CreatedAt::from_datetime(&obj.metadata.creation_timestamp),
     })
 }
 
@@ -401,7 +418,7 @@ pub fn import_environments(
     for (environment, home) in &kept {
         let refuse = |reason: String| ImportRefusal { kind: EnvironmentKind::NAME, record: environment.metadata.name.clone(), reason };
         let result = import_environment(environment, home, vessels, builder_home).and_then(|imported| {
-            let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+            let change = imported.change();
             target.write(home, imported.resource.name(), &change, &imported.resource).map_err(refuse)?;
             // A realised launch keeps the facts its provider reported, written beside it.
             if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
@@ -438,6 +455,7 @@ pub fn import_environment(
         record: obj.metadata.name.clone(),
         home: home.to_owned(),
         resource: Resource::stored(obj.metadata.name.clone(), request, State::new(state, since), Version(1)),
+        created: CreatedAt::from_datetime(&obj.metadata.creation_timestamp),
     })
 }
 
@@ -568,6 +586,7 @@ pub fn import_image_builds(
                 record: name.clone(),
                 home: home.clone(),
                 resource: Resource::stored(name.clone(), request, State::new(state, since), Version(1)),
+                created: CreatedAt::from_datetime(&build.metadata.creation_timestamp),
             };
             write_imported(target, &mut imported, &change).map_err(refuse)?;
             Ok(imported)
@@ -592,7 +611,7 @@ pub fn import_clones(
         }
         let refuse = |reason: String| ImportRefusal { kind: CloneKind::NAME, record: clone.metadata.name.clone(), reason };
         let result = import_clone(clone, home).and_then(|mut imported| {
-            let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+            let change = imported.change();
             write_imported(target, &mut imported, &change).map_err(refuse)?;
             if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
                 let facts = CloneFacts { default_branch: clone.status.as_ref().and_then(|status| status.default_branch.clone()) };
@@ -628,6 +647,7 @@ pub fn import_clone(obj: &ResourceObject<OldClone>, home: &str) -> Result<Import
             State::new(state, since),
             Version(1),
         ),
+        created: CreatedAt::from_datetime(&obj.metadata.creation_timestamp),
     })
 }
 
@@ -654,7 +674,7 @@ pub fn import_checkouts(
         }
         let refuse = |reason: String| ImportRefusal { kind: CheckoutKind::NAME, record: checkout.metadata.name.clone(), reason };
         let result = import_checkout(checkout, home, holders, clones).and_then(|(mut imported, holder)| {
-            let mut change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+            let mut change = imported.change();
             if let Some((identity, version)) = holder {
                 change.items.push(flotilla_schema::ChangeItem::new(identity, Some(version.to_string())));
             }
@@ -723,6 +743,7 @@ pub fn import_checkout(
             record: obj.metadata.name.clone(),
             home: home.to_owned(),
             resource: Resource::stored(obj.metadata.name.clone(), request, State::new(state, since), Version(1)),
+            created: CreatedAt::from_datetime(&obj.metadata.creation_timestamp),
         },
         holder,
     ))
@@ -746,7 +767,7 @@ pub fn import_terminal_sessions(
         }
         let refuse = |reason: String| ImportRefusal { kind: TerminalSessionKind::NAME, record: session.metadata.name.clone(), reason };
         let result = import_terminal_session(session, home, vessels).and_then(|mut imported| {
-            let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+            let change = imported.change();
             write_imported(target, &mut imported, &change).map_err(refuse)?;
             if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
                 write_beside(target, home, imported.resource.name(), &change, &terminal_launch_facts(session), report).map_err(refuse)?;
@@ -791,6 +812,7 @@ pub fn import_terminal_session(
         record: obj.metadata.name.clone(),
         home: home.to_owned(),
         resource: Resource::stored(obj.metadata.name.clone(), request, State::new(state, since), Version(1)),
+        created: CreatedAt::from_datetime(&obj.metadata.creation_timestamp),
     })
 }
 

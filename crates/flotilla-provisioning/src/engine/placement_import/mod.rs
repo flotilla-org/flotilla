@@ -20,7 +20,7 @@ use flotilla_resources::{
     definition_provenance::SEEDING_MANAGER, definitions::DefinitionOrigin, is_prepared_snapshot, FulfilmentGrant, FulfilmentKind,
     FulfilmentKindSpec, FulfilmentRealisation, ResourceObject, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
 };
-use flotilla_schema::{Kind, Timestamp};
+use flotilla_schema::{CreatedAt, Kind, Timestamp};
 
 use self::retired::{PolicySpec, RetiredPolicy};
 use super::{
@@ -284,6 +284,7 @@ pub fn write_placement(copies: &PlacementCopies, target: &mut impl ImportTarget,
     let placed = import_placement_at(copies, &|home| target.imports(home), report).kinds;
     for placed in placed {
         let written = kinds::change_of(&placed.labels, &placed.annotations, &placed.home, Timestamp::from_datetime(&placed.created))
+            .map(|change| change.created_at(CreatedAt::from_datetime(&placed.created)))
             .and_then(|change| target.write(&placed.home, &placed.name, &change, &placed.record));
         match written {
             Ok(()) => {

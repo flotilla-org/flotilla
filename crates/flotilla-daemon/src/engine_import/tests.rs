@@ -196,6 +196,8 @@ async fn an_imported_record_is_created_at_its_old_creation_time() {
     let change = read.last_change(id).expect("change").expect("a create");
     assert_eq!(change.at, Timestamp::from_datetime(&created));
     assert_eq!(change.writer, flotilla_engine_store::IMPORT_WRITER);
+    let exactly = flotilla_schema::CreatedAt::from_datetime(&created);
+    assert_eq!(read.creation_time(id).expect("created"), exactly, "its old creation time, to the nanosecond");
 }
 
 #[tokio::test]

@@ -357,9 +357,10 @@ fn message(old: &OldDemand<'_>, pending: &Pending, version: u64, conversion: &Co
     let mut spec = pending.attention.spec(conversion.roles, inbox.clone())?;
     spec.admitted_seq = version;
     let name = imported_name(&inbox, &pending.id)?;
-    let created = Timestamp::from_datetime(&raised(old.record));
+    let raised = raised(old.record);
+    let (created, created_at) = (Timestamp::from_datetime(&raised), flotilla_schema::CreatedAt::from_datetime(&raised));
     let resource: Resource<Machine> =
         Resource::stored(name, spec, StoredState::<Machine>::new(MessageState::Pending, created), Version(version));
     check(&resource)?;
-    Ok(ImportedMessage { record: old.record.metadata.name.clone(), home: old.home.clone(), resource, created })
+    Ok(ImportedMessage { record: old.record.metadata.name.clone(), home: old.home.clone(), resource, created, created_at })
 }

@@ -28,7 +28,7 @@ use flotilla_resources::account_access::{
 };
 use flotilla_resources::engine_records::{EngineObject, EngineRecords};
 use flotilla_resources::CONVOY_LABEL;
-use flotilla_schema::{Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
+use flotilla_schema::{CreatedAt, Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
 use futures::stream::BoxStream;
@@ -632,6 +632,7 @@ pub fn import_accounts(
     use flotilla_state_machines::Version;
     let change = |old: &flotilla_resources::ObjectMeta| {
         NewChange::new(flotilla_engine_store::IMPORT_WRITER, Timestamp::from_datetime(&old.creation_timestamp))
+            .created_at(CreatedAt::from_datetime(&old.creation_timestamp))
     };
     let mut renamed = BTreeMap::new();
     let mut taken = BTreeSet::new();

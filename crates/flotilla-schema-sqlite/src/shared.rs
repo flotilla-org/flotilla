@@ -281,7 +281,7 @@ pub(crate) const IDENTITY_INSERT: &str = "INSERT INTO resource_identity (kind, n
 /// widened from microseconds to nanoseconds.
 pub(crate) const IDENTITY_SET_CREATED: &str =
     "UPDATE resource_identity SET created_at = (SELECT at * 1000 FROM change WHERE home = ?2 AND seq = ?3) WHERE id = ?1";
-/// A creation time given outright: one a snapshot carries from the home.
+/// A creation time given outright: an import create's, or one a snapshot carries from the home.
 pub(crate) const IDENTITY_RESTORE_CREATED: &str = "UPDATE resource_identity SET created_at = ?1 WHERE id = ?2";
 pub(crate) const IDENTITY_CREATED: &str = "SELECT created_at FROM resource_identity WHERE id = ?1";
 pub(crate) const IDENTITY_OF: &str =

@@ -32,7 +32,7 @@ fn open(conn: Connection, home: &str) -> Store {
 }
 
 fn origin(text: &str) -> NewChange {
-    NewChange { writer: text.to_owned(), at: Timestamp(0), items: Vec::new() }
+    NewChange::new(text, Timestamp(0))
 }
 
 // Property (#3422): equal text is deduplicated only within one domain. Every generated step

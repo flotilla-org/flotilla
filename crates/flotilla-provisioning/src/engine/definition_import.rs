@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::{DateTime, Utc};
 use flotilla_engine_store::{ImportTarget, Rehearsal};
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
@@ -36,7 +37,7 @@ use flotilla_resources::{
     ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, ObjectMeta,
     Project, Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
 };
-use flotilla_schema::{Kind, Timestamp};
+use flotilla_schema::{CreatedAt, Kind, Timestamp};
 use flotilla_store::{definition_is_live, merge_definition_copies};
 
 use super::{
@@ -169,8 +170,9 @@ pub struct ImportedDefinition<S> {
     pub record: S,
     /// Why its home's copy was written: the import's change for it.
     pub origin: DefinitionOrigin,
-    /// When its home's copy was created: the time of the import's change.
-    pub created: Timestamp,
+    /// When its home's copy was created, as the old store stamped it: the time of the import's
+    /// change and the record's creation time.
+    pub created: DateTime<Utc>,
 }
 
 /// Maps the copies of `D`'s kind onto engine records, one group of copies per namespace and name.
@@ -286,7 +288,7 @@ where
                     namespace: namespace.to_owned(),
                     name: name.to_owned(),
                     home: copy.home.clone(),
-                    created: Timestamp::from_datetime(&copy.object.metadata.creation_timestamp),
+                    created: copy.object.metadata.creation_timestamp,
                     record,
                     origin,
                 }),
@@ -337,7 +339,8 @@ where
     let kind = <D::Stored as Kind>::KIND;
     let mut written = BTreeSet::new();
     for imported in import_kind_at::<D>(copies, &|home| target.imports(home), report) {
-        let change = change_of(&imported.origin, &imported.home, imported.created);
+        let change = change_of(&imported.origin, &imported.home, Timestamp::from_datetime(&imported.created))
+            .created_at(CreatedAt::from_datetime(&imported.created));
         match target.write(&imported.home, &imported.name, &change, &imported.record) {
             Ok(()) => {
                 report.import_row(kind, label(&imported.origin));

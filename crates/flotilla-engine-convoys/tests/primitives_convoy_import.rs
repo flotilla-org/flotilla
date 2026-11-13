@@ -359,6 +359,47 @@ fn the_import_is_one_change_at_the_convoys_time() {
     assert!(convoy.history.crews[0].claim.contains("first attempt"), "the import still reads the claim: {:?}", convoy.history);
 }
 
+/// An old convoy stamped, as the old store stamps a record, to the nanosecond: digits a change's
+/// microsecond time cannot hold.
+fn stamped_to_the_nanosecond() -> ResourceObject<Convoy> {
+    use chrono::TimeZone;
+    let mut old = convoy("c", ConvoyPhase::Active, vec![agent("coder", true)]);
+    old.metadata.creation_timestamp = Utc.timestamp_opt(1_700_000_000, 123_456_789).single().expect("time");
+    let started = old.metadata.creation_timestamp + chrono::Duration::hours(1);
+    old.status.as_mut().expect("status").started_at = Some(started);
+    old
+}
+
+// Behaviour (#3108 creation time): an imported convoy is created at the old record's creation
+// time to the nanosecond, not when it started, whichever write path imports it; its state keeps
+// its start.
+#[test]
+fn an_imported_convoy_is_created_at_its_old_creation_time() {
+    use flotilla_engine_store::ImportTarget;
+    use flotilla_schema::{CreatedAt, Kind, Timestamp};
+    use flotilla_state_machines::{machines::convoy::Convoy as Engine, Resource};
+    let old = stamped_to_the_nanosecond();
+    let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
+    let started = old.status.as_ref().and_then(|status| status.started_at).expect("started");
+    assert_eq!(convoy.resource.since(), Timestamp::from_datetime(&started), "the state keeps its start");
+    let created = CreatedAt::from_datetime(&old.metadata.creation_timestamp);
+
+    let connection = rusqlite::Connection::open_in_memory().expect("connection");
+    let mut store =
+        flotilla_schema_sqlite::Store::open(connection, HOME, flotilla_engine_store::registry().expect("registry")).expect("store");
+    let written = flotilla_engine_convoys::convoy_import::write(&mut store, &convoy).expect("written");
+    let mut read = store.read().expect("read");
+    let id = read.resolve(Resource::<Engine>::CODE, written.name(), HOME).expect("resolve").expect("created");
+    assert_eq!(read.creation_time(id).expect("created"), created, "write");
+
+    let mut import = flotilla_engine_store::Import::in_memory(HOME, flotilla_engine_store::registry().expect("registry")).expect("import");
+    let written = flotilla_engine_convoys::convoy_import::write_into(&mut import, &convoy).expect("written");
+    assert!(import.imports(HOME));
+    let mut read = import.store().read().expect("read");
+    let id = read.resolve(Resource::<Engine>::CODE, written.name(), HOME).expect("resolve").expect("created");
+    assert_eq!(read.creation_time(id).expect("created"), created, "write_into");
+}
+
 // Behaviour (the pre-roll rehearsal): every Convoy the stored-record corpus holds is imported,
 // stays on the old path, or is refused by name, and every imported one writes and reads back.
 // Every unfinished, bootstrapped convoy is imported or refused; ended ones stay old. (The current

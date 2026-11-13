@@ -1,5 +1,5 @@
-//! A resource's creation time (#3108): its create's change time widened to nanoseconds, held on
-//! its identity and read by `Read::created`.
+//! A resource's creation time (#3108): its create's change time widened to nanoseconds, or the
+//! old creation time an import's create carries, held on its identity and read by `Read::created`.
 
 use flotilla_schema::{ChangeItem, CreatedAt, Edge, EdgeEvent, Identity, Kind, NewChange, State, Timestamp};
 use flotilla_schema_sqlite::{stream, ResourceId, Store, StoreError};
@@ -10,6 +10,9 @@ use crate::fixtures::{
     synthetic::{DossierEdge, DossierState},
     Dossier, Payload, LOCAL,
 };
+
+/// An import's old creation time: nanoseconds a change's microsecond time cannot hold.
+const IMPORTED: CreatedAt = CreatedAt(100_123_456_789);
 
 /// A store homed at `home`.
 fn store_at(home: &str) -> Store {
@@ -104,26 +107,46 @@ fn a_referenced_identity_has_no_creation_time_until_its_create() {
     assert_eq!(created(&mut store, id), widened(200));
 }
 
-// Behaviour (replication): a replica reads the home's creation time, whether it installed the
-// resource from the home's snapshot or applied the home's create event, and an edit it applies
-// keeps it.
+// Behaviour (import): a create given an old creation time reads it to the nanosecond, whether its
+// new change carries it or it is given beside a change opened before; the change keeps its own time.
+#[test]
+fn an_imported_create_reads_its_old_creation_time_exactly() {
+    let mut store = store();
+    let mut write = store.write().expect("write");
+    let carried = write.insert("carried", &Dossier::sample(0), &at(100).created_at(IMPORTED)).expect("insert");
+    let opened = write.open_change(&at(100)).expect("open");
+    let given = write.insert_created("given", &Dossier::sample(0), opened, IMPORTED).expect("insert");
+    let local = write.insert("local", &Dossier::sample(0), opened).expect("insert");
+    write.commit().expect("commit");
+    assert_eq!(created(&mut store, carried.id), Some(IMPORTED), "carried by the new change");
+    assert_eq!(created(&mut store, given.id), Some(IMPORTED), "given beside an opened change");
+    assert_eq!(created(&mut store, local.id), widened(100), "the opened change's other creates are at its time");
+}
+
+// Behaviour (replication): a replica reads the home's creation time, an imported one to the
+// nanosecond included, whether it installed the resource from the home's snapshot or applied the
+// home's create event, and an edit it applies keeps it.
 #[test]
 fn a_replica_reads_the_homes_creation_time() {
     let mut home = store_at("home");
     let mut replica = store_at("replica");
     let mut write = home.write().expect("write");
     let first = write.insert("first", &Dossier::sample(0), &at(100)).expect("insert");
+    write.insert("imported", &Dossier::sample(0), &at(100).created_at(IMPORTED)).expect("insert");
     write.commit().expect("commit");
     sync(&mut home, &mut replica, None);
     assert_eq!(created_at(&mut replica, "first", "home"), widened(100), "installed from the snapshot");
+    assert_eq!(created_at(&mut replica, "imported", "home"), Some(IMPORTED), "an import's, installed from the snapshot");
 
     let after = home.read().expect("read").last_sequence("home").expect("last");
     let mut write = home.write().expect("write");
     write.insert("second", &Dossier::sample(0), &at(300)).expect("insert");
+    write.insert("imported-later", &Dossier::sample(0), &at(300).created_at(IMPORTED)).expect("insert");
     let current = write.load::<Dossier>(first.id).expect("load").expect("present");
     write.update(&current, &Dossier::sample(1), &at(400)).expect("edit");
     write.commit().expect("commit");
     sync(&mut home, &mut replica, Some(after));
     assert_eq!(created_at(&mut replica, "second", "home"), widened(300), "applied from the create event");
+    assert_eq!(created_at(&mut replica, "imported-later", "home"), Some(IMPORTED), "an import's, applied from the create event");
     assert_eq!(created_at(&mut replica, "first", "home"), widened(100), "an applied edit keeps it");
 }

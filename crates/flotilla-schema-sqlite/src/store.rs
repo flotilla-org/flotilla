@@ -453,8 +453,9 @@ impl Read<'_> {
         self.ctx().last_change(id)
     }
 
-    /// When resource `id` was last created: its create's change time, widened. None for an
-    /// identity no create has been written for, as one held only as a reference's target.
+    /// When resource `id` was last created: its create's change time, widened, or an import's old
+    /// creation time. None for an identity no create has been written for, as one held only as a
+    /// reference's target.
     pub fn created(&mut self, id: ResourceId) -> Result<Option<CreatedAt>, StoreError> {
         self.ctx().created(id)
     }
@@ -834,13 +835,33 @@ impl Write<'_> {
 
     /// Inserts a resource homed here, logged as a `create` entry of `change`. Its version is the
     /// next local home sequence, which also stamps every `records` and `history` row it holds. It
-    /// is created at its change's time.
+    /// is created at a new change's `created` when set, otherwise at its change's time.
     pub fn insert<'c, K: Kind>(&mut self, name: &str, value: &K, change: impl Into<InChange<'c>>) -> Result<Stamp, StoreError> {
-        let rows = Encoder::encode(value)?;
         let change = change.into();
+        let created = match change {
+            InChange::New(change) => change.created,
+            InChange::Opened(_) => None,
+        };
+        self.insert_at(name, value, change, created)
+    }
+
+    /// [`Self::insert`] created at `created`, which its create entry carries: an imported record's
+    /// old creation time, under a change opened before.
+    pub fn insert_created<'c, K: Kind>(
+        &mut self,
+        name: &str,
+        value: &K,
+        change: impl Into<InChange<'c>>,
+        created: CreatedAt,
+    ) -> Result<Stamp, StoreError> {
+        self.insert_at(name, value, change.into(), Some(created))
+    }
+
+    fn insert_at<K: Kind>(&mut self, name: &str, value: &K, change: InChange<'_>, created: Option<CreatedAt>) -> Result<Stamp, StoreError> {
+        let rows = Encoder::encode(value)?;
         self.guarded(|ctx| {
             let change = ctx.change_id(change)?;
-            ctx.insert::<K>(name, rows, change)
+            ctx.insert::<K>(name, rows, change, created)
         })
     }
 
@@ -1344,7 +1365,7 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    fn insert<K: Kind>(&mut self, name: &str, rows: Rows, change: ChangeId) -> Result<Stamp, StoreError> {
+    fn insert<K: Kind>(&mut self, name: &str, rows: Rows, change: ChangeId, created: Option<CreatedAt>) -> Result<Stamp, StoreError> {
         self.sql(K::CODE)?;
         let identity = Identity { kind: K::CODE, name: name.to_owned(), home: self.runtime.home.clone() };
         let id = self.ensure_identity(&identity)?;
@@ -1362,11 +1383,11 @@ impl Ctx<'_> {
             }
         }
         let hashes: BTreeSet<Hash> = rows.tables.iter().flatten().flat_map(|row| set_objects(None, row)).collect();
-        let effect = Effect { changes, objects: carried(hashes, rows.objects)?, expunged: None };
+        let effect = Effect { changes, objects: carried(hashes, rows.objects)?, expunged: None, created };
         let header = Header { topic: whole_log_topic(), cause: Cause::Create, change: change.0, about: None, arguments: None };
         self.write_local(K::CODE, id, header, effect, (sequence, version), None)?;
         let home = self.runtime.home.clone();
-        self.set_created(id, &home, change.0)?;
+        self.set_created(id, &home, change.0, created)?;
         Ok(Stamp { id, version })
     }
 
@@ -1448,7 +1469,7 @@ impl Ctx<'_> {
         });
         let root = root_changed.then(|| (Some(&old.tables[0][0]), &new[0][0]));
         let hashes = changed.chain(root).flat_map(|(before, after)| set_objects(before, after)).collect();
-        let effect = Effect { changes, objects: carried(hashes, new_objects)?, expunged: None };
+        let effect = Effect { changes, objects: carried(hashes, new_objects)?, ..Effect::default() };
         // A no-op opens no change: only a write that logs an entry takes a change's sequence.
         let change = self.change_id(change)?;
         let (sequence, version) = self.next_sequence()?;
@@ -1615,7 +1636,7 @@ impl Ctx<'_> {
         let (sequence, version) = self.next_sequence()?;
         let cause = Cause::Edge { edge: event.edge, from: event.from, to: event.to };
         let header = Header { topic: whole_log_topic(), cause, change: change.0, about: event.about, arguments: Some(event.arguments) };
-        let effect = Effect { changes, objects, expunged: None };
+        let effect = Effect { changes, objects, ..Effect::default() };
         if !self.write_local(K::CODE, current.id, header, effect, (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
         }
@@ -1830,7 +1851,7 @@ impl Ctx<'_> {
             return Err(StoreError::NotFound { id });
         }
         if event.cause == Cause::Create {
-            self.set_created(id, &event.home, event.change)?;
+            self.set_created(id, &event.home, event.change, event.effect.created)?;
         }
         // The log explains the record again from its first entry here.
         self.conn.prepare_cached(SNAPSHOT_CAUSE_DELETE)?.execute([id.0])?;
@@ -2252,8 +2273,13 @@ impl Ctx<'_> {
         Ok(at.flatten().map(CreatedAt))
     }
 
-    /// Writes on identity `id` that it was created by change `seq` of `home`: at that change's time.
-    fn set_created(&mut self, id: ResourceId, home: &str, seq: u64) -> Result<(), StoreError> {
+    /// Writes on identity `id` that it was created by change `seq` of `home`: at `created` when
+    /// the create carries it, otherwise at that change's time.
+    fn set_created(&mut self, id: ResourceId, home: &str, seq: u64, created: Option<CreatedAt>) -> Result<(), StoreError> {
+        if let Some(created) = created {
+            self.conn.prepare_cached(IDENTITY_RESTORE_CREATED)?.execute(params![created.0, id.0])?;
+            return Ok(());
+        }
         let home = self.intern(HOME_DOMAIN, home)?;
         let seq = i64::try_from(seq).map_err(|_| Malformed::Sequence { home_seq: seq })?;
         self.conn.prepare_cached(IDENTITY_SET_CREATED)?.execute(params![id.0, home, seq])?;

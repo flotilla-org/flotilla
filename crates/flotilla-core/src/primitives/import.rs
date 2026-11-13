@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_address::{Address, Kind};
 use flotilla_engine_store::{ImportTarget, IMPORT_WRITER};
 use flotilla_resources::{Message, MessageExpectation, MessagePhase, ResolvedMessageReceiver, ResourceObject};
-use flotilla_schema::{NewChange, Timestamp};
+use flotilla_schema::{CreatedAt, NewChange, Timestamp};
 use flotilla_state_machines::{
     machines::{
         consumer::{ConsumerKind, Receiver},
@@ -59,6 +59,9 @@ pub struct ImportedMessage {
     pub resource: Resource<Machine>,
     /// When the old record was created: the time of the import's change.
     pub created: Timestamp,
+    /// When the old record was created, exactly as the old store stamped it: the message's
+    /// creation time.
+    pub created_at: CreatedAt,
 }
 
 /// A record the import refuses, named.
@@ -140,8 +143,9 @@ pub fn import_message(
     let record = old.record.metadata.name.clone();
     match convert(old, version, conversion, world) {
         Ok(resource) => {
-            let created = Timestamp::from_datetime(&old.record.metadata.creation_timestamp);
-            Ok(Imported::Message(Box::new(ImportedMessage { record, home: old.home.clone(), resource, created })))
+            let stamped = &old.record.metadata.creation_timestamp;
+            let (created, created_at) = (Timestamp::from_datetime(stamped), CreatedAt::from_datetime(stamped));
+            Ok(Imported::Message(Box::new(ImportedMessage { record, home: old.home.clone(), resource, created, created_at })))
         }
         Err(Unimported::Missing { reason, .. }) if settled(old.record) || receiver_ended(old.record, conversion) => {
             Ok(Imported::Dropped(ImportDrop { record, reason }))
@@ -478,7 +482,7 @@ pub fn write_messages(imported: &[ImportedMessage], target: &mut impl ImportTarg
                 next.push(message);
                 continue;
             }
-            let change = NewChange::new(IMPORT_WRITER, message.created);
+            let change = NewChange::new(IMPORT_WRITER, message.created).created_at(message.created_at);
             let result = target.write_with(&message.home, message.resource.name(), &change, message.resource.version().0, |version| {
                 let mut spec = message.resource.spec().clone();
                 spec.admitted_seq = version;

@@ -13,7 +13,7 @@ pub mod watch;
 use std::sync::Arc;
 
 use flotilla_schema::{
-    Cbor, ChangeItem, Event, Identity, Kind, KindRegistry, KindSpec, Labelled, NewChange, RegistryError, StateData, Timestamp,
+    Cbor, ChangeItem, CreatedAt, Event, Identity, Kind, KindRegistry, KindSpec, Labelled, NewChange, RegistryError, StateData, Timestamp,
 };
 use flotilla_schema_sqlite::{AboutCursor, ChangeId, Read, Stamp, Store, StoreError, StoreGuard, StoreHandle, Write};
 use flotilla_state_machines::{
@@ -303,6 +303,18 @@ impl Rehearsal {
     /// Restores `value` as `name` at `home` and `version`, reads it back and compares; the reason
     /// it was refused, or read back differently, otherwise.
     pub fn restore<K: Kind + PartialEq>(&mut self, home: &str, name: &str, version: u64, value: &K) -> Result<(), String> {
+        self.restore_created(home, name, version, value, None)
+    }
+
+    /// [`Self::restore`] at the creation time `created`, as a replica installs the home's snapshot.
+    fn restore_created<K: Kind + PartialEq>(
+        &mut self,
+        home: &str,
+        name: &str,
+        version: u64,
+        value: &K,
+        created: Option<CreatedAt>,
+    ) -> Result<(), String> {
         use flotilla_schema::Encoder;
         if home == REHEARSAL_HOME {
             return Err(format!("homed at `{REHEARSAL_HOME}`, the rehearsal's own home"));
@@ -315,7 +327,7 @@ impl Rehearsal {
             version,
             rows,
             cause: None,
-            created_at: None,
+            created_at: created,
         };
         let mut write = self.store.write().map_err(|error| error.to_string())?;
         write.restore(&snapshot).map_err(|error| error.to_string())?;
@@ -332,12 +344,14 @@ impl ImportTarget for Rehearsal {
     fn write_named_with<K: Kind + PartialEq>(
         &mut self,
         home: &str,
-        _: &NewChange,
+        change: &NewChange,
         version: u64,
         make: impl FnOnce(u64) -> (String, K),
     ) -> Result<(String, K), String> {
         let (name, value) = make(version);
-        self.restore(home, &name, version, &value)?;
+        // The creation time an import's create would give it, on its home and every replica.
+        let created = change.created.unwrap_or_else(|| CreatedAt::from(change.at));
+        self.restore_created(home, &name, version, &value, Some(created))?;
         Ok((name, value))
     }
 
@@ -388,11 +402,15 @@ impl ImportTarget for Import {
             return Err(format!("homed at `{home}`, another home's to import"));
         }
         let mut write = self.store.write().map_err(|error| error.to_string())?;
-        let change = write.open_change(change).map_err(|error| error.to_string())?;
+        let opened = write.open_change(change).map_err(|error| error.to_string())?;
         let version = write.last_sequence(home).map_err(|error| error.to_string())? + 1;
         let (name, value) = make(version);
         let value = value.with_identity(&name, version);
-        write.insert(&name, &value, change).map_err(|error| error.to_string())?;
+        match change.created {
+            Some(created) => write.insert_created(&name, &value, opened, created),
+            None => write.insert(&name, &value, opened),
+        }
+        .map_err(|error| error.to_string())?;
         write.commit().map_err(|error| error.to_string())?;
         read_back(&mut self.store, home, &name, &value)?;
         Ok((name, value))
