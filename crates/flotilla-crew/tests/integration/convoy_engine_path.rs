@@ -11,16 +11,17 @@ use std::{
 use async_trait::async_trait;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_resources::{
-    address::{artifact_address, record_name},
+    address::{artifact_address, record_name, stored_change_request_address},
     artifact::blob_digest_of,
     convoy::engine::{Actor, EngineConvoyPath, EngineConvoys, OldPromises, VerdictScope},
-    promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState},
-    Artifact, ArtifactSpec, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta,
+    promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
+    Artifact, ArtifactSpec, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Convoy, ConvoyPhase,
+    ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, Observation, ObservedChangeRequestState,
     ResourceObject, VesselRequirement, WorkflowSnapshot,
 };
 use flotilla_store::{controller::Reconciler, ResourceBackend};
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadOperation, ReadSnapshot};
+use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadOperation, ReadSnapshot, ReadTally};
 
 const NAMESPACE: &str = "flotilla";
 
@@ -199,6 +200,85 @@ async fn a_pass_reads_only_its_ledgers_artifacts() {
     let reads = assert_flat_reads([0, 40], ledger_pass_reads).await;
     assert_eq!(reads.calls("Artifact", ReadOperation::List), 0, "{reads}");
     assert_eq!(reads.objects("Artifact", ReadOperation::Get), 1, "{reads}");
+}
+
+/// Stores change request `number` of `github.com/org/repo`, merged, under its record name.
+async fn publish_merged_change_request(backend: &ResourceBackend, number: u64) {
+    let name = record_name(&stored_change_request_address("github.com", "org/repo", number, &[]).expect("address")).expect("record name");
+    let requests = backend.clone().using::<ChangeRequest>(NAMESPACE);
+    let spec = ChangeRequestSpec::builder()
+        .service("github.com".into())
+        .scope("org/repo".into())
+        .number(number)
+        .observing_authority("test".into())
+        .build();
+    let created = requests.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("change request");
+    let status = ChangeRequestStatus {
+        state: Observation::known(ObservedChangeRequestState::Merged, chrono::Utc::now()),
+        head_sha: Default::default(),
+        title: Default::default(),
+        author: Default::default(),
+        review_decision: Default::default(),
+        review_requested_from_owner: Default::default(),
+        checks: Default::default(),
+        mergeable: Default::default(),
+        review: ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+    };
+    requests.update_status(&name, &created.metadata.resource_version, &status).await.expect("status");
+}
+
+/// The reads one pass over a convoy whose coder submitted PR 1 makes, and the edges it asked
+/// for, with `others` other change requests held.
+async fn pr_pass_reads(others: usize) -> (ReadSnapshot, Vec<(bool, String, String)>) {
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let mut convoy = ledger_convoy(&backend).await;
+    let status = convoy.status.as_mut().expect("status");
+    status.promises.clear();
+    let submit = PromiseOperation::Submit {
+        id: "pr".into(),
+        kind: PromiseKind::Pr,
+        source: PromiseSource::Crew,
+        submission: Submission {
+            reference: "cr/github.com/org/repo/1".into(),
+            metadata: BTreeMap::new(),
+            submitted_at: chrono::Utc::now(),
+            verdict: None,
+        },
+    };
+    promises::apply(status, "work", "coder", &submit);
+    publish_merged_change_request(&backend, 1).await;
+    for number in 0..others as u64 {
+        publish_merged_change_request(&backend, 100 + number).await;
+    }
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
+    let before = backend.read_snapshot();
+    reconciler.prepare(&convoy).await.expect("prepare");
+    let reads = backend.read_snapshot().since(&before);
+    // The verdicts asked for, without their times.
+    let verdicts = engine
+        .promises
+        .lock()
+        .expect("promises")
+        .iter()
+        .map(|(_, _, operation, _)| match operation {
+            PromiseOperation::Verdict { verdict, .. } => (verdict.accepted, verdict.who.clone(), verdict.why.clone()),
+            other => panic!("a verdict, not {other:?}"),
+        })
+        .collect();
+    (reads, verdicts)
+}
+
+// Behaviour: a pass reads the change requests its promises name, each by its record name, not
+// every change request held; the merged PR still becomes the observer's accepting verdict.
+#[tokio::test]
+async fn a_pass_reads_only_its_change_requests() {
+    let (reads, verdicts) = assert_flat_reads([0, 40], pr_pass_reads).await;
+    assert_eq!(reads.calls("ChangeRequest", ReadOperation::List), 0, "{reads}");
+    // Its one name's copies: this home's and the replicas', one of them held.
+    assert_eq!(reads.tally("ChangeRequest", ReadOperation::Get), ReadTally { calls: 2, objects: 1 }, "{reads}");
+    assert_eq!(verdicts, [(true, "forge".to_string(), "PR merged".to_string())]);
 }
 
 fn reconciler(backend: &ResourceBackend, engine: Arc<Recording>) -> ConvoyReconciler {

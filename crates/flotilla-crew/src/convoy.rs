@@ -736,8 +736,13 @@ impl Reconciler for ConvoyReconciler {
             flotilla_resources::convoy::promises::PromiseKind::DecisionLedger,
         );
         let change_requests = match &self.change_requests {
+            // Only the change requests the pass looks up, each by its record name: every home's
+            // copy of it, selected as the listing selected them.
             Some(change_requests) if needs_pr => {
-                let sources = change_requests.list().await?.items;
+                let mut sources = Vec::new();
+                for name in change_request_record_names(obj, &checkouts, &forges) {
+                    sources.extend(change_requests.get_all(&name).await?.items);
+                }
                 select_change_requests(sources.iter().map(|source| &source.object))
                     .into_values()
                     .filter_map(|record| {

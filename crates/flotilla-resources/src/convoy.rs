@@ -465,13 +465,7 @@ pub fn observed_change_request_subjects(
         let Some(checkout) = checkouts.get(&name) else { continue };
         let Some(inspection) = checkout.inspection() else { continue };
         let Some(observed) = inspection.change_request else { continue };
-        let repository = convoy
-            .spec
-            .repositories
-            .iter()
-            .find(|repository| repository.repo_ref == *checkout.spec.repo_ref())
-            .ok_or_else(|| format!("checkout {name} repository {} is absent from convoy", checkout.spec.repo_ref()))?;
-        let subject = crate::address::remote_change_request_subject(&repository.url, &observed.to_string(), forges)?;
+        let subject = inspected_change_request_subject(convoy, &name, checkout, observed, forges)?;
         let Some(state) = state_of(&subject) else { continue };
         let terminal = !matches!(state, crate::ObservedChangeRequestState::Open | crate::ObservedChangeRequestState::Draft);
         let merged_during_checkout = inspection
@@ -489,6 +483,65 @@ pub fn observed_change_request_subjects(
         }
     }
     Ok(subjects)
+}
+
+/// The change request checkout `name`'s inspection names as `observed`, in its convoy repository's forge.
+fn inspected_change_request_subject(
+    convoy: &crate::ResourceObject<Convoy>,
+    name: &str,
+    checkout: &crate::checkout_records::CheckoutRecord,
+    observed: impl std::fmt::Display,
+    forges: &[crate::ForgeSpec],
+) -> Result<Subject, String> {
+    let repository = convoy
+        .spec
+        .repositories
+        .iter()
+        .find(|repository| repository.repo_ref == *checkout.spec.repo_ref())
+        .ok_or_else(|| format!("checkout {name} repository {} is absent from convoy", checkout.spec.repo_ref()))?;
+    crate::address::remote_change_request_subject(&repository.url, &observed.to_string(), forges)
+}
+
+/// The ChangeRequest records a convoy's pass reads, each by its record name: the change requests
+/// its expected checkouts' inspections name, those it produces, those its submitted PR promises
+/// name, and those its exit binds. A subject with no address names no record and is left out;
+/// the readers that need it report it.
+pub fn change_request_record_names(
+    convoy: &crate::ResourceObject<Convoy>,
+    checkouts: &BTreeMap<String, crate::checkout_records::CheckoutRecord>,
+    forges: &[crate::ForgeSpec],
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut add = |address: Result<crate::address::Address, String>| {
+        let address = address.ok().filter(|address| address.kind() == crate::address::AddressKind::ChangeRequest);
+        names.extend(address.and_then(|address| crate::address::record_name(&address)));
+    };
+    for name in expected_checkout_refs(convoy, checkouts.keys().map(String::as_str)) {
+        let Some(checkout) = checkouts.get(&name) else { continue };
+        let Some(observed) = checkout.inspection().and_then(|inspection| inspection.change_request) else { continue };
+        if let Ok(subject) = inspected_change_request_subject(convoy, &name, checkout, observed, forges) {
+            add(crate::address::subject_address(&subject, forges));
+        }
+    }
+    if let Some(status) = convoy.status.as_ref() {
+        for subject in status.subjects.iter().filter(|subject| {
+            subject.relationship == Relationship::Produces && subject.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+        }) {
+            add(crate::address::subject_address(&subject.subject, forges));
+        }
+        let submitted = status.promises.values().flat_map(BTreeMap::values).flatten().filter(|promise| {
+            promise.kind == crate::promises::PromiseKind::Pr && promise.state == crate::promises::PromiseState::Submitted
+        });
+        for submission in submitted.filter_map(|promise| promise.submissions.last()) {
+            add(submission.subject_address(forges));
+        }
+    }
+    for leaf in bound_change_request_addresses(convoy, forges).unwrap_or_default() {
+        if let Ok(name) = crate::address::leaf_record_name(&leaf, forges) {
+            names.insert(name);
+        }
+    }
+    names
 }
 
 /// The one sanction for collecting a convoy's managed checkouts.
