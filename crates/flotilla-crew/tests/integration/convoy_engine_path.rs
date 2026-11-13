@@ -379,7 +379,7 @@ async fn a_failed_work_ends_the_launch_and_an_ended_launch_is_forgotten() {
 }
 
 // Behaviour: a convoy whose placement chose a full host notes a capacity stall in its home's
-// memory and sets no timer: a change wakes it (a_change_wakes_only_the_convoys_noted_as_waiting).
+// memory and sets no timer: a change wakes it (a_host_change_wakes_only_the_convoys_waiting_on_it).
 // A sleeping host's wake is its one deadline. Once the host has room the stall is cleared.
 // Nothing is written to the convoy.
 #[tokio::test]
@@ -457,9 +457,9 @@ async fn a_capacity_wait_is_a_note() {
 }
 
 // Behaviour: a change of what convoys wait on wakes the convoys their home notes as waiting on
-// it, and no other: a capacity wait on a Host change, a held delivery on a Message change (here
-// any watched kind stands in; secondary_watches names which kinds wake which wait). No timer is
-// involved.
+// it, and no other: a held delivery on a Message change (here any watched kind stands in;
+// secondary_watches names which kinds wake which wait). A capacity wait is woken by the host it
+// waits on (a_host_change_wakes_only_the_convoys_waiting_on_it). No timer is involved.
 #[tokio::test]
 async fn a_change_wakes_only_the_convoys_noted_as_waiting() {
     use flotilla_crew::convoy::{NoteWake, WakeOn};
@@ -497,35 +497,225 @@ async fn a_change_wakes_only_the_convoys_noted_as_waiting() {
         .create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec { display_name: "feta".into(), ..HostSpec::default() })
         .await
         .expect("host");
-    for (waiting, woken) in [
-        (ConvoyNotes::waits_for_capacity as fn(&ConvoyNotes) -> bool, "waits-for-capacity"),
-        (ConvoyNotes::holds_delivery, "holds-delivery"),
-    ] {
-        let (sender, mut queue) = WorkQueueSender::channel();
-        let wake: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(NoteWake {
-            changes: WakeOn::Replicas(backend.including_replicas::<Host>(NAMESPACE)),
-            engine: Arc::clone(&path),
-            waiting,
-        });
-        let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
-        // The wake opens its watch when it starts: change the host until it hears.
-        let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let status = HostStatus { heartbeat_at: Some(chrono::Utc::now()), ..Default::default() };
-                host = hosts.update_status("feta", &host.metadata.resource_version, &status).await.expect("host change");
-                if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
-                    return name;
-                }
+    let woken = "holds-delivery";
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(NoteWake {
+        changes: WakeOn::Replicas(backend.including_replicas::<Host>(NAMESPACE)),
+        engine: Arc::clone(&path),
+        waiting: ConvoyNotes::holds_delivery,
+    });
+    let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
+    // The wake opens its watch when it starts: change the host until it hears.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = HostStatus { heartbeat_at: Some(chrono::Utc::now()), ..Default::default() };
+            host = hosts.update_status("feta", &host.metadata.resource_version, &status).await.expect("host change");
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                return name;
             }
-        })
-        .await
-        .expect("woken");
-        assert_eq!(first, woken);
-        while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
-            assert_eq!(name, woken, "only the convoys noted as waiting on it are woken");
         }
-        watch.abort();
+    })
+    .await
+    .expect("woken");
+    assert_eq!(first, woken);
+    while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+        assert_eq!(name, woken, "only the convoys noted as waiting on it are woken");
     }
+    watch.abort();
+}
+
+/// A docker placement on `host`, as admission records it.
+fn placement_on(host: &str) -> flotilla_protocol::PlacementDecision {
+    use flotilla_protocol::{CanonicalHostId, FulfilmentAllocation, FulfilmentAllocationCandidate, PlacementDecision, PlacementTargetHost};
+    PlacementDecision {
+        provider_instance: None,
+        provider_workspace_root: None,
+        kind: "docker".into(),
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.into() },
+        minimal_alternatives: Vec::new(),
+        escalation_reason: None,
+        refused_candidates: Vec::new(),
+        viable_not_selected: Vec::new(),
+        allocation: Some(FulfilmentAllocation {
+            chosen_kind: "docker".into(),
+            reservation_reason: None,
+            candidates: vec![FulfilmentAllocationCandidate {
+                kind: "docker".into(),
+                host: host.into(),
+                cost_class: "owned_idle".into(),
+                host_ready: true,
+                sleeping_until: None,
+                free_vessel_slots: Some(0),
+                max_vessels: None,
+                single_tenant: false,
+                reserved_for_platform: false,
+                minimal: true,
+                available: false,
+            }],
+        }),
+    }
+}
+
+/// Stores host `name`, ready, with `free` docker vessel slots.
+async fn host_with_slots(backend: &ResourceBackend, name: &str, free: u32) -> ResourceObject<flotilla_resources::Host> {
+    use flotilla_resources::{FulfilmentFacts, Host, HostSpec, HostStatus};
+    let hosts = backend.clone().using::<Host>(NAMESPACE);
+    let status = HostStatus {
+        ready: true,
+        heartbeat_at: Some(chrono::Utc::now()),
+        fulfilment_facts: BTreeMap::from([(
+            "docker".to_string(),
+            FulfilmentFacts { free_vessel_slots: Some(free), observed_at: chrono::Utc::now(), ..Default::default() },
+        )]),
+        ..Default::default()
+    };
+    match hosts.get(name).await {
+        Ok(host) => hosts.update_status(name, &host.metadata.resource_version, &status).await.expect("host status"),
+        Err(_) => {
+            let host = hosts
+                .create(
+                    &InputMeta::builder().name(name.to_string()).build(),
+                    &HostSpec { display_name: name.into(), ..HostSpec::default() },
+                )
+                .await
+                .expect("host");
+            hosts.update_status(name, &host.metadata.resource_version, &status).await.expect("host status")
+        }
+    }
+}
+
+// Behaviour: a capacity wait notes in its home's memory the host it waits on, so that host's
+// changes wake it, and a pass that no longer waits notes none.
+#[tokio::test]
+async fn a_capacity_wait_notes_the_host_it_waits_on() {
+    use flotilla_resources::Host;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    host_with_slots(&backend, "feta", 0).await;
+    let mut convoy = ledger_convoy(&backend).await;
+    convoy.status.as_mut().expect("status").placement_decision = Some(placement_on("feta"));
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine)).with_hosts(backend.including_replicas::<Host>(NAMESPACE));
+
+    reconciler.prepare(&convoy).await.expect("prepare full");
+    assert!(engine.memory.get("c").waits_for_capacity());
+    assert_eq!(engine.memory.reading("Host", "feta"), ["c"]);
+
+    // The view shows the note; the host frees a slot.
+    engine.memory.get("c").write_into(convoy.status.as_mut().expect("status"));
+    host_with_slots(&backend, "feta", 1).await;
+    reconciler.prepare(&convoy).await.expect("prepare free");
+    assert!(!engine.memory.get("c").waits_for_capacity());
+    assert!(engine.memory.readers("Host").is_empty(), "a convoy with room waits on no host");
+}
+
+/// What hearing one change of host `feta` reads, from when the wake has started, and which
+/// convoys it wakes, with `others` convoys each waiting on a host of its own.
+async fn capacity_wake_reads(others: usize) -> (ReadSnapshot, BTreeSet<String>) {
+    use flotilla_crew::convoy::{host_references, CapacityWake, WakeOn};
+    use flotilla_resources::Host;
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    host_with_slots(&backend, "feta", 0).await;
+    for n in 0..others {
+        host_with_slots(&backend, &format!("host-{n}"), 0).await;
+    }
+    // A convoy waiting on the host the test changes until the wake hears.
+    engine.memory.note_evidence("probe", "Host", ["probe-host".to_string()].into());
+
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(CapacityWake {
+        changes: WakeOn::Replicas(backend.including_replicas::<Host>(NAMESPACE)),
+        engine: engine_path(&engine),
+        hosts: host_references,
+    });
+    let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
+    // The wake queues "probe" once its watch is open.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            host_with_slots(&backend, "probe-host", 0).await;
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                assert_eq!(name, "probe");
+                return;
+            }
+        }
+    })
+    .await
+    .expect("woken");
+    while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+        assert_eq!(name, "probe");
+    }
+    // Noted once the wake is open: a queue holds a name until a controller takes it.
+    engine.memory.note_evidence("c", "Host", ["feta".to_string()].into());
+    for n in 0..others {
+        engine.memory.note_evidence(&format!("other-{n}"), "Host", [format!("host-{n}")].into());
+    }
+
+    let hosts = backend.clone().using::<Host>(NAMESPACE);
+    let feta = hosts.get("feta").await.expect("feta");
+    // Only what the wake reads: the test's own get of the host it changes comes before.
+    let before = backend.read_snapshot();
+    let status = flotilla_resources::HostStatus { heartbeat_at: Some(chrono::Utc::now()), ..feta.status.clone().unwrap_or_default() };
+    hosts.update_status("feta", &feta.metadata.resource_version, &status).await.expect("feta change");
+    let woken = woken(&mut queue).await;
+    let reads = backend.read_snapshot().since(&before);
+    watch.abort();
+    (reads, woken)
+}
+
+// Behaviour: a change of a host wakes only the convoys waiting for capacity on it, reading
+// nothing to find them, at any number of other waiting convoys and hosts.
+#[tokio::test]
+async fn a_host_change_wakes_only_the_convoys_waiting_on_it() {
+    let (reads, woken) = assert_flat_reads([0, 40], capacity_wake_reads).await;
+    reads.assert_zero("hearing a host change");
+    assert_eq!(woken, BTreeSet::from(["c".to_string()]));
+}
+
+// Behaviour: what each capacity wake reads a changed record as standing on: a host by its name
+// and display name, a vessel or convoy by the host its placement targets, an environment by its
+// host; a convoy with no placement stands on none.
+#[tokio::test]
+async fn a_capacity_change_names_the_hosts_it_is_on() {
+    use flotilla_crew::convoy::{convoy_hosts, environment_hosts, host_references, vessel_hosts};
+    use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostSpec, Vessel, VesselSpec, VesselStatus};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut host = host_with_slots(&backend, "feta", 0).await;
+    host.spec = HostSpec { display_name: "Feta".into(), ..HostSpec::default() };
+    assert_eq!(host_references(&host), BTreeSet::from(["Feta".to_string(), "feta".to_string()]));
+
+    let mut convoy = ledger_convoy(&backend).await;
+    assert!(convoy_hosts(&convoy).is_empty(), "no placement, no host");
+    convoy.status.as_mut().expect("status").placement_decision = Some(placement_on("feta"));
+    let pin = flotilla_resources::convoy::VesselPlacementPin { kind_ref: "docker".into(), decision: placement_on("brie") };
+    convoy.metadata.annotations.insert(
+        flotilla_resources::convoy::VESSEL_PLACEMENTS_ANNOTATION.into(),
+        serde_json::to_string(&BTreeMap::from([("work".to_string(), pin)])).expect("pins"),
+    );
+    assert_eq!(convoy_hosts(&convoy), BTreeSet::from(["brie".to_string(), "feta".to_string()]));
+
+    // Any object's metadata will do: the hosts are read from spec and status.
+    let vessel = ResourceObject::<Vessel> {
+        metadata: convoy.metadata.clone(),
+        spec: VesselSpec {
+            convoy_ref: "c".into(),
+            vessel_name: "work".into(),
+            fulfilment_kind_ref: "docker".into(),
+            adopted_checkout_refs: BTreeMap::new(),
+        },
+        status: Some(VesselStatus { placement_decision: Some(placement_on("feta")), ..Default::default() }),
+    };
+    assert_eq!(vessel_hosts(&vessel), BTreeSet::from(["feta".to_string()]));
+
+    let environment = ResourceObject::<Environment> {
+        metadata: convoy.metadata.clone(),
+        spec: EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "feta".into(), repo_default_dir: "/repo".into() }),
+            ..Default::default()
+        },
+        status: None,
+    };
+    assert_eq!(environment_hosts(&environment), BTreeSet::from(["feta".to_string()]));
 }
 
 // Behaviour (#3108): a Message committed on the engine's Message path wakes the convoys noted as

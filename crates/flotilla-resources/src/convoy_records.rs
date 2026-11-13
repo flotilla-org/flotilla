@@ -624,7 +624,8 @@ impl Default for ConvoyMemory {
     }
 }
 
-/// Which evidence records each launch reads, by kind and record name, both ways round.
+/// Which records each launch's last pass read, by kind and record name, both ways round: the
+/// evidence its promises are observed from and the hosts it waits on for capacity.
 #[derive(Debug, Default)]
 struct EvidenceReads {
     by_launch: BTreeMap<(String, &'static str), BTreeSet<String>>,
@@ -687,7 +688,9 @@ impl ConvoyMemory {
     }
 
     /// Notes that launch `name` reads the `kind` records named `records`, in place of what it read
-    /// before. A pass notes them before reading, so a change after its read still wakes it.
+    /// before. A pass notes them before reading, so a change after its read still wakes it. A
+    /// capacity wait notes its Hosts by every reference a change may name them by: placement's,
+    /// the canonical id and the display name.
     pub fn note_evidence(&self, name: &str, kind: &'static str, records: BTreeSet<String>) {
         let mut held = self.evidence.lock().unwrap_or_else(PoisonError::into_inner);
         let before = held.by_launch.remove(&(name.to_owned(), kind)).unwrap_or_default();

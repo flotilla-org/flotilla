@@ -132,6 +132,23 @@ pub fn vessel_placement_pin(convoy: &ResourceObject<Convoy>, vessel: &str) -> Op
     serde_json::from_str::<BTreeMap<String, VesselPlacementPin>>(encoded).ok()?.remove(vessel)
 }
 
+/// Every placement decision the convoy holds: its own, then each vessel pin's.
+pub fn placement_decisions(convoy: &ResourceObject<Convoy>) -> Vec<PlacementDecision> {
+    let pins = convoy
+        .metadata
+        .annotations
+        .get(VESSEL_PLACEMENTS_ANNOTATION)
+        .and_then(|encoded| serde_json::from_str::<BTreeMap<String, VesselPlacementPin>>(encoded).ok())
+        .unwrap_or_default();
+    convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.placement_decision.clone())
+        .into_iter()
+        .chain(pins.into_values().map(|pin| pin.decision))
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct ConvoySpec {
     /// Repository explicitly continued at admission. Other members use fresh branches.

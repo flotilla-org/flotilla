@@ -135,35 +135,34 @@ impl ConvoyReconciler {
 
     /// What wakes a convoy besides its engine records: its sessions (a turn's delivery holds its
     /// landing), the evidence its promises are observed from, and, for a convoy its home notes as
-    /// waiting, what it waits on: capacity on a host (Host, Vessel, Environment and Convoy
-    /// changes) or a crew turn's delivery (commits to `messages`).
+    /// waiting, what it waits on: capacity on a host (changes of that Host, or of a Vessel,
+    /// Environment or Convoy on it) or a crew turn's delivery (commits to `messages`).
     pub fn secondary_watches(
         backend: &flotilla_store::ResourceBackend,
         namespace: &str,
         engine: EngineConvoyPath,
         messages: crate::ports::MessagePath,
     ) -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
-        let capacity = flotilla_resources::convoy_records::ConvoyNotes::waits_for_capacity;
         vec![
-            Box::new(NoteWake {
+            Box::new(CapacityWake {
                 changes: WakeOn::Replicas(backend.including_replicas::<Host>(namespace)),
                 engine: Arc::clone(&engine),
-                waiting: capacity,
+                hosts: host_references,
             }),
-            Box::new(NoteWake {
+            Box::new(CapacityWake {
                 changes: WakeOn::Replicas(backend.including_replicas::<Vessel>(namespace)),
                 engine: Arc::clone(&engine),
-                waiting: capacity,
+                hosts: vessel_hosts,
             }),
-            Box::new(NoteWake {
+            Box::new(CapacityWake {
                 changes: WakeOn::Engine(backend.clone().using::<Environment>(namespace)),
                 engine: Arc::clone(&engine),
-                waiting: capacity,
+                hosts: environment_hosts,
             }),
-            Box::new(NoteWake {
+            Box::new(CapacityWake {
                 changes: WakeOn::Replicas(backend.including_replicas::<Convoy>(namespace)),
                 engine: Arc::clone(&engine),
-                waiting: capacity,
+                hosts: convoy_hosts,
             }),
             Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(namespace), engine: Arc::clone(&engine) }),
             Box::new(EvidenceWake { evidence: backend.including_replicas::<Artifact>(namespace), engine: Arc::clone(&engine) }),
@@ -254,30 +253,23 @@ impl ConvoyReconciler {
     async fn capacity(&self, obj: &ResourceObject<Convoy>) -> Result<Option<CapacityWait>, ResourceError> {
         let Some(hosts) = &self.hosts else { return Ok(None) };
         let available_hosts = hosts.list().await?;
-        let mut decisions = obj.status.as_ref().and_then(|status| status.placement_decision.as_ref()).into_iter().collect::<Vec<_>>();
-        let vessel_pins = obj
-            .metadata
-            .annotations
-            .get(flotilla_resources::convoy::VESSEL_PLACEMENTS_ANNOTATION)
-            .and_then(|encoded| serde_json::from_str::<BTreeMap<String, flotilla_resources::convoy::VesselPlacementPin>>(encoded).ok())
-            .unwrap_or_default();
-        decisions.extend(vessel_pins.values().map(|pin| &pin.decision));
-        for allocation in decisions.into_iter().filter_map(|decision| decision.allocation.as_ref()) {
-            let Some(selected) = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind) else {
-                continue;
-            };
+        for selected in chosen_candidates(obj) {
+            // Every reference a change of the host may name it by.
+            let mut waits_on = BTreeSet::from([selected.host.clone()]);
             let canonical = match canonical_host_id(available_hosts.items.iter().map(|host| &host.object), &selected.host) {
                 Ok(canonical) => canonical,
                 Err(error) => {
-                    return Ok(Some(CapacityWait::reason(format!(
-                        "capacity for fulfilment `{}` on host `{}` is unavailable: {error}",
-                        selected.kind, selected.host
-                    ))));
+                    return Ok(Some(CapacityWait::reason(
+                        format!("capacity for fulfilment `{}` on host `{}` is unavailable: {error}", selected.kind, selected.host),
+                        waits_on,
+                    )));
                 }
             };
             let host = canonical.as_ref().and_then(|id| {
                 available_hosts.items.iter().find(|host| host.object.metadata.name == id.as_str()).map(|host| host.object.clone())
             });
+            waits_on.extend(canonical.iter().map(|id| id.as_str().to_owned()));
+            waits_on.extend(host.iter().map(|host| host.spec.display_name.clone()).filter(|name| !name.is_empty()));
             // A daemon host's cap bounds only the Docker placements admission recorded as capped
             // (#4002). The live cap's value wins: lowering it holds admitted convoys, removing it
             // releases them.
@@ -301,10 +293,13 @@ impl ConvoyReconciler {
                     Ok(None) => slots == Some(0),
                     // An unreadable count waits rather than failing the pass.
                     Err(error) => {
-                        return Ok(Some(CapacityWait::reason(format!(
-                            "capacity for fulfilment `{}` on host `{}` is unavailable: cannot count its vessels: {error}",
-                            selected.kind, selected.host
-                        ))));
+                        return Ok(Some(CapacityWait::reason(
+                            format!(
+                                "capacity for fulfilment `{}` on host `{}` is unavailable: cannot count its vessels: {error}",
+                                selected.kind, selected.host
+                            ),
+                            waits_on,
+                        )));
                     }
                 },
                 _ => slots == Some(0),
@@ -319,6 +314,7 @@ impl ConvoyReconciler {
                         if full { " (no free vessel slots)" } else { "" }
                     ),
                     until: sleeping_until,
+                    hosts: waits_on,
                 }));
             }
         }
@@ -438,22 +434,64 @@ impl ConvoyReconciler {
     }
 }
 
-/// The capacity a convoy waits for: why, and when a sleeping host it waits on wakes.
+/// The capacity a convoy waits for: why, when a sleeping host it waits on wakes, and the
+/// references of the host it waits on, whose changes wake it.
 struct CapacityWait {
     reason: String,
     until: Option<DateTime<Utc>>,
+    hosts: BTreeSet<String>,
 }
 
 impl CapacityWait {
-    fn reason(reason: String) -> Self {
-        Self { reason, until: None }
+    fn reason(reason: String, hosts: BTreeSet<String>) -> Self {
+        Self { reason, until: None, hosts }
     }
 }
 
-/// Wakes the convoys whose home notes `waiting` selects when a `W` changes: a convoy waiting on
-/// capacity when a host, vessel, environment or convoy changes; one holding delivery on a crew
-/// turn when a message changes. A change wakes only the convoys noted as waiting, and each reads
-/// again whether it still waits.
+/// The candidate each of `obj`'s placement decisions chose: the convoy's and each vessel pin's.
+fn chosen_candidates(obj: &ResourceObject<Convoy>) -> Vec<flotilla_protocol::FulfilmentAllocationCandidate> {
+    flotilla_resources::convoy::placement_decisions(obj)
+        .into_iter()
+        .filter_map(|decision| {
+            let allocation = decision.allocation?;
+            allocation.candidates.into_iter().find(|candidate| candidate.kind == allocation.chosen_kind)
+        })
+        .collect()
+}
+
+/// The hosts a convoy's placement decisions target, by their recorded references: what a
+/// convoy holds against a host's capacity.
+pub fn convoy_hosts(convoy: &ResourceObject<Convoy>) -> BTreeSet<String> {
+    flotilla_resources::convoy::placement_decisions(convoy)
+        .into_iter()
+        .map(|decision| decision.target_host.reference.as_str().to_owned())
+        .collect()
+}
+
+/// The host a vessel's placement targets, the one it holds against that host's capacity.
+pub fn vessel_hosts(vessel: &ResourceObject<Vessel>) -> BTreeSet<String> {
+    vessel
+        .status
+        .as_ref()
+        .and_then(|status| status.placement_decision.as_ref())
+        .map(|decision| decision.target_host.reference.as_str().to_owned())
+        .into_iter()
+        .collect()
+}
+
+/// A host by its name and its display name.
+pub fn host_references(host: &ResourceObject<Host>) -> BTreeSet<String> {
+    [host.metadata.name.clone(), host.spec.display_name.clone()].into_iter().filter(|name| !name.is_empty()).collect()
+}
+
+/// The host an environment runs on, if it runs on one.
+pub fn environment_hosts(environment: &ResourceObject<Environment>) -> BTreeSet<String> {
+    environment.spec.host_ref().map(str::to_owned).into_iter().collect()
+}
+
+/// Wakes the convoys whose home notes `waiting` selects when a `W` changes: one holding delivery
+/// on a crew turn when a message changes. A change wakes only the convoys noted as waiting, and
+/// each reads again whether it still waits.
 pub struct NoteWake<W: Resource> {
     pub changes: WakeOn<W>,
     pub engine: EngineConvoyPath,
@@ -483,10 +521,37 @@ impl<W: Resource> WakeOn<W> {
     /// The kind's changes, each read as nothing more than that one happened.
     async fn watch(&self) -> Result<futures::stream::BoxStream<'static, Result<(), ResourceError>>, ResourceError> {
         use futures::StreamExt;
+        Ok(self.objects().await?.map(|event| event.map(drop)).boxed())
+    }
+
+    /// The kind's changes, each the changed object, or None for one that names no object: a
+    /// deletion known only by its name, a Message commit.
+    async fn objects(
+        &self,
+    ) -> Result<futures::stream::BoxStream<'static, Result<Option<ResourceObject<W>>, ResourceError>>, ResourceError> {
+        use futures::StreamExt;
         Ok(match self {
-            WakeOn::Replicas(resolver) => resolver.watch().await?.map(|event| event.map(drop)).boxed(),
-            WakeOn::Engine(resolver) => resolver.watch(WatchStart::Now).await?.map(|event| event.map(drop)).boxed(),
-            WakeOn::MessageCommits(path) => crate::ports::installed_messages(path)?.changes()?.map(Ok).boxed(),
+            WakeOn::Replicas(resolver) => resolver
+                .watch()
+                .await?
+                .map(|event| {
+                    event.map(|event| match event {
+                        ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) | ReadWatchEvent::Deleted(read) => Some(read.object),
+                        ReadWatchEvent::DeletedByName { .. } => None,
+                    })
+                })
+                .boxed(),
+            WakeOn::Engine(resolver) => resolver
+                .watch(WatchStart::Now)
+                .await?
+                .map(|event| {
+                    event.map(|event| match event {
+                        WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => Some(object),
+                        WatchEvent::DeletedByName(_) => None,
+                    })
+                })
+                .boxed(),
+            WakeOn::MessageCommits(path) => crate::ports::installed_messages(path)?.changes()?.map(|()| Ok(None)).boxed(),
         })
     }
 }
@@ -527,6 +592,70 @@ impl<W: Resource> SecondaryWatch for NoteWake<W> {
                         return Err(error);
                     }
                     None => return Ok(()),
+                }
+            }
+        })
+    }
+}
+
+/// Wakes the convoys waiting for capacity on a host when something on that host changes: the
+/// host, a vessel or convoy placed on it, an environment on it. Each pass notes in the home's
+/// memory the hosts it waits on, so a change wakes only those hosts' waiters. A change naming no
+/// object, a deletion known only by its name, wakes every convoy waiting on any host. Placement
+/// decisions are fixed at admission, so a changed vessel or convoy names the host it held.
+pub struct CapacityWake<W: Resource> {
+    pub changes: WakeOn<W>,
+    pub engine: EngineConvoyPath,
+    /// The references of the hosts a `W` is on.
+    pub hosts: fn(&ResourceObject<W>) -> BTreeSet<String>,
+}
+
+impl<W: Resource> std::clone::Clone for CapacityWake<W> {
+    fn clone(&self) -> Self {
+        Self { changes: self.changes.clone(), engine: Arc::clone(&self.engine), hosts: self.hosts }
+    }
+}
+
+impl<W: Resource> SecondaryWatch for CapacityWake<W> {
+    type Primary = Convoy;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: flotilla_store::ResourceBackend,
+        _namespace: String,
+        sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            let Some(engine) = self.engine.get().cloned() else { return Err(ResourceError::other(NO_ENGINE)) };
+            let memory = engine.memory();
+            let host = Host::API_PATHS.kind;
+            // As EvidenceWake: a convoy noted before the watch opened takes one more pass.
+            let mut watch = self.changes.objects().await?;
+            for name in memory.readers(host) {
+                if sender.send(name).await.is_err() {
+                    return Ok(());
+                }
+            }
+            loop {
+                let woken = match futures::StreamExt::next(&mut watch).await {
+                    Some(Ok(Some(object))) => {
+                        (self.hosts)(&object).iter().flat_map(|reference| memory.reading(host, reference)).collect::<BTreeSet<_>>()
+                    }
+                    Some(Ok(None)) => memory.readers(host),
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, kind = W::API_PATHS.kind, "a convoy capacity wake's watch failed");
+                        return Err(error);
+                    }
+                    None => return Ok(()),
+                };
+                for name in woken {
+                    if sender.send(name).await.is_err() {
+                        return Ok(());
+                    }
                 }
             }
         })
@@ -653,10 +782,11 @@ impl Reconciler for ConvoyReconciler {
         let Some(status) = obj.status.as_ref() else { return Ok(ConvoyPass::default()) };
         let now = self.clock.now();
         if status.phase.is_terminal() {
-            // An ended convoy reads no evidence, so no change of it wakes the convoy.
+            // An ended convoy reads no evidence and waits on no host, so no change of either wakes it.
             let memory = engine.memory();
-            memory.note_evidence(&obj.metadata.name, ChangeRequest::API_PATHS.kind, BTreeSet::new());
-            memory.note_evidence(&obj.metadata.name, Artifact::API_PATHS.kind, BTreeSet::new());
+            for kind in [ChangeRequest::API_PATHS.kind, Artifact::API_PATHS.kind, Host::API_PATHS.kind] {
+                memory.note_evidence(&obj.metadata.name, kind, BTreeSet::new());
+            }
             if status.finished_at.is_none() {
                 // The view derived the failure from a failed work; the launch has not ended yet.
                 let reason = status.message.clone().unwrap_or_else(|| format!("the convoy's work {:?}", status.phase));
@@ -671,8 +801,22 @@ impl Reconciler for ConvoyReconciler {
             Some(vessels) => select_convoy_children(obj, &vessels.list().await?.items),
             None => BTreeMap::new(),
         };
-        // A convoy waits for capacity until its first vessel is placed.
-        let capacity = if vessels.is_empty() { self.capacity(obj).await? } else { None };
+        // A convoy waits for capacity until its first vessel is placed. The hosts its placement
+        // chose are noted before they are read, so a change of one after the read wakes it, and
+        // after the read only the host it waits on stays noted.
+        let memory = engine.memory();
+        let capacity = if vessels.is_empty() {
+            let chosen = chosen_candidates(obj).into_iter().map(|candidate| candidate.host).collect();
+            memory.note_evidence(&obj.metadata.name, Host::API_PATHS.kind, chosen);
+            self.capacity(obj).await?
+        } else {
+            None
+        };
+        memory.note_evidence(
+            &obj.metadata.name,
+            Host::API_PATHS.kind,
+            capacity.as_ref().map(|wait| wait.hosts.clone()).unwrap_or_default(),
+        );
         self.note_capacity(obj, capacity.as_ref().map(|wait| &wait.reason), now).map_err(ResourceError::other)?;
         if let Some(wait) = capacity {
             return Ok(ConvoyPass { requeue_after: wait.until.and_then(|until| until.signed_duration_since(now).to_std().ok()) });
