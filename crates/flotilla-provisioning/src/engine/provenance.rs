@@ -26,10 +26,15 @@ use flotilla_resources::{
     DocumentKey, RepositorySpec,
 };
 use flotilla_schema::{ChangeHeader, ChangeItem, Identity, Kind, KindCode, NewChange, Timestamp};
-use flotilla_schema_sqlite::{Read, StoreError};
+use flotilla_schema_sqlite::{Loaded, Read, StoreError};
 use flotilla_state_machines::Resource;
 
-use crate::stored::{manifest_root::ManifestRoot, project::ProjectDefinition, repository::RepositoryRecord};
+use super::manifest_root::generation_name;
+use crate::stored::{
+    manifest_root::{ManifestRoot, RootState},
+    project::ProjectDefinition,
+    repository::RepositoryRecord,
+};
 
 pub(crate) const MANIFEST: &str = "manifest-reconciler";
 pub(crate) const PROJECT_OPERATIONS: &str = "project-operations";
@@ -208,8 +213,7 @@ pub(crate) fn origin_of(
 /// The source of `root`, and the path of each document it declares: the root's baselines list
 /// every one. None while this store does not hold the root.
 fn load_root(read: &mut Read<'_>, root: &Identity) -> Result<Option<Root>, StoreError> {
-    let Some(id) = read.resolve(root.kind, &root.name, &root.home)? else { return Ok(None) };
-    let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? else { return Ok(None) };
+    let Some(loaded) = live_generation(read, root)? else { return Ok(None) };
     let spec = loaded.value.spec();
     let paths = spec
         .baselines
@@ -218,6 +222,26 @@ fn load_root(read: &mut Read<'_>, root: &Identity) -> Result<Option<Root>, Store
         .map(|key| ((key.kind, key.name), key.path))
         .collect();
     Ok(Some(Root { source: spec.source.clone(), paths }))
+}
+
+/// The generation of `root` that reads for it at its home: a change names a root by the name it
+/// was declared under, and a root declared again after it retired is that name's next generation.
+/// The newest bound generation, else the newest. Generations are numbered from the declared name
+/// up and none is deleted, so each is a keyed read.
+fn live_generation(read: &mut Read<'_>, root: &Identity) -> Result<Option<Loaded<Resource<ManifestRoot>>>, StoreError> {
+    let mut generations = Vec::new();
+    while let Some(id) = read.resolve(root.kind, &generation_name(&root.name, generations.len() as u64), &root.home)? {
+        generations.push(id);
+    }
+    let mut newest = None;
+    for id in generations.into_iter().rev() {
+        let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? else { continue };
+        if matches!(loaded.value.state(), RootState::Bound { .. }) {
+            return Ok(Some(loaded));
+        }
+        newest.get_or_insert(loaded);
+    }
+    Ok(newest)
 }
 
 #[cfg(test)]

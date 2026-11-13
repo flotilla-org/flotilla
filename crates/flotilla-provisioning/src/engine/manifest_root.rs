@@ -52,6 +52,15 @@ fn generation(name: &str) -> u64 {
     name.split_once('.').and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
 }
 
+/// The engine name of generation `generation` of the root declared as `name`.
+pub(crate) fn generation_name(name: &str, generation: u64) -> String {
+    if generation == 0 {
+        name.to_owned()
+    } else {
+        format!("{name}.{generation}")
+    }
+}
+
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -422,10 +431,7 @@ impl ManifestRoots for EngineManifestRoots {
             }
             if open {
                 let last = roots.resources().filter(|root| base(root.name()) == name).map(|root| generation(root.name())).max();
-                let next = match last {
-                    None => name.to_owned(),
-                    Some(last) => format!("{name}.{}", last + 1),
-                };
+                let next = generation_name(name, last.map_or(0, |last| last + 1));
                 let request = RootRequest {
                     host: declaration.host.clone(),
                     path: declaration.path.clone(),

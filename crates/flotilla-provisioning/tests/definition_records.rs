@@ -219,6 +219,45 @@ async fn on_the_engine_one_root_revision_is_one_change() {
     assert_manifest(&forges.get("lab").await.expect("get"), "r2");
 }
 
+// Behaviour (#4024, ADR 0064): a definition's manifest source is read from the root its change
+// names, by the name the root was declared under. A root declared again after it retired is that
+// name's next generation, so the source read is the live generation's, not the first's.
+#[tokio::test]
+async fn a_manifest_definition_reads_the_source_of_its_roots_live_generation() {
+    use flotilla_provisioning::engine::manifest_root::EngineManifestRoots;
+    use flotilla_resources::{
+        definition_provenance::MANIFEST_SOURCE_ANNOTATION,
+        manifest_roots::{ManifestRoots, RootDeclaration},
+    };
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::definition::register(&mut kinds).expect("register");
+    flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
+    flotilla_provisioning::stored::repository::register(&mut kinds).expect("register repositories");
+    flotilla_provisioning::stored::project::register(&mut kinds).expect("register projects");
+    let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
+    let clock = Arc::new(SystemClock) as Arc<dyn Clock>;
+    let roots = EngineManifestRoots::open(Arc::clone(&service), Arc::clone(&clock)).expect("open roots");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.install_engine_records(Arc::new(EngineDefinitions::open(service, clock).expect("open")));
+
+    // An ops root whose source moves retires and opens the next generation: the declared name,
+    // then `.1`, then `.2`.
+    let root = "manifest-0011223344556677";
+    for source in ["first-map", "second-map", "third-map"] {
+        let declaration =
+            RootDeclaration { host: "feta".into(), path: "/manifests".into(), source: source.into(), binding: None, ops: true };
+        roots.declare(NS, root, declaration).await.expect("declare");
+    }
+    assert_eq!(roots.root(NS, root).await.expect("read").expect("live").spec.source, "third-map");
+
+    let forges = backend.definitions::<Forge>(NS);
+    forges.apply(&meta("lab", &manifest("r1")), &forge("lab")).await.expect("apply");
+    let read = forges.get("lab").await.expect("get");
+    assert_eq!(read.metadata.annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str), Some("third-map"));
+}
+
 // Behaviour (#3108 item B): every watcher of the definitions on a daemon is woken by one shared
 // follower. Each watcher gets the tick for a write after it subscribed, and once every watcher has
 // gone a new one is still woken.
