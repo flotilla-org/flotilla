@@ -3807,14 +3807,14 @@ impl InProcessDaemon {
         address: &str,
     ) -> Result<(Option<ResolvedAttach>, Option<String>), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        // Watch before reading: an engine-served kind's watch cannot resume from a listing, so a
+        // failure written between a read and a later watch would reach neither.
+        let mut watch =
+            convoys.watch(WatchStart::Now).await.map_err(|error| format!("watch convoy {address} while waiting to attach: {error}"))?;
         let listed = convoys.list().await.map_err(|error| format!("watch convoy {address} while waiting to attach: {error}"))?;
         if let Some(message) = listed.items.iter().find(|convoy| convoy.metadata.name == name).and_then(convoy_start_failure) {
             return Err(message);
         }
-        let mut watch = convoys
-            .watch(WatchStart::resuming_from(&listed))
-            .await
-            .map_err(|error| format!("watch convoy {address} while waiting to attach: {error}"))?;
         let deadline = tokio::time::Instant::now() + CONVOY_ATTACH_WAIT;
         let mut retry = tokio::time::interval(Duration::from_millis(100));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
