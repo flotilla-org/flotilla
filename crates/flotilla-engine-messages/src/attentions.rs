@@ -173,25 +173,41 @@ impl MessagePrimitives {
         Ok(held.into_iter().filter(|held| held.sender == sender && &held.subject == subject).collect())
     }
 
+    /// `principal`'s role in `project`, on the project's declaration read into `records`.
+    async fn person_inbox(
+        &self,
+        records: &mut OldStoreRecords,
+        roles: &FleetRoles,
+        principal: &str,
+        project: Option<&str>,
+    ) -> Result<Address, String> {
+        self.spell(records, |records| Conversion { roles, forges: &[], records }.person(principal, project))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
     /// The engine's cause and person inbox for a fact, read from the records it names.
-    async fn cause(&self, namespace: &str, fact: &Fact, conversion: &Conversion<'_>) -> Result<(Cause, Address), String> {
+    async fn cause(&self, namespace: &str, roles: &FleetRoles, fact: &Fact) -> Result<(Cause, Address), String> {
+        let mut records = OldStoreRecords::empty(namespace);
         let Some(name) = fact.convoy() else {
             let Fact::Refused { ensure, project, role } = fact else { unreachable!("only a refused admission names no convoy") };
             // No generation was admitted: the principal admission would have stamped hears it,
             // in the role's project, as the other standing attentions are addressed.
             let principal = format!("principal:{}", flotilla_protocol::PrincipalRef::implicit_for_namespace(namespace).name);
-            let inbox = conversion.person(&principal, Some(project))?;
+            let inbox = self.person_inbox(&mut records, roles, &principal, Some(project)).await?;
             return Ok((Cause::Refused { role: self.standing_role(namespace, ensure, project, role).await? }, inbox));
         };
-        let mut records = self.records(namespace).await.map_err(|error| error.to_string())?;
-        if !records.convoys.contains_key(name) {
-            // The held read may predate the convoy: a miss is judged again on a read made now.
-            records = self.read_records(namespace, true).await.map_err(|error| error.to_string())?.records;
-        }
-        let convoy = records.convoys.get(name).ok_or_else(|| format!("convoy `{name}` is not in this home's records"))?;
-        let held = Read { address: records.convoy_address(name)?, revision: convoy.metadata.resource_version.clone() };
+        let convoy = self
+            .spell(&mut records, |records| records.convoy(name).cloned())
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("convoy `{name}` is not in this home's records"))?;
+        let held = Read {
+            address: super::convoy_address(name, convoy.spec.project_ref.as_deref())?,
+            revision: convoy.metadata.resource_version.clone(),
+        };
         let principal = format!("principal:{}", convoy.spec.dispatching_principal_ref.name);
-        let inbox = conversion.person(&principal, convoy.spec.project_ref.as_deref())?;
+        let inbox = self.person_inbox(&mut records, roles, &principal, convoy.spec.project_ref.as_deref()).await?;
         let cause = match fact {
             Fact::Hold { .. } => Cause::Hold { convoy: held },
             Fact::ReclaimRefused { .. } => Cause::ReclaimRefused { convoy: held },
@@ -263,9 +279,7 @@ impl Attentions for MessagePrimitives {
             return Ok(());
         }
         let roles = self.roles(namespace).await?;
-        let records = self.records(namespace).await.map_err(|error| error.to_string())?;
-        let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
-        let (cause, inbox) = self.cause(namespace, &attention.fact, &conversion).await?;
+        let (cause, inbox) = self.cause(namespace, &roles, &attention.fact).await?;
         let mut spec = Attention { cause, reason: attention.reason.clone() }.spec(&roles, inbox)?;
         let replaced: Vec<&Held> = open.iter().filter(|held| held.home == self.home).collect();
         if let Some(older) = replaced.first() {

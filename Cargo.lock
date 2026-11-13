@@ -2870,6 +2870,7 @@ dependencies = [
  "flotilla-state-machines",
  "flotilla-store",
  "flotilla-store-memory",
+ "flotilla-store-testkit",
  "flotilla-tracing",
  "futures",
  "hegeltest",

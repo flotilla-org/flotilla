@@ -577,7 +577,11 @@ impl MessageDelivery {
         }
         // Framing reads old-store records: only once a turn is due.
         let roles = self.primitives.roles(&self.namespace).await?;
-        let records = self.primitives.records(&self.namespace).await.map_err(|error| error.to_string())?;
+        let records = self
+            .primitives
+            .records_for(&self.namespace, &roles, &[&turns[..], &held[..]].concat())
+            .await
+            .map_err(|error| error.to_string())?;
         let mut members = Vec::new();
         let mut texts = Vec::new();
         let mut due = Vec::new();

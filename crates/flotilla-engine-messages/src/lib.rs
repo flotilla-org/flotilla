@@ -397,13 +397,9 @@ pub struct MessagePrimitives {
     bindings: Arc<dyn ports::RoleBindings>,
     conditions: Arc<dyn ports::ConditionReads>,
     home_reads: std::sync::OnceLock<Arc<dyn ports::HomeReads>>,
-    /// Records held between commits that could change them; see [`Self::read_records`].
-    records: tokio::sync::Mutex<BTreeMap<String, RecordsRead>>,
-    /// Counts the commits that may have changed the records: one that writes or applies a kind
-    /// they could read, on any home, or makes followers look again.
-    records_moved: Arc<std::sync::atomic::AtomicU64>,
-    /// Bumps `records_moved`; the service holds it weakly.
-    _records_listener: Arc<flotilla_schema_sqlite::stream::CommitListener>,
+    /// The engine's vessels and terminal sessions, through which a convoy role's session is
+    /// read; without them it is read by its labels.
+    lifecycle: std::sync::OnceLock<Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>>,
     /// Signalled after an attention here is raised, cleared or acknowledged, and after another
     /// home's Messages are applied.
     attention_changes: tokio::sync::broadcast::Sender<()>,
@@ -456,24 +452,6 @@ impl MessagePrimitives {
             services.home.lock().expect("service home").restore(record).map_err(|error| format!("{error:?}"))?;
         }
         let awaiting = Arc::new(awaiting::AwaitingReplies::open(home, &service)?);
-        let records_moved = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let records_listener: Arc<flotilla_schema_sqlite::stream::CommitListener> = {
-            let moved = Arc::clone(&records_moved);
-            // The message path's own kinds: the records read none of them.
-            let unread = BTreeSet::from([
-                <Resource<Message> as StoredKind>::CODE,
-                <Resource<AgentSession> as StoredKind>::CODE,
-                <Resource<Person> as StoredKind>::CODE,
-                <Resource<ServiceMachine> as StoredKind>::CODE,
-                <Resource<flotilla_state_machines::machines::awaiting_reply::AwaitingReply> as StoredKind>::CODE,
-            ]);
-            Arc::new(move |committed: &flotilla_schema_sqlite::stream::Committed<'_>| {
-                if committed.rescan || !committed.kinds.is_subset(&unread) {
-                    moved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            })
-        };
-        service.on_commit(Arc::downgrade(&records_listener));
         // Attentions homed elsewhere arrive with their homes' entries; their readers read again then.
         let attention_changes = tokio::sync::broadcast::channel(16).0;
         let replicated = attention_changes.clone();
@@ -498,9 +476,7 @@ impl MessagePrimitives {
             bindings: Arc::new(ports::OldRoleRouting { backend: backend.downgrade() }),
             conditions: Arc::new(ports::OldStoreConditions { backend: backend.downgrade() }),
             home_reads: std::sync::OnceLock::new(),
-            records: tokio::sync::Mutex::new(BTreeMap::new()),
-            records_moved,
-            _records_listener: records_listener,
+            lifecycle: std::sync::OnceLock::new(),
             attention_changes,
             acknowledgements: tokio::sync::broadcast::channel(16).0,
             backend: backend.downgrade(),
@@ -521,16 +497,8 @@ impl MessagePrimitives {
         self.loaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// `resource` in the old shape on records already read, counted.
-    fn old_view_counted(
-        &self,
-        resource: &Resource<Message>,
-        namespace: &str,
-        roles: &FleetRoles,
-        records: &OldStoreRecords,
-    ) -> Result<ResourceObject<OldMessage>, String> {
-        self.converted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        old_view(resource, namespace, roles, records)
+    fn count_converted(&self, rows: usize) {
+        self.converted.fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn backend(&self) -> Result<ResourceBackend, String> {
@@ -578,33 +546,175 @@ impl MessagePrimitives {
         self.home_reads.set(reads).map_err(|_| "home reads are already installed".to_owned())
     }
 
-    /// Old-store records the views and conversions read, through their port.
-    pub async fn records(&self, namespace: &str) -> Result<Arc<OldStoreRecords>, ResourceError> {
-        Ok(self.read_records(namespace, false).await?.records)
+    /// Installs the engine's vessel and terminal session reads; the composition root owns them.
+    pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>) -> Result<(), String> {
+        self.lifecycle.set(reads).map_err(|_| "lifecycle reads are already installed".to_owned())
     }
 
-    /// The held read of the records, or, when `reread`, an engine commit has
-    /// landed since, or the held one is a second old, a read made now. A read
-    /// made to judge a miss again is marked `rechecked`.
-    ///
-    /// Engine records (launches, repositories, and whatever moves next) are
-    /// fresh until a commit that could change them, including another home's
-    /// entries applied by the follower. The second bounds only the kinds
-    /// still in the old store, which signal no commits; it goes with Convoy
-    /// and Vessel when they leave it (see `view_of`).
-    async fn read_records(&self, namespace: &str, reread: bool) -> Result<RecordsRead, ResourceError> {
-        const OLD_STORE_FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(1);
-        let mut cache = self.records.lock().await;
-        // Taken before the load, so a commit during it makes the next read load again.
-        let moved = self.records_moved.load(std::sync::atomic::Ordering::SeqCst);
-        if let Some(read) = cache.get(namespace).filter(|read| !reread && read.moved == moved && read.at.elapsed() < OLD_STORE_FRESH_FOR) {
-            return Ok(read.clone());
+    /// Runs `spell` on the old-store records it names, each read by its key: a lookup
+    /// `records` does not hold asks for its record, the asked records are read, and `spell`
+    /// runs again, until it asks for nothing it has not had. `records` keeps what was read, so
+    /// a later spelling over the same records reads only what is new to it.
+    pub async fn spell<T>(&self, records: &mut OldStoreRecords, mut spell: impl FnMut(&OldStoreRecords) -> T) -> Result<T, ResourceError> {
+        loop {
+            let spelled = spell(records);
+            let asked = records.take_asked();
+            if asked.is_empty() {
+                return Ok(spelled);
+            }
+            self.read_asked(records, asked).await?;
         }
-        let world_at = self.world.now();
-        let records = Arc::new(OldStoreRecords::load(&self.backend().map_err(ResourceError::other)?, namespace).await?);
-        let read = RecordsRead { at: std::time::Instant::now(), moved, world_at, rechecked: reread, records };
-        cache.insert(namespace.to_owned(), read.clone());
-        Ok(read)
+    }
+
+    /// `resources` in the old shape, each read on the records it names.
+    pub async fn old_views(
+        &self,
+        namespace: &str,
+        roles: &FleetRoles,
+        resources: &[Resource<Message>],
+    ) -> Result<Vec<Result<ResourceObject<OldMessage>, String>>, ResourceError> {
+        let mut records = OldStoreRecords::empty(namespace);
+        let views = self
+            .spell(&mut records, |records| resources.iter().map(|resource| old_view(resource, namespace, roles, records)).collect())
+            .await?;
+        self.count_converted(resources.len());
+        Ok(views)
+    }
+
+    /// The records the messages `ids` held here name, read by key, for spelling them later.
+    pub async fn records_for(&self, namespace: &str, roles: &FleetRoles, ids: &[String]) -> Result<Arc<OldStoreRecords>, ResourceError> {
+        let mut resources = Vec::new();
+        for id in ids {
+            resources.extend(self.inbox.get_async(id).await.map_err(|error| ResourceError::other(error.to_string()))?);
+        }
+        let mut records = OldStoreRecords::empty(namespace);
+        self.spell(&mut records, |records| {
+            resources.iter().for_each(|resource| {
+                let _ = old_view(resource, namespace, roles, records);
+            })
+        })
+        .await?;
+        Ok(Arc::new(records))
+    }
+
+    /// Reads what `asked` names into `records`, each record by its key. A convoy role's session
+    /// is read through its convoy's snapshot, the vessel launched for that work and the
+    /// sessions of that vessel; the sessions of a role whose convoy names no vessel for it are
+    /// read by their labels, as is every role's where the engine's reads are not installed.
+    async fn read_asked(&self, records: &mut OldStoreRecords, mut asked: Wanted) -> Result<(), ResourceError> {
+        let backend = self.backend().map_err(ResourceError::other)?;
+        let namespace = records.namespace.clone();
+        // A seat is read through its convoy, so the convoy is read first.
+        asked.convoys.extend(asked.seats.iter().map(|(convoy, _)| convoy.clone()).filter(|convoy| !records.read.convoys.contains(convoy)));
+        if asked.forges {
+            records.forges =
+                backend.definitions::<flotilla_resources::Forge>(&namespace).list().await?.into_iter().map(|forge| forge.spec).collect();
+        }
+        for name in &asked.convoys {
+            let copies = match backend.including_replicas::<Convoy>(&namespace).get_all(name).await {
+                Ok(copies) => copies.items,
+                Err(ResourceError::NotFound { .. }) => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            if copies.iter().any(|copy| !copy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal())) {
+                records.live_convoys.insert(name.clone());
+            }
+            // This home's copy, else the first listed.
+            let held =
+                copies.iter().position(|copy| matches!(copy.provenance, ResourceProvenance::Local)).or((!copies.is_empty()).then_some(0));
+            if let Some(copy) = held.map(|index| copies[index].clone()) {
+                let home = match &copy.provenance {
+                    ResourceProvenance::Local => self.home.clone(),
+                    ResourceProvenance::Replica { origin_root, .. } => origin_root.to_string(),
+                };
+                records.convoy_homes.insert(name.clone(), home);
+                records.convoys.insert(name.clone(), copy.object);
+            }
+        }
+        for name in &asked.terminals {
+            if let Some(terminal) = found(backend.including_replicas::<TerminalSession>(&namespace).get(name).await)? {
+                records.terminals.insert(name.clone(), terminal.object);
+            }
+        }
+        for name in &asked.artifacts {
+            if let Some(artifact) = found(backend.including_replicas::<Artifact>(&namespace).get(name).await)? {
+                records.artifacts.insert(name.clone(), artifact.object);
+            }
+        }
+        for name in &asked.repositories {
+            if let Some(repository) = found(backend.including_replicas::<Repository>(&namespace).get(name).await)? {
+                records.repositories.insert(name.clone(), repository.object);
+            }
+        }
+        if asked.every_repository {
+            for repository in backend.including_replicas::<Repository>(&namespace).list().await?.items {
+                records.repositories.insert(repository.object.metadata.name.clone(), repository.object);
+            }
+        }
+        for name in &asked.projects {
+            if let Some(project) = found(backend.definitions::<Project>(&namespace).get(name).await)? {
+                records.projects.insert(name.clone(), project);
+            }
+        }
+        let mut labelled = asked.labelled.clone();
+        for (convoy, role) in &asked.seats {
+            match self.seat_sessions(records, convoy, role) {
+                Some(sessions) => {
+                    for session in sessions {
+                        if let Some(terminal) = found(backend.including_replicas::<TerminalSession>(&namespace).get(&session).await)? {
+                            records.terminals.insert(session, terminal.object);
+                        }
+                    }
+                }
+                None => {
+                    labelled.insert((convoy.clone(), role.clone()));
+                }
+            }
+        }
+        for (convoy, role) in &labelled {
+            let labels = BTreeMap::from([
+                (flotilla_resources::CONVOY_LABEL.to_owned(), convoy.clone()),
+                (flotilla_resources::ROLE_LABEL.to_owned(), role.clone()),
+            ]);
+            for terminal in backend.including_replicas::<TerminalSession>(&namespace).list_matching_labels(&labels).await?.items {
+                records.terminals.insert(terminal.object.metadata.name.clone(), terminal.object);
+            }
+        }
+        asked.labelled.extend(labelled);
+        records.read.absorb(asked);
+        Ok(())
+    }
+
+    /// The sessions of the vessel launched for the work holding `role` in `convoy`, newest
+    /// launch at this home or the convoy's: through the convoy's snapshot and the engine's
+    /// indexed vessel and terminal reads. `None` when those reads are not installed or the
+    /// convoy's snapshot names no work for the role, and the sessions are read by their labels.
+    fn seat_sessions(&self, records: &OldStoreRecords, convoy: &str, role: &str) -> Option<Vec<String>> {
+        let lifecycle = self.lifecycle.get()?;
+        let (vessels, terminals) = (lifecycle.vessels().ok()?, lifecycle.terminals().ok()?);
+        let work = records.convoys.get(convoy).and_then(|held| snapshot_vessel(held, role))?;
+        let convoy_home = records.convoy_homes.get(convoy)?;
+        let launch_of = flotilla_resources::vessel_resource_name(flotilla_resources::convoy::launch_of(convoy), &work);
+        let mut sessions = Vec::new();
+        for home in BTreeSet::from([self.home.as_str(), convoy_home.as_str()]) {
+            let vessel = match vessels.newest(convoy, convoy_home, &launch_of, Some(home)) {
+                Ok(vessel) => vessel,
+                Err(error) => {
+                    tracing::debug!(%convoy, %role, %error, "a convoy role's vessel could not be read");
+                    return None;
+                }
+            };
+            let Some(vessel) = vessel else { continue };
+            match terminals.of_vessel(&vessel.name) {
+                Ok(launches) => sessions
+                    .extend(launches.into_iter().filter(|launch| launch.role == role).map(|launch| launch.session_name().to_owned())),
+                Err(error) => {
+                    tracing::debug!(%convoy, %role, %error, "a convoy role's sessions could not be read");
+                    return None;
+                }
+            }
+        }
+        Some(sessions)
     }
 
     /// The consumer identity of a crew session's record at this home.
@@ -952,12 +1062,17 @@ impl MessagePrimitives {
             intent,
         )?;
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let records = self.records(namespace).await?;
-        let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
+        let mut records = OldStoreRecords::empty(namespace);
+        let (sender, receiver) = self
+            .spell(&mut records, |records| {
+                let conversion = Conversion { roles: &roles, forges: &[], records };
+                (conversion.sender_of(intent), conversion.receiver(intent))
+            })
+            .await?;
         // The messages it names, read from this replica, or at their home on a miss.
         let mut referenced = BTreeMap::new();
         // A reply's original was sent to this sender; a successor's predecessor to this receiver.
-        for (old, inbox) in [(&intent.in_reply_to, conversion.sender_of(intent)), (&intent.supersedes, conversion.receiver(intent))] {
+        for (old, inbox) in [(&intent.in_reply_to, sender), (&intent.supersedes, receiver)] {
             let Some(old) = old else { continue };
             let read = self.read_message(old, inbox.map_err(ResourceError::invalid)?).await.map_err(ResourceError::invalid)?;
             referenced.insert(old.clone(), read);
@@ -967,7 +1082,9 @@ impl MessagePrimitives {
                 let read = referenced.get(old).ok_or_else(|| format!("message `{old}` was not read"))?;
                 Ok(MessageRef::new(read.id.clone(), read.home.clone()))
             };
-            conversion.spec(intent, &message).map_err(ResourceError::invalid)?
+            self.spell(&mut records, |records| Conversion { roles: &roles, forges: records.forges(), records }.spec(intent, &message))
+                .await?
+                .map_err(ResourceError::invalid)?
         };
         // Admission's reads of the messages it names, at the versions read.
         self.world.update(|world| {
@@ -1041,17 +1158,23 @@ impl MessagePrimitives {
             MessageExpectation::Outcome { .. } => Awaited::Outcome,
         };
         let roles = self.roles(namespace).await?;
-        let records = self.records(namespace).await.map_err(|error| error.to_string())?;
-        let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
-        let sender = match conversion.sender_of(intent) {
+        let (sender, recipient) = self
+            .spell(&mut OldStoreRecords::empty(namespace), |records| {
+                let conversion = Conversion { roles: &roles, forges: &[], records };
+                (conversion.sender_of(intent), conversion.receiver(intent))
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let sender = match sender {
             Ok(sender) => sender,
             // A system producer with no fleet role has no inbox to receive the
             // reply, so nothing awaits it; recording nothing is the answer.
             Err(_) if intent.sender.starts_with("system:") => return Ok(false),
             Err(error) => return Err(error),
         };
-        let recipient = conversion.receiver(intent)?;
+        let recipient = recipient?;
         let message = MessageRef::new(Address::message(&recipient, name).map_err(|error| error.to_string())?.as_str(), home);
+        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
         let subject = about.map(|about| conversion.stall_subject(about)).transpose()?;
         // The predecessor whose record this send's record replaces, wherever it is homed.
         let superseded = match &intent.supersedes {
@@ -1138,8 +1261,7 @@ impl MessagePrimitives {
             return Ok(Vec::new());
         }
         let roles = self.roles(namespace).await?;
-        let records = self.records(namespace).await.map_err(|error| error.to_string())?;
-        let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
+        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
         let kept = stalled.map(|seat| conversion.stall_subject(seat)).transpose()?;
         let mut subjects = Vec::new();
         for seat in seats {
@@ -1209,8 +1331,11 @@ impl MessagePrimitives {
         let Some(original) = &intent.in_reply_to else { return MessageResolution::Absent };
         let inbox = async {
             let roles = self.roles(namespace).await?;
-            let records = self.records(namespace).await.map_err(|error| error.to_string())?;
-            Conversion { roles: &roles, forges: &records.forges, records: &*records }.sender_of(intent)
+            self.spell(&mut OldStoreRecords::empty(namespace), |records| {
+                Conversion { roles: &roles, forges: &[], records }.sender_of(intent)
+            })
+            .await
+            .map_err(|error| error.to_string())?
         };
         let found = match inbox.await {
             Ok(inbox) => self.find_message(original, inbox).await,
@@ -1421,8 +1546,7 @@ impl MessagePrimitives {
     pub async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
         // Nothing is admitted until the fleet is designated.
         let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(None) };
-        let records = self.records(namespace).await.map_err(|error| error.to_string())?;
-        let inbox = Conversion { roles: &roles, forges: &records.forges, records: &*records }.inbox(receiver)?;
+        let inbox = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords }.inbox(receiver)?;
         let hold = flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.num_microseconds().expect("a bounded hold");
         let now = self.world.now();
         Ok(self
@@ -1522,8 +1646,7 @@ impl MessagePrimitives {
         record: &str,
     ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let records = self.records(namespace).await?;
-        let inbox = Conversion { roles: &roles, forges: &records.forges, records: &*records }.inbox(receiver);
+        let inbox = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords }.inbox(receiver);
         self.view_in(namespace, &roles, inbox, record).await
     }
 
@@ -1546,8 +1669,9 @@ impl MessagePrimitives {
         record: &str,
     ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let records = self.records(namespace).await?;
-        let inbox = Conversion { roles: &roles, forges: &records.forges, records: &*records }.receiver(intent);
+        let inbox = self
+            .spell(&mut OldStoreRecords::empty(namespace), |records| Conversion { roles: &roles, forges: &[], records }.receiver(intent))
+            .await?;
         self.view_in(namespace, &roles, inbox, record).await
     }
 
@@ -1571,30 +1695,30 @@ impl MessagePrimitives {
     }
 
     /// The open messages to `receivers` (old addresses) in the old shape, read through each
-    /// inbox's index. A message the held records cannot spell is left out, not read again.
+    /// inbox's index. A message the records it names cannot spell is left out.
     pub async fn open_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
-        let (roles, records, inboxes) = self.inboxes_of(namespace, receivers).await?;
+        let (roles, inboxes) = self.inboxes_of(namespace, receivers).await?;
         let mut rows = Vec::new();
         for inbox in &inboxes {
             rows.extend(self.open_in(inbox).map_err(ResourceError::other)?);
         }
-        Ok(self.spelled_to(rows, namespace, &roles, &records, receivers))
+        self.spelled_to(rows, namespace, &roles, receivers).await
     }
 
     /// What the stall judge reads of crew seats' inboxes, in the old shape: for each of
     /// `receivers` (old crew addresses), its open messages, the last one admitted among those
     /// settled, and the one delivered last and not dropped since; then each `named` message,
     /// a (receiver, record) pair, by its exact identity. Each is read through an index or by
-    /// key, so the read grows with the seats, not the inboxes' history. A message the held
-    /// records cannot spell is left out.
+    /// key, so the read grows with the seats, not the inboxes' history. A message the records
+    /// it names cannot spell is left out.
     pub async fn seat_messages(
         &self,
         namespace: &str,
         receivers: &[String],
         named: &[(String, String)],
     ) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
-        let (roles, records, inboxes) = self.inboxes_of(namespace, receivers).await?;
-        let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
+        let (roles, inboxes) = self.inboxes_of(namespace, receivers).await?;
+        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
         let mut rows = BTreeMap::new();
         let mut keep = |(home, message): (String, Resource<Message>)| {
             rows.entry(message.name().to_owned()).or_insert((home, message));
@@ -1617,30 +1741,25 @@ impl MessagePrimitives {
             }
         }
         let receivers: Vec<String> = receivers.iter().cloned().chain(named.iter().map(|(receiver, _)| receiver.clone())).collect();
-        Ok(self.spelled_to(rows.into_values(), namespace, &roles, &records, &receivers))
+        self.spelled_to(rows.into_values().collect(), namespace, &roles, &receivers).await
     }
 
     /// The pending messages to `receivers` (old addresses) in the old shape, read through each
-    /// inbox's pending index. A message the held records cannot spell is left out.
+    /// inbox's pending index. A message the records it names cannot spell is left out.
     pub async fn pending_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
-        let (roles, records, inboxes) = self.inboxes_of(namespace, receivers).await?;
+        let (roles, inboxes) = self.inboxes_of(namespace, receivers).await?;
         let mut rows = Vec::new();
         for inbox in &inboxes {
             rows.extend(self.pending_in(inbox).map_err(ResourceError::other)?);
         }
-        Ok(self.spelled_to(rows, namespace, &roles, &records, receivers))
+        self.spelled_to(rows, namespace, &roles, receivers).await
     }
 
     /// The inboxes old receivers' messages are in. A person's role depends on the message's
     /// context, so a principal is read in every person role's inbox.
-    async fn inboxes_of(
-        &self,
-        namespace: &str,
-        receivers: &[String],
-    ) -> Result<(FleetRoles, Arc<OldStoreRecords>, BTreeSet<Address>), ResourceError> {
+    async fn inboxes_of(&self, namespace: &str, receivers: &[String]) -> Result<(FleetRoles, BTreeSet<Address>), ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let records = self.records(namespace).await?;
-        let conversion = Conversion { roles: &roles, forges: &records.forges, records: &*records };
+        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
         let mut inboxes = BTreeSet::new();
         for receiver in receivers {
             if receiver.starts_with("principal:") {
@@ -1654,21 +1773,24 @@ impl MessagePrimitives {
                 Err(error) => tracing::debug!(%receiver, %error, "a receiver with no inbox holds no message"),
             }
         }
-        Ok((roles, records, inboxes))
+        Ok((roles, inboxes))
     }
 
     /// `rows` in the old shape, those spelled to one of `receivers`: a convoy role's inbox is
-    /// spelled with the vessel holding it.
-    fn spelled_to(
+    /// spelled with the vessel holding it. The records read are those the rows name.
+    async fn spelled_to(
         &self,
-        rows: impl IntoIterator<Item = (String, Resource<Message>)>,
+        rows: Vec<(String, Resource<Message>)>,
         namespace: &str,
         roles: &FleetRoles,
-        records: &OldStoreRecords,
         receivers: &[String],
-    ) -> Vec<ReadResourceObject<OldMessage>> {
-        rows.into_iter()
-            .filter_map(|(home, resource)| match self.old_view_counted(&resource, namespace, roles, records) {
+    ) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
+        let messages: Vec<Resource<Message>> = rows.iter().map(|(_, resource)| resource.clone()).collect();
+        let views = self.old_views(namespace, roles, &messages).await?;
+        Ok(rows
+            .into_iter()
+            .zip(views)
+            .filter_map(|((home, resource), view)| match view {
                 Ok(object) if receivers.contains(&object.spec.receiver) => {
                     Some(ReadResourceObject { object, provenance: self.provenance(&home) })
                 }
@@ -1678,48 +1800,32 @@ impl MessagePrimitives {
                     None
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// An intent with its sender and receiver as [`Self::view`] spells them once
     /// admitted: each party converted as admission converts it, then spelled
-    /// back. A miss on held records is judged again on records read now.
+    /// back, on the records the parties name.
     pub async fn spelled(&self, namespace: &str, intent: &OldSpec) -> Result<OldSpec, ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let spell = |records: &OldStoreRecords| -> Result<OldSpec, String> {
-            let conversion = Conversion { roles: &roles, forges: &records.forges, records };
+        self.spell(&mut OldStoreRecords::empty(namespace), |records| -> Result<OldSpec, String> {
+            let conversion = Conversion { roles: &roles, forges: &[], records };
             let sender = view::old_address(&conversion.sender_of(intent)?, &roles, records)?;
             let receiver = view::old_address(&conversion.receiver(intent)?, &roles, records)?;
             Ok(OldSpec { sender, receiver, ..intent.clone() })
-        };
-        match spell(&self.read_records(namespace, false).await?.records) {
-            Ok(spelled) => Ok(spelled),
-            Err(_) => spell(&self.read_records(namespace, true).await?.records).map_err(ResourceError::invalid),
-        }
+        })
+        .await?
+        .map_err(ResourceError::invalid)
     }
 
-    /// A message in the old shape. A held read of the records may predate the
-    /// convoy or session the message names, so a miss is judged again on
-    /// records read now: once per held read, or again when the message
-    /// changed after the read it missed on.
-    ///
-    /// A patch over the old store, not a design: the timed cache and the
-    /// reread on a miss go with Convoy and Vessel (and the session kinds) when
-    /// they leave the old store; the view then reads the engine's records,
-    /// which hold what a message names when it is admitted.
+    /// A message in the old shape, on the records it names, read now.
     async fn view_of(
         &self,
         resource: &Resource<Message>,
         namespace: &str,
         roles: &FleetRoles,
     ) -> Result<Result<ResourceObject<OldMessage>, String>, ResourceError> {
-        let held = self.read_records(namespace, false).await?;
-        match self.old_view_counted(resource, namespace, roles, &held.records) {
-            Err(_) if !held.rechecked || resource.since() > held.world_at => {
-                Ok(self.old_view_counted(resource, namespace, roles, &self.read_records(namespace, true).await?.records))
-            }
-            view => Ok(view),
-        }
+        Ok(self.old_views(namespace, roles, std::slice::from_ref(resource)).await?.pop().expect("one view per message"))
     }
 }
 
@@ -1854,9 +1960,8 @@ impl flotilla_messaging::CharterNotices for EngineCharterNotices {
         // The engine admits in the create: a stored message is admitted. Nothing is admitted
         // before the fleet is designated.
         let Ok(roles) = self.primitives.roles_or_wait(&self.namespace).await.map_err(ResourceError::other)? else { return Ok(false) };
-        let records = self.primitives.records(&self.namespace).await?;
         let inbox =
-            Conversion { roles: &roles, forges: &records.forges, records: &*records }.inbox(receiver).map_err(ResourceError::invalid)?;
+            Conversion { roles: &roles, forges: &[], records: &convert::NoRecords }.inbox(receiver).map_err(ResourceError::invalid)?;
         Ok(self.primitives.locate_in(&inbox, name).map_err(ResourceError::other)?.is_some())
     }
     async fn open_to(&self, receiver: &str) -> Result<Vec<ResourceObject<OldMessage>>, ResourceError> {
@@ -1867,35 +1972,160 @@ impl flotilla_messaging::CharterNotices for EngineCharterNotices {
     }
 }
 
-/// One read of a namespace's old-store records: when, by the clock and by the world's time, and
-/// whether it was made to judge a miss again.
-#[derive(Clone)]
-struct RecordsRead {
-    at: std::time::Instant,
-    /// `records_moved` when it was read.
-    moved: u64,
-    world_at: Timestamp,
-    rechecked: bool,
-    records: Arc<OldStoreRecords>,
+/// What spelling asked of the old-store records: each record by its key, and the two lookups no
+/// key reaches, a repository by its address and a session by its convoy role's labels.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Wanted {
+    forges: bool,
+    every_repository: bool,
+    convoys: BTreeSet<String>,
+    terminals: BTreeSet<String>,
+    artifacts: BTreeSet<String>,
+    repositories: BTreeSet<String>,
+    projects: BTreeSet<String>,
+    /// (convoy, role): the sessions holding a convoy role, read through its vessel.
+    seats: BTreeSet<(String, String)>,
+    /// (convoy, role): the sessions labelled with a convoy role whose convoy names no vessel for it.
+    labelled: BTreeSet<(String, String)>,
+}
+
+impl Wanted {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn absorb(&mut self, other: Wanted) {
+        self.forges |= other.forges;
+        self.every_repository |= other.every_repository;
+        self.convoys.extend(other.convoys);
+        self.terminals.extend(other.terminals);
+        self.artifacts.extend(other.artifacts);
+        self.repositories.extend(other.repositories);
+        self.projects.extend(other.projects);
+        self.seats.extend(other.seats);
+        self.labelled.extend(other.labelled);
+    }
+}
+
+/// `read` with a missing record as `None`.
+fn found<T>(read: Result<T, ResourceError>) -> Result<Option<T>, ResourceError> {
+    match read {
+        Ok(read) => Ok(Some(read)),
+        Err(ResourceError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The work holding `role` in `convoy`'s workflow snapshot.
+fn snapshot_vessel(convoy: &ResourceObject<Convoy>, role: &str) -> Option<String> {
+    let status = convoy.status.as_ref()?;
+    status
+        .workflow_snapshot
+        .as_ref()?
+        .vessels
+        .iter()
+        .find(|vessel| vessel.crew.iter().any(|crew| crew.role == role))
+        .map(|vessel| vessel.name.clone())
 }
 
 /// The old-store facts the new path reads, through one named port (#3317
 /// ruling 5): convoys (a role's vessel), crew sessions (a receipt's
 /// session), and the records a reference names. When Convoy and the
 /// session kinds move, this is the one implementation that changes.
+///
+/// Spelling reads them by key ([`MessagePrimitives::spell`]): a lookup that misses a record not
+/// yet read asks for it, and the spelling runs again once it is read.
 pub struct OldStoreRecords {
     pub namespace: String,
+    /// The Forge catalog as read; [`Self::forges`] asks for it when it has not been.
     pub forges: Vec<ForgeSpec>,
     convoys: BTreeMap<String, ResourceObject<Convoy>>,
+    /// Each held convoy's home: this home, or the home its copy was replicated from.
+    convoy_homes: BTreeMap<String, String>,
     /// Convoys any read copy of which has not ended; `convoys` keeps one copy per name.
     live_convoys: BTreeSet<String>,
     terminals: BTreeMap<String, ResourceObject<TerminalSession>>,
     artifacts: BTreeMap<String, ResourceObject<Artifact>>,
-    repositories: Vec<ResourceObject<Repository>>,
+    repositories: BTreeMap<String, ResourceObject<Repository>>,
     projects: BTreeMap<String, ResourceObject<Project>>,
+    /// What has been read, found or not: a lookup asks only for what is beyond it.
+    read: Wanted,
+    /// What lookups asked for since the last read.
+    asked: Mutex<Wanted>,
 }
 
 impl OldStoreRecords {
+    /// No records read yet: spelling reads what it asks for.
+    pub fn empty(namespace: &str) -> Self {
+        Self::from_records(namespace, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    }
+
+    /// What lookups asked for since the last read, beyond what was read.
+    fn take_asked(&self) -> Wanted {
+        std::mem::take(&mut *self.asked.lock().expect("asked records"))
+    }
+
+    fn ask(&self, edit: impl FnOnce(&mut Wanted)) {
+        edit(&mut self.asked.lock().expect("asked records"));
+    }
+
+    /// The Forge catalog, asked for when it has not been read.
+    pub fn forges(&self) -> &[ForgeSpec] {
+        if !self.read.forges {
+            self.ask(|asked| asked.forges = true);
+        }
+        &self.forges
+    }
+
+    pub(crate) fn convoy(&self, name: &str) -> Option<&ResourceObject<Convoy>> {
+        let held = self.convoys.get(name);
+        if held.is_none() && !self.read.convoys.contains(name) {
+            self.ask(|asked| {
+                asked.convoys.insert(name.to_owned());
+            });
+        }
+        held
+    }
+
+    fn terminal(&self, name: &str) -> Option<&ResourceObject<TerminalSession>> {
+        let held = self.terminals.get(name);
+        if held.is_none() && !self.read.terminals.contains(name) {
+            self.ask(|asked| {
+                asked.terminals.insert(name.to_owned());
+            });
+        }
+        held
+    }
+
+    fn artifact(&self, name: &str) -> Option<&ResourceObject<Artifact>> {
+        let held = self.artifacts.get(name);
+        if held.is_none() && !self.read.artifacts.contains(name) {
+            self.ask(|asked| {
+                asked.artifacts.insert(name.to_owned());
+            });
+        }
+        held
+    }
+
+    fn repository_named(&self, name: &str) -> Option<&ResourceObject<Repository>> {
+        let held = self.repositories.get(name);
+        if held.is_none() && !self.read.repositories.contains(name) && !self.read.every_repository {
+            self.ask(|asked| {
+                asked.repositories.insert(name.to_owned());
+            });
+        }
+        held
+    }
+
+    fn project(&self, name: &str) -> Option<&ResourceObject<Project>> {
+        let held = self.projects.get(name);
+        if held.is_none() && !self.read.projects.contains(name) {
+            self.ask(|asked| {
+                asked.projects.insert(name.to_owned());
+            });
+        }
+        held
+    }
     /// The port over records already read, as a validation rehearsal holds them.
     pub fn from_records(
         namespace: &str,
@@ -1914,52 +2144,32 @@ impl OldStoreRecords {
             forges,
             live_convoys: live(&convoys),
             convoys: by_name(convoys),
+            convoy_homes: BTreeMap::new(),
             terminals: by_name(terminals),
             artifacts: by_name(artifacts),
-            repositories,
+            repositories: by_name(repositories),
             projects: by_name(projects),
+            read: Wanted::default(),
+            asked: Mutex::default(),
         }
     }
 
+    /// Every record of each kind the port reads, for the role-routing and condition ports.
     pub async fn load(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
         let forges =
             backend.definitions::<flotilla_resources::Forge>(namespace).list().await?.into_iter().map(|forge| forge.spec).collect();
-        let convoys: Vec<_> =
-            backend.including_replicas::<Convoy>(namespace).list().await?.items.into_iter().map(|convoy| convoy.object).collect();
-        let live_convoys = live(&convoys);
-        let convoys = convoys.into_iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect();
-        let terminals = backend
-            .including_replicas::<TerminalSession>(namespace)
-            .list()
-            .await?
-            .items
-            .into_iter()
-            .map(|terminal| (terminal.object.metadata.name.clone(), terminal.object))
-            .collect();
-        let artifacts = backend
-            .including_replicas::<Artifact>(namespace)
-            .list()
-            .await?
-            .items
-            .into_iter()
-            .map(|artifact| (artifact.object.metadata.name.clone(), artifact.object))
-            .collect();
-        let repositories = backend
-            .including_replicas::<Repository>(namespace)
-            .list()
-            .await?
-            .items
-            .into_iter()
-            .map(|repository| repository.object)
-            .collect();
-        let projects = backend
-            .definitions::<Project>(namespace)
-            .list()
-            .await?
-            .into_iter()
-            .map(|project| (project.metadata.name.clone(), project))
-            .collect();
-        Ok(Self { namespace: namespace.to_owned(), forges, convoys, live_convoys, terminals, artifacts, repositories, projects })
+        fn objects<R: flotilla_resources::Resource>(items: Vec<ReadResourceObject<R>>) -> Vec<ResourceObject<R>> {
+            items.into_iter().map(|item| item.object).collect()
+        }
+        Ok(Self::from_records(
+            namespace,
+            forges,
+            objects(backend.including_replicas::<Convoy>(namespace).list().await?.items),
+            objects(backend.including_replicas::<TerminalSession>(namespace).list().await?.items),
+            objects(backend.including_replicas::<Artifact>(namespace).list().await?.items),
+            objects(backend.including_replicas::<Repository>(namespace).list().await?.items),
+            backend.definitions::<Project>(namespace).list().await?,
+        ))
     }
 
     /// Every project declared in this namespace, by name.
@@ -1971,25 +2181,25 @@ impl OldStoreRecords {
     /// that principal. Declarations stay local: an inherited role shape
     /// names no holder in a child project.
     pub fn principal_backed(&self, project: &str) -> impl Iterator<Item = (&str, &str)> {
-        self.projects.get(project).into_iter().flat_map(|project| {
+        self.project(project).into_iter().flat_map(|project| {
             project.spec.role_definitions.iter().filter_map(|(role, definition)| Some((role.as_str(), definition.principal.as_deref()?)))
         })
     }
 
     /// The project a convoy belongs to, if it declares one.
     pub fn convoy_project(&self, name: &str) -> Option<String> {
-        self.convoys.get(name)?.spec.project_ref.clone()
+        self.convoy(name)?.spec.project_ref.clone()
     }
 
     fn convoy_address(&self, name: &str) -> Result<Address, String> {
-        convoy_address(name, self.convoys.get(name).and_then(|convoy| convoy.spec.project_ref.as_deref()))
+        convoy_address(name, self.convoy(name).and_then(|convoy| convoy.spec.project_ref.as_deref()))
     }
 
     /// A crew session's seat, the address its convoy role's messages are received at (the crew's
     /// receiver spelling, under the convoy's project or else the namespace): a capability card is
     /// about the session's seat.
     fn seat(&self, session: &str) -> Result<Address, String> {
-        let terminal = self.terminals.get(session).ok_or_else(|| format!("session `{session}` was not read"))?;
+        let terminal = self.terminal(session).ok_or_else(|| format!("session `{session}` was not read"))?;
         let TerminalSessionSource::Agent { context, .. } = &terminal.spec.source else {
             return Err(format!("session `{session}` is no crew session"));
         };
@@ -2001,19 +2211,40 @@ impl OldStoreRecords {
     }
 
     fn repository(&self, name: &str) -> Result<Address, String> {
-        let repository = self
-            .repositories
-            .iter()
-            .find(|repository| repository.metadata.name == name)
-            .ok_or_else(|| format!("repository `{name}` is not declared"))?;
+        let forges = self.forges();
+        let repository = self.repository_named(name).ok_or_else(|| format!("repository `{name}` is not declared"))?;
         let remote = repository.spec.remotes().first().ok_or_else(|| format!("repository `{name}` has no remote"))?;
-        repository_address(remote, &self.forges)
+        repository_address(remote, forges)
+    }
+
+    /// The repository whose first remote is at `address`: no key reaches it, so every
+    /// repository is read once a spelling asks.
+    fn repository_at(&self, address: &Address) -> Option<&ResourceObject<Repository>> {
+        if !self.read.every_repository {
+            self.ask(|asked| asked.every_repository = true);
+        }
+        let forges = self.forges();
+        self.repositories.values().find(|repository| {
+            repository.spec.remotes().first().is_some_and(|remote| repository_address(remote, forges).as_ref() == Ok(address))
+        })
+    }
+
+    /// The session holding `role` in `convoy`, among the sessions read; asked for through the
+    /// convoy's vessel when not read.
+    fn seat_session(&self, convoy: &str, role: &str, seat: &Address) -> Option<&str> {
+        let held = self.terminals.keys().find(|session| self.seat(session).as_ref() == Ok(seat)).map(String::as_str);
+        let key = (convoy.to_owned(), role.to_owned());
+        if held.is_none() && !self.read.seats.contains(&key) {
+            self.ask(|asked| {
+                asked.seats.insert(key);
+            });
+        }
+        held
     }
 }
 
-/// A convoy with no status has not been seen to end.
 /// Convoy `name`'s address: under `project` when it names one.
-fn convoy_address(name: &str, project: Option<&str>) -> Result<Address, String> {
+pub(crate) fn convoy_address(name: &str, project: Option<&str>) -> Result<Address, String> {
     let address = match project {
         Some(project) => Address::project(project).and_then(|project| project.child(AddressKind::Convoy, name)),
         None => Address::convoy(name),
@@ -2021,6 +2252,7 @@ fn convoy_address(name: &str, project: Option<&str>) -> Result<Address, String> 
     address.map_err(|error| format!("convoy `{name}`: {error}"))
 }
 
+/// A convoy with no status has not been seen to end.
 fn live(convoys: &[ResourceObject<Convoy>]) -> BTreeSet<String> {
     convoys
         .iter()
@@ -2034,14 +2266,12 @@ impl ReferenceAddresses for OldStoreRecords {
         match reference {
             OldReference::ControlRecord { resource, .. } if matches!(resource.kind.as_str(), "Convoy" | "Project") => None,
             OldReference::ControlRecord { resource, .. } if resource.kind == "TerminalSession" => {
-                (!self.terminals.contains_key(&resource.name)).then_some("a referenced session is gone")
+                self.terminal(&resource.name).is_none().then_some("a referenced session is gone")
             }
             OldReference::ControlRecord { .. } => Some("it references a kind with no address"),
-            OldReference::Artifact { resource, .. } => {
-                (!self.artifacts.contains_key(&resource.name)).then_some("a referenced artifact is gone")
-            }
+            OldReference::Artifact { resource, .. } => self.artifact(&resource.name).is_none().then_some("a referenced artifact is gone"),
             OldReference::Commit { repository, .. } | OldReference::Ref { repository, .. } => {
-                (!self.repositories.iter().any(|held| held.metadata.name == repository.name)).then_some("a referenced repository is gone")
+                self.repository_named(&repository.name).is_none().then_some("a referenced repository is gone")
             }
             _ => None,
         }
@@ -2050,6 +2280,7 @@ impl ReferenceAddresses for OldStoreRecords {
         OldStoreRecords::convoy_project(self, convoy)
     }
     fn convoy_ended(&self, convoy: &str) -> bool {
+        self.convoy(convoy);
         !self.live_convoys.contains(convoy)
     }
     fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
@@ -2063,7 +2294,7 @@ impl ReferenceAddresses for OldStoreRecords {
             }
             OldReference::ControlRecord { resource, .. } if resource.kind == "TerminalSession" => self.seat(&resource.name),
             OldReference::Artifact { resource, .. } => {
-                let artifact = self.artifacts.get(&resource.name).ok_or_else(|| format!("artifact `{}` was not read", resource.name))?;
+                let artifact = self.artifact(&resource.name).ok_or_else(|| format!("artifact `{}` was not read", resource.name))?;
                 artifact_address(&artifact.spec.convoy, &artifact.spec.producer, &artifact.spec.kind, &artifact.spec.subject)
             }
             OldReference::Commit { repository, revision } => {
@@ -2081,30 +2312,30 @@ impl ViewLookups for OldStoreRecords {
     fn principal_of(&self, project: &str, role: &str) -> Option<String> {
         self.principal_backed(project).find(|(declared, _)| *declared == role).map(|(_, principal)| principal.to_owned())
     }
+    /// From the convoy's snapshot; where it names no vessel for the role (the convoy is not held
+    /// here, or its snapshot lacks the role), from the labels of a session holding the role.
     fn vessel(&self, convoy: &str, role: &str) -> Option<String> {
-        self.terminals
-            .values()
-            .find_map(|terminal| {
-                let labels = &terminal.metadata.labels;
-                (labels.get(flotilla_resources::CONVOY_LABEL).map(String::as_str) == Some(convoy)
-                    && labels.get(flotilla_resources::ROLE_LABEL).map(String::as_str) == Some(role))
-                .then(|| labels.get(flotilla_resources::VESSEL_LABEL).cloned())
-                .flatten()
-            })
-            .or_else(|| {
-                let status = self.convoys.get(convoy)?.status.as_ref()?;
-                status
-                    .workflow_snapshot
-                    .as_ref()?
-                    .vessels
-                    .iter()
-                    .find(|vessel| vessel.crew.iter().any(|crew| crew.role == role))
-                    .map(|vessel| vessel.name.clone())
-            })
+        if let Some(vessel) = self.convoy(convoy).and_then(|held| snapshot_vessel(held, role)) {
+            return Some(vessel);
+        }
+        let labelled = self.terminals.values().find_map(|terminal| {
+            let labels = &terminal.metadata.labels;
+            (labels.get(flotilla_resources::CONVOY_LABEL).map(String::as_str) == Some(convoy)
+                && labels.get(flotilla_resources::ROLE_LABEL).map(String::as_str) == Some(role))
+            .then(|| labels.get(flotilla_resources::VESSEL_LABEL).cloned())
+            .flatten()
+        });
+        let key = (convoy.to_owned(), role.to_owned());
+        if labelled.is_none() && self.read.convoys.contains(convoy) && !self.read.labelled.contains(&key) {
+            self.ask(|asked| {
+                asked.labelled.insert(key);
+            });
+        }
+        labelled
     }
     /// A receiver names its launch, read from the session's view only while it shows that launch.
     fn session(&self, receiver: &Receiver) -> Option<(String, String)> {
-        let terminal = self.terminals.get(flotilla_resources::terminal_records::launched(&receiver.id))?;
+        let terminal = self.terminal(flotilla_resources::terminal_records::launched(&receiver.id))?;
         if flotilla_resources::terminal_records::launch_of(terminal) != Some(receiver.id.as_str()) {
             return None;
         }
@@ -2129,10 +2360,7 @@ impl ViewLookups for OldStoreRecords {
                 Some(OldReference::Artifact { resource: reference("Artifact", &name, namespace), revision: revision.to_owned() })
             }
             AddressKind::Commit | AddressKind::Ref => {
-                let parent = address.parent()?;
-                let repository = self.repositories.iter().find(|repository| {
-                    repository.spec.remotes().first().is_some_and(|remote| repository_address(remote, &self.forges).as_ref() == Ok(&parent))
-                })?;
+                let repository = self.repository_at(&address.parent()?)?;
                 let repository = reference("Repository", &repository.metadata.name, namespace);
                 Some(match address.kind() {
                     AddressKind::Commit => OldReference::Commit { repository, revision: revision.to_owned() },
@@ -2142,7 +2370,7 @@ impl ViewLookups for OldStoreRecords {
             // A crew session's seat: the session holding it, the old spelling's subject. It goes
             // when crew compares engine addresses (#3108 gate task).
             AddressKind::Role if address.get(AddressKind::Convoy).is_some() => {
-                let session = self.terminals.keys().find(|session| self.seat(session).as_ref() == Ok(address))?;
+                let session = self.seat_session(address.get(AddressKind::Convoy).expect("checked"), address.name(), address)?;
                 Some(OldReference::ControlRecord {
                     resource: reference("TerminalSession", session, namespace),
                     revision: revision.to_owned(),

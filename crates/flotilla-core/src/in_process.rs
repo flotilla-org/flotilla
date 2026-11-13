@@ -2423,6 +2423,7 @@ impl InProcessDaemon {
     /// home (#3587 layer 6). Absent, every Message stays in the old store.
     pub fn install_message_primitives(&self, primitives: Arc<flotilla_engine_messages::MessagePrimitives>) -> Result<(), String> {
         self.install_convoy_path(primitives.home(), primitives.service())?;
+        primitives.install_lifecycle_reads(self.lifecycle_reads())?;
         self.message_path.set(Arc::clone(&primitives)).map_err(|_| "the Message path is already installed".to_owned())?;
         self.resource_backend.install_attentions(Arc::clone(&primitives) as Arc<dyn flotilla_resources::attentions::Attentions>);
         self.resource_backend
@@ -5100,9 +5101,13 @@ impl InProcessDaemon {
     ) -> Result<NodeId, String> {
         // The original was sent to the replying role: its inbox names it at its home on a replica miss.
         let roles = primitives.roles(namespace).await?;
-        let records = primitives.records(namespace).await.map_err(|error| error.to_string())?;
-        let conversion = flotilla_engine_messages::convert::Conversion { roles: &roles, forges: &records.forges, records: &*records };
-        let inbox = conversion.sender_of(reply).map_err(|error| format!("the replying role has no inbox: {error}"))?;
+        let inbox = primitives
+            .spell(&mut flotilla_engine_messages::OldStoreRecords::empty(namespace), |records| {
+                flotilla_engine_messages::convert::Conversion { roles: &roles, forges: &[], records }.sender_of(reply)
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("the replying role has no inbox: {error}"))?;
         let original = primitives
             .read_view(namespace, original_id, inbox)
             .await
