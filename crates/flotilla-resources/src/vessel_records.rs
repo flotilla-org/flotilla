@@ -221,6 +221,122 @@ pub trait VesselRecords: Send + Sync {
     }
 }
 
+/// A vessel at this home in an environment there, as its frozen requirement asks for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvironmentVessel {
+    /// The launch.
+    pub name: String,
+    pub convoy: String,
+    /// The environment its read view names.
+    pub environment: String,
+    /// Its work's requirement in its convoy's admitted workflow.
+    pub requirement: VesselRequirement,
+    /// Its convoy's project, if it has one.
+    pub project: Option<String>,
+    /// Whether an agent crew of it is starting or running in that environment.
+    pub live: bool,
+}
+
+/// The vessels at this home that the Vessel listing shows in `environments` (or in any
+/// environment), each with its convoy's requirement for it, read from the records without
+/// composing a view: each work's newest launch here, unless it was released, or it ended and its
+/// convoy's phase is terminal. A vessel's environment is the one it was realised in, else the
+/// unended one it holds.
+///
+/// For named environments only that environment's records are read: the vessel holding it and
+/// the vessels of the terminal launches in it. A host's own environment is shared and held by no
+/// vessel; a vessel realised in it seats its crews there before it is ready, so their launches
+/// name it.
+pub fn environment_vessels(
+    reads: &dyn crate::lifecycle_reads::LifecycleReads,
+    environments: Option<&BTreeSet<String>>,
+) -> Result<Vec<EnvironmentVessel>, String> {
+    let vessels = reads.vessels()?;
+    let terminals = reads.terminals()?;
+    let environment_records = reads.environments()?;
+    let here = vessels.home().to_owned();
+    let live_launch = |terminal: &TerminalRecord| {
+        terminal.is_agent()
+            && matches!(
+                terminal.reading,
+                LifecycleReading::Ready { .. }
+                    | LifecycleReading::InProgress
+                    | LifecycleReading::Retrying { .. }
+                    | LifecycleReading::Exhausted { .. }
+            )
+    };
+    // A session's earlier launches have all ended, so a live launch is its newest.
+    let mut live = BTreeSet::new();
+    let mut newest = BTreeMap::<(String, String, String), VesselRecord>::new();
+    let mut keep = |record: VesselRecord| {
+        let work = (record.convoy.clone(), record.convoy_home.clone(), record.launch_of.clone());
+        if newest.get(&work).is_none_or(|held| held.launch_number() < record.launch_number()) {
+            newest.insert(work, record);
+        }
+    };
+    match environments {
+        None => {
+            for terminal in terminals.at(&here)?.into_iter().filter(live_launch) {
+                live.extend(terminal.vessel.map(|vessel| (vessel, terminal.environment)));
+            }
+            vessels.at(&here)?.into_iter().for_each(&mut keep);
+        }
+        Some(environments) => {
+            let mut held = BTreeSet::new();
+            for environment in environments {
+                held.extend(environment_records.get(environment, None)?.and_then(|record| record.vessel));
+                for terminal in terminals.of_environment(environment, &here)? {
+                    if live_launch(&terminal) {
+                        live.extend(terminal.vessel.clone().map(|vessel| (vessel, terminal.environment.clone())));
+                    }
+                    held.extend(terminal.vessel);
+                }
+            }
+            for name in held {
+                let Some(record) = vessels.get(&name, None)? else { continue };
+                let newer = vessels.newest(&record.convoy, &record.convoy_home, &record.launch_of, None)?;
+                keep(newer.unwrap_or(record));
+            }
+        }
+    }
+    let convoys = reads.convoys()?;
+    let mut convoy_records = BTreeMap::new();
+    let mut found = Vec::new();
+    for record in newest.into_values() {
+        if record.reading == LifecycleReading::Released {
+            continue;
+        }
+        let environment = match record.environment() {
+            Some(identity) => Some(identity.to_owned()),
+            None => environment_records.held(&record.name)?.into_iter().find(|environment| !environment.ended()).map(|held| held.name),
+        };
+        let Some(environment) = environment.filter(|environment| environments.is_none_or(|set| set.contains(environment))) else {
+            continue;
+        };
+        let key = (record.convoy.clone(), record.convoy_home.clone());
+        if !convoy_records.contains_key(&key) {
+            convoy_records.insert(key.clone(), convoys.get(&record.convoy, Some(&record.convoy_home))?);
+        }
+        let Some(convoy) = &convoy_records[&key] else { continue };
+        if record.ended() && convoy.is_terminal(&vessels.of_convoy(&convoy.name)?) {
+            continue;
+        }
+        let Some(requirement) = convoy.admission.workflow_snapshot.vessels.iter().find(|requirement| requirement.name == record.work())
+        else {
+            continue;
+        };
+        found.push(EnvironmentVessel {
+            live: live.contains(&(record.name.clone(), environment.clone())),
+            requirement: requirement.clone(),
+            project: (!convoy.project.is_empty()).then(|| convoy.project.clone()),
+            convoy: record.convoy.clone(),
+            name: record.name,
+            environment,
+        });
+    }
+    Ok(found)
+}
+
 /// Whether crew member `index` of `requirement` is wanted running in `convoy`: it is Working or
 /// Interrupted, or it starts with its vessel and the work is launching or running.
 pub fn crew_active(convoy: &ResourceObject<Convoy>, requirement: &VesselRequirement, index: usize) -> bool {

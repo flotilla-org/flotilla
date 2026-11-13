@@ -2,6 +2,7 @@
 //! a number that does not grow with the unrelated records held.
 
 use std::{
+    collections::BTreeSet,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -10,12 +11,12 @@ use chrono::Utc;
 use flotilla_crew::reconcilers::vessel::ConvoyVesselWake;
 use flotilla_engine_convoys_testkit::{convoy, single_agent, EngineConvoysHome};
 use flotilla_provisioning::engine::checkouts::CheckoutConvoyWake;
-use flotilla_provisioning_testkit::{EngineFixture, OtherHome};
+use flotilla_provisioning_testkit::{EngineFixture, OtherHome, TerminalsFixture};
 use flotilla_resources::{
     account_access::AccountRecords,
     address::{artifact_address, record_name},
     checkout_records::CheckoutHolder,
-    vessel_records::VesselRecords,
+    vessel_records::{environment_vessels, EnvironmentVessel, VesselRecords},
     Artifact, ArtifactSpec, CheckoutSpec, ConvoySpec, ObservedCheckoutSpec, RepositoryKey, SystemClock,
 };
 use flotilla_store::{
@@ -204,6 +205,51 @@ async fn a_checkout_queues_only_its_holders_convoy() {
     assert_eq!(large.len(), 1, "only the holder's convoy is queued: {large:?}");
     assert_eq!(small_read, 1, "only that convoy's view is converted");
     assert_eq!(large_read, small_read, "the cost does not grow with the other convoys");
+}
+
+/// The vessels credential delivery finds in the shared environment, and the launches read and
+/// convoy views converted finding them, with `others` other convoys each holding a ready vessel
+/// and a starting crew in an environment of its own. Two convoys' vessels are realised in the
+/// shared environment, which no vessel holds, as a host's own environment is held.
+async fn vessels_in_one_environment(others: usize) -> (Vec<EnvironmentVessel>, u64, u64) {
+    let store = OtherHome::open("home");
+    let engine = EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
+    for n in 0..others + 2 {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let launch = convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
+        let vessel = engine.vessels.request(&launch, "work", "host");
+        let environment = if n < 2 { "shared".to_owned() } else { format!("env-{n}") };
+        engine.terminals.request(&TerminalsFixture::agent(&vessel, "coder", &environment));
+        engine.vessels.ready(&vessel, &environment);
+    }
+    if others == 5 {
+        let every = environment_vessels(convoys.reads().as_ref(), None).expect("every environment's vessels");
+        assert_eq!(every.len(), others + 2, "a full pass finds every vessel: {every:?}");
+    }
+
+    let launches = engine.vessels.vessels.launches_read();
+    let converted = convoys.views().views_converted();
+    let found = environment_vessels(convoys.reads().as_ref(), Some(&BTreeSet::from(["shared".to_owned()]))).expect("vessels");
+    (found, engine.vessels.vessels.launches_read() - launches, convoys.views().views_converted() - converted)
+}
+
+// Behaviour: credential delivery to one environment reads that environment's vessels and their
+// convoys' records by key, not every vessel view at this home and every convoy they serve.
+#[tokio::test]
+async fn an_environments_credential_vessels_are_read_without_the_others() {
+    let (small, small_launches, small_converted) = vessels_in_one_environment(5).await;
+    let (large, large_launches, large_converted) = vessels_in_one_environment(60).await;
+    for found in [&small, &large] {
+        let convoys: Vec<_> = found.iter().map(|vessel| vessel.convoy.as_str()).collect();
+        assert_eq!(convoys.len(), 2, "the shared environment's two vessels: {found:?}");
+        assert!(found.iter().all(|vessel| vessel.environment == "shared" && vessel.live && vessel.requirement.name == "work"));
+    }
+    assert_eq!(small_converted, 0, "no convoy view is converted");
+    assert_eq!(large_converted, 0, "no convoy view is converted");
+    assert_eq!(small_launches, 0, "each vessel is read by key: no launch is listed, scanned or read through an index");
+    assert_eq!(large_launches, small_launches, "the cost does not grow with the other convoys");
 }
 
 // Behaviour: a brief artifact queues only the vessels of the convoy it belongs to, read by that

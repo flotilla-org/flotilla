@@ -322,6 +322,26 @@ impl ConvoyRecord {
         eager || notes.and_then(|notes| notes.crew.get(work)).and_then(|roles| roles.get(role)).is_some_and(|crew| crew.task_assigned)
     }
 
+    /// Whether its phase is terminal with `launches`, its works' Vessel launches at every home, as
+    /// [`Self::read_view`] derives it. Its home's notes and its live sessions are left out: they
+    /// never make a phase terminal.
+    pub fn is_terminal(&self, launches: &[crate::vessel_records::VesselRecord]) -> bool {
+        let snapshot = &self.admission.workflow_snapshot;
+        let vessels = snapshot
+            .vessels
+            .iter()
+            .filter_map(|requirement| {
+                launches
+                    .iter()
+                    .filter(|vessel| vessel.convoy_home == self.home && vessel.work() == requirement.name)
+                    .max_by_key(|vessel| (vessel.requested_at, vessel.launch_number()))
+                    .map(|vessel| (requirement.name.clone(), VesselReading::At(vessel.phase())))
+            })
+            .collect();
+        let crew = self.crew_readings(&BTreeSet::new(), None);
+        view::derive(&ConvoyFacts { ended: self.end(), snapshot, vessels: &vessels, crew: &crew }).phase.is_terminal()
+    }
+
     fn end(&self) -> Option<Ended> {
         self.ended.as_ref().map(|(end, _)| match end {
             ConvoyEnd::Delivered { .. } => Ended::Delivered,

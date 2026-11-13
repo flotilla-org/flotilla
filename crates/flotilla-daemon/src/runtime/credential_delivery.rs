@@ -21,8 +21,10 @@ use std::{
 
 use flotilla_credentials::{CredentialStore, GithubAppRefreshWake, GithubAppScope};
 use flotilla_resources::{
-    environment_records::EnvironmentChange, Convoy, CredentialGrant, CredentialSpec, Project, ReadWatchEvent, Repository, RepositoryKey,
-    RepositoryTrust, TerminalSession, TerminalSessionPhase, TerminalSessionSource, Vessel, WatchEvent,
+    environment_records::EnvironmentChange,
+    vessel_records::{environment_vessels, EnvironmentVessel},
+    CredentialGrant, CredentialSpec, Project, ReadWatchEvent, Repository, RepositoryKey, RepositoryTrust, TerminalSession,
+    TerminalSessionPhase, WatchEvent,
 };
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -411,54 +413,13 @@ impl CredentialDelivery {
     async fn wanted(&self, environments: Option<&BTreeSet<String>>) -> Result<BTreeMap<String, Wanted>, String> {
         let namespace = self.namespace.as_str();
         let backend = self.state.daemon.resource_backend();
-        let selected =
-            |environment: Option<&String>| environment.is_some_and(|environment| environments.is_none_or(|set| set.contains(environment)));
-        let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| format!("list credential vessels: {error}"))?;
-        let vessels = vessels
-            .items
-            .into_iter()
-            .filter(|vessel| selected(vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref())))
-            .collect::<Vec<_>>();
-        let mut live_crews = BTreeSet::new();
-        for session in backend
-            .using::<TerminalSession>(namespace)
-            .list()
+        let reads = self.state.daemon.lifecycle_reads();
+        let named = environments.cloned();
+        let vessels = tokio::task::spawn_blocking(move || environment_vessels(reads.as_ref(), named.as_ref()))
             .await
-            .map_err(|error| format!("list crew terminal sessions for credential delivery: {error}"))?
-            .items
-        {
-            if !selected(Some(&session.spec.env_ref)) {
-                continue;
-            }
-            let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { continue };
-            let running = session
-                .status
-                .as_ref()
-                .is_none_or(|status| matches!(status.phase, TerminalSessionPhase::Starting | TerminalSessionPhase::Running));
-            if context.namespace == namespace && running {
-                live_crews.insert((context.vessel_ref.clone(), context.convoy.clone(), session.spec.env_ref.clone()));
-            }
-        }
-        let mut convoys = BTreeMap::new();
-        for name in vessels.iter().map(|vessel| &vessel.spec.convoy_ref).collect::<BTreeSet<_>>() {
-            let convoy = backend
-                .including_replicas::<Convoy>(namespace)
-                .get(name)
-                .await
-                .map_err(|error| format!("read credential convoy {name}: {error}"))?
-                .object;
-            convoys.insert(name.clone(), convoy);
-        }
-        let requirement = |vessel: &flotilla_resources::ResourceObject<Vessel>| {
-            convoys
-                .get(&vessel.spec.convoy_ref)
-                .and_then(|convoy| convoy.status.as_ref())
-                .and_then(|status| status.workflow_snapshot.as_ref())
-                .and_then(|snapshot| snapshot.vessels.iter().find(|requirement| requirement.name == vessel.spec.vessel_name))
-                .cloned()
-        };
-        let needs_grants =
-            vessels.iter().any(|vessel| requirement(vessel).is_some_and(|requirement| !requirement.credential_scopes.is_empty()));
+            .map_err(|error| format!("read credential vessels: {error}"))?
+            .map_err(|error| format!("read credential vessels: {error}"))?;
+        let needs_grants = vessels.iter().any(|vessel| !vessel.requirement.credential_scopes.is_empty());
         let (grants, repository_trust) = if needs_grants {
             let grants = backend
                 .including_replicas::<CredentialGrant>(namespace)
@@ -486,14 +447,10 @@ impl CredentialDelivery {
             (Vec::new(), BTreeMap::new())
         };
         let mut wanted = BTreeMap::<String, Wanted>::new();
-        for vessel in &vessels {
-            let Some(environment) = vessel.status.as_ref().and_then(|status| status.environment_ref.clone()) else { continue };
-            let Some(requirement) = requirement(vessel) else { continue };
-            let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
-            let live = live_crews.contains(&(vessel.metadata.name.clone(), vessel.spec.convoy_ref.clone(), environment.clone()));
+        for EnvironmentVessel { environment, requirement, project, live, .. } in &vessels {
             let entry = wanted.entry(environment.clone()).or_default();
             entry.granted.extend(requirement.credential_refs.iter().cloned());
-            if !live {
+            if !*live {
                 continue;
             }
             entry.running.extend(requirement.credential_refs.iter().cloned());
@@ -515,7 +472,7 @@ impl CredentialDelivery {
                 let mut scope = github_app_scope_from_grants(
                     name,
                     repositories,
-                    convoy.spec.project_ref.as_deref(),
+                    project.as_deref(),
                     &requirement.crew.iter().map(|crew| crew.role.clone()).collect(),
                     &repository_trust,
                     requirement.repository_refs.is_some(),
