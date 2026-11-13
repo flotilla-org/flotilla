@@ -724,18 +724,13 @@ async fn a_record_created_after_the_pass_wakes_the_convoy_that_looked_for_it() {
     // where the pass looks.
     let convoy = pr_ledger_convoy(&ResourceBackend::new(InMemoryBackend::default()), 1).await;
     let engine = Arc::new(Recording { holds: true, ..Default::default() });
-    engine.memory.note_evidence("unrelated", "ChangeRequest", [change_request_name(2)].into());
-    engine.memory.note_evidence("unrelated", "Artifact", [ledger_name("unrelated")].into());
-    let reconciler = reconciler(&backend, Arc::clone(&engine))
-        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
-    reconciler.prepare(&convoy).await.expect("prepare");
-    assert!(engine.promises.lock().expect("promises").is_empty(), "the pass found nothing to observe");
 
-    // Probes a third convoy reads, written until each wake has started and heard one.
+    // Probes a convoy reads, written until each wake has started and heard one.
     engine.memory.note_evidence("probe", "ChangeRequest", (10_000..10_500).map(change_request_name).collect());
     engine.memory.note_evidence("probe", "Artifact", (0..500).map(|n| ledger_name(&format!("probe-{n}"))).collect());
     // A queue holds a name until the controller takes it, which a test never does, so each wake
-    // has its own queue.
+    // has its own queue, and the convoys under test are noted only once the wakes are open: a
+    // wake queues every convoy already noted when it opens.
     let (change_request_sender, mut change_request_queue) = WorkQueueSender::channel();
     let (artifact_sender, mut artifact_queue) = WorkQueueSender::channel();
     let wakes: Vec<(Box<dyn SecondaryWatch<Primary = Convoy>>, WorkQueueSender)> = vec![
@@ -777,6 +772,13 @@ async fn a_record_created_after_the_pass_wakes_the_convoy_that_looked_for_it() {
     .await
     .expect("the artifact wake heard a probe");
 
+    engine.memory.note_evidence("unrelated", "ChangeRequest", [change_request_name(2)].into());
+    engine.memory.note_evidence("unrelated", "Artifact", [ledger_name("unrelated")].into());
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
+    reconciler.prepare(&convoy).await.expect("prepare");
+    assert!(engine.promises.lock().expect("promises").is_empty(), "the pass found nothing to observe");
+
     publish_merged_change_request(&backend, 1).await;
     assert_eq!(woken(&mut change_request_queue).await, BTreeSet::from(["c".to_string()]), "the PR the convoy looked for wakes it alone");
     publish_ledger(&backend, "c").await;
@@ -816,6 +818,61 @@ async fn after_a_restart_the_first_pass_reads_what_changed_before_it() {
     assert_eq!(engine.memory.reading("ChangeRequest", &change_request_name(1)), ["c"]);
 }
 
+// Behaviour: after a restart, with the home's memory empty, the controller's start-up listing gives
+// an open convoy its first pass, which notes the change request its PR names though it is not yet
+// held, and that change request's later merge wakes the convoy with no other event.
+#[tokio::test]
+async fn after_a_restart_the_start_up_pass_lets_a_later_change_wake_the_convoy() {
+    use flotilla_crew::convoy::EvidenceWake;
+    use flotilla_store::controller::{ControllerLoop, SecondaryWatch};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut convoy = ledger_convoy(&backend).await;
+    // Only the PR promise, so the merge is the pass's one observation.
+    convoy.status.as_mut().expect("status").promises.clear();
+    submit_pr(&mut convoy, 1);
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    convoys.update_status("c", &convoy.metadata.resource_version, convoy.status.as_ref().expect("status")).await.expect("status");
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let verdicts = || {
+        engine
+            .promises
+            .lock()
+            .expect("promises")
+            .iter()
+            .filter_map(|(_, _, operation, _)| match operation {
+                PromiseOperation::Verdict { verdict, .. } => Some((verdict.accepted, verdict.why.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> =
+        Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(NAMESPACE), engine: engine_path(&engine) });
+    let mut harness = crate::common::ControllerLoopHarness::new(backend.clone());
+    harness.spawn(
+        ControllerLoop {
+            primary: convoys,
+            secondaries: vec![wake],
+            reconciler: reconciler(&backend, Arc::clone(&engine))
+                .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180)),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+    harness
+        .wait_until(std::time::Duration::from_secs(5), || async {
+            engine.memory.reading("ChangeRequest", &change_request_name(1)) == ["c"]
+        })
+        .await;
+    assert!(verdicts().is_empty(), "the first pass finds no change request to judge");
+
+    publish_merged_change_request(&backend, 1).await;
+    harness.wait_until(std::time::Duration::from_secs(5), || async { !verdicts().is_empty() }).await;
+    // The change request's creation and its status each wake the convoy, so it may judge twice.
+    assert!(verdicts().iter().all(|verdict| *verdict == (true, "PR merged".to_string())), "the merge woke the convoy: {:?}", verdicts());
+    harness.shutdown().await;
+}
+
 /// What hearing one change of convoy c's change request reads, from when the wake has started,
 /// and which convoys it wakes, with `others` convoys each reading another change request. Also
 /// the Convoy reads from before the wake starts.
@@ -824,21 +881,16 @@ async fn evidence_wake_reads(others: usize) -> (ReadSnapshot, usize, BTreeSet<St
     use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
     let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
     let engine = Arc::new(Recording { holds: true, ..Default::default() });
-    engine.memory.note_evidence("c", "ChangeRequest", [change_request_name(1)].into());
     for n in 0..others as u64 {
-        engine.memory.note_evidence(&format!("other-{n}"), "ChangeRequest", [change_request_name(100 + n)].into());
         publish_merged_change_request(&backend, 100 + n).await;
     }
     // A convoy reading the probes the test writes until the wake hears.
     engine.memory.note_evidence("probe", "ChangeRequest", (10_000..10_500).map(change_request_name).collect());
-    let path: EngineConvoyPath = Arc::new(OnceLock::new());
-    let shared: Arc<dyn EngineConvoys> = engine;
-    assert!(path.set(shared).is_ok());
 
     let started = backend.read_snapshot();
     let (sender, mut queue) = WorkQueueSender::channel();
     let wake: Box<dyn SecondaryWatch<Primary = Convoy>> =
-        Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(NAMESPACE), engine: path });
+        Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(NAMESPACE), engine: engine_path(&engine) });
     let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
     // The wake opens its watch when it starts: write probes until it hears one.
     let mut probe = 10_000;
@@ -856,6 +908,12 @@ async fn evidence_wake_reads(others: usize) -> (ReadSnapshot, usize, BTreeSet<St
     .expect("woken");
     while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
         assert_eq!(name, "probe");
+    }
+    // The convoys under test are noted once the wake is open, which queues every convoy noted
+    // when it opens, and a queue holds a name until a controller takes it.
+    engine.memory.note_evidence("c", "ChangeRequest", [change_request_name(1)].into());
+    for n in 0..others as u64 {
+        engine.memory.note_evidence(&format!("other-{n}"), "ChangeRequest", [change_request_name(100 + n)].into());
     }
     let convoy_reads = backend.read_snapshot().since(&started).calls_by_kind().get("Convoy").copied().unwrap_or_default();
 
@@ -876,6 +934,30 @@ async fn an_evidence_change_wakes_only_the_convoys_that_read_it() {
     reads.assert_zero("hearing a change request change");
     assert_eq!(convoy_reads, 0, "the wake reads no convoy");
     assert_eq!(woken, BTreeSet::from(["c".to_string()]));
+}
+
+// Behaviour: a convoy whose pass read evidence before the wake opened its watch may have missed a
+// change in between, so the wake queues every convoy noted for its kind once its watch is open,
+// and none noted only for another kind, reading no convoy.
+#[tokio::test]
+async fn an_opening_wake_queues_the_convoys_already_reading_its_kind() {
+    use flotilla_crew::convoy::EvidenceWake;
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    engine.memory.note_evidence("c", "ChangeRequest", [change_request_name(1)].into());
+    engine.memory.note_evidence("d", "ChangeRequest", [change_request_name(2)].into());
+    engine.memory.note_evidence("ledger-only", "Artifact", [ledger_name("ledger-only")].into());
+
+    let before = backend.read_snapshot();
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> =
+        Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(NAMESPACE), engine: engine_path(&engine) });
+    let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
+    assert_eq!(woken(&mut queue).await, BTreeSet::from(["c".to_string(), "d".to_string()]));
+    let reads = backend.read_snapshot().since(&before);
+    watch.abort();
+    assert_eq!(reads.calls_by_kind().get("Convoy").copied().unwrap_or_default(), 0, "{reads}");
 }
 
 /// The engine Message path's one answer the hold reads: until when the crew's

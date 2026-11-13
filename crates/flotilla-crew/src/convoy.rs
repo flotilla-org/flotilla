@@ -564,8 +564,15 @@ impl<W: Resource> SecondaryWatch for EvidenceWake<W> {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let Some(engine) = self.engine.get().cloned() else { return Err(ResourceError::other(NO_ENGINE)) };
-            // What is already held was read by the convoys' own first pass; only changes wake.
+            // The watch hears changes from when it opens. A pass notes its names before it reads,
+            // so a convoy noted by now may have read before the watch opened and missed a change
+            // in between: it takes one more pass. Every later pass notes after the watch opened.
             let mut watch = self.evidence.watch().await?;
+            for name in engine.memory().readers(W::API_PATHS.kind) {
+                if sender.send(name).await.is_err() {
+                    return Ok(());
+                }
+            }
             loop {
                 match futures::StreamExt::next(&mut watch).await {
                     Some(Ok(event)) => {

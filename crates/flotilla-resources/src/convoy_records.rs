@@ -714,6 +714,12 @@ impl ConvoyMemory {
         held.by_record.get(&(kind, record.to_owned())).map(|launches| launches.iter().cloned().collect()).unwrap_or_default()
     }
 
+    /// The launches whose last pass read any `kind` record.
+    pub fn readers(&self, kind: &'static str) -> BTreeSet<String> {
+        let held = self.evidence.lock().unwrap_or_else(PoisonError::into_inner);
+        held.by_launch.keys().filter(|(_, read)| *read == kind).map(|(name, _)| name.clone()).collect()
+    }
+
     /// Drops the notes on launch `name`, once it has ended and its home no longer judges it.
     pub fn forget(&self, name: &str) {
         if self.notes.lock().unwrap_or_else(PoisonError::into_inner).remove(name).is_some() {
