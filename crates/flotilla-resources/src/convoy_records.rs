@@ -628,8 +628,32 @@ impl Default for ConvoyMemory {
 /// evidence its promises are observed from and the hosts it waits on for capacity.
 #[derive(Debug, Default)]
 struct EvidenceReads {
+    /// What each launch's last completed pass noted; an empty set is a pass that read none.
     by_launch: BTreeMap<(String, &'static str), BTreeSet<String>>,
     by_record: BTreeMap<(&'static str, String), BTreeSet<String>>,
+    /// The launches reading every record of a kind: no pass of theirs has noted what it reads,
+    /// so any change of the kind wakes them. Each holds the names noted before its first read.
+    every: BTreeMap<(String, &'static str), BTreeSet<String>>,
+}
+
+impl EvidenceReads {
+    fn replace(&mut self, name: &str, kind: &'static str, records: BTreeSet<String>) {
+        self.every.remove(&(name.to_owned(), kind));
+        let before = self.by_launch.remove(&(name.to_owned(), kind)).unwrap_or_default();
+        for record in before.difference(&records) {
+            let key = (kind, record.clone());
+            if let Some(launches) = self.by_record.get_mut(&key) {
+                launches.remove(name);
+                if launches.is_empty() {
+                    self.by_record.remove(&key);
+                }
+            }
+        }
+        for record in records.difference(&before) {
+            self.by_record.entry((kind, record.clone())).or_default().insert(name.to_owned());
+        }
+        self.by_launch.insert((name.to_owned(), kind), records);
+    }
 }
 
 impl ConvoyMemory {
@@ -692,35 +716,60 @@ impl ConvoyMemory {
     /// capacity wait notes its Hosts by every reference a change may name them by: placement's,
     /// the canonical id and the display name.
     pub fn note_evidence(&self, name: &str, kind: &'static str, records: BTreeSet<String>) {
+        self.evidence.lock().unwrap_or_else(PoisonError::into_inner).replace(name, kind, records);
+    }
+
+    /// Notes, before a pass's first read that may fail, the `kind` records it names without
+    /// reading. A launch an earlier pass noted keeps that note and adds these; one with none
+    /// reads every `kind` record until a pass notes what it reads, so a pass that fails before
+    /// then is woken by any change of the kind, as every open launch once was.
+    pub fn note_evidence_unread(&self, name: &str, kind: &'static str, records: BTreeSet<String>) {
         let mut held = self.evidence.lock().unwrap_or_else(PoisonError::into_inner);
-        let before = held.by_launch.remove(&(name.to_owned(), kind)).unwrap_or_default();
-        for record in before.difference(&records) {
-            let key = (kind, record.clone());
-            if let Some(launches) = held.by_record.get_mut(&key) {
-                launches.remove(name);
-                if launches.is_empty() {
-                    held.by_record.remove(&key);
-                }
-            }
-        }
-        for record in records.difference(&before) {
-            held.by_record.entry((kind, record.clone())).or_default().insert(name.to_owned());
-        }
-        if !records.is_empty() {
-            held.by_launch.insert((name.to_owned(), kind), records);
+        let EvidenceReads { by_launch, by_record, every } = &mut *held;
+        let Some(noted) = by_launch.get_mut(&(name.to_owned(), kind)) else {
+            every.insert((name.to_owned(), kind), records);
+            return;
+        };
+        for record in records {
+            by_record.entry((kind, record.clone())).or_default().insert(name.to_owned());
+            noted.insert(record);
         }
     }
 
-    /// The launches whose last pass read the `kind` record `record`.
+    /// Ends a pass that completed without noting its `kind` reads: a launch still reading every
+    /// `kind` record reads only those noted before its first read.
+    pub fn settle_evidence(&self, name: &str, kind: &'static str) {
+        let mut held = self.evidence.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(records) = held.every.remove(&(name.to_owned(), kind)) {
+            held.replace(name, kind, records);
+        }
+    }
+
+    /// Drops what launch `name` reads, once it has ended and reads nothing.
+    pub fn drop_evidence(&self, name: &str) {
+        let mut held = self.evidence.lock().unwrap_or_else(PoisonError::into_inner);
+        let kinds = held.by_launch.keys().chain(held.every.keys()).filter(|(launch, _)| launch == name).map(|(_, kind)| *kind);
+        for kind in kinds.collect::<BTreeSet<_>>() {
+            held.replace(name, kind, BTreeSet::new());
+            held.by_launch.remove(&(name.to_owned(), kind));
+        }
+    }
+
+    /// The launches whose last pass read the `kind` record `record`, and those reading every
+    /// `kind` record.
     pub fn reading(&self, kind: &'static str, record: &str) -> Vec<String> {
         let held = self.evidence.lock().unwrap_or_else(PoisonError::into_inner);
-        held.by_record.get(&(kind, record.to_owned())).map(|launches| launches.iter().cloned().collect()).unwrap_or_default()
+        let named = held.by_record.get(&(kind, record.to_owned())).into_iter().flatten();
+        let every = held.every.keys().filter(|(_, read)| *read == kind).map(|(name, _)| name);
+        named.chain(every).cloned().collect::<BTreeSet<_>>().into_iter().collect()
     }
 
-    /// The launches whose last pass read any `kind` record.
+    /// The launches whose last pass read any `kind` record, and those reading every one.
     pub fn readers(&self, kind: &'static str) -> BTreeSet<String> {
         let held = self.evidence.lock().unwrap_or_else(PoisonError::into_inner);
-        held.by_launch.keys().filter(|(_, read)| *read == kind).map(|(name, _)| name.clone()).collect()
+        let named = held.by_launch.iter().filter(|((_, read), records)| *read == kind && !records.is_empty()).map(|((name, _), _)| name);
+        let every = held.every.keys().filter(|(_, read)| *read == kind).map(|(name, _)| name);
+        named.chain(every).cloned().collect()
     }
 
     /// Drops the notes on launch `name`, once it has ended and its home no longer judges it.

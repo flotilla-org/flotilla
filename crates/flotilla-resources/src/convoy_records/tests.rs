@@ -322,3 +322,39 @@ fn a_seat_the_end_overtook_reads_the_end() {
     assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("it looped"));
     assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Ended);
 }
+
+// Behaviour: a launch no pass has noted reads every record of a kind from its unread note until a
+// pass notes what it reads or completes without reading; a noted launch's unread note adds to
+// what it reads; an ended launch reads nothing.
+#[test]
+fn an_unread_note_reads_every_record_until_a_pass_notes_its_own() {
+    let memory = super::ConvoyMemory::default();
+    let names = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect::<BTreeSet<_>>();
+    memory.note_evidence_unread("c", "ChangeRequest", names(&["cr-1"]));
+    assert_eq!(memory.reading("ChangeRequest", "cr-9"), ["c"]);
+    assert!(memory.reading("Artifact", "a-9").is_empty(), "only the kind noted");
+    assert_eq!(memory.readers("ChangeRequest"), names(&["c"]));
+
+    memory.note_evidence("c", "ChangeRequest", names(&["cr-2"]));
+    assert!(memory.reading("ChangeRequest", "cr-9").is_empty());
+    assert_eq!(memory.reading("ChangeRequest", "cr-2"), ["c"]);
+    memory.note_evidence_unread("c", "ChangeRequest", names(&["cr-1"]));
+    assert!(memory.reading("ChangeRequest", "cr-9").is_empty(), "a noted launch keeps its note");
+    assert_eq!(memory.reading("ChangeRequest", "cr-1"), ["c"]);
+    assert_eq!(memory.reading("ChangeRequest", "cr-2"), ["c"]);
+
+    memory.note_evidence_unread("d", "ChangeRequest", names(&["cr-4"]));
+    memory.settle_evidence("d", "ChangeRequest");
+    assert_eq!(memory.reading("ChangeRequest", "cr-9"), Vec::<String>::new(), "a completed pass reads what it noted first");
+    assert_eq!(memory.reading("ChangeRequest", "cr-4"), ["d"]);
+
+    memory.note_evidence("e", "ChangeRequest", BTreeSet::new());
+    memory.note_evidence_unread("e", "ChangeRequest", BTreeSet::new());
+    assert!(!memory.readers("ChangeRequest").contains("e"), "a pass that read none is a note");
+
+    memory.drop_evidence("c");
+    memory.drop_evidence("d");
+    assert!(memory.readers("ChangeRequest").is_empty());
+    memory.note_evidence_unread("c", "ChangeRequest", BTreeSet::new());
+    assert_eq!(memory.reading("ChangeRequest", "cr-9"), ["c"], "an ended launch's notes are gone");
+}

@@ -540,6 +540,19 @@ pub fn change_request_record_names(
             add(crate::address::subject_address(&subject, forges));
         }
     }
+    names.extend(convoy_change_request_names(convoy, forges));
+    names
+}
+
+/// The ChangeRequest records a convoy names itself, without its checkouts: those it produces,
+/// those its submitted PR promises name, and those its exit binds. With no forges only the forge
+/// id and public GitHub spellings name a record.
+pub fn convoy_change_request_names(convoy: &crate::ResourceObject<Convoy>, forges: &[crate::ForgeSpec]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut add = |address: Result<crate::address::Address, String>| {
+        let address = address.ok().filter(|address| address.kind() == crate::address::AddressKind::ChangeRequest);
+        names.extend(address.and_then(|address| crate::address::record_name(&address)));
+    };
     if let Some(status) = convoy.status.as_ref() {
         for subject in status.subjects.iter().filter(|subject| {
             subject.relationship == Relationship::Produces && subject.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest

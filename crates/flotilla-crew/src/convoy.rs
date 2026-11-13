@@ -783,10 +783,7 @@ impl Reconciler for ConvoyReconciler {
         let now = self.clock.now();
         if status.phase.is_terminal() {
             // An ended convoy reads no evidence and waits on no host, so no change of either wakes it.
-            let memory = engine.memory();
-            for kind in [ChangeRequest::API_PATHS.kind, Artifact::API_PATHS.kind, Host::API_PATHS.kind] {
-                memory.note_evidence(&obj.metadata.name, kind, BTreeSet::new());
-            }
+            engine.memory().drop_evidence(&obj.metadata.name);
             if status.finished_at.is_none() {
                 // The view derived the failure from a failed work; the launch has not ended yet.
                 let reason = status.message.clone().unwrap_or_else(|| format!("the convoy's work {:?}", status.phase));
@@ -797,6 +794,25 @@ impl Reconciler for ConvoyReconciler {
             return Ok(ConvoyPass::default());
         }
 
+        // What the pass reads is noted first: a change after the note wakes the convoy again, and
+        // one before it is in the read. The ledger's artifacts are named by the convoy alone. Of
+        // its change requests, those its checkouts name and those named through a Forge are
+        // known only after reads that may fail; until a pass gets that far the convoy is woken
+        // by any change request.
+        let memory = engine.memory();
+        let needs_ledger = flotilla_resources::convoy::promises::needs_observation(
+            status,
+            flotilla_resources::convoy::promises::PromiseKind::DecisionLedger,
+        );
+        let artifact_names = match &self.artifacts {
+            Some(_) if needs_ledger => flotilla_resources::convoy::promises::ledger_artifact_names(status, &obj.metadata.name),
+            _ => BTreeSet::new(),
+        };
+        memory.note_evidence(&obj.metadata.name, Artifact::API_PATHS.kind, artifact_names.clone());
+        if self.change_requests.is_some() {
+            memory.note_evidence_unread(&obj.metadata.name, ChangeRequest::API_PATHS.kind, convoy_change_request_names(obj, &[]));
+        }
+
         let vessels = match &self.vessels {
             Some(vessels) => select_convoy_children(obj, &vessels.list().await?.items),
             None => BTreeMap::new(),
@@ -804,7 +820,6 @@ impl Reconciler for ConvoyReconciler {
         // A convoy waits for capacity until its first vessel is placed. The hosts its placement
         // chose are noted before they are read, so a change of one after the read wakes it, and
         // after the read only the host it waits on stays noted.
-        let memory = engine.memory();
         let capacity = if vessels.is_empty() {
             let chosen = chosen_candidates(obj).into_iter().map(|candidate| candidate.host).collect();
             memory.note_evidence(&obj.metadata.name, Host::API_PATHS.kind, chosen);
@@ -819,6 +834,8 @@ impl Reconciler for ConvoyReconciler {
         );
         self.note_capacity(obj, capacity.as_ref().map(|wait| &wait.reason), now).map_err(ResourceError::other)?;
         if let Some(wait) = capacity {
+            // A waiting convoy reads no change request.
+            memory.settle_evidence(&obj.metadata.name, ChangeRequest::API_PATHS.kind);
             return Ok(ConvoyPass { requeue_after: wait.until.and_then(|until| until.signed_duration_since(now).to_std().ok()) });
         }
 
@@ -835,12 +852,6 @@ impl Reconciler for ConvoyReconciler {
         let needs_pr = is_landing
             || names_change_request
             || flotilla_resources::convoy::promises::needs_observation(status, flotilla_resources::convoy::promises::PromiseKind::Pr);
-        let needs_ledger = flotilla_resources::convoy::promises::needs_observation(
-            status,
-            flotilla_resources::convoy::promises::PromiseKind::DecisionLedger,
-        );
-        // What the pass reads is noted first: a change after the note wakes the convoy again, and
-        // one before it is in the read.
         let change_request_names = match &self.change_requests {
             Some(_) if needs_pr => change_request_record_names(obj, &checkouts, &forges),
             _ => BTreeSet::new(),
@@ -879,11 +890,6 @@ impl Reconciler for ConvoyReconciler {
             }
         }
 
-        let artifact_names = match &self.artifacts {
-            Some(_) if needs_ledger => flotilla_resources::convoy::promises::ledger_artifact_names(status, &obj.metadata.name),
-            _ => BTreeSet::new(),
-        };
-        engine.memory().note_evidence(&obj.metadata.name, Artifact::API_PATHS.kind, artifact_names.clone());
         let artifacts = match &self.artifacts {
             // Only the artifacts its ledger promises name, each by its name.
             Some(artifacts) if needs_ledger => {

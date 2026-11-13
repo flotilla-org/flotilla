@@ -1150,6 +1150,109 @@ async fn an_opening_wake_queues_the_convoys_already_reading_its_kind() {
     assert_eq!(reads.calls_by_kind().get("Convoy").copied().unwrap_or_default(), 0, "{reads}");
 }
 
+/// The Forges the engine serves, or a refusal to list them while `failing`.
+#[derive(Debug, Default)]
+struct Forges {
+    failing: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl flotilla_resources::engine_records::EngineRecords for Forges {
+    fn kinds(&self) -> &'static [&'static str] {
+        &["Forge"]
+    }
+    fn home(&self) -> String {
+        "kiwi".into()
+    }
+    async fn get(&self, _: &str, _: &str) -> Result<Option<flotilla_resources::engine_records::EngineObject>, String> {
+        self.list("Forge").await.map(|_| None)
+    }
+    async fn list(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+        self.sources(kind).await
+    }
+    async fn sources(&self, _: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("the forges are unreadable".into());
+        }
+        Ok(Vec::new())
+    }
+    async fn apply(
+        &self,
+        _: &str,
+        _: &str,
+        _: &BTreeMap<String, String>,
+        _: &BTreeMap<String, String>,
+        _: serde_json::Value,
+    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+        Err("read only".into())
+    }
+    async fn set_status(&self, _: &str, _: &str, _: serde_json::Value) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+        Err("read only".into())
+    }
+    async fn delete(&self, _: &str, _: &str) -> Result<(), String> {
+        Err("read only".into())
+    }
+    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
+        Ok(futures::StreamExt::boxed(futures::stream::pending()))
+    }
+}
+
+// Behaviour: a convoy whose pass fails before it has noted which change requests it reads, and
+// that no earlier pass noted, is woken by any change request, as every open convoy once was; a
+// pass that completes notes only the ones it reads, and a later failing pass keeps that note.
+#[tokio::test]
+async fn a_convoy_failing_before_its_first_note_is_woken_by_any_change_request() {
+    use flotilla_crew::convoy::EvidenceWake;
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let forges = Arc::new(Forges { failing: true.into() });
+    backend.install_engine_records(Arc::clone(&forges) as Arc<dyn flotilla_resources::engine_records::EngineRecords>);
+    let mut convoy = ledger_convoy(&backend).await;
+    convoy.status.as_mut().expect("status").promises.clear();
+    submit_pr(&mut convoy, 1);
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180))
+        .with_forges(backend.definitions::<flotilla_resources::Forge>(NAMESPACE));
+
+    // A probe convoy reads change requests, written until the wake has started and heard one.
+    engine.memory.note_evidence("probe", "ChangeRequest", (10_000..10_500).map(change_request_name).collect());
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> =
+        Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(NAMESPACE), engine: engine_path(&engine) });
+    let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
+    let mut probe = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            publish_merged_change_request(&backend, 10_000 + probe).await;
+            probe += 1;
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                assert_eq!(name, "probe");
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the wake heard a probe");
+
+    reconciler.prepare(&convoy).await.expect_err("the forges are unreadable");
+    publish_merged_change_request(&backend, 2).await;
+    assert_eq!(woken(&mut queue).await, BTreeSet::from(["c".to_string()]), "an unrelated change request wakes the failing convoy");
+    watch.abort();
+
+    // A queue holds "c" until a controller takes it, so what wakes it now is read from the notes
+    // each change is matched against.
+    forges.failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    reconciler.prepare(&convoy).await.expect("prepare");
+    assert!(engine.memory.reading("ChangeRequest", &change_request_name(3)).is_empty(), "a completed pass reads only its own");
+    assert_eq!(engine.memory.reading("ChangeRequest", &change_request_name(1)), ["c"]);
+
+    forges.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    reconciler.prepare(&convoy).await.expect_err("the forges are unreadable");
+    assert!(engine.memory.reading("ChangeRequest", &change_request_name(3)).is_empty(), "a failed pass keeps the last note");
+    assert_eq!(engine.memory.reading("ChangeRequest", &change_request_name(1)), ["c"]);
+}
+
 /// The engine Message path's one answer the hold reads: until when the crew's
 /// undelivered turn holds delivery. The convoy reconciler asks it nothing else.
 struct Turns {
