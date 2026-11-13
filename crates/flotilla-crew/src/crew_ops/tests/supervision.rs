@@ -140,6 +140,40 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
     });
 }
 
+// b0's relaunch: the reviewer's session of a superseded vessel launch gave up (its environment
+// was not registered after a restart) beside its successor's live session. A handoff reaches the
+// live one. With only the given-up session, the handoff is refused: its crew cannot be revived.
+#[tokio::test]
+async fn a_handoff_passes_a_given_up_launch_for_its_relaunch() {
+    use flotilla_provisioning_testkit::TerminalsFixture;
+    use flotilla_resources::vessel_records::VesselStep;
+
+    // Stages the reviewer's credentials: the fixture's probe stages only for the coder's resume.
+    struct Stages;
+    #[async_trait]
+    impl WorkCredentialReconciler for Stages {
+        async fn reconcile(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let (crew, _backend, _probe, held) = shaped_fixture(CrewWorkPhase::Working, with_review(false)).await;
+    *crew.work_credential_reconciler.write().await = Some(Arc::new(Stages));
+    let engine = &held.engine;
+    let first = engine.vessel(&held.launch, "review", "resume-env");
+    let gave_up = engine.engine.terminals.request(&TerminalsFixture::agent(&first, "reviewer", "resume-env"));
+    engine.engine.terminals.give_up(&gave_up, "provider registry unavailable for environment resume-env");
+    let context = CrewCommandContext::builder().convoy(held.launch.clone()).vessel_ref(held.vessel.clone()).role("coder".into()).build();
+    let target = format!("{}/review/reviewer", held.launch);
+    let error = crew.handoff(&context, &target, "review this").await.expect_err("a lone given-up holder");
+    assert!(error.contains("failed provisioning and cannot be revived"), "{error}");
+
+    engine.engine.vessels.step(&first, VesselStep::Lost { reason: "its environment disappeared".into() });
+    let relaunched = engine.vessel(&held.launch, "review", "resume-env");
+    assert_ne!(relaunched, first);
+    engine.launch_session(&TerminalsFixture::agent(&relaunched, "reviewer", "resume-env"));
+    crew.handoff(&context, &target, "review this").await.expect("the relaunch's live session holds the role");
+}
+
 // An authenticated operator can send supervisor guidance to crew that has no stall.
 #[tokio::test]
 async fn operator_supervision_messages_working_crew() {

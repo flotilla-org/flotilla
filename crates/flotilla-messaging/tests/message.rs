@@ -549,8 +549,8 @@ async fn four_part_addresses_select_the_role_within_a_shared_vessel() {
     assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/absent").await.unwrap().is_none());
 }
 
-// A relaunched vessel's earlier session stays listed, ended, beside its successor's: the live one
-// holds the role. With every launch ended, the newest launch's session does, so a sender learns
+// A relaunched vessel's earlier session stays listed, ended, beside its successor's (on b0, a
+// launch that gave up, which reads Failed): the live one holds the role. With every launch ended, the newest launch's session does, so a sender learns
 // why it ended rather than meeting two holders.
 #[tokio::test]
 async fn an_ended_launchs_session_yields_its_role_to_the_relaunch() {

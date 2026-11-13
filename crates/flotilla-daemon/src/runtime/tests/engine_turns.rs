@@ -474,7 +474,7 @@ async fn message_delivery_runs_on_events_not_a_timer() {
 // than giving up and leaving an ended session beside the vessel's next launch.
 #[tokio::test(start_paused = true)]
 async fn a_launch_waits_for_its_environments_registration() {
-    use flotilla_provisioning::engine::terminal_actuator::TerminalProvider;
+    use flotilla_provisioning::engine::terminal_actuator::{LaunchFailure, TerminalProvider};
 
     let crew = engine_crew("codex", lossy_pool()).await;
     let runtime = TerminalControllerRuntime { state: Arc::clone(&crew.state) };
@@ -495,4 +495,7 @@ async fn a_launch_waits_for_its_environments_registration() {
     });
     let waits = runtime.launch_waits_for(&record(&unadopted)).await.expect("readiness");
     assert_eq!(waits.as_deref(), Some("environment env-unadopted is not registered on this host yet"));
+    // A launch that reaches its pool before the registration fails as waiting, not refused.
+    let Err(failure) = runtime.launch(&record(&unadopted)).await else { panic!("no environment to launch in") };
+    assert_eq!(failure, LaunchFailure::waits("environment env-unadopted is not registered on this host yet"));
 }

@@ -7,9 +7,10 @@
 //!   pool session is replaced if a stale one holds the name. It stages what the launch was given
 //!   (its cleat endpoint, its harness, its build parallelism) as the launch's
 //!   [`TerminalLaunchFacts`] for the Realise edge, and records the command it ran as a local
-//!   observation. A launch that cannot start gives up at once; its holder renews it. A brief whose
-//!   artifact has not reached this host's blob store is a try that fails; the probe asks for the
-//!   next try once the artifact has arrived.
+//!   observation. A launch refused for good gives up at once; its holder renews it. A launch that
+//!   waits on something that may yet arrive here (its brief's artifact in this host's blob store,
+//!   its environment's adoption after a restart) is a retryable try that fails; the probe asks for
+//!   the next try once nothing is missing.
 //! - **Holder**: a crew's session is held for its vessel's lease, homed here; a tool's for its
 //!   environment. Either ending releases the launch. A launch is usable only while its environment
 //!   is realised.
@@ -82,6 +83,34 @@ pub struct TerminalLaunched {
     pub launch_command: String,
 }
 
+/// Why a launch did not start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchFailure {
+    pub message: String,
+    /// Whether it waits on something that may yet arrive on this host, such as its environment's
+    /// adoption: the probe asks for the next try once nothing is missing. Otherwise the launch
+    /// gives up, and its holder renews it.
+    pub retryable: bool,
+}
+
+impl LaunchFailure {
+    /// A launch refused for good.
+    pub fn refused(message: impl Into<String>) -> Self {
+        Self { message: message.into(), retryable: false }
+    }
+
+    /// A launch that waits on what `message` names.
+    pub fn waits(message: impl Into<String>) -> Self {
+        Self { message: message.into(), retryable: true }
+    }
+}
+
+impl From<String> for LaunchFailure {
+    fn from(message: String) -> Self {
+        Self::refused(message)
+    }
+}
+
 /// One read of a running launch's screen and controller seat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenReading {
@@ -101,7 +130,7 @@ pub trait TerminalProvider: Send + Sync {
     async fn launch_waits_for(&self, launch: &TerminalRecord) -> Result<Option<String>, String>;
     /// Starts `launch`'s process: its harness prepared, its credentials delivered, its brief
     /// written.
-    async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, String>;
+    async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, LaunchFailure>;
     async fn liveness(&self, launch: &TerminalRecord, session_id: &str) -> Result<TerminalLiveness, String>;
     /// The exit code an agent launch's process left in its receipt, once it exited.
     async fn exit_code(&self, launch: &TerminalRecord) -> Result<Option<i32>, String>;
@@ -257,8 +286,14 @@ where
                 self.records.observations().update(name, |observation| observation.launch_command = Some(launched.launch_command));
                 Ok(launched.session_id)
             }
+            Err(LaunchFailure { message, retryable: true }) => {
+                self.briefs.await_brief(name);
+                Err(ProviderFailure::new(transient(message), true))
+            }
             // The launch gives up: its holder renews it once what failed is fixed.
-            Err(message) => Err(ProviderFailure::new(Cause::new(CauseCategory::External, message), false)),
+            Err(LaunchFailure { message, retryable: false }) => {
+                Err(ProviderFailure::new(Cause::new(CauseCategory::External, message), false))
+            }
         }
     }
 
@@ -339,7 +374,10 @@ where
 /// wakes on those facts and on its log. Its brief check polls too, because nothing signals a
 /// brief's arrival here: the writer's daemon puts the blob in its local tier, then writes the
 /// Artifact record, and uploads to the fleet tier in the background, so the replicated record can
-/// arrive before the blob is readable from this host, and no tier notifies a reader.
+/// arrive before the blob is readable from this host, and no tier notifies a reader. Its look at
+/// an environment's adoption polls for the same reason: the daemon registers an adopted
+/// environment in memory, on its own reconciliation interval, and commits nothing a launch could
+/// wake on; the environment's ending is a commit, and releases the launch.
 pub const TERMINAL_PROBE_EVERY: Duration = Duration::from_secs(5);
 
 /// This home's probe of its running launches: it pushes each launch it finds ended to the

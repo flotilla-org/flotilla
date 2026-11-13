@@ -14,7 +14,9 @@ use flotilla_provisioning::{
     engine::{
         controller::Controller,
         reads::StoreReads,
-        terminal_actuator::{ScreenReading, TerminalActuator, TerminalLaunched, TerminalLiveness, TerminalProbe, TerminalProvider},
+        terminal_actuator::{
+            LaunchFailure, ScreenReading, TerminalActuator, TerminalLaunched, TerminalLiveness, TerminalProbe, TerminalProvider,
+        },
     },
     stored::decided_registry,
 };
@@ -43,7 +45,9 @@ struct Asked {
     /// Whether the brief's artifact is still missing from this host.
     brief_missing: bool,
     /// Why a launch fails to start, when it does.
-    launch_error: Option<String>,
+    launch_error: Option<LaunchFailure>,
+    /// What a launch waits for besides its brief, such as its environment's adoption.
+    waits_for: Option<String>,
     /// What the pool says of the session; running when unset.
     liveness: Option<TerminalLiveness>,
     /// The code an agent's exit receipt holds, once it exited.
@@ -72,10 +76,11 @@ impl RecordingProvider {
 #[async_trait]
 impl TerminalProvider for RecordingProvider {
     async fn launch_waits_for(&self, _: &TerminalRecord) -> Result<Option<String>, String> {
-        Ok(self.asked().brief_missing.then(|| "its brief artifact is not on this host yet".into()))
+        let asked = self.asked();
+        Ok(asked.brief_missing.then(|| "its brief artifact is not on this host yet".into()).or_else(|| asked.waits_for.clone()))
     }
 
-    async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, String> {
+    async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, LaunchFailure> {
         let mut asked = self.asked();
         asked.launches.push(launch.name.clone());
         if let Some(error) = asked.launch_error.clone() {
@@ -278,11 +283,54 @@ async fn a_session_waits_for_its_brief_artifact_then_starts() {
     assert_eq!(world.provider.asked().launches, vec![launch]);
 }
 
+const UNREGISTERED: &str = "environment host-direct-home is not registered on this host yet";
+
+// Behaviour: a launch that reaches its pool before its environment is registered here, as after a
+// restart before the environment's adoption, fails a retryable try recorded on the launch rather
+// than giving up. The probe does not try it again while the registration is missing, and starts it
+// once it is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_waiting_for_its_environments_adoption_starts_once_it_is_registered() {
+    let world = World::start(RecordingProvider::default(), true);
+    world.provider.asked().launch_error = Some(LaunchFailure::waits(UNREGISTERED));
+    let (launch, _lease) = world.agent("v1");
+    world.until("retrying", |world| matches!(world.reading(&launch), LifecycleReading::Retrying { .. })).await;
+    let LifecycleReading::Retrying { failures, cause, .. } = world.reading(&launch) else { unreachable!("retrying") };
+    assert_eq!(failures, 1);
+    assert!(cause.contains(UNREGISTERED), "{cause}");
+    {
+        let mut asked = world.provider.asked();
+        asked.launch_error = None;
+        asked.waits_for = Some(UNREGISTERED.into());
+    }
+    assert!(world.probe.pass().await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(world.provider.asked().launches, vec![launch.clone()], "not tried again while unregistered");
+    world.provider.asked().waits_for = None;
+    assert!(world.probe.pass().await);
+    world.until("ready", |world| world.ready(&launch)).await;
+    assert_eq!(world.provider.asked().launches, vec![launch.clone(), launch]);
+}
+
+// Behaviour: a launch waiting for its environment's adoption is released when its vessel ends, as
+// when the restart lost the environment and the vessel's next launch replaces it: it does not
+// stay listed beside its successor's session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_waiting_for_its_environment_is_released_with_its_vessel() {
+    let world = World::start(RecordingProvider::default(), true);
+    world.provider.asked().launch_error = Some(LaunchFailure::waits(UNREGISTERED));
+    let (launch, lease) = world.agent("v1");
+    world.until("retrying", |world| matches!(world.reading(&launch), LifecycleReading::Retrying { .. })).await;
+    world.vessels.vessels.ready(&lease, "vessel-v1");
+    world.vessels.vessels.step(&lease, VesselStep::Lost { reason: "its environment disappeared".into() });
+    world.until("released", |world| world.reading(&launch) == LifecycleReading::Released).await;
+}
+
 // Behaviour: a launch that cannot start gives up at once, tried once; its holder renews it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_launch_that_cannot_start_gives_up() {
     let world = World::start(RecordingProvider::default(), true);
-    world.provider.asked().launch_error = Some("terminal pool cleat unavailable".into());
+    world.provider.asked().launch_error = Some(LaunchFailure::refused("terminal pool cleat unavailable"));
     let (launch, _lease) = world.agent("v1");
     world.until("gave up", |world| matches!(world.reading(&launch), LifecycleReading::GaveUp { .. })).await;
     assert_eq!(world.provider.asked().launches, vec![launch]);

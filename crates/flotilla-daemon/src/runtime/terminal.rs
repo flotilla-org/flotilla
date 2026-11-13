@@ -17,7 +17,9 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::TerminalStatus;
 use flotilla_provider_runtime::execution_context::BoundLayer;
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
-use flotilla_provisioning::engine::terminal_actuator::{ScreenReading, TerminalLaunched, TerminalLiveness, TerminalProvider};
+use flotilla_provisioning::engine::terminal_actuator::{
+    LaunchFailure, ScreenReading, TerminalLaunched, TerminalLiveness, TerminalProvider,
+};
 use flotilla_resources::{
     terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalRecord},
     Convoy, FulfilmentKind, ResourceObject, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
@@ -817,6 +819,13 @@ impl TerminalControllerRuntime {
             .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
     }
 
+    /// Why a launch in environment `env_ref` waits, while that environment is not registered here:
+    /// after a restart its registration returns only with its adoption.
+    fn unregistered(&self, env_ref: &str) -> Option<String> {
+        (!self.state.ssh_host.contains_key(env_ref) && self.registry_for_env(env_ref).is_err())
+            .then(|| format!("environment {env_ref} is not registered on this host yet"))
+    }
+
     /// The Claude Code hook launch for a host-direct session, while flotillad listens on
     /// loopback TCP; `None` keeps command hooks.
     async fn host_direct_hooks(&self, namespace: &str, session_name: &str) -> Option<HookLaunch> {
@@ -970,18 +979,19 @@ impl TerminalProvider for TerminalControllerRuntime {
         if !self.brief_ready_for(spec).await? {
             return Ok(Some("its brief artifact is not in this host's blob store yet".into()));
         }
-        // After a restart an environment's registration returns only with its adoption: a launch
-        // before then waits for it rather than giving up.
-        if !self.state.ssh_host.contains_key(&spec.env_ref) && self.registry_for_env(&spec.env_ref).is_err() {
-            return Ok(Some(format!("environment {} is not registered on this host yet", spec.env_ref)));
-        }
-        Ok(None)
+        Ok(self.unregistered(&spec.env_ref))
     }
 
-    async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, String> {
+    async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, LaunchFailure> {
         let view = self.session_view(launch).await?;
-        let tags = self.launch_tags(&view, launch).await?;
-        self.ensure_session(launch.session_name(), &launch.name, (&view).into(), &tags).await
+        let spec: TerminalSessionTarget<'_> = (&view).into();
+        let started = async {
+            let tags = self.launch_tags(&view, launch).await?;
+            self.ensure_session(launch.session_name(), &launch.name, spec, &tags).await
+        };
+        started
+            .await
+            .map_err(|message| self.unregistered(&spec.env_ref).map_or_else(|| LaunchFailure::refused(message), LaunchFailure::waits))
     }
 
     async fn liveness(&self, launch: &TerminalRecord, session_id: &str) -> Result<TerminalLiveness, String> {
