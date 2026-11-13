@@ -10,7 +10,8 @@
 //! A source's observer is the single writer of its records: once the observers are installed
 //! ([`EngineObservations::observed_by`]), a write of a record whose source this home does
 //! not observe is refused, so no other home's copy, however fresh its write, stands beside the
-//! observer's facts. A home may still delete a copy of its own.
+//! observer's facts. A home may still delete a copy of its own. A change request is written only
+//! under its subject's record name, the name readers get it by.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -23,6 +24,7 @@ use flotilla_engine_store::{
     plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
+    address::record_name,
     engine_records::{BranchChangeRequest, ChangeRequestBranches, EngineObject, EngineRecords, ObservationFailures, SourceObservers},
     ChangeRequestSpec, ChangeRequestStatus, IssueSpec, IssueStatus,
 };
@@ -75,6 +77,8 @@ trait Observed: Kind + PartialEq + Clone {
 
     /// The source `(service, scope)` `spec` names.
     fn spec_source(spec: &Self::Spec) -> (&str, &str);
+    /// Refuses `name` for `spec`'s record when readers look it up under another.
+    fn check_name(name: &str, spec: &Self::Spec) -> Result<(), String>;
     /// The source `(service, scope)` the record is of.
     fn source(&self) -> (&str, &str);
     /// The record of `spec`'s subject, keeping `current`'s observed values when there is one.
@@ -91,6 +95,18 @@ impl Observed for ChangeRequestRecord {
 
     fn spec_source(spec: &ChangeRequestSpec) -> (&str, &str) {
         (&spec.service, &spec.scope)
+    }
+
+    /// Readers get a change request by its subject's record name, so a record under any other
+    /// name would never be read.
+    fn check_name(name: &str, spec: &ChangeRequestSpec) -> Result<(), String> {
+        let address = spec.address(&[]).map_err(|error| format!("{CHANGE_REQUEST} {name}: {error}"))?;
+        let canonical = record_name(&address).ok_or_else(|| format!("{CHANGE_REQUEST} {name}: {address} has no record name"))?;
+        if name == canonical {
+            Ok(())
+        } else {
+            Err(format!("{CHANGE_REQUEST} {name} is not named for its subject: its record name is {canonical}"))
+        }
     }
 
     fn source(&self) -> (&str, &str) {
@@ -123,6 +139,10 @@ impl Observed for IssueRecord {
 
     fn spec_source(spec: &IssueSpec) -> (&str, &str) {
         (&spec.service, &spec.scope)
+    }
+
+    fn check_name(_: &str, _: &IssueSpec) -> Result<(), String> {
+        Ok(())
     }
 
     fn source(&self) -> (&str, &str) {
@@ -316,6 +336,7 @@ impl EngineObservations {
     /// Writes this home's record `name` of `K` from `spec`, as its observer.
     async fn apply_observed<K: Observed>(&self, kind: &'static str, name: &str, spec: Value) -> Result<EngineObject, String> {
         let spec: K::Spec = serde_json::from_value(spec).map_err(|error| format!("{kind} spec: {error}"))?;
+        K::check_name(name, &spec)?;
         self.observer_write(kind, name, K::spec_source(&spec)).await?;
         self.apply_as::<K>(kind, name, &spec)
     }

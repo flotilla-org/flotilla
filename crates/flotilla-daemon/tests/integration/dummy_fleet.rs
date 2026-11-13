@@ -1020,7 +1020,12 @@ async fn apply_transport_fixtures(fleet: &TestDaemon, host: &str) {
     };
     fleet.apply::<AccessDelivery>(&access, delivery).await;
     let observed = |number: u64| serde_json::json!({"service": "https://github.com", "scope": format!("{host}/app"), "number": number, "observing_authority": local});
-    apply_json::<ChangeRequest>(fleet, &format!("{host}-change-request"), observed(1)).await;
+    // A change request is written under its subject's record name, the one readers get it by.
+    let change_request = flotilla_resources::address::stored_change_request_address("https://github.com", &format!("{host}/app"), 1, &[])
+        .ok()
+        .and_then(|address| flotilla_resources::address::record_name(&address))
+        .expect("change request record name");
+    apply_json::<ChangeRequest>(fleet, &change_request, observed(1)).await;
     apply_json::<Issue>(fleet, &format!("{host}-issue"), observed(2)).await;
     let ensure = serde_json::json!({"project_ref": "fleet", "role": format!("{host}-standing"), "workflow_ref": CrewMix::Coder.workflow_name(), "repositories": []});
     apply_json::<ConvoyEnsure>(fleet, &format!("{host}-ensure"), ensure).await;

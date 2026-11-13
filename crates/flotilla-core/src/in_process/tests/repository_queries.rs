@@ -50,8 +50,11 @@ async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
         },
     );
     let change_requests = backend.using::<ResourceChangeRequest>("flotilla");
-    for (name, number, state) in [("open-pr", 42, ObservedChangeRequestState::Open), ("closed-pr", 43, ObservedChangeRequestState::Closed)]
-    {
+    for (number, state) in [(42, ObservedChangeRequestState::Open), (43, ObservedChangeRequestState::Closed)] {
+        // A change request is written under its subject's record name, the one readers get it by.
+        let address = flotilla_resources::address::stored_change_request_address("https://github.com", "team/repo", number, &[])
+            .expect("change request address");
+        let name = &flotilla_resources::address::record_name(&address).expect("change request record name");
         let created = change_requests
             .create(
                 &test_meta(name),

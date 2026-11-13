@@ -6,6 +6,9 @@
 //! | Each observed value | its column; its `observed_at` is dropped (a judgement) |
 //! | `observing_authority` | dropped: the home is the observer |
 //! | ChangeRequest `subject_of` | dropped and counted: the convoys hold their links |
+//! | A change request's old name | its subject's record name, the one its observer writes |
+//! | Copies under two spellings of one source | one record, the other copy dropped and counted |
+//! | A change request whose source no Forge resolves | dropped: it has no record name |
 //! | A copy with no status | dropped: it never observed anything |
 //! | Deleted copies; labels, annotations and namespaces (#3212) | dropped |
 //!
@@ -18,7 +21,9 @@ use std::collections::BTreeMap;
 
 use flotilla_engine_store::ImportTarget;
 use flotilla_protocol::IssueSource;
-use flotilla_resources::{select_change_request_sources, ChangeRequest, Issue, Resource, ResourceObject};
+use flotilla_resources::{
+    address::record_name, select_change_request_sources, ChangeRequest, ChangeRequestSpec, ForgeSpec, Issue, Resource, ResourceObject,
+};
 use flotilla_schema::Kind;
 
 use super::import::{created, ImportRefusal, ImportReport, RowOutcome};
@@ -138,6 +143,15 @@ fn imported(kind: &'static str, here: bool, report: &mut ImportReport) {
     report.rows(kind, if here { RowOutcome::Imported } else { RowOutcome::CopyImported }, 1);
 }
 
+/// Counts a chosen copy not written for `reason`: where it is homed when here, else in the ledger.
+fn dropped_copy(kind: &'static str, here: bool, reason: &'static str, report: &mut ImportReport) {
+    if here {
+        report.drop_rows(kind, reason, 1);
+    } else {
+        report.rows(kind, RowOutcome::CopyDropped(reason), 1);
+    }
+}
+
 /// Writes `record` as `name` at `home` and counts it, or names the refusal.
 fn write<K: Kind + PartialEq + Clone, R: Resource>(
     kind: &'static str,
@@ -160,31 +174,66 @@ fn write<K: Kind + PartialEq + Clone, R: Resource>(
     }
 }
 
+/// The record name the observer writes a change request's record under, when `forges` resolve its
+/// source.
+fn change_request_name(spec: &ChangeRequestSpec, forges: &[ForgeSpec]) -> Option<String> {
+    spec.address(forges).ok().and_then(|address| record_name(&address))
+}
+
 /// Imports every change request whose source's observer `target` imports, one record per subject,
-/// from the copy `select_change_request_sources` picks among every home's copies; counts what each
-/// home `target` imports did not write.
+/// from the copy `select_change_request_sources` picks among every home's copies, under the record
+/// name the observer writes it under; counts what each home `target` imports did not write.
 pub fn import_change_requests(
     copies: &[ObservationCopy<ChangeRequest>],
+    forges: &[ForgeSpec],
     observer_of: &ObserverOf<'_>,
     target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) {
     const KIND: &str = "ChangeRequest";
+    const RESPELLED: &str = "another spelling of an imported subject";
     let mut live = Vec::new();
     let mut candidates = Candidates::default();
     for copy in copies {
         let source = IssueSource { service: copy.object.spec.service.clone(), scope: copy.object.spec.scope.clone() };
-        let unusable = copy.object.status.is_none().then_some("never observed");
-        if let Some(home) = candidate(KIND, copy, &source, unusable, observer_of, target, report) {
+        let name = change_request_name(&copy.object.spec, forges);
+        let unusable = if copy.object.status.is_none() { Some("never observed") } else { name.is_none().then_some("no record name") };
+        if let (Some(home), Some(name)) = (candidate(KIND, copy, &source, unusable, observer_of, target, report), name) {
             let here = target.imports(&copy.home);
             candidates.read(here);
-            live.push((&copy.object, (home, here)));
+            live.push((&copy.object, (name, home, here)));
         }
     }
-    for (_, (object, (home, here))) in select_change_request_sources(live) {
+    // Two spellings of one source (a host and its forge id, say) are two subjects to the selection
+    // but one record: the fresher is written, then the one already under that name, then the first
+    // by namespace and name.
+    let rank = |object: &ResourceObject<ChangeRequest>, name: &str| {
+        (
+            object.status.as_ref().map(|status| status.state.observed_at),
+            object.spec.observing_authority.clone(),
+            object.metadata.name == name,
+            object.metadata.namespace.clone(),
+            object.metadata.name.clone(),
+        )
+    };
+    let mut named = BTreeMap::<String, (ResourceObject<ChangeRequest>, String, bool)>::new();
+    for (_, (object, (name, home, here))) in select_change_request_sources(live) {
         candidates.chose(here);
+        let chosen = match named.remove(&name) {
+            Some(prior) if rank(&prior.0, &name) >= rank(&object, &name) => {
+                dropped_copy(KIND, here, RESPELLED, report);
+                prior
+            }
+            Some(prior) => {
+                dropped_copy(KIND, prior.2, RESPELLED, report);
+                (object, home, here)
+            }
+            None => (object, home, here),
+        };
+        named.insert(name, chosen);
+    }
+    for (name, (object, home, here)) in named {
         let Some(status) = &object.status else { continue };
-        let name = object.metadata.name.clone();
         let record = ChangeRequestRecord::from_old(&object.spec, status);
         if write(KIND, target, &home, &name, &object, &record, report) {
             imported(KIND, here, report);
