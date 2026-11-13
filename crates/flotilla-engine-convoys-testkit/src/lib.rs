@@ -61,6 +61,11 @@ impl EngineConvoysHome {
         self.meter.gets()
     }
 
+    /// The convoy listings made through [`Self::reads`] so far, for read-cost tests.
+    pub fn convoy_listings(&self) -> u64 {
+        self.meter.convoy_listings()
+    }
+
     /// The Convoy views `backend` serves, for read-cost tests.
     pub fn views(&self) -> &Arc<ConvoyViews> {
         &self.views

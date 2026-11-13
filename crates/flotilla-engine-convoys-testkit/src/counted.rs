@@ -51,9 +51,15 @@ pub(crate) struct Meter {
     convoys: AtomicU64,
     environments: AtomicU64,
     terminals: AtomicU64,
+    /// Convoy listings, `at` a home or at `every` home.
+    convoy_listings: AtomicU64,
 }
 
 impl Meter {
+    pub(crate) fn convoy_listings(&self) -> u64 {
+        self.convoy_listings.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn gets(&self) -> KeyedGets {
         KeyedGets {
             vessels: self.vessels.load(Ordering::Relaxed),
@@ -217,10 +223,12 @@ impl ConvoyRecords for CountedConvoys {
     }
 
     fn at(&self, home: &str) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoy_listings);
         self.records.at(home)
     }
 
     fn every(&self) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoy_listings);
         self.records.every()
     }
 

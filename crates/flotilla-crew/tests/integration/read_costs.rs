@@ -21,6 +21,7 @@ use flotilla_resources::{
     account_access::AccountRecords,
     address::{artifact_address, record_name},
     checkout_records::CheckoutHolder,
+    convoy_records::OpenLaunches,
     terminal_records::TerminalLaunchFacts,
     vessel_records::{environment_vessels, EnvironmentVessel},
     Artifact, ArtifactSpec, CheckoutSpec, Convoy, ConvoySpec, EnvironmentSpec, HostDirectEnvironmentSpec, ObservedCheckoutSpec,
@@ -427,5 +428,62 @@ async fn a_brief_queues_only_its_convoys_vessels() {
     assert_eq!(small_read, 1, "only that convoy's launch is read");
     assert_eq!(large_read, small_read, "the cost does not grow with the other convoys");
     assert_eq!(small_gets, KeyedGets { convoys: 1, ..KeyedGets::default() }, "only that convoy's record is got, for its works");
+    assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
+}
+
+/// The open launches read, and the convoy listings and keyed gets the reads made, when one of
+/// `others + 1` open launches has ended and another was admitted since the first read.
+async fn read_by_open_launches(others: usize) -> (usize, u64, KeyedGets) {
+    let store = OtherHome::open("home");
+    let engine = EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
+    let reads = convoys.reads().convoys().expect("convoys");
+    // The log's changes reach followers from a task: each read below waits until they are quiet,
+    // so a change still on its way is not counted in the wrong read.
+    let mut sent = reads.changes();
+    let home = &convoys;
+    let admit = |n: usize| async move {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let mut admitted = convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"));
+        admitted.metadata.name = home.launch(admitted.clone()).await;
+        admitted
+    };
+    let mut launches = Vec::new();
+    for n in 0..=others {
+        launches.push(admit(n).await);
+    }
+    quiet(&mut sent).await;
+    let mut open = OpenLaunches::follow(reads);
+    assert_eq!(open.read(reads).expect("first read").len(), others + 1, "the first read lists every open launch");
+
+    let before = (convoys.convoy_listings(), convoys.keyed_gets());
+    convoys.path().get().expect("the Convoy path").abandon(&launches[0], "operator", "ended").await.expect("end the first launch");
+    let ended = &launches[0].metadata.name;
+    let admitted = admit(others + 1).await.metadata.name;
+    quiet(&mut sent).await;
+    let read = open.read(reads).expect("read").clone();
+    assert!(read.contains(&admitted) && !read.contains(ended), "the end and the admission are read: {read:?}");
+    (read.len(), convoys.convoy_listings() - before.0, convoys.keyed_gets() - before.1)
+}
+
+/// Waits until no change has been sent for 300 ms.
+async fn quiet(sent: &mut tokio::sync::broadcast::Receiver<flotilla_resources::convoy_records::ConvoyChange>) {
+    use tokio::sync::broadcast::error::RecvError;
+    while let Ok(received) = tokio::time::timeout(Duration::from_millis(300), sent.recv()).await {
+        assert!(!matches!(received, Err(RecvError::Closed)), "the convoys' changes are followed");
+    }
+}
+
+// Behaviour: the open launches a grant event reaches are read again by the launches changed since
+// the last read, not by listing every launch at this home.
+#[tokio::test]
+async fn open_launches_are_read_by_those_changed_since() {
+    let (small, small_listings, small_gets) = read_by_open_launches(5).await;
+    let (large, large_listings, large_gets) = read_by_open_launches(60).await;
+    assert_eq!((small, large), (6, 61), "the ended launch is gone and the admitted one is there");
+    assert_eq!(small_listings, 0, "no launch is listed again");
+    assert_eq!(large_listings, small_listings, "the cost does not grow with the other convoys");
+    assert_eq!(small_gets, KeyedGets { convoys: 2, ..KeyedGets::default() }, "only the ended and the admitted launches are got");
     assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
 }

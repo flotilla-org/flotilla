@@ -113,6 +113,7 @@ use placement_support::*;
 use recovery_scenario::*;
 use terminal_support::*;
 
+mod account_binding;
 mod adopted_checkouts;
 mod clone_credentials;
 mod clone_reads;

@@ -36,8 +36,9 @@ use flotilla_resources::{
         binding_name, material_generation, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords,
         BindingRecord, Delivered, ProvisionPlan, ProvisionRecord,
     },
-    Convoy, CredentialGrant, CredentialSpec, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance, TerminalSession,
-    TerminalSessionSource,
+    convoy_records::OpenLaunches,
+    lifecycle_reads::LifecycleReads,
+    Convoy, CredentialGrant, CredentialSpec, ReadWatchEvent, ResourceError, ResourceObject, TerminalSession, TerminalSessionSource,
 };
 use flotilla_schema::{Ref, Timestamp};
 use flotilla_store::{
@@ -375,47 +376,45 @@ async fn push_generation(
 }
 
 /// Grant and declaration events reach the convoys whose bindings use the credentials they name,
-/// and the live convoys here still waiting for a binding.
-struct CredentialConvoysWatch<K: flotilla_resources::Resource> {
+/// and the open convoys here still waiting for a binding. The open convoys are kept from the
+/// convoys' changes, so an event gets again only the convoys changed since the last one.
+#[derive(Clone)]
+struct CredentialConvoysWatch {
     accounts: Arc<dyn AccountRecords>,
-    credentials: fn(&ResourceObject<K>) -> Vec<String>,
-    /// The credentials a deletion known only by name names, when the name alone says.
-    deleted: fn(&str) -> Option<Vec<String>>,
+    reads: Arc<dyn LifecycleReads>,
 }
 
-impl<K: flotilla_resources::Resource> Clone for CredentialConvoysWatch<K> {
-    fn clone(&self) -> Self {
-        Self { accounts: Arc::clone(&self.accounts), credentials: self.credentials, deleted: self.deleted }
-    }
-}
-
-impl<K: flotilla_resources::Resource> CredentialConvoysWatch<K> {
+impl CredentialConvoysWatch {
     /// `credentials: None` (a grant deleted by name) reaches every convoy with a binding here.
     async fn enqueue(
         &self,
-        backend: &ResourceBackend,
         namespace: &str,
         sender: &WorkQueueSender,
+        open: OpenLaunches,
         credentials: Option<Vec<String>>,
-    ) -> Result<(), ResourceError> {
+    ) -> Result<OpenLaunches, ResourceError> {
         let (mut convoys, bound) =
             self.accounts.bound_convoys(namespace, credentials.as_deref().unwrap_or_default()).await.map_err(ResourceError::other)?;
         if credentials.is_none() {
             convoys.extend(bound.iter().cloned());
         }
-        for convoy in backend.query_declared::<Convoy>(namespace, &flotilla_store::live_convoys_query()).await?.items {
-            if matches!(convoy.provenance, ResourceProvenance::Local) && !bound.contains(&convoy.object.metadata.name) {
-                convoys.insert(convoy.object.metadata.name);
-            }
-        }
+        let reads = Arc::clone(&self.reads);
+        let (open, read) = tokio::task::spawn_blocking(move || {
+            let mut open = open;
+            let read = reads.convoys().and_then(|convoys| open.read(convoys).cloned());
+            (open, read)
+        })
+        .await
+        .map_err(|error| ResourceError::other(format!("read the open convoys: {error}")))?;
+        convoys.extend(read.map_err(ResourceError::other)?.into_iter().filter(|convoy| !bound.contains(convoy)));
         for convoy in convoys {
             sender.send(convoy).await.map_err(|_| ResourceError::other("controller queue closed while forwarding a credential event"))?;
         }
-        Ok(())
+        Ok(open)
     }
 }
 
-impl<K: flotilla_resources::Resource> SecondaryWatch for CredentialConvoysWatch<K> {
+impl SecondaryWatch for CredentialConvoysWatch {
     type Primary = Convoy;
 
     fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Convoy>> {
@@ -429,17 +428,35 @@ impl<K: flotilla_resources::Resource> SecondaryWatch for CredentialConvoysWatch<
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let mut watch = backend.including_replicas::<K>(&namespace).watch().await?;
-            while let Some(event) = watch.next().await {
-                let credentials = match event? {
-                    ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => {
-                        Some((self.credentials)(&source.object))
+            // Followed before the credential watches open, so no convoy change is missed.
+            let mut open = OpenLaunches::follow(self.reads.convoys().map_err(ResourceError::other)?);
+            let grants = backend.including_replicas::<CredentialGrant>(&namespace).watch().await?.map(|event| {
+                event.map(|event| match event {
+                    ReadWatchEvent::Added(grant) | ReadWatchEvent::Modified(grant) | ReadWatchEvent::Deleted(grant) => {
+                        Some(grant.object.spec.credentials.iter().cloned().collect())
                     }
-                    ReadWatchEvent::DeletedByName { tombstone, .. } => (self.deleted)(&tombstone.name),
+                    ReadWatchEvent::DeletedByName { .. } => None,
+                })
+            });
+            let specs = backend.including_replicas::<CredentialSpec>(&namespace).watch().await?.map(|event| {
+                event.map(|event| match event {
+                    ReadWatchEvent::Added(spec) | ReadWatchEvent::Modified(spec) | ReadWatchEvent::Deleted(spec) => {
+                        Some(vec![spec.object.metadata.name])
+                    }
+                    ReadWatchEvent::DeletedByName { tombstone, .. } => Some(vec![tombstone.name]),
+                })
+            });
+            let mut events = futures::stream::select(grants, specs);
+            loop {
+                let credentials = tokio::select! {
+                    event = events.next() => match event {
+                        Some(credentials) => credentials?,
+                        None => return Ok(()),
+                    },
+                    () = open.next_change() => continue,
                 };
-                self.enqueue(&backend, &namespace, &sender, credentials).await?;
+                open = self.enqueue(&namespace, &sender, open, credentials).await?;
             }
-            Ok(())
         })
     }
 }
@@ -490,16 +507,7 @@ pub(super) fn binding_controller(
     (
         vec![
             Box::new(AccountConvoysWatch { accounts: Arc::clone(&accounts) }),
-            Box::new(CredentialConvoysWatch::<CredentialGrant> {
-                accounts: Arc::clone(&accounts),
-                credentials: |grant| grant.spec.credentials.iter().cloned().collect(),
-                deleted: |_| None,
-            }),
-            Box::new(CredentialConvoysWatch::<CredentialSpec> {
-                accounts,
-                credentials: |spec| vec![spec.metadata.name.clone()],
-                deleted: |name| Some(vec![name.to_string()]),
-            }),
+            Box::new(CredentialConvoysWatch { accounts, reads: daemon.lifecycle_reads() }),
         ],
         AccountBindingReconciler { daemon, namespace },
     )
