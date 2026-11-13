@@ -112,7 +112,7 @@ pub use registry::{KindRegistry, RegistryError};
 #[doc(hidden)]
 pub use state::StateDelta;
 pub use state::{RowEdit, State};
-pub use time::Timestamp;
+pub use time::{CreatedAt, Timestamp};
 pub use traits::{CodeEnum, Column, Columns, Element, Flat, Intern, KeyColumn, Kind, KindSpec, StateData, SUPPORTED_ATTRIBUTES};
 pub use value::{Hash, Identity, KindCode, Row, Rows, Value};
 pub use verb::{Param, ParamDeclaration, ParamType, Verb, VerbDeclaration, VerbEffect};

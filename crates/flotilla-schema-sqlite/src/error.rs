@@ -54,6 +54,10 @@ pub enum StoreError {
     WrongKind { id: ResourceId, expected: KindCode, found: KindCode },
     #[error("resource {id} does not exist")]
     NotFound { id: ResourceId },
+    /// A held resource whose identity has no creation time: no create of it was written or applied
+    /// here. Never read as the epoch.
+    #[error("{}/{}/{} has no creation time", .identity.home, .identity.kind, .identity.name)]
+    NotCreated { identity: Identity },
     /// Only the replication applier writes rows homed elsewhere.
     #[error("resource {id} is homed at {home}, not here")]
     NotHome { id: ResourceId, home: String },

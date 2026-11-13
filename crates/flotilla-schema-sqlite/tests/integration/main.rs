@@ -2,6 +2,7 @@
 // Tests share a process: isolate state and keep process-wide mutations in separate targets.
 mod bench;
 mod checks;
+mod created;
 mod ddl;
 mod derive_codec;
 mod derive_indexes;

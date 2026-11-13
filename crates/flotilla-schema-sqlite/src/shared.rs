@@ -12,8 +12,14 @@ use rusqlite::Connection;
 /// `strings` interns names and interned columns; `resource_identity` holds every resource's
 /// (kind, name, home), with homes filtered through `resource_identity_by_home`, and its `seq`:
 /// the home sequence of the last event written or applied for it, kept after a delete as a
-/// tombstone, so replaying an older event is a duplicate; `objects` holds frozen documents by
-/// hash, always ADR 0063 canonical CBOR, so no media column; `home_sequence.last` is each home's
+/// tombstone, so replaying an older event is a duplicate; and its `created_at`, in nanoseconds
+/// since the epoch (a `CreatedAt`), not the microseconds every other stored time uses: the old
+/// store stamped records to the nanosecond and a managed checkout's name hashes that stamp's
+/// RFC 3339 string, so an imported record must keep it exactly. It is the creation time of the
+/// last create: written by that create (here, applied from its home or restored from its home's
+/// snapshot) and by nothing else, so an edit, edge or delete keeps it and a create again replaces
+/// it. NULL until a create: an identity first written for a reference's target. `objects` holds
+/// frozen documents by hash, always ADR 0063 canonical CBOR, so no media column; `home_sequence.last` is each home's
 /// sequence, which never decreases, so a sequence never repeats.
 ///
 /// `log` is the per-home event log (#3392 G8): one entry per write, keyed by the home and the
@@ -60,6 +66,7 @@ CREATE TABLE IF NOT EXISTS resource_identity (
   id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),
   seq INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER,
   UNIQUE (kind, name, home)) STRICT;
 CREATE INDEX IF NOT EXISTS resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE IF NOT EXISTS objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
@@ -191,6 +198,8 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("identity_resolve", IDENTITY_RESOLVE),
     ("identity_named", IDENTITY_NAMED),
     ("identity_insert", IDENTITY_INSERT),
+    ("identity_set_created", IDENTITY_SET_CREATED),
+    ("identity_created", IDENTITY_CREATED),
     ("identity_of", IDENTITY_OF),
     ("identity_delete", IDENTITY_DELETE),
     ("sequence_next", SEQUENCE_NEXT),
@@ -267,6 +276,11 @@ pub(crate) const IDENTITY_RESOLVE: &str = "SELECT id FROM resource_identity WHER
 /// Every home's identity of one kind and name, by home, through the (kind, name, home) key.
 pub(crate) const IDENTITY_NAMED: &str = "SELECT id FROM resource_identity WHERE kind = ?1 AND name = ?2 ORDER BY home";
 pub(crate) const IDENTITY_INSERT: &str = "INSERT INTO resource_identity (kind, name, home) VALUES (?1, ?2, ?3)";
+/// A create's time on its identity: the time of change `?3` of home `?2`, which the create names,
+/// widened from microseconds to nanoseconds.
+pub(crate) const IDENTITY_SET_CREATED: &str =
+    "UPDATE resource_identity SET created_at = (SELECT at * 1000 FROM change WHERE home = ?2 AND seq = ?3) WHERE id = ?1";
+pub(crate) const IDENTITY_CREATED: &str = "SELECT created_at FROM resource_identity WHERE id = ?1";
 pub(crate) const IDENTITY_OF: &str =
     "SELECT i.kind, n.s, h.s FROM resource_identity i JOIN strings n ON n.id = i.name JOIN strings h ON h.id = i.home WHERE i.id = ?1";
 pub(crate) const IDENTITY_DELETE: &str = "DELETE FROM resource_identity WHERE id = ?1";

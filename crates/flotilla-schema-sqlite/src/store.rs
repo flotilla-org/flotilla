@@ -13,9 +13,9 @@ use std::{
 
 use crate::DdlMode;
 use flotilla_schema::{
-    whole_log_topic, Cause, Change, ChangeHeader, ChangeItem, Code, ColumnDef, ColumnType, DecodeError, Decoder, Edge, EdgeParts, EdgeRow,
-    Effect, Encoder, Event, Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry, Named, NewChange, Row, RowEdit, RowPath, Rows,
-    TableRole, Timestamp, Value, HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
+    whole_log_topic, Cause, Change, ChangeHeader, ChangeItem, Code, ColumnDef, ColumnType, CreatedAt, DecodeError, Decoder, Edge,
+    EdgeParts, EdgeRow, Effect, Encoder, Event, Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry, Named, NewChange, Row, RowEdit,
+    RowPath, Rows, TableRole, Timestamp, Value, HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,11 +29,11 @@ use crate::{
     shared::{
         check_kind_codes, check_kind_columns, has_string_domain, log_predates_changes, schema_ddl, sync_indexes, sync_views, CHANGE_APPEND,
         CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_NAMED, CHANGE_NAMING, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE,
-        HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_NAMED,
-        IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME,
-        LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE, LOG_EXPUNGED_AFTER, LOG_LAST_CHANGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX,
-        SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, SNAPSHOT_CAUSE_DELETE, SNAPSHOT_CAUSE_GET, SNAPSHOT_CAUSE_PUT,
-        STRING_ID, STRING_INSERT, WATERMARK_PUT,
+        HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_CREATED, IDENTITY_DELETE,
+        IDENTITY_INSERT, IDENTITY_NAMED, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_CREATED, IDENTITY_SET_SEQ,
+        LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE, LOG_EXPUNGED_AFTER,
+        LOG_LAST_CHANGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE,
+        SHARED_STATEMENTS, SNAPSHOT_CAUSE_DELETE, SNAPSHOT_CAUSE_GET, SNAPSHOT_CAUSE_PUT, STRING_ID, STRING_INSERT, WATERMARK_PUT,
     },
     sql::{KindSql, TableSql},
 };
@@ -448,6 +448,22 @@ impl Read<'_> {
         self.ctx().last_change(id)
     }
 
+    /// When resource `id` was last created: its create's change time, widened. None for an
+    /// identity no create has been written for, as one held only as a reference's target.
+    pub fn created(&mut self, id: ResourceId) -> Result<Option<CreatedAt>, StoreError> {
+        self.ctx().created(id)
+    }
+
+    /// When held resource `id` was last created: [`Self::created`], where none is an error naming
+    /// the resource, since every held resource was created.
+    pub fn creation_time(&mut self, id: ResourceId) -> Result<CreatedAt, StoreError> {
+        let mut ctx = self.ctx();
+        match ctx.created(id)? {
+            Some(created) => Ok(created),
+            None => Err(StoreError::NotCreated { identity: ctx.identity_of(id)?.ok_or(StoreError::NotFound { id })? }),
+        }
+    }
+
     /// The newest change at `home` naming `record` as an item; none when no change names it.
     pub fn latest_change_naming(&mut self, home: &str, record: &Identity) -> Result<Option<ChangeHeader>, StoreError> {
         self.ctx().latest_change_naming(home, record)
@@ -812,7 +828,8 @@ impl Write<'_> {
     }
 
     /// Inserts a resource homed here, logged as a `create` entry of `change`. Its version is the
-    /// next local home sequence, which also stamps every `records` and `history` row it holds.
+    /// next local home sequence, which also stamps every `records` and `history` row it holds. It
+    /// is created at its change's time.
     pub fn insert<'c, K: Kind>(&mut self, name: &str, value: &K, change: impl Into<InChange<'c>>) -> Result<Stamp, StoreError> {
         let rows = Encoder::encode(value)?;
         let change = change.into();
@@ -1343,6 +1360,8 @@ impl Ctx<'_> {
         let effect = Effect { changes, objects: carried(hashes, rows.objects)?, expunged: None };
         let header = Header { topic: whole_log_topic(), cause: Cause::Create, change: change.0, about: None, arguments: None };
         self.write_local(K::CODE, id, header, effect, (sequence, version), None)?;
+        let home = self.runtime.home.clone();
+        self.set_created(id, &home, change.0)?;
         Ok(Stamp { id, version })
     }
 
@@ -2215,6 +2234,19 @@ impl Ctx<'_> {
         let Some((home, seq)) = last else { return Ok(None) };
         let seq = u64::try_from(seq).map_err(|_| StoreError::Corrupt { table: "log".into(), column: "change".into() })?;
         self.change(&home, seq)
+    }
+
+    fn created(&mut self, id: ResourceId) -> Result<Option<CreatedAt>, StoreError> {
+        let at: Option<Option<i64>> = self.conn.prepare_cached(IDENTITY_CREATED)?.query_row([id.0], |row| row.get(0)).optional()?;
+        Ok(at.flatten().map(CreatedAt))
+    }
+
+    /// Writes on identity `id` that it was created by change `seq` of `home`: at that change's time.
+    fn set_created(&mut self, id: ResourceId, home: &str, seq: u64) -> Result<(), StoreError> {
+        let home = self.intern(HOME_DOMAIN, home)?;
+        let seq = i64::try_from(seq).map_err(|_| Malformed::Sequence { home_seq: seq })?;
+        self.conn.prepare_cached(IDENTITY_SET_CREATED)?.execute(params![id.0, home, seq])?;
+        Ok(())
     }
 
     /// The newest change at `home` naming `record` as an item.

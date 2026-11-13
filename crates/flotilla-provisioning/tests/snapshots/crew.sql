@@ -8,6 +8,7 @@ CREATE TABLE resource_identity (
   id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),
   seq INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER,
   UNIQUE (kind, name, home)) STRICT;
 CREATE INDEX resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
