@@ -5,6 +5,7 @@
 mod common;
 mod convoy_engine_path;
 mod placement_tiebreak_capacity_wait;
+mod read_costs;
 mod review_bundle;
 mod review_bundle_aggregator;
 #[path = "../../../../tests/support/integration_modules.rs"]

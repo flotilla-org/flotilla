@@ -27,7 +27,6 @@ const CONVOY_CONTROLLER: &str = "convoy-controller";
 #[derive(Clone)]
 pub struct ConvoyReconciler {
     vessels: Option<ReplicaReadResolver<Vessel>>,
-    terminal_sessions: Option<TypedResolver<TerminalSession>>,
     artifacts: Option<ReplicaReadResolver<Artifact>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
     forges: Option<DefinitionResolver<Forge>>,
@@ -56,7 +55,6 @@ impl ConvoyReconciler {
     pub fn new(lifecycle_reads: Arc<dyn lifecycle_reads::LifecycleReads>) -> Self {
         Self {
             vessels: None,
-            terminal_sessions: None,
             artifacts: None,
             change_requests: None,
             forges: None,
@@ -102,11 +100,6 @@ impl ConvoyReconciler {
 
     pub fn with_convoys(mut self, convoys: ReplicaReadResolver<Convoy>) -> Self {
         self.convoys = Some(convoys);
-        self
-    }
-
-    pub fn with_terminal_sessions(mut self, terminal_sessions: TypedResolver<TerminalSession>) -> Self {
-        self.terminal_sessions = Some(terminal_sessions);
         self
     }
 
@@ -192,17 +185,29 @@ impl ConvoyReconciler {
         vessel: &str,
         role: &str,
     ) -> Result<Option<DateTime<Utc>>, ResourceError> {
-        let (Some(messages), Some(sessions)) = (self.messages.get(), &self.terminal_sessions) else { return Ok(None) };
-        let sessions = sessions
-            .list_matching_labels(&BTreeMap::from([
-                (CONVOY_LABEL.to_string(), obj.metadata.name.clone()),
-                (VESSEL_LABEL.to_string(), vessel.to_string()),
-                (ROLE_LABEL.to_string(), role.to_string()),
-            ]))
-            .await?
-            .items;
-        let live =
-            sessions.iter().any(|session| session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running));
+        let Some(messages) = self.messages.get() else { return Ok(None) };
+        // The seat's sessions here, read by the launches of its work: a session runs while its
+        // newest launch is ready.
+        let reads = Arc::clone(&self.lifecycle_reads);
+        let (convoy, work, seat) = (obj.metadata.name.clone(), vessel.to_owned(), role.to_owned());
+        let live = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let launch_of = vessel_resource_name(flotilla_resources::convoy::launch_of(&convoy), &work);
+            let terminals = reads.terminals()?;
+            for launch in reads.vessels()?.of_convoy(&convoy)?.into_iter().filter(|launch| launch.launch_of == launch_of) {
+                let sessions = terminal_records::newest_launches(terminals.of_vessel(&launch.name)?);
+                if sessions.values().any(|session| {
+                    session.home == terminals.home()
+                        && session.role == seat
+                        && matches!(session.reading, flotilla_protocol::LifecycleReading::Ready { .. })
+                }) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+        .map_err(|error| ResourceError::other(format!("read the seat's sessions: {error}")))?
+        .map_err(ResourceError::other)?;
         if !live {
             return Ok(None);
         }

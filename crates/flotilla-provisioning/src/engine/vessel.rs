@@ -24,17 +24,23 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, PoisonError,
+    },
 };
 
 use chrono::{DateTime, Utc};
 use flotilla_engine_store::follow::Followed;
-use flotilla_resources::vessel_records::{VesselChange, VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep};
+use flotilla_resources::{
+    convoy::admission::AdmissionDocument,
+    vessel_records::{VesselChange, VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep},
+};
 use flotilla_schema::{Kind, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreHandle};
 use flotilla_state_machines::{
     machines::{
-        convoy::{ConvoyId, Priority, VesselClass},
+        convoy::{Convoy, ConvoyId, Priority, VesselClass},
         lifecycle::{Attempted, Lifecycle, LifecycleEdge, Realise, Release, Vanish, VanishCause},
         vessel::{live_leases, Vessel, VesselKind, VesselSpec},
     },
@@ -267,6 +273,8 @@ pub struct EngineVessels {
     reads: StoreReads,
     homes: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     changes: tokio::sync::broadcast::Sender<VesselChange>,
+    /// Launches read into records by listing, index and scan reads, the cost of those reads.
+    launches_read: AtomicU64,
 }
 
 /// How many changes a slow follower may fall behind by; one that lags rereads everything.
@@ -279,7 +287,18 @@ impl EngineVessels {
         store: Arc<StoreHandle>,
         homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
-        Self { lifecycles, reads: StoreReads::new(store), homes: Arc::new(homes), changes: tokio::sync::broadcast::channel(CHANGES).0 }
+        Self {
+            lifecycles,
+            reads: StoreReads::new(store),
+            homes: Arc::new(homes),
+            changes: tokio::sync::broadcast::channel(CHANGES).0,
+            launches_read: AtomicU64::new(0),
+        }
+    }
+
+    /// How many launches listing, index and scan reads have read, for read-cost tests.
+    pub fn launches_read(&self) -> u64 {
+        self.launches_read.load(Ordering::Relaxed)
     }
 
     /// The port over `service`'s store and homes.
@@ -314,9 +333,12 @@ impl EngineVessels {
         what: &str,
         views: impl FnOnce(&mut Read<'_>) -> Result<Vec<View<VesselKind>>, ReadError>,
     ) -> Result<Vec<VesselRecord>, String> {
-        self.reads
+        let records: Vec<VesselRecord> = self
+            .reads
             .read(|read| views(read)?.into_iter().map(|view| record(read, view)).collect())
-            .map_err(|error| format!("engine vessels {what}: {error}"))
+            .map_err(|error| format!("engine vessels {what}: {error}"))?;
+        self.launches_read.fetch_add(records.len() as u64, Ordering::Relaxed);
+        Ok(records)
     }
 
     fn scan(read: &mut Read<'_>, home: &str) -> Result<Vec<View<VesselKind>>, ReadError> {
@@ -381,6 +403,43 @@ impl VesselRecords for EngineVessels {
                 Ok(None)
             })
             .map_err(|error| format!("engine Vessel/{name}: {error}"))
+    }
+
+    /// Read by the `by_launch` index, once for each work of each home's launch `convoy`: its works
+    /// are those its admission froze. Where a home's launch of that name is not held (it is gone,
+    /// or only named by its vessels' references), its vessels are found by a scan, so the
+    /// launches it leaves behind are still read.
+    fn of_convoy(&self, convoy: &str) -> Result<Vec<VesselRecord>, String> {
+        let launches = self
+            .reads
+            .read(|read| {
+                let convoys = read.resolve_named(<Resource<Convoy> as Kind>::CODE, convoy)?;
+                if convoys.is_empty() {
+                    return Ok(None);
+                }
+                let mut launches = Vec::new();
+                for id in convoys {
+                    let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
+                    let admission = AdmissionDocument::decode(convoy, loaded.value.spec().admission.value().bytes())
+                        .map_err(|error| ReadError(format!("convoy {convoy}'s admission: {error}")))?;
+                    let id = ConvoyId::new(convoy, &loaded.home);
+                    for work in &admission.workflow_snapshot.vessels {
+                        let launch_of = flotilla_resources::vessel_resource_name(flotilla_resources::convoy::launch_of(convoy), &work.name);
+                        for view in indexed::<VesselKind, _>(read, &VesselSpec::by_launch(&id, &launch_of))? {
+                            launches.push(record(read, view)?);
+                        }
+                    }
+                }
+                Ok(Some(launches))
+            })
+            .map_err(|error| format!("engine vessels of convoy {convoy}: {error}"))?;
+        match launches {
+            Some(launches) => {
+                self.launches_read.fetch_add(launches.len() as u64, Ordering::Relaxed);
+                Ok(launches)
+            }
+            None => Ok(self.every()?.into_iter().filter(|record| record.convoy == convoy).collect()),
+        }
     }
 
     fn launches(&self, convoy: &str, convoy_home: &str, launch_of: &str, home: Option<&str>) -> Result<Vec<VesselRecord>, String> {

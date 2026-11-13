@@ -36,7 +36,7 @@ use flotilla_protocol::CanonicalHostId;
 use flotilla_provisioning::engine::ProvisioningLifecycles;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
-use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Host, Repository, Resource, ResourceError, TerminalSession, Vessel};
+use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Host, Repository, Resource, ResourceError, Vessel};
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::task::AbortOnDropHandle;
@@ -838,7 +838,6 @@ fn spawn_controller_loops(
                         .with_hosts(backend.including_replicas::<Host>(&namespace_string))
                         .with_convoys(backend.including_replicas::<Convoy>(&namespace_string))
                         .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))
-                        .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
                         .with_forges(backend.definitions::<Forge>(&namespace_string))
                         .with_change_requests(
                             backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),

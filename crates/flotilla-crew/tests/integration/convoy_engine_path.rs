@@ -639,7 +639,6 @@ impl flotilla_messaging::EngineMessages for Turns {
 #[tokio::test]
 async fn an_undelivered_turn_holds_delivery() {
     use flotilla_provisioning_testkit::{EngineFixture, TerminalsFixture};
-    use flotilla_resources::TerminalSession;
     for (awaiting, live) in [(true, true), (false, true), (true, false)] {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut convoy = ledger_convoy(&backend).await;
@@ -662,17 +661,12 @@ async fn an_undelivered_turn_holds_delivery() {
         if !live {
             fixture.release(&launch);
         }
-        backend.install_engine_records(Arc::new(flotilla_store::TerminalViews::new(NAMESPACE, fixture.reads.clone())));
-        backend.serve_engine_in(NAMESPACE);
-        let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
         let messages: flotilla_crew::ports::MessagePath = Arc::new(OnceLock::new());
         let held_until = awaiting.then(|| chrono::Utc::now() + chrono::Duration::minutes(5));
         let turns: Arc<dyn flotilla_messaging::EngineMessages> = Arc::new(Turns { backend: backend.clone(), held_until });
         assert!(messages.set(turns).is_ok());
         let engine = Arc::new(Recording { holds: true, ..Default::default() });
-        let reconciler = reconciler_reading(&backend, Arc::clone(&engine), fixture.reads.clone())
-            .with_terminal_sessions(sessions)
-            .with_messages(messages);
+        let reconciler = reconciler_reading(&backend, Arc::clone(&engine), fixture.reads.clone()).with_messages(messages);
         let prepared = reconciler.prepare(&convoy).await.expect("prepare");
         let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
         let delivered = *engine.deliveries.lock().expect("deliveries") == 1;
