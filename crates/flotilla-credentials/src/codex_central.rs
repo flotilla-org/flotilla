@@ -26,6 +26,7 @@ use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_provider_runtime::HttpClient;
 use flotilla_provider_runtime::ReqwestHttpClient;
+use flotilla_resources::{Clock, SystemClock};
 use futures::future::BoxFuture;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
@@ -183,6 +184,7 @@ impl CodexTokenRefresher for RealCodexTokenRefresher {
 pub struct CodexCentralRefresher {
     auth_path: PathBuf,
     refresher: Arc<dyn CodexTokenRefresher>,
+    clock: Arc<dyn Clock>,
 }
 
 impl CodexCentralRefresher {
@@ -201,11 +203,12 @@ impl CodexCentralRefresher {
         Self::new_with_refresher(
             auth_path,
             Arc::new(RealCodexTokenRefresher { http: Arc::new(ReqwestHttpClient::new()), token_url, client_id }),
+            Arc::new(SystemClock),
         )
     }
 
-    fn new_with_refresher(auth_path: PathBuf, refresher: Arc<dyn CodexTokenRefresher>) -> Self {
-        Self { auth_path, refresher }
+    fn new_with_refresher(auth_path: PathBuf, refresher: Arc<dyn CodexTokenRefresher>, clock: Arc<dyn Clock>) -> Self {
+        Self { auth_path, refresher, clock }
     }
 
     pub fn refresh_once(&self) -> BoxFuture<'_, Result<CodexRefreshSuccess, CodexRefreshFailure>> {
@@ -234,11 +237,11 @@ impl CodexCentralRefresher {
         let (changes, mut changed) = mpsc::unbounded_channel();
         let mut watcher = self.watch(changes);
         let mut held = read_held(&self.auth_path).await;
-        let mut next = held.as_ref().map(|held| due(held, Utc::now()));
+        let mut next = held.as_ref().map(|held| due(held, self.clock.now()));
         let mut failures = 0u32;
         loop {
             tokio::select! {
-                () = sleep_until(next) => {}
+                () = sleep_until(next, &*self.clock) => {}
                 Some(()) = changed.recv() => {
                     while changed.try_recv().is_ok() {}
                     let seen = read_held(&self.auth_path).await;
@@ -249,7 +252,7 @@ impl CodexCentralRefresher {
                     info!(present = seen.is_some(), "the central Codex login changed on disk");
                     held = seen;
                     failures = 0;
-                    next = held.as_ref().map(|held| due(held, Utc::now()));
+                    next = held.as_ref().map(|held| due(held, self.clock.now()));
                     self.rearm(&mut watcher);
                     if held.is_some() {
                         rotated();
@@ -266,14 +269,16 @@ impl CodexCentralRefresher {
                     );
                     failures = 0;
                     held = read_held(&self.auth_path).await;
-                    next = held.as_ref().map(|held| due(held, Utc::now()));
+                    next = held.as_ref().map(|held| due(held, self.clock.now()));
                     self.rearm(&mut watcher);
                     rotated();
                 }
                 Err(error) => {
                     failures = failures.saturating_add(1);
                     next = match error {
-                        CodexRefreshFailure::Transient(_) => retry_at(failures, held.as_ref().and_then(|held| held.expires_at), Utc::now()),
+                        CodexRefreshFailure::Transient(_) => {
+                            retry_at(failures, held.as_ref().and_then(|held| held.expires_at), self.clock.now())
+                        }
                         CodexRefreshFailure::Local(_) | CodexRefreshFailure::DeadRefreshToken(_) => None,
                     };
                     warn!(%error, attempts = failures, retry_at = ?next, "failed to refresh central Codex credential");
@@ -354,9 +359,9 @@ fn retry_at(failures: u32, expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>
     }
 }
 
-async fn sleep_until(at: Option<DateTime<Utc>>) {
+async fn sleep_until(at: Option<DateTime<Utc>>, clock: &dyn Clock) {
     match at {
-        Some(at) => tokio::time::sleep((at - Utc::now()).to_std().unwrap_or_default()).await,
+        Some(at) => tokio::time::sleep((at - clock.now()).to_std().unwrap_or_default()).await,
         None => std::future::pending().await,
     }
 }
@@ -450,6 +455,7 @@ mod tests {
     use std::{collections::VecDeque, os::unix::fs::PermissionsExt, sync::Mutex as StdMutex};
 
     use chrono::Duration;
+    use flotilla_store_testkit::PausedClock;
     use tempfile::TempDir;
 
     use super::*;
@@ -500,7 +506,7 @@ mod tests {
             })])),
             requests: StdMutex::new(Vec::new()),
         });
-        let central = CodexCentralRefresher::new_with_refresher(path.clone(), refresher.clone());
+        let central = CodexCentralRefresher::new_with_refresher(path.clone(), refresher.clone(), Arc::new(SystemClock));
 
         let success = central.refresh_once().await.expect("refresh succeeds");
 
@@ -524,7 +530,7 @@ mod tests {
             responses: StdMutex::new(VecDeque::from([Err(CodexRefreshFailure::DeadRefreshToken("refresh_token_expired".to_string()))])),
             requests: StdMutex::new(Vec::new()),
         });
-        let central = CodexCentralRefresher::new_with_refresher(path.clone(), refresher);
+        let central = CodexCentralRefresher::new_with_refresher(path.clone(), refresher, Arc::new(SystemClock));
 
         let failure = central.refresh_once().await.expect_err("refresh fails");
 
@@ -539,7 +545,7 @@ mod tests {
         let path = dir.path().join("missing").join("auth.json");
         let refresher =
             Arc::new(FakeCodexTokenRefresher { responses: StdMutex::new(VecDeque::new()), requests: StdMutex::new(Vec::new()) });
-        let central = CodexCentralRefresher::new_with_refresher(path, refresher.clone());
+        let central = CodexCentralRefresher::new_with_refresher(path, refresher.clone(), Arc::new(SystemClock));
 
         let failure = central.refresh_once().await.expect_err("refresh fails");
 
@@ -559,10 +565,11 @@ mod tests {
         })
     }
 
-    /// Runs the refresher over `path`, reporting each rotation on the returned channel.
+    /// Runs the refresher over `path` on a clock that moves with tokio's, reporting each rotation
+    /// on the returned channel.
     fn run(path: PathBuf, refresher: Arc<FakeCodexTokenRefresher>) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedReceiver<()>) {
         let (rotations, rotated) = mpsc::unbounded_channel();
-        let central = CodexCentralRefresher::new_with_refresher(path, refresher);
+        let central = CodexCentralRefresher::new_with_refresher(path, refresher, Arc::new(PausedClock::start()));
         (
             tokio::spawn(central.run(move || {
                 let _ = rotations.send(());
