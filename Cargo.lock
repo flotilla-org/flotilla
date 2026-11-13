@@ -2864,6 +2864,7 @@ dependencies = [
  "flotilla-inbox",
  "flotilla-messaging",
  "flotilla-protocol",
+ "flotilla-provisioning-testkit",
  "flotilla-resources",
  "flotilla-schema",
  "flotilla-schema-sqlite",

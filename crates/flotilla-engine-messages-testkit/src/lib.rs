@@ -43,7 +43,7 @@ pub struct EngineMessagesHome {
     service: Arc<Service>,
     namespace: String,
     backend: ResourceBackend,
-    _dir: tempfile::TempDir,
+    _dir: Option<tempfile::TempDir>,
 }
 
 impl EngineMessagesHome {
@@ -58,11 +58,23 @@ impl EngineMessagesHome {
         let dir = tempfile::tempdir().expect("decided store directory");
         let registry = flotilla_engine_store::registry().expect("engine kind registry");
         let service = Arc::new(Service::open(&dir.path().join("decided.sqlite"), home, registry).expect("decided store"));
+        let mut opened = Self::over_with_clock(service, namespace, backend, clock);
+        opened._dir = Some(dir);
+        opened
+    }
+
+    /// The Message path over `service`, a decided store the test holds (one with the kinds of
+    /// other engine readers beside it, say), installed on `backend` as [`Self::open`] installs it.
+    pub fn over(service: Arc<Service>, namespace: &str, backend: &ResourceBackend) -> Self {
+        Self::over_with_clock(service, namespace, backend, Arc::new(SystemClock))
+    }
+
+    fn over_with_clock(service: Arc<Service>, namespace: &str, backend: &ResourceBackend, clock: Arc<dyn Clock>) -> Self {
         let primitives =
-            Arc::new(MessagePrimitives::open(home, Arc::clone(&service), backend.clone(), clock).expect("engine Message path"));
+            Arc::new(MessagePrimitives::open(service.home(), Arc::clone(&service), backend.clone(), clock).expect("engine Message path"));
         backend.install_attentions(Arc::clone(&primitives) as Arc<dyn Attentions>);
         backend.install_engine_records(Arc::new(MessageRecords::new(Arc::clone(&primitives), Arc::new(RwLock::new(namespace.to_owned())))));
-        Self { primitives, service, namespace: namespace.to_owned(), backend: backend.clone(), _dir: dir }
+        Self { primitives, service, namespace: namespace.to_owned(), backend: backend.clone(), _dir: None }
     }
 
     pub fn primitives(&self) -> &Arc<MessagePrimitives> {

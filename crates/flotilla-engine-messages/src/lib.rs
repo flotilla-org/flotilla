@@ -696,17 +696,20 @@ impl MessagePrimitives {
     }
 
     /// The sessions of the vessel launched for the work holding `role` in `convoy`, newest
-    /// launch at this home or the convoy's: through the convoy's snapshot and the engine's
-    /// indexed vessel and terminal reads. `None` when those reads are not installed or the
-    /// convoy's snapshot names no work for the role, and the sessions are read by their labels.
+    /// launch at each home this store holds, since the vessel is homed where it was placed:
+    /// through the convoy's snapshot and the engine's indexed vessel and terminal reads, one
+    /// index read per home. `None` when those reads are not installed or the convoy's snapshot
+    /// names no work for the role, and the sessions are read by their labels.
     fn seat_sessions(&self, records: &OldStoreRecords, convoy: &str, role: &str) -> Option<Vec<String>> {
         let lifecycle = self.lifecycle.get()?;
         let (vessels, terminals) = (lifecycle.vessels().ok()?, lifecycle.terminals().ok()?);
         let work = records.convoys.get(convoy).and_then(|held| snapshot_vessel(held, role))?;
         let convoy_home = records.convoy_homes.get(convoy)?;
         let launch_of = flotilla_resources::vessel_resource_name(flotilla_resources::convoy::launch_of(convoy), &work);
+        let mut homes = BTreeSet::from([self.home.clone(), convoy_home.clone()]);
+        homes.extend(self.service.homes());
         let mut sessions = Vec::new();
-        for home in BTreeSet::from([self.home.as_str(), convoy_home.as_str()]) {
+        for home in &homes {
             let vessel = match vessels.newest(convoy, convoy_home, &launch_of, Some(home)) {
                 Ok(vessel) => vessel,
                 Err(error) => {
