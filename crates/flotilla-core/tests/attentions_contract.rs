@@ -17,6 +17,7 @@ use flotilla_resources::{
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
+use futures::{stream::BoxStream, StreamExt};
 use hegel::{generators as gs, TestCase};
 use serde_json::json;
 
@@ -423,9 +424,18 @@ fn follow(from: &Service, from_home: &str, to: &Service, cursor: &mut Option<u64
     *cursor = Some(next);
 }
 
+/// The next tick on `signal`: the change stream reads the log on its own task after a commit.
+async fn next_signal(signal: &mut BoxStream<'static, ()>, what: &str) {
+    tokio::time::timeout(Duration::from_secs(10), signal.next())
+        .await
+        .unwrap_or_else(|_| panic!("{what}"))
+        .expect("the change stream ended");
+}
+
 // Behaviour: an attention raised at one home, and its acknowledgement there, reach another home's
 // readers with the replicated entries: the signal fires when Messages are applied, with no local
-// write, and not for entries of another kind.
+// write. That another kind's entries do not tick is engine-store watch.rs's
+// a_pass_over_another_kinds_entries_does_not_tick, which drives the pass by hand.
 #[tokio::test]
 async fn another_homes_attentions_signal_their_readers_when_they_arrive() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -436,20 +446,18 @@ async fn another_homes_attentions_signal_their_readers_when_they_arrive() {
     let mut signal = b.changes().expect("the engine signals its readers");
     a.register_person(flotilla_schema::Timestamp::from_datetime(&Utc::now())).await.expect("a person at home a");
     follow(&a_store, "home-a", &b_store, &mut cursor);
-    assert!(signal.try_recv().is_err(), "another kind's entries are no attention: its readers are not signalled");
     let hold = attention(0, "held", episode_start().await);
     let (sender, subject) = (hold.fact.sender(), hold.fact.subject());
     a.raise(NAMESPACE, &hold).await.expect("raise at home a");
-    assert!(signal.try_recv().is_err(), "nothing has reached home b yet");
     follow(&a_store, "home-a", &b_store, &mut cursor);
-    signal.try_recv().expect("applying home a's entries signals home b's readers");
+    next_signal(&mut signal, "applying home a's entries signals home b's readers").await;
     let seen = b.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open at home b");
     assert_eq!(seen.len(), 1, "home b reads home a's hold");
 
     let (_, message) = a.person_messages(NAMESPACE).await.expect("messages").into_iter().next().expect("the hold");
     a.acknowledge(NAMESPACE, &record_name(message.name()).expect("record")).await.expect("acknowledge at home a");
     follow(&a_store, "home-a", &b_store, &mut cursor);
-    signal.try_recv().expect("the acknowledgement's entries signal home b's readers");
+    next_signal(&mut signal, "the acknowledgement's entries signal home b's readers").await;
     assert!(b.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open at home b").is_empty());
     assert!(b.acknowledged(NAMESPACE, sender, &subject, hold.began_at).await.expect("acknowledged at home b").is_some());
 }

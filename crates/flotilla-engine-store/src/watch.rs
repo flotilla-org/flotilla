@@ -216,13 +216,22 @@ async fn follow(mut watch: EngineWatch, sender: tokio::sync::watch::Sender<u64>,
                 }
             }
             // A pass that fails is tried again at the next commit; the watchers see no tick.
-            found = watch.next(|_, followed| Ok(!followed.is_empty())) => match found {
-                Ok(true) => sender.send_modify(|passes| *passes += 1),
-                Ok(false) => {}
-                Err(error) => tracing::warn!(%error, what, "change stream could not read the log; retrying"),
+            passed = async {
+                watch.woken().await;
+                tick(&mut watch, &sender).await
+            } => if let Err(error) = passed {
+                tracing::warn!(%error, what, "change stream could not read the log; retrying")
             },
         }
     }
+}
+
+/// One pass of `watch`, counted on `sender` only when it found the followed kinds changed.
+async fn tick(watch: &mut EngineWatch, sender: &tokio::sync::watch::Sender<u64>) -> Result<(), StoreError> {
+    if watch.pass(|_, followed| Ok(!followed.is_empty())).await? {
+        sender.send_modify(|passes| *passes += 1);
+    }
+    Ok(())
 }
 
 /// The pass of `follower` over `homes`, or, where a home was `reset` since it last passed (a
@@ -234,4 +243,52 @@ pub fn reset_or_pass(follower: &mut Follower, read: &mut Read<'_>, homes: &[Stri
     }
     follower.start(read, homes)?;
     Ok(homes.iter().cloned().map(Followed::Rescan).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use flotilla_schema::{Address, Kind, Timestamp};
+    use flotilla_schema_sqlite::stream::Service;
+    use flotilla_state_machines::{
+        machines::{
+            agent_session::{AgentSession, MemoryAgentSessionWorld},
+            message::{MemoryMessageWorld, Message, MessageBody, MessageSpec, Relation},
+        },
+        Home, Resource,
+    };
+
+    use super::{tick, EngineWatch};
+    use crate::{registry, MessageLog, StoreLog};
+
+    const HOME: &str = "alpha";
+
+    // Behaviour: a change stream counts a pass only when it finds its kinds changed. Each pass is
+    // driven here by hand, so whether a pass over another kind's entries ticks is read directly,
+    // with no wait on the follower task.
+    #[tokio::test]
+    async fn a_pass_over_another_kinds_entries_does_not_tick() {
+        let service = Arc::new(Service::open(std::path::Path::new(":memory:"), HOME, registry().expect("registry")).expect("service"));
+        let mut watch = EngineWatch::start(Arc::clone(&service), [Resource::<Message>::CODE]).expect("watch");
+        let sender = tokio::sync::watch::channel(0u64).0;
+
+        let mut sessions = Home::<AgentSession, StoreLog>::with_log(HOME, StoreLog::new(service.store())).expect("session home");
+        sessions.create("session", (), &MemoryAgentSessionWorld::default(), Timestamp(1)).expect("session");
+        tick(&mut watch, &sender).await.expect("pass");
+        assert_eq!(*sender.borrow(), 0, "an AgentSession's entries are no Message: the pass does not tick");
+
+        let inbox: Address = "project:fleet/convoy:demo/role:coder".parse().expect("inbox");
+        let name = Address::message(&inbox, "first").expect("message address").as_str().to_owned();
+        let spec = MessageSpec::new(
+            "project:fleet/role:turn-rules".parse().expect("sender"),
+            inbox,
+            Relation::System,
+            MessageBody::text("take a turn").expect("small body"),
+        );
+        let mut messages = Home::<Message, MessageLog>::with_log(HOME, MessageLog::new(service.store())).expect("message home");
+        messages.create(&name, spec, &MemoryMessageWorld::default(), Timestamp(2)).expect("message");
+        tick(&mut watch, &sender).await.expect("pass");
+        assert_eq!(*sender.borrow(), 1, "a pass over a Message's entries ticks");
+    }
 }
