@@ -899,6 +899,20 @@ impl<T: Resource> TypedResolver<T> {
         Ok(sources.into_iter().find(|record| record.name == name && record.home == home))
     }
 
+    /// Why `verb` on `name` fails when this home holds no copy: other homes' copies, named,
+    /// since only a record's home writes it; otherwise not found.
+    pub(crate) async fn not_held_here(&self, name: &str, verb: &str) -> Result<ResourceError, ResourceError> {
+        let Some(records) = self.engine_owned() else {
+            return Ok(ResourceError::not_found(name));
+        };
+        let copies = records.copies(T::API_PATHS.kind, name).await.map_err(ResourceError::other)?;
+        if copies.is_empty() {
+            return Ok(ResourceError::not_found(name));
+        }
+        let homes = copies.iter().map(|copy| format!("`{}`", copy.home)).collect::<Vec<_>>().join(", ");
+        Ok(ResourceError::conflict(name, format!("{} {name} is homed at {homes}; {verb} it there", T::API_PATHS.kind)))
+    }
+
     /// The engine record `name` at this home, refused unless it is at `resource_version`.
     async fn engine_current(
         &self,
@@ -907,7 +921,7 @@ impl<T: Resource> TypedResolver<T> {
         resource_version: &str,
     ) -> Result<(), ResourceError> {
         match self.engine_home_record(records, name).await? {
-            None => Err(ResourceError::not_found(name)),
+            None => Err(self.not_held_here(name, "write").await?),
             Some(current) if current.version.to_string() != resource_version => Err(ResourceError::conflict(name, "stale resourceVersion")),
             Some(_) => Ok(()),
         }
@@ -984,7 +998,7 @@ impl<T: Resource> TypedResolver<T> {
         }
         if let Some(records) = self.engine_owned() {
             if self.engine_home_record(&*records, name).await?.is_none() {
-                return Err(ResourceError::not_found(name));
+                return Err(self.not_held_here(name, "delete").await?);
             }
             return records.delete(T::API_PATHS.kind, name).await.map_err(ResourceError::other);
         }

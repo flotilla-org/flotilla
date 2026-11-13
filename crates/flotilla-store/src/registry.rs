@@ -1038,9 +1038,9 @@ async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, n
         // answers a delete of a name it does not list too, refusing it when the kind takes no writes.
         let object = match resolver.get(name).await {
             Ok(object) => object,
-            Err(not_found @ ResourceError::NotFound { .. }) => {
+            Err(ResourceError::NotFound { .. }) => {
                 records.delete(T::API_PATHS.kind, name).await.map_err(ResourceError::invalid)?;
-                return Err(not_found);
+                return Err(resolver.not_held_here(name, "delete").await?);
             }
             Err(error) => return Err(error),
         };
@@ -1178,7 +1178,10 @@ async fn patch_status_typed<T: Resource>(
         .map_err(|error| ResourceError::decode(format!("decode {} status: {error}", T::API_PATHS.kind)))?;
     let resolver = backend.using::<T>(namespace);
     for _ in 0..3 {
-        let current = resolver.get(name).await?;
+        let current = match resolver.get(name).await {
+            Err(ResourceError::NotFound { .. }) => return Err(resolver.not_held_here(name, "write").await?),
+            current => current?,
+        };
         if expected_resource_version.is_some_and(|expected| expected != current.metadata.resource_version) {
             return Err(ResourceError::conflict(name, "guarded status patch refused: status changed since the caller's observation"));
         }
@@ -1342,7 +1345,11 @@ async fn apply_typed<T: Resource>(
             let meta = metadata.input_meta_for_update(&existing.metadata);
             resolver.update(&meta, &existing.metadata.resource_version, &spec).await?
         }
-        Err(ResourceError::NotFound { .. }) => resolver.create(&metadata.input_meta_for_create(), &spec).await?,
+        // A name another home holds is that home's to write, not a new record here.
+        Err(ResourceError::NotFound { .. }) => match resolver.not_held_here(&metadata.name, "write").await? {
+            ResourceError::NotFound { .. } => resolver.create(&metadata.input_meta_for_create(), &spec).await?,
+            held_elsewhere => return Err(held_elsewhere),
+        },
         Err(error) => return Err(error),
     };
     Ok(DynamicResourceObject {

@@ -1524,6 +1524,21 @@ fn observed_checkout(branch: &str) -> ResourceCheckoutSpec {
     })
 }
 
+/// An artifact's spec over `content`: a plain engine kind its producer's home writes.
+fn artifact_spec(content: &[u8]) -> flotilla_resources::ArtifactSpec {
+    flotilla_resources::ArtifactSpec::builder()
+        .convoy("remote-convoy".into())
+        .producer("coder".into())
+        .kind("decision-ledger".into())
+        .subject("remote-convoy".into())
+        .summary(BTreeMap::new())
+        .digest(flotilla_resources::artifact::blob_digest_of(content))
+        .size(content.len() as u64)
+        .media_type("text/markdown".into())
+        .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
+        .build()
+}
+
 #[tokio::test]
 async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
     let authority_temp = tempfile::tempdir().expect("authority tempdir");
@@ -1549,18 +1564,18 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
     // The engine's readings, which a running daemon always has.
     let _engine = install_engine_reads(&replica);
     let origin = authority.node_id().clone();
-    let convoys = authority.resource_backend().using::<ResourceCheckout>("flotilla");
-    convoys
-        .create(&InputMeta::builder().name("remote-checkout".to_string()).build(), &observed_checkout("wf"))
-        .await
-        .expect("create checkout at authority");
-    let snapshot = convoys.list().await.expect("authority snapshot");
-    replica
-        .resource_backend()
-        .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
-        .replace(&snapshot, chrono::Utc::now())
-        .await
-        .expect("replicate checkout");
+    // An artifact is a plain engine kind its producer's home writes; the authority's log carries
+    // it to the replica, as a followed peer's does.
+    let spec = artifact_spec(b"remote");
+    let artifacts = authority.resource_backend().using::<flotilla_resources::Artifact>("flotilla");
+    artifacts.create(&InputMeta::builder().name("remote-artifact".to_string()).build(), &spec).await.expect("create artifact at authority");
+    flotilla_provisioning_testkit::replicate_home(
+        &authority.decided_store().expect("authority store"),
+        authority.node_id().as_str(),
+        &replica.decided_store().expect("replica store"),
+    );
+    let replica_artifacts = replica.resource_backend().including_replicas::<flotilla_resources::Artifact>("flotilla");
+    assert!(replica_artifacts.get("remote-artifact").await.is_ok(), "the authority's artifact reads at the replica");
 
     let mut events = replica.subscribe();
     let command_id = replica
@@ -1568,8 +1583,8 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
             Command::builder()
                 .action(CommandAction::ResourceDelete {
                     namespace: "flotilla".to_string(),
-                    kind: "checkouts".to_string(),
-                    name: "remote-checkout".to_string(),
+                    kind: "artifacts".to_string(),
+                    name: "remote-artifact".to_string(),
                     replica_origin: None,
                 })
                 .build(),
@@ -1581,24 +1596,22 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
         matches!(result, CommandValue::Error { ref message } if message.contains(origin.as_str())),
         "a replica delete must identify its origin: {result:?}"
     );
-    assert!(convoys.get("remote-checkout").await.is_ok(), "authority record must remain");
-    assert!(
-        replica.resource_backend().including_replicas::<ResourceCheckout>("flotilla").get("remote-checkout").await.is_ok(),
-        "replica must remain visible"
-    );
+    assert!(artifacts.get("remote-artifact").await.is_ok(), "authority record must remain");
+    assert!(replica_artifacts.get("remote-artifact").await.is_ok(), "replica must remain visible");
 
     for action in [
         CommandAction::ResourceStatusPatch {
             expected_resource_version: None,
             namespace: "flotilla".to_string(),
-            kind: "checkouts".to_string(),
-            name: "remote-checkout".to_string(),
+            kind: "artifacts".to_string(),
+            name: "remote-artifact".to_string(),
             status: serde_json::json!({}),
         },
         CommandAction::ResourceApply {
             namespace: "flotilla".to_string(),
             document: serde_json::json!({
-                "apiVersion": "flotilla.work/v1", "kind": "Checkout", "metadata": {"name": "remote-checkout"}, "spec": {}
+                "apiVersion": "flotilla.work/v1", "kind": "Artifact", "metadata": {"name": "remote-artifact"},
+                "spec": serde_json::to_value(&spec).expect("artifact spec")
             }),
         },
     ] {
@@ -1609,6 +1622,13 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
             "a replica mutation must identify its origin: {result:?}"
         );
     }
+    assert!(
+        matches!(
+            replica.resource_backend().using::<flotilla_resources::Artifact>("flotilla").get("remote-artifact").await,
+            Err(ResourceError::NotFound { .. })
+        ),
+        "a refused apply must not create a copy at the replica"
+    );
 
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     let repository_name = repository_spec.key().to_string();
@@ -1643,234 +1663,48 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
 }
 
 #[tokio::test]
-async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
+async fn deleting_a_name_this_home_does_not_hold_is_not_found_and_appends_nothing() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon = InProcessDaemon::new(
         vec![],
         test_config_store(temp.path().join("config")),
-        fake_discovery(false),
-        HostName::local(),
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
-    // The engine's readings, which a running daemon always has.
-    let _engine = install_engine_reads(&daemon);
-    let authority_node = test_node("retired-authority");
-    let origin = authority_node.node_id.clone();
-    daemon.set_configured_peers(vec![authority_node.clone()]).await;
-
-    let local = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
-    local
-        .create(&InputMeta::builder().name("orphaned-checkout".to_string()).build(), &observed_checkout("wf"))
-        .await
-        .expect("create authority record");
-    let authority_snapshot = local.list().await.expect("list authority record");
-    local.delete("orphaned-checkout").await.expect("authority store vanishes");
-    daemon
-        .resource_backend()
-        .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
-        .replace(&authority_snapshot, chrono::Utc::now())
-        .await
-        .expect("retain stale replica after authority disappears");
-
-    let mut events = daemon.subscribe();
-    InProcessDaemon::publish_peer_connection_status(daemon.as_ref(), &authority_node, PeerConnectionState::Connected).await;
-    let refused_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::ResourceDelete {
-                    namespace: "flotilla".to_string(),
-                    kind: "checkouts".to_string(),
-                    name: "orphaned-checkout".to_string(),
-                    replica_origin: Some(origin.clone()),
-                })
-                .build(),
-        )
-        .await
-        .expect("request collection while authority is connected");
-    let refused = recv_command_finished(&mut events, refused_id).await;
-    assert!(
-        matches!(refused, CommandValue::Error { ref message } if message.contains("is connected")),
-        "live authorities must retain their deletion authority: {refused:?}"
-    );
-
-    InProcessDaemon::publish_peer_connection_status(daemon.as_ref(), &authority_node, PeerConnectionState::Disconnected).await;
-    let command_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::ResourceDelete {
-                    namespace: "flotilla".to_string(),
-                    kind: "checkouts".to_string(),
-                    name: "orphaned-checkout".to_string(),
-                    replica_origin: Some(origin),
-                })
-                .build(),
-        )
-        .await
-        .expect("collect orphaned replica");
-
-    let result = recv_command_finished(&mut events, command_id).await;
-    assert!(matches!(result, CommandValue::ResourceDeleted(_)), "unexpected collection result: {result:?}");
-    assert!(
-        daemon
-            .resource_backend()
-            .including_replicas::<ResourceCheckout>("flotilla")
-            .list()
-            .await
-            .expect("list after collection")
-            .items
-            .is_empty(),
-        "the stale authority projection must be collectable"
-    );
-}
-
-#[tokio::test]
-async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_cycles() {
-    let authority_temp = tempfile::tempdir().expect("create authority tempdir");
-    let authority = InProcessDaemon::new(
-        vec![],
-        test_config_store(authority_temp.path().join("config")),
         fake_discovery(false),
         HostName::new("authority"),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     // The engine's readings, which a running daemon always has.
-    let _engine = install_engine_reads(&authority);
-    let peer_one_temp = tempfile::tempdir().expect("create first peer tempdir");
-    let peer_one = InProcessDaemon::new(
-        vec![],
-        test_config_store(peer_one_temp.path().join("config")),
-        fake_discovery(false),
-        HostName::new("peer-one"),
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
-    // The engine's readings, which a running daemon always has.
-    let _engine = install_engine_reads(&peer_one);
-    let peer_two_temp = tempfile::tempdir().expect("create second peer tempdir");
-    let peer_two = InProcessDaemon::new(
-        vec![],
-        test_config_store(peer_two_temp.path().join("config")),
-        fake_discovery(false),
-        HostName::new("peer-two"),
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
-    // The engine's readings, which a running daemon always has.
-    let _engine = install_engine_reads(&peer_two);
-    let origin = authority.node_id().clone();
-    let fixture_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let fixture = fixture_backend.using::<ResourceCheckout>("flotilla");
-    fixture
-        .create(&InputMeta::builder().name("lost-at-authority".to_string()).build(), &observed_checkout("wf"))
-        .await
-        .expect("create stale source object");
-    let stale_snapshot = fixture.list().await.expect("snapshot stale source object");
-    let stale_object = stale_snapshot.items[0].clone();
-    let stale_synced_at = chrono::Utc::now() - chrono::Duration::minutes(1);
-    for daemon in [&authority, &peer_one, &peer_two] {
-        daemon
-            .resource_backend()
-            .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
-            .replace(&stale_snapshot, stale_synced_at)
-            .await
-            .expect("seed stale replica");
-    }
-
-    let authority_convoys = authority.resource_backend().using::<ResourceCheckout>("flotilla");
-    let listed = authority_convoys.list().await.expect("list before authority tombstone");
-    let mut authority_watch = authority_convoys.watch(WatchStart::resuming_from(&listed)).await.expect("watch authority tombstones");
-    let mut peer_one_relay =
-        peer_one.resource_backend().including_replicas::<ResourceCheckout>("flotilla").watch().await.expect("watch first peer replicas");
-    let mut authority_events = authority.subscribe();
-    let delete_id = authority
-        .execute(
-            Command::builder()
-                .action(CommandAction::ResourceDelete {
-                    namespace: "flotilla".to_string(),
-                    kind: "checkouts".to_string(),
-                    name: "lost-at-authority".to_string(),
-                    replica_origin: None,
-                })
-                .build(),
-        )
-        .await
-        .expect("delete missing authority resource");
-    let deleted = recv_command_finished(&mut authority_events, delete_id).await;
-    assert!(matches!(deleted, CommandValue::ResourceDeleted(_)), "missing authority delete must succeed: {deleted:?}");
-
-    let tombstone_event = tokio::time::timeout(Duration::from_secs(1), authority_watch.next())
-        .await
-        .expect("authority tombstone watch timeout")
-        .expect("authority tombstone watch ended")
-        .expect("authority tombstone watch failed");
-    assert!(
-        matches!(&tombstone_event, WatchEvent::DeletedByName(tombstone) if tombstone.name == "lost-at-authority"),
-        "missing authority delete must emit a name tombstone: {tombstone_event:?}"
-    );
-    let tombstone_synced_at = chrono::Utc::now();
-    for peer in [&peer_one, &peer_two] {
-        peer.resource_backend()
-            .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
-            .apply(tombstone_event.clone(), tombstone_synced_at)
-            .await
-            .expect("relay authority tombstone to peer");
-    }
-
-    let relayed = tokio::time::timeout(Duration::from_secs(1), peer_one_relay.next())
-        .await
-        .expect("peer relay tombstone timeout")
-        .expect("peer relay watch ended")
-        .expect("peer relay watch failed");
-    let flotilla_resources::ReadWatchEvent::DeletedByName { tombstone, provenance } = relayed else {
-        panic!("expected relayed name tombstone");
+    let _engine = install_engine_reads(&daemon);
+    let store = daemon.decided_store().expect("decided store");
+    let home = daemon.node_id().as_str().to_string();
+    let artifacts = daemon.resource_backend().using::<flotilla_resources::Artifact>("flotilla");
+    artifacts.create(&InputMeta::builder().name("once-held".to_string()).build(), &artifact_spec(b"once")).await.expect("create artifact");
+    let mut events = daemon.subscribe();
+    let delete = |name: &str| {
+        Command::builder()
+            .action(CommandAction::ResourceDelete {
+                namespace: "flotilla".to_string(),
+                kind: "artifacts".to_string(),
+                name: name.to_string(),
+                replica_origin: None,
+            })
+            .build()
     };
-    let flotilla_resources::ResourceProvenance::Replica { last_synced_at, .. } = provenance else {
-        panic!("expected replica provenance");
-    };
-    peer_two
-        .resource_backend()
-        .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
-        .apply(WatchEvent::DeletedByName(tombstone), last_synced_at)
-        .await
-        .expect("apply peer relay tombstone");
+    let command_id = daemon.execute(delete("once-held")).await.expect("submit delete");
+    let deleted = recv_command_finished(&mut events, command_id).await;
+    assert!(matches!(deleted, CommandValue::ResourceDeleted(_)), "a held record deletes: {deleted:?}");
 
-    for daemon in [&authority, &peer_one, &peer_two] {
-        daemon
-            .resource_backend()
-            .replica_writer::<ResourceCheckout>(origin.clone(), "flotilla")
-            .apply(WatchEvent::Added(stale_object.clone()), stale_synced_at)
-            .await
-            .expect("exercise a stale relay cycle after deletion");
+    // A name never held and a name already deleted: neither is held here any more.
+    for name in ["never-held", "once-held"] {
+        let before = store.last_sequence(&home).expect("sequence before");
+        let command_id = daemon.execute(delete(name)).await.expect("submit delete");
+        let result = recv_command_finished(&mut events, command_id).await;
         assert!(
-            daemon
-                .resource_backend()
-                .including_replicas::<ResourceCheckout>("flotilla")
-                .list()
-                .await
-                .expect("list converged replicas")
-                .items
-                .is_empty(),
-            "authority and both peers must remain absent after stale relay cycles"
+            matches!(result, CommandValue::Error { ref message } if message.contains("not found")),
+            "deleting {name}, which this home does not hold, must be NotFound: {result:?}"
         );
+        assert_eq!(store.last_sequence(&home).expect("sequence after"), before, "deleting {name} must append nothing to the log");
     }
-
-    let repeated_id = authority
-        .execute(
-            Command::builder()
-                .action(CommandAction::ResourceDelete {
-                    namespace: "flotilla".to_string(),
-                    kind: "checkouts".to_string(),
-                    name: "lost-at-authority".to_string(),
-                    replica_origin: None,
-                })
-                .build(),
-        )
-        .await
-        .expect("repeat delete missing authority resource");
-    let repeated = recv_command_finished(&mut authority_events, repeated_id).await;
-    assert!(matches!(repeated, CommandValue::ResourceAlreadyDeleted(_)), "repeat delete must be explicit: {repeated:?}");
 }
 
 #[tokio::test]
@@ -6950,22 +6784,7 @@ async fn repository_identity_change_does_not_materialize_project_when_superseded
 
     let old_key = RepositorySpec::remote("https://github.com/owner/old-repo").expect("old repository spec").key();
     let new_key = RepositorySpec::remote("https://github.com/owner/new-repo").expect("new repository spec").key();
-    let durable = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
-    durable
-        .create(
-            &InputMeta::builder().name("durable-old-checkout".to_string()).build(),
-            &ResourceCheckoutSpec::Observed(
-                ObservedCheckoutSpec::builder()
-                    .r#ref("main".to_string())
-                    .path(repo.to_string_lossy().into_owned())
-                    .repo_ref(old_key.clone())
-                    .host_ref("host-test".to_string())
-                    .is_main(true)
-                    .build(),
-            ),
-        )
-        .await
-        .expect("durable checkout create should succeed");
+    // The checkout observed under the old identity is what names the old Repository as superseded.
 
     let repositories = daemon.resource_backend().using::<Repository>("flotilla");
     repositories.delete(&old_key.to_string()).await.expect("simulate already-disappeared old Repository");
