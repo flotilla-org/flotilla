@@ -22,10 +22,11 @@ use std::{
 use flotilla_credentials::{CredentialStore, GithubAppRefreshWake, GithubAppScope};
 use flotilla_resources::{
     environment_records::EnvironmentChange,
-    vessel_records::{environment_vessels, EnvironmentVessel},
+    vessel_records::{environment_vessels, EnvironmentVessel, EnvironmentVessels, VesselWithoutConvoy},
     CredentialGrant, CredentialSpec, Project, ReadWatchEvent, Repository, RepositoryKey, RepositoryTrust, TerminalSession,
     TerminalSessionPhase, WatchEvent,
 };
+use flotilla_store::load_metrics::ControllerLoadMetrics;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, info, warn};
@@ -33,6 +34,9 @@ use tracing::{debug, info, warn};
 use super::access_layer::redeliver_central_logins;
 use super::credentials::{github_app_scope_from_grants, reconcile_credential_refresh_attention_in, redeliver_codex_credentials};
 use super::state::ControllerRuntimeState;
+
+/// The kind the loop's metrics are registered under, as the runtime starts it.
+const METRICS_KIND: &str = "CredentialDelivery";
 
 /// The backoff after an environment's delivery fails, doubling to the cap.
 const RETRY_INITIAL: Duration = Duration::from_secs(30);
@@ -152,6 +156,8 @@ pub(super) struct CredentialDelivery {
     login_retry_at: Option<tokio::time::Instant>,
     /// The refresh failures last told to the attention reconciler.
     told: Vec<(String, Option<String>, bool)>,
+    /// The loop's metrics, which every pass, the start pass too, counts into.
+    metrics: Arc<ControllerLoadMetrics>,
 }
 
 impl CredentialDelivery {
@@ -159,6 +165,7 @@ impl CredentialDelivery {
     pub(super) fn new(state: Arc<ControllerRuntimeState>) -> Option<Self> {
         let store = state.credential_store.clone()?;
         Some(Self {
+            metrics: state.controller_metrics.for_kind(METRICS_KIND),
             namespace: state.namespace.clone(),
             events: Arc::clone(&state.credential_events),
             state,
@@ -415,10 +422,16 @@ impl CredentialDelivery {
         let backend = self.state.daemon.resource_backend();
         let reads = self.state.daemon.lifecycle_reads();
         let named = environments.cloned();
-        let vessels = tokio::task::spawn_blocking(move || environment_vessels(reads.as_ref(), named.as_ref()))
-            .await
-            .map_err(|error| format!("read credential vessels: {error}"))?
-            .map_err(|error| format!("read credential vessels: {error}"))?;
+        let EnvironmentVessels { vessels, without_convoy } =
+            tokio::task::spawn_blocking(move || environment_vessels(reads.as_ref(), named.as_ref()))
+                .await
+                .map_err(|error| format!("read credential vessels: {error}"))?
+                .map_err(|error| format!("read credential vessels: {error}"))?;
+        // The other vessels' credentials are still delivered.
+        for VesselWithoutConvoy { vessel, convoy, convoy_home } in &without_convoy {
+            warn!(%vessel, %convoy, %convoy_home, "credential delivery: the vessel's convoy record is missing; its credentials are left out");
+            self.metrics.skipped.increment();
+        }
         let needs_grants = vessels.iter().any(|vessel| !vessel.requirement.credential_scopes.is_empty());
         let (grants, repository_trust) = if needs_grants {
             let grants = backend

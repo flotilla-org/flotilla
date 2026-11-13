@@ -452,6 +452,8 @@ pub struct ControllerLoadMetrics {
     pub queue_peak: Peak,
     /// Objects whose retries ran out, held until they change.
     pub parked: Gauge,
+    /// Objects a pass left out because a record they are read with is missing.
+    pub skipped: Counter,
 }
 
 #[derive(Debug, Default)]
@@ -497,6 +499,7 @@ impl ControllerLoadMetrics {
             resync_enqueued: self.resync_enqueued.get(),
             queue_peak: self.queue_peak.get(),
             parked: self.parked.get(),
+            skipped: self.skipped.get(),
         }
     }
 }
@@ -515,6 +518,7 @@ pub struct ControllerLoadSnapshot {
     pub queue_peak: u64,
     /// Current, not accumulated: `since` keeps the later value.
     pub parked: u64,
+    pub skipped: u64,
 }
 
 impl ControllerLoadSnapshot {
@@ -531,6 +535,7 @@ impl ControllerLoadSnapshot {
             resync_enqueued: self.resync_enqueued.saturating_sub(earlier.resync_enqueued),
             queue_peak: self.queue_peak,
             parked: self.parked,
+            skipped: self.skipped.saturating_sub(earlier.skipped),
         }
     }
 }

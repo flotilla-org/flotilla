@@ -121,6 +121,7 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
                 ("failures", snapshot.failures),
                 ("resyncs", snapshot.resyncs),
                 ("resync_enqueued", snapshot.resync_enqueued),
+                ("skipped", snapshot.skipped),
             ] {
                 out.number(&format!("flotilla_controller_{name}_total"), "counter", &labels, value);
             }
@@ -371,6 +372,7 @@ mod tests {
             "flotilla_controller_failures_total",
             "flotilla_controller_resyncs_total",
             "flotilla_controller_resync_enqueued_total",
+            "flotilla_controller_skipped_total",
             "flotilla_replication_snapshots_total",
             "flotilla_replication_events_applied_total",
             "flotilla_read_retry_recoveries_total",

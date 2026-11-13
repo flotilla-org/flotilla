@@ -237,14 +237,14 @@ async fn vessels_in_one_environment(others: usize) -> (Vec<EnvironmentVessel>, u
         engine.vessels.ready(&vessel, &environment);
     }
     if others == 5 {
-        let every = environment_vessels(convoys.reads().as_ref(), None).expect("every environment's vessels");
+        let every = environment_vessels(convoys.reads().as_ref(), None).expect("every environment's vessels").vessels;
         assert_eq!(every.len(), others + 2, "a full pass finds every vessel: {every:?}");
     }
 
     let launches = engine.vessels.vessels.launches_read();
     let converted = convoys.views().views_converted();
     let gets = keyed_gets(&convoys, &engine);
-    let found = environment_vessels(convoys.reads().as_ref(), Some(&BTreeSet::from(["shared".to_owned()]))).expect("vessels");
+    let found = environment_vessels(convoys.reads().as_ref(), Some(&BTreeSet::from(["shared".to_owned()]))).expect("vessels").vessels;
     (
         found,
         engine.vessels.vessels.launches_read() - launches,

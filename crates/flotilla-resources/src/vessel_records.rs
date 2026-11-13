@@ -237,6 +237,23 @@ pub struct EnvironmentVessel {
     pub live: bool,
 }
 
+/// What [`environment_vessels`] reads: the vessels, and those left out because their convoy's
+/// record is missing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EnvironmentVessels {
+    pub vessels: Vec<EnvironmentVessel>,
+    pub without_convoy: Vec<VesselWithoutConvoy>,
+}
+
+/// A vessel launch whose convoy's record is not held: nothing says what its work requires.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VesselWithoutConvoy {
+    /// The launch.
+    pub vessel: String,
+    pub convoy: String,
+    pub convoy_home: String,
+}
+
 /// The vessels at this home that the Vessel listing shows in `environments` (or in any
 /// environment), each with its convoy's requirement for it, read from the records without
 /// composing a view: each work's newest launch here, unless it was released, or it ended and its
@@ -247,10 +264,13 @@ pub struct EnvironmentVessel {
 /// the vessels of the terminal launches in it. A host's own environment is shared and held by no
 /// vessel; a vessel realised in it seats its crews there before it is ready, so their launches
 /// name it.
+///
+/// A vessel whose convoy's record is missing is left out and named in
+/// [`EnvironmentVessels::without_convoy`]; the others are still read.
 pub fn environment_vessels(
     reads: &dyn crate::lifecycle_reads::LifecycleReads,
     environments: Option<&BTreeSet<String>>,
-) -> Result<Vec<EnvironmentVessel>, String> {
+) -> Result<EnvironmentVessels, String> {
     let vessels = reads.vessels()?;
     let terminals = reads.terminals()?;
     let environment_records = reads.environments()?;
@@ -301,7 +321,7 @@ pub fn environment_vessels(
     }
     let convoys = reads.convoys()?;
     let mut convoy_records = BTreeMap::new();
-    let mut found = Vec::new();
+    let mut found = EnvironmentVessels::default();
     for record in newest.into_values() {
         if record.reading == LifecycleReading::Released {
             continue;
@@ -317,7 +337,10 @@ pub fn environment_vessels(
         if !convoy_records.contains_key(&key) {
             convoy_records.insert(key.clone(), convoys.get(&record.convoy, Some(&record.convoy_home))?);
         }
-        let Some(convoy) = &convoy_records[&key] else { continue };
+        let Some(convoy) = &convoy_records[&key] else {
+            found.without_convoy.push(VesselWithoutConvoy { vessel: record.name, convoy: record.convoy, convoy_home: record.convoy_home });
+            continue;
+        };
         if record.ended() && convoy.is_terminal(&vessels.of_convoy(&convoy.name)?) {
             continue;
         }
@@ -325,7 +348,7 @@ pub fn environment_vessels(
         else {
             continue;
         };
-        found.push(EnvironmentVessel {
+        found.vessels.push(EnvironmentVessel {
             live: live.contains(&(record.name.clone(), environment.clone())),
             requirement: requirement.clone(),
             project: (!convoy.project.is_empty()).then(|| convoy.project.clone()),
