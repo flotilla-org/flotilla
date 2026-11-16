@@ -1181,242 +1181,252 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
 
 // #2613: settlement is terminal once merge has been recognised. Collecting the
 // evidence afterwards must not undo it; without recognition, absence still holds.
-#[hegel::test]
-fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
-    // Cover both deletion orders, recognised/unrecognised merge, and legacy
-    // Landed records that predate the persisted disposition.
-    let recognise_merge = tc.draw(hegel::generators::booleans());
-    let checkout_first = tc.draw(hegel::generators::booleans());
-    let legacy_disposition = tc.draw(hegel::generators::booleans());
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(async {
-        let TerminalChangeRequestReconcile { settlement, backend, checkouts, checkout_launch, .. } =
-            reconcile_terminal_bound_change_request(true, VesselsAre::Live, false).await;
-        let convoys = backend.using::<Convoy>("flotilla");
-        let changes = backend.using::<ChangeRequest>("flotilla");
-        if recognise_merge {
-            // The engine delivered the launch: its view reads Landed with the disposition.
-            let current = convoys.get("convoy-a").await.expect("convoy");
-            let mut status = current.status.clone().expect("status");
-            status.phase = ConvoyPhase::Landed;
-            status.disposition = Some(settlement.disposition.clone().expect("merged exit"));
-            if legacy_disposition {
-                status.disposition = None;
+#[tokio::test]
+async fn collected_merge_evidence_preserves_settlement() {
+    // Every combination of both deletion orders, recognised/unrecognised merge,
+    // and legacy Landed records that predate the persisted disposition.
+    for recognise_merge in [false, true] {
+        for checkout_first in [false, true] {
+            for legacy_disposition in [false, true] {
+                let TerminalChangeRequestReconcile { settlement, backend, checkouts, checkout_launch, .. } =
+                    reconcile_terminal_bound_change_request(true, VesselsAre::Live, false).await;
+                let convoys = backend.using::<Convoy>("flotilla");
+                let changes = backend.using::<ChangeRequest>("flotilla");
+                if recognise_merge {
+                    // The engine delivered the launch: its view reads Landed with the disposition.
+                    let current = convoys.get("convoy-a").await.expect("convoy");
+                    let mut status = current.status.clone().expect("status");
+                    status.phase = ConvoyPhase::Landed;
+                    status.disposition = Some(settlement.disposition.clone().expect("merged exit"));
+                    if legacy_disposition {
+                        status.disposition = None;
+                    }
+                    convoys.update_status("convoy-a", &current.metadata.resource_version, &status).await.expect("persist settlement");
+                }
+                if !recognise_merge {
+                    let name = cr_name("github.com", "example/repo-a", 42);
+                    let record = changes.get(&name).await.expect("CR");
+                    let mut status = record.status.expect("CR status");
+                    status.state = Observation::known(ObservedChangeRequestState::Open, timestamp(40));
+                    changes.update_status(&name, &record.metadata.resource_version, &status).await.expect("publish open CR");
+                }
+                for delete_checkout in [checkout_first, !checkout_first] {
+                    if delete_checkout {
+                        // Its home releases it: the launch ends.
+                        checkouts.finish(checkout_launch.as_deref().expect("checkout present"), Ending::Released);
+                    } else {
+                        changes.delete(&cr_name("github.com", "example/repo-a", 42)).await.expect("collect CR");
+                    }
+                    let current = convoys.get("convoy-a").await.expect("convoy");
+                    let checkout_objects = held_checkouts(&checkouts);
+                    let change_objects = changes
+                        .list()
+                        .await
+                        .expect("changes")
+                        .items
+                        .into_iter()
+                        .map(|object| (object.metadata.name.clone(), object))
+                        .collect();
+                    let evaluation = evaluate_landing_settlement(
+                        &current,
+                        &checkout_objects,
+                        &[],
+                        &change_objects,
+                        &[],
+                        Duration::from_secs(180),
+                        Duration::from_secs(30),
+                        timestamp(40),
+                    );
+                    if recognise_merge {
+                        assert!(evaluation.satisfied, "Landed settlement must survive collection: {:?}", evaluation.unmet);
+                        assert!(evaluation.unmet.is_empty());
+                    } else {
+                        assert!(!evaluation.satisfied, "unrecognised merge cannot discharge missing evidence");
+                        let judgement = landing_judgement(&backend, &current, &checkouts, &VesselsFixture::default(), timestamp(40)).await;
+                        assert_eq!(judgement.disposition, None, "an unrecognised merge is not delivered");
+                    }
+                }
             }
-            convoys.update_status("convoy-a", &current.metadata.resource_version, &status).await.expect("persist settlement");
         }
-        if !recognise_merge {
-            let name = cr_name("github.com", "example/repo-a", 42);
-            let record = changes.get(&name).await.expect("CR");
-            let mut status = record.status.expect("CR status");
-            status.state = Observation::known(ObservedChangeRequestState::Open, timestamp(40));
-            changes.update_status(&name, &record.metadata.resource_version, &status).await.expect("publish open CR");
-        }
-        for delete_checkout in [checkout_first, !checkout_first] {
-            if delete_checkout {
-                // Its home releases it: the launch ends.
-                checkouts.finish(checkout_launch.as_deref().expect("checkout present"), Ending::Released);
-            } else {
-                changes.delete(&cr_name("github.com", "example/repo-a", 42)).await.expect("collect CR");
-            }
-            let current = convoys.get("convoy-a").await.expect("convoy");
-            let checkout_objects = held_checkouts(&checkouts);
-            let change_objects =
-                changes.list().await.expect("changes").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
-            let evaluation = evaluate_landing_settlement(
-                &current,
-                &checkout_objects,
-                &[],
-                &change_objects,
-                &[],
-                Duration::from_secs(180),
-                Duration::from_secs(30),
-                timestamp(40),
-            );
-            if recognise_merge {
-                assert!(evaluation.satisfied, "Landed settlement must survive collection: {:?}", evaluation.unmet);
-                assert!(evaluation.unmet.is_empty());
-            } else {
-                assert!(!evaluation.satisfied, "unrecognised merge cannot discharge missing evidence");
-                let judgement = landing_judgement(&backend, &current, &checkouts, &VesselsFixture::default(), timestamp(40)).await;
-                assert_eq!(judgement.disposition, None, "an unrecognised merge is not delivered");
-            }
-        }
-    });
+    }
 }
 
 // ADR 0061 / #2979: the first merged PR must not settle a three-PR crew.
 // Duplicate observation cannot settle after a partial merge; the promises keep
 // their states and submission evidence without any completion command.
-#[hegel::test]
-fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
+#[tokio::test(flavor = "multi_thread")]
+async fn three_pr_promises_hold_completion_and_landing() {
     use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission};
-    // Span settlement before launch, during active work, and after interruption.
-    let envelope = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2));
-    let interrupted = envelope == 1;
-    let pending = envelope == 2;
-    let duplicates = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let convoys = backend.using::<Convoy>("flotilla");
-        let requests = backend.using::<ChangeRequest>("flotilla");
-        let mut workflow = implement_review_workflow_spec();
-        workflow.vessels[0].crew.retain(|crew| crew.role == "coder");
-        workflow.vessels[0].crew[0].completion_conditions.clear();
-        workflow.vessels[0].crew[0].promises.clear();
-        workflow.vessels[0].crew[0].deliverer = true;
-        let mut status = ConvoyStatus {
-            phase: if pending {
-                ConvoyPhase::Pending
-            } else if interrupted {
-                ConvoyPhase::Interrupted
-            } else {
-                ConvoyPhase::Active
-            },
-            observed_workflow_ref: Some("review-and-fix".into()),
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: workflow.exit,
-                turn_delivery: workflow.turn_delivery,
-                vessels: workflow.vessels,
-            }),
-            work: BTreeMap::from([(
-                "work".into(),
-                flotilla_resources::WorkState::builder()
-                    .phase(if pending {
-                        WorkPhase::Ready
-                    } else if interrupted {
-                        WorkPhase::Interrupted
-                    } else {
-                        WorkPhase::Running
-                    })
-                    .build(),
-            )]),
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([(
-                    "coder".into(),
-                    flotilla_resources::CrewWorkState::builder()
+    // Span settlement before launch, during active work, and after interruption,
+    // with each number of duplicate observations.
+    for envelope in 0..=2 {
+        for duplicates in 1..=3usize {
+            let interrupted = envelope == 1;
+            let pending = envelope == 2;
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let convoys = backend.using::<Convoy>("flotilla");
+            let requests = backend.using::<ChangeRequest>("flotilla");
+            let mut workflow = implement_review_workflow_spec();
+            workflow.vessels[0].crew.retain(|crew| crew.role == "coder");
+            workflow.vessels[0].crew[0].completion_conditions.clear();
+            workflow.vessels[0].crew[0].promises.clear();
+            workflow.vessels[0].crew[0].deliverer = true;
+            let mut status = ConvoyStatus {
+                phase: if pending {
+                    ConvoyPhase::Pending
+                } else if interrupted {
+                    ConvoyPhase::Interrupted
+                } else {
+                    ConvoyPhase::Active
+                },
+                observed_workflow_ref: Some("review-and-fix".into()),
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: workflow.exit,
+                    turn_delivery: workflow.turn_delivery,
+                    vessels: workflow.vessels,
+                }),
+                work: BTreeMap::from([(
+                    "work".into(),
+                    flotilla_resources::WorkState::builder()
                         .phase(if pending {
-                            CrewWorkPhase::Pending
+                            WorkPhase::Ready
                         } else if interrupted {
-                            CrewWorkPhase::Interrupted
+                            WorkPhase::Interrupted
                         } else {
-                            CrewWorkPhase::Working
+                            WorkPhase::Running
                         })
                         .build(),
                 )]),
-            )]),
-            ..Default::default()
-        };
-        for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], &status, false) {
-            flotilla_resources::promises::apply(&mut status, &vessel, &role, &operation);
-        }
-        for number in 1..=3 {
-            flotilla_resources::promises::apply(
-                &mut status,
-                "work",
-                "coder",
-                &PromiseOperation::Declare { id: format!("B{number}"), kind: PromiseKind::Pr, source: PromiseSource::Dispatch },
-            );
-        }
-        let created = convoys
-            .create(&convoy_meta("three-pr"), &flotilla_resources::ConvoySpec::builder().workflow_ref("review-and-fix".into()).build())
-            .await
-            .unwrap();
-        convoys.update_status("three-pr", &created.metadata.resource_version, &status).await.unwrap();
-        // The controller's observer: each pass observes the next promise the records settle.
-        let observe = |at| {
-            let (convoys, requests) = (convoys.clone(), requests.clone());
-            async move {
-                for _ in 0..16 {
-                    let current = convoys.get("three-pr").await.unwrap();
-                    let records = requests.list().await.unwrap().items.into_iter().map(|cr| (cr.metadata.name.clone(), cr)).collect();
-                    let Some(observation) = flotilla_resources::promises::next_observation(
-                        current.status.as_ref().unwrap(),
-                        "three-pr",
-                        &records,
-                        &BTreeMap::new(),
-                        &[],
-                        at,
-                        Duration::from_secs(180),
-                    ) else {
-                        break;
-                    };
-                    flotilla_store::apply_status_patch(&convoys, "three-pr", &observation).await.unwrap();
-                }
-            }
-        };
-        for number in 1..=3 {
-            let address = flotilla_protocol::LeafAddress::ChangeRequest {
-                service: "github.com".into(),
-                scope: "flotilla-org/flotilla".into(),
-                number,
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([(
+                        "coder".into(),
+                        flotilla_resources::CrewWorkState::builder()
+                            .phase(if pending {
+                                CrewWorkPhase::Pending
+                            } else if interrupted {
+                                CrewWorkPhase::Interrupted
+                            } else {
+                                CrewWorkPhase::Working
+                            })
+                            .build(),
+                    )]),
+                )]),
+                ..Default::default()
             };
-            let name = cr_name("github.com", "flotilla-org/flotilla", number);
-            let record = requests
-                .create(
-                    &InputMeta::builder().name(name.clone()).build(),
-                    &ChangeRequestSpec::builder()
-                        .service("github.com".into())
-                        .scope("flotilla-org/flotilla".into())
-                        .number(number)
-                        .observing_authority("host-a".into())
-                        .build(),
+            for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], &status, false) {
+                flotilla_resources::promises::apply(&mut status, &vessel, &role, &operation);
+            }
+            for number in 1..=3 {
+                flotilla_resources::promises::apply(
+                    &mut status,
+                    "work",
+                    "coder",
+                    &PromiseOperation::Declare { id: format!("B{number}"), kind: PromiseKind::Pr, source: PromiseSource::Dispatch },
+                );
+            }
+            let created = convoys
+                .create(&convoy_meta("three-pr"), &flotilla_resources::ConvoySpec::builder().workflow_ref("review-and-fix".into()).build())
+                .await
+                .unwrap();
+            convoys.update_status("three-pr", &created.metadata.resource_version, &status).await.unwrap();
+            // The controller's observer: each pass observes the next promise the records settle.
+            let observe = |at| {
+                let (convoys, requests) = (convoys.clone(), requests.clone());
+                async move {
+                    for _ in 0..16 {
+                        let current = convoys.get("three-pr").await.unwrap();
+                        let records = requests.list().await.unwrap().items.into_iter().map(|cr| (cr.metadata.name.clone(), cr)).collect();
+                        let Some(observation) = flotilla_resources::promises::next_observation(
+                            current.status.as_ref().unwrap(),
+                            "three-pr",
+                            &records,
+                            &BTreeMap::new(),
+                            &[],
+                            at,
+                            Duration::from_secs(180),
+                        ) else {
+                            break;
+                        };
+                        flotilla_store::apply_status_patch(&convoys, "three-pr", &observation).await.unwrap();
+                    }
+                }
+            };
+            for number in 1..=3 {
+                let address = flotilla_protocol::LeafAddress::ChangeRequest {
+                    service: "github.com".into(),
+                    scope: "flotilla-org/flotilla".into(),
+                    number,
+                };
+                let name = cr_name("github.com", "flotilla-org/flotilla", number);
+                let record = requests
+                    .create(
+                        &InputMeta::builder().name(name.clone()).build(),
+                        &ChangeRequestSpec::builder()
+                            .service("github.com".into())
+                            .scope("flotilla-org/flotilla".into())
+                            .number(number)
+                            .observing_authority("host-a".into())
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                requests
+                    .update_status(&name, &record.metadata.resource_version, &merged_change_request_status(timestamp(40)))
+                    .await
+                    .unwrap();
+                flotilla_store::apply_status_patch(
+                    &convoys,
+                    "three-pr",
+                    &ConvoyStatusPatch::Promise {
+                        vessel: "work".into(),
+                        role: "coder".into(),
+                        operation: PromiseOperation::Submit {
+                            id: format!("B{number}"),
+                            kind: PromiseKind::Pr,
+                            source: PromiseSource::Crew,
+                            submission: Submission {
+                                reference: address.to_string(),
+                                metadata: BTreeMap::new(),
+                                submitted_at: timestamp(30),
+                                verdict: None,
+                            },
+                        },
+                    },
                 )
                 .await
                 .unwrap();
-            requests.update_status(&name, &record.metadata.resource_version, &merged_change_request_status(timestamp(40))).await.unwrap();
-            flotilla_store::apply_status_patch(
-                &convoys,
-                "three-pr",
-                &ConvoyStatusPatch::Promise {
-                    vessel: "work".into(),
-                    role: "coder".into(),
-                    operation: PromiseOperation::Submit {
-                        id: format!("B{number}"),
-                        kind: PromiseKind::Pr,
-                        source: PromiseSource::Crew,
-                        submission: Submission {
-                            reference: address.to_string(),
-                            metadata: BTreeMap::new(),
-                            submitted_at: timestamp(30),
-                            verdict: None,
-                        },
-                    },
-                },
-            )
-            .await
-            .unwrap();
-            observe(timestamp(55)).await;
-            let current = convoys.get("three-pr").await.unwrap();
-            let promises = &current.status.as_ref().unwrap().promises["work"]["coder"];
-            assert_eq!(promises.iter().filter(|p| p.state == PromiseState::Kept).count(), number as usize + 1);
-            for _ in 0..duplicates {
                 observe(timestamp(55)).await;
                 let current = convoys.get("three-pr").await.unwrap();
-                let evidence = evaluate_landing_settlement(
-                    &current,
-                    &BTreeMap::new(),
-                    &[],
-                    &requests.list().await.unwrap().items.into_iter().map(|cr| (cr.metadata.name.clone(), cr)).collect(),
-                    &[],
-                    Duration::from_secs(180),
-                    Duration::from_secs(180),
-                    timestamp(55),
-                );
-                assert_eq!(evidence.satisfied, number == 3);
-                assert_eq!(evidence.promises.len(), 4);
+                let promises = &current.status.as_ref().unwrap().promises["work"]["coder"];
+                assert_eq!(promises.iter().filter(|p| p.state == PromiseState::Kept).count(), number as usize + 1);
+                for _ in 0..duplicates {
+                    observe(timestamp(55)).await;
+                    let current = convoys.get("three-pr").await.unwrap();
+                    let evidence = evaluate_landing_settlement(
+                        &current,
+                        &BTreeMap::new(),
+                        &[],
+                        &requests.list().await.unwrap().items.into_iter().map(|cr| (cr.metadata.name.clone(), cr)).collect(),
+                        &[],
+                        Duration::from_secs(180),
+                        Duration::from_secs(180),
+                        timestamp(55),
+                    );
+                    assert_eq!(evidence.satisfied, number == 3);
+                    assert_eq!(evidence.promises.len(), 4);
+                }
             }
+            observe(timestamp(65)).await;
+            let current = convoys.get("three-pr").await.unwrap();
+            let promises = &current.status.as_ref().unwrap().promises["work"]["coder"];
+            assert_eq!(promises.len(), 4);
+            assert!(promises.iter().all(|p| p.state == PromiseState::Kept));
         }
-        observe(timestamp(65)).await;
-        let current = convoys.get("three-pr").await.unwrap();
-        let promises = &current.status.as_ref().unwrap().promises["work"]["coder"];
-        assert_eq!(promises.len(), 4);
-        assert!(promises.iter().all(|p| p.state == PromiseState::Kept));
-    });
+    }
 }
 
 // Behaviour: a repository whose change request landed on a target other than the one it
