@@ -1999,6 +1999,9 @@ impl CredentialStore {
                     "#!/bin/sh\nGH_TOKEN=$(cat \"$GITHUB_TOKEN_FILE\") || exit $?\nexport GH_TOKEN\nexec {} \"$@\"\n",
                     shell_single_quote(gh_path)
                 );
+                // Its preflight below runs it through sh, never by path: a concurrent fork may still
+                // hold the write descriptor, and exec of the file would fail with ETXTBSY. The crew
+                // execs it by name from PATH only after delivery, once no such fork remains.
                 write_executable(&*runner, &gh_wrapper, &gh_wrapper_contents, "gh token-file wrapper").await?;
                 let git_helper = credential_dir.join("git-credential-github-app");
                 let git_helper_contents = "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nhost=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$host\" = github.com ] || exit 0\nprintf 'username=x-access-token\\n'\nprintf 'password='\ncat \"$GITHUB_TOKEN_FILE\"\nprintf '\\n'\n";
@@ -2009,7 +2012,7 @@ impl CredentialStore {
                         "sh",
                         &[
                             "-c",
-                            "unset GH_TOKEN GITHUB_TOKEN; GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories --silent",
+                            "unset GH_TOKEN GITHUB_TOKEN; GITHUB_TOKEN_FILE=\"$1\" /bin/sh \"$2\" api installation/repositories --silent",
                             "flotilla-github-app-preflight",
                             &token_file,
                             &gh_wrapper_path,
@@ -2025,12 +2028,7 @@ impl CredentialStore {
                 }
                 env.insert("PATH".to_string(), format!("{}:{path}", credential_dir.to_string_lossy()));
                 git_credential = Some(GitCredentialContribution {
-                    fragment: git_credential_fragment(
-                        name,
-                        "github-app",
-                        "https://github.com",
-                        format!("!{}", git_helper.to_string_lossy()),
-                    ),
+                    fragment: git_credential_fragment(name, "github-app", "https://github.com", sh_helper(&git_helper.to_string_lossy())),
                     preflight: Some(GitCredentialPreflight::GithubApp { token_file }),
                 });
             }
@@ -2082,7 +2080,7 @@ impl CredentialStore {
                 env.insert("FORGEJO_API_URL".to_string(), format!("{server_url}/api/v1"));
                 env.insert("FORGEJO_USERNAME".to_string(), username.to_string());
                 git_credential = Some(GitCredentialContribution {
-                    fragment: git_credential_fragment(name, "forgejo", credential_url, format!("!{helper_path}")),
+                    fragment: git_credential_fragment(name, "forgejo", credential_url, sh_helper(&helper_path)),
                     preflight: (!already_prepared).then(|| GitCredentialPreflight::Forgejo {
                         host: match parsed_url.port() {
                             Some(port) => format!("{host}:{port}"),
@@ -2120,7 +2118,7 @@ impl CredentialStore {
                         .map_err(|error| format!("write Git credential helper: {error}"))?;
                 }
                 git_credential = Some(GitCredentialContribution {
-                    fragment: git_credential_fragment(name, "git-http-token", credential_url, format!("!{helper_path}")),
+                    fragment: git_credential_fragment(name, "git-http-token", credential_url, sh_helper(&helper_path)),
                     preflight: (!already_prepared).then_some(GitCredentialPreflight::GitHttpToken { host }),
                 });
             }
@@ -2291,6 +2289,13 @@ fn forgejo_git_host(server_url: &str) -> Result<String, String> {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     })
+}
+
+/// The Git credential helper value running the script at `path` through sh. The script is never
+/// exec'd: this daemon has just written it, and a concurrent fork may still hold the write
+/// descriptor, so exec would fail with ETXTBSY.
+fn sh_helper(path: &str) -> String {
+    format!("!/bin/sh {}", shell_single_quote(path))
 }
 
 fn git_credential_fragment(credential_name: &str, adapter: &str, credential_url: impl Into<String>, helper: impl Into<String>) -> Fragment {
@@ -2603,6 +2608,52 @@ mod tests {
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;
+
+    // Behaviour: a Git credential helper delivered while other threads spawn processes runs at
+    // its preflight every time. A fork during the helper's write holds the write descriptor until
+    // it execs, so a helper exec'd by path fails with ETXTBSY; delivery runs it through sh. Its
+    // state path holds a space and a single quote, which the helper value quotes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delivered_git_helpers_run_while_other_threads_spawn() {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawners = (0..6)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    use std::os::unix::process::CommandExt;
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut command = std::process::Command::new("true");
+                        // A child that runs code before exec, as the daemon's detaching spawns
+                        // do, holds the descriptors it forked with for that long.
+                        // SAFETY: the child only sleeps, which is async-signal-safe.
+                        unsafe {
+                            command.pre_exec(|| {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                Ok(())
+                            });
+                        }
+                        let _ = command.status();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut failures = Vec::new();
+        for round in 0..600 {
+            let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+            create_git_http_token_spec(&backend, "lab-forgejo", "forgejo.lab", "TEST_FORGEJO_TOKEN").await;
+            let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
+            let runner = Arc::new(ProcessCommandRunner);
+            let state = base.path().join(format!("crew's state {round}"));
+            let store = CredentialStore::new(backend, "flotilla", env, EnvironmentBag::new(), runner.clone(), state);
+            if let Err(error) = store.prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner).await {
+                failures.push(error);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        spawners.into_iter().for_each(|spawner| spawner.join().expect("spawner"));
+        assert_eq!(failures, Vec::<String>::new(), "every delivery's helper ran");
+    }
 
     #[derive(Default)]
     struct TestEnv(BTreeMap<String, String>);
@@ -4558,7 +4609,8 @@ interactions:
         {
             let calls = runner.calls.lock().expect("calls lock");
             assert!(calls.iter().any(|(command, args, _)| {
-                command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
+                command == "sh"
+                    && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" /bin/sh \"$2\" api installation/repositories"))
             }));
             assert!(calls
                 .iter()
@@ -5276,7 +5328,7 @@ interactions:
             .expect("staged shared Git config");
         assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
         assert!(gitconfig.contains(
-            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"
+            "[credential \"https://forgejo.lab\"]\n\thelper = !/bin/sh '/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token'"
         ));
         assert!(gitconfig.contains("# fragment: credential/gh github"));
         assert!(gitconfig.contains("# fragment: credential/git-http-token lab-forgejo"));
@@ -5335,7 +5387,7 @@ interactions:
             .expect("staged shared Git config");
         assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
         assert!(gitconfig.contains(
-            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"
+            "[credential \"https://forgejo.lab\"]\n\thelper = !/bin/sh '/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token'"
         ));
     }
 
@@ -5387,7 +5439,7 @@ interactions:
             writes[2],
             (
                 PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
-                "# fragment: credential/git-http-token lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
+                "# fragment: credential/git-http-token lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/bin/sh '/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token'\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
             )
         );
         let protected = runner.protected_writes.lock().expect("protected writes lock");
