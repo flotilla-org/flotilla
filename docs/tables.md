@@ -52,17 +52,19 @@ Errors found while a stream is already open arrive as a `resync` message instead
 Parameters apply to the rows route. Each is validated against the table's description before any row is read.
 
 - `where=<condition>`, repeatable; every condition must hold. A condition is an expression in the condition language ([Conditions](#conditions)), URL-encoded, such as `where=inbox.under("project:flotilla/convoy:fix-3774")`.
+- `scope=<condition>`, repeatable: conditions as `where`, which the rows must also match, but which name the set a `count`'s `total` counts and every field's distinct values are drawn from. A client puts the view's fixed bounds in `scope` and the user's filters in `where`.
+- `values=a,b`, repeatable: filterable fields whose distinct values the read sends, one `values` message each. A field's values are counted over the rows matching every `scope` and every `where` except those that mention only that field, so a filtered column's own values stay listed. A clause mentioning the field and another field still applies. A field that cannot be filtered is refused as `where` refuses it. A client asks for every field it offers a checklist for when it opens a watch, and keeps the lists from the deltas.
 - `sort=a,-b`: comma-separated column names, `-` for descending. Columns must be `sortable`. The table's key columns are appended in ascending order, so the order is total. Null sorts before every value ascending, and after every value descending.
 - `columns=a,b`: the columns to return. Key columns and the [subject](#subject-and-address-cells) field are always included, and a `reference` column brings its `.kind` and `.home` companions.
 - `limit`: rows per page; 200 when absent, otherwise 1 to 10000.
 - `offset`: rows to skip (default 0).
-- `cursor`: the `cursor` of the previous `rows` message when it was not null. It is opaque, and bound to the table, `namespace`, `sort` and the canonical text of `where` of the query that produced it, so another spelling of the same conditions continues it; a cursor used with a different query, or one issued before conditions took this language, yields a `resync` message instead of rows. Paging is keyset: rows strictly after the cursor's sort values are returned, so inserts and deletes between pages do not shift it.
-- `count=exact|estimate`: adds a `count` message.
+- `cursor`: the `cursor` of the previous `rows` message when it was not null. It is opaque, and bound to the table, `namespace`, `sort` and the canonical text of `scope` and `where`, conjoined, of the query that produced it, so another spelling of the same conditions continues it; a cursor used with a different query, or one issued before conditions took this language, yields a `resync` message instead of rows. Paging is keyset: rows strictly after the cursor's sort values are returned, so inserts and deletes between pages do not shift it.
+- `count=exact|estimate`: adds a `count` message, carrying the rows matching every condition and the `total` matching the `scope` alone.
 - `namespace` (default `default`): the scope read. Flotilla's own records live in the `flotilla` namespace, so a client that omits `namespace` gets empty tables and no error; pass `namespace=flotilla`. For engine kinds, a namespace other than `default` names the home.
 - `watch` (bare, or `true`): keep the stream open and send changes.
 - `query`: on a named query's tables only, the query to read, as the JSON of its framed-protocol query id (`{"convoys":{"scope":{"namespace":"flotilla","name":"demo"}}}`). It must be of the table's family. Absent, a table reads its family's fleet-wide query; `issue_row` tables need one, and answer `invalid_request` without it.
 
-`.log` tables accept no `watch`, `cursor`, `offset`, `count` or custom `sort`; they return a bounded snapshot in `home, sequence` order.
+`.log` tables accept no `watch`, `cursor`, `offset`, `count`, `values` or custom `sort`; they return a bounded snapshot in `home, sequence` order.
 
 ## Conditions
 
@@ -95,7 +97,7 @@ map: in
 - A bare boolean field is a condition: `done`, `!done`.
 - On resource kinds, `metadata.labels` is a map: `"k" in metadata.labels` tests a label's presence and `metadata.labels["k"] == "v"` its value; its `additionalProperties` carry the string operators. Label and indexed field equalities are read through the store's indexes, and the rest of the condition is evaluated over the rows the store returns.
 
-Errors: a condition that does not parse, exceeds a limit (32 terms in one `&&` or `||` run, 32 list elements, 12 nested parentheses or `!`, 4,096 bytes), or names a bare word where a literal belongs, is `invalid_filter`; a field the table does not have is `unknown_column`, and one it cannot filter is `unsupported_filter`; a literal of the wrong type, an enum name outside the set, a non-canonical address, or ordering (`<`, `>`, …) on a boolean, enum or address is `type_mismatch`.
+Errors, for `scope` as for `where`: a condition that does not parse, exceeds a limit (32 terms in one `&&` or `||` run, 32 list elements, 12 nested parentheses or `!`, 4,096 bytes), or names a bare word where a literal belongs, is `invalid_filter`; a field the table does not have is `unknown_column`, and one it cannot filter is `unsupported_filter`; a literal of the wrong type, an enum name outside the set, a non-canonical address, or ordering (`<`, `>`, …) on a boolean, enum or address is `type_mismatch`.
 
 ## Messages
 
@@ -108,6 +110,7 @@ delete
 progress
 resync
 count
+values
 ```
 
 Every message is an object with a `type` field holding one of the names above. `sequence` is the source position the message describes.
@@ -115,7 +118,8 @@ Every message is an object with a `type` field holding one of the names above. `
 | `type` | Other fields | Meaning |
 |---|---|---|
 | `table` | `table`, `schema`, `incarnation`, `sequence` | The description (below), limited to the requested `columns`. |
-| `count` | `count`, `estimate`, `sequence` | Only when `count` was requested. |
+| `count` | `count`, `total`, `estimate`, `sequence` | Only when `count` was requested. `count` rows match every `scope` and `where`; `total` match the `scope` alone (every row when there is none). A watch sends it again when either changes. |
+| `values` | `field`, `values`, `more`, `sequence` | One per `values` field. `values` lists `{"value","count"}`: a distinct value of the field, `null` for an absent one (apart from `""`), and the rows holding it, the 100 most frequent, ties in value order, most frequent first. `more` is true when the field has more distinct values. A watch sends only the changed entries, when any changes: a value's new count, a value entering the 100 with its count, and a value gone or leaving the 100 with count 0. |
 | `rows` | `rows`, `sequence`, `partial`, `cursor` | A batch of rows keyed by column name. `partial` is true when this response is not the whole table: more rows follow, or the request gave `offset` or `cursor`. A client pages on `cursor`, not `partial`: a non-null `cursor` on the last batch of a page means more pages, and null means there are none. |
 | `synced` | `sequence` | The snapshot is complete. |
 | `upsert` | `key`, `row`, `sequence` | A row appeared or changed. `key` is the values of the primary key columns. |
@@ -123,7 +127,7 @@ Every message is an object with a `type` field holding one of the names above. `
 | `progress` | `sequence` | Nothing changed; sent at least every 15 seconds on a watch. |
 | `resync` | `reason` | Discard what you hold. Sent for a bad cursor (followed by a fresh page), a changed `incarnation` (followed by a fresh snapshot), or a source failure. |
 
-Order: `[resync]` (bad cursor only), `table`, `[count]`, one or more `rows`, `synced`. With `watch`, afterwards any number of `upsert`, `delete`, `count` and `progress` messages; a change that alters no projected row produces `progress`. After a `resync` for a changed `incarnation`, a fresh `table`, `rows`, `synced` sequence follows. After a source failure the server retries, up to three times, and then ends the stream.
+Order: `[resync]` (bad cursor only), `table`, `[count]`, `[values]`…, one or more `rows`, `synced`. With `watch`, afterwards any number of `upsert`, `delete`, `count`, `values` and `progress` messages; a change that alters no projected row produces `progress`. After a `resync` for a changed `incarnation`, a fresh `table`, `rows`, `synced` sequence follows. After a source failure the server retries, up to three times, and then ends the stream.
 
 ## Description
 
@@ -279,7 +283,7 @@ wait_fired
 | `type` | From | Fields |
 |---|---|---|
 | `hello` | server, first frame | `build`, `fingerprint`, `incarnation` (this daemon run) |
-| `subscribe` | client | `id`, `table` or `query` (or both, to pick a named query's child table), the row parameters `where`, `sort` and `columns` (each a list), `namespace`, `count`, and `cursor` `{incarnation, sequence}` to resume |
+| `subscribe` | client | `id`, `table` or `query` (or both, to pick a named query's child table), the row parameters `scope`, `where`, `sort`, `columns` and `values` (each a list), `namespace`, `count`, and `cursor` `{incarnation, sequence}` to resume |
 | `unsubscribe` | client | `id` of the subscribe |
 | `cancel` | client | `id` of any open request |
 | `fetch_more` | client | `id`, `query`: extend a demand-backed query this connection subscribes to; the rows arrive on its subscriptions |
@@ -290,7 +294,7 @@ wait_fired
 | `command_outcome` | server | `id`, `state`, `outcome`, `progress_truncated`, `observation_error`, as the record has them once it finishes |
 | `wait_fired` | server | `id`, `subscription_id`, `leaf`, `value` |
 
-Every message about a subscription is a message above plus the subscription's `id`. A subscription is a watch of its whole table (up to 10,000 rows in the snapshot), with `progress` at least every 15 seconds. A subscription's `incarnation` names its source's lifetime (the store's generation, the daemon run, or a named query's materialisations, above) and its parameters (`table`, `query`, `namespace`, `where`, `sort`, `columns`). A `cursor` whose `incarnation` and `sequence` are those of the current snapshot resumes with `synced` alone (after `count` when requested); any other cursor gets `resync`, then `table`, `rows`, `synced`. That includes a cursor from another lifetime whose sequence looks current, and one from a subscription with other parameters.
+Every message about a subscription is a message above plus the subscription's `id`. A subscription is a watch of its whole table (up to 10,000 rows in the snapshot), with `progress` at least every 15 seconds. A subscription's `incarnation` names its source's lifetime (the store's generation, the daemon run, or a named query's materialisations, above) and its parameters (`table`, `query`, `namespace`, `scope` and `where`, `sort`, `columns`). A `cursor` whose `incarnation` and `sequence` are those of the current snapshot resumes with `synced` alone (after `count` and `values`, in full, when requested); any other cursor gets `resync`, then `table`, `rows`, `synced`. That includes a cursor from another lifetime whose sequence looks current, and one from a subscription with other parameters.
 
 `unsubscribe` and `cancel` end a request; nothing more is sent for it, and an id that names no open request gets `error` `not_found`. An id may be reused once its request has ended; while it is open, reuse gets `duplicate_id`. A connection holds at most 256 open requests; one more gets `too_many_requests`. Wait subscriptions and the named queries a connection reads are its own: a wait's request ends after its one `wait_fired`, a wait ends with its request, and all of them end when the connection closes. A wait whose fires may have been missed ends with `error` `wait_lagged`; subscribe again. Commands are started over `/v1/commands`; `command` follows one under the same owner rule as `GET /v1/commands/{id}`.
 

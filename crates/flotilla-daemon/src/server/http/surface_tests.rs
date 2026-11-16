@@ -830,3 +830,79 @@ async fn ended_requests_free_their_ids_and_open_requests_are_bounded() {
     client.send(subscribe("one-more")).await;
     client.until(|message| message["id"] == "one-more" && message["type"] == "synced").await;
 }
+
+// #4363: a named query's table keeps the summary contract the other sources do
+// (`tables/summary_tests.rs`): `count` is the rows read, `total` a read of the `scope` alone, and
+// each field's values those of a read with the `where` clauses that do not mention only it.
+#[hegel::test(test_cases = 5)]
+fn named_query_summaries_match_fresh_reads(tc: hegel::TestCase) {
+    use crate::server::tables::summary_tests::{check_read, clauses, rows, Field};
+    use flotilla_resources::{ConvoyPhase, ConvoyStatus};
+    use hegel::generators as gs;
+    const FIELDS: &[Field] = &[
+        Field { column: "phase", spelling: "phase", literals: &[r#""pending""#, r#""active""#, r#""landed""#], has: false },
+        Field { column: "workflow_ref", spelling: "workflow_ref", literals: &[r#""w1""#, r#""w2""#], has: false },
+        Field { column: "name", spelling: "name", literals: &[r#""r0""#, r#""r1""#], has: false },
+    ];
+    let phases = [ConvoyPhase::Pending, ConvoyPhase::Active, ConvoyPhase::Landed];
+    let convoys: Vec<(usize, usize)> = (0..tc.draw(gs::integers::<usize>().max_value(6)))
+        .map(|_| (tc.draw(gs::integers::<usize>().max_value(2)), tc.draw(gs::integers::<usize>().max_value(1))))
+        .collect();
+    let (scope, wheres) = (clauses(&tc, FIELDS, 2), clauses(&tc, FIELDS, 3));
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    runtime.block_on(async move {
+        let daemon = Daemon::start().await;
+        let store = daemon.daemon.resource_backend().using::<Convoy>("flotilla");
+        for (index, (phase, workflow)) in convoys.iter().enumerate() {
+            let name = format!("r{index}");
+            let spec = ConvoySpec::builder().workflow_ref(format!("w{}", workflow + 1)).build();
+            let created = store.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.unwrap();
+            let status = ConvoyStatus { phase: phases[*phase], ..ConvoyStatus::default() };
+            store.update_status(&name, &created.metadata.resource_version, &status).await.unwrap();
+        }
+        let table = QueryId::Convoys { scope: None }.table_set().tables[0].name.clone();
+        let read = |params: Vec<(String, String)>| {
+            let (router, table) = (daemon.router.clone(), table.clone());
+            async move {
+                let query = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(&params).finish();
+                let mut request = Request::builder()
+                    .uri(format!("/tables/{table}/rows?{query}"))
+                    .header(header::ACCEPT, "application/x-ndjson")
+                    .body(Body::empty())
+                    .unwrap();
+                request.extensions_mut().insert(CallerAuth::Bearer);
+                let response = router.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{params:?}");
+                let bytes = to_bytes(response.into_body(), 1 << 24).await.unwrap();
+                bytes
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_slice::<flotilla_protocol::table::Message>(line).unwrap())
+                    .collect::<Vec<_>>()
+            }
+        };
+        // The aggregator settles on the written convoys before the reads compare.
+        let expected: BTreeSet<(String, String)> = convoys
+            .iter()
+            .enumerate()
+            .map(|(index, (phase, _))| (format!("r{index}"), format!("{:?}", phases[*phase]).to_lowercase()))
+            .collect();
+        let mut held = Vec::new();
+        let settled = tokio::time::timeout(WAIT, async {
+            loop {
+                held = rows(&read(vec![]).await);
+                let names: BTreeSet<(String, String)> = held
+                    .iter()
+                    .map(|row| (row["name"].as_str().unwrap_or_default().to_owned(), row["phase"].as_str().unwrap_or_default().to_owned()))
+                    .collect();
+                if names == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(settled.is_ok(), "the query holds the written convoys {expected:?}: {held:?}");
+        check_read(read, &[], &scope, &wheres, &["phase", "workflow_ref", "name"]).await;
+    });
+}
