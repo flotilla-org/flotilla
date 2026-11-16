@@ -51,7 +51,7 @@ async fn cross_vessel_handoff_publishes_typed_messages() {
 
 async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiver_phase: CrewWorkPhase, repeats: usize) {
     use flotilla_engine_messages_testkit::EngineMessagesHome;
-    use flotilla_resources::{MessageReference, MessageRelation, MessageSpec};
+    use flotilla_resources::{MessageReference, MessageRelation};
 
     use crate::leaf_engine::ResourceIntentPublisher;
     // Stand-in for the cross-host resource mutation endpoint; admission is the receiver home's.
@@ -66,9 +66,9 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
                 return Err("receiver publication unavailable".into());
             }
             assert_eq!(document["kind"], "Message");
-            let spec: MessageSpec = serde_json::from_value(document["spec"].clone()).expect("Message intent");
+            let intent: flotilla_messaging::Intent = serde_json::from_value(document["spec"].clone()).expect("Message intent");
             let name = document["metadata"]["name"].as_str().expect("message name");
-            let admitted = self.messages.primitives().admit_old(namespace, name, &spec).await.map_err(|error| error.to_string())?;
+            let admitted = self.messages.primitives().admit(name, &intent).await.map_err(|error| error.to_string())?;
             Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, admitted.record))
         }
     }
@@ -1089,18 +1089,12 @@ async fn terminal_legacy_brief_is_ignored() {
 // stalled crew, else the kind its expectation names; a send expecting nothing records nothing.
 #[test]
 fn awaiting_records_take_the_stall_or_the_expectations_kind() {
-    use flotilla_resources::MessageExpectation;
-    let outcome = MessageExpectation::Outcome {
-        condition: flotilla_protocol::Leaf {
-            address: flotilla_protocol::LeafAddress::Work { convoy: "c".into(), work: "work".into() },
-            field_path: ".crew.coder.phase".into(),
-            operator: flotilla_protocol::LeafOperator::Equal,
-            literal: "Done".into(),
-        },
-    };
-    assert_eq!(super::super::awaiting_kind(&MessageExpectation::None, Some("p/c/work/coder")), None);
-    assert_eq!(super::super::awaiting_kind(&MessageExpectation::Reply, Some("p/c/work/coder")), Some("stall"));
-    assert_eq!(super::super::awaiting_kind(&MessageExpectation::Reply, None), Some("reply"));
+    use flotilla_messaging::IntentExpectation;
+    let outcome =
+        IntentExpectation::Outcome { condition: "project:p/convoy:c/role:coder .phase == Done".parse().expect("a canonical condition") };
+    assert_eq!(super::super::awaiting_kind(&IntentExpectation::Nothing, Some("p/c/work/coder")), None);
+    assert_eq!(super::super::awaiting_kind(&IntentExpectation::Reply, Some("p/c/work/coder")), Some("stall"));
+    assert_eq!(super::super::awaiting_kind(&IntentExpectation::Reply, None), Some("reply"));
     assert_eq!(super::super::awaiting_kind(&outcome, None), Some("outcome"));
 }
 

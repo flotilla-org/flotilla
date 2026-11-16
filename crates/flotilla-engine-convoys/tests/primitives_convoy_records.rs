@@ -4,15 +4,12 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::{TimeZone, Utc};
-use flotilla_engine_convoys::{
-    convoy_records::{seat_address, EngineConvoyRecords},
-    convoys::Convoys,
-};
+use flotilla_engine_convoys::{convoy_records::EngineConvoyRecords, convoys::Convoys};
 use flotilla_engine_messages::awaiting::{AwaitingReplies, STALL};
 use flotilla_protocol::{PrincipalRef, Relationship};
 use flotilla_resources::{
     address::{stored_change_request_address, subject_for},
-    convoy::admission::AdmissionDocument,
+    convoy::{admission::AdmissionDocument, engine::seat_address},
     convoy_records::{ConvoyEnd, ConvoyRecords, SeatRecord},
     workflow_template::single_agent_workflow_spec,
     SubjectDiscoverySource, WorkflowSnapshot,

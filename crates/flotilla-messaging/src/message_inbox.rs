@@ -360,3 +360,46 @@ pub async fn resolve_message_receiver(
     validate_message_address(address)?;
     MessageReceiverSnapshot::load_for_addresses(backend, namespace, &[address.to_string()]).await?.resolve_validated(address)
 }
+
+/// The receiver spelling an inbox's holder records are read by: `P/R` for a project's role, and
+/// `P/C/V/R` for a convoy's crew member, read on the convoy record by its name and the vessel its
+/// workflow seats the role on. `None` for an inbox no crew or project role holds, or whose convoy
+/// is not held. Goes when terminal sessions name their holders by inbox (#3108).
+pub async fn inbox_receiver(
+    backend: &ResourceBackend,
+    namespace: &str,
+    inbox: &flotilla_address::Address,
+) -> Result<Option<String>, ResourceError> {
+    use flotilla_address::Kind;
+    let (Some(project), Kind::Role) = (inbox.get(Kind::Project), inbox.kind()) else { return Ok(None) };
+    let role = inbox.name();
+    if inbox.get(Kind::Convoy).is_none() {
+        return Ok(Some(format!("{project}/{role}")));
+    }
+    let Some(convoy) = inbox_convoy(backend, namespace, inbox).await? else { return Ok(None) };
+    Ok(seated_vessel(&convoy.object, role).map(|vessel| crew_role_address(project, &convoy.object.metadata.name, &vessel, role)))
+}
+
+/// The convoy record a crew member's inbox is under, local or replicated, read by its name; `None`
+/// when no such convoy is held.
+pub async fn inbox_convoy(
+    backend: &ResourceBackend,
+    namespace: &str,
+    inbox: &flotilla_address::Address,
+) -> Result<Option<crate::ReadResourceObject<Convoy>>, ResourceError> {
+    let convoys = backend.including_replicas::<Convoy>(namespace);
+    for name in flotilla_resources::convoy::engine::convoy_records(inbox) {
+        match convoys.get(&name).await {
+            Ok(convoy) => return Ok(Some(convoy)),
+            Err(ResourceError::NotFound { .. }) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+/// The vessel `convoy`'s workflow seats `role` on, once its workflow is frozen.
+pub fn seated_vessel(convoy: &ResourceObject<Convoy>, role: &str) -> Option<String> {
+    let workflow = convoy.status.as_ref()?.workflow_snapshot.as_ref()?;
+    workflow.vessels.iter().find(|vessel| vessel.crew.iter().any(|member| member.role == role)).map(|vessel| vessel.name.clone())
+}

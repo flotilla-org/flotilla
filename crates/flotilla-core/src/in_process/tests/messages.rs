@@ -32,7 +32,7 @@ async fn resource_message_mutations_use_durable_inbox_admission() {
     let primitives = install_engine_messages(&daemon);
     let mut document = serde_json::json!({
         "apiVersion": "flotilla.work/v1", "kind": "Message", "metadata": {"name": "first"},
-        "spec": {"sender": "flotilla/checks", "receiver": "flotilla/convoy/work/coder", "relation": "system", "body": "checks settled"}
+        "spec": {"sender": "project:flotilla/role:checks", "inbox": "project:flotilla/convoy:convoy/role:coder", "relation": "system", "body": "checks settled"}
     });
     let first = daemon.apply_intent_document("flotilla", document.clone()).await.expect("admit");
     let retry = daemon.apply_intent_document("flotilla", document.clone()).await.expect("retry");
@@ -79,7 +79,7 @@ async fn new_message_mutations_route_to_the_absent_receivers_home() {
         namespace: "flotilla".into(),
         document: serde_json::json!({
             "apiVersion": "flotilla.work/v1", "kind": "Message", "metadata": {"name": "first"},
-            "spec": {"sender": "flotilla/checks", "receiver": "flotilla/convoy/work/coder", "relation": "system", "body": "checks settled"}
+            "spec": {"sender": "project:flotilla/role:checks", "inbox": "project:flotilla/convoy:convoy/role:coder", "relation": "system", "body": "checks settled"}
         }),
     };
     let target = daemon.resolve_command_target(&action, Some(&NodeId::new("unrelated"))).await.expect("route");
@@ -87,10 +87,10 @@ async fn new_message_mutations_route_to_the_absent_receivers_home() {
     assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("sender messages").items.is_empty());
 }
 
-// Resource admission qualifies a relative receiver from its sender context and
-// returns the canonical delivered predecessor without creating the suppressed ID.
+// Resource admission answers with the intent it admitted, and returns the canonical
+// delivered predecessor without creating the suppressed ID.
 #[tokio::test]
-async fn message_admission_qualifies_and_exposes_canonical_suppression() {
+async fn message_admission_exposes_canonical_suppression() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-review-test\"\n").unwrap();
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -105,12 +105,12 @@ async fn message_admission_qualifies_and_exposes_canonical_suppression() {
     .await;
     let mut document = serde_json::json!({
         "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"first"},
-        "spec":{"sender":"flotilla/convoy/work/reviewer","receiver":"coder","relation":"peer","body":"reply please","expectation":{"kind":"reply"},"references":[{"kind":"change_request","service":"github","scope":"owner/repo","number":1,"revision":"head"}],"subject":{"kind":"change_request","service":"github","scope":"owner/repo","number":1,"revision":"head"}}
+        "spec":{"sender":"project:flotilla/convoy:convoy/role:reviewer","inbox":"project:flotilla/convoy:convoy/role:coder","relation":"peer","body":"reply please","expectation":{"kind":"reply"},"references":[{"address":"forge:github/repo:owner%2Frepo/cr:1","revision":"head","subject":true}]}
     });
     designate_fleet(&backend).await;
     let primitives = install_engine_messages(&daemon);
     let first = daemon.apply_intent_document("flotilla", document.clone()).await.unwrap();
-    assert_eq!(first.value.pointer("/spec/receiver").and_then(serde_json::Value::as_str), Some("flotilla/convoy/work/coder"));
+    assert_eq!(first.value.pointer("/spec/inbox").and_then(serde_json::Value::as_str), Some("project:flotilla/convoy:convoy/role:coder"));
     flotilla_engine_messages_testkit::deliver_turn(&primitives, "flotilla", "flotilla/convoy/work/coder", "first", "session", Utc::now())
         .await;
     document["metadata"]["name"] = "next".into();
@@ -137,10 +137,14 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
     )
     .await;
     let document =
-        |receiver: &str| serde_json::json!({"spec":{"sender":"flotilla/checks","receiver":receiver,"relation":"system","body":"wake"}});
-    assert!(daemon.message_creation_origin("flotilla", &document("flotilla/undeclared")).await.unwrap_err().contains("no declared home"));
+        |inbox: &str| serde_json::json!({"spec":{"sender":"project:flotilla/role:checks","inbox":inbox,"relation":"system","body":"wake"}});
     assert!(daemon
-        .message_creation_origin("flotilla", &document("flotilla/missing/work/coder"))
+        .message_creation_origin("flotilla", &document("project:flotilla/role:undeclared"))
+        .await
+        .unwrap_err()
+        .contains("no declared home"));
+    assert!(daemon
+        .message_creation_origin("flotilla", &document("project:flotilla/convoy:missing/role:coder"))
         .await
         .unwrap_err()
         .contains("no admitted convoy"));
@@ -157,7 +161,10 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         .await
         .expect("declared role before admission");
     assert_eq!(
-        daemon.message_creation_origin("flotilla", &document("flotilla/governor")).await.expect("declared absent holder must wait"),
+        daemon
+            .message_creation_origin("flotilla", &document("project:flotilla/role:governor"))
+            .await
+            .expect("declared absent holder must wait"),
         Some(daemon.node_id().clone())
     );
     // The reviewer is declared at another home and reaches this daemon through that home's log.
@@ -171,7 +178,10 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
     remote.definition::<flotilla_resources::ConvoyEnsure>("waiting-reviewer", &reviewer).await;
     remote.replicate_to(&decided);
     assert_eq!(
-        daemon.message_creation_origin("flotilla", &document("flotilla/reviewer")).await.expect("remote declared absent holder"),
+        daemon
+            .message_creation_origin("flotilla", &document("project:flotilla/role:reviewer"))
+            .await
+            .expect("remote declared absent holder"),
         Some(NodeId::new("remote-holder-home"))
     );
     // A system producer sends as its fleet role, to the crew that replies.
@@ -183,7 +193,7 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         .build();
     designate_fleet(&backend).await;
     install_engine_messages(&daemon).admit_old("flotilla", "system-request", &original).await.expect("original system request");
-    let reply = serde_json::json!({"spec":{"sender":"flotilla/c/work/coder","receiver":"system:turn-rules","relation":"peer","body":"answer","in_reply_to":"system-request"}});
+    let reply = serde_json::json!({"spec":{"sender":"project:flotilla/convoy:c/role:coder","inbox":"fleet:lab/role:turn-rules","relation":"peer","body":"answer","in_reply_to":"system-request"}});
     assert_eq!(daemon.message_creation_origin("flotilla", &reply).await.expect("system reply home"), Some(daemon.node_id().clone()));
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let convoy = convoys
@@ -193,7 +203,7 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
     let status = ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() };
     convoys.update_status("finished", &convoy.metadata.resource_version, &status).await.unwrap();
     assert!(daemon
-        .message_creation_origin("flotilla", &document("flotilla/finished/work/coder"))
+        .message_creation_origin("flotilla", &document("project:flotilla/convoy:finished/role:coder"))
         .await
         .unwrap_err()
         .contains("terminal convoy"));
@@ -210,7 +220,7 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
     });
     convoys.update_status("finished", &convoy.metadata.resource_version, &status).await.unwrap();
     assert!(daemon
-        .message_creation_origin("flotilla", &document("flotilla/finished/work/coder"))
+        .message_creation_origin("flotilla", &document("project:flotilla/convoy:finished/role:coder"))
         .await
         .unwrap_err()
         .contains("undeclared vessel"));
@@ -259,7 +269,7 @@ async fn message_send_reads_ignore_unrelated_history() {
         }
         let document = serde_json::json!({
             "apiVersion": "flotilla.work/v1", "kind": "Message", "metadata": {"name": "send"},
-            "spec": {"sender": "flotilla/checks", "receiver": "flotilla/convoy/work/coder", "relation": "system", "body": "checks settled"}
+            "spec": {"sender": "project:flotilla/role:checks", "inbox": "project:flotilla/convoy:convoy/role:coder", "relation": "system", "body": "checks settled"}
         });
         let action = CommandAction::ResourceApply { namespace: "flotilla".into(), document: document.clone() };
         let (target, routing) = measure_reads(daemon.resolve_command_target(&action, None)).await;

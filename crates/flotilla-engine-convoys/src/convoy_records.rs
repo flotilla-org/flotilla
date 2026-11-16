@@ -16,7 +16,7 @@ use flotilla_protocol::Relationship;
 use flotilla_provisioning::engine::{log_cursor::LogCursor, reads::StoreReads};
 use flotilla_resources::{
     address::subject_for,
-    convoy::{admission::AdmissionDocument, engine::launch_address},
+    convoy::{admission::AdmissionDocument, engine::seat_address},
     convoy_records::{ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords, SeatRecord, UnreadableLaunch},
     lifecycle_reads::{ChangeCursor, CursorSince},
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
@@ -233,11 +233,6 @@ fn changes_of(read: &mut Read<'_>, followed: Vec<Followed>) -> Result<Vec<Convoy
         }
     }
     Ok(out)
-}
-
-/// The seat address a stall about role `role` of launch `launch` in `project` names.
-pub fn seat_address(project: &Address, launch: &str, role: &str) -> Result<Address, String> {
-    launch_address(project, launch)?.child(AddressKind::Role, role).map_err(|error| error.to_string())
 }
 
 /// The launch a stall record is about, when it is about a convoy or one of its seats.

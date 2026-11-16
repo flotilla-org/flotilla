@@ -17,6 +17,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_messaging::Intent;
 use flotilla_protocol::{
     CheckoutArchiveOutcome, CheckoutArchiveStatus, CommandValue, CrewCommandContext, CrewListMember, CrewListResponse, CrewProject,
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
@@ -30,7 +31,7 @@ use flotilla_resources::{
         submission_subject_text, AddressKind,
     },
     expected_change_request_leaves, external_patches as convoy_external_patches, ChangeRequest as ResourceChangeRequest, Clock,
-    Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewMessageSender, CrewSource, CrewWorkPhase, Forge, HoldAct, InputMeta,
+    Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewMessageSender, CrewSource, CrewWorkPhase, Forge, HoldAct,
     ObservedChangeRequestState, Project, Repository, RepositoryKey, ResourceError, ResourceObject, ResourceProvenance,
     TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TurnDeliveryRung, Vessel, CONVOY_LABEL, ROLE_LABEL,
@@ -93,15 +94,23 @@ pub use flotilla_store::resolve_convoy_record;
 /// The sender's awaiting-reply record kind for a send (#3587 layer 7): none
 /// for a send expecting nothing, a stall for a stalled crew's supervision,
 /// else the expectation's own.
-fn awaiting_kind(expectation: &flotilla_resources::MessageExpectation, stall_of: Option<&str>) -> Option<&'static str> {
-    use flotilla_resources::MessageExpectation;
+fn awaiting_kind(expectation: &flotilla_messaging::IntentExpectation, stall_of: Option<&str>) -> Option<&'static str> {
+    use flotilla_messaging::IntentExpectation;
     match (expectation, stall_of) {
-        (MessageExpectation::None, _) => None,
+        (IntentExpectation::Nothing, _) => None,
         // A stalled crew's supervision is a stall, whatever it expects back.
         (_, Some(_)) => Some(flotilla_resources::STALL_KIND),
-        (MessageExpectation::Reply, None) => Some("reply"),
-        (MessageExpectation::Outcome { .. }, None) => Some("outcome"),
+        (IntentExpectation::Reply, None) => Some("reply"),
+        (IntentExpectation::Outcome { .. }, None) => Some("outcome"),
     }
+}
+
+/// The Message document the router admits at the receiver's home: `name`, its intent the spec.
+fn message_document(namespace: &str, name: &str, intent: &Intent) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "flotilla.work/v1", "kind": "Message",
+        "metadata": { "name": name, "namespace": namespace }, "spec": intent
+    })
 }
 
 /// An authorized supervision decision; escalation carries its admitted recipient.
@@ -456,7 +465,7 @@ type TurnReceiverSession = (Option<flotilla_resources::ReadResourceObject<Resour
 /// A new crew turn's message and the session that receives it.
 struct CrewTurn {
     target: flotilla_resources::ReadResourceObject<ResourceConvoy>,
-    intent: flotilla_resources::MessageSpec,
+    intent: Intent,
     name: String,
     holder: Option<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>,
     rung: TurnDeliveryRung,
@@ -1298,7 +1307,7 @@ impl CrewService {
                 .body(message.into())
                 .maybe_in_reply_to(in_reply_to.clone())
                 .build();
-            self.publish_message_intent(namespace, &name, &intent).await?;
+            self.publish_message_spec(namespace, &name, &intent).await?;
         }
         match ruling {
             SupervisorRuling::Resume => {
@@ -1421,7 +1430,8 @@ impl CrewService {
                 revision: "any".into(),
             }])
             .build();
-        let found = self.awaited_reply_from(namespace, &escalation).await.map_err(|error| error.to_string())?;
+        let escalation = self.intent_of(namespace, &escalation).await.map_err(|error| error.to_string())?;
+        let found = self.awaited_reply_from(&escalation).await.map_err(|error| error.to_string())?;
         if found.is_some() {
             return Ok(found);
         }
@@ -1448,7 +1458,11 @@ impl CrewService {
             .body(String::new())
             .in_reply_to(escalation.to_owned())
             .build();
-        match self.resolve_in_reply_to(namespace, &ruling).await {
+        let resolution = match self.intent_of(namespace, &ruling).await {
+            Ok(ruling) => self.resolve_in_reply_to(&ruling).await,
+            Err(error) => flotilla_messaging::MessageResolution::Unknown(error.to_string()),
+        };
+        match resolution {
             flotilla_messaging::MessageResolution::Found => Some(escalation.to_owned()),
             flotilla_messaging::MessageResolution::Absent => None,
             flotilla_messaging::MessageResolution::Unknown(error) => {
@@ -2041,7 +2055,7 @@ impl CrewService {
         let reassign = || engine.reassign(&convoy, &context.vessel, &context.caller_role, target);
         // Admit the turn before reopening its recipient: the reopened crew's
         // derived Done waits on that turn's delivery (#3894).
-        let admitted = self.publish_message_intent(&context.namespace, &message_name, &intent).await?;
+        let admitted = self.publish_message_spec(&context.namespace, &message_name, &intent).await?;
         // Each branch below reuses the admitted turn once its target session is settled.
         let send = || async { Ok::<_, String>(admitted.clone()) };
         // A handoff that fails after its engine turn was admitted withdraws that
@@ -2330,7 +2344,7 @@ impl CrewService {
             .body(prompt.to_string())
             .maybe_in_reply_to(in_reply_to)
             .build();
-        self.publish_message_intent(namespace, &message_name, &intent).await?;
+        self.publish_message_spec(namespace, &message_name, &intent).await?;
         Ok(ConvoyResumeOutcome::Informational)
     }
 
@@ -2422,16 +2436,17 @@ impl CrewService {
         let address = sender;
         let relation = flotilla_resources::MessageRelation::Supervisor;
         let message_name = flotilla_resources::message_record_name(&receiver, &address, &format!("resume:{}", uuid::Uuid::new_v4()));
-        let mut intent = flotilla_resources::MessageSpec::builder()
+        let intent = flotilla_resources::MessageSpec::builder()
             .sender(address)
             .receiver(receiver.clone())
             .relation(relation)
             .body(prompt.to_string())
             .maybe_in_reply_to(in_reply_to)
             .build();
+        let mut intent = self.intent_of(namespace, &intent).await.map_err(|error| error.to_string())?;
         // Parties compare as admission converts them: a person is the role they send in, so the
         // same operator role is the same sender.
-        let prior = self.undelivered_from(namespace, &intent).await.map_err(|error| error.to_string())?;
+        let prior = self.undelivered_from(&intent).await.map_err(|error| error.to_string())?;
         let displaced = prior.as_ref().map(|message| message.body.clone());
         intent.supersedes = prior.map(|message| message.standing.name);
         // This per-command ID survives router retries. The publisher still
@@ -2536,11 +2551,11 @@ impl CrewService {
         let (vessel, role, status) = (&selected.vessel, &selected.role, selected.status());
         if intent == ResumeIntent::Reminder && reopened.status.as_ref().is_some_and(|status| status.crew_claim_is_settled(vessel, role)) {
             // The claim guard made the patch a no-op; only the message is published.
-            self.publish_message_intent(namespace, &message_name, &resume_intent).await?;
+            self.publish_message_spec(namespace, &message_name, &resume_intent).await?;
             return Ok(ConvoyResumeOutcome::Informational);
         }
         if matches!(session.provenance, ResourceProvenance::Replica { .. }) {
-            if let Err(error) = self.publish_message_intent(namespace, &message_name, &resume_intent).await {
+            if let Err(error) = self.publish_message_spec(namespace, &message_name, &resume_intent).await {
                 return Err(self.restore_crew_work_after_delivery_failure(name, status, error).await);
             }
             return Ok(ConvoyResumeOutcome::Queued { displaced });
@@ -2551,7 +2566,7 @@ impl CrewService {
             if session.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped) {
                 self.restart_terminal(&session)?;
             }
-            self.publish_message_intent(namespace, &message_name, &resume_intent).await?;
+            self.publish_message_spec(namespace, &message_name, &resume_intent).await?;
             Ok(())
         }
         .await;
@@ -2649,12 +2664,13 @@ impl CrewService {
             .expectation(request.expectation.clone())
             .maybe_delivery_condition(request.delivery_condition.clone())
             .build();
+        let intent = self.intent_of(&request.namespace, &intent).await.map_err(|error| error.to_string())?;
         let name = flotilla_resources::message_record_name(
             receiver,
             &request.sender,
             &turn_message_producer_key(&request.source, &request.subject_revision),
         );
-        if let Some(existing) = self.admitted_message(&request.namespace, &intent, &name).await.map_err(|error| error.to_string())? {
+        if let Some(existing) = self.admitted_message(&intent, &name).await.map_err(|error| error.to_string())? {
             // A repeat records what an earlier send could not (record is idempotent).
             self.record_awaiting(&request.namespace, &name, &intent, Some(existing.home), request.stall_of.as_deref()).await?;
             return Ok(CrewTurnAdmission {
@@ -2673,19 +2689,16 @@ impl CrewService {
             .map_err(|error| error.to_string())?;
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
         let (message, new_turn) = if let Some(publisher) = publisher {
-            let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":request.namespace}, "spec":intent});
-            let (reference, home) = publisher.publish_admitted(&request.namespace, document).await?;
+            let (reference, home) =
+                publisher.publish_admitted(&request.namespace, message_document(&request.namespace, &name, &intent)).await?;
             self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await?;
             (reference, true)
         } else {
             if holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
                 return Err("receiver-home resource mutation router unavailable".into());
             }
-            let existing = self.admitted_message(&request.namespace, &intent, &name).await.map_err(|error| error.to_string())?.is_some();
-            let admitted = self
-                .admit_message(&request.namespace, &InputMeta::builder().name(name).build(), &intent)
-                .await
-                .map_err(|error| error.to_string())?;
+            let existing = self.admitted_message(&intent, &name).await.map_err(|error| error.to_string())?.is_some();
+            let admitted = self.admit_message(&name, &intent).await.map_err(|error| error.to_string())?;
             self.record_awaiting(&request.namespace, &admitted.record, &intent, Some(admitted.home), request.stall_of.as_deref()).await?;
             (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, admitted.record), !existing)
         };
@@ -2817,6 +2830,7 @@ impl CrewService {
             .expectation(request.expectation.clone())
             .maybe_delivery_condition(request.delivery_condition.clone())
             .build();
+        let intent = self.intent_of(&request.namespace, &intent).await.map_err(|error| error.to_string())?;
         let name = flotilla_resources::message_record_name(
             &receiver,
             &sender,
@@ -2851,11 +2865,11 @@ impl CrewService {
     async fn earlier_turn_admission(
         &self,
         request: &CrewTurnIntent,
-        intent: &flotilla_resources::MessageSpec,
+        intent: &Intent,
         name: &str,
         rung: TurnDeliveryRung,
     ) -> Result<Option<CrewTurnAdmission>, String> {
-        if let Some(existing) = self.admitted_message(&request.namespace, intent, name).await.map_err(|error| error.to_string())? {
+        if let Some(existing) = self.admitted_message(intent, name).await.map_err(|error| error.to_string())? {
             // A repeat records what an earlier send could not (record is idempotent).
             self.record_awaiting(&request.namespace, name, intent, Some(existing.home), request.stall_of.as_deref()).await?;
             return Ok(Some(CrewTurnAdmission {
@@ -2873,7 +2887,7 @@ impl CrewService {
             return Ok(None);
         }
         // Admission suppresses it too; found first, the turn activates no work for nothing.
-        let suppressing = self.open_superseded(&request.namespace, intent).await.map_err(|error| error.to_string())?;
+        let suppressing = self.open_superseded(intent).await.map_err(|error| error.to_string())?;
         Ok(suppressing.map(|existing| CrewTurnAdmission {
             new_turn: false,
             rung,
@@ -2976,11 +2990,8 @@ impl CrewService {
         let CrewTurn { target, intent, name, holder, .. } = turn;
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
         let message = if let Some(publisher) = publisher {
-            let document = serde_json::json!({
-                "apiVersion": "flotilla.work/v1", "kind": "Message",
-                "metadata": { "name": name, "namespace": request.namespace }, "spec": intent
-            });
-            let (reference, home) = publisher.publish_admitted(&request.namespace, document).await?;
+            let (reference, home) =
+                publisher.publish_admitted(&request.namespace, message_document(&request.namespace, name, intent)).await?;
             // A suppressed turn answers with the message that suppressed it: the sender awaits that.
             self.record_awaiting(&request.namespace, &reference.name, intent, home, request.stall_of.as_deref()).await?;
             reference
@@ -2990,10 +3001,7 @@ impl CrewService {
             {
                 return Err("receiver-home resource mutation router unavailable".into());
             }
-            let admitted = self
-                .admit_message(&request.namespace, &InputMeta::builder().name(name.clone()).build(), intent)
-                .await
-                .map_err(|error| error.to_string())?;
+            let admitted = self.admit_message(name, intent).await.map_err(|error| error.to_string())?;
             self.record_awaiting(&request.namespace, &admitted.record, intent, Some(admitted.home), request.stall_of.as_deref()).await?;
             ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, admitted.record)
         };
@@ -3059,7 +3067,7 @@ impl CrewService {
                 }
                 let intent = flotilla_resources::legacy_message_spec(&receiver, &turn.message);
                 let name = flotilla_resources::message_record_name(&receiver, &intent.sender, &turn.message.id);
-                self.publish_message_intent(namespace, &name, &intent).await?;
+                self.publish_message_spec(namespace, &name, &intent).await?;
             }
             for brief in convoy
                 .status
@@ -3081,7 +3089,7 @@ impl CrewService {
                     .relation(relation)
                     .body(brief.content.clone())
                     .build();
-                self.publish_message_intent(namespace, &name, &intent).await?;
+                self.publish_message_spec(namespace, &name, &intent).await?;
             }
         }
         let convoys = self.resource_backend.using::<ResourceConvoy>(namespace);
@@ -3101,7 +3109,7 @@ impl CrewService {
                     let receiver = crew_role_address(project, &convoy.metadata.name, &turn.vessel, &turn.role);
                     let intent = flotilla_resources::legacy_message_spec(&receiver, &turn.message);
                     let name = flotilla_resources::message_record_name(&receiver, &intent.sender, &turn.message.id);
-                    self.publish_message_intent(namespace, &name, &intent).await?;
+                    self.publish_message_spec(namespace, &name, &intent).await?;
                     replacements.push((key.clone(), name, turn.message.id.clone()));
                 }
                 if let Some(brief) = &delivery.pending_brief {
@@ -3114,7 +3122,7 @@ impl CrewService {
                         .relation(relation)
                         .body(brief.content.clone())
                         .build();
-                    self.publish_message_intent(namespace, &name, &intent).await?;
+                    self.publish_message_spec(namespace, &name, &intent).await?;
                     replacements.push((key.clone(), name, String::new()));
                 }
             }
@@ -3242,43 +3250,56 @@ impl CrewService {
         &'a self,
         namespace: &'a str,
         name: &'a str,
-        intent: &'a flotilla_resources::MessageSpec,
+        intent: &'a Intent,
     ) -> Pin<Box<dyn Future<Output = Result<ResourceRef, String>> + Send + 'a>> {
         off_frame(move || {
             self.publish_message_intent_traced(namespace, name, intent).instrument(flotilla_tracing::queued_span(name, "send"))
         })
     }
 
-    async fn publish_message_intent_traced(
+    /// [`Self::publish_message_intent`] of an old-shaped intent.
+    // Goes once every producer builds its intent in the engine's terms (#3108).
+    pub async fn publish_message_spec(
         &self,
         namespace: &str,
         name: &str,
-        intent: &flotilla_resources::MessageSpec,
+        old: &flotilla_resources::MessageSpec,
     ) -> Result<ResourceRef, String> {
-        if let Some(existing) = self.admitted_message(namespace, intent, name).await.map_err(|error| error.to_string())? {
+        let intent = self.intent_of(namespace, old).await.map_err(|error| error.to_string())?;
+        self.publish_message_intent(namespace, name, &intent).await
+    }
+
+    async fn publish_message_intent_traced(&self, namespace: &str, name: &str, intent: &Intent) -> Result<ResourceRef, String> {
+        if let Some(existing) = self.admitted_message(intent, name).await.map_err(|error| error.to_string())? {
             // A repeat records what an earlier send could not (record is idempotent).
             self.record_awaiting(namespace, name, intent, Some(existing.home), None).await?;
             return Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, name));
         }
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
         if let Some(publisher) = publisher {
-            let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":namespace}, "spec":intent});
-            let (reference, home) = publisher.publish_admitted(namespace, document).await?;
+            let (reference, home) = publisher.publish_admitted(namespace, message_document(namespace, name, intent)).await?;
             self.record_awaiting(namespace, name, intent, home, None).await?;
             return Ok(reference);
         }
-        let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, namespace, &intent.receiver)
-            .await
-            .map_err(|error| error.to_string())?;
-        if holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
+        if self.inbox_held_elsewhere(namespace, &intent.inbox).await? {
             return Err("receiver-home resource mutation router unavailable".into());
         }
-        let admitted = self
-            .admit_message(namespace, &InputMeta::builder().name(name.into()).build(), intent)
-            .await
-            .map_err(|error| error.to_string())?;
+        let admitted = self.admit_message(name, intent).await.map_err(|error| error.to_string())?;
         self.record_awaiting(namespace, &admitted.record, intent, Some(admitted.home), None).await?;
         Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, admitted.record))
+    }
+
+    /// Whether another home holds `inbox`'s receiver, so that only the router reaches it.
+    async fn inbox_held_elsewhere(&self, namespace: &str, inbox: &flotilla_address::Address) -> Result<bool, String> {
+        let Some(receiver) =
+            flotilla_messaging::inbox_receiver(&self.resource_backend, namespace, inbox).await.map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, namespace, &receiver)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })))
     }
 
     /// Records the sender's half of a send expecting a reply or an outcome,
@@ -3293,7 +3314,7 @@ impl CrewService {
         &self,
         namespace: &str,
         name: &str,
-        intent: &flotilla_resources::MessageSpec,
+        intent: &Intent,
         home: Option<String>,
         stall_of: Option<&str>,
     ) -> Result<(), String> {
@@ -3396,7 +3417,7 @@ impl CrewService {
                 .maybe_subject(request.message_subject.clone())
                 .maybe_delivery_condition(request.delivery_condition.clone())
                 .build();
-            self.publish_message_intent(&request.namespace, &notice, &intent).await?;
+            self.publish_message_spec(&request.namespace, &notice, &intent).await?;
         }
         // Producer identity follows the persisted hold, independent of receiver changes
         // or new observations racing a lost acceptance response.
@@ -3416,7 +3437,7 @@ impl CrewService {
             .maybe_subject(request.message_subject.clone())
             .maybe_delivery_condition(request.delivery_condition.clone())
             .build();
-        self.publish_message_intent(&request.namespace, &name, &intent).await.map(|_| ())
+        self.publish_message_spec(&request.namespace, &name, &intent).await.map(|_| ())
     }
 
     async fn reconcile_resumed_work_credentials(&self, namespace: &str, environment_ref: &str) -> Result<(), String> {

@@ -197,9 +197,9 @@ async fn remote_suppression_restores_workflow_before_replication() {
             document: serde_json::Value,
         ) -> Result<(ResourceRef, Option<String>), String> {
             assert_eq!(document["kind"], "Message");
-            let spec: MessageSpec = serde_json::from_value(document["spec"].clone()).unwrap();
+            let intent: flotilla_messaging::Intent = serde_json::from_value(document["spec"].clone()).unwrap();
             let name = document["metadata"]["name"].as_str().unwrap();
-            let admitted = self.0.primitives().admit_old(namespace, name, &spec).await.map_err(|error| error.to_string())?;
+            let admitted = self.0.primitives().admit(name, &intent).await.map_err(|error| error.to_string())?;
             Ok((ResourceRef::new("flotilla.work/v1", "Message", namespace, admitted.record), Some(admitted.home)))
         }
     }

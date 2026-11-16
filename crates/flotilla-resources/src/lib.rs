@@ -286,8 +286,7 @@ pub use message::{
 };
 pub use message_inbox::{
     convoy_crew_seats, convoy_of_segment, convoy_seat_turns, convoy_segment, crew_role_address, parse_crew_role_address,
-    parse_topic_address, qualify_message_address, qualify_message_spec, validate_message_address, MessageAddressContext,
-    ROLE_ADDRESS_ANNOTATION,
+    parse_topic_address, qualify_message_address, validate_message_address, MessageAddressContext, ROLE_ADDRESS_ANNOTATION,
 };
 pub use message_migration::{legacy_message_sender, legacy_message_spec};
 pub use workflow_template::{

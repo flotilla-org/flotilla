@@ -3598,6 +3598,12 @@ impl InProcessDaemon {
 /// Non-trait methods that are called directly on the concrete `InProcessDaemon`
 /// type by the daemon server peer-overlay code and by the `execute()` implementation.
 /// The `cr/github.com/<owner>/<repo>/<number>` text of a public GitHub change request.
+/// A Message document's intent: its spec in the engine's terms.
+fn message_intent(document: &serde_json::Value) -> Result<flotilla_messaging::Intent, ResourceError> {
+    serde_json::from_value(document.get("spec").cloned().unwrap_or_default())
+        .map_err(|error| ResourceError::decode(format!("message intent: {error}")))
+}
+
 fn github_change_request_text(address: &flotilla_address::Address) -> Option<String> {
     use flotilla_address::Kind;
     if address.kind() != Kind::ChangeRequest || address.get(Kind::Forge) != Some(flotilla_address::GITHUB_FORGE_ID) {
@@ -4976,7 +4982,7 @@ impl InProcessDaemon {
         name: &str,
         intent: &flotilla_resources::MessageSpec,
     ) -> Result<ResourceRef, String> {
-        self.crew.publish_message_intent(namespace, name, intent).await
+        self.crew.publish_message_spec(namespace, name, intent).await
     }
 
     pub async fn deliver_standing_turn(&self, request: &flotilla_crew::leaf_engine::CrewTurnIntent) -> Result<TurnDeliveryRung, String> {
@@ -5117,46 +5123,33 @@ impl InProcessDaemon {
         &self,
         primitives: &flotilla_engine_messages::MessagePrimitives,
         namespace: &str,
-        reply: &flotilla_resources::MessageSpec,
+        reply: &flotilla_messaging::Intent,
         original_id: &str,
     ) -> Result<NodeId, String> {
         // The original was sent to the replying role: its inbox names it at its home on a replica miss.
-        let roles = primitives.roles(namespace).await?;
-        let inbox = primitives
-            .spell(&mut flotilla_engine_messages::OldStoreRecords::empty(namespace), |records| {
-                flotilla_engine_messages::convert::Conversion { roles: &roles, forges: &[], records }.sender_of(reply)
-            })
-            .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| format!("the replying role has no inbox: {error}"))?;
         let original = primitives
-            .find_stored(original_id, &inbox)
+            .find_stored(original_id, &reply.sender)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("replied-to message `{original_id}` is neither in this home's replica nor at a reachable home"))?;
         let spec = original.resource.spec();
-        let conversion = flotilla_engine_messages::convert::Conversion {
-            roles: &roles,
-            forges: &[],
-            records: &flotilla_engine_messages::convert::NoRecords,
-        };
-        if conversion.sender(&reply.receiver).ok().as_ref() != Some(&spec.sender) {
+        if reply.inbox != spec.sender {
             return Err("reply system receiver does not match the original sender".into());
         }
-        let referenced = reply.references.iter().find_map(|reference| match reference {
-            flotilla_resources::MessageReference::ControlRecord { resource, .. } if resource.kind == "Convoy" => {
-                Some(resource.name.clone())
-            }
-            _ => None,
-        });
-        let convoy = referenced
+        let convoy = |address: &flotilla_address::Address| {
+            (address.kind() == flotilla_address::Kind::Convoy).then(|| flotilla_resources::convoy::engine::convoy_records(address))
+        };
+        let candidates = reply
+            .references
+            .iter()
+            .find_map(|reference| convoy(&reference.address))
+            .or_else(|| spec.references.iter().find_map(|reference| convoy(&reference.address)))
             .or_else(|| {
-                let convoy = spec.references.iter().find(|reference| reference.address.kind() == flotilla_address::Kind::Convoy);
-                convoy.map(|reference| reference.address.name().to_owned())
+                spec.inbox.get(flotilla_address::Kind::Convoy).map(|_| flotilla_resources::convoy::engine::convoy_records(&spec.inbox))
             })
-            .or_else(|| spec.inbox.get(flotilla_address::Kind::Convoy).map(str::to_owned));
-        if let Some(convoy) = convoy {
-            if let Ok(convoy) = self.resource_backend.including_replicas::<ResourceConvoy>(namespace).get(&convoy).await {
+            .unwrap_or_default();
+        for name in candidates {
+            if let Ok(convoy) = self.resource_backend.including_replicas::<ResourceConvoy>(namespace).get(&name).await {
                 return Ok(match convoy.provenance {
                     ResourceProvenance::Local => self.node_id.clone(),
                     ResourceProvenance::Replica { origin_root, .. } => origin_root,
@@ -5168,107 +5161,85 @@ impl InProcessDaemon {
 
     async fn message_creation_origin(&self, namespace: &str, document: &serde_json::Value) -> Result<Option<NodeId>, String> {
         let namespace = document.pointer("/metadata/namespace").and_then(serde_json::Value::as_str).unwrap_or(namespace);
-        let spec = flotilla_resources::qualify_message_spec(
-            serde_json::from_value(document.get("spec").cloned().unwrap_or_default()).map_err(|error| format!("Message spec: {error}"))?,
-        )
-        .map_err(|error| error.to_string())?;
-        let receiver = spec.receiver.as_str();
-        if receiver.starts_with("system:") {
-            let original_id = spec.in_reply_to.as_deref().ok_or("a system receiver requires a correlated reply")?;
-            return off_frame(|| self.system_reply_origin(namespace, &spec, original_id)).await;
+        let intent = message_intent(document).map_err(|error| error.to_string())?;
+        if intent.inbox.get(flotilla_address::Kind::Fleet).is_some() {
+            let original_id = intent.in_reply_to.as_deref().ok_or("a fleet role's inbox takes only a correlated reply")?;
+            let primitives = self.message_primitives().ok_or("no Message path is installed")?;
+            return off_frame(|| self.fleet_role_reply_origin(&primitives, namespace, &intent, original_id)).await.map(Some);
         }
-        let parts = receiver.split('/').collect::<Vec<_>>();
-        let receiver_convoy = off_frame(|| self.receiver_admitted_convoy(namespace, receiver, &parts)).await?;
-        let holder = if receiver.starts_with("topic:") {
-            off_frame(|| flotilla_messaging::resolve_topic_receiver(&self.resource_backend, namespace, receiver, &spec.sender)).await
+        let inbox = &intent.inbox;
+        let (Some(project), flotilla_address::Kind::Role) = (inbox.get(flotilla_address::Kind::Project), inbox.kind()) else {
+            return Err(format!("inbox `{inbox}` has no declared home yet"));
+        };
+        let role = inbox.name();
+        // The holders are read by their old receiver spelling.
+        let (receiver, receiver_convoy) = if inbox.get(flotilla_address::Kind::Convoy).is_some() {
+            let (convoy, vessel) = off_frame(|| self.inbox_admitted_convoy(namespace, inbox, project, role)).await?;
+            let receiver =
+                vessel.as_deref().map(|vessel| flotilla_resources::crew_role_address(project, &convoy.object.metadata.name, vessel, role));
+            (receiver, Some((convoy, vessel)))
         } else {
-            off_frame(|| flotilla_messaging::resolve_message_receiver(&self.resource_backend, namespace, receiver)).await
-        }
-        .map_err(|error| error.to_string())?;
-        if let Some(holder) = holder {
-            return Ok(Some(match holder.provenance {
-                ResourceProvenance::Local => self.node_id.clone(),
-                ResourceProvenance::Replica { origin_root, .. } => origin_root,
-            }));
+            (Some(format!("{project}/{role}")), None)
+        };
+        if let Some(receiver) = &receiver {
+            let holder = off_frame(|| flotilla_messaging::resolve_message_receiver(&self.resource_backend, namespace, receiver))
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(holder) = holder {
+                return Ok(Some(match holder.provenance {
+                    ResourceProvenance::Local => self.node_id.clone(),
+                    ResourceProvenance::Replica { origin_root, .. } => origin_root,
+                }));
+            }
         }
         // An admitted vessel has a home before its agent starts. This lets its
         // messages wait at the receiver while a holder is absent or provisioning.
-        if let (Some(convoy), [_, _, vessel, _]) = (receiver_convoy, parts.as_slice()) {
-            return off_frame(|| self.vessel_receiver_origin(namespace, receiver, convoy, vessel)).await;
+        if let Some((convoy, vessel)) = receiver_convoy {
+            return off_frame(|| self.vessel_receiver_origin(namespace, inbox, convoy, vessel.as_deref())).await;
         }
-        if let [project, role] = parts.as_slice() {
-            if let Some(home) = off_frame(|| self.project_role_receiver_origin(namespace, project, role)).await? {
-                return Ok(Some(home));
-            }
+        if let Some(home) = off_frame(|| self.project_role_receiver_origin(namespace, project, role)).await? {
+            return Ok(Some(home));
         }
-        Err(format!("receiver `{receiver}` has no declared home yet"))
+        Err(format!("inbox `{inbox}` has no declared home yet"))
     }
 
-    /// The home of a reply to a system receiver: the original's sender.
-    async fn system_reply_origin(
+    /// The admitted convoy a crew member's inbox is under, with the vessel its workflow seats the
+    /// role on once frozen; refused when the inbox does not fit it.
+    async fn inbox_admitted_convoy(
         &self,
         namespace: &str,
-        spec: &flotilla_resources::MessageSpec,
-        original_id: &str,
-    ) -> Result<Option<NodeId>, String> {
-        let receiver = spec.receiver.as_str();
-        if let Some(primitives) = self.message_primitives() {
-            return self.fleet_role_reply_origin(&primitives, namespace, spec, original_id).await.map(Some);
-        }
-        let original = self
-            .resource_backend
-            .including_replicas::<flotilla_resources::Message>(namespace)
-            .get(original_id)
+        inbox: &flotilla_address::Address,
+        project: &str,
+        role: &str,
+    ) -> Result<(flotilla_resources::ReadResourceObject<ResourceConvoy>, Option<String>), String> {
+        let convoy = flotilla_messaging::inbox_convoy(&self.resource_backend, namespace, inbox)
             .await
-            .map_err(|error| error.to_string())?;
-        if original.object.spec.sender != receiver {
-            return Err("reply system receiver does not match the original sender".into());
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("inbox `{inbox}` has no admitted convoy"))?;
+        if convoy.object.spec.project_ref.as_deref().unwrap_or(namespace) != project {
+            return Err(format!("inbox `{inbox}` does not belong to the convoy's project"));
         }
-        Ok(Some(match original.provenance {
-            ResourceProvenance::Local => self.node_id.clone(),
-            ResourceProvenance::Replica { origin_root, .. } => origin_root,
-        }))
-    }
-
-    /// The admitted convoy a crew receiver names, refused when the receiver does not fit it.
-    async fn receiver_admitted_convoy(
-        &self,
-        namespace: &str,
-        receiver: &str,
-        parts: &[&str],
-    ) -> Result<Option<flotilla_resources::ReadResourceObject<ResourceConvoy>>, String> {
-        let [project, segment, vessel, _role] = parts else { return Ok(None) };
-        // A standing role's launch name carries its project's address, escaped in the segment.
-        let convoy_name = flotilla_resources::convoy_of_segment(segment);
-        let convoy = self
-            .resource_backend
-            .including_replicas::<ResourceConvoy>(namespace)
-            .get(&convoy_name)
-            .await
-            .map_err(|error| format!("receiver `{receiver}` has no admitted convoy: {error}"))?;
-        if convoy.object.spec.project_ref.as_deref().unwrap_or(namespace) != *project {
-            return Err(format!("receiver `{receiver}` does not belong to the convoy's project"));
-        }
+        let vessel = flotilla_messaging::seated_vessel(&convoy.object, role);
         if let Some(status) = &convoy.object.status {
             if status.phase.is_terminal() {
-                return Err(format!("receiver `{receiver}` names a terminal convoy"));
+                return Err(format!("inbox `{inbox}` names a terminal convoy"));
             }
-            if status.workflow_snapshot.as_ref().is_some_and(|snapshot| !snapshot.vessels.iter().any(|declared| declared.name == *vessel)) {
-                return Err(format!("receiver `{receiver}` names an undeclared vessel"));
+            if status.workflow_snapshot.is_some() && vessel.is_none() {
+                return Err(format!("inbox `{inbox}` names a role of an undeclared vessel"));
             }
         }
-        Ok(Some(convoy))
+        Ok((convoy, vessel))
     }
 
     /// The home of an admitted vessel's crew receiver: its placement's host, else its convoy's home.
     async fn vessel_receiver_origin(
         &self,
         namespace: &str,
-        receiver: &str,
+        receiver: &flotilla_address::Address,
         convoy: flotilla_resources::ReadResourceObject<ResourceConvoy>,
-        vessel: &str,
+        vessel: Option<&str>,
     ) -> Result<Option<NodeId>, String> {
-        if let Some(pin) = flotilla_resources::vessel_placement_pin(&convoy.object, vessel) {
+        if let Some(pin) = vessel.and_then(|vessel| flotilla_resources::vessel_placement_pin(&convoy.object, vessel)) {
             let actuator = placement_actuator_host_ref(&self.resource_backend, namespace, &pin.decision.target_host).await?;
             if self.canonical_local_host_id().as_ref() == Some(&actuator) {
                 return Ok(Some(self.node_id.clone()));
@@ -5529,19 +5500,17 @@ impl InProcessDaemon {
         namespace: &str,
         document: serde_json::Value,
     ) -> Result<flotilla_store::DynamicResourceObject, ResourceError> {
-        use flotilla_resources::MessageSpec;
         if document.get("kind").and_then(serde_json::Value::as_str) != Some("Message") {
             return apply_resource_document(&self.resource_backend, namespace, document).await;
         }
-        flotilla_store::validate_resource_document(&document)?;
+        if document.get("apiVersion").and_then(serde_json::Value::as_str) != Some("flotilla.work/v1") {
+            return Err(ResourceError::decode("a Message document's apiVersion is flotilla.work/v1"));
+        }
         let namespace = document.pointer("/metadata/namespace").and_then(serde_json::Value::as_str).unwrap_or(namespace);
         let meta: InputMeta = serde_json::from_value(document.get("metadata").cloned().unwrap_or_default())
             .map_err(|error| ResourceError::decode(format!("message metadata: {error}")))?;
-        let spec: MessageSpec = serde_json::from_value(document.get("spec").cloned().unwrap_or_default())
-            .map_err(|error| ResourceError::decode(format!("message spec: {error}")))?;
-        let spec = flotilla_resources::qualify_message_spec(spec)?;
+        let intent = message_intent(&document)?;
         let primitives = self.message_primitives().ok_or_else(|| ResourceError::other("no Message path is installed"))?;
-        let intent = primitives.intent_of(namespace, &spec).await?;
         let admitted = primitives.admit(&meta.name, &intent).await?;
         // The admitted record (or the one that suppressed it) and the home holding it.
         Ok(flotilla_store::DynamicResourceObject {
@@ -5556,7 +5525,7 @@ impl InProcessDaemon {
                     "namespace": namespace,
                     "annotations": { flotilla_store::replica::ORIGIN_ROOT_ANNOTATION: admitted.home },
                 },
-                "spec": spec,
+                "spec": intent,
             }),
         })
     }

@@ -266,6 +266,27 @@ pub fn launch_address(project: &flotilla_address::Address, launch: &str) -> Resu
     address.map_err(|error| error.to_string())
 }
 
+/// The inbox of `role` in convoy `convoy` of `project`: `project:P/convoy:C/role:R`, with a
+/// launch's convoy as [`launch_address`] names it. A crew member's vessel takes no part.
+pub fn seat_address(project: &flotilla_address::Address, convoy: &str, role: &str) -> Result<flotilla_address::Address, String> {
+    let convoy = match split_launch(convoy) {
+        Some(_) => launch_address(project, convoy)?,
+        None => project.child(flotilla_address::Kind::Convoy, convoy).map_err(|error| error.to_string())?,
+    };
+    convoy.child(flotilla_address::Kind::Role, role).map_err(|error| error.to_string())
+}
+
+/// The convoy records the convoy an address names may be, by name: a standing role's launch
+/// (`project:P/convoy:R#n`, named by its address) first, then the convoy its segment names.
+pub fn convoy_records(address: &flotilla_address::Address) -> Vec<String> {
+    let Some(segment) = address.get(flotilla_address::Kind::Convoy) else { return Vec::new() };
+    let standing = split_launch(segment).and_then(|(of, n)| {
+        let project = address.get(flotilla_address::Kind::Project)?;
+        Some(format!("{}#{n}", standing_name(project, of).ok()?))
+    });
+    standing.into_iter().chain([segment.to_owned()]).collect()
+}
+
 /// What `convoy` is a launch of. A launch read from the engine is named by its launch. An old
 /// record (the import's) keeps its name when finite; a standing one uses its ensure's frozen role
 /// and project, including old generations admitted before spec.role.
@@ -414,6 +435,21 @@ mod tests {
         assert_eq!(launch_address(&project, &format!("{standing}#4")).expect("standing").as_str(), "project:p/convoy:coder%234");
         assert_eq!(launch_address(&project, "convoy-0f3a#6").expect("finite").as_str(), "project:p/convoy:convoy-0f3a%236");
         assert!(launch_address(&project, "convoy-0f3a").is_err(), "no launch");
+    }
+
+    // Behaviour: a seat's inbox names its convoy as its launch's address, and the convoy records
+    // that inbox may be under include the launch it was built from.
+    #[test]
+    fn a_seat_inbox_leads_back_to_its_convoy_record() {
+        let project = flotilla_address::Address::project("p").expect("project");
+        let standing = format!("{}#4", standing_name("p", "coder").expect("standing"));
+        for convoy in [standing.as_str(), "convoy-0f3a#6", "convoy-0f3a"] {
+            let seat = seat_address(&project, convoy, "coder").expect("seat");
+            assert_eq!(seat.name(), "coder");
+            let parent = seat.parent().expect("convoy");
+            assert!(convoy_records(&parent).iter().any(|record| record == convoy), "{convoy}: {:?}", convoy_records(&parent));
+        }
+        assert_eq!(seat_address(&project, &standing, "coder").expect("seat").as_str(), "project:p/convoy:coder%234/role:coder");
     }
 
     fn convoy(name: &str) -> ResourceObject<Convoy> {

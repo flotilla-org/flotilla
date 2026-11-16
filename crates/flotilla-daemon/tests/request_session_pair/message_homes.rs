@@ -276,13 +276,14 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         let name = flotilla_resources::message_record_name(&intent.receiver, &intent.sender, &format!("cancel-{step}"));
         let mut cancel = intent.clone();
         cancel.deadline = matches!(action, DropAction::Expire).then(|| Utc::now() - chrono::Duration::seconds(1));
+        let routed = engine_a.intent_of(NS, &cancel).await.expect("intent");
         // Exercise receiver admission through the router, then resume the sender's
         // record write separately to model a delayed or retried send continuation.
         let mut events = a.subscribe();
         let command = flotilla_protocol::Command::builder()
             .action(flotilla_protocol::CommandAction::ResourceApply {
                 namespace: NS.into(),
-                document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name}, "spec":cancel}),
+                document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name}, "spec":routed}),
             })
             .build();
         let id = mesh.clients[0].execute(command).await.expect("routed cancellable admission");

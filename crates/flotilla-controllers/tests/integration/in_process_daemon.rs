@@ -145,10 +145,10 @@ impl flotilla_crew::leaf_engine::ResourceIntentPublisher for ReceiverIntentPubli
         if document["kind"] != "Message" || document["metadata"]["namespace"] != namespace {
             return Err("invalid receiver-home resource document".into());
         }
-        let spec = serde_json::from_value(document["spec"].clone()).map_err(|error| error.to_string())?;
+        let intent = serde_json::from_value(document["spec"].clone()).map_err(|error| error.to_string())?;
         let name = document["metadata"]["name"].as_str().ok_or("missing name")?;
         let primitives = self.home.message_primitives().ok_or("the receiver home has no Message path")?;
-        let admitted = primitives.admit_old(namespace, name, &spec).await.map_err(|error| error.to_string())?;
+        let admitted = primitives.admit(name, &intent).await.map_err(|error| error.to_string())?;
         Ok(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", namespace, admitted.record))
     }
 }
@@ -9589,12 +9589,14 @@ async fn message_apply_uses_document_namespace_and_status_patches_are_refused() 
     .await;
     let mut events = daemon.subscribe();
     let apply = |namespace: &str| {
+        let project = flotilla_resources::address::Address::project(namespace).expect("project");
+        let inbox = flotilla_resources::convoy::engine::seat_address(&project, &convoy, "coder").expect("inbox");
         Command::builder()
             .action(CommandAction::ResourceApply {
                 namespace: "request-default".into(),
                 document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message",
             "metadata":{"name":"namespace-message","namespace":namespace},
-            "spec":{"sender":"system:nudge","receiver":format!("{namespace}/{convoy}/work/coder"),"relation":"system","body":"test"}}),
+            "spec":{"sender":"fleet:lab/role:nudge","inbox":inbox,"relation":"system","body":"test"}}),
             })
             .build()
     };

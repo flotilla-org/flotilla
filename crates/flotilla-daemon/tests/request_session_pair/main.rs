@@ -3870,8 +3870,8 @@ fn generated_cross_host_supervision(tc: hegel::TestCase) {
     ));
 }
 
-// Message admission validates open addresses and the supervisor-only interrupt
-// constraint through ordinary resource mutation, before any transport work.
+// Message admission refuses an intent whose addresses do not parse through ordinary
+// resource mutation, before any transport work.
 #[tokio::test]
 async fn message_resource_apply_rejects_invalid_intent() {
     let daemon = empty_daemon_named("receiver").await;
@@ -3884,16 +3884,15 @@ async fn message_resource_apply_rejects_invalid_intent() {
         ),
     )
     .await;
-    // The receiver names the convoy's launch.
-    let receiver = format!("project/{convoy}/work/coder");
-    for (sender, relation, interrupting, reason) in
-        [("invalid/address/shape", "system", false, "invalid role address"), ("system:turn-rules", "peer", true, "interrupt")]
-    {
+    // The inbox names the convoy's launch.
+    let project = flotilla_address::Address::project("project").expect("project");
+    let inbox = flotilla_resources::convoy::engine::seat_address(&project, &convoy, "coder").expect("inbox");
+    for (sender, relation, reason) in [("invalid/address/shape", "system", "is not `kind:value`")] {
         let mut events = daemon.subscribe();
         let admission = daemon.execute(Command::builder().action(CommandAction::ResourceApply {
             namespace: "flotilla".into(),
             document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"invalid","namespace":"flotilla"},
-                "spec":{"sender":sender,"receiver":receiver,"relation":relation,"body":"test","interrupting":interrupting}}),
+                "spec":{"sender":sender,"inbox":inbox,"relation":relation,"body":"test"}}),
         }).build()).await;
         let error = match admission {
             Err(error) => error,
@@ -4315,11 +4314,11 @@ async fn run_message_role_waiting_home_case(remote: bool, admitted: bool) {
     for (name, intent) in [
         (
             "request",
-            serde_json::json!({"sender":"system:turn-rules","receiver":"flotilla/governor","relation":"system","body":"settled checks","expectation":{"kind":"reply"}}),
+            serde_json::json!({"sender":"fleet:lab/role:turn-rules","inbox":"project:flotilla/role:governor","relation":"system","body":"settled checks","expectation":{"kind":"reply"}}),
         ),
         (
             "reply",
-            serde_json::json!({"sender":"flotilla/governor","receiver":"system:turn-rules","relation":"peer","body":"received","in_reply_to":"request"}),
+            serde_json::json!({"sender":"project:flotilla/role:governor","inbox":"fleet:lab/role:turn-rules","relation":"peer","body":"received","in_reply_to":"request"}),
         ),
     ] {
         if remote && name == "reply" {

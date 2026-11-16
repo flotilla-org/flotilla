@@ -263,6 +263,12 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
     }
 }
 
+/// The coder's inbox in launch `convoy` of project flotilla.
+fn crew_inbox(convoy: &str) -> String {
+    let project = flotilla_address::Address::project("flotilla").expect("project");
+    flotilla_resources::convoy::engine::seat_address(&project, convoy, "coder").expect("seat").to_string()
+}
+
 // A system reply to a legacy controller sender is correlated with its receiver
 // intent and has a creatable home on this daemon.
 #[tokio::test]
@@ -288,9 +294,10 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
         .into_iter()
         .find(|message| message.metadata.name == admission.message.name)
         .expect("receiver intent");
+    let crew = crew_inbox(&probe.convoy);
     let reply = serde_json::json!({
         "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"legacy-reply"},
-        "spec":{"sender":original.spec.receiver,"receiver":original.spec.sender,"relation":"peer",
+        "spec":{"sender":crew,"inbox":"fleet:lab/role:turn-rules","relation":"peer",
                 "body":"acknowledged","in_reply_to":original.metadata.name}
     });
     assert_eq!(
@@ -332,7 +339,7 @@ async fn read_by_routing_a_reply(count: usize) -> (u64, u64) {
     }
     let reply = serde_json::json!({
         "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"reply"},
-        "spec":{"sender":crew,"receiver":"system:turn-rules","relation":"peer","body":"done","in_reply_to":admission.message.name}
+        "spec":{"sender":crew_inbox(&probe.convoy),"inbox":"fleet:lab/role:turn-rules","relation":"peer","body":"done","in_reply_to":admission.message.name}
     });
     let (home, reads) = flotilla_store::load_metrics::measure(daemon.message_creation_origin("flotilla", &reply)).await;
     assert_eq!(home.expect("the reply has a home"), Some(daemon.node_id().clone()), "the convoy's home");
