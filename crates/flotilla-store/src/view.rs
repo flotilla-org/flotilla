@@ -57,18 +57,16 @@ impl<T: Resource> ViewSource<T> for StoreViewSource<T> {
         let replicas = if T::REPLICATION_CLASS == ReplicationClass::None {
             futures::stream::pending().boxed()
         } else {
-            crate::retry_store_read(|| store.watch_replicas_typed::<T>(&self.namespace)).await?
+            store.watch_replicas_typed::<T>(&self.namespace).await?
         };
         let query = StoreQuery { include_replicas: true, suppress_self_origin: false, ..StoreQuery::default() };
-        let listed = crate::retry_store_read(|| store.query_decoded(ResourceKind::of::<T>(), &self.namespace, &query)).await?;
+        let listed = store.query_decoded(ResourceKind::of::<T>(), &self.namespace, &query).await?;
         let position = listed.position.clone();
         let start = match position.generation {
             Some(generation) => WatchStart::FromVersionInGeneration { generation, resource_version: position.resource_version },
             None => WatchStart::FromVersion(position.resource_version),
         };
-        let local = crate::retry_store_read(|| store.watch_typed::<T>(&self.namespace, start.clone()))
-            .await?
-            .map(|event| event.map(ReadWatchEvent::local));
+        let local = store.watch_typed::<T>(&self.namespace, start).await?.map(|event| event.map(ReadWatchEvent::local));
         let items = ReadResourceList { items: listed.into_typed()? };
         Ok((items, futures::stream::select(local, replicas).boxed()))
     }
@@ -645,17 +643,17 @@ pub trait LocalViewSource<T: Resource>: Send + Sync {
 #[async_trait]
 impl<T: Resource> LocalViewSource<T> for crate::TypedResolver<T> {
     async fn list(&self) -> Result<ResourceList<T>, ResourceError> {
-        crate::retry_store_read(|| self.list()).await
+        self.list().await
     }
     async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
-        crate::retry_store_read(|| self.watch(start.clone())).await
+        self.watch(start).await
     }
 }
 #[async_trait]
 impl<T: Resource> ViewSource<T> for crate::ReplicaReadResolver<T> {
     async fn list_and_watch(&self) -> Result<(ReadResourceList<T>, Events<T>), ResourceError> {
-        let watch = crate::retry_store_read(|| self.watch()).await?;
-        let listed = crate::retry_store_read(|| self.list()).await?;
+        let watch = self.watch().await?;
+        let listed = self.list().await?;
         Ok((listed, watch))
     }
 }
@@ -666,8 +664,8 @@ pub async fn recover_local_view<T: Resource>(source: &dyn LocalViewSource<T>) ->
     let mut warnings = RecoveryWarnings::default();
     loop {
         let result = async {
-            let listed = crate::retry_store_read(|| source.list()).await?;
-            let events = crate::retry_store_read(|| source.watch(WatchStart::resuming_from(&listed))).await?;
+            let listed = source.list().await?;
+            let events = source.watch(WatchStart::resuming_from(&listed)).await?;
             Ok((listed, events))
         }
         .await;

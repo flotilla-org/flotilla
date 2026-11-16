@@ -339,9 +339,8 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelMappedWatch<W, P> {
         Box::pin(async move {
             let resolver = backend.using::<W>(&namespace);
             // Watch before listing (see `spawn_primary_watch`).
-            let mut watch =
-                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.watch(WatchStart::Now)).await?;
-            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.list()).await?;
+            let mut watch = resolver.watch(WatchStart::Now).await?;
+            let listed = resolver.list().await?;
             for object in &listed.items {
                 Self::enqueue_from_object(self.label_key, &sender, object).await?;
             }
@@ -380,10 +379,8 @@ impl<W: Resource, P: Resource> SecondaryWatch for ResolverLabelMappedWatch<W, P>
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             // Watch before listing (see `spawn_primary_watch`).
-            let mut watch =
-                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.watch(WatchStart::Now))
-                    .await?;
-            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.list()).await?;
+            let mut watch = self.resolver.watch(WatchStart::Now).await?;
+            let listed = self.resolver.list().await?;
             for object in &listed.items {
                 LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, object).await?;
             }
@@ -421,9 +418,8 @@ impl<W: Resource, P: Resource> SecondaryWatch for ReplicaLabelMappedWatch<W, P> 
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let mut watch =
-                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.watch()).await?;
-            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.list()).await?;
+            let mut watch = self.resolver.watch().await?;
+            let listed = self.resolver.list().await?;
             for source in &listed.items {
                 LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, &source.object).await?;
             }
@@ -458,9 +454,7 @@ impl<W: Resource, P: Resource> LabelJoinWatch<W, P> {
             return Ok(());
         };
         let selector = BTreeMap::from([(label_key.to_string(), value.clone())]);
-        let listed =
-            crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primaries.list_matching_labels(&selector))
-                .await?;
+        let listed = primaries.list_matching_labels(&selector).await?;
         for object in listed.items {
             sender
                 .send(object.metadata.name)
@@ -488,9 +482,8 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelJoinWatch<W, P> {
             let watched = backend.clone().using::<W>(&namespace);
             let primaries = backend.using::<P>(&namespace);
             // Watch before listing (see `spawn_primary_watch`).
-            let mut watch =
-                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || watched.watch(WatchStart::Now)).await?;
-            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || watched.list()).await?;
+            let mut watch = watched.watch(WatchStart::Now).await?;
+            let listed = watched.list().await?;
             for object in &listed.items {
                 Self::enqueue_matching_primaries(self.label_key, &sender, object, &primaries).await?;
             }
@@ -585,10 +578,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                 // so a change between the two is in the list, the watch or both. Every event only
                 // queues a name for a reconcile of its current state, so one seen twice costs a
                 // repeated reconcile, never a wrong one.
-                let mut watch =
-                    crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.watch(WatchStart::Now))
-                        .await?;
-                let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.list()).await?;
+                let mut watch = primary.watch(WatchStart::Now).await?;
+                let listed = primary.list().await?;
                 for object in &listed.items {
                     sender
                         .send(object.metadata.name.clone())
@@ -660,7 +651,7 @@ impl<R: Reconciler> ControllerLoop<R> {
     }
 
     async fn resync_all(primary: &TypedResolver<R::Resource>, sender: &WorkQueueSender) -> Result<HashSet<String>, ResourceError> {
-        let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.list()).await?;
+        let listed = primary.list().await?;
         let mut live_names = HashSet::with_capacity(listed.items.len());
         for object in listed.items {
             live_names.insert(object.metadata.name.clone());
@@ -737,47 +728,46 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let woke_at = Instant::now();
                 metrics.queue_wait.record(sender.start(&name));
                 let _busy = metrics.busy();
-                let object =
-                    match crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.get(&name)).await {
-                        Ok(object) => {
-                            read_failures.remove(&name);
-                            object
-                        }
-                        Err(ResourceError::NotFound { .. }) => {
-                            read_failures.remove(&name);
-                            object_failures.remove(&name);
-                            finalizer_failures.remove(&name);
-                            metrics.parked.set(sender.unpark(&name) as u64);
-                            continue;
-                        }
-                        Err(err) => {
-                            let limit = ReconcileErrorPolicy::UNBUDGETED.max_consecutive_failures;
-                            let failures = read_failures.entry(name.clone()).or_insert(0);
-                            // A parked object is read again only when a change wakes it: count afresh.
-                            *failures = if *failures >= limit { 1 } else { failures.saturating_add(1) };
-                            if *failures >= limit {
-                                error!(
-                                    resource_kind = R::Resource::API_PATHS.kind,
-                                    resource = %name,
-                                    %err,
-                                    failures = *failures,
-                                    "controller could not read object; parked until it changes",
-                                );
-                                metrics.parked.set(sender.park(&name, format!("reading it failed {} times: {err}", *failures)) as u64);
-                                continue;
-                            }
-                            let delay = ReconcileErrorPolicy::UNBUDGETED.backoff(*failures);
-                            warn!(
+                let object = match primary.get(&name).await {
+                    Ok(object) => {
+                        read_failures.remove(&name);
+                        object
+                    }
+                    Err(ResourceError::NotFound { .. }) => {
+                        read_failures.remove(&name);
+                        object_failures.remove(&name);
+                        finalizer_failures.remove(&name);
+                        metrics.parked.set(sender.unpark(&name) as u64);
+                        continue;
+                    }
+                    Err(err) => {
+                        let limit = ReconcileErrorPolicy::UNBUDGETED.max_consecutive_failures;
+                        let failures = read_failures.entry(name.clone()).or_insert(0);
+                        // A parked object is read again only when a change wakes it: count afresh.
+                        *failures = if *failures >= limit { 1 } else { failures.saturating_add(1) };
+                        if *failures >= limit {
+                            error!(
                                 resource_kind = R::Resource::API_PATHS.kind,
                                 resource = %name,
                                 %err,
-                                retry_in = ?delay,
-                                "controller failed to read object; retrying it",
+                                failures = *failures,
+                                "controller could not read object; parked until it changes",
                             );
-                            Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await;
+                            metrics.parked.set(sender.park(&name, format!("reading it failed {} times: {err}", *failures)) as u64);
                             continue;
                         }
-                    };
+                        let delay = ReconcileErrorPolicy::UNBUDGETED.backoff(*failures);
+                        warn!(
+                            resource_kind = R::Resource::API_PATHS.kind,
+                            resource = %name,
+                            %err,
+                            retry_in = ?delay,
+                            "controller failed to read object; retrying it",
+                        );
+                        Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await;
+                        continue;
+                    }
+                };
                 if finalizer_failures.get(&name).is_some_and(|failure| failure.creation_timestamp != object.metadata.creation_timestamp) {
                     finalizer_failures.remove(&name);
                 }
@@ -1076,8 +1066,7 @@ pub async fn delete_lifecycle_owned_matching<T: Resource>(
     resolver: &TypedResolver<T>,
     selector: &BTreeMap<String, String>,
 ) -> Result<(), ResourceError> {
-    let listed =
-        crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.list_matching_labels(selector)).await?;
+    let listed = resolver.list_matching_labels(selector).await?;
     for object in listed.items {
         if !is_lifecycle_owned(object.metadata.lifecycle_authority()?) {
             continue;

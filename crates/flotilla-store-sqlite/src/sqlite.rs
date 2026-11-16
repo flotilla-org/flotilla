@@ -369,16 +369,6 @@ impl SqliteBackend {
         self.connection.clone()
     }
 
-    /// Awaits `pause` after each watch registers on the writer and before
-    /// the watch's first read, in this handle and the clones taken after.
-    #[cfg(test)]
-    pub(crate) fn pause_after_watch_registered(
-        &mut self,
-        pause: impl Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync + 'static,
-    ) {
-        self.replay_probe.registered = Some(Arc::new(pause));
-    }
-
     /// Statement compiles and executed operations per connection since open.
     ///
     /// Take a snapshot before and after an operation and compare them with

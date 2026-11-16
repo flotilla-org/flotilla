@@ -68,7 +68,7 @@ use crate::server::environment_sockets::EnvironmentSocketService;
 use crate::{
     blob_store::TieredBlobStore,
     resource_manifest::manifest_root_name,
-    startup::{phase, result_phase, retry_phase},
+    startup::{phase, result_phase},
     supervisor::ControllerSupervision,
 };
 pub(crate) use tasks::manifest_reconciler_enabled;
@@ -193,8 +193,8 @@ impl DaemonRuntime {
                 }
             }
         }
-        let local_registry = retry_phase("probe_local_provider_registry", || probe_local_provider_registry(&daemon, &config)).await?;
-        let mut profile = retry_phase("build_local_profile", || build_local_profile(&daemon, &local_registry)).await?;
+        let local_registry = result_phase("probe_local_provider_registry", probe_local_provider_registry(&daemon, &config)).await?;
+        let mut profile = result_phase("build_local_profile", build_local_profile(&daemon, &local_registry)).await?;
         profile.max_vessels = daemon_config.max_vessels;
         let host_direct_environment_name = host_direct_environment_name(&profile.host_id);
         let mut archive_roots = vec![CheckoutArchiveRoot {
@@ -245,19 +245,19 @@ impl DaemonRuntime {
             .with_blob_store(Arc::clone(&blob_store));
         runtime_health.host_observations.record_provider_advertisements(profile.environment_providers.clone()).await;
 
-        retry_phase("quarantine_undecodable_stored_objects", || async {
+        result_phase("quarantine_undecodable_stored_objects", async {
             flotilla_store::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace).await
         })
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
-        retry_phase("register_startup_resources", || register_startup_resources(&daemon, &options.namespace, &profile)).await?;
+        result_phase("register_startup_resources", register_startup_resources(&daemon, &options.namespace, &profile)).await?;
         let registered_image_caches = local_registry
             .environment_providers
             .iter()
             .filter(|(_, provider)| provider.local_image_cache().is_some())
             .filter_map(|(_, provider)| local_registry.environment_providers.instance_name(provider).map(String::from))
             .collect::<BTreeSet<_>>();
-        retry_phase("prune_unregistered_image_caches", || async {
+        result_phase("prune_unregistered_image_caches", async {
             flotilla_provisioning::image_inventory::prune_unregistered_caches(
                 &daemon.resource_backend(),
                 &options.namespace,
@@ -278,7 +278,7 @@ impl DaemonRuntime {
         });
         let mut registered_ssh_profiles = Vec::new();
         for ssh in ssh_profiles {
-            if let Err(error) = retry_phase("register_ssh_host_resources", || async {
+            if let Err(error) = result_phase("register_ssh_host_resources", async {
                 register_ssh_host_resources(
                     &daemon.resource_backend(),
                     daemon.lifecycle_reads(),
@@ -293,9 +293,10 @@ impl DaemonRuntime {
                 warn!(host = %ssh.provisioning.host_id, %error, "failed to register SSH host; continuing startup");
                 continue;
             }
-            if let Err(error) = retry_phase("apply_ssh_host_observation", || {
-                apply_ssh_host_observation(&daemon, &options.namespace, &ssh, Some(&credential_store), ssh_host_vessels.as_deref())
-            })
+            if let Err(error) = result_phase(
+                "apply_ssh_host_observation",
+                apply_ssh_host_observation(&daemon, &options.namespace, &ssh, Some(&credential_store), ssh_host_vessels.as_deref()),
+            )
             .await
             {
                 warn!(host = %ssh.provisioning.host_id, %error, "failed to observe SSH host; continuing startup");
@@ -303,9 +304,10 @@ impl DaemonRuntime {
             registered_ssh_profiles.push(ssh);
         }
         let ssh_profiles = registered_ssh_profiles;
-        retry_phase("publish_local_host_heartbeat", || {
-            apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health)
-        })
+        result_phase(
+            "publish_local_host_heartbeat",
+            apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health),
+        )
         .await?;
 
         let mut tasks = lifecycle_followers;
@@ -405,13 +407,13 @@ impl DaemonRuntime {
             .filter(|declared| manifest_reconciler_enabled(&declared.reconciler_root, &profile.host_id))
             .map(|declared| manifest_root_name(&declared.reconciler_root, &declared.dir, &declared.source));
         let roots = daemon.manifest_roots();
-        for root in retry_phase("list_manifest_roots", || roots.roots(&options.namespace)).await? {
+        for root in result_phase("list_manifest_roots", roots.roots(&options.namespace)).await? {
             if root.local
                 && root.name.starts_with("manifest-")
                 && root.spec.host == profile.host_id
                 && desired_manifest_root.as_deref() != Some(root.name.as_str())
             {
-                retry_phase("retire_stale_manifest_root", || roots.retire(&options.namespace, &root.name)).await?;
+                result_phase("retire_stale_manifest_root", roots.retire(&options.namespace, &root.name)).await?;
             }
         }
         let charter_daemon = Arc::clone(&daemon);
@@ -960,7 +962,7 @@ pub fn engine_opener(config: &ConfigStore) -> flotilla_core::in_process::EngineO
 /// Opens the Message path over the decided store composed with the daemon (#3317). Installed
 /// before peer tasks start, so every peer's log is followed from the first connection.
 pub(crate) async fn open_message_primitives(daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
-    retry_phase("restore_message_primitives", || async {
+    result_phase("restore_message_primitives", async {
         let daemon = Arc::clone(daemon);
         tokio::task::spawn_blocking(move || daemon.open_message_primitives()).await.map_err(|error| error.to_string())?
     })

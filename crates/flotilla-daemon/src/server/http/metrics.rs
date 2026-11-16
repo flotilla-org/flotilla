@@ -132,26 +132,6 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
     ] {
         out.number(&format!("flotilla_replication_{name}_total"), "counter", "", value);
     }
-    for (consumer, snapshot) in flotilla_store::load_metrics::read_retry_snapshot() {
-        let labels = format!(",consumer=\"{consumer}\"");
-        for (name, value) in [
-            ("retries", snapshot.retries),
-            ("recoveries", snapshot.recoveries),
-            ("failures", snapshot.failures),
-            ("cancellations", snapshot.cancellations),
-        ] {
-            out.number(&format!("flotilla_read_retry_{name}_total"), "counter", &labels, value);
-        }
-        for (name, value) in [
-            ("peak_consecutive", snapshot.peak_consecutive),
-            ("active", snapshot.active),
-            ("prolonged", snapshot.prolonged),
-            ("consecutive", snapshot.consecutive),
-        ] {
-            out.number(&format!("flotilla_read_retry_{name}"), "gauge", &labels, value);
-        }
-        out.number("flotilla_read_retry_oldest_seconds", "gauge", &labels, snapshot.oldest_millis as f64 / 1000.0);
-    }
     for row in daemon.forge_budget_rows() {
         let labels = format!(",identity=\"{}\",budget=\"{}\"", escaped(&row.identity), escaped(&row.budget));
         for (name, value) in
@@ -337,7 +317,6 @@ mod tests {
             "flotilla_store_execution_seconds",
             "flotilla_controller_reconcile_seconds",
             "flotilla_replication_stream_failures_total",
-            "flotilla_read_retry_retries_total",
             "flotilla_forge_budget_calls_total",
             "flotilla_forge_budget_window_calls",
             "flotilla_store_queue_wait_seconds_max",
@@ -357,14 +336,6 @@ mod tests {
             "flotilla_controller_skipped_total",
             "flotilla_replication_snapshots_total",
             "flotilla_replication_events_applied_total",
-            "flotilla_read_retry_recoveries_total",
-            "flotilla_read_retry_failures_total",
-            "flotilla_read_retry_cancellations_total",
-            "flotilla_read_retry_peak_consecutive",
-            "flotilla_read_retry_active",
-            "flotilla_read_retry_prolonged",
-            "flotilla_read_retry_consecutive",
-            "flotilla_read_retry_oldest_seconds",
             "flotilla_forge_budget_reported_cost_total",
             "flotilla_forge_budget_unreported_calls_total",
             "flotilla_forge_budget_window_reported_cost",
