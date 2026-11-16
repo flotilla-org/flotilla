@@ -84,7 +84,8 @@ async fn command_reads(others: usize) -> Vec<(String, ReadCounts)> {
     costs.push((format!("undelivered_from: {}", undelivered.standing.name), reads));
 
     let ruling = primitives.intent_of(NAMESPACE, &escalation("")).await.expect("intent");
-    let (awaited, reads) = measure_now(|| primitives.awaited_reply_from(&ruling));
+    let about = ruling.references.iter().map(|reference| reference.address.clone()).collect::<Vec<_>>();
+    let (awaited, reads) = measure_now(|| primitives.awaited_reply_from(&ruling.sender, &ruling.inbox, &about));
     assert_eq!(awaited.expect("awaited read").as_deref(), Some("escalation"));
     costs.push(("awaited_reply_from".into(), reads));
 

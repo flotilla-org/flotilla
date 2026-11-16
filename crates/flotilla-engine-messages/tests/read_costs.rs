@@ -110,7 +110,8 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     assert_eq!(cost.0, 3, "a delivery hold loads only the waiting messages");
 
     let ruling = primitives.intent_of(NAMESPACE, &intent(BUSY, "ruling")).await.expect("intent");
-    let (awaited, cost) = measured_now(|| primitives.awaited_reply_from(&ruling));
+    let about = ruling.references.iter().map(|reference| reference.address.clone()).collect::<Vec<_>>();
+    let (awaited, cost) = measured_now(|| primitives.awaited_reply_from(&ruling.sender, &ruling.inbox, &about));
     assert_eq!(awaited.expect("open read"), None, "no open message expects a reply");
     assert_eq!(cost, (3, 0), "an open read loads only the open messages and converts none");
 

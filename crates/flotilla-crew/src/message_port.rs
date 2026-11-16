@@ -2,10 +2,11 @@
 //! Messages only through these methods, from the engine store's replica in
 //! the old shape.
 
+use flotilla_address::Address;
 use flotilla_messaging::{Admitted, Intent, SentMessage};
 use flotilla_resources::{MessageSpec, ResourceError};
 
-use crate::crew_ops::CrewService;
+use crate::crew_ops::{CrewService, Party};
 
 impl CrewService {
     pub(crate) fn message_primitives(&self) -> Result<std::sync::Arc<dyn flotilla_messaging::EngineMessages>, ResourceError> {
@@ -58,10 +59,29 @@ impl CrewService {
         self.message_primitives()?.undelivered_from(intent).await
     }
 
-    /// The last open Message from `intent`'s sender to its inbox expecting a reply about one of
-    /// what `intent` refers to, local or replicated: its name.
-    pub(crate) async fn awaited_reply_from(&self, intent: &Intent) -> Result<Option<String>, ResourceError> {
-        self.message_primitives()?.awaited_reply_from(intent).await
+    /// The last open Message from `sender` to `inbox` expecting a reply about one of `about`, at
+    /// any revision, local or replicated: its name.
+    pub(crate) async fn awaited_reply_from(
+        &self,
+        sender: &Address,
+        inbox: &Address,
+        about: &[Address],
+    ) -> Result<Option<String>, ResourceError> {
+        self.message_primitives()?.awaited_reply_from(sender, inbox, about).await
+    }
+
+    /// The inbox `party` sends and receives at; a person's is the role they hold in `project`.
+    pub(crate) async fn party_inbox(&self, namespace: &str, party: &Party, project: &str) -> Result<Address, String> {
+        match party {
+            Party::Person(principal) => {
+                self.message_primitives().map_err(|error| error.to_string())?.person(namespace, principal, Some(project)).await
+            }
+            Party::Seat { project, convoy, role } => Address::project(project)
+                .map_err(|error| error.to_string())
+                .and_then(|project| flotilla_resources::convoy::engine::seat_address(&project, convoy, role))
+                .map_err(ResourceError::invalid),
+        }
+        .map_err(|error| error.to_string())
     }
 
     /// The Messages to `seats` still waiting for delivery that a supervisor sent and no fleet role

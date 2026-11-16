@@ -37,6 +37,7 @@ use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_engine_store::StoreLog;
 use flotilla_inbox::{sqlite::SqliteInbox, ConsumerLog, ConsumerPort, InboxBackend, Observations, ReceiptScope, Supervision};
 use flotilla_messaging::MessageResolution;
+use flotilla_resources::convoy::engine::convoy_reference_address;
 use flotilla_resources::{
     address::{artifact_address, record_name as address_record_name, repository_address},
     Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, MessageSpec as OldSpec, Project,
@@ -1006,6 +1007,19 @@ impl MessagePrimitives {
         Ok(self.roles_or_wait(namespace).await?.err())
     }
 
+    /// The inbox of fleet role `role`, read on the FleetDesignation by its name.
+    pub async fn fleet_role(&self, namespace: &str, role: &str) -> Result<Address, ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        roles.address(role).ok_or_else(|| ResourceError::invalid(format!("fleet role `{role}` is not declared")))
+    }
+
+    /// The inbox of the role person `principal` holds in `project`, or under the fleet with no
+    /// project, read on the project's declaration by its name.
+    pub async fn person_role(&self, namespace: &str, principal: &str, project: Option<&str>) -> Result<Address, ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        self.person_inbox(namespace, &roles, &format!("principal:{principal}"), project).await.map_err(ResourceError::invalid)
+    }
+
     /// An old-shaped intent in the engine's terms, as admission takes it.
     // Goes once every producer builds its intent in the engine's terms (#3108).
     pub async fn intent_of(&self, namespace: &str, old: &OldSpec) -> Result<flotilla_messaging::Intent, ResourceError> {
@@ -1380,7 +1394,7 @@ impl MessagePrimitives {
             Err(ResourceError::NotFound { .. }) => None,
             Err(error) => return Err(error.to_string()),
         };
-        let authority = convoy_address(convoy, project.as_deref())?;
+        let authority = convoy_reference_address(convoy, project.as_deref())?;
         self.world.update(|world| world.authority.put(&flotilla_state_machines::Ref::new(authority.as_str()), true));
         self.inbox.drop(&id, DropReason::Withdrawn { by: by.clone(), authority }).await.map_err(|error| error.to_string())?;
         self.withdraw_awaiting(&id, &by, "withdrawn by an operator").await;
@@ -1854,14 +1868,13 @@ impl MessagePrimitives {
         Ok(created.into_iter().next().and_then(|created| sent_message(intent.inbox.to_string(), &row.1, created)))
     }
 
-    /// The last open message admitted to `intent`'s inbox from its sender that expects a reply
-    /// and refers to one of what `intent` refers to: its record name. Read through the inbox's
-    /// open indexes.
-    pub fn awaited_reply_from(&self, intent: &flotilla_messaging::Intent) -> Result<Option<String>, ResourceError> {
-        let found = self.open_in(&intent.inbox).map_err(ResourceError::other)?.into_iter().filter_map(|(_, message)| {
+    /// The last open message admitted to `inbox` from `sender` that expects a reply and refers to
+    /// one of `about`, at any revision: its record name. Read through the inbox's open indexes.
+    pub fn awaited_reply_from(&self, sender: &Address, inbox: &Address, about: &[Address]) -> Result<Option<String>, ResourceError> {
+        let found = self.open_in(inbox).map_err(ResourceError::other)?.into_iter().filter_map(|(_, message)| {
             let spec = message.spec();
-            let refers = spec.references.iter().any(|reference| intent.references.iter().any(|cited| cited.address == reference.address));
-            let awaited = spec.sender == intent.sender && spec.expectation == Expectation::Reply && refers;
+            let refers = spec.references.iter().any(|reference| about.contains(&reference.address));
+            let awaited = spec.sender == *sender && spec.expectation == Expectation::Reply && refers;
             let admitted = spec.admitted_seq;
             awaited.then_some((admitted, message))
         });
@@ -2037,8 +2050,14 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     ) -> Result<Option<flotilla_messaging::SentMessage>, ResourceError> {
         MessagePrimitives::undelivered_from(self, intent)
     }
-    async fn awaited_reply_from(&self, intent: &flotilla_messaging::Intent) -> Result<Option<String>, ResourceError> {
-        MessagePrimitives::awaited_reply_from(self, intent)
+    async fn awaited_reply_from(&self, sender: &Address, inbox: &Address, about: &[Address]) -> Result<Option<String>, ResourceError> {
+        MessagePrimitives::awaited_reply_from(self, sender, inbox, about)
+    }
+    async fn fleet_role(&self, namespace: &str, role: &str) -> Result<Address, ResourceError> {
+        MessagePrimitives::fleet_role(self, namespace, role).await
+    }
+    async fn person(&self, namespace: &str, principal: &str, project: Option<&str>) -> Result<Address, ResourceError> {
+        MessagePrimitives::person_role(self, namespace, principal, project).await
     }
     async fn queued_briefs(&self, namespace: &str, seats: &[String]) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
         MessagePrimitives::queued_briefs(self, namespace, seats).await
@@ -2373,7 +2392,7 @@ impl OldStoreRecords {
     }
 
     fn convoy_address(&self, name: &str) -> Result<Address, String> {
-        convoy_address(name, self.convoy(name).and_then(|convoy| convoy.spec.project_ref.as_deref()))
+        convoy_reference_address(name, self.convoy(name).and_then(|convoy| convoy.spec.project_ref.as_deref()))
     }
 
     /// A crew session's seat, the address its convoy role's messages are received at (the crew's
@@ -2422,15 +2441,6 @@ impl OldStoreRecords {
         }
         held
     }
-}
-
-/// Convoy `name`'s address: under `project` when it names one.
-pub(crate) fn convoy_address(name: &str, project: Option<&str>) -> Result<Address, String> {
-    let address = match project {
-        Some(project) => Address::project(project).and_then(|project| project.child(AddressKind::Convoy, name)),
-        None => Address::convoy(name),
-    };
-    address.map_err(|error| format!("convoy `{name}`: {error}"))
 }
 
 /// A convoy with no status has not been seen to end.

@@ -499,23 +499,46 @@ struct ResumeSession {
 /// A resume whose crew work is reopened, ready to publish.
 struct ResumeDelivery {
     session: flotilla_resources::ReadResourceObject<ResourceTerminalSession>,
-    resume_intent: flotilla_resources::MessageSpec,
+    resume_intent: Intent,
     message_name: String,
     reopened: ResourceObject<ResourceConvoy>,
     displaced: Option<String>,
 }
 
+/// Who a crew command's message is from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Party {
+    /// A person, by their principal's name: they send as the role they hold where the message goes.
+    Person(String),
+    /// A crew member: role `role` of convoy `convoy` in `project`.
+    Seat { project: String, convoy: String, role: String },
+}
+
+/// The person who sends as `party`, when one does: admission traces them.
+fn principal_of(party: &Party) -> Option<String> {
+    match party {
+        Party::Person(principal) => Some(principal.clone()),
+        Party::Seat { .. } => None,
+    }
+}
+
+/// The inboxes a message is from and to.
+struct Parties {
+    from: flotilla_address::Address,
+    to: flotilla_address::Address,
+}
+
 pub struct MessageAttribution {
+    /// The sender as record names and logs spell it.
     pub sender: String,
+    pub party: Party,
     pub in_reply_to: Option<String>,
 }
 
 impl MessageAttribution {
     pub fn operator(principal: Option<&PrincipalRef>) -> Self {
-        Self {
-            sender: format!("principal:{}", principal.map_or(PrincipalRef::IMPLICIT_NAME, |principal| principal.name.as_str())),
-            in_reply_to: None,
-        }
+        let name = principal.map_or(PrincipalRef::IMPLICIT_NAME, |principal| principal.name.as_str());
+        Self { sender: format!("principal:{name}"), party: Party::Person(name.to_owned()), in_reply_to: None }
     }
 }
 
@@ -1279,10 +1302,14 @@ impl CrewService {
                 reason: "stall is already at the operator rung".into(),
             });
         }
-        let receiver = crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy_name, vessel, role);
-        let sender = off_frame(|| self.supervision_sender(namespace, stalled, actor_crew_id, principal)).await?;
+        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+        let receiver = crew_role_address(project, convoy_name, vessel, role);
+        let (sender, party) = off_frame(|| self.supervision_sender(namespace, stalled, actor_crew_id, principal)).await?;
+        let seat = Party::Seat { project: project.to_owned(), convoy: convoy_name.to_owned(), role: role.to_owned() };
+        let parties =
+            Parties { from: self.party_inbox(namespace, &party, project).await?, to: self.party_inbox(namespace, &seat, project).await? };
         let in_reply_to =
-            off_frame(|| self.supervision_reply_to(namespace, convoy_name, stalled, &sender, &receiver, actor_crew_id)).await?;
+            off_frame(|| self.supervision_reply_to((project, convoy_name), stalled, (&sender, &receiver), &parties, actor_crew_id)).await?;
         let ruling = match action {
             flotilla_protocol::CrewSupervisionAction::Resume => SupervisorRuling::Resume,
             flotilla_protocol::CrewSupervisionAction::Fail => SupervisorRuling::Fail,
@@ -1300,14 +1327,11 @@ impl CrewService {
         // any state-patch failure, so the supervisor can retry that mutation.
         if !matches!(ruling, SupervisorRuling::Resume) {
             let name = flotilla_resources::message_record_name(&receiver, &sender, &format!("supervision:{}", uuid::Uuid::new_v4()));
-            let intent = flotilla_resources::MessageSpec::builder()
-                .sender(sender.clone())
-                .receiver(receiver)
-                .relation(flotilla_resources::MessageRelation::Supervisor)
-                .body(message.into())
-                .maybe_in_reply_to(in_reply_to.clone())
-                .build();
-            self.publish_message_spec(namespace, &name, &intent).await?;
+            let mut intent =
+                Intent::new(parties.from.clone(), parties.to.clone(), flotilla_resources::MessageRelation::Supervisor, message);
+            intent.in_reply_to = in_reply_to.clone();
+            intent.principal = principal_of(&party);
+            self.publish_message_intent(namespace, &name, &intent).await?;
         }
         match ruling {
             SupervisorRuling::Resume => {
@@ -1317,7 +1341,7 @@ impl CrewService {
                         convoy_name,
                         message,
                         (Some(vessel), Some(role)),
-                        MessageAttribution { sender, in_reply_to },
+                        MessageAttribution { sender, party, in_reply_to },
                         ResumeIntent::Reminder,
                     )
                 })
@@ -1379,8 +1403,8 @@ impl CrewService {
         stalled: &flotilla_resources::StalledCondition,
         actor_crew_id: Option<&str>,
         principal: Option<&PrincipalRef>,
-    ) -> Result<String, String> {
-        let sender = if actor_crew_id.is_some() {
+    ) -> Result<(String, Party), String> {
+        if actor_crew_id.is_some() {
             let supervisor = stalled.supervisor.as_ref().expect("checked supervisor above");
             let supervisor_convoy = self
                 .resource_backend
@@ -1388,50 +1412,35 @@ impl CrewService {
                 .get(&supervisor.convoy)
                 .await
                 .map_err(|error| error.to_string())?;
-            crew_role_address(
-                supervisor_convoy.object.spec.project_ref.as_deref().unwrap_or(namespace),
-                &supervisor.convoy,
-                &supervisor.vessel,
-                &supervisor.role,
-            )
-        } else {
-            format!("principal:{}", principal.expect("authenticated operator").name)
-        };
-        Ok(sender)
+            let project = supervisor_convoy.object.spec.project_ref.as_deref().unwrap_or(namespace);
+            let sender = crew_role_address(project, &supervisor.convoy, &supervisor.vessel, &supervisor.role);
+            let party = Party::Seat { project: project.to_owned(), convoy: supervisor.convoy.clone(), role: supervisor.role.clone() };
+            return Ok((sender, party));
+        }
+        let name = &principal.expect("authenticated operator").name;
+        Ok((format!("principal:{name}"), Party::Person(name.clone())))
     }
 
     /// The escalation a supervision ruling replies to.
     async fn supervision_reply_to(
         &self,
-        namespace: &str,
-        convoy_name: &str,
+        (project, convoy_name): (&str, &str),
         stalled: &flotilla_resources::StalledCondition,
-        sender: &str,
-        receiver: &str,
+        (sender, receiver): (&str, &str),
+        parties: &Parties,
         actor_crew_id: Option<&str>,
     ) -> Result<Option<String>, String> {
         if let Some(reference) = &stalled.supervision_message {
             // The stall recorded the escalation it sent; a real daemon always holds or reaches it.
-            let linked = self.reply_link(namespace, sender, receiver, &reference.name).await;
+            let linked = self.reply_link(parties, &reference.name).await;
             if linked.is_none() {
                 tracing::warn!(message = %reference.name, "a stall's recorded escalation did not resolve; its ruling goes unlinked");
             }
             return Ok(linked);
         }
-        // The escalation runs the other way: from the crew to this ruling's sender, about the convoy
-        // at any revision: the read compares what it refers to, not at which revision.
-        let escalation = flotilla_resources::MessageSpec::builder()
-            .sender(receiver.to_owned())
-            .receiver(sender.to_owned())
-            .relation(flotilla_resources::MessageRelation::Supervisor)
-            .body(String::new())
-            .references(vec![flotilla_resources::MessageReference::ControlRecord {
-                resource: ResourceRef::new("flotilla.work/v1", "Convoy", namespace, convoy_name),
-                revision: "any".into(),
-            }])
-            .build();
-        let escalation = self.intent_of(namespace, &escalation).await.map_err(|error| error.to_string())?;
-        let found = self.awaited_reply_from(&escalation).await.map_err(|error| error.to_string())?;
+        // The escalation runs the other way: from the crew to this ruling's sender, about the convoy.
+        let convoy = flotilla_resources::convoy::engine::convoy_reference_address(convoy_name, Some(project))?;
+        let found = self.awaited_reply_from(&parties.to, &parties.from, &[convoy]).await.map_err(|error| error.to_string())?;
         if found.is_some() {
             return Ok(found);
         }
@@ -1445,24 +1454,16 @@ impl CrewService {
             receiver,
             &turn_message_producer_key(&supervision_message_source(convoy_name, index), &stalled.began_at.timestamp_micros().to_string()),
         );
-        Ok(self.reply_link(namespace, sender, receiver, &name).await)
+        Ok(self.reply_link(parties, &name).await)
     }
 
-    /// `escalation` when a ruling from `sender` to `receiver` can reply to it, read as the ruling's
+    /// `escalation` when a ruling between `parties` can reply to it, read as the ruling's
     /// admission reads it; otherwise the ruling goes unlinked.
-    async fn reply_link(&self, namespace: &str, sender: &str, receiver: &str, escalation: &str) -> Option<String> {
-        let ruling = flotilla_resources::MessageSpec::builder()
-            .sender(sender.to_owned())
-            .receiver(receiver.to_owned())
-            .relation(flotilla_resources::MessageRelation::Supervisor)
-            .body(String::new())
-            .in_reply_to(escalation.to_owned())
-            .build();
-        let resolution = match self.intent_of(namespace, &ruling).await {
-            Ok(ruling) => self.resolve_in_reply_to(&ruling).await,
-            Err(error) => flotilla_messaging::MessageResolution::Unknown(error.to_string()),
-        };
-        match resolution {
+    async fn reply_link(&self, parties: &Parties, escalation: &str) -> Option<String> {
+        let mut ruling =
+            Intent::new(parties.from.clone(), parties.to.clone(), flotilla_resources::MessageRelation::Supervisor, String::new());
+        ruling.in_reply_to = Some(escalation.to_owned());
+        match self.resolve_in_reply_to(&ruling).await {
             flotilla_messaging::MessageResolution::Found => Some(escalation.to_owned()),
             flotilla_messaging::MessageResolution::Absent => None,
             flotilla_messaging::MessageResolution::Unknown(error) => {
@@ -2334,18 +2335,31 @@ impl CrewService {
         prompt: &str,
         attribution: MessageAttribution,
     ) -> Result<ConvoyResumeOutcome, String> {
-        let MessageAttribution { sender, in_reply_to } = attribution;
         let receiver = crew_role_address(selected.project(namespace), name, &selected.vessel, &selected.role);
-        let message_name = flotilla_resources::message_record_name(&receiver, &sender, &format!("resume:{}", uuid::Uuid::new_v4()));
-        let intent = flotilla_resources::MessageSpec::builder()
-            .sender(sender)
-            .receiver(receiver)
-            .relation(flotilla_resources::MessageRelation::Supervisor)
-            .body(prompt.to_string())
-            .maybe_in_reply_to(in_reply_to)
-            .build();
-        self.publish_message_spec(namespace, &message_name, &intent).await?;
+        let message_name =
+            flotilla_resources::message_record_name(&receiver, &attribution.sender, &format!("resume:{}", uuid::Uuid::new_v4()));
+        let intent = self.supervisor_intent(namespace, selected, name, attribution, prompt).await?;
+        self.publish_message_intent(namespace, &message_name, &intent).await?;
         Ok(ConvoyResumeOutcome::Informational)
+    }
+
+    /// A supervisor's message from `attribution` to the selected crew member of convoy `name`.
+    async fn supervisor_intent(
+        &self,
+        namespace: &str,
+        selected: &ResumeSelection,
+        name: &str,
+        attribution: MessageAttribution,
+        body: &str,
+    ) -> Result<Intent, String> {
+        let MessageAttribution { party, in_reply_to, .. } = attribution;
+        let project = selected.project(namespace);
+        let seat = Party::Seat { project: project.to_owned(), convoy: name.to_owned(), role: selected.role.clone() };
+        let (from, to) = (self.party_inbox(namespace, &party, project).await?, self.party_inbox(namespace, &seat, project).await?);
+        let mut intent = Intent::new(from, to, flotilla_resources::MessageRelation::Supervisor, body);
+        intent.in_reply_to = in_reply_to;
+        intent.principal = principal_of(&party);
+        Ok(intent)
     }
 
     /// The selected crew member's terminal session, and whether its resume waits for a turn
@@ -2430,22 +2444,12 @@ impl CrewService {
         prompt: &str,
         attribution: MessageAttribution,
     ) -> Result<ConvoyResumeOutcome, String> {
-        let MessageAttribution { sender, in_reply_to } = attribution;
         let (vessel, role) = (&selected.vessel, &selected.role);
         let receiver = crew_role_address(selected.project(namespace), name, vessel, role);
-        let address = sender;
-        let relation = flotilla_resources::MessageRelation::Supervisor;
-        let message_name = flotilla_resources::message_record_name(&receiver, &address, &format!("resume:{}", uuid::Uuid::new_v4()));
-        let intent = flotilla_resources::MessageSpec::builder()
-            .sender(address)
-            .receiver(receiver.clone())
-            .relation(relation)
-            .body(prompt.to_string())
-            .maybe_in_reply_to(in_reply_to)
-            .build();
-        let mut intent = self.intent_of(namespace, &intent).await.map_err(|error| error.to_string())?;
-        // Parties compare as admission converts them: a person is the role they send in, so the
-        // same operator role is the same sender.
+        let message_name =
+            flotilla_resources::message_record_name(&receiver, &attribution.sender, &format!("resume:{}", uuid::Uuid::new_v4()));
+        let mut intent = self.supervisor_intent(namespace, selected, name, attribution, prompt).await?;
+        // A person is the role they send in, so the same operator role is the same sender.
         let prior = self.undelivered_from(&intent).await.map_err(|error| error.to_string())?;
         let displaced = prior.as_ref().map(|message| message.body.clone());
         intent.supersedes = prior.map(|message| message.standing.name);
@@ -2478,7 +2482,6 @@ impl CrewService {
         intent: ResumeIntent,
         session: ResumeSession,
     ) -> Result<ResumeDelivery, String> {
-        let MessageAttribution { sender, in_reply_to } = attribution;
         let (vessel, role) = (&selected.vessel, &selected.role);
         let ResumeSession { session, .. } = session;
         let pending_ref =
@@ -2501,20 +2504,13 @@ impl CrewService {
             return Err(format!("crew member `{role}` on vessel `{vessel}` failed and cannot be resumed: {reason}"));
         }
         let receiver = crew_role_address(selected.project(namespace), name, vessel, role);
-        let resume_intent = flotilla_resources::MessageSpec::builder()
-            .sender(sender.clone())
-            .receiver(receiver.clone())
-            .relation(flotilla_resources::MessageRelation::Supervisor)
-            .body(prompt.to_string())
-            .maybe_in_reply_to(in_reply_to)
-            .maybe_supersedes(
-                pending_message
-                    .as_ref()
-                    .filter(|message| !message.standing.phase.has_delivery_evidence() && !message.standing.phase.is_terminal())
-                    .map(|message| message.standing.name.clone()),
-            )
-            .build();
-        let message_name = flotilla_resources::message_record_name(&receiver, &sender, &format!("resume:{}", uuid::Uuid::new_v4()));
+        let message_name =
+            flotilla_resources::message_record_name(&receiver, &attribution.sender, &format!("resume:{}", uuid::Uuid::new_v4()));
+        let mut resume_intent = self.supervisor_intent(namespace, selected, name, attribution, prompt).await?;
+        resume_intent.supersedes = pending_message
+            .as_ref()
+            .filter(|message| !message.standing.phase.has_delivery_evidence() && !message.standing.phase.is_terminal())
+            .map(|message| message.standing.name.clone());
         let reopened = flotilla_store::note_convoy(
             &self.convoy_engine,
             &selected.convoys,
@@ -2551,11 +2547,11 @@ impl CrewService {
         let (vessel, role, status) = (&selected.vessel, &selected.role, selected.status());
         if intent == ResumeIntent::Reminder && reopened.status.as_ref().is_some_and(|status| status.crew_claim_is_settled(vessel, role)) {
             // The claim guard made the patch a no-op; only the message is published.
-            self.publish_message_spec(namespace, &message_name, &resume_intent).await?;
+            self.publish_message_intent(namespace, &message_name, &resume_intent).await?;
             return Ok(ConvoyResumeOutcome::Informational);
         }
         if matches!(session.provenance, ResourceProvenance::Replica { .. }) {
-            if let Err(error) = self.publish_message_spec(namespace, &message_name, &resume_intent).await {
+            if let Err(error) = self.publish_message_intent(namespace, &message_name, &resume_intent).await {
                 return Err(self.restore_crew_work_after_delivery_failure(name, status, error).await);
             }
             return Ok(ConvoyResumeOutcome::Queued { displaced });
@@ -2566,7 +2562,7 @@ impl CrewService {
             if session.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped) {
                 self.restart_terminal(&session)?;
             }
-            self.publish_message_spec(namespace, &message_name, &resume_intent).await?;
+            self.publish_message_intent(namespace, &message_name, &resume_intent).await?;
             Ok(())
         }
         .await;

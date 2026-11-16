@@ -287,6 +287,18 @@ pub fn convoy_records(address: &flotilla_address::Address) -> Vec<String> {
     standing.into_iter().chain([segment.to_owned()]).collect()
 }
 
+/// The address a message refers to convoy record `name` by: the record's name under the project it
+/// declares, or under none.
+pub fn convoy_reference_address(name: &str, project: Option<&str>) -> Result<flotilla_address::Address, String> {
+    let address = match project {
+        Some(project) => {
+            flotilla_address::Address::project(project).and_then(|project| project.child(flotilla_address::Kind::Convoy, name))
+        }
+        None => flotilla_address::Address::convoy(name),
+    };
+    address.map_err(|error| format!("convoy `{name}`: {error}"))
+}
+
 /// What `convoy` is a launch of. A launch read from the engine is named by its launch. An old
 /// record (the import's) keeps its name when finite; a standing one uses its ensure's frozen role
 /// and project, including old generations admitted before spec.role.

@@ -69,6 +69,18 @@ pub trait EngineMessages: Send + Sync {
         namespace: &str,
         old: &flotilla_resources::MessageSpec,
     ) -> Result<crate::Intent, flotilla_resources::ResourceError>;
+    /// The inbox of fleet role `role` (`fleet:<fleet>/role:<role>`), read on the FleetDesignation
+    /// by its name; refused for a role the fleet does not declare.
+    async fn fleet_role(&self, namespace: &str, role: &str) -> Result<flotilla_address::Address, flotilla_resources::ResourceError>;
+    /// The inbox of the role person `principal` holds in `project`, or under the fleet with no
+    /// project: the one role the project's charter says they hold, else the person role named as
+    /// they are, else the operator role. Read on the project's declaration by its name.
+    async fn person(
+        &self,
+        namespace: &str,
+        principal: &str,
+        project: Option<&str>,
+    ) -> Result<flotilla_address::Address, flotilla_resources::ResourceError>;
     /// Where the message `record` in `inbox` stands, local or replicated.
     async fn admitted(
         &self,
@@ -82,9 +94,14 @@ pub trait EngineMessages: Send + Sync {
     /// The last message admitted to `intent`'s inbox from its sender that is still waiting for
     /// delivery, local or replicated.
     async fn undelivered_from(&self, intent: &crate::Intent) -> Result<Option<SentMessage>, flotilla_resources::ResourceError>;
-    /// The last open message admitted to `intent`'s inbox from its sender that expects a reply
-    /// and refers to one of what `intent` refers to, local or replicated: its record name.
-    async fn awaited_reply_from(&self, intent: &crate::Intent) -> Result<Option<String>, flotilla_resources::ResourceError>;
+    /// The last open message admitted to `inbox` from `sender` that expects a reply and refers to
+    /// one of `about`, at any revision, local or replicated: its record name.
+    async fn awaited_reply_from(
+        &self,
+        sender: &flotilla_address::Address,
+        inbox: &flotilla_address::Address,
+        about: &[flotilla_address::Address],
+    ) -> Result<Option<String>, flotilla_resources::ResourceError>;
     /// The messages to `seats` (old crew addresses) still waiting for delivery that a supervisor
     /// sent and no fleet role did, local or replicated, in admission order.
     async fn queued_briefs(&self, namespace: &str, seats: &[String]) -> Result<Vec<SentMessage>, flotilla_resources::ResourceError>;

@@ -142,15 +142,28 @@ impl EngineMessages for RecordingMessages {
             self.admitted_to(std::slice::from_ref(&intent.receiver)).into_iter().filter(|read| read.object.spec.sender == intent.sender);
         Ok(from.max_by_key(|read| read.object.metadata.creation_timestamp).map(|read| sent(&read.object)))
     }
-    async fn awaited_reply_from(&self, intent: &Intent) -> Result<Option<String>, ResourceError> {
-        let intent = &self.old(intent);
-        let awaiting = self.admitted_to(std::slice::from_ref(&intent.receiver)).into_iter().filter(|read| {
-            let held = &read.object.spec;
-            held.sender == intent.sender
-                && held.expectation == MessageExpectation::Reply
-                && held.references.iter().any(|reference| intent.references.contains(reference))
+    async fn awaited_reply_from(&self, sender: &Address, inbox: &Address, about: &[Address]) -> Result<Option<String>, ResourceError> {
+        let converted = self.converted.lock().expect("converted").clone();
+        let admitted = self.admitted.lock().expect("admitted").values().cloned().collect::<Vec<_>>();
+        let awaiting = admitted.into_iter().filter(|object| {
+            converted.iter().any(|(intent, old)| {
+                *old == object.spec
+                    && intent.sender == *sender
+                    && intent.inbox == *inbox
+                    && old.expectation == MessageExpectation::Reply
+                    && intent.references.iter().any(|reference| about.contains(&reference.address))
+            })
         });
-        Ok(awaiting.max_by_key(|read| read.object.metadata.creation_timestamp).map(|read| read.object.metadata.name))
+        Ok(awaiting.max_by_key(|object| object.metadata.creation_timestamp).map(|object| object.metadata.name))
+    }
+    async fn fleet_role(&self, _namespace: &str, role: &str) -> Result<Address, ResourceError> {
+        let roles = FleetRoles::declared("fleet").expect("declared roles");
+        roles.address(role).ok_or_else(|| ResourceError::invalid(format!("fleet role `{role}` is not declared")))
+    }
+    async fn person(&self, _namespace: &str, principal: &str, project: Option<&str>) -> Result<Address, ResourceError> {
+        let roles = FleetRoles::declared("fleet").expect("declared roles");
+        let conversion = Conversion { roles: &roles, forges: &[], records: &Named };
+        conversion.person(&format!("principal:{principal}"), project).map_err(ResourceError::invalid)
     }
     async fn queued_briefs(&self, _namespace: &str, seats: &[String]) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
         let mut briefs = self

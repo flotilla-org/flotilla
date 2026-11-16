@@ -182,7 +182,13 @@ impl MessagePrimitives {
     }
 
     /// `principal`'s role in `project`, on the project's declaration read by its name.
-    async fn person_inbox(&self, namespace: &str, roles: &FleetRoles, principal: &str, project: Option<&str>) -> Result<Address, String> {
+    pub(crate) async fn person_inbox(
+        &self,
+        namespace: &str,
+        roles: &FleetRoles,
+        principal: &str,
+        project: Option<&str>,
+    ) -> Result<Address, String> {
         let declared = match project {
             Some(project) => self.keyed_reads().declared::<Project>(namespace, project).await.map_err(|error| error.to_string())?,
             None => None,
@@ -207,7 +213,7 @@ impl MessagePrimitives {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("convoy `{name}` is not in this home's records"))?;
         let held = Read {
-            address: super::convoy_address(name, convoy.object.spec.project_ref.as_deref())?,
+            address: super::convoy_reference_address(name, convoy.object.spec.project_ref.as_deref())?,
             revision: convoy.object.metadata.resource_version.clone(),
         };
         let principal = format!("principal:{}", convoy.object.spec.dispatching_principal_ref.name);

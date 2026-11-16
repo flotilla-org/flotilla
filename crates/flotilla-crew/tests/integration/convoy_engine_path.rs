@@ -1314,8 +1314,19 @@ impl flotilla_messaging::EngineMessages for Turns {
     ) -> Result<Option<flotilla_messaging::SentMessage>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
-    async fn awaited_reply_from(&self, _: &flotilla_messaging::Intent) -> Result<Option<String>, flotilla_resources::ResourceError> {
+    async fn awaited_reply_from(
+        &self,
+        _: &flotilla_address::Address,
+        _: &flotilla_address::Address,
+        _: &[flotilla_address::Address],
+    ) -> Result<Option<String>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn fleet_role(&self, _: &str, _: &str) -> Result<flotilla_address::Address, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler sends nothing")
+    }
+    async fn person(&self, _: &str, _: &str, _: Option<&str>) -> Result<flotilla_address::Address, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler sends nothing")
     }
     async fn queued_briefs(
         &self,
