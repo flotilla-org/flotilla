@@ -3,9 +3,11 @@
 mod decided;
 mod filter;
 mod query;
+#[cfg(test)]
+pub(crate) mod summary_tests;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use flotilla_address::Address;
-use flotilla_protocol::table::{Message, Row};
+use flotilla_protocol::table::{Message, Row, ValueCount};
 use flotilla_resources::WatchStart;
 use flotilla_schema::{ColumnType, Filterable, Layout, Table, TableSet};
 use flotilla_store::{
@@ -24,6 +26,8 @@ use std::{
     time::Duration,
 };
 const LIMIT: usize = 200;
+/// The most distinct values a `values` message lists for one field.
+pub(crate) const DISTINCT: usize = 100;
 pub(crate) const MAX_LIMIT: usize = 10_000;
 /// The longest a watch goes without a message.
 const PROGRESS: Duration = Duration::from_secs(15);
@@ -187,8 +191,14 @@ pub(crate) fn descriptor(kind: &str, subject: Option<&SubjectTable>) -> Table {
 #[derive(Clone)]
 pub(crate) struct Query {
     pub(crate) namespace: String,
-    /// Every `where`, conjoined and checked against the description.
+    /// Every `scope` and `where`, conjoined and checked against the description.
     pub(crate) filter: Option<rigging_condition::Checked<rigging_condition::Condition>>,
+    /// Every `scope`, conjoined: the rows a count's `total` counts.
+    scope: Option<rigging_condition::Checked<rigging_condition::Condition>>,
+    /// Each `where` apart, for the distinct values of the fields they mention.
+    clauses: Vec<filter::Clause>,
+    /// The fields whose distinct values the read sends.
+    distinct: Vec<String>,
     /// The fields the filter reads, for sources that evaluate it over their rows.
     fields: Filterable,
     pub(crate) sort: Vec<(String, bool)>,
@@ -218,7 +228,14 @@ impl Query {
         let get = |name: &str| params.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
         let fields: BTreeSet<_> = table.key.iter().chain(&table.columns).map(|column| column.name.as_str()).collect();
         let filterable = filter::fields(table);
-        let filter = filter::parse(params, table, &filterable)?;
+        let filter::Conditions { filter, scope, clauses } = filter::parse(params, table, &filterable)?;
+        let mut distinct = Vec::new();
+        for name in params.iter().filter(|(key, _)| key == "values").flat_map(|(_, value)| value.split(',')) {
+            let name = filter::distinct_field(name, table, &filterable)?;
+            if !distinct.contains(&name) {
+                distinct.push(name);
+            }
+        }
 
         let mut sort = Vec::new();
         let default_sort = table.key.iter().map(|column| column.name.as_str()).collect::<Vec<_>>().join(",");
@@ -294,6 +311,9 @@ impl Query {
             keys: table.key.iter().map(|column| column.name.clone()).collect(),
             namespace: get("namespace").unwrap_or("default").into(),
             filter,
+            scope,
+            clauses,
+            distinct,
             fields: filterable,
             sort,
             columns,
@@ -310,6 +330,66 @@ impl Query {
     /// Whether the filter keeps `row`, for sources that evaluate it in memory.
     fn keeps(&self, row: &Row) -> bool {
         self.filter.as_ref().is_none_or(|filter| filter::keeps(filter, &self.fields, row))
+    }
+    /// Whether the read sends a summary of its scope: a count with its total, or distinct values.
+    fn summarised(&self) -> bool {
+        self.count.is_some() || !self.distinct.is_empty()
+    }
+    /// This query reading the rows of its scope alone.
+    fn scoped(&self) -> Self {
+        Self { filter: self.scope.clone(), ..self.clone() }
+    }
+    /// `scoped`, the rows matching the scope, narrowed by every `where`, with the summary of the
+    /// scope: its total, and each requested field's distinct values over the rows matching every
+    /// `where` but those mentioning only that field.
+    fn summarise(&self, mut scoped: Snapshot) -> Snapshot {
+        let total = scoped.rows.len() as u64;
+        let kept: Vec<Vec<bool>> = scoped
+            .rows
+            .iter()
+            .map(|row| self.clauses.iter().map(|clause| filter::keeps(&clause.condition, &self.fields, row)).collect())
+            .collect();
+        let values = self
+            .distinct
+            .iter()
+            .map(|field| {
+                let mut counts: BTreeMap<String, (Value, u64)> = BTreeMap::new();
+                for (row, kept) in scoped.rows.iter().zip(&kept) {
+                    let applies = self.clauses.iter().zip(kept).all(|(clause, kept)| *kept || clause.only.as_ref() == Some(field));
+                    if applies {
+                        let value = row.get(field).cloned().unwrap_or(Value::Null);
+                        counts.entry(value.to_string()).or_insert((value, 0)).1 += 1;
+                    }
+                }
+                let mut ranked: Vec<(Value, u64)> = counts.into_values().collect();
+                ranked.sort_by(|(a, a_count), (b, b_count)| b_count.cmp(a_count).then_with(|| compare(a, b)));
+                let more = ranked.len() > DISTINCT;
+                ranked.truncate(DISTINCT);
+                (field.clone(), Distinct { ranked, more })
+            })
+            .collect();
+        let rows = std::mem::take(&mut scoped.rows);
+        scoped.rows = rows.into_iter().zip(kept).filter(|(_, kept)| kept.iter().all(|kept| *kept)).map(|(row, _)| row).collect();
+        scoped.summary = Some(Summary { total, values });
+        scoped
+    }
+    /// The `count` and `values` messages of `snapshot`, in full.
+    fn summary(&self, snapshot: &Snapshot) -> Vec<Message> {
+        let Some(summary) = &snapshot.summary else { return Vec::new() };
+        let sequence = snapshot.sequence;
+        let count = self.count.as_ref().map(|mode| Message::Count {
+            count: snapshot.rows.len() as u64,
+            total: summary.total,
+            estimate: mode == "estimate",
+            sequence,
+        });
+        let values = summary.values.iter().map(|(field, distinct)| Message::Values {
+            field: field.clone(),
+            values: distinct.ranked.iter().map(|(value, count)| ValueCount { value: value.clone(), count: *count }).collect(),
+            more: distinct.more,
+            sequence,
+        });
+        count.into_iter().chain(values).collect()
     }
     pub(crate) fn values(&self, row: &Row) -> Vec<Value> {
         self.sort.iter().map(|(name, _)| row.get(name).cloned().unwrap_or(Value::Null)).collect()
@@ -447,6 +527,45 @@ pub(crate) struct Snapshot {
     pub sequence: u64,
     pub incarnation: String,
     start: WatchStart,
+    /// The scope's total and distinct values, when the query asks for them.
+    summary: Option<Summary>,
+}
+
+/// What a read sends about its scope beside its rows.
+#[derive(Clone, Debug, PartialEq)]
+struct Summary {
+    /// The rows matching the scope.
+    total: u64,
+    /// Each requested field's distinct values, in the query's order.
+    values: Vec<(String, Distinct)>,
+}
+
+/// A field's most frequent values, most frequent first, ties in value order.
+#[derive(Clone, Debug, PartialEq)]
+struct Distinct {
+    ranked: Vec<(Value, u64)>,
+    /// Whether more distinct values exist than `ranked` holds.
+    more: bool,
+}
+
+impl Distinct {
+    /// The entries of `next` that differ from `self`: a changed count, a value new to the list,
+    /// and one gone from it with a count of 0.
+    fn changes(&self, next: &Distinct) -> Vec<ValueCount> {
+        let before: BTreeMap<String, u64> = self.ranked.iter().map(|(value, count)| (value.to_string(), *count)).collect();
+        let after: BTreeSet<String> = next.ranked.iter().map(|(value, _)| value.to_string()).collect();
+        let changed = next
+            .ranked
+            .iter()
+            .filter(|(value, count)| before.get(&value.to_string()) != Some(count))
+            .map(|(value, count)| ValueCount { value: value.clone(), count: *count });
+        let gone = self
+            .ranked
+            .iter()
+            .filter(|(value, _)| !after.contains(&value.to_string()))
+            .map(|(value, _)| ValueCount { value: value.clone(), count: 0 });
+        changed.chain(gone).collect()
+    }
 }
 /// Tables computed from code rather than stored, such as `verbs` (#4197): a description and
 /// every row of each table, in the set's table order, fixed for the daemon's life.
@@ -688,7 +807,9 @@ impl TableSource {
     /// A snapshot whose incarnation also names the subscription's parameters, so a cursor
     /// resumes only the subscription it came from.
     async fn snapshot(&self, table: &Table, query: &Query) -> Result<Snapshot, Failure> {
-        let mut snapshot = self.read(table, query).await?;
+        // A summary reads the scope, and narrows it by each `where` here, once for every source.
+        let mut snapshot =
+            if query.summarised() { query.summarise(self.read(table, &query.scoped()).await?) } else { self.read(table, query).await? };
         let named = match self {
             Self::Query(source) => Some(source.query()?),
             _ => None,
@@ -718,11 +839,12 @@ impl TableSource {
                     sequence,
                     incarnation: generation.unwrap_or_else(|| "durable".into()),
                     start,
+                    summary: None,
                 })
             }
             Self::Decided { service, name, subject: None } => {
                 let (sequence, _, rows) = decided::read(service, name, query).await?;
-                Ok(Snapshot { rows, sequence, incarnation: "durable".into(), start: WatchStart::Now })
+                Ok(Snapshot { rows, sequence, incarnation: "durable".into(), start: WatchStart::Now, summary: None })
             }
             Self::Decided { service, name, subject: Some(subject) } => {
                 // The store holds no address column: a filter reading the derived address is
@@ -744,14 +866,14 @@ impl TableSource {
                     })
                     .filter(|row| !local || query.keeps(row))
                     .collect();
-                Ok(Snapshot { rows, sequence, incarnation: "durable".into(), start: WatchStart::Now })
+                Ok(Snapshot { rows, sequence, incarnation: "durable".into(), start: WatchStart::Now, summary: None })
             }
             Self::Derived { derived, name, incarnation } => {
                 let rows =
                     derived.rows[derived.table(name).expect("opened table")].iter().filter(|row| query.keeps(row)).cloned().collect();
                 // Derived rows change only with the daemon, so one snapshot serves its life. A catalog
                 // that reloads (verbs from `verbs/*.yaml`, #4198) needs events here.
-                Ok(Snapshot { rows, sequence: 1, incarnation: incarnation.clone(), start: WatchStart::Now })
+                Ok(Snapshot { rows, sequence: 1, incarnation: incarnation.clone(), start: WatchStart::Now, summary: None })
             }
             Self::Query(source) => {
                 let (rows, sequence, incarnation) = source.rows().await?;
@@ -760,6 +882,7 @@ impl TableSource {
                     sequence,
                     incarnation,
                     start: WatchStart::Now,
+                    summary: None,
                 })
             }
         }
@@ -815,10 +938,13 @@ impl TableSource {
             }
             if query.cursor.is_some()
                 || query.offset != 0
-                || query.count.is_some()
+                || query.summarised()
                 || query.sort != vec![("home".into(), false), ("sequence".into(), false)]
             {
-                return Err(bad("unsupported_log_paging", "log reads support only bounded sequence-order snapshots without counts"));
+                return Err(bad(
+                    "unsupported_log_paging",
+                    "log reads support only bounded sequence-order snapshots without counts or values",
+                ));
             }
         }
         let snapshot = self.snapshot(&description.table, &query).await?;
@@ -826,12 +952,9 @@ impl TableSource {
             resume.as_ref().is_some_and(|resume| resume.incarnation == snapshot.incarnation && resume.sequence == snapshot.sequence);
         let initial = match resume {
             Some(_) if resumed => {
-                let count = query.count.as_ref().map(|mode| Message::Count {
-                    count: snapshot.rows.len() as u64,
-                    estimate: mode == "estimate",
-                    sequence: snapshot.sequence,
-                });
-                count.into_iter().chain([Message::Synced { sequence: snapshot.sequence }]).collect()
+                let mut messages = query.summary(&snapshot);
+                messages.push(Message::Synced { sequence: snapshot.sequence });
+                messages
             }
             Some(_) => {
                 let mut messages = vec![Message::Resync { reason: "stale cursor".into() }];
@@ -986,9 +1109,7 @@ fn page(name: &str, mut schema: Value, query: &Query, snapshot: &Snapshot) -> Re
         });
     }
     messages.push(Message::Table { table: name.into(), schema, incarnation: snapshot.incarnation.clone(), sequence: snapshot.sequence });
-    if let Some(mode) = &query.count {
-        messages.push(Message::Count { count: snapshot.rows.len() as u64, estimate: mode == "estimate", sequence: snapshot.sequence })
-    }
+    messages.extend(query.summary(snapshot));
     let mut rows = snapshot.rows.clone();
     rows.sort_by(|a, b| query.compare(&query.values(a), &query.values(b)));
     if let Some(after) = after {
@@ -1013,6 +1134,7 @@ fn indexed(rows: &[Row], keys: &[String]) -> Result<RowIndex, String> {
         .collect()
 }
 fn diff(previous: &Snapshot, next: &Snapshot, query: &Query) -> Result<Vec<Message>, String> {
+    let summaries = (&previous.summary, &next.summary);
     let previous = indexed(&previous.rows, &query.keys)?;
     let current = indexed(&next.rows, &query.keys)?;
     let mut messages = vec![];
@@ -1026,8 +1148,23 @@ fn diff(previous: &Snapshot, next: &Snapshot, query: &Query) -> Result<Vec<Messa
             messages.push(Message::Delete { key: tuple.clone(), sequence: next.sequence })
         }
     }
-    if query.count.is_some() && previous.len() != current.len() {
-        messages.push(Message::Count { count: current.len() as u64, estimate: false, sequence: next.sequence })
+    if let (Some(before), Some(after)) = summaries {
+        if let Some(mode) = &query.count {
+            if previous.len() != current.len() || before.total != after.total {
+                messages.push(Message::Count {
+                    count: current.len() as u64,
+                    total: after.total,
+                    estimate: mode == "estimate",
+                    sequence: next.sequence,
+                })
+            }
+        }
+        for ((field, before), (_, after)) in before.values.iter().zip(&after.values) {
+            let values = before.changes(after);
+            if !values.is_empty() || before.more != after.more {
+                messages.push(Message::Values { field: field.clone(), values, more: after.more, sequence: next.sequence })
+            }
+        }
     }
     if messages.is_empty() {
         messages.push(Message::Progress { sequence: next.sequence })
@@ -1286,7 +1423,7 @@ mod properties {
         let mut seen = Vec::new();
         let mut page_query = query.clone();
         loop {
-            let snapshot = Snapshot { rows: rows.clone(), sequence: 1, incarnation: "same".into(), start: WatchStart::Now };
+            let snapshot = Snapshot { rows: rows.clone(), sequence: 1, incarnation: "same".into(), start: WatchStart::Now, summary: None };
             let messages = page("convoys", json!({"fields": []}), &page_query, &snapshot).unwrap();
             let mut cursor = None;
             for message in messages {
@@ -1363,10 +1500,10 @@ mod source_contract_tests {
         let table = descriptor("convoys", None);
         let query = Query::parse(&[("columns".into(), "spec".into())], &table).unwrap();
         let row = Row::from([(KEY.into(), json!("one")), ("spec".into(), json!({})), ("metadata.labels".into(), json!({"group":"a"}))]);
-        let before = Snapshot { rows: vec![row.clone()], sequence: 1, incarnation: "same".into(), start: WatchStart::Now };
+        let before = Snapshot { rows: vec![row.clone()], sequence: 1, incarnation: "same".into(), start: WatchStart::Now, summary: None };
         let mut row = row;
         row.insert("metadata.labels".into(), json!({"group":"b"}));
-        let after = Snapshot { rows: vec![row], sequence: 2, incarnation: "same".into(), start: WatchStart::Now };
+        let after = Snapshot { rows: vec![row], sequence: 2, incarnation: "same".into(), start: WatchStart::Now, summary: None };
         assert!(matches!(diff(&before, &after, &query).unwrap().as_slice(), [Message::Progress { sequence: 2 }]));
     }
 }

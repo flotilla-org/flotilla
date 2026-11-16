@@ -51,13 +51,35 @@ pub enum Message {
     Resync {
         reason: String,
     },
+    /// `count` rows match every condition; `total` match the `scope` conditions alone.
     Count {
         #[serde(deserialize_with = "integer")]
         count: u64,
+        #[serde(deserialize_with = "integer")]
+        total: u64,
         estimate: bool,
         #[serde(deserialize_with = "integer")]
         sequence: u64,
     },
+    /// A field's distinct values and how many rows hold each, over the rows matching `scope` and
+    /// every `where` that does not mention only `field`: the most frequent first, at most 100.
+    /// In a watch, only the changed entries; a count of 0 means the value is gone from the list.
+    Values {
+        field: String,
+        values: Vec<ValueCount>,
+        /// Whether more distinct values exist than the list holds.
+        more: bool,
+        #[serde(deserialize_with = "integer")]
+        sequence: u64,
+    },
+}
+
+/// One distinct value of a field, `null` for an absent one, and the rows holding it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValueCount {
+    pub value: Value,
+    #[serde(deserialize_with = "integer")]
+    pub count: u64,
 }
 
 fn integer<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {

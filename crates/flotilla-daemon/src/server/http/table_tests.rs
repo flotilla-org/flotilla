@@ -89,6 +89,9 @@ async fn error_body(response: axum::response::Response) -> serde_json::Value {
 fn condition(text: &str) -> String {
     text.bytes().map(|byte| if byte.is_ascii_alphanumeric() { char::from(byte).to_string() } else { format!("%{byte:02X}") }).collect()
 }
+fn rows_of(messages: &[Message]) -> usize {
+    messages.iter().map(|message| if let Message::Rows { rows, .. } = message { rows.len() } else { 0 }).sum()
+}
 async fn messages(router: &Router, path: &str, cbor: bool) -> Vec<Message> {
     let response = call(router, path, cbor).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -146,7 +149,11 @@ async fn table_carriers_share_paging_filter_count_and_resync_contract() {
         let empty = messages(&router, "/tables/convoys/rows?namespace=empty", cbor).await;
         assert!(empty.iter().any(|message| matches!(message,Message::Rows{rows,partial:false,..} if rows.is_empty())));
     }
-    // The indexed store read returned two matches, rather than listing three and filtering.
+    // Without a count, the indexed store read returned two matches, rather than listing three and
+    // filtering. A count reads its whole scope for the `total` (#4363), which here is every row.
+    reads.0.lock().unwrap().clear();
+    let uncounted = format!("/tables/convoys/rows?namespace=test&where={}", condition(r#"metadata.labels["group"] == "yes""#));
+    assert_eq!(rows_of(&messages(&router, &uncounted, false).await), 2);
     assert!(reads.0.lock().unwrap().iter().any(|(operation, count)| *operation == ReadOperation::Query && *count == 2));
     reads.0.lock().unwrap().clear();
     // #4108: the former spelling is refused before any read.
@@ -220,6 +227,55 @@ async fn tables_do_not_bypass_resource_caller_access() {
             .insert(CallerAuth::Environment { environment: flotilla_protocol::EnvironmentId::new("env-work"), peer: None });
         assert_eq!(router.clone().oneshot(request).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
+}
+
+// #4363, the owner-approved shape: `scope` bounds the view and `where` filters it. The count's
+// `total` is the scope's rows, a `where` on `status.phase` leaves `status.phase`'s own values whole
+// (null apart), and it narrows every other field's.
+#[tokio::test]
+async fn scope_totals_and_values_answer_a_filtered_view() {
+    use flotilla_resources::{ConvoyPhase, ConvoyStatus};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = backend.using::<Convoy>("test");
+    for (name, project, phase) in [
+        ("one", "flotilla", Some(ConvoyPhase::Active)),
+        ("two", "flotilla", Some(ConvoyPhase::Landed)),
+        ("three", "flotilla", None),
+        ("four", "other", Some(ConvoyPhase::Active)),
+    ] {
+        let labels = BTreeMap::from([("project".to_owned(), project.to_owned())]);
+        let created = convoys
+            .create(&InputMeta::builder().name(name.into()).labels(labels).build(), &ConvoySpec::builder().workflow_ref("w".into()).build())
+            .await
+            .unwrap();
+        if let Some(phase) = phase {
+            convoys.update_status(name, &created.metadata.resource_version, &ConvoyStatus { phase, ..Default::default() }).await.unwrap();
+        }
+    }
+    let router = router(backend);
+    let path = format!(
+        "/tables/convoys/rows?namespace=test&scope={}&where={}&count=exact&values=status.phase,metadata.name",
+        condition(r#"metadata.labels["project"] == "flotilla""#),
+        condition(r#"status.phase in ["Active"]"#)
+    );
+    let json = messages(&router, &path, false).await;
+    assert_eq!(json, messages(&router, &path, true).await);
+    assert!(json.iter().any(|message| matches!(message, Message::Count { count: 1, total: 3, estimate: false, .. })), "{json:?}");
+    let values = |field: &str| {
+        json.iter()
+            .find_map(|message| match message {
+                Message::Values { field: named, values, more: false, .. } if named == field => {
+                    Some(values.iter().map(|entry| (entry.value.clone(), entry.count)).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(values("status.phase"), [(json!(null), 1), (json!("Active"), 1), (json!("Landed"), 1)]);
+    assert_eq!(values("metadata.name"), [(json!("one"), 1)]);
+    // The summary precedes the rows.
+    let position = |kind: fn(&Message) -> bool| json.iter().position(kind).unwrap();
+    assert!(position(|message| matches!(message, Message::Values { .. })) < position(|message| matches!(message, Message::Rows { .. })));
 }
 
 // The snapshot boundary hands off without a listener; creates and deletes after synced
@@ -379,6 +435,7 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
                 ("/tables/table_sample/rows?sort=bytes", "unsupported_sort"),
                 ("/tables/table_sample.log/rows?watch", "unsupported_watch"),
                 ("/tables/table_sample.log/rows?count=exact", "unsupported_log_paging"),
+                ("/tables/table_sample.log/rows?values=cause", "unsupported_log_paging"),
                 ("/tables/table_sample.log/rows?cursor=anything", "unsupported_log_paging"),
                 ("/tables/table_sample.log/rows?offset=1", "unsupported_log_paging"),
                 ("/tables/table_sample.log/rows?sort=-sequence", "unsupported_log_paging"),
@@ -614,6 +671,12 @@ async fn table_request_errors_and_content_negotiation_are_explicit() {
         ("where=.status.phase%20%3D%3D%20x".into(), "invalid_filter"),
         ("limit=0".into(), "invalid_paging"),
         ("columns=absent".into(), "unknown_column"),
+        // #4363: `scope` fails as `where` does, and `values` names only a filterable field.
+        (format!("scope={}", condition("status.phase == Running")), "invalid_filter"),
+        (format!("scope={}", condition(r#"unknown == "x""#)), "unknown_column"),
+        (format!("scope={}", condition(r#"status.phase < 3"#)), "type_mismatch"),
+        ("values=spec".into(), "unsupported_filter"),
+        ("values=status.phase,absent".into(), "unknown_column"),
     ] {
         let response = call(&router, &format!("/tables/convoys/rows?{query}"), false).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -772,6 +835,7 @@ fn tables_doc_lists_the_message_kinds_of_the_code() {
             Message::Progress { .. } => "progress",
             Message::Resync { .. } => "resync",
             Message::Count { .. } => "count",
+            Message::Values { .. } => "values",
         }
     }
     let samples = [
@@ -782,7 +846,8 @@ fn tables_doc_lists_the_message_kinds_of_the_code() {
         Message::Delete { key: vec![], sequence: 0 },
         Message::Progress { sequence: 0 },
         Message::Resync { reason: String::new() },
-        Message::Count { count: 0, estimate: false, sequence: 0 },
+        Message::Count { count: 0, total: 0, estimate: false, sequence: 0 },
+        Message::Values { field: String::new(), values: vec![], more: false, sequence: 0 },
     ];
     for sample in &samples {
         assert_eq!(serde_json::to_value(sample).unwrap()["type"], kind(sample));
