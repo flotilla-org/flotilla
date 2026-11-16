@@ -35,7 +35,7 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;
 use flotilla_provider_runtime::{
     execution_context::{BaseLayer, BoundLayer},
-    ChannelLabel, CommandOutput, CommandProcess, CommandRunner,
+    ChannelLabel, CommandLines, CommandOutput, CommandProcess, CommandRunner,
 };
 use flotilla_resources::{TerminalSession, TerminalSessionTarget, Vessel};
 use flotilla_store::ResourceBackend;
@@ -331,6 +331,9 @@ impl CommandRunner for VesselRunner {
         label: &ChannelLabel,
     ) -> Result<Box<dyn CommandProcess>, String> {
         self.current().spawn_long_lived(cmd, args, cwd, label).await
+    }
+    async fn stream_lines(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<Box<dyn CommandLines>, String> {
+        self.current().stream_lines(cmd, args, cwd, label).await
     }
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         self.current().run_with_input(cmd, args, cwd, label, input).await

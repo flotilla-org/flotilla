@@ -15,6 +15,8 @@ rustix = { version = "1", features = ["event", "fs", "process", "stdio", "system
 getrandom04 = { package = "getrandom", version = "0.4", features = ["std", "sys_rng"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# getrandom 0.4 (drydock's tungstenite) takes libc on Linux.
+libc = { workspace = true }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl", "system"] }
 
 # rustix uses libc/errno on macOS rather than Linux's raw syscall backend.
