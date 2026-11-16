@@ -58,17 +58,25 @@ impl<T: Resource> DefinitionResolver<T> {
         self.backend.engine_records(T::API_PATHS.kind)
     }
 
+    /// Whether this namespace holds the engine's records of this kind. The engine serves its kinds
+    /// in one namespace; a read or watch through any other finds none of them, as the old store
+    /// found none of one namespace's records through another.
+    fn holds_engine_records(&self) -> bool {
+        self.backend.engine_namespace(T::API_PATHS.kind).is_none_or(|namespace| namespace == self.namespace)
+    }
+
     /// An engine record as the old store's object: the stamps its port rebuilds, and no merge
     /// metadata, owner references or finalizers. The engine keeps no creation time.
-    /// It carries the engine's namespace, not the one read through.
+    /// It carries the engine's namespace, which a write through another namespace lands in.
     fn object(&self, record: EngineObject) -> Result<ResourceObject<T>, ResourceError> {
         let namespace = self.backend.engine_namespace(T::API_PATHS.kind).unwrap_or_else(|| self.namespace.clone());
         engine_object(&namespace, record)
     }
 
-    /// Every engine record of this kind, with the built-ins.
+    /// Every engine record of this kind read through this namespace, with the built-ins.
     async fn engine_list(&self, records: &dyn EngineRecords) -> Result<Vec<ResourceObject<T>>, ResourceError> {
-        let listed = records.list(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
+        let listed =
+            if self.holds_engine_records() { records.list(T::API_PATHS.kind).await.map_err(ResourceError::other)? } else { Vec::new() };
         let objects = listed.into_iter().map(|record| self.object(record)).collect::<Result<Vec<_>, _>>()?;
         overlay_builtins(T::API_PATHS.kind, &self.namespace, objects, None)
     }
@@ -84,6 +92,9 @@ impl<T: Resource> DefinitionResolver<T> {
     /// through the port's index when it keeps one, and every other reads them all.
     pub(crate) async fn engine_reads_for(&self, query: &crate::StoreQuery) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
         let records = self.records()?;
+        if !self.holds_engine_records() {
+            return Some(self.reads(&records.home(), Vec::new(), None));
+        }
         if let Some(receiver) = query.message.as_ref().and_then(crate::MessageQuery::open_receiver) {
             if let Some(open) = records.open_to(T::API_PATHS.kind, receiver).await {
                 return Some(open.map_err(ResourceError::other).and_then(|open| self.reads(&records.home(), open, None)));
@@ -94,7 +105,8 @@ impl<T: Resource> DefinitionResolver<T> {
 
     async fn read_all(&self, records: &dyn EngineRecords) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
         // Every home's copy, as the old store's replica reads return each origin's.
-        let listed = records.sources(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
+        let listed =
+            if self.holds_engine_records() { records.sources(T::API_PATHS.kind).await.map_err(ResourceError::other)? } else { Vec::new() };
         self.reads(&records.home(), listed, None)
     }
 
@@ -102,9 +114,12 @@ impl<T: Resource> DefinitionResolver<T> {
     /// the kind is served by the engine.
     pub(crate) async fn engine_copies(&self, name: &str) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
         let records = self.records()?;
-        let copies = match records.copies(T::API_PATHS.kind, name).await {
-            Ok(copies) => copies,
-            Err(error) => return Some(Err(ResourceError::other(error))),
+        let copies = match self.holds_engine_records() {
+            false => Vec::new(),
+            true => match records.copies(T::API_PATHS.kind, name).await {
+                Ok(copies) => copies,
+                Err(error) => return Some(Err(ResourceError::other(error))),
+            },
         };
         Some(self.reads(&records.home(), copies, Some(name)))
     }
@@ -140,6 +155,14 @@ impl<T: Resource> DefinitionResolver<T> {
         &self,
     ) -> Option<Result<(Vec<ReadResourceObject<T>>, BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>), ResourceError>> {
         let records = self.records()?;
+        if !self.holds_engine_records() {
+            // This namespace holds only the built-ins, which never change.
+            let initial = match self.reads(&records.home(), Vec::new(), None) {
+                Ok(initial) => initial,
+                Err(error) => return Some(Err(error)),
+            };
+            return Some(Ok((initial, futures::stream::pending().boxed())));
+        }
         let feed = match self.backend.engine_feed(T::API_PATHS.kind).await? {
             Ok(feed) => feed,
             Err(error) => return Some(Err(error)),
@@ -245,6 +268,9 @@ impl<T: Resource> DefinitionResolver<T> {
             }
         }
         if let Some(records) = self.records() {
+            if !self.holds_engine_records() {
+                return Err(ResourceError::not_found(name));
+            }
             let record = records.get(T::API_PATHS.kind, name).await.map_err(ResourceError::other)?;
             return record.map(|record| self.object(record)).unwrap_or_else(|| Err(ResourceError::not_found(name)));
         }
@@ -323,6 +349,9 @@ impl<T: Resource> DefinitionResolver<T> {
         ensure_definitions::<T>()?;
         if let Some(records) = self.records() {
             // The stored selection never selects a built-in; neither does this one.
+            if !self.holds_engine_records() {
+                return Ok(Vec::new());
+            }
             let stored = records.list(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
             let objects = stored.into_iter().map(|record| self.object(record)).collect::<Result<Vec<_>, _>>()?;
             return select(objects, &selection);

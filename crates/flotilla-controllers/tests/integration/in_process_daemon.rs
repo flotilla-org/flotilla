@@ -9566,11 +9566,11 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
     // The engine's readings, which a running daemon always has.
     let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
-    // The receiver's convoy, a launch in the document's namespace.
+    // The receiver's convoy, a launch in the document's namespace, the engine's.
     let convoy = flotilla_engine_convoys_testkit::launch(
         &daemon.convoy_engine_path(),
         flotilla_engine_convoys_testkit::convoy(
-            "document-namespace",
+            "flotilla",
             "namespace-convoy",
             flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).build(),
             flotilla_engine_convoys_testkit::single_agent("coder"),
@@ -9578,22 +9578,24 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
     )
     .await;
     let mut events = daemon.subscribe();
-    let id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::ResourceApply {
-                    namespace: "request-default".into(),
-                    document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message",
-            "metadata":{"name":"namespace-message","namespace":"document-namespace"},
-            "spec":{"sender":"system:test","receiver":format!("document-namespace/{convoy}/work/coder"),"relation":"system","body":"test"}}),
-                })
-                .build(),
-        )
-        .await
-        .expect("resource envelope");
+    let apply = |namespace: &str| {
+        Command::builder()
+            .action(CommandAction::ResourceApply {
+                namespace: "request-default".into(),
+                document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message",
+            "metadata":{"name":"namespace-message","namespace":namespace},
+            "spec":{"sender":"system:test","receiver":format!("{namespace}/{convoy}/work/coder"),"relation":"system","body":"test"}}),
+            })
+            .build()
+    };
+    // A document naming a namespace the engine does not serve is refused: its receiver's convoy is
+    // in no other namespace.
+    let refused = daemon.execute(apply("document-namespace")).await.expect_err("a document outside the engine's namespace");
+    assert!(refused.contains("document-namespace/") && refused.contains("has no admitted convoy"), "{refused}");
+    let id = daemon.execute(apply("flotilla")).await.expect("resource envelope");
     let result = recv_command_finished(&mut events, id).await;
-    assert!(matches!(result, CommandValue::ResourceObject(response) if response.namespace == "document-namespace"));
-    let messages = backend.using::<flotilla_resources::Message>("document-namespace");
+    assert!(matches!(result, CommandValue::ResourceObject(response) if response.namespace == "flotilla"));
+    let messages = backend.using::<flotilla_resources::Message>("flotilla");
     let observed = messages.get("namespace-message").await.expect("document-scoped admission");
     assert!(backend.using::<flotilla_resources::Message>("request-default").list().await.expect("default namespace").items.is_empty());
     let mut next = observed.status.clone().expect("accepted status");
@@ -9611,7 +9613,7 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
         .execute(
             Command::builder()
                 .action(CommandAction::ResourceStatusPatch {
-                    namespace: "document-namespace".into(),
+                    namespace: "flotilla".into(),
                     kind: "Message".into(),
                     name: "namespace-message".into(),
                     status: serde_json::to_value(observed.status).expect("stale status"),

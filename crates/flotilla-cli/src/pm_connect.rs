@@ -171,9 +171,6 @@ pub struct ConnectorState {
     snapshots: HashSet<QueryId>,
     known_namespaces: BTreeSet<String>,
     pending_namespaces: BTreeSet<String>,
-    /// Kinds whose records are in one namespace whichever is watched (the engine's), each with
-    /// that namespace: one watch already follows every record of the kind.
-    single_namespace_kinds: BTreeMap<&'static str, String>,
 }
 
 impl Default for ConnectorState {
@@ -193,7 +190,6 @@ impl Default for ConnectorState {
             snapshots: HashSet::new(),
             known_namespaces: BTreeSet::from(["flotilla".to_owned()]),
             pending_namespaces: BTreeSet::from(["flotilla".to_owned()]),
-            single_namespace_kinds: BTreeMap::new(),
         }
     }
 }
@@ -635,24 +631,12 @@ async fn ensure_resource_watches(
             continue;
         }
         for kind in resources::KINDS {
-            if state.single_namespace_kinds.contains_key(kind) {
-                continue;
-            }
             let mut watch = client
                 .watch(
                     ResourceWatchRequest::builder().kind((*kind).to_string()).namespace(namespace.clone()).include_replicas(true).build(),
                 )
                 .await?;
-            let (scope, envelopes) = read_subject_snapshot(&mut watch, kind).await?;
-            if scope != namespace {
-                // The kind's records are all in `scope`, whichever namespace is watched: one watch
-                // follows them. A watch of `scope` already does, unless it is yet to be opened.
-                state.single_namespace_kinds.insert(kind, scope.clone());
-                if watched.contains(&scope) {
-                    continue;
-                }
-            }
-            for envelope in envelopes {
+            for envelope in read_subject_snapshot(&mut watch, &namespace, kind).await? {
                 state.apply_resource_records(&envelope)?;
             }
             let updates = updates.clone();
@@ -678,16 +662,19 @@ async fn ensure_resource_watches(
                                             .build(),
                                     )
                                     .await?;
-                                let (scope, envelopes) = read_subject_snapshot(&mut next, kind).await?;
-                                Ok::<_, String>((next, scope, envelopes))
+                                let envelopes = read_subject_snapshot(&mut next, &namespace, kind).await?;
+                                Ok::<_, String>((next, envelopes))
                             }
                             .await;
                             match restarted {
-                                Ok((next, scope, envelopes)) => {
+                                Ok((next, envelopes)) => {
                                     watch = next;
-                                    // The records' own namespace, whose held records the snapshot replaces.
                                     if updates
-                                        .send(Ok(ResourceUpdate::Snapshot { namespace: scope, kind: (*kind).into(), envelopes }))
+                                        .send(Ok(ResourceUpdate::Snapshot {
+                                            namespace: namespace.clone(),
+                                            kind: (*kind).into(),
+                                            envelopes,
+                                        }))
                                         .await
                                         .is_err()
                                     {
@@ -720,29 +707,26 @@ async fn ensure_resource_watches(
 
 // The daemon emits snapshot envelopes followed by a bookmark, then live
 // events. Consume through that explicit boundary, allowing fragmentation but
-// refusing live updates or a mismatched scope before setup can publish. The
-// scope is the namespace the envelopes name: the watched one, or the one an
-// engine-served kind's records are all in.
+// refusing live updates or a mismatched scope before setup can publish.
 async fn read_subject_snapshot(
     watch: &mut flotilla_client::resource::ResourceWatch,
+    namespace: &str,
     plural: &str,
-) -> Result<(String, Vec<flotilla_protocol::ResourceReadEnvelope>), String> {
+) -> Result<Vec<flotilla_protocol::ResourceReadEnvelope>, String> {
     use flotilla_protocol::ResourceRecordType;
     use flotilla_resources::ResourceError;
 
-    let mut scope: Option<String> = None;
     let mut envelopes = Vec::new();
     loop {
         let envelope = watch.next().await?.ok_or_else(|| "subject catalog resource watch ended during bootstrap".to_string())?;
-        if envelope.plural != plural || scope.as_ref().is_some_and(|scope| *scope != envelope.namespace) {
+        if envelope.namespace != namespace || envelope.plural != plural {
             return Err(ResourceError::invalid("subject resource snapshot scope does not match its watch").to_string());
         }
-        let scope = scope.get_or_insert_with(|| envelope.namespace.clone());
         if envelope.records.iter().any(|record| record.record_type == ResourceRecordType::Bookmark) {
             if envelope.records.len() != 1 || envelope.records[0].object.is_some() {
                 return Err(ResourceError::invalid("subject resource snapshot bookmark must be a separate envelope").to_string());
             }
-            return Ok((scope.clone(), envelopes));
+            return Ok(envelopes);
         }
         if envelope.records.iter().any(|record| !matches!(record.record_type, ResourceRecordType::Current | ResourceRecordType::Added)) {
             return Err(ResourceError::invalid("subject resource snapshot contains a live event before its bookmark").to_string());

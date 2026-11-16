@@ -1255,12 +1255,9 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
         state: Default::default(),
     })));
     ensure_resource_watches(&daemon, &mut state, &mut watched, &mut tasks, &tx).await.expect("discover namespace");
-    // The engine-served kinds are already followed by the first namespace's watches: the new
-    // namespace adds watches only of the kinds kept per namespace.
-    for kind in ["changerequests", "issues", "forges", "repositories", "projects"] {
-        assert_eq!(state.single_namespace_kinds.get(kind).map(String::as_str), Some("flotilla"), "{kind} is the engine's");
-    }
-    assert_eq!(tasks.len(), opened + resources::KINDS.len() - state.single_namespace_kinds.len());
+    // The new namespace is watched kind by kind; it holds none of the engine's records, which the
+    // first namespace's watches follow.
+    assert_eq!(tasks.len(), opened + resources::KINDS.len());
     // The first namespace's watch follows change request 42's creation.
     tokio::time::timeout(Duration::from_secs(2), async {
         while state.resources.projection().change_requests.is_empty() {

@@ -535,7 +535,7 @@ impl TestDaemon {
         let (mut client, server) = tokio::net::UnixStream::pair().expect("socket pair");
         let serving = tokio::spawn(flotilla_daemon::server::serve_local_http(server, Arc::clone(&self.daemon)));
         let request = format!(
-            "GET /tables/{table}/rows?limit=10000&watch=true HTTP/1.1\r\nHost: flotilla.local\r\nAccept: application/x-ndjson\r\n\r\n"
+            "GET /tables/{table}/rows?namespace={NAMESPACE}&limit=10000&watch=true HTTP/1.1\r\nHost: flotilla.local\r\nAccept: application/x-ndjson\r\n\r\n"
         );
         client.write_all(request.as_bytes()).await.expect("send request");
         let mut body = tokio::io::BufReader::new(client);

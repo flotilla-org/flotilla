@@ -4187,13 +4187,13 @@ fn generated_router_repository_identity_operations(tc: hegel::TestCase) {
 async fn operator_crew_stalls_query_reads_remote_obligations() {
     let leader = empty_daemon_named("stall-reader").await;
     let follower = empty_daemon_named("stall-home").await;
-    let remote = follower.resource_backend().using::<Convoy>("other-project-namespace");
+    let remote = follower.resource_backend().using::<Convoy>("flotilla");
     // The namespace's fleet is designated, so its stall judge can tell a person.
-    flotilla_engine_messages_testkit::designate_fleet(&follower.resource_backend(), "other-project-namespace").await;
+    flotilla_engine_messages_testkit::designate_fleet(&follower.resource_backend(), "flotilla").await;
     // The convoy's project, whose operator is told; it declares no governor.
     follower
         .resource_backend()
-        .definitions::<flotilla_resources::Project>("other-project-namespace")
+        .definitions::<flotilla_resources::Project>("flotilla")
         .apply(
             &InputMeta::builder().name("project".into()).build(),
             &flotilla_resources::ProjectSpec::builder()
@@ -4205,7 +4205,7 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
         .await
         .expect("project");
     // A working coder in a realised vessel, with its running session.
-    off_frame(|| seed_supervision_crew_in(&follower, "other-project-namespace", "stalled-work", "work", "coder")).await;
+    off_frame(|| seed_supervision_crew_in(&follower, "flotilla", "stalled-work", "work", "coder")).await;
     let launch = current_launch(&follower, "stalled-work");
     // A crew's stall is its home's note (#3108).
     flotilla_store::note_convoy(
@@ -4225,7 +4225,7 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
     .await
     .expect("declare stall");
     // With no governor the judge tells the operator: the attention is what reaches another host.
-    follower.reconcile_crew_stalls_once("other-project-namespace").await.expect("stall judge pass");
+    follower.reconcile_crew_stalls_once("flotilla").await.expect("stall judge pass");
     let topology = spawn_in_memory_request_topology_stateful_with_surface(
         Arc::clone(&leader),
         follower,
@@ -4234,7 +4234,7 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
     .await
     .expect("operator connection");
     eventually(Duration::from_secs(5), Duration::from_millis(10), "the reader follows the stall's home", || async {
-        leader.resource_backend().including_replicas::<Convoy>("other-project-namespace").get(&launch).await.is_ok()
+        leader.resource_backend().including_replicas::<Convoy>("flotilla").get(&launch).await.is_ok()
     })
     .await;
     let stalls = || async {
@@ -4255,7 +4255,6 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
     // vessel, evidence, reason and disposition are the home's note, so they are absent here.
     assert_eq!(response.rows.len(), 1, "{:?}", response.rows);
     let row = &response.rows[0];
-    // The engine serves its convoys in its one namespace, whichever the launch was admitted to.
     assert_eq!(row.namespace, "flotilla");
     assert_eq!(row.convoy, launch);
     assert_eq!(row.role, "coder");

@@ -467,6 +467,35 @@ async fn kind_discovery_on_the_engine_home_reads_no_old_store() {
     assert!(accesses.accesses().is_empty(), "{}", accesses.report());
 }
 
+// A kind the engine serves is in the engine's namespace alone: a read through another answers
+// none of its records.
+#[tokio::test]
+async fn engine_records_are_not_read_through_another_namespace() {
+    use flotilla_resources::{MessageRelation, MessageSpec};
+
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.serve_engine_in("flotilla");
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
+    let home = flotilla_engine_messages_testkit::EngineMessagesHome::open("home-a", "flotilla", &backend);
+    let spec = MessageSpec::builder()
+        .sender("flotilla/reviewer".into())
+        .receiver("flotilla/coder".into())
+        .relation(MessageRelation::Peer)
+        .body("a".into())
+        .build();
+    home.primitives().admit("flotilla", "to-coder", &spec).await.expect("admit");
+    let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
+    let items = |reply: Reply| {
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+        reply.json()["items"].as_array().expect("items").len()
+    };
+    let list = |namespace: &str| get(&format!("/apis/flotilla.work/v1/namespaces/{namespace}/messages"));
+    assert_eq!(items(daemon.call(CallerAuth::Socket(None), list("flotilla")).await), 1);
+    assert_eq!(items(daemon.call(CallerAuth::Socket(None), list("empty")).await), 0);
+    let read = daemon.call(CallerAuth::Socket(None), get("/apis/flotilla.work/v1/namespaces/empty/messages/to-coder")).await;
+    assert_eq!(read.status, StatusCode::NOT_FOUND, "{:?}", read.body);
+}
+
 // A Message query reads the engine's messages and answers with only those it selects, with or
 // without other homes' copies: a receiver's open messages, every open message, and the replies to
 // one message.

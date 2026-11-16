@@ -1420,7 +1420,7 @@ mod tests {
         )
         .await;
         backend
-            .using::<Project>("ops")
+            .using::<Project>("flotilla")
             .create(
                 &InputMeta::builder().name("ops-project".to_string()).build(),
                 &ProjectSpec::builder()
@@ -1430,7 +1430,7 @@ mod tests {
                     .build(),
             )
             .await
-            .expect("create project outside default namespace");
+            .expect("create ops project");
         // The engine holds definitions in the daemon's one namespace, so a replicated convoy that
         // names one is in that namespace too.
         backend
@@ -1503,7 +1503,7 @@ mod tests {
             validate_daemon(&socket, Some(&[]), Some(&catalog)).await.expect_err("pre-roll checks registered projects in every namespace");
         assert!(error.to_string().contains("ops") && error.to_string().contains("missing"), "{error}");
         backend
-            .using::<Project>("missing")
+            .using::<Project>("flotilla")
             .create(
                 &InputMeta::builder().name("unavailable".to_string()).build(),
                 &ProjectSpec::builder()
@@ -1522,7 +1522,7 @@ mod tests {
             .await
             .expect("project with missing ops source");
         let reported = client
-            .get("http://flotilla.local/apis/flotilla.work/v1/namespaces/missing/operationalentries")
+            .get("http://flotilla.local/apis/flotilla.work/v1/namespaces/flotilla/operationalentries")
             .send()
             .await
             .expect("missing-source endpoint");

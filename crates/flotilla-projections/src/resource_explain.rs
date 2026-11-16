@@ -60,9 +60,7 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
 
     let resource_kind = watch.kind;
     let plural = watch.plural;
-    // An engine-served kind's records are in the engine's one namespace, whichever was asked: the
-    // envelope names it, so a watcher of several namespaces can tell it holds the same records.
-    let namespace = context.backend.engine_namespace(&resource_kind).unwrap_or(watch.namespace);
+    let namespace = watch.namespace;
     let initial_resource_version = watch.resource_version;
     let generation = watch.generation;
     let initial_cursor = ResourceCursor::from_position(initial_resource_version.clone(), generation.clone());
