@@ -555,7 +555,8 @@ fn refuse_without_evidence(
                     .into(),
                 &none,
             ),
-            (lifecycle::GiveUp { cause: cause("other") }.into(), &none),
+            // A cause the scenario never picks, so it is never the last failure's.
+            (lifecycle::GiveUp { cause: cause("stranger") }.into(), &none),
         ];
         for (edge, world) in probes {
             let kind = edge.kind();
