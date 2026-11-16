@@ -87,11 +87,9 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     primitives.admit(NAMESPACE, "for-a-person", &to_person).await.expect("admit");
     let total = SETTLED + 2 + 3 + 2 + 1;
 
-    let (waiting, cost) = measured(primitives.pending_to(NAMESPACE, &[BUSY.to_owned()])).await;
-    let mut names = waiting.expect("pending read").iter().map(|read| read.object.metadata.name.clone()).collect::<Vec<_>>();
-    names.sort();
-    assert_eq!(names, ["waiting-0", "waiting-1", "waiting-2"]);
-    assert_eq!(cost, (3, 3), "a pending read loads and converts only the waiting messages");
+    let (waiting, cost) = measured(primitives.undelivered_from(NAMESPACE, &intent(BUSY, "next"))).await;
+    assert_eq!(waiting.expect("pending read").expect("waiting").standing.name, "waiting-2");
+    assert_eq!(cost, (3, 0), "a pending read loads only the waiting messages and converts none");
 
     let (settled, cost) = measured(primitives.view_to(NAMESPACE, BUSY, "settled-17")).await;
     assert_eq!(settled.expect("by-name read").expect("held").object.metadata.name, "settled-17");
@@ -109,9 +107,9 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     assert!(held.expect("hold read").is_some(), "the waiting messages hold delivery");
     assert_eq!(cost.0, 3, "a delivery hold loads only the waiting messages");
 
-    let (open, cost) = measured(primitives.open_to(NAMESPACE, &[BUSY.to_owned()])).await;
-    assert_eq!(open.expect("open read").len(), 3, "the waiting messages are the open ones");
-    assert_eq!(cost, (3, 3), "an open read loads and converts only the open messages");
+    let (awaited, cost) = measured(primitives.awaited_reply_from(NAMESPACE, &intent(BUSY, "ruling"))).await;
+    assert_eq!(awaited.expect("open read"), None, "no open message expects a reply");
+    assert_eq!(cost, (3, 0), "an open read loads only the open messages and converts none");
 
     // A seat's open messages, its newest settled and delivered (here one message), and a named one.
     let quiet = [(QUIET.to_owned(), "quiet-0".to_owned())];

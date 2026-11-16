@@ -58,13 +58,6 @@ pub struct AdmittedMessage {
 /// the old store's, unchanged.
 #[async_trait]
 pub trait EngineMessages: Send + Sync {
-    /// The message `record` in `receiver`'s inbox (an old address), local or replicated.
-    async fn view_to(
-        &self,
-        namespace: &str,
-        receiver: &str,
-        record: &str,
-    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
     /// Whether `receiver`'s inbox (an old address) holds the message `record`, local or
     /// replicated, read by its exact identity without loading it.
     async fn holds(&self, namespace: &str, receiver: &str, record: &str) -> Result<bool, flotilla_resources::ResourceError>;
@@ -83,12 +76,23 @@ pub trait EngineMessages: Send + Sync {
         namespace: &str,
         intent: &flotilla_resources::MessageSpec,
     ) -> Result<Option<String>, flotilla_resources::ResourceError>;
-    /// The open messages to `receivers` (old addresses), local or replicated.
-    async fn open_to(
+    /// The last message admitted to `intent`'s inbox from its sender that is still waiting for
+    /// delivery, local or replicated, read as in `intent`'s receiver.
+    async fn undelivered_from(
         &self,
         namespace: &str,
-        receivers: &[String],
-    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
+        intent: &flotilla_resources::MessageSpec,
+    ) -> Result<Option<SentMessage>, flotilla_resources::ResourceError>;
+    /// The last open message admitted to `intent`'s inbox from its sender that expects a reply
+    /// and refers to one of what `intent` refers to, local or replicated: its record name.
+    async fn awaited_reply_from(
+        &self,
+        namespace: &str,
+        intent: &flotilla_resources::MessageSpec,
+    ) -> Result<Option<String>, flotilla_resources::ResourceError>;
+    /// The messages to `seats` (old crew addresses) still waiting for delivery that a supervisor
+    /// sent and no fleet role did, local or replicated, in admission order.
+    async fn queued_briefs(&self, namespace: &str, seats: &[String]) -> Result<Vec<SentMessage>, flotilla_resources::ResourceError>;
     /// What the stall judge reads of crew seats' inboxes, local or replicated: for each of
     /// `receivers` (old crew addresses), its open messages, the last one admitted among those
     /// settled and the one delivered last and not dropped since; then each `named` (receiver,
@@ -106,12 +110,6 @@ pub trait EngineMessages: Send + Sync {
         namespace: &str,
         named: &[(String, String)],
     ) -> Result<Vec<SentMessage>, flotilla_resources::ResourceError>;
-    /// The messages to `receivers` (old addresses) still waiting for delivery, local or replicated.
-    async fn pending_to(
-        &self,
-        namespace: &str,
-        receivers: &[String],
-    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
     /// Admits an intent at this home, its receiver's; a repeated name is the message already admitted.
     async fn admit(
         &self,
@@ -119,15 +117,6 @@ pub trait EngineMessages: Send + Sync {
         name: &str,
         intent: &flotilla_resources::MessageSpec,
     ) -> Result<flotilla_resources::ResourceObject<flotilla_resources::Message>, flotilla_resources::ResourceError>;
-    /// An intent with its sender and receiver as this path's views spell
-    /// them, for comparing parties with messages read back: a person reads
-    /// back as the role they send in (the principal goes to the trace), a
-    /// convoy role as the vessel that holds it.
-    async fn spelled(
-        &self,
-        namespace: &str,
-        intent: &flotilla_resources::MessageSpec,
-    ) -> Result<flotilla_resources::MessageSpec, flotilla_resources::ResourceError>;
     /// Where the message `intent` replies to stands, read as its admission
     /// reads it: in this home's replica, or at its home on a miss. With no
     /// `in_reply_to` it is absent.

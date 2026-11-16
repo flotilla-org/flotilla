@@ -2,20 +2,14 @@
 //! Messages only through these methods, from the engine store's replica in
 //! the old shape.
 
-use flotilla_messaging::MessageAdmission;
-use flotilla_resources::{InputMeta, Message, MessageSpec, ReadResourceObject, ResourceError};
+use flotilla_messaging::{MessageAdmission, SentMessage};
+use flotilla_resources::{InputMeta, MessageSpec, ResourceError};
 
 use crate::crew_ops::CrewService;
 
 impl CrewService {
     pub(crate) fn message_primitives(&self) -> Result<std::sync::Arc<dyn flotilla_messaging::EngineMessages>, ResourceError> {
         crate::ports::installed_messages(&self.message_path)
-    }
-
-    /// An intent with its sender and receiver as Messages read back spell them,
-    /// for comparing parties.
-    pub(crate) async fn spelled_message_intent(&self, namespace: &str, intent: &MessageSpec) -> Result<MessageSpec, ResourceError> {
-        self.message_primitives()?.spelled(namespace, intent).await
     }
 
     /// Where the Message `intent` replies to stands, read as its admission reads it.
@@ -26,14 +20,10 @@ impl CrewService {
         }
     }
 
-    /// The Message `name` in `receiver`'s inbox, local or replicated.
-    pub(crate) async fn message_to(
-        &self,
-        namespace: &str,
-        receiver: &str,
-        name: &str,
-    ) -> Result<ReadResourceObject<Message>, ResourceError> {
-        self.message_primitives()?.view_to(namespace, receiver, name).await?.ok_or_else(|| ResourceError::not_found(name))
+    /// The Message `name` in `receiver`'s inbox, local or replicated: where it stands, with its body.
+    pub(crate) async fn message_to(&self, namespace: &str, receiver: &str, name: &str) -> Result<SentMessage, ResourceError> {
+        let named = [(receiver.to_owned(), name.to_owned())];
+        self.message_primitives()?.sent_messages(namespace, &named).await?.pop().ok_or_else(|| ResourceError::not_found(name))
     }
 
     /// Whether `receiver`'s inbox holds the Message `name`, local or replicated.
@@ -58,22 +48,22 @@ impl CrewService {
         self.message_primitives()?.open_superseded(namespace, intent).await
     }
 
-    /// The open Messages to `receiver`, local or replicated.
-    pub(crate) async fn active_message_records(
-        &self,
-        namespace: &str,
-        receiver: &str,
-    ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        self.message_primitives()?.open_to(namespace, &[receiver.to_owned()]).await
+    /// The last Message from `intent`'s sender to its receiver still waiting for delivery, local or
+    /// replicated.
+    pub(crate) async fn undelivered_from(&self, namespace: &str, intent: &MessageSpec) -> Result<Option<SentMessage>, ResourceError> {
+        self.message_primitives()?.undelivered_from(namespace, intent).await
     }
 
-    /// The Messages still waiting for delivery to `receivers`, local or replicated.
-    pub(crate) async fn pending_message_records(
-        &self,
-        namespace: &str,
-        receivers: &[String],
-    ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        self.message_primitives()?.pending_to(namespace, receivers).await
+    /// The last open Message from `intent`'s sender to its receiver expecting a reply about one of
+    /// what `intent` refers to, local or replicated: its name.
+    pub(crate) async fn awaited_reply_from(&self, namespace: &str, intent: &MessageSpec) -> Result<Option<String>, ResourceError> {
+        self.message_primitives()?.awaited_reply_from(namespace, intent).await
+    }
+
+    /// The Messages to `seats` still waiting for delivery that a supervisor sent and no fleet role
+    /// did, local or replicated, in admission order.
+    pub(crate) async fn queued_briefs(&self, namespace: &str, seats: &[String]) -> Result<Vec<SentMessage>, ResourceError> {
+        self.message_primitives()?.queued_briefs(namespace, seats).await
     }
 
     /// The Messages with these names, each a (receiver, name) pair read in its receiver's inbox,

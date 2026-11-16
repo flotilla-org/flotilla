@@ -1275,14 +1275,6 @@ struct Turns {
 
 #[async_trait]
 impl flotilla_messaging::EngineMessages for Turns {
-    async fn view_to(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
-        unreachable!("the convoy reconciler reads no message views")
-    }
     async fn holds(&self, _: &str, _: &str, _: &str) -> Result<bool, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message by name")
     }
@@ -1301,11 +1293,25 @@ impl flotilla_messaging::EngineMessages for Turns {
     ) -> Result<Option<String>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
-    async fn open_to(
+    async fn undelivered_from(
+        &self,
+        _: &str,
+        _: &flotilla_resources::MessageSpec,
+    ) -> Result<Option<flotilla_messaging::SentMessage>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn awaited_reply_from(
+        &self,
+        _: &str,
+        _: &flotilla_resources::MessageSpec,
+    ) -> Result<Option<String>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn queued_briefs(
         &self,
         _: &str,
         _: &[String],
-    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+    ) -> Result<Vec<flotilla_messaging::SentMessage>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
     async fn seat_standings(
@@ -1323,13 +1329,6 @@ impl flotilla_messaging::EngineMessages for Turns {
     ) -> Result<Vec<flotilla_messaging::SentMessage>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
-    async fn pending_to(
-        &self,
-        _: &str,
-        _: &[String],
-    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
-        unreachable!("the convoy reconciler reads no message views")
-    }
     async fn admit(
         &self,
         _: &str,
@@ -1337,13 +1336,6 @@ impl flotilla_messaging::EngineMessages for Turns {
         _: &flotilla_resources::MessageSpec,
     ) -> Result<ResourceObject<flotilla_resources::Message>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler admits nothing")
-    }
-    async fn spelled(
-        &self,
-        _: &str,
-        _: &flotilla_resources::MessageSpec,
-    ) -> Result<flotilla_resources::MessageSpec, flotilla_resources::ResourceError> {
-        unreachable!("the convoy reconciler compares no parties")
     }
     async fn resolve_in_reply_to(&self, _: &str, _: &flotilla_resources::MessageSpec) -> flotilla_messaging::MessageResolution {
         unreachable!("the convoy reconciler links no replies")

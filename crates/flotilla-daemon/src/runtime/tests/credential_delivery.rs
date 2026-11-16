@@ -1181,18 +1181,20 @@ impl RunningCards {
         Self { daemon, source, convoys, build, _controller: controller, _temp: temp }
     }
 
-    /// The capability Message to convoy `n`'s coder whose body names `text`.
-    async fn card_naming(&self, n: usize, text: &str) -> flotilla_resources::MessageSpec {
+    /// The body of the open capability Message to convoy `n`'s coder that names `text`.
+    async fn card_naming(&self, n: usize, text: &str) -> String {
         let receiver = flotilla_resources::crew_role_address(NAMESPACE, &self.convoys[n], "work", "coder");
         let primitives = self.daemon.message_primitives().expect("message path");
+        let inbox = primitives.inbox_for(NAMESPACE, &receiver).await.expect("the coder's inbox");
+        let capabilities = primitives.roles(NAMESPACE).await.expect("fleet roles").system_sender("system:capabilities");
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let open = primitives.open_to(NAMESPACE, std::slice::from_ref(&receiver)).await.expect("the coder's messages");
-                if let Some(message) = open
-                    .into_iter()
-                    .find(|message| message.object.spec.sender == "system:capabilities" && message.object.spec.body.contains(text))
-                {
-                    return message.object.spec;
+                let open = primitives.open_in(&inbox).expect("the coder's messages");
+                if let Some(body) = open.into_iter().find_map(|(_, message)| {
+                    let body = flotilla_engine_messages::view::body_text(message.spec().body.value());
+                    (Some(&message.spec().sender) == capabilities.as_ref() && body.contains(text)).then_some(body)
+                }) {
+                    return body;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -1213,7 +1215,7 @@ async fn a_rebind_reaches_a_running_sessions_card_with_no_other_event() {
     cards.daemon.account_records().rebind(NAMESPACE, reopened, None, now).await.expect("rebind");
 
     let card = cards.card_naming(0, "credential `claude-b` (account b@example.com)").await;
-    assert!(!card.body.contains("claude-max"), "{}", card.body);
+    assert!(!card.contains("claude-max"), "{card}");
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(cards.source.readings("cards-session-1"), other, "the other convoy's card is not read again");
 }

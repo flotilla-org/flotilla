@@ -1833,17 +1833,6 @@ impl MessagePrimitives {
         self.view_at(namespace, roles, id, home).await
     }
 
-    /// The open messages to `receivers` (old addresses) in the old shape, read through each
-    /// inbox's index. A message the records it names cannot spell is left out.
-    pub async fn open_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
-        let (roles, inboxes) = self.inboxes_of(namespace, receivers).await?;
-        let mut rows = Vec::new();
-        for inbox in &inboxes {
-            rows.extend(self.open_in(inbox).map_err(ResourceError::other)?);
-        }
-        self.spelled_to(rows, namespace, &roles, receivers).await
-    }
-
     /// What the stall judge reads of crew seats' inboxes, in the old shape: for each of
     /// `receivers` (old crew addresses), its open messages, the last one admitted among those
     /// settled, and the one delivered last and not dropped since; then each `named` message,
@@ -1912,16 +1901,91 @@ impl MessagePrimitives {
         for (inbox, receiver, record) in named_inboxes(&conversion, named) {
             let Some((id, home)) = self.locate_in(&inbox, record).map_err(ResourceError::other)? else { continue };
             let Some((_, created, resource)) = self.load_at(id, home)? else { continue };
-            if let Some(standing) = standing(receiver.to_owned(), &resource, created) {
-                let spec = resource.spec();
-                sent.push(flotilla_messaging::SentMessage {
-                    standing,
-                    body: view::body_text(spec.body.value()),
-                    supersedes: spec.supersedes.as_ref().and_then(|older| record_name(&older.name)),
-                });
-            }
+            sent.extend(sent_message(receiver.to_owned(), &resource, created));
         }
         Ok(sent)
+    }
+
+    /// The last message admitted to `intent`'s inbox from its sender, both converted as admission
+    /// converts them, that is still waiting for delivery: read through the inbox's pending index.
+    pub async fn undelivered_from(
+        &self,
+        namespace: &str,
+        intent: &OldSpec,
+    ) -> Result<Option<flotilla_messaging::SentMessage>, ResourceError> {
+        let parties = self.parties(namespace, intent).await?;
+        let Some(row) = self
+            .pending_in(&parties.inbox)
+            .map_err(ResourceError::other)?
+            .into_iter()
+            .rfind(|(_, message)| message.spec().sender == parties.sender)
+        else {
+            return Ok(None);
+        };
+        let created = self.created_of(std::slice::from_ref(&row))?;
+        Ok(created.into_iter().next().and_then(|created| sent_message(intent.receiver.clone(), &row.1, created)))
+    }
+
+    /// The last open message admitted to `intent`'s inbox from its sender, both converted as
+    /// admission converts them, that expects a reply and refers to one of what `intent` refers to:
+    /// its record name. Read through the inbox's open indexes.
+    pub async fn awaited_reply_from(&self, namespace: &str, intent: &OldSpec) -> Result<Option<String>, ResourceError> {
+        let parties = self.parties(namespace, intent).await?;
+        let found = self.open_in(&parties.inbox).map_err(ResourceError::other)?.into_iter().filter_map(|(_, message)| {
+            let spec = message.spec();
+            let refers = spec.references.iter().any(|reference| parties.references.contains(&reference.address));
+            let awaited = spec.sender == parties.sender && spec.expectation == Expectation::Reply && refers;
+            let admitted = spec.admitted_seq;
+            awaited.then_some((admitted, message))
+        });
+        Ok(found.max_by_key(|(admitted, _)| *admitted).and_then(|(_, message)| record_name(message.name())))
+    }
+
+    /// The messages to `seats` (old crew addresses) still waiting for delivery that a supervisor
+    /// sent and no fleet role did: each seat's pending index, in admission order.
+    pub async fn queued_briefs(&self, namespace: &str, seats: &[String]) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
+        let mut briefs = Vec::new();
+        for seat in seats {
+            let inbox = match conversion.inbox(seat) {
+                Ok(inbox) => inbox,
+                Err(error) => {
+                    tracing::debug!(%seat, %error, "a seat with no inbox holds no message");
+                    continue;
+                }
+            };
+            let rows: Vec<_> = self
+                .pending_in(&inbox)
+                .map_err(ResourceError::other)?
+                .into_iter()
+                .filter(|(_, message)| {
+                    let spec = message.spec();
+                    spec.relation == Relation::Supervisor && roles.role_of(&spec.sender).is_none()
+                })
+                .collect();
+            let created = self.created_of(&rows)?;
+            briefs.extend(rows.iter().zip(created).filter_map(|((_, message), created)| sent_message(seat.clone(), message, created)));
+        }
+        briefs.sort_by_key(|brief| brief.standing.accepted_sequence);
+        Ok(briefs)
+    }
+
+    /// `intent`'s sender, inbox and the addresses it refers to, converted as admission converts
+    /// them on the records they name.
+    async fn parties(&self, namespace: &str, intent: &OldSpec) -> Result<Parties, ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        self.spell(&mut OldStoreRecords::empty(namespace), |records| -> Result<Parties, String> {
+            let conversion = Conversion { roles: &roles, forges: &[], records };
+            let references = intent
+                .references
+                .iter()
+                .map(|reference| Ok(conversion.reference(reference, false)?.address))
+                .collect::<Result<_, String>>()?;
+            Ok(Parties { sender: conversion.sender_of(intent)?, inbox: conversion.receiver(intent)?, references })
+        })
+        .await?
+        .map_err(ResourceError::invalid)
     }
 
     /// Each of `inboxes`' open messages, the last one admitted among those settled and the one
@@ -1947,17 +2011,6 @@ impl MessagePrimitives {
             }
         }
         Ok(rows.into_values().collect())
-    }
-
-    /// The pending messages to `receivers` (old addresses) in the old shape, read through each
-    /// inbox's pending index. A message the records it names cannot spell is left out.
-    pub async fn pending_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
-        let (roles, inboxes) = self.inboxes_of(namespace, receivers).await?;
-        let mut rows = Vec::new();
-        for inbox in &inboxes {
-            rows.extend(self.pending_in(inbox).map_err(ResourceError::other)?);
-        }
-        self.spelled_to(rows, namespace, &roles, receivers).await
     }
 
     /// The inboxes old receivers' messages are in. A person's role depends on the message's
@@ -2008,21 +2061,6 @@ impl MessagePrimitives {
                 }
             })
             .collect())
-    }
-
-    /// An intent with its sender and receiver as [`Self::view`] spells them once
-    /// admitted: each party converted as admission converts it, then spelled
-    /// back, on the records the parties name.
-    pub async fn spelled(&self, namespace: &str, intent: &OldSpec) -> Result<OldSpec, ResourceError> {
-        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        self.spell(&mut OldStoreRecords::empty(namespace), |records| -> Result<OldSpec, String> {
-            let conversion = Conversion { roles: &roles, forges: &[], records };
-            let sender = view::old_address(&conversion.sender_of(intent)?, &roles, records)?;
-            let receiver = view::old_address(&conversion.receiver(intent)?, &roles, records)?;
-            Ok(OldSpec { sender, receiver, ..intent.clone() })
-        })
-        .await?
-        .map_err(ResourceError::invalid)
     }
 
     /// A message created at `created` in the old shape, on the records it names, read now.
@@ -2103,14 +2141,6 @@ fn admitted_intent(
 /// Crew code's port onto this path (`flotilla_messaging::EngineMessages`).
 #[async_trait::async_trait]
 impl flotilla_messaging::EngineMessages for MessagePrimitives {
-    async fn view_to(
-        &self,
-        namespace: &str,
-        receiver: &str,
-        record: &str,
-    ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
-        MessagePrimitives::view_to(self, namespace, receiver, record).await
-    }
     async fn holds(&self, namespace: &str, receiver: &str, record: &str) -> Result<bool, ResourceError> {
         MessagePrimitives::holds(self, namespace, receiver, record).await
     }
@@ -2125,8 +2155,14 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     async fn open_superseded(&self, namespace: &str, intent: &OldSpec) -> Result<Option<String>, ResourceError> {
         MessagePrimitives::open_superseded(self, namespace, intent).await
     }
-    async fn open_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
-        MessagePrimitives::open_to(self, namespace, receivers).await
+    async fn undelivered_from(&self, namespace: &str, intent: &OldSpec) -> Result<Option<flotilla_messaging::SentMessage>, ResourceError> {
+        MessagePrimitives::undelivered_from(self, namespace, intent).await
+    }
+    async fn awaited_reply_from(&self, namespace: &str, intent: &OldSpec) -> Result<Option<String>, ResourceError> {
+        MessagePrimitives::awaited_reply_from(self, namespace, intent).await
+    }
+    async fn queued_briefs(&self, namespace: &str, seats: &[String]) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
+        MessagePrimitives::queued_briefs(self, namespace, seats).await
     }
     async fn seat_standings(
         &self,
@@ -2143,14 +2179,8 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     ) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
         MessagePrimitives::sent_messages(self, namespace, named).await
     }
-    async fn pending_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
-        MessagePrimitives::pending_to(self, namespace, receivers).await
-    }
     async fn admit(&self, namespace: &str, name: &str, intent: &OldSpec) -> Result<ResourceObject<OldMessage>, ResourceError> {
         MessagePrimitives::admit(self, namespace, name, intent).await
-    }
-    async fn spelled(&self, namespace: &str, intent: &OldSpec) -> Result<OldSpec, ResourceError> {
-        MessagePrimitives::spelled(self, namespace, intent).await
     }
     async fn resolve_in_reply_to(&self, namespace: &str, intent: &OldSpec) -> MessageResolution {
         MessagePrimitives::resolve_in_reply_to(self, namespace, intent).await
@@ -2301,6 +2331,24 @@ fn standing(seat: String, resource: &Resource<Message>, created: CreatedAt) -> O
 
 /// Each `named` (receiver, record) message's inbox, with its receiver and record; a receiver with
 /// no inbox names none.
+/// A message's parties and references as admission converts an intent's.
+struct Parties {
+    sender: Address,
+    inbox: Address,
+    references: Vec<Address>,
+}
+
+/// A message read as in `seat`: where it stands, with its body and the message it supersedes.
+fn sent_message(seat: String, resource: &Resource<Message>, created: CreatedAt) -> Option<flotilla_messaging::SentMessage> {
+    let standing = standing(seat, resource, created)?;
+    let spec = resource.spec();
+    Some(flotilla_messaging::SentMessage {
+        standing,
+        body: view::body_text(spec.body.value()),
+        supersedes: spec.supersedes.as_ref().and_then(|older| record_name(&older.name)),
+    })
+}
+
 fn named_inboxes<'a>(conversion: &Conversion<'_>, named: &'a [(String, String)]) -> Vec<(Address, &'a str, &'a str)> {
     named
         .iter()

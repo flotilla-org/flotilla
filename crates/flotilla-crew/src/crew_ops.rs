@@ -1409,32 +1409,18 @@ impl CrewService {
             }
             return Ok(linked);
         }
-        // The escalation runs the other way: from the crew to this ruling's sender, its parties
-        // spelled as the messages read back spell them.
+        // The escalation runs the other way: from the crew to this ruling's sender, about the convoy.
         let escalation = flotilla_resources::MessageSpec::builder()
             .sender(receiver.to_owned())
             .receiver(sender.to_owned())
             .relation(flotilla_resources::MessageRelation::Supervisor)
             .body(String::new())
+            .references(vec![flotilla_resources::MessageReference::ControlRecord {
+                resource: ResourceRef::new("flotilla.work/v1", "Convoy", namespace, convoy_name),
+                revision: String::new(),
+            }])
             .build();
-        let escalation = self.spelled_message_intent(namespace, &escalation).await.map_err(|error| error.to_string())?;
-        let found = self
-            .active_message_records(namespace, &escalation.receiver)
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .filter(|record| {
-                record.object.spec.receiver == escalation.receiver
-                    && record.object.spec.sender == escalation.sender
-                    && record.object.spec.expectation == flotilla_resources::MessageExpectation::Reply
-                    && record.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
-                    && record.object.spec.references.iter().any(|reference| {
-                        matches!(reference, flotilla_resources::MessageReference::ControlRecord { resource, .. }
-                    if resource.kind == "Convoy" && resource.name == convoy_name && resource.namespace == namespace)
-                    })
-            })
-            .max_by_key(|record| record.object.metadata.creation_timestamp)
-            .map(|record| record.object.metadata.name);
+        let found = self.awaited_reply_from(namespace, &escalation).await.map_err(|error| error.to_string())?;
         if found.is_some() {
             return Ok(found);
         }
@@ -2442,27 +2428,11 @@ impl CrewService {
             .body(prompt.to_string())
             .maybe_in_reply_to(in_reply_to)
             .build();
-        // Parties compare as the messages read back spell them: on the engine
-        // a person is the role they send in, so the same operator role is the
-        // same sender.
-        let spelled = self.spelled_message_intent(namespace, &intent).await.map_err(|error| error.to_string())?;
-        let prior = self
-            .active_message_records(namespace, &spelled.receiver)
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .filter(|message| {
-                message.object.spec.receiver == spelled.receiver
-                    && message.object.spec.sender == spelled.sender
-                    && message
-                        .object
-                        .status
-                        .as_ref()
-                        .is_none_or(|status| !status.phase.is_terminal() && !status.phase.has_delivery_evidence())
-            })
-            .max_by_key(|message| message.object.metadata.creation_timestamp);
-        let displaced = prior.as_ref().map(|message| message.object.spec.body.clone());
-        intent.supersedes = prior.map(|message| message.object.metadata.name);
+        // Parties compare as admission converts them: a person is the role they send in, so the
+        // same operator role is the same sender.
+        let prior = self.undelivered_from(namespace, &intent).await.map_err(|error| error.to_string())?;
+        let displaced = prior.as_ref().map(|message| message.body.clone());
+        intent.supersedes = prior.map(|message| message.standing.name);
         // This per-command ID survives router retries. The publisher still
         // returns canonical admission, as it does for subject-based producers.
         let admitted = self.publish_message_intent(namespace, &message_name, &intent).await?;
@@ -2500,15 +2470,15 @@ impl CrewService {
         let pending_message = if let Some(reference) = pending_ref {
             // A follow-up is queued to the crew member it follows up.
             let receiver = crew_role_address(selected.project(namespace), name, vessel, role);
-            self.message_to(namespace, &receiver, &reference.name)
-                .await
-                .map_err(|error| format!("follow-up Message awaits replication: {error}"))?
-                .object
-                .into()
+            Some(
+                self.message_to(namespace, &receiver, &reference.name)
+                    .await
+                    .map_err(|error| format!("follow-up Message awaits replication: {error}"))?,
+            )
         } else {
             None
         };
-        let displaced = pending_message.as_ref().map(|message| message.spec.body.clone());
+        let displaced = pending_message.as_ref().map(|message| message.body.clone());
         let session = session?.ok_or_else(|| format!("crew member `{role}` on vessel `{vessel}` has no intact terminal session"))?;
         if session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed) {
             let reason = session.object.status.as_ref().and_then(|status| status.message.as_deref()).unwrap_or("terminal session failed");
@@ -2524,12 +2494,8 @@ impl CrewService {
             .maybe_supersedes(
                 pending_message
                     .as_ref()
-                    .filter(|message| {
-                        message.status.as_ref().is_none_or(|status| {
-                            status.submission.is_none() && !status.phase.has_delivery_evidence() && !status.phase.is_terminal()
-                        })
-                    })
-                    .map(|message| message.metadata.name.clone()),
+                    .filter(|message| !message.standing.phase.has_delivery_evidence() && !message.standing.phase.is_terminal())
+                    .map(|message| message.standing.name.clone()),
             )
             .build();
         let message_name = flotilla_resources::message_record_name(&receiver, &sender, &format!("resume:{}", uuid::Uuid::new_v4()));
@@ -2605,31 +2571,19 @@ impl CrewService {
         }
         let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
         let seats = flotilla_resources::convoy_crew_seats(namespace, &convoy);
-        let mut messages = self
-            .pending_message_records(namespace, &seats)
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .filter(|message| {
-                message.object.spec.relation == flotilla_resources::MessageRelation::Supervisor
-                    && !message.object.spec.sender.starts_with("system:")
-                    && message.object.status.as_ref().is_none_or(|status| {
-                        !status.phase.is_terminal() && !status.phase.has_delivery_evidence() && status.submission.is_none()
-                    })
-            })
-            .collect::<Vec<_>>();
-        messages.sort_by_key(|message| message.object.metadata.creation_timestamp);
-        let withdrawn = messages.last().map(|message| message.object.spec.body.clone());
+        let messages = self.queued_briefs(namespace, &seats).await.map_err(|error| error.to_string())?;
+        let withdrawn = messages.last().map(|message| message.body.clone());
         let mut closed = BTreeSet::new();
         let primitives = self.message_primitives().map_err(|error| error.to_string())?;
         for message in messages {
-            if let Err(error) = primitives.withdraw(namespace, &message.object.spec.receiver, &message.object.metadata.name, name).await {
+            let message = message.standing;
+            if let Err(error) = primitives.withdraw(namespace, &message.seat, &message.name, name).await {
                 return Err(format!(
                     "withdrawal of {} failed: {error}; already withdrawn: {closed:?}; last queued brief: {withdrawn:?}",
-                    message.object.metadata.name
+                    message.name
                 ));
             }
-            closed.insert(message.object.metadata.name);
+            closed.insert(message.name);
         }
         let latest = convoys.get(name).await.map_err(|error| error.to_string())?;
         for (vessel, crew) in latest.status.as_ref().into_iter().flat_map(|status| status.crew_work.iter()) {
@@ -2645,10 +2599,9 @@ impl CrewService {
                             .map_err(|error| {
                                 format!("follow-up Message awaits replication during withdrawal: {error}; last queued brief: {withdrawn:?}")
                             })?
-                            .object
-                            .status
-                            .as_ref()
-                            .is_some_and(|status| status.phase.is_terminal())
+                            .standing
+                            .phase
+                            .is_terminal()
                     };
                     if terminal {
                         flotilla_store::note_convoy(

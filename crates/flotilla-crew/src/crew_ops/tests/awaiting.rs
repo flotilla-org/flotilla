@@ -47,6 +47,15 @@ impl RecordingMessages {
     }
 }
 
+/// An admitted message as the engine path reads it by name: where it stands, with its body.
+fn sent(object: &ResourceObject<Message>) -> flotilla_messaging::SentMessage {
+    flotilla_messaging::SentMessage {
+        standing: standing(object),
+        body: object.spec.body.clone(),
+        supersedes: object.spec.supersedes.clone(),
+    }
+}
+
 /// Where an admitted message stands, as the engine path reads it.
 fn standing(object: &ResourceObject<Message>) -> flotilla_messaging::SeatMessage {
     let status = object.status.as_ref();
@@ -64,25 +73,19 @@ fn standing(object: &ResourceObject<Message>) -> flotilla_messaging::SeatMessage
 
 #[async_trait]
 impl EngineMessages for RecordingMessages {
-    async fn view_to(&self, _namespace: &str, receiver: &str, record: &str) -> Result<Option<ReadResourceObject<Message>>, ResourceError> {
-        let admitted = self.admitted.lock().expect("admitted").get(record).cloned();
-        Ok(admitted
-            .filter(|object| object.spec.receiver == receiver)
-            .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }))
-    }
     async fn holds(&self, _namespace: &str, receiver: &str, record: &str) -> Result<bool, ResourceError> {
         Ok(self.admitted.lock().expect("admitted").get(record).is_some_and(|object| object.spec.receiver == receiver))
     }
     async fn admitted(
         &self,
-        namespace: &str,
+        _namespace: &str,
         intent: &MessageSpec,
         record: &str,
     ) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
-        let read = self.view_to(namespace, &intent.receiver, record).await?;
-        Ok(read.map(|read| flotilla_messaging::AdmittedMessage {
+        let admitted = self.admitted.lock().expect("admitted").get(record).cloned();
+        Ok(admitted.filter(|object| object.spec.receiver == intent.receiver).map(|object| flotilla_messaging::AdmittedMessage {
             home: self.home(),
-            superseded_by: read.object.status.and_then(|status| status.canonical_predecessor).map(|predecessor| predecessor.name),
+            superseded_by: object.status.and_then(|status| status.canonical_predecessor).map(|predecessor| predecessor.name),
         }))
     }
     async fn open_superseded(&self, _namespace: &str, intent: &MessageSpec) -> Result<Option<String>, ResourceError> {
@@ -95,8 +98,35 @@ impl EngineMessages for RecordingMessages {
             (same && awaiting).then(|| held.metadata.name.clone())
         }))
     }
-    async fn open_to(&self, _namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        Ok(self.admitted_to(receivers))
+    async fn undelivered_from(
+        &self,
+        _namespace: &str,
+        intent: &MessageSpec,
+    ) -> Result<Option<flotilla_messaging::SentMessage>, ResourceError> {
+        let from =
+            self.admitted_to(std::slice::from_ref(&intent.receiver)).into_iter().filter(|read| read.object.spec.sender == intent.sender);
+        Ok(from.max_by_key(|read| read.object.metadata.creation_timestamp).map(|read| sent(&read.object)))
+    }
+    async fn awaited_reply_from(&self, _namespace: &str, intent: &MessageSpec) -> Result<Option<String>, ResourceError> {
+        let awaiting = self.admitted_to(std::slice::from_ref(&intent.receiver)).into_iter().filter(|read| {
+            let held = &read.object.spec;
+            held.sender == intent.sender
+                && held.expectation == MessageExpectation::Reply
+                && held.references.iter().any(|reference| intent.references.contains(reference))
+        });
+        Ok(awaiting.max_by_key(|read| read.object.metadata.creation_timestamp).map(|read| read.object.metadata.name))
+    }
+    async fn queued_briefs(&self, _namespace: &str, seats: &[String]) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
+        let mut briefs = self
+            .admitted_to(seats)
+            .into_iter()
+            .filter(|read| {
+                read.object.spec.relation == flotilla_resources::MessageRelation::Supervisor
+                    && !read.object.spec.sender.starts_with("system:")
+            })
+            .collect::<Vec<_>>();
+        briefs.sort_by_key(|read| read.object.metadata.creation_timestamp);
+        Ok(briefs.iter().map(|read| sent(&read.object)).collect())
     }
     async fn seat_standings(
         &self,
@@ -115,15 +145,8 @@ impl EngineMessages for RecordingMessages {
         Ok(named
             .iter()
             .filter_map(|(receiver, name)| admitted.get(name).filter(|object| object.spec.receiver == *receiver))
-            .map(|object| flotilla_messaging::SentMessage {
-                standing: standing(object),
-                body: object.spec.body.clone(),
-                supersedes: object.spec.supersedes.clone(),
-            })
+            .map(sent)
             .collect())
-    }
-    async fn pending_to(&self, _namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        Ok(self.admitted_to(receivers))
     }
     async fn admit(&self, namespace: &str, name: &str, intent: &MessageSpec) -> Result<ResourceObject<Message>, ResourceError> {
         let object = ResourceObject {
@@ -144,10 +167,6 @@ impl EngineMessages for RecordingMessages {
         };
         self.admitted.lock().expect("admitted").insert(name.to_owned(), object.clone());
         Ok(object)
-    }
-    async fn spelled(&self, _namespace: &str, intent: &MessageSpec) -> Result<MessageSpec, ResourceError> {
-        // Admitted intents read back as admitted.
-        Ok(intent.clone())
     }
     async fn resolve_in_reply_to(&self, _namespace: &str, intent: &MessageSpec) -> flotilla_messaging::MessageResolution {
         match &intent.in_reply_to {

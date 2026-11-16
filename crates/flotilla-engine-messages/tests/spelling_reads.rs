@@ -118,7 +118,7 @@ async fn open_read(unrelated: usize) -> ReadSnapshot {
     }
 
     let before = backend.read_snapshot();
-    let open = primitives.open_to(NAMESPACE, &[HELD.to_owned(), ELSEWHERE.to_owned()]).await.expect("open read");
+    let open = primitives.seat_messages(NAMESPACE, &[HELD.to_owned(), ELSEWHERE.to_owned()], &[]).await.expect("open read");
     let reads = backend.read_snapshot().since(&before);
     let mut spelled = open.iter().map(|read| (read.object.metadata.name.clone(), read.object.spec.receiver.clone())).collect::<Vec<_>>();
     spelled.sort();
