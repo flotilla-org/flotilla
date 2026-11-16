@@ -78,6 +78,9 @@ struct HeldViews {
     /// The views held by each index key their labels and declared fields give, as the store's
     /// query index names them: a selecting query reads only the views it may select.
     index: ViewIndex,
+    /// The launches held, by `(home, launch)`, that have not ended. One that cannot be read
+    /// counts: nothing says it ended.
+    open: BTreeSet<(String, String)>,
 }
 
 /// The views held, by `(home, launch)`, under each of their index keys.
@@ -243,6 +246,14 @@ impl ConvoyViews {
         self.with_held(move |held| held.views.get(&key).cloned()).await
     }
 
+    /// This home's launches that have not ended, from the views held: a read composes again only
+    /// the launches changed since the last, shared with every other reader of the views. One that
+    /// cannot be read counts as open: nothing says it ended.
+    pub async fn open(&self) -> Result<BTreeSet<String>, ResourceError> {
+        let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
+        self.with_held(move |held| held.open.iter().filter(|(home, _)| *home == here).map(|(_, name)| name.clone()).collect()).await
+    }
+
     /// The newest launch of `of` in `project` held at `home`, or at this home when `None`.
     pub async fn newest(&self, of: &str, project: &str, home: Option<&str>) -> Result<Option<ReadResourceObject<Convoy>>, ResourceError> {
         let (of, project, home) = (of.to_owned(), project.to_owned(), home.map(str::to_owned));
@@ -274,6 +285,7 @@ impl ConvoyViews {
                 unreadable: BTreeMap::new(),
                 changed: UnloggedJournal::default(),
                 index: ViewIndex::default(),
+                open: BTreeSet::new(),
             };
             self.refill(&mut held).await?;
             *state = Some(held);
@@ -303,6 +315,11 @@ impl ConvoyViews {
     }
 
     /// Recomposes the views each wake's changes touch, and ticks the watchers.
+    ///
+    /// A read that takes the views before the follower has woken for a write composes that write's
+    /// launches itself, so a writer reads back what it wrote. That read's cost grows with the
+    /// writes not yet followed, not with the launches held: an occasional small cost in a read
+    /// right after a write is this read-your-writes, not a regression.
     async fn follow(self, mut wakes: BoxStream<'static, ()>) {
         let mut ended = false;
         while !ended && wakes.next().await.is_some() {
@@ -433,6 +450,7 @@ impl ConvoyViews {
                 home: launch.home.clone(),
                 view: ReadResourceObject { object: launch.read_view(&self.namespace), provenance },
                 unreadable: Some((launch.version, launch.reason.clone())),
+                ended: false,
             }
         }));
         // Each view read again keeps its version while it shows the same; the rest leave.
@@ -481,7 +499,12 @@ impl ConvoyViews {
                     let synced = record.ended.as_ref().map_or(record.admitted_at, |(_, at)| *at);
                     ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: synced }
                 };
-                Composed { home: record.home.clone(), view: ReadResourceObject { object, provenance }, unreadable: None }
+                Composed {
+                    home: record.home.clone(),
+                    view: ReadResourceObject { object, provenance },
+                    unreadable: None,
+                    ended: record.ended.is_some(),
+                }
             })
             .collect())
     }
@@ -685,6 +708,8 @@ struct Composed {
     view: ReadResourceObject<Convoy>,
     /// For a launch that cannot be read, its version and why.
     unreadable: Option<(u64, String)>,
+    /// The launch's record says it ended.
+    ended: bool,
 }
 
 impl HeldViews {
@@ -710,8 +735,13 @@ impl HeldViews {
     /// all of it, its launch's write in its resource version among it.
     fn insert(&mut self, composed: Vec<Composed>) -> Result<(), String> {
         let position = self.position();
-        for Composed { home, view, unreadable } in composed {
+        for Composed { home, view, unreadable, ended } in composed {
             let key = (home, view.object.metadata.name.clone());
+            if ended {
+                self.open.remove(&key);
+            } else {
+                self.open.insert(key.clone());
+            }
             match unreadable {
                 Some((version, reason)) => {
                     // Told once for each version of the launch, not at each read of them all.
@@ -743,6 +773,7 @@ impl HeldViews {
             self.index.remove(key);
         }
         self.unreadable.remove(key);
+        self.open.remove(key);
     }
 
     /// Keeps only the views `keep` names.

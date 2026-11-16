@@ -21,7 +21,6 @@ use flotilla_resources::{
     account_access::AccountRecords,
     address::{artifact_address, record_name},
     checkout_records::CheckoutHolder,
-    convoy_records::OpenLaunches,
     terminal_records::TerminalLaunchFacts,
     vessel_records::{environment_vessels, EnvironmentVessel},
     Artifact, ArtifactSpec, CheckoutSpec, Convoy, ConvoySpec, EnvironmentSpec, HostDirectEnvironmentSpec, ObservedCheckoutSpec,
@@ -63,6 +62,7 @@ async fn launches_read_by_of_convoy(others: usize) -> (u64, KeyedGets) {
     }
 
     let vessels = &engine.vessels.vessels;
+    convoys.settled().await;
     let before = (vessels.launches_read(), keyed_gets(&convoys, &engine));
     let read = convoys.reads().vessels().expect("vessels").of_convoy(&launches[0]).expect("of convoy");
     assert_eq!(read.iter().map(|launch| launch.convoy.as_str()).collect::<Vec<_>>(), [launches[0].as_str()]);
@@ -99,6 +99,7 @@ async fn launches_read_by_a_pass(others: usize) -> (u64, KeyedGets) {
     let reconciler = ConvoyReconciler::new(Arc::clone(convoys.reads())).with_engine(convoys.path());
 
     let vessels = &engine.vessels.vessels;
+    convoys.settled().await;
     let before = (vessels.launches_read(), keyed_gets(&convoys, &engine));
     reconciler.prepare(&passed).await.expect("prepare");
     (vessels.launches_read() - before.0, keyed_gets(&convoys, &engine) - before.1)
@@ -180,6 +181,7 @@ async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
     while queued.try_recv().is_ok() {}
 
     let vessels = &engine.vessels.vessels;
+    convoys.settled().await;
     let before = (vessels.launches_read(), keyed_gets(&convoys, &engine));
     let (changed, _) = &launches[1];
     publish_brief(&backend, changed, "coder").await;
@@ -240,6 +242,7 @@ async fn queued_by_one_checkout(others: usize) -> (Vec<String>, u64, KeyedGets) 
     tokio::time::sleep(Duration::from_millis(100)).await;
     while queued.try_recv().is_ok() {}
 
+    convoys.settled().await;
     let before = (converted(), keyed_gets(&convoys, &engine));
     let changed = &launches[1];
     engine.checkouts.request("changed", &checkout("changed"), Some(&CheckoutHolder::Convoy(changed.clone())));
@@ -364,6 +367,7 @@ async fn read_by_cards(others: usize, scope: impl FnOnce(&[String]) -> CardScope
     let accounts = OldStoreAccounts::new(backend.clone());
     let scope = scope(&launches);
 
+    convoys.settled().await;
     let before = (engine.terminals.terminals.launches_read(), engine.vessels.vessels.launches_read(), keyed_gets(&convoys, &engine));
     refresh_cards(&backend, NAMESPACE, &NothingDelivered, &tracker, Arc::clone(convoys.reads()), &accounts, &scope)
         .await
@@ -452,15 +456,15 @@ async fn read_by_open_launches(others: usize) -> (usize, u64, KeyedGets) {
         launches.push(admit(n).await);
     }
     quiet(&mut sent).await;
-    let mut open = OpenLaunches::follow(reads);
-    assert_eq!(open.read(reads).expect("first read").len(), others + 1, "the first read lists every open launch");
+    let views = convoys.views();
+    assert_eq!(views.open().await.expect("first read").len(), others + 1, "the first read lists every open launch");
 
     let before = (convoys.convoy_listings(), convoys.keyed_gets());
     convoys.path().get().expect("the Convoy path").abandon(&launches[0], "operator", "ended").await.expect("end the first launch");
     let ended = &launches[0].metadata.name;
     let admitted = admit(others + 1).await.metadata.name;
     quiet(&mut sent).await;
-    let read = open.read(reads).expect("read").clone();
+    let read = views.open().await.expect("read");
     assert!(read.contains(&admitted) && !read.contains(ended), "the end and the admission are read: {read:?}");
     (read.len(), convoys.convoy_listings() - before.0, convoys.keyed_gets() - before.1)
 }

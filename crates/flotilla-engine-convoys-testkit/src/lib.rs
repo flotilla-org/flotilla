@@ -73,6 +73,12 @@ impl EngineConvoysHome {
         &self.views
     }
 
+    /// Reads the views, so they have read every write made so far: a read-cost measurement begun
+    /// after it does not count the views' follower catching up on the writes before it.
+    pub async fn settled(&self) {
+        self.views.open().await.expect("read the convoy views");
+    }
+
     /// The lifecycle reads the views compose with, with this home's convoys added.
     pub fn reads(&self) -> &Arc<dyn LifecycleReads> {
         &self.reads
