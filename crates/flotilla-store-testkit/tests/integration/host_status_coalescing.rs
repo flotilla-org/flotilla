@@ -19,7 +19,7 @@ fn start() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).single().expect("valid timestamp")
 }
 
-fn heartbeat(at: DateTime<Utc>, rss: u64) -> HostStatusPatch {
+fn heartbeat(at: DateTime<Utc>, disk_free: u64) -> HostStatusPatch {
     HostStatusPatch::Heartbeat {
         description: None,
         capabilities: BTreeMap::from([("docker".to_string(), serde_json::Value::Bool(true))]),
@@ -29,8 +29,7 @@ fn heartbeat(at: DateTime<Utc>, rss: u64) -> HostStatusPatch {
         protocol_fingerprint: None,
         daemon_version: None,
         daemon_started_at: Some(start()),
-        disk_free_bytes: None,
-        daemon_rss_bytes: Some(rss),
+        disk_free_bytes: Some(disk_free),
         admission_free_space_floor_bytes: None,
         agent_adapter_baseline: None,
         // Restamped on every heartbeat, as the daemon's gathered conditions are.
@@ -79,8 +78,8 @@ async fn version(hosts: &TypedResolver<Host>) -> String {
 
 #[derive(Debug, Clone, Copy)]
 enum Step {
-    /// A heartbeat whose only observation is daemon RSS.
-    Heartbeat { advance: i64, rss: u64 },
+    /// A heartbeat whose only observation is free disk.
+    Heartbeat { advance: i64, disk_free: u64 },
     /// A fulfilment pass; an unchanged toolchain only refreshes `observed_at`.
     Fulfilment { advance: i64, toolchain: u8 },
     /// A sleep-inhibition health observation.
@@ -89,11 +88,11 @@ enum Step {
 
 fn draw_step(tc: &hegel::TestCase) -> Step {
     // Advances straddle HEARTBEAT_REFRESH_SECS (20 s) and the 60 s readiness
-    // TTL; the two-value RSS, toolchain and health domains make "unchanged"
+    // TTL; the two-value disk, toolchain and health domains make "unchanged"
     // observations common, so both commit and elision branches are drawn.
     let advance = tc.draw(gs::integers::<i64>().min_value(0).max_value(45));
     match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
-        0 => Step::Heartbeat { advance, rss: tc.draw(gs::integers::<u64>().min_value(1).max_value(2)) },
+        0 => Step::Heartbeat { advance, disk_free: tc.draw(gs::integers::<u64>().min_value(1).max_value(2)) },
         1 => Step::Fulfilment { advance, toolchain: tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) },
         _ => Step::Sleep { advance, failed: tc.draw(gs::booleans()) },
     }
@@ -102,7 +101,7 @@ fn draw_step(tc: &hegel::TestCase) -> Step {
 /// Expected latest observations, independent of how the patch is implemented.
 #[derive(Default)]
 struct Model {
-    rss: Option<u64>,
+    disk_free: Option<u64>,
     toolchain: Option<u8>,
     sleep_failed: Option<bool>,
     /// Readiness as last computed by a heartbeat: a failed sleep inhibition blocks it.
@@ -123,19 +122,19 @@ async fn run_steps(backend: ResourceBackend, steps: &[Step]) {
     for (index, step) in steps.iter().enumerate() {
         let before = version(&hosts).await;
         let (patch, expect_commit) = match *step {
-            Step::Heartbeat { advance, rss } => {
+            Step::Heartbeat { advance, disk_free } => {
                 now += Duration::seconds(advance);
-                // Commit when RSS changed, or when the stored heartbeat is at least the refresh window old.
+                // Commit when free disk changed, or when the stored heartbeat is at least the refresh window old.
                 let stale = model.stored_heartbeat_at.is_none_or(|stored| now - stored >= Duration::seconds(HEARTBEAT_REFRESH_SECS));
                 let ready = model.sleep_failed != Some(true);
-                let commit = model.rss != Some(rss) || model.ready != Some(ready) || stale;
-                model.rss = Some(rss);
+                let commit = model.disk_free != Some(disk_free) || model.ready != Some(ready) || stale;
+                model.disk_free = Some(disk_free);
                 model.ready = Some(ready);
                 model.latest_heartbeat_at = Some(now);
                 if commit {
                     model.stored_heartbeat_at = Some(now);
                 }
-                (heartbeat(now, rss), commit)
+                (heartbeat(now, disk_free), commit)
             }
             Step::Fulfilment { advance, toolchain } => {
                 now += Duration::seconds(advance);
@@ -156,7 +155,7 @@ async fn run_steps(backend: ResourceBackend, steps: &[Step]) {
         assert_eq!(after.metadata.resource_version != before, expect_commit, "step {index} {step:?}: commit iff the observation changed");
         let status = after.status.expect("status");
         // Elision never loses an observation change.
-        assert_eq!(status.daemon_rss_bytes, model.rss, "step {index}");
+        assert_eq!(status.disk_free_bytes, model.disk_free, "step {index}");
         assert_eq!(
             status.fulfilment_facts.get("kind-a").and_then(|facts| facts.toolchains.get("rust").cloned()),
             model.toolchain.map(|toolchain| format!("1.{toolchain}.0")),

@@ -5,7 +5,7 @@ use flotilla_charter::ops_entry::{
     MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
 };
 use flotilla_resources::{CapabilityNeed, CrewSource, CrewSpec, ProjectSpec, VesselRequirement};
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 
 // #2701: Projects with either retired builtin reference admit using the
 // current rules even when the stale builtin still exists, or has been deleted.
@@ -70,7 +70,7 @@ async fn admission_freezes_role_selections_and_refuses_missing_imports() {
     std::fs::write(temp.path().join(".flotilla-sources.json"), serde_json::json!({"schema_version":5,"sources":[{"name":"source", "repository":"https://github.com/owner/repo.git", "revision":"1".repeat(40)}]}).to_string()).expect("source manifest");
     let mut discovery = fake_discovery(false);
     discovery.env = Arc::new(TestEnvVars::new([("FLOTILLA_SKILLS_DIR", temp.path().display().to_string())]));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -141,7 +141,7 @@ async fn admission_cascade_precedence_and_dispatch_are_frozen() {
     use flotilla_resources::{FleetDesignation, FleetDesignationSpec, RoleDefinition};
     let temp = tempfile::tempdir().expect("config");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"cascade-test\"\n").expect("machine identity");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -225,7 +225,7 @@ async fn need_composition_unites_project_role_and_dispatch_needs() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("test-host"),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
@@ -254,7 +254,7 @@ async fn codex_adapter_floor_is_composed_without_a_model() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("test-host"),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;

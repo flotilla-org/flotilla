@@ -1,17 +1,17 @@
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
 use flotilla_config::ConfigStore;
-use flotilla_protocol::{HostName, NodeId};
+use flotilla_protocol::HostName;
+use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::{
     ConvoyRepositorySpec, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
     CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
     FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host as ResourceHost, HostSpec, HostStatus, Repository, RepositorySpec,
     RepositoryTrust, Selector, VesselRequirement, WorkflowTemplateSpec,
 };
-use flotilla_store::ResourceBackend;
 
 use super::support::{create_docker_placement, put_host, read_host, set_host_credential_expiry, test_meta};
 use crate::in_process::InProcessDaemon;
@@ -23,7 +23,7 @@ use flotilla_admission::convoy_admission::{resolve_workflow_credentials, validat
 async fn docker_placement_refuses_instance_readiness_before_selection() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -64,7 +64,7 @@ async fn docker_placement_refuses_instance_readiness_before_selection() {
 
 #[tokio::test]
 async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_isolation() {
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = EngineBackend::open("root-a");
     let own = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("own repository");
     let fork = RepositorySpec::remote("https://github.com/example/flotilla")
         .expect("fork repository")
@@ -185,7 +185,7 @@ async fn admission_refuses_mixed_grant_permissions_and_preserves_homogeneous_mod
         EmptyExplicit,
     }
     for mode in [Mode::Unlisted, Mode::UnlistedNoCap, Mode::Explicit, Mode::Mixed, Mode::EmptyExplicit] {
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = EngineBackend::open("root-a");
         backend
             .definitions::<CredentialSpec>("flotilla")
             .create(
@@ -262,7 +262,7 @@ async fn admission_refuses_mixed_grant_permissions_and_preserves_homogeneous_mod
 
 #[tokio::test]
 async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() {
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = EngineBackend::open("root-a");
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
@@ -338,7 +338,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
 
 #[tokio::test]
 async fn harness_bound_credential_reaches_only_vessels_running_that_harness() {
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = EngineBackend::open("root-a");
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
@@ -404,7 +404,7 @@ async fn harness_bound_credential_reaches_only_vessels_running_that_harness() {
 
 #[tokio::test]
 async fn docker_placement_selects_credentials_for_the_effective_contained_stance() {
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = EngineBackend::open("root-a");
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
@@ -450,7 +450,7 @@ async fn docker_placement_selects_credentials_for_the_effective_contained_stance
 
 #[tokio::test]
 async fn project_grant_entitlement_is_independent_of_vessel_stance() {
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = EngineBackend::open("root-a");
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
@@ -495,42 +495,29 @@ async fn project_grant_entitlement_is_independent_of_vessel_stance() {
 
 #[tokio::test]
 async fn remote_placement_uses_replicated_host_capabilities() {
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("kiwi-root"));
+    let backend = EngineBackend::open("kiwi-root");
     let now = Utc::now();
-    let feta = ResourceBackend::new(InMemoryBackend::default());
-    let feta_hosts = feta.using::<ResourceHost>("flotilla");
-    let fresh = feta_hosts
-        .create(
-            &test_meta("feta-host"),
-            &HostSpec { display_name: "feta".to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("create fresh feta self-report");
-    feta_hosts
-        .update_status(
-            &fresh.metadata.name,
-            &fresh.metadata.resource_version,
-            &HostStatus {
-                capabilities: [(
-                    flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(),
-                    serde_json::json!(BTreeSet::from(["claude-max".to_string()])),
-                )]
-                .into_iter()
-                .collect(),
-                heartbeat_at: Some(now - chrono::Duration::seconds(1)),
-                ready: true,
-                daemon_generation: Some("fresh-feta-generation".to_string()),
-                daemon_started_at: Some(now - chrono::Duration::minutes(1)),
-                ..HostStatus::default()
-            },
-        )
-        .await
-        .expect("write fresh feta capabilities");
-    backend
-        .replica_writer::<ResourceHost>(NodeId::new("feta-root"), "flotilla")
-        .replace(&feta_hosts.list().await.expect("list feta self-report"), Utc::now())
-        .await
-        .expect("replicate fresh feta self-report to kiwi");
+    // Feta's daemon reports its own Host at its home; kiwi hears it.
+    let feta = backend.other_home("feta-root");
+    feta.host(
+        "feta-host",
+        &HostSpec { display_name: "feta".to_string(), connection: Default::default(), ..HostSpec::default() },
+        Some(&HostStatus {
+            capabilities: [(
+                flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(),
+                serde_json::json!(BTreeSet::from(["claude-max".to_string()])),
+            )]
+            .into_iter()
+            .collect(),
+            heartbeat_at: Some(now - chrono::Duration::seconds(1)),
+            ready: true,
+            daemon_generation: Some("fresh-feta-generation".to_string()),
+            daemon_started_at: Some(now - chrono::Duration::minutes(1)),
+            ..HostStatus::default()
+        }),
+    )
+    .await;
+    backend.receive(&feta);
 
     let sources = backend.including_replicas::<ResourceHost>("flotilla").list().await.expect("list host sources");
     assert_eq!(sources.items.len(), 1, "a Host should have only its home-authored source");
@@ -570,7 +557,7 @@ async fn remote_placement_uses_replicated_host_capabilities() {
 
 #[tokio::test]
 async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = EngineBackend::open("root-a");
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
@@ -646,7 +633,7 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
 
 #[tokio::test]
 async fn dispatch_against_an_expired_credential_is_refused_with_the_credential_and_host_named() {
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = EngineBackend::open("root-a");
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")

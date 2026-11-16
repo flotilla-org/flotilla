@@ -1,4 +1,4 @@
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -10,7 +10,6 @@ use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoySpec, CrewWorkPhase, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TurnDeliveryRung,
 };
-use flotilla_store::ResourceBackend;
 
 use super::support::{crew_messages, ensure_vessel, observe_attention, receive_turn, resume_staging_fixture, RecordingWorkCredentials};
 use crate::in_process::InProcessDaemon;
@@ -89,7 +88,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
     for phase in [ResourceTerminalSessionPhase::Running, ResourceTerminalSessionPhase::Starting, ResourceTerminalSessionPhase::Stopped] {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"turn-credential-test\"\n").expect("daemon config");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = engine_home_backend();
         let daemon = InProcessDaemon::new_with_resource_backend(
             Vec::new(),
             Arc::new(ConfigStore::with_base(temp.path())),
@@ -193,15 +192,14 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
     for limit in [0, 2] {
         let clock = Arc::new(VirtualClock::new(Utc::now() + chrono::Duration::hours(1)));
         // The coder's work is open, its convoy Active, under the standard exit table and the nudge ceiling.
-        let (daemon, backend, probe) =
-            resume_staging_fixture_shaped(ResourceBackend::new(InMemoryBackend::default()), clock.clone(), false, |_, snapshot| {
-                snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
-                snapshot.stall_nudges.insert(
-                    "work/coder".to_string(),
-                    flotilla_resources::StallNudgePolicy { max_per_episode: limit, max_refusals: None, idle_grace_seconds: Some(0) },
-                );
-            })
-            .await;
+        let (daemon, backend, probe) = resume_staging_fixture_shaped(engine_home_backend(), clock.clone(), false, |_, snapshot| {
+            snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+            snapshot.stall_nudges.insert(
+                "work/coder".to_string(),
+                flotilla_resources::StallNudgePolicy { max_per_episode: limit, max_refusals: None, idle_grace_seconds: Some(0) },
+            );
+        })
+        .await;
         probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
         let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
         // The vessel is realised and the session ready: the coder is at work.

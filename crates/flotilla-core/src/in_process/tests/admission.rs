@@ -1,16 +1,31 @@
 use flotilla_admission::support::{ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot, prepared_snapshot_name};
 use flotilla_resources::checkout_integration::change_request_subjects_from_claim;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use super::support::{admit, convoy_engine, create_host_direct_placement, test_meta, ForgeAwareTestChangeRequestFactory};
+use crate::in_process::{CheckoutArchiveStatus, InProcessDaemon};
+use crate::testkits::discovery::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
+use crate::testkits::replay::testing::MockRunner;
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_admission::convoy_admission::{KindCandidate, PlacementResolution, PlacementTieBreak};
+use flotilla_admission::repository_inspection::LocalCheckoutInspection;
+use flotilla_admission::repository_inspection::RepositoryContinuity;
+use flotilla_admission::repository_inspection::RepositoryInspection;
+use flotilla_admission::repository_inspection::RepositoryInspector;
 use flotilla_config::ConfigStore;
+use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_engine_convoys_testkit::single_agent;
 use flotilla_protocol::result_set::ConvoyChangeRequest;
-use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId};
+use flotilla_protocol::ChangeRequest;
+use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName};
+use flotilla_provider_runtime::available_space::AvailableSpaceProbe;
+use flotilla_provisioning_testkit::{replicate_home, EngineBackend};
+use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecords as _, Inspection};
 use flotilla_resources::{
     BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutWorktreeSpec as ResourceCheckoutWorktreeSpec, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, CredentialConsumer,
@@ -19,22 +34,6 @@ use flotilla_resources::{
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec, ResourceObject, VesselRequirement, WorkflowTemplate,
     WorkflowTemplateSpec,
 };
-use flotilla_store::ResourceBackend;
-
-use super::support::{admit, convoy_engine, create_host_direct_placement, test_meta, ForgeAwareTestChangeRequestFactory};
-use crate::in_process::{CheckoutArchiveStatus, InProcessDaemon};
-use crate::testkits::discovery::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
-use crate::testkits::replay::testing::MockRunner;
-use flotilla_admission::convoy_admission::{KindCandidate, PlacementResolution, PlacementTieBreak};
-use flotilla_admission::repository_inspection::LocalCheckoutInspection;
-use flotilla_admission::repository_inspection::RepositoryContinuity;
-use flotilla_admission::repository_inspection::RepositoryInspection;
-use flotilla_admission::repository_inspection::RepositoryInspector;
-use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_engine_convoys_testkit::single_agent;
-use flotilla_protocol::ChangeRequest;
-use flotilla_provider_runtime::available_space::AvailableSpaceProbe;
-use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecords as _, Inspection};
 use flotilla_store_testkit::cr_name;
 
 #[tokio::test]
@@ -47,7 +46,7 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     .expect("daemon config");
     let token_path = temp.path().join("forgejo-token");
     std::fs::write(&token_path, "test-token").expect("token file");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let provider = Arc::new(FakeChangeRequest::new());
     provider
         .add_change_requests(vec![(
@@ -268,7 +267,7 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
         Arc::new(ConfigStore::with_base(temp.path())),
         discovery,
         HostName::local(),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
@@ -276,7 +275,7 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
     daemon.set_repository_inspector(Arc::new(ConcurrentCreateRepositoryInspector)).await;
     let backend = daemon.resource_backend();
     let local_host = daemon.local_host_id().expect("local host id").to_string();
-    create_host_direct_placement(&backend, "host-direct-local", &local_host, BTreeSet::new()).await;
+    create_host_direct_placement(&daemon, "host-direct-local", &local_host, BTreeSet::new()).await;
     backend
         .using::<WorkflowTemplate>("flotilla")
         .create(
@@ -337,19 +336,13 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
 
 #[tokio::test]
 async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
-    let home_root = NodeId::new("snapshot-home");
-    let driver_root = NodeId::new("snapshot-driver");
-    let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(home_root.clone());
-    let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(driver_root);
+    let home = EngineBackend::open("snapshot-home");
+    let driver = EngineBackend::open("snapshot-driver");
     let spec = flotilla_resources::single_agent_workflow_spec();
     let name = prepared_snapshot_name("workflow", &serde_json::to_value(&spec).expect("serialize workflow")).expect("snapshot name");
 
     ensure_prepared_workflow_snapshot(&home, "flotilla", &name, &spec).await.expect("author snapshot on home");
-    driver
-        .replica_writer::<WorkflowTemplate>(home_root, "flotilla")
-        .replace(&home.using::<WorkflowTemplate>("flotilla").list().await.expect("home workflow log"), Utc::now())
-        .await
-        .expect("replicate snapshot to driver");
+    replicate_home(&home.service, home.home(), &driver.service);
 
     ensure_prepared_workflow_snapshot(&driver, "flotilla", &name, &spec).await.expect("reuse identical replicated snapshot");
     assert!(driver.using::<WorkflowTemplate>("flotilla").list().await.expect("driver local workflow log").items.is_empty());
@@ -361,19 +354,13 @@ fn snapshot_kind(pool: &str) -> FulfilmentKindSpec {
 
 #[tokio::test]
 async fn prepared_placement_snapshot_reuses_an_identical_replica() {
-    let home_root = NodeId::new("snapshot-home");
-    let driver_root = NodeId::new("snapshot-driver");
-    let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(home_root.clone());
-    let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(driver_root);
+    let home = EngineBackend::open("snapshot-home");
+    let driver = EngineBackend::open("snapshot-driver");
     let spec = snapshot_kind("passthrough");
     let name = prepared_snapshot_name("placement", &serde_json::to_value(&spec).expect("serialize placement")).expect("snapshot name");
 
     ensure_prepared_placement_snapshot(&home, "flotilla", &name, "convoy", &spec).await.expect("author snapshot on home");
-    driver
-        .replica_writer::<FulfilmentKind>(home_root, "flotilla")
-        .replace(&home.using::<FulfilmentKind>("flotilla").list().await.expect("home placement log"), Utc::now())
-        .await
-        .expect("replicate snapshot to driver");
+    replicate_home(&home.service, home.home(), &driver.service);
 
     ensure_prepared_placement_snapshot(&driver, "flotilla", &name, "convoy", &spec).await.expect("reuse identical replicated snapshot");
     assert!(driver.using::<FulfilmentKind>("flotilla").list().await.expect("driver local placement log").items.is_empty());
@@ -381,18 +368,13 @@ async fn prepared_placement_snapshot_reuses_an_identical_replica() {
 
 #[tokio::test]
 async fn prepared_placement_snapshot_rejects_a_different_replica_spec() {
-    let home_root = NodeId::new("snapshot-home");
-    let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(home_root.clone());
-    let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("snapshot-driver"));
+    let home = EngineBackend::open("snapshot-home");
+    let driver = EngineBackend::open("snapshot-driver");
     let name = "placement-snapshot-collision";
     let authored = snapshot_kind("passthrough");
     let requested = snapshot_kind("cleat");
     home.using::<FulfilmentKind>("flotilla").create(&test_meta(name), &authored).await.expect("author snapshot on home");
-    driver
-        .replica_writer::<FulfilmentKind>(home_root, "flotilla")
-        .replace(&home.using::<FulfilmentKind>("flotilla").list().await.expect("home placement log"), Utc::now())
-        .await
-        .expect("replicate snapshot to driver");
+    replicate_home(&home.service, home.home(), &driver.service);
 
     let error = ensure_prepared_placement_snapshot(&driver, "flotilla", name, "convoy", &requested)
         .await
@@ -423,7 +405,7 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
         Err("base unknown".to_string()),
         Ok("archived stale head".to_string()),
     ]));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let mut discovery = fake_discovery_with_runner(false, runner.clone());
     discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -486,7 +468,7 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
 async fn abandon_archive_names_replica_checkouts_left_to_their_own_host() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").unwrap();
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
     discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -542,7 +524,7 @@ async fn abandon_archive_pushes_only_checkout_with_commits_beyond_base() {
     };
     let remote = temp.path().join("remote.git");
     git(temp.path(), &["init", "--bare", "-b", "main", remote.to_str().unwrap()]);
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
     discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -600,7 +582,7 @@ async fn abandon_archive_pushes_only_checkout_with_commits_beyond_base() {
 async fn abandon_archive_of_a_checkout_in_an_unreachable_environment_names_it_and_where_the_work_stayed() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").unwrap();
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
     discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -664,7 +646,7 @@ async fn host_direct_checkout_on_the_daemon_host_is_archived_and_passes_delete_i
     git(&path, &["remote", "set-head", "origin", "-a"]);
     git(&path, &["switch", "-c", "governor"]);
     git(&path, &[&commit[..], &["work"]].concat());
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
     discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -723,7 +705,7 @@ async fn host_direct_checkout_on_the_daemon_host_is_archived_and_passes_delete_i
 async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_checkout() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"bound-pr-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -866,7 +848,7 @@ async fn rehearsal_binding_preserves_copied_forge_data() {
                 token.to_str().expect("path")
             ),
         ).expect("daemon config");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = engine_home_backend();
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let discovery = fake_discovery(false);
         let daemon = InProcessDaemon::new_with_resource_backend(

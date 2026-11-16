@@ -10,8 +10,7 @@ use flotilla_protocol::HostName;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{Repository, RepositoryKey, RepositorySpec};
-use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 
 use super::support::test_meta;
 use crate::in_process::InProcessDaemon;
@@ -137,7 +136,7 @@ pub(super) async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lo
     use flotilla_github_providers::change_request::GitHubChangeRequest;
     let config = tempfile::tempdir().expect("tempdir");
     std::fs::write(config.path().join("daemon.toml"), "machine_id = \"rest-admission-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let responses = outcomes
         .into_iter()
         .enumerate()

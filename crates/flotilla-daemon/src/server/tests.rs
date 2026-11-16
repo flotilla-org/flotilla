@@ -31,10 +31,9 @@ use flotilla_protocol::{
     StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, FulfilmentFacts, FulfilmentKind,
-    FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
-    ResourceError, ResourceProvenance, Selector, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, Vessel, WatchEvent, WatchStart,
+    Convoy, ConvoySpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceError, ResourceProvenance, Selector, TerminalAttentionState,
+    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, WatchEvent, WatchStart,
 };
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use flotilla_test_support::TestSocketDir;
@@ -892,7 +891,7 @@ fn daemon_startup_cleanup_removes_only_reverse_peer_socket_files() {
 }
 
 #[tokio::test]
-async fn daemon_server_observed_resource_backend_is_ephemeral_per_restart() {
+async fn daemon_server_discovered_checkouts_are_ephemeral_per_restart() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(tmp.path().join("config"));
     let socket_path = tmp.path().join("flotilla.sock");
@@ -900,32 +899,29 @@ async fn daemon_server_observed_resource_backend_is_ephemeral_per_restart() {
     let server = DaemonServer::new(Vec::new(), Arc::clone(&config), fake_discovery(false), socket_path.clone(), StdDuration::from_secs(30))
         .await
         .expect("server should start");
-    let observed = server.daemon().observed_resource_backend();
-    let checkouts = observed.using::<ResourceCheckout>("flotilla");
-    checkouts
-        .create(
-            &InputMeta::builder().name("local-main".to_string()).build(),
-            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+    let repository = flotilla_resources::RepositoryKey("project-flotilla".to_string());
+    let discovered = server.daemon().discovered_checkouts();
+    discovered.replace(
+        &repository,
+        vec![flotilla_resources::discovered_checkouts::DiscoveredCheckout {
+            name: "local-main".to_string(),
+            repo_slug: "flotilla".to_string(),
+            spec: ResourceObservedCheckoutSpec {
                 r#ref: "main".to_string(),
                 path: "/Users/alice/dev/flotilla".to_string(),
-                repo_ref: flotilla_resources::RepositoryKey("project-flotilla".to_string()),
+                repo_ref: repository.clone(),
                 host_ref: "host-01".to_string(),
                 is_main: true,
-            }),
-        )
-        .await
-        .expect("observed checkout create should succeed");
-    let first_generation = checkouts.list().await.expect("observed list should succeed").generation.expect("generation");
+            },
+        }],
+    );
+    assert!(discovered.get("local-main").is_some(), "the discovered checkout is held while the daemon runs");
     drop(server);
 
     let restarted = DaemonServer::new(Vec::new(), config, fake_discovery(false), socket_path, StdDuration::from_secs(30))
         .await
         .expect("server should restart");
-    let restarted_checkouts = restarted.daemon().observed_resource_backend().using::<ResourceCheckout>("flotilla");
-    let restarted_list = restarted_checkouts.list().await.expect("observed list after restart should succeed");
-
-    assert_ne!(restarted_list.generation.expect("generation"), first_generation);
-    assert!(matches!(restarted_checkouts.get("local-main").await, Err(ResourceError::NotFound { .. })));
+    assert!(restarted.daemon().discovered_checkouts().get("local-main").is_none(), "a restarted daemon discovers its checkouts again");
 }
 
 #[tokio::test]

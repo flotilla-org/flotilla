@@ -1,4 +1,4 @@
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +7,6 @@ use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_resources::{ConvoySpec, Project, ProjectSpec};
-use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, SuspendedBoardProvider};
 use crate::in_process::InProcessDaemon;
@@ -20,7 +19,7 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
     use flotilla_resources::{DispatchQueueEntry, ProjectStatus};
     let temp = tempfile::tempdir().expect("config");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"dispatch-board-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "org/large".into() };
     let provider = Arc::new(SuspendedBoardProvider {
         calls: AtomicUsize::new(0),

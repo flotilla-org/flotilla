@@ -1,11 +1,12 @@
 use flotilla_admission::support::placement_host_ref;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
+use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource};
 use flotilla_resources::{
     Convoy as ResourceConvoy, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
@@ -14,7 +15,6 @@ use flotilla_resources::{
     Project, ProjectSpec, ResourceProvenance, Selector, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
     AGENT_ADAPTERS_CAPABILITY,
 };
-use flotilla_store::ResourceBackend;
 
 use super::support::{
     create_host_direct_host, create_host_direct_placement, create_identity_convoy, create_running_session, create_test_environment,
@@ -37,7 +37,7 @@ async fn placement_daemon(machine: &str) -> (Arc<InProcessDaemon>, tempfile::Tem
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new(machine),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
@@ -62,7 +62,7 @@ async fn put_kind_at_home(daemon: &InProcessDaemon, home: &str, name: &str, spec
 async fn remote_placement_resolves_replicated_credentials_before_admission() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -72,6 +72,7 @@ async fn remote_placement_resolves_replicated_credentials_before_admission() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    super::test_engine(&daemon);
     backend
         .definitions::<Project>("flotilla")
         .create(
@@ -262,7 +263,7 @@ async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
 
 #[tokio::test]
 async fn placement_target_host_rejects_unknown_display_name() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = EngineBackend::open("home");
     let policy = host_direct_kind(&backend, "unknown-host", "missing-host").await;
     let error = placement_target_host(&backend, "flotilla", &policy).await.expect_err("unknown host alias must be rejected");
     assert_eq!(error, "placement `unknown-host` references unknown host `missing-host`");
@@ -270,16 +271,10 @@ async fn placement_target_host_rejects_unknown_display_name() {
 
 #[tokio::test]
 async fn placement_target_host_rejects_ambiguous_display_name() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let hosts = backend.using::<ResourceHost>("flotilla");
+    let backend = EngineBackend::open("home");
     for host_id in ["host-id-a", "host-id-b"] {
-        hosts
-            .create(
-                &test_meta(host_id),
-                &HostSpec { display_name: "shared-name".to_string(), connection: Default::default(), ..HostSpec::default() },
-            )
-            .await
-            .expect("host");
+        let spec = HostSpec { display_name: "shared-name".to_string(), connection: Default::default(), ..HostSpec::default() };
+        backend.put_host_at_its_home(host_id, &spec, None).await;
     }
     let policy = host_direct_kind(&backend, "ambiguous-host", "shared-name").await;
     let error = placement_target_host(&backend, "flotilla", &policy).await.expect_err("ambiguous host alias must be rejected");
@@ -370,7 +365,8 @@ async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
 #[tokio::test]
 async fn codex_crews_place_on_an_ssh_host_only_while_its_owner_has_a_central_login() {
     for central_login in [None, Some(false), Some(true)] {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        // The SSH host is homed at its owning daemon.
+        let backend = EngineBackend::open("owner-host");
         let hosts = backend.using::<ResourceHost>("flotilla");
         let connection = flotilla_resources::HostConnection::SshHost {
             owning_daemon: "owner-host".to_string(),
@@ -498,7 +494,7 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("local"),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
@@ -529,7 +525,7 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("local"),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;

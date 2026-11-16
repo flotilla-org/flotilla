@@ -1,10 +1,9 @@
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::sync::Arc;
 use std::time::Duration;
 
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName};
-use flotilla_store::ResourceBackend;
 use tokio::sync::broadcast;
 
 use crate::in_process::InProcessDaemon;
@@ -23,7 +22,7 @@ async fn event_publication_preserves_context_free_command_order() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("test-host"),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
@@ -57,10 +56,11 @@ async fn event_publication_preserves_spawned_watch_order() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("test-host"),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    super::test_engine(&daemon);
     let mut events = daemon.subscribe();
     let id = daemon
         .execute(

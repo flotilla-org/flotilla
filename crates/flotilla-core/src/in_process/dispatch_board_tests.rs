@@ -46,12 +46,11 @@ pub(super) mod tests {
     async fn layered_deadlines_preserve_observation_timeout_and_recover() {
         use flotilla_observation::forge_observation::{ForgeReadRequest, ForgeReads};
         use flotilla_resources::Clock;
-        use flotilla_store::ResourceBackend;
-        use flotilla_store_memory::InMemoryBackend;
+        use flotilla_store_memory::engine_home_backend;
         use flotilla_store_testkit::VirtualClock;
         let cache = DispatchBoardCache::default();
         let source = source("org/shared");
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("host"));
+        let backend = engine_home_backend().with_local_root(flotilla_protocol::NodeId::new("host"));
         let clock = Arc::new(VirtualClock::new(Utc::now()));
         let mut reads = ForgeReads::new(backend, "flotilla".into()).with_clock(clock.clone());
         reads.allow_stale = true;

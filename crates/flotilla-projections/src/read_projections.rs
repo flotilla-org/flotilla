@@ -683,7 +683,6 @@ impl ReadProjections<'_> {
                         .convoy_count(convoys.len())
                         .surface_states(surface_states)
                         .maybe_disk_free_bytes(status.and_then(|status| status.disk_free_bytes))
-                        .maybe_daemon_rss_bytes(status.and_then(|status| status.daemon_rss_bytes))
                         .maybe_blob_sync(status.and_then(|status| status.blob_sync.clone()))
                         .sleep_inhibition(status.map(|status| status.sleep_inhibition.clone()).unwrap_or_default())
                         .staleness(staleness)

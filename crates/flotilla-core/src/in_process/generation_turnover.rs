@@ -1,5 +1,5 @@
 #[cfg(test)]
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::path::Path;
 
 use flotilla_discovery::generation_turnover::{AdvanceRequest, GenerationTurnovers, RecordedSession, RecordedSessions};
@@ -84,25 +84,23 @@ mod tests {
     use crate::testkits::in_process_ext::InProcessDiscoveryExt;
     use std::{collections::HashMap, sync::Arc};
 
-    use async_trait::async_trait;
-    use flotilla_protocol::{qualified_path::HostId, EnvironmentId, HostName, ImageId};
-    use flotilla_resources::{
-        terminal_records::{TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords},
-        ConditionValue,
-    };
-    use flotilla_store::ResourceBackend;
-
     use super::*;
     use crate::testkits::discovery::fake_discovery;
     use crate::testkits::discovery::fake_discovery_with_runner;
     use crate::testkits::discovery::DiscoveryMockRunner;
     use crate::testkits::replay::testing::MockRunner;
+    use async_trait::async_trait;
     use flotilla_config::ConfigStore;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_environment::environment::ProvisionedEnvironment;
     use flotilla_environment::environment::ProvisionedMount;
+    use flotilla_protocol::{qualified_path::HostId, EnvironmentId, HostName, ImageId};
     use flotilla_provider_runtime::CommandRunner;
+    use flotilla_resources::{
+        terminal_records::{TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords},
+        ConditionValue,
+    };
 
     struct Contained {
         id: EnvironmentId,
@@ -145,7 +143,7 @@ mod tests {
     async fn inventory_includes_contained_and_named_crew_roots_but_excludes_remote_hosts() {
         let directory = tempfile::tempdir().expect("config");
         std::fs::write(directory.path().join("daemon.toml"), "machine_id = \"cleat-roll-test\"\n").expect("daemon identity");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = engine_home_backend();
         let daemon = InProcessDaemon::new_with_resource_backend(
             vec![],
             Arc::new(ConfigStore::with_base(directory.path())),
@@ -239,7 +237,7 @@ mod tests {
     async fn daemon_with_unadopted_vessel() -> (Arc<InProcessDaemon>, tempfile::TempDir) {
         let directory = tempfile::tempdir().expect("config");
         std::fs::write(directory.path().join("daemon.toml"), "machine_id = \"cleat-roll-test\"\n").expect("daemon identity");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = engine_home_backend();
         let daemon = InProcessDaemon::new_with_resource_backend(
             vec![],
             Arc::new(ConfigStore::with_base(directory.path())),
@@ -425,7 +423,7 @@ mod tests {
             Arc::new(ConfigStore::with_base(directory.path())),
             fake_discovery_with_runner(false, runner),
             HostName::new("host"),
-            ResourceBackend::new(InMemoryBackend::default()),
+            engine_home_backend(),
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;

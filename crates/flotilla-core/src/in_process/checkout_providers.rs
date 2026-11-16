@@ -341,7 +341,7 @@ mod lifecycle_contract {
     use crate::testkits::discovery::fake_discovery;
     use flotilla_provisioning_testkit::{CheckoutFixture, Ending};
     use flotilla_resources::CheckoutWorktreeSpec;
-    use flotilla_store_memory::InMemoryBackend;
+    use flotilla_store_memory::engine_home_backend;
 
     // Provider facts and lifetime keys follow the engine's checkouts here: none while requested,
     // the ready path once ready, none once lost, and a failed read is an error.
@@ -349,7 +349,7 @@ mod lifecycle_contract {
     async fn provider_lifetimes_follow_engine_checkouts() {
         let temp = tempfile::tempdir().expect("config");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"provider-contract\"\n").expect("config");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = engine_home_backend();
         let daemon = InProcessDaemon::new_with_resource_backend(
             Vec::new(),
             Arc::new(ConfigStore::with_base(temp.path())),
@@ -398,7 +398,7 @@ mod lifecycle_contract {
             Arc::new(ConfigStore::with_base(temp.path())),
             fake_discovery(false),
             flotilla_protocol::HostName::new("local"),
-            ResourceBackend::new(InMemoryBackend::default()),
+            engine_home_backend(),
             Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;

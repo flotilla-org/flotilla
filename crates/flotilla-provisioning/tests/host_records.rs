@@ -48,7 +48,6 @@ fn observed(time: DateTime<Utc>, free_space: &str) -> HostStatus {
         heartbeat_at: Some(time),
         ready: true,
         daemon_generation: Some("g7".into()),
-        daemon_rss_bytes: Some(time.timestamp() as u64),
         disk_free_bytes: Some(5),
         admission_free_space_floor_bytes: Some(10),
         description: Some(

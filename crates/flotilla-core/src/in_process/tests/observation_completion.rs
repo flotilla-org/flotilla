@@ -1,4 +1,4 @@
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +15,6 @@ use flotilla_resources::{
     BoundChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, CrewWorkPhase, Repository,
     RepositorySpec, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, VesselRequirement,
 };
-use flotilla_store::ResourceBackend;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply, RestAdmissionSelection};
 use super::support::{test_meta, BatchedObservationRunner};
@@ -129,7 +128,7 @@ async fn bound_admission_prioritizes_typed_limit_over_misleading_diagnostic() {
     });
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"typed-admission-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -139,6 +138,7 @@ async fn bound_admission_prioritizes_typed_limit_over_misleading_diagnostic() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    super::test_engine(&daemon);
     daemon.set_provisioning_namespace("flotilla".into()).await;
     daemon
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
@@ -172,7 +172,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
     });
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"batch-observation-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -182,6 +182,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    super::test_engine(&daemon);
     daemon
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
         .expect("gh discovery");
@@ -205,7 +206,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
                 .build();
             spec.change_request =
                 Some(BoundChangeRequest { id: id.to_string(), repository_ref: repository_key.clone(), title: format!("PR {id}") });
-            backend.using::<ResourceConvoy>("flotilla").create(&test_meta(&format!("convoy-{id}")), &spec).await.expect("convoy");
+            super::support::admit(&daemon, &format!("convoy-{id}"), spec, flotilla_engine_convoys_testkit::single_agent("coder")).await;
             subjects.push(
                 ChangeRequestKey::new(
                     "flotilla",
@@ -244,7 +245,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         }])
         .build();
     spec.change_request = Some(BoundChangeRequest { id: "6".into(), repository_ref: repository_key, title: "PR 6".into() });
-    backend.using::<ResourceConvoy>("flotilla").create(&test_meta("convoy-6"), &spec).await.expect("new convoy");
+    super::support::admit(&daemon, "convoy-6", spec, flotilla_engine_convoys_testkit::single_agent("coder")).await;
     daemon.change_request_observation_source.observe(first).await.expect("expanded batch");
     assert_eq!(runner.calls.lock().expect("calls").len(), 3, "a new bound CR invalidates its repository batch");
 
@@ -341,7 +342,7 @@ async fn pr_submission_observation_case(rate_limited: bool, missing_artifact: bo
         merged: std::sync::atomic::AtomicBool::new(false),
         conflicting: std::sync::atomic::AtomicBool::new(true),
     });
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),

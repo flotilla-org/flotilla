@@ -7,8 +7,7 @@ use flotilla_resources::{
     terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest},
     Clock, Convoy as ResourceConvoy, ConvoySpec, CrewWorkPhase, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
 };
-use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 
 use flotilla_state_machines::machines::agent_session::Activity;
 
@@ -116,13 +115,12 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     // waiting; the test stamps from the same clock. The source is the project's graphql-budget
     // role, its coder at work under the standard exit table.
     let clock = Arc::new(SkippingClock::default());
-    let (daemon, backend, probe) =
-        resume_staging_fixture_shaped(ResourceBackend::new(InMemoryBackend::default()), clock.clone(), false, |spec, snapshot| {
-            spec.project_ref = Some("project".to_string());
-            spec.role = "graphql-budget".to_string();
-            snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
-        })
-        .await;
+    let (daemon, backend, probe) = resume_staging_fixture_shaped(engine_home_backend(), clock.clone(), false, |spec, snapshot| {
+        spec.project_ref = Some("project".to_string());
+        spec.role = "graphql-budget".to_string();
+        snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+    })
+    .await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let supervision = Arc::new(AcceptSupervision::default());
     daemon.crew.set_turn_delivery_actuator(supervision.clone()).await;

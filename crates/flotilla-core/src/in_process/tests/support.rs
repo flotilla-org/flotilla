@@ -1,6 +1,6 @@
 //! Shared scenario fixtures and stand-ins for credential-controller and forge I/O.
 
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,6 +17,7 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 use flotilla_protocol::HostName;
+use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::{
     terminal_records::{TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords},
     Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, EnvironmentSpec as ResourceEnvironmentSpec, FulfilmentFacts,
@@ -98,7 +99,7 @@ impl WorkCredentialReconciler for SessionStagingProbe {
 }
 
 pub(super) async fn resume_staging_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
-    resume_staging_fixture_with_backend(ResourceBackend::new(InMemoryBackend::default())).await
+    resume_staging_fixture_with_backend(engine_home_backend()).await
 }
 
 pub(super) async fn resume_staging_fixture_with_backend(
@@ -116,13 +117,7 @@ pub(super) async fn resume_staging_fixture_with_clock(
 
 /// [`resume_staging_fixture`] whose coder's work is still open: the convoy is Active.
 pub(super) async fn resume_staging_fixture_open() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
-    resume_staging_fixture_shaped(
-        ResourceBackend::new(InMemoryBackend::default()),
-        Arc::new(flotilla_resources::SystemClock),
-        false,
-        |_, _| {},
-    )
-    .await
+    resume_staging_fixture_shaped(engine_home_backend(), Arc::new(flotilla_resources::SystemClock), false, |_, _| {}).await
 }
 
 /// The resume-staging convoy, its coder's work `complete` (Landing) or open (Active), its spec and
@@ -418,16 +413,16 @@ pub(super) async fn host_direct_kind(backend: &ResourceBackend, name: &str, host
     backend.using::<FulfilmentKind>("flotilla").create(&test_meta(name), &host_direct_kind_spec(host_ref)).await.expect("host-direct kind")
 }
 
-/// Where a test writes Hosts: a plain store holds any, and a daemon's store only those homed at
-/// that daemon (ADR 0064); another host's are written at its own home and replicated in.
+/// Where a test writes Hosts: an engine's store, or a daemon's, holds only those homed at it (ADR
+/// 0064); another host's are written at its own home and replicated in.
 #[derive(Clone, Copy)]
 pub(super) enum HostsAt<'a> {
-    Store(&'a ResourceBackend),
+    Store(&'a EngineBackend),
     Daemon(&'a InProcessDaemon),
 }
 
-impl<'a> From<&'a ResourceBackend> for HostsAt<'a> {
-    fn from(backend: &'a ResourceBackend) -> Self {
+impl<'a> From<&'a EngineBackend> for HostsAt<'a> {
+    fn from(backend: &'a EngineBackend) -> Self {
         Self::Store(backend)
     }
 }
@@ -447,19 +442,29 @@ impl<'a> From<&'a Arc<InProcessDaemon>> for HostsAt<'a> {
 impl HostsAt<'_> {
     pub(super) fn backend(self) -> ResourceBackend {
         match self {
-            Self::Store(backend) => backend.clone(),
+            Self::Store(backend) => backend.backend.clone(),
             Self::Daemon(daemon) => daemon.resource_backend(),
+        }
+    }
+
+    /// The decided store Hosts homed elsewhere are replicated into.
+    fn service(self) -> Arc<flotilla_schema_sqlite::stream::Service> {
+        match self {
+            Self::Store(backend) => Arc::clone(&backend.service),
+            Self::Daemon(daemon) => daemon.decided_store().expect("decided store"),
         }
     }
 
     /// Whether Host `name` with `spec` is written through [`Self::backend`].
     fn homes(self, name: &str, spec: &HostSpec) -> bool {
-        let Self::Daemon(daemon) = self else { return true };
         let home_host = match &spec.connection {
             flotilla_resources::HostConnection::Daemon => name,
             flotilla_resources::HostConnection::SshHost { owning_daemon, .. } => owning_daemon.as_str(),
         };
-        daemon.local_host_id().is_some_and(|own| own.to_string() == home_host)
+        match self {
+            Self::Store(backend) => backend.home() == home_host,
+            Self::Daemon(daemon) => daemon.local_host_id().is_some_and(|own| own.to_string() == home_host),
+        }
     }
 }
 
@@ -467,9 +472,7 @@ impl HostsAt<'_> {
 pub(super) async fn put_host<'a>(at: impl Into<HostsAt<'a>>, name: &str, spec: &HostSpec, status: &HostStatus) {
     let at = at.into();
     if !at.homes(name, spec) {
-        let HostsAt::Daemon(daemon) = at else { unreachable!("a plain store homes every host") };
-        let target = daemon.decided_store().expect("decided store");
-        flotilla_provisioning_testkit::put_host_at_its_home(&target, name, spec, Some(status)).await;
+        flotilla_provisioning_testkit::put_host_at_its_home(&at.service(), name, spec, Some(status)).await;
         return;
     }
     let hosts = at.backend().using::<ResourceHost>("flotilla");
@@ -615,11 +618,6 @@ pub(in crate::in_process) async fn complete_work(daemon: &InProcessDaemon, convo
     convoy_engine(daemon).keep_by_verdict(&object, &scope, "operator", "work done").await.expect("work complete");
 }
 
-/// An engine not installed into any daemon: each fixture's `reads` serve all of them.
-pub(in crate::in_process) fn engine_fixture() -> flotilla_provisioning_testkit::EngineFixture {
-    flotilla_provisioning_testkit::EngineFixture::default()
-}
-
 /// `name`, a ready host-direct environment of `host_ref` on the engine.
 pub(in crate::in_process) fn create_test_environment(
     environments: &flotilla_provisioning_testkit::EnvironmentFixture,
@@ -736,7 +734,7 @@ pub(super) async fn stall_test_daemon() -> StallTestDaemon {
 pub(super) async fn stall_test_daemon_with_clock(clock: Arc<dyn flotilla_resources::Clock>) -> StallTestDaemon {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"stall-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -911,21 +909,6 @@ impl IssueProvider for SuspendedBoardProvider {
 
 // #2842: realistic Project status and 400 serving convoys must not turn a
 // board read into per-issue forge calls or wait on an unfinished bulk fetch.
-
-/// The engine's Message path over `service`, its attentions installed on `backend`, as the
-/// runtime opens it (#3108).
-pub(in crate::in_process) fn engine_messages(
-    service: Arc<flotilla_schema_sqlite::stream::Service>,
-    backend: &ResourceBackend,
-) -> Arc<flotilla_engine_messages::MessagePrimitives> {
-    let home = service.home().to_owned();
-    let primitives = Arc::new(
-        flotilla_engine_messages::MessagePrimitives::open(&home, service, backend.clone(), Arc::new(flotilla_resources::SystemClock))
-            .expect("message path"),
-    );
-    backend.install_attentions(Arc::clone(&primitives) as Arc<dyn flotilla_resources::attentions::Attentions>);
-    primitives
-}
 
 /// `daemon`'s Message path over its decided store, installed as its runtime installs it: opened
 /// on first use, the same path after.

@@ -15,7 +15,7 @@ use flotilla_resources::{
     ImageSelection, PlacementImageSource, Project, ProjectSpec, VesselRequirement, WorkflowTemplateSpec, FLEET_DESIGNATION_NAME,
 };
 use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 
 use super::support::{create_docker_placement, put_host, test_engine, test_meta, TestEngine};
 use crate::in_process::InProcessDaemon;
@@ -63,7 +63,7 @@ struct Fixture {
 async fn fixture(layers: Vec<ImageLayerSpec>, image: Option<ImageSelection>) -> Fixture {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"image-admission\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),

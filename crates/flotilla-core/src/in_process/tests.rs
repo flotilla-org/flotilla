@@ -5,8 +5,7 @@ mod start_attach;
 mod support;
 pub(super) use support::{
     admit, admit_snapshot, complete_work, convoy_engine, create_identity_convoy, create_running_session, create_test_environment,
-    discover_checkout, engine_fixture, engine_messages, ensure_vessel, identity_launch, install_engine_messages, test_engine, test_meta,
-    TestEngine,
+    discover_checkout, ensure_vessel, identity_launch, install_engine_messages, test_engine, test_meta, TestEngine,
 };
 mod admission;
 mod branch_discovery;

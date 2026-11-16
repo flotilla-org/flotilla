@@ -5,7 +5,7 @@ use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_resources::Convoy;
 use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 
 use super::support::{convoy_engine, create_identity_convoy};
 use crate::in_process::{InProcessDaemon, CONVOY_ATTACH_WAIT};
@@ -14,7 +14,7 @@ use crate::testkits::discovery::fake_discovery;
 async fn fixture() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"start-attach-test\"\n").unwrap();
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),

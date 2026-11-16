@@ -478,7 +478,6 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
             agent_adapter_baseline: Some(adapter_assessment.baseline),
             heartbeat_at: daemon.clock().now(),
             ready,
-            daemon_rss_bytes: flotilla_projections::host_summary::daemon_rss_bytes(),
             daemon_generation: health.generation.clone(),
             protocol_fingerprint: Some(flotilla_protocol::PROTOCOL_FINGERPRINT.to_string()),
             daemon_version: Some(health.version.clone()),

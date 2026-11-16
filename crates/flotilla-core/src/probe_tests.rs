@@ -5,8 +5,8 @@ use std::time::Duration;
 // because spawn_blocking itself cannot be cancelled.
 #[tokio::test(flavor = "current_thread")]
 async fn blocked_probe_does_not_block_resource_store() {
+    use flotilla_provisioning_testkit::{EngineBackend, ENGINE_NAMESPACE};
     use flotilla_resources::Host;
-    use flotilla_store::ResourceBackend;
     let (release, blocked) = std::sync::mpsc::channel();
     let (started, observed) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(blocking("privacy", Duration::from_millis(30), move || {
@@ -14,8 +14,8 @@ async fn blocked_probe_does_not_block_resource_store() {
         blocked.recv().map_err(|error| error.to_string())
     }));
     observed.await.expect("probe started");
-    let store = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let result = tokio::time::timeout(Duration::from_millis(100), store.using::<Host>("test").list()).await;
+    let store = EngineBackend::open("home");
+    let result = tokio::time::timeout(Duration::from_millis(100), store.using::<Host>(ENGINE_NAMESPACE).list()).await;
     let timed_out = task.await.expect("probe task");
     release.send(()).expect("release blocked probe");
     assert!(result.expect("store remains responsive").expect("list hosts").items.is_empty());

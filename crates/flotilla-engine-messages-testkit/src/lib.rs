@@ -147,9 +147,11 @@ pub async fn deliver_turn(
 
 /// The inbox `party` names in fleet `lab`, which [`designate_fleet`] designates: a crew seat
 /// (`P/C/V/R` or `P/R`) or a `system:` producer as [`FleetRoles::inbox`] reads it, else an engine
-/// address as written. A person is written as the role address they hold.
+/// address as written. A person is written as the role address they hold. A seat's project
+/// segment holds no `:`, though a standing launch's convoy segment does.
 pub fn party(party: &str) -> Address {
-    if party.starts_with("system:") || !party.contains(':') {
+    let project = party.split('/').next().unwrap_or_default();
+    if party.starts_with("system:") || !project.contains(':') {
         return FleetRoles::declared("lab").and_then(|roles| roles.inbox(party)).unwrap_or_else(|error| panic!("{party}: {error}"));
     }
     party.parse().unwrap_or_else(|error| panic!("{party}: {error}"))

@@ -1,4 +1,4 @@
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,7 +6,6 @@ use flotilla_change_request::ChangeRequestTracker;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_resources::{ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec};
-use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
 use crate::in_process::InProcessDaemon;
@@ -132,7 +131,7 @@ async fn checkout_vcs_discovery_names_the_repository_a_clone_is_for() {
 async fn repository_watch_evicts_deleted_providers_and_preserves_live_providers() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"provider-watch-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),

@@ -204,7 +204,7 @@ pub(crate) fn observation(
     if status.disk_free_bytes.is_some() || status.admission_free_space_floor_bytes.is_some() {
         uncarried("the disk figures, carried only as the free-space floor flag");
     }
-    if status.daemon_rss_bytes.is_some() || status.resource_store.is_some() || status.blob_sync.is_some() {
+    if status.resource_store.is_some() || status.blob_sync.is_some() {
         uncarried("metrics");
     }
     // Without a vessel cap only a missing pool gives no free slots; under a cap a full host does too,

@@ -1,4 +1,4 @@
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -8,7 +8,6 @@ use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, RepositoryKey, Selector,
     TerminalSession as ResourceTerminalSession, VesselRequirement,
 };
-use flotilla_store::ResourceBackend;
 
 use super::support::{admit, convoy_engine, designate_fleet, install_engine_messages, test_engine, SessionStagingProbe, TestEngine};
 use crate::in_process::{InProcessDaemon, TerminalSessionIdentity};
@@ -32,7 +31,7 @@ fn snapshot(requirement: VesselRequirement) -> flotilla_resources::WorkflowSnaps
 async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_reviewer() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"two-crew-contained-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -208,7 +207,7 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
     for (ending, delivers) in [(None, true), (Some(Ending::Ready("sid")), true), (Some(Ending::GaveUp("launch refused")), false)] {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"concurrent-handoff-test\"\n").expect("daemon config");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = engine_home_backend();
         let daemon = InProcessDaemon::new_with_resource_backend(
             Vec::new(),
             Arc::new(ConfigStore::with_base(temp.path())),

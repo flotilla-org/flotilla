@@ -1,23 +1,20 @@
 use flotilla_resources::ResumeIntent;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::sync::Arc;
 
 use chrono::Utc;
 use flotilla_config::ConfigStore;
-use flotilla_protocol::{CrewCommandContext, DaemonEvent, HostName, NodeId};
+use flotilla_protocol::{CrewCommandContext, DaemonEvent, HostName};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewWorkPhase, Selector, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase,
+    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, CrewSource, CrewWorkPhase, Selector, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
 };
-use flotilla_store::ResourceBackend;
 
 use flotilla_state_machines::machines::agent_session::Activity;
 
 use super::support::{
-    admit_snapshot, admit_standing, agent_sessions, claim_crew, complete_work, engine_at, ensure_vessel, install_engine_messages,
-    observe_attention, resume_staging_fixture_shaped, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta,
-    wait_for_stall,
+    admit_snapshot, admit_standing, agent_sessions, claim_crew, complete_work, engine_at, ensure_vessel, observe_attention,
+    resume_staging_fixture_shaped, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
 };
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
@@ -385,24 +382,18 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
 
 #[tokio::test]
 async fn replica_wake_engine_does_not_write_stalled_condition() {
-    let authority = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("authority"));
-    let convoys = authority.clone().using::<ResourceConvoy>("flotilla");
-    let created =
-        convoys.create(&test_meta("replicated"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
-    convoys
-        .update_status(
+    let authority = flotilla_engine_convoys_testkit::EngineHome::open("authority");
+    let convoys = authority.backend().clone().using::<ResourceConvoy>("flotilla");
+    let launch = authority
+        .admit(
             "replicated",
-            &created.metadata.resource_version,
-            &ConvoyStatus { phase: flotilla_resources::ConvoyPhase::Landing, ..Default::default() },
+            ConvoySpec::builder().workflow_ref("test".into()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
         )
-        .await
-        .expect("landing status");
-    let replica = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("replica"));
-    replica
-        .replica_writer::<ResourceConvoy>(NodeId::new("authority"), "flotilla")
-        .replace(&convoys.list().await.expect("authority list"), Utc::now())
-        .await
-        .expect("replicate");
+        .await;
+    flotilla_engine_convoys_testkit::keep_all(&authority.convoys.path(), &authority.convoy(&launch).await).await;
+    assert_eq!(convoys.get(&launch).await.expect("convoy").status.expect("status").phase, flotilla_resources::ConvoyPhase::Landing);
+    let replica = engine_home_backend();
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"replica-stall-test\"\n").expect("daemon config");
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -414,7 +405,8 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    install_engine_messages(&daemon);
+    super::test_engine(&daemon);
+    flotilla_provisioning_testkit::replicate_home(authority.service(), "authority", &daemon.decided_store().expect("decided store"));
     let (sender, _receiver) = flotilla_store::controller::WorkQueueSender::channel();
     let watch = daemon.reconciler_wake_watch();
     let replica_check = replica.clone();
@@ -424,7 +416,7 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
     assert!(replica_check.using::<ResourceConvoy>("flotilla").list().await.expect("local convoys").items.is_empty());
     assert!(replica_check
         .including_replicas::<ResourceConvoy>("flotilla")
-        .get("replicated")
+        .get(&launch)
         .await
         .expect("replicated convoy")
         .object
@@ -432,7 +424,7 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
         .expect("replica status")
         .stalled
         .is_none());
-    assert!(convoys.get("replicated").await.expect("authority convoy").status.expect("status").stalled.is_none());
+    assert!(convoys.get(&launch).await.expect("authority convoy").status.expect("status").stalled.is_none());
     task.abort();
 }
 
@@ -443,19 +435,15 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
 async fn resume_relaunches_exited_active_and_interrupted_crew() {
     // The coder is an agent, the shape its agent session is launched for: only an agent's exit
     // interrupts its seat.
-    let (daemon, backend, probe) = resume_staging_fixture_shaped(
-        ResourceBackend::new(InMemoryBackend::default()),
-        Arc::new(flotilla_resources::SystemClock),
-        false,
-        |_, snapshot| {
+    let (daemon, backend, probe) =
+        resume_staging_fixture_shaped(engine_home_backend(), Arc::new(flotilla_resources::SystemClock), false, |_, snapshot| {
             snapshot.vessels[0].crew[0].source = CrewSource::Agent {
                 selector: Selector { capability: "code".to_string(), adapter: None, model: None },
                 prompt: None,
                 brief_template: None,
             };
-        },
-    )
-    .await;
+        })
+        .await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");

@@ -26,7 +26,6 @@ fn host_status_patch_updates_heartbeat_snapshot() {
         daemon_version: None,
         daemon_started_at: None,
         disk_free_bytes: None,
-        daemon_rss_bytes: Some(123 * 1024 * 1024),
         admission_free_space_floor_bytes: None,
         agent_adapter_baseline: None,
         conditions: Vec::new(),
@@ -38,8 +37,6 @@ fn host_status_patch_updates_heartbeat_snapshot() {
     assert_eq!(status.capabilities.get(flotilla_resources::IMAGE_DIGESTS_CAPABILITY), Some(&inventory));
     assert!(status.heartbeat_at.is_some());
     assert!(status.ready);
-    // Heartbeat telemetry is in bytes and persists on the host status.
-    assert_eq!(status.daemon_rss_bytes, Some(123 * 1024 * 1024));
     // Heartbeats persist wire identity separately from the daemon instance id.
     assert_eq!(status.protocol_fingerprint.as_deref(), Some("wire-fingerprint"));
 
@@ -104,7 +101,6 @@ async fn heartbeat_patch_preserves_independent_status_after_another_writer_updat
         daemon_version: None,
         daemon_started_at: None,
         disk_free_bytes: None,
-        daemon_rss_bytes: None,
         admission_free_space_floor_bytes: None,
         agent_adapter_baseline: Some(["codex".to_string()].into()),
         conditions: vec![heartbeat_condition.clone()],
@@ -282,8 +278,7 @@ fn heartbeat_description_has_one_availability_authority(tc: hegel::TestCase) {
         protocol_fingerprint: None,
         daemon_version: None,
         daemon_started_at: None,
-        disk_free_bytes: None,
-        daemon_rss_bytes: Some(u64::MAX),
+        disk_free_bytes: Some(u64::MAX),
         admission_free_space_floor_bytes: None,
         agent_adapter_baseline: None,
         conditions: vec![],
@@ -312,7 +307,7 @@ fn heartbeat_description_has_one_availability_authority(tc: hegel::TestCase) {
     let previous: HostStatus = serde_json::from_value(previous).expect("previous generation still decodes");
     assert!(previous.description.is_none());
     assert_eq!(previous.capabilities, status.capabilities);
-    assert_eq!(previous.daemon_rss_bytes, status.daemon_rss_bytes);
+    assert_eq!(previous.disk_free_bytes, status.disk_free_bytes);
 }
 
 // ADR 0047: previous-generation statuses lack configured limits and must decode

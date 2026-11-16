@@ -27,7 +27,10 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use flotilla_provisioning_testkit::image_build::{builder, Behaviour, BuildService, Builder, Materials, HOST, NS};
+use flotilla_provisioning_testkit::{
+    image_build::{builder, Behaviour, BuildService, Builder, Materials, HOST, NS},
+    EngineBackend,
+};
 
 const PROJECT: &str = "app";
 const REPO: &str = "https://github.com/example/app";
@@ -120,8 +123,9 @@ async fn host(backend: &ResourceBackend, architecture: &str, capacity: Option<Im
 /// (already synced), selecting `rust` over a stdlib catalogue with one
 /// harness, on a single amd64 host that builds locally. Its builder is idle
 /// until a test runs it.
-async fn fixture() -> (ResourceBackend, Arc<Branches>, Builder) {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+async fn fixture() -> (EngineBackend, Arc<Branches>, Builder) {
+    // The builder's own engine: its Host is written at its home.
+    let backend = EngineBackend::open_in(HOST, NS);
     host(&backend, "x86_64", builder(1)).await;
     let repository = RepositorySpec::remote(REPO).expect("repository");
     let created = backend
@@ -144,10 +148,11 @@ async fn fixture() -> (ResourceBackend, Arc<Branches>, Builder) {
     project.image = Some(ImageSelection { base: None, layers: vec!["rust".into()] });
     let meta = InputMeta::builder()
         .name(PROJECT.into())
-        .annotations(BTreeMap::from([(
-            flotilla_resources::definition_provenance::BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(),
-            repository.key().to_string(),
-        )]))
+        .annotations(BTreeMap::from([
+            (flotilla_resources::definition_provenance::BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), repository.key().to_string()),
+            // The engine reads a declaration-backed Project's origin whole: the commit it was declared at.
+            (flotilla_resources::definition_provenance::BOOTSTRAP_COMMIT_ANNOTATION.to_string(), "declared".to_string()),
+        ]))
         .build();
     backend.using::<Project>(NS).create(&meta, &project).await.expect("project");
 
@@ -161,7 +166,22 @@ async fn fixture() -> (ResourceBackend, Arc<Branches>, Builder) {
     }
     let main = project_layer_files("1.0", "RUN app-install");
     let synced = parse_layer_directory(&main, ImageLayerSource::Project, Some(PROJECT)).expect("main layer");
-    apply_layer(&backend, &synced, BTreeMap::from([(MANAGED_BY_LABEL.to_string(), PROJECT_IMAGE_MANAGER.to_string())])).await;
+    // The project's layer as its image sync wrote it: managed for the project, from the commit it read.
+    backend
+        .definitions::<ImageLayer>(NS)
+        .apply(
+            &InputMeta::builder()
+                .name(synced.resource_name())
+                .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), PROJECT_IMAGE_MANAGER.to_string())]))
+                .annotations(BTreeMap::from([
+                    (flotilla_resources::definition_provenance::MATERIALIZED_PROJECT_ANNOTATION.to_string(), PROJECT.to_string()),
+                    (flotilla_resources::definition_provenance::SOURCE_COMMIT_ANNOTATION.to_string(), "synced".to_string()),
+                ]))
+                .build(),
+            &synced.clone().into(),
+        )
+        .await
+        .expect("project layer");
     let branches = Arc::new(Branches::default());
     branches.layers.lock().expect("layers").insert("main".into(), main);
     let builder = Builder::idle("amd64", builder(1), BuildService::new(Behaviour::Succeed), Arc::new(Materials::default()));

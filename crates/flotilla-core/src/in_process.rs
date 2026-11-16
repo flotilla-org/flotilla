@@ -32,7 +32,6 @@ use flotilla_resources::ResumeIntent;
 use flotilla_schema::reads::carry;
 use flotilla_store::off_frame;
 use flotilla_store::ResolvedCascadeStoreExt;
-use flotilla_store_memory::InMemoryBackend;
 pub use projection_ports::DecidedAgentSessions;
 
 use flotilla_daemon_api::action_events;
@@ -792,7 +791,6 @@ pub struct InProcessDaemon {
     resource_backend: ResourceBackend,
     clock: Arc<dyn Clock>,
     surfaces: Surfaces,
-    observed_resource_backend: ResourceBackend,
     /// The checkouts this host's refresh discovered: local facts, in memory.
     discovered_checkouts: DiscoveredCheckouts,
     /// Serializes observed Checkout publication with repository removal so a
@@ -1083,7 +1081,6 @@ impl InProcessDaemon {
             .await
             .expect("failed to resolve local node id");
         let resource_backend = resource_backend.with_local_root(local_node_id.clone());
-        let observed_resource_backend = ResourceBackend::new(InMemoryBackend::observed()).with_local_root(local_node_id.clone());
         let discovered_checkouts = DiscoveredCheckouts::default();
         let local_environment_id =
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
@@ -1455,7 +1452,6 @@ impl InProcessDaemon {
             change_request_observer,
             issue_observer,
             resource_backend: resource_backend.clone(),
-            observed_resource_backend: observed_resource_backend.clone(),
             discovered_checkouts: discovered_checkouts.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
             aggregator_projection_state: aggregator_projection_state.clone(),
@@ -2652,10 +2648,6 @@ impl InProcessDaemon {
     pub async fn disconnect_surface(&self, surface_id: uuid::Uuid) -> Result<(), String> {
         self.surfaces.disconnect(surface_id);
         Ok(())
-    }
-
-    pub fn observed_resource_backend(&self) -> ResourceBackend {
-        self.observed_resource_backend.clone()
     }
 
     /// The checkouts this host's refresh discovered.
@@ -5272,10 +5264,8 @@ impl InProcessDaemon {
     /// is the one standing admission chooses.
     async fn project_role_definition_origin(&self, namespace: &str, project: &str, role: &str) -> Result<Option<NodeId>, String> {
         let declarations = self.resource_backend.including_replicas::<flotilla_resources::ConvoyEnsure>(namespace);
-        // Each home's copy with its home; an HTTP backend serves only the merged read.
-        let definitions =
-            if self.resource_backend.serves_read_views() { declarations.list().await } else { declarations.list_replica_sources().await }
-                .map_err(|error| error.to_string())?;
+        // Each home's copy with its home.
+        let definitions = declarations.list_replica_sources().await.map_err(|error| error.to_string())?;
         let homes = definitions
             .items
             .into_iter()

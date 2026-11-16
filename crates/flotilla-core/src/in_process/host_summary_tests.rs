@@ -9,12 +9,6 @@ mod tests {
     use crate::testkits::discovery::DiscoveryMockRunner;
     use flotilla_environment::environment::ProvisionedMount;
 
-    // Glue: the sampler queries only the current process and reports bytes.
-    #[test]
-    fn daemon_rss_reports_resident_bytes() {
-        assert!(daemon_rss_bytes().is_some_and(|bytes| bytes > 0));
-    }
-
     use crate::testkits::discovery::TestEnvVars as FixtureEnvVars;
     use flotilla_discovery::environment_manager::EnvironmentManager;
     use flotilla_discovery_api::EnvironmentAssertion;
