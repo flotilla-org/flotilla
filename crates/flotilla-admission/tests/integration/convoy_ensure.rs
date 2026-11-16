@@ -339,6 +339,12 @@ async fn declared_driverless_ensure_has_one_acting_home() {
     ensure_scenarios::driverless_ensure_has_one_acting_home(&Controller, true, &[2, 0, 1, 0, 2, 1]).await;
 }
 
+// A declared copy owns a driverless ensure beside an undeclared original, until it is deleted.
+#[tokio::test]
+async fn a_declared_copy_owns_a_driverless_ensure_until_deleted() {
+    ensure_scenarios::a_declared_copy_owns_a_driverless_ensure_until_deleted(&Controller).await;
+}
+
 // Undeclared driverless ensures act only where they were created.
 #[tokio::test]
 #[ignore = "driverless ensure home after a later same-name copy: owner ruling pending (#3108)"]

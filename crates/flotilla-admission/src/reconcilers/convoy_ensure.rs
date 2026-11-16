@@ -21,6 +21,7 @@ use flotilla_charter::ops_entry::{
 };
 use flotilla_protocol::{PlacementTargetHost, PrincipalRef};
 use flotilla_resources::attentions::{Attention, Attentions, Fact, OpenAttention, Sender, Subject};
+use flotilla_resources::definition_provenance::{MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_SOURCE_ANNOTATION};
 use flotilla_resources::{
     config_changes, Clock, ControllerRetry, ControllerRetryDisposition, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec,
     ConvoyPhase, FulfilmentKind, Host as ResourceHost, Project, ReadResourceObject, Repository, ResourceError, ResourceObject,
@@ -307,21 +308,11 @@ impl EnsurePass<'_> {
     /// Definitions reads merge every host's copy, so local presence does not
     /// establish home. ManifestRoots are home-bound; undeclared definitions
     /// belong to their earliest creation, before later local reapplications.
+    /// A declaration owns the name: while any live copy carries a manifest
+    /// stamp, its root's home decides and undeclared copies confer nothing.
     async fn driverless_ensure_is_home(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<bool, ResourceError> {
-        if let Some(root) = ensure.metadata.annotations.get("flotilla.work/manifest-reconciler-root") {
-            if let Some(root) = self.manifest_roots.root(namespace, root).await.map_err(ResourceError::other)? {
-                return Ok(root.local);
-            }
-            // ADR 0047: previous-generation provenance named the host, not the ManifestRoot.
-            // Match its source too, as manifest resolution does; remove this fallback after one roll.
-            let Some(source) = ensure.metadata.annotations.get("flotilla.work/manifest-source") else {
-                // The declaration may not have replicated yet. Never adopt its ensure.
-                return Ok(false);
-            };
-            let roots = self.manifest_roots.roots(namespace).await.map_err(ResourceError::other)?;
-            let mut matching = roots.into_iter().filter(|candidate| candidate.spec.host == *root && candidate.spec.source == *source);
-            let first = matching.next();
-            return Ok(matching.next().is_none() && first.is_some_and(|root| root.local));
+        if ensure.metadata.annotations.contains_key(MANIFEST_RECONCILER_ROOT_ANNOTATION) {
+            return self.declaring_root_is_local(namespace, &ensure.metadata.annotations).await;
         }
         let local_root = self.resource_backend.local_root()?;
         // Read raw sources: the definitions resolver intentionally reports a
@@ -330,9 +321,16 @@ impl EnsurePass<'_> {
             .resource_backend
             .query_declared::<ConvoyEnsure>(namespace, &StoreQuery::names([ensure.metadata.name.clone()], true))
             .await?;
+        let live = sources.items.into_iter().filter(|source| source.object.metadata.deletion_timestamp.is_none()).collect::<Vec<_>>();
+        // Reads prefer this home's copy, so another home's declared copy shows only here.
+        if let Some(declared) =
+            live.iter().find(|source| source.object.metadata.annotations.contains_key(MANIFEST_RECONCILER_ROOT_ANNOTATION))
+        {
+            return self.declaring_root_is_local(namespace, &declared.object.metadata.annotations).await;
+        }
         // Replication preserves each origin's creation_timestamp; it never
         // substitutes the replica's arrival time. Reapplications create later sources.
-        let first = sources.items.into_iter().filter(|source| source.object.metadata.deletion_timestamp.is_none()).min_by_key(|source| {
+        let first = live.into_iter().min_by_key(|source| {
             let origin = match &source.provenance {
                 ResourceProvenance::Local => &local_root,
                 ResourceProvenance::Replica { origin_root, .. } => origin_root,
@@ -340,6 +338,24 @@ impl EnsurePass<'_> {
             (source.object.metadata.creation_timestamp, origin.clone())
         });
         Ok(first.is_some_and(|source| matches!(source.provenance, ResourceProvenance::Local)))
+    }
+
+    /// Whether the ManifestRoot a declared copy's `annotations` name is held here.
+    async fn declaring_root_is_local(&self, namespace: &str, annotations: &BTreeMap<String, String>) -> Result<bool, ResourceError> {
+        let Some(root) = annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION) else { return Ok(false) };
+        if let Some(root) = self.manifest_roots.root(namespace, root).await.map_err(ResourceError::other)? {
+            return Ok(root.local);
+        }
+        // ADR 0047: previous-generation provenance named the host, not the ManifestRoot.
+        // Match its source too, as manifest resolution does; remove this fallback after one roll.
+        let Some(source) = annotations.get(MANIFEST_SOURCE_ANNOTATION) else {
+            // The declaration may not have replicated yet. Never adopt its ensure.
+            return Ok(false);
+        };
+        let roots = self.manifest_roots.roots(namespace).await.map_err(ResourceError::other)?;
+        let mut matching = roots.into_iter().filter(|candidate| candidate.spec.host == *root && candidate.spec.source == *source);
+        let first = matching.next();
+        Ok(matching.next().is_none() && first.is_some_and(|root| root.local))
     }
 
     pub async fn reconcile_convoy_ensures_once_with_backing_inspector(

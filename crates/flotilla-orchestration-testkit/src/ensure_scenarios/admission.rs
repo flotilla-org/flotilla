@@ -924,31 +924,7 @@ pub async fn driverless_ensure_home_case(
         meta.annotations.insert("flotilla.work/manifest-path".into(), "ensures/quartermaster.yaml".into());
         meta.annotations.insert("flotilla.work/manifest-revision".into(), "rev-1".into());
         ensure = ensures.apply(&meta, &ensure.spec).await.expect("declared ensure");
-        // The reconciler then records its pass, whose baseline gives the document's path back.
-        let key = flotilla_resources::DocumentKey {
-            path: "ensures/quartermaster.yaml".into(),
-            kind: "ConvoyEnsure".into(),
-            namespace: "flotilla".into(),
-            name: "quartermaster".into(),
-        };
-        let state = flotilla_resources::DocumentState {
-            phase: flotilla_resources::DocumentPhase::Applied,
-            reason: None,
-            live_hash: Some("h".into()),
-            desired_hash: Some("h".into()),
-            baseline_hash: Some("h".into()),
-            observed_at: chrono::Utc::now(),
-            resolved_token: None,
-            resolution_outcome: None,
-            removed_in: None,
-        };
-        let pass = flotilla_resources::manifest_roots::PassReport {
-            revision: "rev-1".into(),
-            complete: true,
-            documents: [(key, state)].into(),
-            at: chrono::Utc::now(),
-        };
-        hosts[acting_home].0.manifest_roots().record_pass("flotilla", "declaring-root", pass).await.expect("record the pass");
+        record_declaring_pass(&hosts[acting_home].0).await;
     }
     if refused {
         let mut spec = ensure.spec.clone();
@@ -1015,5 +991,98 @@ pub async fn driverless_ensure_home_case(
         }
     } else {
         assert_eq!(acting_backend.using::<ResourceConvoy>("flotilla").list().await.expect("home convoys").items.len(), 1);
+    }
+}
+
+/// The declaring root's reconciler records its pass over `ensures/quartermaster.yaml`, whose
+/// baseline gives a stamped copy's document path back.
+async fn record_declaring_pass(daemon: &InProcessDaemon) {
+    let key = flotilla_resources::DocumentKey {
+        path: "ensures/quartermaster.yaml".into(),
+        kind: "ConvoyEnsure".into(),
+        namespace: "flotilla".into(),
+        name: "quartermaster".into(),
+    };
+    let state = flotilla_resources::DocumentState {
+        phase: flotilla_resources::DocumentPhase::Applied,
+        reason: None,
+        live_hash: Some("h".into()),
+        desired_hash: Some("h".into()),
+        baseline_hash: Some("h".into()),
+        observed_at: chrono::Utc::now(),
+        resolved_token: None,
+        resolution_outcome: None,
+        removed_in: None,
+    };
+    let pass = flotilla_resources::manifest_roots::PassReport {
+        revision: "rev-1".into(),
+        complete: true,
+        documents: [(key, state)].into(),
+        at: chrono::Utc::now(),
+    };
+    daemon.manifest_roots().record_pass("flotilla", "declaring-root", pass).await.expect("record the pass");
+}
+
+// #3108: a declaration owns the name. Kiwi holds its undeclared original beside feta's declared
+// copy, and reads prefer its own; while the declared copy lives, only feta, the root's home, acts.
+// Once the declared copy is deleted, the undeclared copies decide again: the earliest, kiwi's.
+// A manifest-declared ensure holds no source commit, so it never admits, on the fleet or here:
+// feta acts by attempting admission, which leaves its refusal note.
+pub async fn a_declared_copy_owns_a_driverless_ensure_until_deleted(factory: &dyn EnsureScenarioController) {
+    use flotilla_resources::manifest_roots::RootDeclaration;
+    let kiwi = standing_ensure_fixture_for(factory, "kiwi", true).await;
+    let feta = standing_ensure_fixture_for(factory, "feta", false).await;
+    let udder = standing_ensure_fixture_for(factory, "udder", false).await;
+    let replicate = |from: &InProcessDaemon, to: &InProcessDaemon| {
+        flotilla_provisioning_testkit::replicate_home(
+            &from.decided_store().expect("source decided store"),
+            from.node_id().as_str(),
+            &to.decided_store().expect("target decided store"),
+        );
+    };
+    let convoys = |backend: &ResourceBackend| backend.clone().using::<ResourceConvoy>("flotilla");
+    let project = kiwi.1.definitions::<Project>("flotilla").get("standing-project").await.expect("kiwi project");
+    for peer in [&feta, &udder] {
+        peer.1
+            .definitions::<Project>("flotilla")
+            .create(&InputMeta::from(&project.metadata), &project.spec)
+            .await
+            .expect("each peer's Project copy");
+        replicate(&kiwi.0, &peer.0);
+    }
+
+    let declaration = RootDeclaration { host: "feta".into(), path: "/ops".into(), source: "project-map".into(), binding: None, ops: false };
+    feta.0.manifest_roots().declare("flotilla", "declaring-root", declaration).await.expect("declaring root");
+    let ensures = feta.1.definitions::<ConvoyEnsure>("flotilla");
+    let original = ensures.get("quartermaster").await.expect("kiwi's ensure at feta");
+    let mut meta = InputMeta::from(&original.metadata);
+    meta.annotations.insert("flotilla.work/manifest-reconciler-root".into(), "declaring-root".into());
+    meta.annotations.insert("flotilla.work/manifest-source".into(), "project-map".into());
+    meta.annotations.insert("flotilla.work/manifest-path".into(), "ensures/quartermaster.yaml".into());
+    meta.annotations.insert("flotilla.work/manifest-revision".into(), "rev-1".into());
+    feta.2.advance(chrono::Duration::seconds(1));
+    ensures.apply(&meta, &original.spec).await.expect("declared ensure");
+    record_declaring_pass(&feta.0).await;
+    replicate(&feta.0, &kiwi.0);
+    replicate(&feta.0, &udder.0);
+
+    // Kiwi's own copy is undeclared and the earliest, yet confers nothing beside a declaration.
+    for (name, host) in [("kiwi", &kiwi), ("udder", &udder)] {
+        assert_eq!(host.0.reconcile_convoy_ensures_once("flotilla").await, Ok(Vec::new()), "{name} does not act");
+        assert!(quartermaster(&host.0).await.next_attempt.is_none(), "{name} attempts nothing beside a declaration");
+        assert!(convoys(&host.1).list().await.expect("convoys").items.is_empty(), "{name} never admits beside a declaration");
+    }
+    let refusal = feta.0.reconcile_convoy_ensures_once("flotilla").await;
+    assert!(refusal.as_ref().is_err_and(|error| error.contains("no source commit provenance")), "the root's home attempts: {refusal:?}");
+    assert!(quartermaster(&feta.0).await.next_attempt.is_some(), "the root's home holds its refusal note");
+
+    ensures.delete("quartermaster").await.expect("the declaration goes away");
+    replicate(&feta.0, &kiwi.0);
+    replicate(&feta.0, &udder.0);
+    kiwi.0.reconcile_convoy_ensures_once("flotilla").await.expect("kiwi admits");
+    assert_eq!(convoys(&kiwi.1).list().await.expect("kiwi convoys").items.len(), 1, "the earliest undeclared copy acts again");
+    for (name, host) in [("feta", &feta), ("udder", &udder)] {
+        assert_eq!(host.0.reconcile_convoy_ensures_once("flotilla").await, Ok(Vec::new()), "{name} does not act");
+        assert!(convoys(&host.1).list().await.expect("convoys").items.is_empty(), "{name} never admits");
     }
 }

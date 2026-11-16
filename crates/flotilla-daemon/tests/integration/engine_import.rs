@@ -19,7 +19,9 @@ use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_provisioning::stored::{artifact::ArtifactRecord, repository::RepositoryRecord};
 use flotilla_resources::{
-    definition_provenance::SOURCE_COMMIT_ANNOTATION,
+    definition_provenance::{
+        MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
+    },
     definitions::{origin, DefinitionOrigin},
     Artifact, ConvoyEnsure, InputMeta, Repository, RepositorySpec, Resource, TerminalSession,
 };
@@ -72,6 +74,24 @@ impl Host {
             let version = created.metadata.resource_version.clone();
             self.backend.update_status_raw(kind, NS, name, &version, &status).await.expect("status")
         };
+        kind.encode_object(&created).expect("encode")
+    }
+
+    /// This host's project-ops copy of ensure `standing-quartermaster`, stamped as every fleet copy
+    /// held at several homes is: materialised from an ops entry at a commit.
+    async fn materialized_ensure(&self, spec: &Value) -> Value {
+        let kind = ResourceKind::of::<ConvoyEnsure>();
+        let stamps = [
+            (MATERIALIZED_PROJECT_ANNOTATION, "absent-project"),
+            (SOURCE_REPOSITORY_ANNOTATION, "github.com/org/repo"),
+            (SOURCE_COMMIT_ANNOTATION, "abc123"),
+            (SOURCE_ENTRY_PATH_ANNOTATION, ".flotilla/ops/quartermaster.yaml"),
+        ];
+        let meta = InputMeta::builder()
+            .name("standing-quartermaster".to_owned())
+            .annotations(stamps.into_iter().map(|(key, value)| (key.to_owned(), value.to_owned())).collect())
+            .build();
+        let created = self.backend.create_raw(kind, NS, &meta, spec).await.expect("create");
         kind.encode_object(&created).expect("encode")
     }
 
@@ -237,6 +257,54 @@ async fn a_refused_import_fails_the_start() {
     assert!(!host.dir.path().join(ENGINE_STORE).exists());
     assert!(host.dir.path().join(IMPORTING).exists());
     assert!(host.daemon.get().is_none(), "no daemon is composed over a refused import");
+}
+
+// #3108: a driverless ensure held at several homes acts at the home of its earliest copy, by the
+// old store's creation times, after the import as before it. Each home's copy is project ops', as
+// every fleet ensure held at several homes is, so the import keeps a record at each home. The
+// later copy's home sorts first, so only the kept creation times give the earlier home the
+// ensure. The ensure names an absent Project: its home reports that, and every other host skips it.
+#[tokio::test]
+async fn an_ensure_held_at_two_homes_acts_at_its_earliest_copys_home_after_import() {
+    // Node ids are random, so the copies' order follows the homes' order.
+    let (one, two) = (Host::new("ensure-one").await, Host::new("ensure-two").await);
+    let (later, earlier) = if one.home() < two.home() { (one, two) } else { (two, one) };
+    let spec = json!({"project_ref": "absent-project", "role": "quartermaster", "workflow_ref": "standing", "repositories": []});
+    let earlier_copy = earlier.materialized_ensure(&spec).await;
+    let later_copy = later.materialized_ensure(&spec).await;
+    let created = |copy: &Value| {
+        serde_json::from_value::<chrono::DateTime<chrono::Utc>>(copy["metadata"]["creationTimestamp"].clone()).expect("creation time")
+    };
+    assert!(created(&earlier_copy) < created(&later_copy), "the old store stamps each copy when it is created");
+    assert!(later.home() < earlier.home(), "the tie-break alone would give the later copy's home the ensure");
+    earlier.replica::<ConvoyEnsure>(&later, later_copy).await;
+    later.replica::<ConvoyEnsure>(&earlier, earlier_copy).await;
+    let hosts = [earlier, later];
+    let _runtimes: Vec<_> =
+        futures::future::join_all(hosts.iter().map(Host::start)).await.into_iter().map(|runtime| runtime.expect("runtime")).collect();
+    let _mesh = flotilla_daemon_testkit::server::spawn_in_memory_request_mesh(hosts.iter().map(|host| Arc::clone(host.daemon())).collect())
+        .await
+        .expect("mesh");
+    let both = flotilla_store::StoreQuery::names(["standing-quartermaster".to_owned()], true);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let mut done = true;
+            for host in &hosts {
+                let sources = host.daemon().resource_backend().query_declared::<ConvoyEnsure>(NS, &both).await.expect("sources");
+                done &= sources.items.len() == 2;
+            }
+            if done {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("each host holds both homes' copies");
+
+    let at_home = hosts[0].daemon().reconcile_convoy_ensures_once(NS).await.expect_err("the earliest copy's home acts");
+    assert!(at_home.contains("parent Project/absent-project is absent"), "{at_home}");
+    assert_eq!(hosts[1].daemon().reconcile_convoy_ensures_once(NS).await, Ok(Vec::new()), "the later copy's home skips it");
 }
 
 /// What a daemon started over an old store read back: the import's report, the records of each
