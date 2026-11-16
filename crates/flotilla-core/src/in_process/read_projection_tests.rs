@@ -1370,7 +1370,6 @@ mod tests {
     // Listing a fixed project or crew scope reads and decodes the same as unrelated convoys,
     // sessions and messages grow.
     #[tokio::test]
-    #[ignore = "scoped fleet listing reads grow with unrelated convoys; engine-fixes item in decisions.md"]
     async fn scoped_listing_reads_and_decodes_are_bounded() {
         use flotilla_resources::{
             terminal_records::{AgentLaunch, TerminalLaunchFacts},
@@ -1413,6 +1412,9 @@ mod tests {
                 }
             }
             let (launch, crew) = target.expect("the target");
+            // The views are filled once, at their first read, as a running daemon's already are.
+            fixture.home.convoys.settled().await;
+            fixture.backend.using::<flotilla_resources::TerminalSession>("flotilla").list().await.expect("the session views");
             let mut costs = Vec::new();
             for (project, crew, convoy) in
                 [(Some("app"), None, None), (None, Some(crew.as_str()), None), (None, None, Some(launch.as_str()))]
