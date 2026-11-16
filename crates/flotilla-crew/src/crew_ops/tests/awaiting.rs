@@ -86,9 +86,13 @@ impl EngineMessages for RecordingMessages {
         }))
     }
     async fn open_superseded(&self, _namespace: &str, intent: &MessageSpec) -> Result<Option<String>, ResourceError> {
+        // A delivered message from the same sender about the same subject, awaiting its answer.
         Ok(self.admitted_to(std::slice::from_ref(&intent.receiver)).into_iter().find_map(|read| {
-            (flotilla_resources::message_supersedes(intent, &read.object) && flotilla_resources::message_expectation_open(&read.object))
-                .then_some(read.object.metadata.name)
+            let held = &read.object;
+            let same = held.spec.sender == intent.sender && intent.subject.is_some() && held.spec.subject == intent.subject;
+            let awaiting = held.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::MessagePhase::Delivered)
+                && held.spec.expectation != flotilla_resources::MessageExpectation::None;
+            (same && awaiting).then(|| held.metadata.name.clone())
         }))
     }
     async fn open_to(&self, _namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {

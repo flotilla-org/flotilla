@@ -1,6 +1,4 @@
 use flotilla_resources::ResumeIntent;
-use flotilla_store_memory::InMemoryBackend;
-use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -9,16 +7,14 @@ use chrono::Utc;
 use flotilla_protocol::{CrewCommandContext, PrincipalRef, ResourceRef};
 use flotilla_resources::{
     convoy::engine::{EngineConvoyPath, EngineConvoys},
-    external_patches as convoy_external_patches, Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, CrewWorkPhase, HoldAct, InputMeta,
-    TerminalSession as ResourceTerminalSession, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    external_patches as convoy_external_patches, Convoy as ResourceConvoy, ConvoyPhase, CrewWorkPhase, HoldAct, WorkflowSnapshot,
 };
 use flotilla_store::ResourceBackend;
 use tokio::sync::RwLock;
 
 use super::{fixture, prelude_fixture, shaped_fixture, Crewed, Held};
-use crate::crew_ops::{queue_pending_crew_message, CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator, ResolvedCrewContext};
+use crate::crew_ops::{CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator, ResolvedCrewContext};
 use crate::ports::WorkCredentialReconciler;
-use flotilla_resources::{CrewMessageSender, Selector, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec};
 
 /// A second vessel `review`, crewed by agent `reviewer` owing a decision ledger when `owes`.
 fn with_review(owes: bool) -> impl FnOnce(&mut WorkflowSnapshot) {
@@ -54,13 +50,13 @@ async fn cross_vessel_handoff_publishes_typed_messages() {
 }
 
 async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiver_phase: CrewWorkPhase, repeats: usize) {
-    use flotilla_messaging::MessageInbox;
-    use flotilla_resources::{Message, MessageReference, MessageRelation, MessageSpec};
+    use flotilla_engine_messages_testkit::EngineMessagesHome;
+    use flotilla_resources::{MessageReference, MessageRelation, MessageSpec};
 
     use crate::leaf_engine::ResourceIntentPublisher;
-    // Stand-in for the cross-host resource mutation endpoint; admission uses the real inbox.
+    // Stand-in for the cross-host resource mutation endpoint; admission is the receiver home's.
     struct ReceiverHome {
-        inbox: MessageInbox,
+        messages: EngineMessagesHome,
         fail: bool,
     }
     #[async_trait]
@@ -71,19 +67,8 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
             }
             assert_eq!(document["kind"], "Message");
             let spec: MessageSpec = serde_json::from_value(document["spec"].clone()).expect("Message intent");
-            let admission = self
-                .inbox
-                .accept(
-                    &InputMeta::builder().name(document["metadata"]["name"].as_str().expect("message name").into()).build(),
-                    &spec,
-                    Utc::now(),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            let record = match admission {
-                flotilla_messaging::MessageAdmission::Accepted(record) => record,
-                flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
-            };
+            let name = document["metadata"]["name"].as_str().expect("message name");
+            let record = self.messages.primitives().admit(namespace, name, &spec).await.map_err(|error| error.to_string())?;
             Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
         }
     }
@@ -94,9 +79,14 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
         held.engine.keep(&backend, &launch, "review", "reviewer").await;
     }
     assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].phase, receiver_phase);
-    let home = if remote { ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()) } else { backend.clone() };
-    let publisher: Arc<dyn ResourceIntentPublisher> =
-        Arc::new(ReceiverHome { inbox: MessageInbox::new(home.clone(), "flotilla"), fail: publication_fails });
+    // A remote receiver home keeps its own Message store; it reads the same declarations.
+    let messages = if remote {
+        EngineMessagesHome::open("remote", "flotilla", &backend)
+    } else {
+        EngineMessagesHome::over(Arc::clone(held.messages().service()), "flotilla", &backend)
+    };
+    let home = Arc::new(ReceiverHome { messages, fail: publication_fails });
+    let publisher: Arc<dyn ResourceIntentPublisher> = home.clone();
     if remote || publication_fails {
         crew.set_resource_intent_publisher(Arc::downgrade(&publisher));
     }
@@ -113,7 +103,7 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
         for _ in 0..repeats {
             crew.handoff_with_carries(&context, &short, "review this", vec![carry.clone()]).await.expect_err("receiver publication fails");
             assert_eq!(held.convoy(&backend).await.status, before);
-            assert!(home.using::<Message>("flotilla").list().await.expect("inbox").items.is_empty());
+            assert!(home.messages.views().await.expect("inbox").is_empty());
         }
         return;
     }
@@ -123,11 +113,7 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
         // The handoff delivers the reviewer its task: it is wanted running, and its vessel starts it.
         assert!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].task_assigned);
         // The crew's view of a local Message spells its receiver by the vessel that holds it.
-        let records: Vec<_> = if remote {
-            home.using::<Message>("flotilla").list().await.expect("receiver inbox").items
-        } else {
-            held.messages().views().await.expect("receiver inbox").into_iter().map(|read| read.object).collect()
-        };
+        let records: Vec<_> = home.messages.views().await.expect("receiver inbox").into_iter().map(|read| read.object).collect();
         assert_eq!(records.len(), index + 1, "each handoff is distinct even when its body repeats");
         for record in records {
             assert_eq!(record.spec.sender, held.receiver("work", "coder"));
@@ -141,7 +127,7 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
         crew.handoff(&context, &invalid, "review").await.expect_err("invalid crew target");
     }
     crew.handoff(&context, &short, "").await.expect_err("empty handoff");
-    assert_eq!(home.using::<Message>("flotilla").list().await.expect("inbox").items.len(), repeats);
+    assert_eq!(home.messages.views().await.expect("inbox").len(), repeats);
 }
 
 // b0's relaunch: the reviewer's session of a superseded vessel launch gave up (its environment
@@ -1094,74 +1080,6 @@ async fn terminal_legacy_brief_is_ignored() {
     crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("reconcile");
     assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items.is_empty());
     assert_eq!(held.convoy(&backend).await.status, status);
-}
-
-#[tokio::test]
-async fn operator_brief_survives_a_racing_nudge_until_delivery() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("racing-messages".into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "convoy".into()),
-                    (VESSEL_LABEL.into(), "work".into()),
-                    (ROLE_LABEL.into(), "coder".into()),
-                ]))
-                .build(),
-            &ResourceTerminalSessionSpec {
-                env_ref: "env".to_string(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("coding"),
-                    brief: flotilla_resources::TerminalBrief {
-                        path: "brief.md".to_string(),
-                        content: "Initial".to_string(),
-                        artifact_digest: None,
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".to_string(),
-                        convoy: "convoy".to_string(),
-                        vessel_ref: "work".to_string(),
-                    }),
-                },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("session");
-    backend
-        .using::<ResourceConvoy>("flotilla")
-        .create(&InputMeta::builder().name("convoy".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-        .await
-        .expect("convoy context");
-    queue_pending_crew_message(&sessions, &session, CrewMessageSender::OperatorResume { principal: None }, "Continue the work")
-        .await
-        .expect("operator brief queued");
-    let queued = sessions.get("racing-messages").await.expect("queued operator brief");
-    queue_pending_crew_message(&sessions, &queued, CrewMessageSender::FlotillaNudge, "Please settle").await.expect("nudge queued");
-    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("records").items;
-    assert_eq!(records.len(), 2);
-    assert!(records.iter().any(|message| message.spec.sender == "principal:implicit" && message.spec.body.contains("Continue the work")));
-    assert!(records.iter().any(|message| message.spec.sender == "system:nudge"));
-
-    let concurrent = sessions
-        .create(&InputMeta::builder().name("concurrent-messages".into()).labels(session.metadata.labels.clone()).build(), &session.spec)
-        .await
-        .expect("concurrent session");
-    let (operator, nudge) = tokio::join!(
-        queue_pending_crew_message(&sessions, &concurrent, CrewMessageSender::OperatorResume { principal: None }, "New guidance"),
-        queue_pending_crew_message(&sessions, &concurrent, CrewMessageSender::FlotillaNudge, "Please settle"),
-    );
-    operator.expect("operator brief survives concurrent write");
-    nudge.expect("nudge does not erase concurrent brief");
-    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("concurrent records").items;
-    assert_eq!(records.len(), 4);
-    assert!(records.iter().any(|message| message.spec.body.contains("New guidance")));
 }
 
 // Behaviour (#3587 layer 7): a send's awaiting-reply record is a stall when it supervises a

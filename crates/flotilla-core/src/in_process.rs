@@ -30,7 +30,6 @@ use flotilla_discovery_api::EnvironmentBag;
 use flotilla_executor::action_support::{fallback_repo_identity, AddRepoOutcome};
 use flotilla_resources::ResumeIntent;
 use flotilla_schema::reads::carry;
-use flotilla_store::get_resource_kind;
 use flotilla_store::off_frame;
 use flotilla_store::ResolvedCascadeStoreExt;
 use flotilla_store_memory::InMemoryBackend;
@@ -1311,7 +1310,6 @@ impl InProcessDaemon {
             Arc::new(ProviderIssueObservationSource { backend: resource_backend.clone(), query_port: Arc::clone(&issue_query_port) }),
             flotilla_observation::issue_observer::IssueRefreshCadence::default(),
         );
-        let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
         let message_path = flotilla_engine_messages::MessagePath::default();
         let crew_message_path = flotilla_crew::ports::MessagePath::default();
         let convoy_engine_path = flotilla_resources::convoy::engine::EngineConvoyPath::default();
@@ -1356,7 +1354,6 @@ impl InProcessDaemon {
             CrewService::builder()
                 .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
                 .accounts(accounts.clone() as Arc<dyn flotilla_resources::account_access::AccountRecords>)
-                .message_inboxes(Arc::clone(&message_inboxes))
                 .message_path(Arc::clone(&crew_message_path))
                 .convoy_engine(Arc::clone(&convoy_engine_path))
                 .vessel_seats(Arc::new(flotilla_store::EngineVesselSeats::new(
@@ -5525,19 +5522,13 @@ impl InProcessDaemon {
         execute_local_remote_step_batch(self.node_id.clone(), request, progress_sink, cancel, &resolver).await
     }
 
-    pub async fn message_inbox(&self, namespace: &str) -> flotilla_messaging::MessageInbox {
-        self.crew.message_inbox(namespace).await
-    }
-
-    /// Returns the canonical admitted record. Suppression before creation does
-    /// not create the successor ID. A recovered partial creation stays as a
-    /// superseded audit record and durably forwards admission to its predecessor.
+    /// Returns the admitted record, or the delivered message that suppresses it (ADR 0055). A
+    /// Message is admitted only on the Message path.
     async fn apply_intent_document(
         &self,
         namespace: &str,
         document: serde_json::Value,
     ) -> Result<flotilla_store::DynamicResourceObject, ResourceError> {
-        use flotilla_messaging::MessageAdmission;
         use flotilla_resources::MessageSpec;
         if document.get("kind").and_then(serde_json::Value::as_str) != Some("Message") {
             return apply_resource_document(&self.resource_backend, namespace, document).await;
@@ -5549,28 +5540,21 @@ impl InProcessDaemon {
         let spec: MessageSpec = serde_json::from_value(document.get("spec").cloned().unwrap_or_default())
             .map_err(|error| ResourceError::decode(format!("message spec: {error}")))?;
         let spec = flotilla_resources::qualify_message_spec(spec)?;
-        if let Some(primitives) = self.message_primitives() {
-            let object = primitives.admit(namespace, &meta.name, &spec).await?;
-            return Ok(flotilla_store::DynamicResourceObject {
-                kind: "Message".into(),
-                plural: "messages".into(),
-                namespace: namespace.to_owned(),
-                value: serde_json::to_value(serde_json::json!({
-                    "apiVersion": "flotilla.work/v1",
-                    "kind": "Message",
-                    "metadata": object.metadata,
-                    "spec": object.spec,
-                    "status": object.status,
-                }))
-                .map_err(|error| ResourceError::decode(error.to_string()))?,
-            });
-        }
-        let admission = self.message_inbox(namespace).await.accept(&meta, &spec, self.clock.now()).await?;
-        let record = match admission {
-            MessageAdmission::Accepted(record) => record,
-            MessageAdmission::Suppressed { predecessor } => predecessor,
-        };
-        get_resource_kind(&self.resource_backend, namespace, "Message", &record.metadata.name).await
+        let primitives = self.message_primitives().ok_or_else(|| ResourceError::other("no Message path is installed"))?;
+        let object = primitives.admit(namespace, &meta.name, &spec).await?;
+        Ok(flotilla_store::DynamicResourceObject {
+            kind: "Message".into(),
+            plural: "messages".into(),
+            namespace: namespace.to_owned(),
+            value: serde_json::to_value(serde_json::json!({
+                "apiVersion": "flotilla.work/v1",
+                "kind": "Message",
+                "metadata": object.metadata,
+                "spec": object.spec,
+                "status": object.status,
+            }))
+            .map_err(|error| ResourceError::decode(error.to_string()))?,
+        })
     }
 
     // This executor has many async arms. Box substantial nested futures below

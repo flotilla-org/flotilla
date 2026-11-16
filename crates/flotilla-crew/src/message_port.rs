@@ -88,13 +88,19 @@ impl CrewService {
 
     /// Admits a Message at this home, the receiver's. A message's name is
     /// its producer key's digest, so a repeated name is the message already
-    /// admitted.
+    /// admitted; admission answers with another message when a delivered one
+    /// about the same subject suppresses it (ADR 0055).
     pub(crate) async fn admit_message(
         &self,
         namespace: &str,
         meta: &InputMeta,
         spec: &MessageSpec,
     ) -> Result<MessageAdmission, ResourceError> {
-        Ok(MessageAdmission::Accepted(self.message_primitives()?.admit(namespace, &meta.name, spec).await?))
+        let admitted = self.message_primitives()?.admit(namespace, &meta.name, spec).await?;
+        Ok(if admitted.metadata.name == meta.name {
+            MessageAdmission::Accepted(admitted)
+        } else {
+            MessageAdmission::Suppressed { predecessor: admitted }
+        })
     }
 }

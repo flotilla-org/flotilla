@@ -1039,15 +1039,7 @@ impl MessagePrimitives {
                 &implied
             }
             Some(SameSubject::Answering { id, home, record }) => {
-                let mut object = match self.view_at(namespace, &roles, id.clone(), home.clone()).await {
-                    Ok(Some(view)) => view.object,
-                    Ok(None) => admitted_intent(namespace, &record, intent),
-                    Err(error) => {
-                        tracing::warn!(message = %record, %error, "suppressing message has no old-shaped view; answering with the intent");
-                        admitted_intent(namespace, &record, intent)
-                    }
-                };
-                object.metadata.annotations.insert(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION.to_owned(), home);
+                let object = self.admitted_answer(namespace, &roles, id.clone(), home, &record, intent).await;
                 return Ok((id, object));
             }
         };
@@ -1111,18 +1103,41 @@ impl MessagePrimitives {
             let awaits = !matches!(intent.expectation, flotilla_resources::MessageExpectation::None);
             self.supersede(&older.name, &id, !awaits).await;
         }
-        let mut object = match self.view_at(namespace, &roles, id.clone(), self.home.clone()).await {
+        let object = self.admitted_answer(namespace, &roles, id.clone(), self.home.clone(), name, intent).await;
+        Ok((id, object))
+    }
+
+    /// The admitted message `id`, held at `home`, as its producer is answered: its old-shaped view,
+    /// or, when none can be shaped, the producer's intent stamped as the engine stored it. Either
+    /// names `home`, where the sender records its awaiting reply (#3587 layer 7).
+    async fn admitted_answer(
+        &self,
+        namespace: &str,
+        roles: &FleetRoles,
+        id: String,
+        home: String,
+        record: &str,
+        intent: &OldSpec,
+    ) -> ResourceObject<OldMessage> {
+        let mut object = match self.view_at(namespace, roles, id.clone(), home.clone()).await {
             Ok(Some(view)) => view.object,
             // The engine keeps no vessel; when no holder names it, answer with the producer's own intent.
-            Ok(None) => admitted_intent(namespace, name, intent),
-            Err(error) => {
-                tracing::warn!(message = %name, %error, "admitted message has no old-shaped view; answering with its intent");
-                admitted_intent(namespace, name, intent)
+            unshaped => {
+                if let Err(error) = unshaped {
+                    tracing::warn!(message = %record, %error, "admitted message has no old-shaped view; answering with its intent");
+                }
+                let stored = match self.load_at(id, home.clone()) {
+                    Ok(stored) => stored.map(|(_, created, resource)| (created.to_datetime(), resource.version().0.to_string())),
+                    Err(error) => {
+                        tracing::warn!(message = %record, %error, "admitted message did not load; answering with its intent as of now");
+                        None
+                    }
+                };
+                admitted_intent(namespace, record, intent, stored)
             }
         };
-        // The home that admitted it: the sender records its awaiting reply against this (#3587 layer 7).
-        object.metadata.annotations.insert(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION.to_owned(), self.home.clone());
-        Ok((id, object))
+        object.metadata.annotations.insert(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION.to_owned(), home);
+        object
     }
 
     /// Records the sender's half of a send expecting a reply or an outcome
@@ -2053,13 +2068,20 @@ enum SameSubject {
     Answering { id: String, home: String, record: String },
 }
 
-fn admitted_intent(namespace: &str, name: &str, intent: &OldSpec) -> ResourceObject<OldMessage> {
-    let now = chrono::Utc::now();
+/// The producer's own intent as admitted as `name`, when no view of it can be shaped: stamped with
+/// its stored creation and version when `stored` holds them, so a repeat answers the same.
+fn admitted_intent(
+    namespace: &str,
+    name: &str,
+    intent: &OldSpec,
+    stored: Option<(chrono::DateTime<chrono::Utc>, String)>,
+) -> ResourceObject<OldMessage> {
+    let (now, resource_version) = stored.unwrap_or_else(|| (chrono::Utc::now(), String::new()));
     ResourceObject {
         metadata: flotilla_resources::ObjectMeta {
             name: name.to_owned(),
             namespace: namespace.to_owned(),
-            resource_version: String::new(),
+            resource_version,
             labels: Default::default(),
             annotations: Default::default(),
             owner_references: Vec::new(),

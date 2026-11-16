@@ -4,7 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{CommandAction, HostName, NodeId};
-use flotilla_resources::{Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ResourceError};
+use flotilla_resources::{Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus};
 use flotilla_store::ResourceBackend;
 
 use super::support::{designate_fleet, install_engine_messages, test_meta};
@@ -15,7 +15,7 @@ use crate::testkits::discovery::fake_discovery;
 // superseding pending intent rather than appending independent terminal inputs.
 #[tokio::test]
 async fn resource_message_mutations_use_durable_inbox_admission() {
-    use flotilla_resources::{Message, MessagePhase};
+    use flotilla_state_machines::machines::message::{DropReason, MessageState};
     let temp = tempfile::tempdir().expect("config directory");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-test\"\n").expect("machine identity");
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -28,6 +28,8 @@ async fn resource_message_mutations_use_durable_inbox_admission() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    designate_fleet(&backend).await;
+    let primitives = install_engine_messages(&daemon);
     let mut document = serde_json::json!({
         "apiVersion": "flotilla.work/v1", "kind": "Message", "metadata": {"name": "first"},
         "spec": {"sender": "flotilla/checks", "receiver": "flotilla/convoy/work/coder", "relation": "system", "body": "checks settled"}
@@ -38,8 +40,10 @@ async fn resource_message_mutations_use_durable_inbox_admission() {
     document["metadata"]["name"] = "next".into();
     document["spec"]["supersedes"] = "first".into();
     daemon.apply_intent_document("flotilla", document).await.expect("successor");
-    let first = backend.using::<Message>("flotilla").get("first").await.expect("read first");
-    assert_eq!(first.status.expect("status").phase, MessagePhase::Superseded);
+    let inbox = primitives.inbox_for("flotilla", "flotilla/convoy/work/coder").await.expect("inbox");
+    let (id, _) = primitives.locate_in(&inbox, "first").expect("locate").expect("read first");
+    let first = primitives.message(&id).await.expect("load").expect("held");
+    assert!(matches!(first.state(), MessageState::Dropped { reason: DropReason::Superseded { .. }, .. }), "{:?}", first.state());
 }
 
 // A receiver's admitted convoy supplies a home before its terminal is present;
@@ -87,7 +91,6 @@ async fn new_message_mutations_route_to_the_absent_receivers_home() {
 // returns the canonical delivered predecessor without creating the suppressed ID.
 #[tokio::test]
 async fn message_admission_qualifies_and_exposes_canonical_suppression() {
-    use flotilla_resources::{Message, MessageStatusPatch, ResolvedMessageReceiver};
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-review-test\"\n").unwrap();
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -104,28 +107,17 @@ async fn message_admission_qualifies_and_exposes_canonical_suppression() {
         "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"first"},
         "spec":{"sender":"flotilla/convoy/work/reviewer","receiver":"coder","relation":"peer","body":"reply please","expectation":{"kind":"reply"},"references":[{"kind":"change_request","service":"github","scope":"owner/repo","number":1,"revision":"head"}],"subject":{"kind":"change_request","service":"github","scope":"owner/repo","number":1,"revision":"head"}}
     });
-    daemon.apply_intent_document("flotilla", document.clone()).await.unwrap();
-    let messages = backend.using::<Message>("flotilla");
-    assert_eq!(messages.get("first").await.unwrap().spec.receiver, "flotilla/convoy/work/coder");
-    flotilla_store::apply_status_patch(
-        &messages,
-        "first",
-        &MessageStatusPatch::Delivered {
-            receiver: ResolvedMessageReceiver::builder()
-                .crew_id("crew".into())
-                .session("session".into())
-                .delivered_at(chrono::Utc::now())
-                .evidence("receipt".into())
-                .build(),
-            at: chrono::Utc::now(),
-        },
-    )
-    .await
-    .unwrap();
+    designate_fleet(&backend).await;
+    let primitives = install_engine_messages(&daemon);
+    let first = daemon.apply_intent_document("flotilla", document.clone()).await.unwrap();
+    assert_eq!(first.value.pointer("/spec/receiver").and_then(serde_json::Value::as_str), Some("flotilla/convoy/work/coder"));
+    flotilla_engine_messages_testkit::deliver_turn(&primitives, "flotilla", "flotilla/convoy/work/coder", "first", "session", Utc::now())
+        .await;
     document["metadata"]["name"] = "next".into();
     let canonical = daemon.apply_intent_document("flotilla", document).await.unwrap();
     assert_eq!(canonical.value.pointer("/metadata/name").and_then(serde_json::Value::as_str), Some("first"));
-    assert!(matches!(messages.get("next").await, Err(ResourceError::NotFound { .. })));
+    let inbox = primitives.inbox_for("flotilla", "flotilla/convoy/work/coder").await.expect("inbox");
+    assert!(primitives.locate_in(&inbox, "next").expect("locate").is_none(), "the suppressed name is not admitted");
 }
 
 // Unknown homes cannot fall through to the caller's requested host. A finished
@@ -182,19 +174,16 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         daemon.message_creation_origin("flotilla", &document("flotilla/reviewer")).await.expect("remote declared absent holder"),
         Some(NodeId::new("remote-holder-home"))
     );
+    // A system producer sends as its fleet role, to the crew that replies.
     let original = flotilla_resources::MessageSpec::builder()
-        .sender("system:checks".into())
-        .receiver("flotilla/governor".into())
+        .sender("system:turn-rules".into())
+        .receiver("flotilla/c/work/coder".into())
         .relation(flotilla_resources::MessageRelation::System)
         .body("request".into())
         .build();
-    daemon
-        .message_inbox("flotilla")
-        .await
-        .accept(&test_meta("system-request"), &original, Utc::now())
-        .await
-        .expect("original system request");
-    let reply = serde_json::json!({"spec":{"sender":"flotilla/c/work/coder","receiver":"system:checks","relation":"peer","body":"answer","in_reply_to":"system-request"}});
+    designate_fleet(&backend).await;
+    install_engine_messages(&daemon).admit("flotilla", "system-request", &original).await.expect("original system request");
+    let reply = serde_json::json!({"spec":{"sender":"flotilla/c/work/coder","receiver":"system:turn-rules","relation":"peer","body":"answer","in_reply_to":"system-request"}});
     assert_eq!(daemon.message_creation_origin("flotilla", &reply).await.expect("system reply home"), Some(daemon.node_id().clone()));
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let convoy = convoys
@@ -234,7 +223,7 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
 // is measured.
 #[tokio::test]
 async fn message_send_reads_ignore_unrelated_history() {
-    use flotilla_resources::{Message, MessageRelation, MessageSpec};
+    use flotilla_resources::{MessageRelation, MessageSpec};
     use flotilla_store_testkit::{assert_flat_reads, measure_reads, ReadBudget, ReadCountsBackendExt, ReadOperation, ReadSnapshot};
     async fn send_reads(unrelated: usize) -> (ReadSnapshot, ReadSnapshot) {
         let temp = tempfile::tempdir().expect("config directory");
@@ -249,6 +238,8 @@ async fn message_send_reads_ignore_unrelated_history() {
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
+        designate_fleet(&backend).await;
+        let primitives = install_engine_messages(&daemon);
         let convoys = backend.using::<ResourceConvoy>("flotilla");
         for index in 0..=unrelated {
             let name = if index == 0 { "convoy".to_string() } else { format!("unrelated-{index}") };
@@ -257,19 +248,13 @@ async fn message_send_reads_ignore_unrelated_history() {
                 .await
                 .expect("convoy");
             if index != 0 {
-                backend
-                    .using::<Message>("flotilla")
-                    .create(
-                        &test_meta(&format!("history-{index}")),
-                        &MessageSpec::builder()
-                            .sender("flotilla/checks".into())
-                            .receiver(format!("flotilla/{name}/work/coder"))
-                            .relation(MessageRelation::System)
-                            .body("unrelated".into())
-                            .build(),
-                    )
-                    .await
-                    .expect("unrelated message");
+                let unrelated = MessageSpec::builder()
+                    .sender("flotilla/checks".into())
+                    .receiver(format!("flotilla/{name}/work/coder"))
+                    .relation(MessageRelation::System)
+                    .body("unrelated".into())
+                    .build();
+                primitives.admit("flotilla", &format!("history-{index}"), &unrelated).await.expect("unrelated message");
             }
         }
         let document = serde_json::json!({
@@ -293,8 +278,10 @@ async fn message_send_reads_ignore_unrelated_history() {
                 .objects("TerminalSession", ReadOperation::Query, 1, 1),
             "message routing",
         );
+        // Admission reads no Message from the store; it reads the receiver's convoy, and its
+        // holder by index, to answer with the admitted message's view.
         admission.assert_within(
-            &ReadBudget::new().objects("Message", ReadOperation::Query, 1, 1).objects("Message", ReadOperation::Get, 2, 1),
+            &ReadBudget::new().objects("Convoy", ReadOperation::Get, 2, 1).objects("TerminalSession", ReadOperation::Query, 1, 0),
             "message admission",
         );
         (routing, admission)

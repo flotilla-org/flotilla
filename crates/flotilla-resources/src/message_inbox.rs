@@ -1,4 +1,4 @@
-use crate::{Convoy, Message, MessageExpectation, MessagePhase, MessageSpec, ResourceError, ResourceObject, TurnDeliveryOutcome};
+use crate::{Convoy, MessageSpec, ResourceError, ResourceObject, TurnDeliveryOutcome};
 pub const ROLE_ADDRESS_ANNOTATION: &str = "flotilla.work/role-address";
 
 /// Creation context for convoy-relative role addresses.
@@ -107,7 +107,7 @@ pub fn qualify_message_address(address: &str, context: &MessageAddressContext) -
 }
 
 /// Ordinary resource mutations can qualify a relative receiver when the sender
-/// already carries its convoy context. Bare sender roles require accept_in_context.
+/// already carries its convoy context. A bare sender role is refused: its producer qualifies it.
 pub fn qualify_message_spec(mut spec: MessageSpec) -> Result<MessageSpec, ResourceError> {
     validate_message_address(&spec.sender)?;
     if let Some((project, convoy, vessel, _)) = parse_crew_role_address(&spec.sender) {
@@ -116,18 +116,6 @@ pub fn qualify_message_spec(mut spec: MessageSpec) -> Result<MessageSpec, Resour
     }
     validate_message_address(&spec.receiver)?;
     Ok(spec)
-}
-
-pub fn message_expectation_open(message: &ResourceObject<Message>) -> bool {
-    message.status.as_ref().is_some_and(|status| status.phase == MessagePhase::Delivered)
-        && message.spec.expectation != MessageExpectation::None
-}
-
-pub fn message_supersedes(successor: &MessageSpec, predecessor: &ResourceObject<Message>) -> bool {
-    successor.supersedes.as_deref() == Some(predecessor.metadata.name.as_str())
-        || (successor.sender == predecessor.spec.sender
-            && successor.receiver == predecessor.spec.receiver
-            && successor.subject.as_ref().is_some_and(|subject| predecessor.spec.subject.as_ref() == Some(subject)))
 }
 
 pub fn parse_topic_address(address: &str) -> Option<(&str, &str)> {

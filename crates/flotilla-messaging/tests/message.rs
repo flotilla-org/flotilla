@@ -160,135 +160,6 @@ fn relative_role_addresses_are_qualified_once(tc: hegel::TestCase) {
     }
 }
 
-// Identical subject revisions replace pending messages but suppress a new
-// message while a delivered predecessor expects a reply or outcome. A new
-// revision, another sender/receiver, or no subject is independent.
-#[hegel::test]
-fn subject_supersession_follows_identity_and_expectation(tc: hegel::TestCase) {
-    use flotilla_messaging::{MessageAdmission, MessageInbox};
-    let delivered = tc.draw(gs::booleans());
-    let open = tc.draw(gs::booleans());
-    let same_revision = tc.draw(gs::booleans());
-    let same_sender = tc.draw(gs::booleans());
-    let same_receiver = tc.draw(gs::booleans());
-    let has_subject = tc.draw(gs::booleans());
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    // The complete six-bit product guarantees identity collisions and open
-    // expectations in every generated run; draws vary their traversal order.
-    runtime.block_on(async {
-        for case in 0..64 {
-            let delivered = delivered ^ (case & 1 != 0);
-            let open = open ^ (case & 2 != 0);
-            let same_revision = same_revision ^ (case & 4 != 0);
-            let same_sender = same_sender ^ (case & 8 != 0);
-            let same_receiver = same_receiver ^ (case & 16 != 0);
-            let has_subject = has_subject ^ (case & 32 != 0);
-            let backend = ResourceBackend::new(InMemoryBackend::default());
-            let resolver = backend.using::<Message>("flotilla");
-            let inbox = MessageInbox::new(backend, "flotilla");
-            let subject = has_subject.then(|| MessageReference::ChangeRequest {
-                service: "github".into(),
-                scope: "org/repo".into(),
-                number: 1,
-                revision: "head".into(),
-            });
-            let first_spec = spec(subject, if open { MessageExpectation::Reply } else { MessageExpectation::None });
-            inbox.accept(&InputMeta::builder().name("first".into()).build(), &first_spec, at(10)).await.expect("first");
-            if delivered {
-                flotilla_store::apply_status_patch(
-                    &resolver,
-                    "first",
-                    &MessageStatusPatch::Delivered {
-                        receiver: ResolvedMessageReceiver::builder()
-                            .crew_id("crew".into())
-                            .session("session".into())
-                            .delivered_at(at(20))
-                            .evidence("accepted".into())
-                            .build(),
-                        at: at(20),
-                    },
-                )
-                .await
-                .expect("deliver first");
-            }
-            let mut second_spec = first_spec.clone();
-            second_spec.body = "replacement".into();
-            if !same_revision && has_subject {
-                let Some(MessageReference::ChangeRequest { revision, .. }) = &mut second_spec.subject else { unreachable!() };
-                *revision = "new-head".into();
-                second_spec.references = second_spec.subject.clone().into_iter().collect();
-            }
-            if !same_sender {
-                second_spec.sender = "flotilla/review".into();
-            }
-            if !same_receiver {
-                second_spec.receiver = "flotilla/convoy/work/reviewer".into();
-            }
-            let admission = inbox.accept(&InputMeta::builder().name("second".into()).build(), &second_spec, at(30)).await.expect("second");
-            let matches = has_subject && same_revision && same_sender && same_receiver;
-            assert_eq!(matches!(admission, MessageAdmission::Suppressed { .. }), matches && delivered && open);
-            let first = resolver.get("first").await.expect("first record");
-            assert_eq!(first.status.as_ref().is_some_and(|status| status.phase == MessagePhase::Superseded), matches && !delivered);
-            assert_eq!(resolver.list().await.expect("records").items.len(), if matches && delivered && open { 1 } else { 2 });
-        }
-    });
-}
-
-// Subject-free intent is independent unless the producer explicitly names a
-// predecessor. Retries with the same ID are idempotent; an ID cannot change body.
-#[tokio::test]
-async fn explicit_supersession_and_creation_retries_are_scoped_and_idempotent() {
-    use flotilla_messaging::{MessageAdmission, MessageInbox};
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let resolver = backend.using::<Message>("flotilla");
-    let inbox = MessageInbox::new(backend, "flotilla");
-    let original = spec(None, MessageExpectation::None);
-    let meta = InputMeta::builder().name("original".into()).build();
-    let first = inbox.accept(&meta, &original, at(10)).await.expect("create");
-    let retry = inbox.accept(&meta, &original, at(20)).await.expect("retry");
-    let (MessageAdmission::Accepted(first), MessageAdmission::Accepted(retry)) = (first, retry) else { panic!("accepted") };
-    assert_eq!(first.metadata.resource_version, retry.metadata.resource_version);
-    let mut replacement = original.clone();
-    replacement.body = "different".into();
-    assert!(inbox.accept(&meta, &replacement, at(30)).await.is_err());
-    replacement.supersedes = Some("original".into());
-    let replacement_meta = InputMeta::builder().name("replacement".into()).build();
-    replacement.sender = "flotilla/other".into();
-
-    inbox.accept(&replacement_meta, &replacement, at(30)).await.expect("explicit successor");
-    assert_eq!(resolver.get("original").await.expect("original").status.expect("status").phase, MessagePhase::Superseded);
-    replacement.interrupting = true;
-    assert!(inbox.accept(&InputMeta::builder().name("interrupt".into()).build(), &replacement, at(40)).await.is_err());
-}
-
-// Concurrent admissions for one subject leave exactly one pending successor;
-// the inbox serializes the check and supersession for all cloned producers.
-#[tokio::test]
-async fn concurrent_same_subject_admissions_leave_one_pending_message() {
-    use flotilla_messaging::MessageInbox;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let resolver = backend.using::<Message>("flotilla");
-    let inbox = MessageInbox::new(backend, "flotilla");
-    let original = spec(
-        Some(MessageReference::ChangeRequest { service: "github".into(), scope: "org/repo".into(), number: 1, revision: "head".into() }),
-        MessageExpectation::Reply,
-    );
-    let mut tasks = Vec::new();
-    for index in 0..8 {
-        let inbox = inbox.clone();
-        let spec = original.clone();
-        tasks.push(tokio::spawn(async move {
-            inbox.accept(&InputMeta::builder().name(format!("message-{index}")).build(), &spec, at(10 + index)).await.expect("admit")
-        }));
-    }
-    for task in tasks {
-        task.await.expect("join");
-    }
-    let messages = resolver.list().await.expect("messages").items;
-    assert_eq!(messages.len(), 8);
-    assert_eq!(messages.iter().filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal())).count(), 1);
-}
-
 fn holder_spec(convoy: &str) -> flotilla_resources::TerminalSessionSpec {
     use flotilla_resources::{Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSource, TerminalSessionSpec};
     TerminalSessionSpec::builder()
@@ -398,114 +269,6 @@ async fn addresses_resolve_current_holders_after_replication() {
         .expect("new holder");
     let holder = resolve_message_receiver(&backend, "flotilla", "flotilla/coder").await.expect("project role").expect("holder");
     assert_eq!(holder.object.metadata.name, "new-terminal");
-}
-
-// A crash after creating immutable intent must be repaired by retrying its ID:
-// initialise status and supersede the older pending subject exactly once.
-#[tokio::test]
-async fn retry_repairs_partial_admission_without_reviving_older_intent() {
-    use flotilla_messaging::{MessageAdmission, MessageInbox};
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let messages = backend.using::<Message>("flotilla");
-    let inbox = MessageInbox::new(backend.clone(), "flotilla");
-    let intent = spec(
-        Some(MessageReference::ChangeRequest { service: "github".into(), scope: "owner/repo".into(), number: 1, revision: "head".into() }),
-        MessageExpectation::None,
-    );
-    inbox.accept(&InputMeta::builder().name("old".into()).build(), &intent, at(1)).await.unwrap();
-    messages.create(&InputMeta::builder().name("next".into()).build(), &intent).await.unwrap();
-    let MessageAdmission::Accepted(repaired) =
-        inbox.accept(&InputMeta::builder().name("next".into()).build(), &intent, at(2)).await.unwrap()
-    else {
-        panic!("accepted")
-    };
-    assert!(repaired.status.is_some());
-    assert_eq!(messages.get("old").await.unwrap().status.unwrap().phase, MessagePhase::Superseded);
-    inbox.accept(&InputMeta::builder().name("third".into()).build(), &intent, at(3)).await.unwrap();
-    inbox.accept(&InputMeta::builder().name("next".into()).build(), &intent, at(4)).await.unwrap();
-    assert_eq!(messages.get("third").await.unwrap().status.unwrap().phase, MessagePhase::Accepted);
-}
-
-// Explicit sender context qualifies both partial roles before persisting intent.
-#[tokio::test]
-async fn contextual_admission_qualifies_both_roles() {
-    use flotilla_messaging::{MessageAdmission, MessageInbox};
-    use flotilla_resources::MessageAddressContext;
-    let inbox = MessageInbox::new(ResourceBackend::new(InMemoryBackend::default()), "flotilla");
-    let mut intent = spec(None, MessageExpectation::None);
-    intent.sender = "reviewer".into();
-    intent.receiver = "coder".into();
-    let MessageAdmission::Accepted(record) = inbox
-        .accept_in_context(
-            &InputMeta::builder().name("relative".into()).build(),
-            &intent,
-            &MessageAddressContext { project: "project".into(), convoy: "convoy".into(), vessel: "work".into() },
-            at(1),
-        )
-        .await
-        .unwrap()
-    else {
-        panic!("admitted")
-    };
-    assert_eq!(record.spec.sender, "project/convoy/work/reviewer");
-    assert_eq!(record.spec.receiver, "project/convoy/work/coder");
-}
-
-// Suppression during recovery must keep returning its canonical predecessor,
-// including after the predecessor's expectation closes.
-#[tokio::test]
-async fn replay_of_suppressed_partial_admission_returns_canonical_predecessor() {
-    use flotilla_messaging::{MessageAdmission, MessageInbox};
-    use flotilla_store::apply_status_patch;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let inbox = MessageInbox::new(backend.clone(), "flotilla");
-    let messages = backend.using::<Message>("flotilla");
-    let first = spec(
-        Some(MessageReference::ControlRecord {
-            resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy"),
-            revision: "same".into(),
-        }),
-        MessageExpectation::Reply,
-    );
-    inbox.accept(&InputMeta::builder().name("first".into()).build(), &first, at(10)).await.unwrap();
-    let mut next = first.clone();
-    let subject = MessageReference::ControlRecord {
-        resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy"),
-        revision: "same".into(),
-    };
-    next.subject = Some(subject.clone());
-    next.references = vec![subject];
-    messages.create(&InputMeta::builder().name("partial".into()).build(), &next).await.unwrap();
-    apply_status_patch(
-        &messages,
-        "first",
-        &MessageStatusPatch::Delivered {
-            receiver: ResolvedMessageReceiver::builder()
-                .crew_id("crew".into())
-                .session("session".into())
-                .delivered_at(at(20))
-                .evidence("receipt".into())
-                .build(),
-            at: at(20),
-        },
-    )
-    .await
-    .unwrap();
-    for now in [21, 22] {
-        let restarted = MessageInbox::new(backend.clone(), "flotilla");
-        let admission = restarted.accept(&InputMeta::builder().name("partial".into()).build(), &next, at(now)).await.unwrap();
-        assert!(matches!(admission, MessageAdmission::Suppressed { predecessor } if predecessor.metadata.name == "first"));
-    }
-    apply_status_patch(
-        &messages,
-        "first",
-        &MessageStatusPatch::Finish { phase: MessagePhase::Answered, reason: "reply received".into(), at: at(23) },
-    )
-    .await
-    .unwrap();
-    let admission = inbox.accept(&InputMeta::builder().name("partial".into()).build(), &next, at(24)).await.unwrap();
-    assert!(matches!(admission, MessageAdmission::Suppressed { predecessor } if predecessor.metadata.name == "first"));
-    assert_eq!(messages.get("partial").await.unwrap().status.unwrap().phase, MessagePhase::Superseded);
 }
 
 #[tokio::test]
@@ -650,63 +413,6 @@ fn receiver_snapshot_is_pure_and_refreshes(tc: hegel::TestCase) {
     });
 }
 
-// Explicit replacement closes even an open delivered expectation. It never
-// aliases the replacement ID to the original or treats it as a subject repeat.
-#[tokio::test]
-async fn explicit_supersession_replaces_open_expectations() {
-    use flotilla_messaging::{MessageAdmission, MessageInbox};
-    use flotilla_store::apply_status_patch;
-    for expectation in [MessageExpectation::Reply, MessageExpectation::None] {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let inbox = MessageInbox::new(backend.clone(), "flotilla");
-        let messages = backend.using::<Message>("flotilla");
-        let original = spec(None, expectation);
-        inbox.accept(&InputMeta::builder().name("original".into()).build(), &original, at(10)).await.expect("original admission");
-        apply_status_patch(
-            &messages,
-            "original",
-            &MessageStatusPatch::Delivered {
-                receiver: ResolvedMessageReceiver::builder()
-                    .crew_id("crew".into())
-                    .session("session".into())
-                    .delivered_at(at(11))
-                    .evidence("receipt".into())
-                    .build(),
-                at: at(11),
-            },
-        )
-        .await
-        .expect("original receipt");
-        let mut replacement = original;
-        replacement.supersedes = Some("original".into());
-        let admitted = inbox
-            .accept(&InputMeta::builder().name("replacement".into()).build(), &replacement, at(12))
-            .await
-            .expect("explicit replacement");
-        assert!(matches!(admitted, MessageAdmission::Accepted(message) if message.metadata.name == "replacement"));
-        assert_eq!(messages.get("original").await.expect("original").status.expect("status").phase, MessagePhase::Superseded);
-    }
-}
-
-#[tokio::test]
-async fn system_addresses_are_distinct_and_correlated_replies_are_storable() {
-    use flotilla_messaging::MessageInbox;
-    use flotilla_resources::{qualify_message_address, MessageAddressContext};
-    let context = MessageAddressContext { project: "flotilla".into(), convoy: "convoy".into(), vessel: "work".into() };
-    assert_eq!(qualify_message_address("system:checks", &context).expect("system address"), "system:checks");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let inbox = MessageInbox::new(backend.clone(), "flotilla");
-    let mut request = spec(None, MessageExpectation::Reply);
-    request.sender = "system:checks".into();
-    inbox.accept(&InputMeta::builder().name("request".into()).build(), &request, at(10)).await.expect("system request");
-    let mut reply = request;
-    std::mem::swap(&mut reply.sender, &mut reply.receiver);
-    reply.in_reply_to = Some("request".into());
-    reply.expectation = MessageExpectation::None;
-    inbox.accept(&InputMeta::builder().name("reply".into()).build(), &reply, at(11)).await.expect("system reply");
-    assert_eq!(backend.using::<Message>("flotilla").get("reply").await.expect("reply").spec.receiver, "system:checks");
-}
-
 // The next-generation pre-roll guard refuses every legacy authority witness
 // before typed decoding can discard retired fields; clean new shapes pass.
 #[hegel::test]
@@ -742,69 +448,6 @@ async fn migration_guard_accepts_resolved_legacy_launches() {
         let mut document = serde_json::json!({"kind":"Message", "status":status});
         document["status"]["submission"] = serde_json::json!({"legacy_launch":{"terminal":"old"}});
         flotilla_store::validate_message_migration_complete(&document).expect("resolved witness is eligible");
-    }
-}
-
-// Both backing stores exclude terminal history, retain batch members/replies,
-// and preserve exact producer replay.
-#[tokio::test]
-async fn indexed_message_history_and_retention_contract() {
-    use flotilla_messaging::MessageInbox;
-    use flotilla_resources::MessageSubmission;
-    use flotilla_store::MessageQuery;
-    for backend in [
-        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
-        ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")),
-    ] {
-        let resolver = backend.using::<Message>("flotilla");
-        let inbox = MessageInbox::new(backend.clone(), "flotilla");
-        let intent = spec(None, MessageExpectation::None);
-        for index in 0..256 {
-            let meta = InputMeta::builder().name(format!("history-{index}")).build();
-            inbox.accept(&meta, &intent, at(10)).await.expect("admit history");
-            let record = resolver.get(&meta.name).await.expect("record");
-            let mut status = record.status.unwrap();
-            status.phase = MessagePhase::Expired;
-            status.since = at(20);
-            if index == 2 {
-                status.phase = MessagePhase::Superseded;
-                status.canonical_predecessor = Some(ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "history-1"));
-            }
-            resolver.update_status(&meta.name, &record.metadata.resource_version, &status).await.expect("terminal history");
-        }
-        let active_meta = InputMeta::builder().name("active".into()).build();
-        inbox.accept(&active_meta, &intent, at(30)).await.expect("active input");
-        assert_eq!(resolver.query(&MessageQuery::active()).await.unwrap().len(), 1);
-        assert_eq!(resolver.query(&MessageQuery::Active { receiver: Some("other/role".into()) }).await.unwrap().len(), 0);
-        let active = resolver.get("active").await.unwrap();
-        let mut status = active.status.unwrap();
-        status.submission = Some(
-            MessageSubmission::builder()
-                .batch_id("recovery".into())
-                .crew_id("crew".into())
-                .session("session".into())
-                .started_at(at(30))
-                .members(vec!["active".into(), "history-0".into()])
-                .build(),
-        );
-        resolver.update_status("active", &active.metadata.resource_version, &status).await.unwrap();
-        let replay = inbox.accept(&InputMeta::builder().name("history-1".into()).build(), &intent, at(90000)).await.unwrap();
-        assert!(matches!(replay, flotilla_messaging::MessageAdmission::Accepted(_)));
-        let suppressed = inbox.accept(&InputMeta::builder().name("history-2".into()).build(), &intent, at(90000)).await.unwrap();
-        assert!(
-            matches!(suppressed, flotilla_messaging::MessageAdmission::Suppressed { predecessor } if predecessor.metadata.name == "history-1")
-        );
-        let reply_spec = MessageSpec::builder()
-            .sender("flotilla/receiver".into())
-            .receiver("flotilla/checks".into())
-            .relation(MessageRelation::Peer)
-            .body("reply".into())
-            .in_reply_to("active".into())
-            .build();
-        inbox.accept(&InputMeta::builder().name("reply".into()).build(), &reply_spec, at(40)).await.unwrap();
-        assert_eq!(backend.query_messages("flotilla", &MessageQuery::ReplyTo { name: "active".into() }).await.unwrap().len(), 1);
-        resolver.delete("reply").await.unwrap();
-        assert!(backend.query_messages("flotilla", &MessageQuery::ReplyTo { name: "active".into() }).await.unwrap().is_empty());
     }
 }
 
@@ -958,13 +601,19 @@ async fn routing_holder(backend: &ResourceBackend, project: &str, generation: &s
         .expect("terminal");
 }
 
+// A system address is already qualified: sender context leaves it as it is.
+#[test]
+fn system_addresses_are_distinct() {
+    use flotilla_resources::{qualify_message_address, MessageAddressContext};
+    let context = MessageAddressContext { project: "flotilla".into(), convoy: "convoy".into(), vessel: "work".into() };
+    assert_eq!(qualify_message_address("system:checks", &context).expect("system address"), "system:checks");
+}
+
 // Supervision skips unoccupied parent levels, stops at the nearest subscribed
-// holder, and excludes the sender. Generate every local/parent presence pair.
-#[hegel::test]
-fn subscription_supervision_follows_live_parent_chain(tc: hegel::TestCase) {
-    let local = tc.draw(gs::booleans());
-    let parent = tc.draw(gs::booleans());
-    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+// holder, and excludes the sender. Every local/parent presence pair.
+#[tokio::test]
+async fn subscription_supervision_follows_live_parent_chain() {
+    for (local, parent) in [(false, false), (false, true), (true, false), (true, true)] {
         use flotilla_store::*;
         use flotilla_store_testkit::ReadCountsBackendExt;
         let memory = InMemoryBackend::default().with_read_counts();
@@ -1006,7 +655,7 @@ fn subscription_supervision_follows_live_parent_chain(tc: hegel::TestCase) {
         routing_holder(&backend, "root", "two").await;
         let next = crew_address_book(&backend, "flotilla", "child/task/work/coder").await.expect("refreshed contacts");
         assert_eq!(next.supervision.last().expect("root").terminal.as_deref(), Some("terminal-root-two"));
-    });
+    }
 }
 
 // Adoptable roles can be held by an existing agent without an ensured Convoy.
@@ -1176,11 +825,14 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
         }
         // #3433: receiver reads hydrate only addressed receiver rows, even with
         // unrelated holders and active messages sharing the inbox.
-        let inbox = flotilla_messaging::MessageInbox::new(backend.clone(), "flotilla");
         for (index, address) in ["flotilla/convoy/work/coder", "flotilla/coder"].into_iter().enumerate() {
             let mut intent = spec(None, MessageExpectation::Reply);
             intent.receiver = address.into();
-            inbox.accept(&InputMeta::builder().name(format!("addressed-{index}")).build(), &intent, at(10)).await.expect("admit");
+            backend
+                .using::<Message>("flotilla")
+                .create(&InputMeta::builder().name(format!("addressed-{index}")).build(), &intent)
+                .await
+                .expect("addressed message");
         }
         let before = backend.read_snapshot();
         let snapshot = MessageReceiverSnapshot::load_for_addresses(
@@ -1289,72 +941,4 @@ async fn message_query_phase_classification_matches_model() {
             assert!(messages.query(&MessageQuery::AuditBefore { before: at(21) }).await.expect("deleted audit entry").is_empty());
         }
     }
-}
-
-// Separate inbox handles share a store, but not their process-local admission
-// locks. Recovery racing the original admission must converge on one order.
-#[test]
-fn concurrent_partial_admissions_preserve_one_acceptance_order() {
-    use flotilla_store::{ReadObserver, ReadOperation};
-    use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Barrier,
-    };
-
-    #[derive(Debug)]
-    struct ConcurrentAdmissionReads {
-        armed: AtomicBool,
-        arrivals: AtomicUsize,
-        barrier: Barrier,
-    }
-    impl ReadObserver for ConcurrentAdmissionReads {
-        fn read(&self, kind: &str, operation: ReadOperation, _: usize) {
-            if self.armed.load(Ordering::SeqCst)
-                && kind == "Message"
-                && operation == ReadOperation::Query
-                && self.arrivals.fetch_add(1, Ordering::SeqCst) < 2
-            {
-                // Message queries notify after releasing the store lock. Both
-                // real admissions have now read the same interrupted intent.
-                self.barrier.wait();
-            }
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-    let observer =
-        Arc::new(ConcurrentAdmissionReads { armed: AtomicBool::new(false), arrivals: AtomicUsize::new(0), barrier: Barrier::new(2) });
-    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_observer(observer.clone()));
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    let meta = InputMeta::builder().name("racing-admission".into()).build();
-    let intent = spec(None, MessageExpectation::Reply);
-    runtime.block_on(backend.using::<Message>("flotilla").create(&meta, &intent)).expect("interrupted admission");
-    observer.armed.store(true, Ordering::SeqCst);
-    let results = std::thread::scope(|scope| {
-        let tasks: Vec<_> = (0..2)
-            .map(|_| {
-                let inbox = MessageInbox::new(backend.clone(), "flotilla");
-                let meta = &meta;
-                let intent = &intent;
-                scope.spawn(move || {
-                    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(inbox.accept(
-                        meta,
-                        intent,
-                        at(10),
-                    ))
-                })
-            })
-            .collect();
-        tasks.into_iter().map(|task| task.join().expect("admission thread")).collect::<Vec<_>>()
-    });
-    let admitted: Vec<_> = results
-        .into_iter()
-        .map(|result| match result.expect("both admissions succeed") {
-            MessageAdmission::Accepted(message) => message,
-            other => panic!("unexpected admission {other:?}"),
-        })
-        .collect();
-    assert_eq!(admitted[0].status, admitted[1].status);
-    assert!(admitted[0].status.as_ref().expect("admitted").accepted_sequence.is_some());
 }

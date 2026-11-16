@@ -3966,7 +3966,6 @@ dependencies = [
  "chrono",
  "flotilla-build-features-http-server",
  "flotilla-build-features-logging",
- "flotilla-messaging",
  "flotilla-protocol",
  "flotilla-resources",
  "flotilla-store",

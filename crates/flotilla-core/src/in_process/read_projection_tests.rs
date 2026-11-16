@@ -1852,21 +1852,34 @@ mod tests {
         }
     }
 
+    /// Seeds an old-store Message record as the retired inbox admitted one: accepted, waiting for
+    /// its receiver. These views read the old store until step 6 moves them to the engine.
+    async fn seed_old_message(backend: &ResourceBackend, name: &str, intent: &flotilla_resources::MessageSpec) {
+        use flotilla_resources::{Message, MessagePhase, MessageStatus};
+        let messages = backend.using::<Message>("flotilla");
+        let created = messages.create(&InputMeta::builder().name(name.into()).build(), intent).await.expect("admit");
+        let status = MessageStatus::builder()
+            .phase(MessagePhase::Accepted)
+            .since(created.metadata.creation_timestamp)
+            .maybe_accepted_sequence(created.metadata.resource_version.parse().ok())
+            .reason("waiting for receiver resolution".into())
+            .build();
+        messages.update_status(name, &created.metadata.resource_version, &status).await.expect("accepted");
+    }
+
     // Both crew and convoy surfaces share the durable projection. Waiting
     // reasons survive reads, and delivery identity comes only from evidence.
     #[tokio::test]
     async fn message_views_preserve_waiting_reasons_and_delivery_identity() {
-        use flotilla_messaging::MessageInbox;
         use flotilla_resources::{Message, MessageRelation, MessageSpec, MessageStatusPatch, ResolvedMessageReceiver};
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let inbox = MessageInbox::new(backend.clone(), "flotilla");
         let intent = MessageSpec::builder()
             .sender("flotilla/test".into())
             .receiver("project/convoy/work/coder".into())
             .relation(MessageRelation::System)
             .body("brief".into())
             .build();
-        inbox.accept(&InputMeta::builder().name("view".into()).build(), &intent, Utc::now()).await.expect("admit");
+        seed_old_message(&backend, "view", &intent).await;
         let pending = super::crew_message_views(&backend, "flotilla").await.expect("waiting view");
         assert_eq!(pending[0].phase, "accepted");
         assert!(pending[0].reason.as_deref().is_some_and(|reason| !reason.is_empty()));
@@ -1898,7 +1911,6 @@ mod tests {
     // valid and missing candidates; delivery remains strict and refuses them.
     #[tokio::test]
     async fn message_views_show_receiver_errors_beside_valid_candidates() {
-        use flotilla_messaging::MessageInbox;
         use flotilla_resources::{
             MessageRelation, MessageSpec, RoleDefinition, Selector, TerminalBrief, TerminalCrewContext, TerminalSessionStatus,
             ROLE_ADDRESS_ANNOTATION,
@@ -1952,7 +1964,6 @@ mod tests {
                 .await
                 .expect("running claim");
         }
-        let inbox = MessageInbox::new(backend.clone(), "flotilla");
         for (name, receiver) in [
             ("a-valid", "root/attended"),
             ("b-missing", "root/convoy/work/coder"),
@@ -1965,7 +1976,7 @@ mod tests {
                 .relation(MessageRelation::System)
                 .body("brief".into())
                 .build();
-            inbox.accept(&InputMeta::builder().name(name.into()).build(), &intent, Utc::now()).await.expect("admit");
+            seed_old_message(&backend, name, &intent).await;
         }
         let views = super::crew_message_views(&backend, "flotilla").await.expect("diagnostic view survives receiver errors");
         let view = |name: &str| views.iter().find(|view| view.name == name).unwrap_or_else(|| panic!("{name} shown"));

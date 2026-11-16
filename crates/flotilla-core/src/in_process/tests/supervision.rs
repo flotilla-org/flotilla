@@ -14,7 +14,7 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 use futures::{FutureExt, StreamExt};
 
-use super::support::{crew_messages, designate_fleet, test_engine, test_meta};
+use super::support::{crew_messages, designate_fleet, install_engine_messages, test_engine, test_meta};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource};
@@ -46,7 +46,8 @@ async fn supervisor_turn_reconciliation_noop_contract() {
             )
             .await;
             // Keep contract resources outside the daemon's background provisioning namespace.
-            let namespace = "noop-contract";
+            // The fleet's Projects, which the Message path's roles come from, are served in `flotilla`.
+            let namespace = "flotilla";
             let sessions = backend.clone().using::<ResourceTerminalSession>(namespace);
             let convoys = backend.clone().using::<ResourceConvoy>(namespace);
             assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "empty store", passes).await;
@@ -106,22 +107,20 @@ async fn supervisor_turn_reconciliation_noop_contract() {
                 .await
                 .expect("running terminal");
             let intent = flotilla_resources::MessageSpec::builder()
-                .sender("system:test".into())
-                .receiver("noop-contract/convoy/govern/governor".into())
+                .sender("system:nudge".into())
+                .receiver("flotilla/convoy/govern/governor".into())
                 .relation(flotilla_resources::MessageRelation::System)
                 .body("supervise".into())
                 .build();
-            let inbox = daemon.message_inbox(namespace).await;
-            inbox.accept(&test_meta("input"), &intent, Utc::now()).await.expect("new Message");
+            flotilla_engine_messages_testkit::designate_fleet(&backend, namespace).await;
+            let primitives = install_engine_messages(&daemon);
+            primitives.admit(namespace, "input", &intent).await.expect("new Message");
             if terminal_message {
-                let messages = backend.using::<flotilla_resources::Message>(namespace);
-                let record = messages.get("input").await.unwrap();
-                let mut status = record.status.unwrap();
-                status.phase = flotilla_resources::MessagePhase::Expired;
-                status.since = Utc::now();
-                messages.update_status("input", &record.metadata.resource_version, &status).await.unwrap();
+                // Delivered, it awaits nothing more: it has ended.
+                flotilla_engine_messages_testkit::deliver_turn(&primitives, namespace, &intent.receiver, "input", "session", Utc::now())
+                    .await;
             }
-            let state = if terminal_message { "new-only expired Message" } else { "new-only Message" };
+            let state = if terminal_message { "new-only ended Message" } else { "new-only Message" };
             assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, state, passes).await;
         }
     }

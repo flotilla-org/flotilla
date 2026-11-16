@@ -125,8 +125,6 @@ pub struct CrewService {
     capability_source: RwLock<Option<Arc<dyn flotilla_capability_contract::SessionCapabilitySource>>>,
     #[builder(default)]
     capability_cards: CapabilityCardTracker,
-    #[builder(default)]
-    message_inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>,
     /// The `[primitives]` switch's Message path; empty while it is off.
     #[builder(default)]
     pub(crate) message_path: crate::ports::MessagePath,
@@ -527,27 +525,6 @@ fn crew_handoff_address_error(target: &str, vessel: &str) -> String {
     format!("no such crew target; handoff requires a different crew member (target `{target}`, vessel `{vessel}`)")
 }
 
-// Legacy fixture seeding only; remove after the first fleet roll deploying #2710.
-#[cfg(test)]
-pub async fn queue_pending_crew_message(
-    sessions: &flotilla_store::TypedResolver<ResourceTerminalSession>,
-    existing: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
-    sender: CrewMessageSender,
-    message: &str,
-) -> Result<(), String> {
-    queue_crew_message_object(sessions, existing, pending_crew_message(sender, message)).await
-}
-
-// Legacy fixture seeding only; remove after the first fleet roll deploying #2710.
-#[cfg(test)]
-async fn queue_crew_message_object(
-    sessions: &flotilla_store::TypedResolver<ResourceTerminalSession>,
-    existing: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
-    next: TerminalCrewMessage,
-) -> Result<(), String> {
-    sessions.accept_crew_message(existing, &next, chrono::Utc::now()).await.map_err(|error| error.to_string())
-}
-
 impl CrewService {
     /// The session capability source the runtime installs after construction.
     pub fn capability_source(&self) -> &RwLock<Option<Arc<dyn flotilla_capability_contract::SessionCapabilitySource>>> {
@@ -620,15 +597,6 @@ impl CrewService {
     pub async fn ledger_delivery_environment(&self, namespace: &str, environment_ref: &str) -> Result<BTreeMap<String, String>, String> {
         let reconciler = self.work_credential_reconciler.read().await.clone().ok_or("credential controller is unavailable")?;
         reconciler.ledger_delivery_environment(namespace, environment_ref).await
-    }
-
-    pub async fn message_inbox(&self, namespace: &str) -> flotilla_messaging::MessageInbox {
-        self.message_inboxes
-            .lock()
-            .await
-            .entry(namespace.to_string())
-            .or_insert_with(|| flotilla_messaging::MessageInbox::new(self.resource_backend.clone(), namespace))
-            .clone()
     }
 
     pub async fn provisioning_namespace(&self) -> String {
@@ -3064,7 +3032,8 @@ impl CrewService {
                 "metadata": { "name": name, "namespace": request.namespace }, "spec": intent
             });
             let (reference, home) = publisher.publish_admitted(&request.namespace, document).await?;
-            self.record_awaiting(&request.namespace, name, intent, home, request.stall_of.as_deref()).await?;
+            // A suppressed turn answers with the message that suppressed it: the sender awaits that.
+            self.record_awaiting(&request.namespace, &reference.name, intent, home, request.stall_of.as_deref()).await?;
             reference
         } else {
             if matches!(target.provenance, ResourceProvenance::Replica { .. })
@@ -3081,7 +3050,7 @@ impl CrewService {
                 flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
             let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
-            self.record_awaiting(&request.namespace, name, intent, home, request.stall_of.as_deref()).await?;
+            self.record_awaiting(&request.namespace, &record.metadata.name, intent, home, request.stall_of.as_deref()).await?;
             ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
         };
         Ok(message)
@@ -3639,9 +3608,6 @@ fn terminal_convoy_refusal(name: &str, cause: &str) -> String {
          or use explicit --continue-pr continuation once #2873 is available"
     )
 }
-
-#[cfg(test)]
-use flotilla_store_testkit::LegacyMessageFixture;
 
 /// Where a checkout's unpushed work stays when the abandon push fails: its
 /// environment (or host, for an observed checkout), path and branch.

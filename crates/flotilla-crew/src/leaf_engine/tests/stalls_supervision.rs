@@ -1113,9 +1113,10 @@ async fn leaf_engine_steady_state_reconcile_reads_no_store() {
 // #3118: one declared stall episode yields one receiver-homed Message even
 // when the crew repeats its report and the judge restarts between passes.
 async fn stall_message_scenario(repeat_report: bool, restart: bool) {
-    use flotilla_resources::{Message, MessageSpec, StallReason};
-    struct InboxDelivery(flotilla_messaging::MessageInbox);
-    // Boundary stand-in for turn delivery; persist through the real Message inbox.
+    use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+    use flotilla_resources::{MessageSpec, StallReason};
+    struct InboxDelivery(EngineMessagesHome);
+    // Boundary stand-in for turn delivery; persist through the real Message path.
     #[async_trait]
     impl TurnDeliveryActuator for InboxDelivery {
         async fn deliver(&self, request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String> {
@@ -1134,12 +1135,7 @@ async fn stall_message_scenario(repeat_report: bool, restart: bool) {
                 .references(request.references.clone())
                 .expectation(request.expectation.clone())
                 .build();
-            let admission =
-                self.0.accept(&InputMeta::builder().name(name).build(), &spec, Utc::now()).await.map_err(|error| error.to_string())?;
-            let object = match admission {
-                flotilla_messaging::MessageAdmission::Accepted(object) => object,
-                flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
-            };
+            let object = self.0.primitives().admit("flotilla", &name, &spec).await.map_err(|error| error.to_string())?;
             Ok(CrewTurnAdmission {
                 new_turn: true,
                 rung: TurnDeliveryRung::WarmSession,
@@ -1151,7 +1147,8 @@ async fn stall_message_scenario(repeat_report: bool, restart: bool) {
         }
     }
     let case = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-    let delivery = Arc::new(InboxDelivery(flotilla_messaging::MessageInbox::new(case.backend.clone(), "flotilla")));
+    designate_fleet(&case.backend, "flotilla").await;
+    let delivery = Arc::new(InboxDelivery(EngineMessagesHome::open("home", "flotilla", &case.backend)));
     let now = Utc::now();
     let stale_objects = case.objects().await;
     let mut wake = case.wake.clone();
@@ -1180,7 +1177,7 @@ async fn stall_message_scenario(repeat_report: bool, restart: bool) {
         case.caught_up(&wake).await;
         wake.sync_rows("flotilla", &objects).await.expect("rows");
         wake.judge_stalls_at("flotilla", &objects, now + chrono::Duration::seconds(step)).await.expect("judge");
-        let messages = case.backend.using::<Message>("flotilla").list().await.expect("inbox").items;
+        let messages = delivery.0.views().await.expect("inbox");
         assert_eq!(messages.len(), 1, "one episode must not create a burst of copies");
     }
     // Catching up the outer watch rebuilds rows and continues judging normally.
@@ -1188,7 +1185,7 @@ async fn stall_message_scenario(repeat_report: bool, restart: bool) {
     case.caught_up(&wake).await;
     wake.sync_rows("flotilla", &current).await.expect("current rows");
     wake.judge_stalls_at("flotilla", &current, now + chrono::Duration::seconds(4)).await.expect("current judge");
-    assert_eq!(case.backend.using::<Message>("flotilla").list().await.expect("inbox").items.len(), 1);
+    assert_eq!(delivery.0.views().await.expect("inbox").len(), 1);
 }
 
 #[tokio::test]

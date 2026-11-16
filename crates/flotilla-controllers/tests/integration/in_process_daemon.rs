@@ -116,9 +116,19 @@ use flotilla_terminal::TerminalPool;
 use futures::StreamExt;
 use tokio::sync::Notify;
 
-// Boundary stand-in for the ordinary receiver-home ResourceApply router.
+// Boundary stand-in for the ordinary receiver-home ResourceApply router: the receiver home admits.
 struct ReceiverIntentPublisher {
-    inbox: flotilla_messaging::MessageInbox,
+    home: Arc<InProcessDaemon>,
+}
+
+impl ReceiverIntentPublisher {
+    /// The publisher onto `home`'s Message path, opened if the daemon has none yet.
+    fn onto(home: &Arc<InProcessDaemon>) -> Self {
+        if home.message_primitives().is_none() {
+            home.open_message_primitives().expect("the engine Message path");
+        }
+        Self { home: Arc::clone(home) }
+    }
 }
 
 /// The single remote command string `SshCommandRunner` hands to `ssh`: the
@@ -136,12 +146,9 @@ impl flotilla_crew::leaf_engine::ResourceIntentPublisher for ReceiverIntentPubli
             return Err("invalid receiver-home resource document".into());
         }
         let spec = serde_json::from_value(document["spec"].clone()).map_err(|error| error.to_string())?;
-        let meta = InputMeta::builder().name(document["metadata"]["name"].as_str().ok_or("missing name")?.into()).build();
-        let admission = self.inbox.accept(&meta, &spec, chrono::Utc::now()).await.map_err(|error| error.to_string())?;
-        let record = match admission {
-            flotilla_messaging::MessageAdmission::Accepted(record) => record,
-            flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
-        };
+        let name = document["metadata"]["name"].as_str().ok_or("missing name")?;
+        let primitives = self.home.message_primitives().ok_or("the receiver home has no Message path")?;
+        let record = primitives.admit(namespace, name, &spec).await.map_err(|error| error.to_string())?;
         Ok(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
     }
 }
@@ -8513,8 +8520,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     .await;
     // The engine's readings, which a running daemon always has.
     let terminal_engine = install_decided_engine(&terminal_host).await;
-    let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
-        Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
+    let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> = Arc::new(ReceiverIntentPublisher::onto(&terminal_host));
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     let snapshot = WorkflowSnapshot {
         cascade: None,
@@ -8674,8 +8680,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     .await;
     // The engine's readings, which a running daemon always has.
     let terminal_engine = install_decided_engine(&terminal_host).await;
-    let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
-        Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
+    let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> = Arc::new(ReceiverIntentPublisher::onto(&terminal_host));
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
     let convoy = launch_convoy(
@@ -9557,7 +9562,7 @@ async fn startup_forgejo_discovery_error_preserves_other_repositories() {
 }
 
 #[tokio::test]
-async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_observation() {
+async fn message_apply_uses_document_namespace_and_status_patches_are_refused() {
     let temp = tempfile::tempdir().expect("config");
     let daemon = InProcessDaemon::new(
         vec![],
@@ -9570,6 +9575,8 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
     // The engine's readings, which a running daemon always has.
     let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
+    let primitives = daemon.open_message_primitives().expect("the engine Message path");
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
     // The receiver's convoy, a launch in the document's namespace, the engine's.
     let convoy = flotilla_engine_convoys_testkit::launch(
         &daemon.convoy_engine_path(),
@@ -9588,7 +9595,7 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
                 namespace: "request-default".into(),
                 document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message",
             "metadata":{"name":"namespace-message","namespace":namespace},
-            "spec":{"sender":"system:test","receiver":format!("{namespace}/{convoy}/work/coder"),"relation":"system","body":"test"}}),
+            "spec":{"sender":"system:nudge","receiver":format!("{namespace}/{convoy}/work/coder"),"relation":"system","body":"test"}}),
             })
             .build()
     };
@@ -9599,20 +9606,11 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
     let id = daemon.execute(apply("flotilla")).await.expect("resource envelope");
     let result = recv_command_finished(&mut events, id).await;
     assert!(matches!(result, CommandValue::ResourceObject(response) if response.namespace == "flotilla"));
+    let receiver = primitives.inbox_for("flotilla", &format!("flotilla/{convoy}/work/coder")).await.expect("receiver inbox");
+    assert!(primitives.locate_in(&receiver, "namespace-message").expect("locate").is_some(), "document-scoped admission");
     let messages = backend.using::<flotilla_resources::Message>("flotilla");
     let observed = messages.get("namespace-message").await.expect("document-scoped admission");
-    assert!(backend.using::<flotilla_resources::Message>("request-default").list().await.expect("default namespace").items.is_empty());
-    let mut next = observed.status.clone().expect("accepted status");
-    next.submission = Some(
-        flotilla_resources::MessageSubmission::builder()
-            .batch_id("batch".into())
-            .crew_id("crew".into())
-            .session("session".into())
-            .started_at(chrono::Utc::now())
-            .members(vec!["namespace-message".into()])
-            .build(),
-    );
-    messages.update_status("namespace-message", &observed.metadata.resource_version, &next).await.expect("receiver records submission");
+    // A Message's state moves only through delivery and receipts: a status patch is refused.
     let id = daemon
         .execute(
             Command::builder()
@@ -9620,16 +9618,20 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
                     namespace: "flotilla".into(),
                     kind: "Message".into(),
                     name: "namespace-message".into(),
-                    status: serde_json::to_value(observed.status).expect("stale status"),
-                    expected_resource_version: Some(observed.metadata.resource_version),
+                    status: serde_json::to_value(&observed.status).expect("status"),
+                    expected_resource_version: Some(observed.metadata.resource_version.clone()),
                 })
                 .build(),
         )
         .await
         .expect("guarded status command");
     let result = recv_command_finished(&mut events, id).await;
-    assert!(matches!(result, CommandValue::Error { message } if message.contains("status changed")));
-    assert_eq!(messages.get("namespace-message").await.expect("retained evidence").status, Some(next));
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("moves only through delivery and receipts")),
+        "{result:?}"
+    );
+    let retained = messages.get("namespace-message").await.expect("retained message");
+    assert_eq!(retained.metadata.resource_version, observed.metadata.resource_version);
 }
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;

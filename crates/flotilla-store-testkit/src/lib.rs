@@ -9,8 +9,6 @@ pub use read_counts::{
 };
 mod attentions;
 pub use attentions::NoAttentions;
-mod message;
-pub use message::LegacyMessageFixture;
 mod old_store_accounts;
 pub use old_store_accounts::OldStoreAccounts;
 mod old_store_manifest_roots;
