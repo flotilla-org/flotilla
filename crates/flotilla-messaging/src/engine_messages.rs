@@ -38,6 +38,8 @@ pub struct SeatMessage {
 pub struct SentMessage {
     pub standing: SeatMessage,
     pub body: String,
+    /// The record name of the message it supersedes, if it names one.
+    pub supersedes: Option<String>,
 }
 
 /// Where a message admitted under a name stands, read by its exact identity (#3108).

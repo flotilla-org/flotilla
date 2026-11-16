@@ -12,7 +12,7 @@ use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::terminal_records::{newest_launches, TerminalRecord};
 use flotilla_resources::vessel_records::VesselRecord;
 use flotilla_resources::{
-    message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, Message, MessageReference,
+    message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, MessageReference,
     MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
     TerminalSessionSpec, Vessel,
 };
@@ -379,8 +379,6 @@ struct CardObservation {
     message: Option<String>,
 }
 
-const DIGEST_ANNOTATION: &str = "flotilla.work/capabilities-digest";
-
 fn card_digest(card: &str) -> String {
     format!(
         "{:x}",
@@ -432,22 +430,26 @@ async fn observe(
     // Pending notices supersede one another. Promote only snapshots the inbox delivered.
     let mut retired = Vec::new();
     let pending = observation.pending.clone();
+    let named: Vec<_> = pending.values().map(|(name, _)| (receiver.clone(), name.clone())).collect();
+    let sent = tracker
+        .primitives()
+        .map_err(|error| error.to_string())?
+        .sent_messages(namespace, &named)
+        .await
+        .map_err(|error| error.to_string())?;
     for (revision, (name, snapshot)) in &pending {
-        let message = match message_by_name(namespace, &receiver, name, tracker).await {
-            Ok(message) => message,
-            Err(ResourceError::NotFound { .. }) => {
-                // An audit record can be reaped before the next capability change.
-                // Without its receipt evidence, recover with a full card.
-                observation.delivered = None;
-                retired.push(*revision);
-                continue;
-            }
-            Err(error) => return Err(error.to_string()),
+        let Some(message) = sent.iter().find(|message| message.standing.name == *name) else {
+            // An audit record can be reaped before the next capability change.
+            // Without its receipt evidence, recover with a full card.
+            observation.delivered = None;
+            retired.push(*revision);
+            continue;
         };
-        if message.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence() || status.resolved_receiver.is_some()) {
+        let standing = &message.standing;
+        if standing.phase.has_delivery_evidence() || standing.delivered_at.is_some() {
             observation.delivered = Some(snapshot.clone());
             retired.push(*revision);
-        } else if message.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+        } else if standing.phase.is_terminal() {
             retired.push(*revision);
         }
     }
@@ -467,22 +469,6 @@ async fn observe(
     observation.revision = revision;
     observation.message = Some(name);
     Ok(())
-}
-
-/// Admission is idempotent. Recover a published revision before trying to
-/// supersede it with a newer observation: a message's name is its producer
-/// key's digest, the same revision of the same session's card.
-async fn recover_published_revision(
-    namespace: &str,
-    receiver: &str,
-    name: &str,
-    tracker: &CapabilityCardTracker,
-) -> Result<Option<ResourceObject<Message>>, String> {
-    match message_by_name(namespace, receiver, name, tracker).await {
-        Ok(existing) => Ok(Some(existing)),
-        Err(ResourceError::NotFound { .. }) => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
 }
 
 /// One revision of a session's capability card: the card, the body sent for it (the card or its
@@ -507,33 +493,37 @@ async fn publish_card_revision(
         resource: ResourceRef::new("flotilla.work/v1", "TerminalSession", namespace, &session.metadata.name),
         revision: format!("capabilities@{revision}"),
     };
+    let primitives = tracker.primitives().map_err(|error| error.to_string())?;
     let supersedes = match supersedes {
-        Some(name) => match message_by_name(namespace, receiver, &name, tracker).await {
-            Ok(_) => Some(name),
-            Err(ResourceError::NotFound { .. }) => None, // Reaped audit data cannot be a predecessor.
-            Err(error) => return Err(error.to_string()),
-        },
+        // Reaped audit data cannot be a predecessor.
+        Some(name) => primitives.holds(namespace, receiver, &name).await.map_err(|error| error.to_string())?.then_some(name),
         None => None,
     };
-    let requested = MessageSpec::builder()
+    // Admission is idempotent. Recover a published revision before trying to supersede it with
+    // a newer observation: a message's name is its producer key's digest, the same revision of
+    // the same session's card, so it differs from this intent only in its body and predecessor.
+    let recovered = primitives
+        .sent_messages(namespace, &[(receiver.to_owned(), name.clone())])
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next();
+    // The engine keeps no annotations: a recovered revision's card is the body it was published with.
+    let digest = recovered.as_ref().map(|message| card_digest(&message.body)).unwrap_or_else(|| card_digest(card));
+    let (body, supersedes) = match recovered {
+        Some(message) => (message.body, message.supersedes),
+        None => (body.to_string(), supersedes),
+    };
+    let spec = MessageSpec::builder()
         .sender(sender.into())
         .receiver(receiver.to_owned())
         .relation(MessageRelation::System)
-        .body(body.to_string())
+        .body(body)
         .references(vec![subject.clone()])
         .subject(subject)
         .maybe_supersedes(supersedes)
         .build();
-    let recovered = recover_published_revision(namespace, receiver, &name, tracker).await?;
-    let digest = recovered
-        .as_ref()
-        .and_then(|message| message.metadata.annotations.get(DIGEST_ANNOTATION))
-        .cloned()
-        // Previous-generation Messages without this annotation always contain full cards.
-        .unwrap_or_else(|| recovered.as_ref().map(|message| card_digest(&message.spec.body)).unwrap_or_else(|| card_digest(card)));
-    let spec = recovered.map(|message| message.spec).unwrap_or(requested);
-    // The engine keeps no annotations: a revision's card is the one it was published with.
-    tracker.primitives().map_err(|error| error.to_string())?.admit(namespace, &name, &spec).await.map_err(|error| error.to_string())?;
+    primitives.admit(namespace, &name, &spec).await.map_err(|error| error.to_string())?;
     Ok((name, digest))
 }
 
@@ -550,16 +540,6 @@ async fn card_receiver(backend: &ResourceBackend, namespace: &str, session: &Res
         &vessel.spec.vessel_name,
         &session.spec.role,
     ))
-}
-
-/// A capability Message to `receiver` by name.
-async fn message_by_name(
-    namespace: &str,
-    receiver: &str,
-    name: &str,
-    tracker: &CapabilityCardTracker,
-) -> Result<ResourceObject<Message>, ResourceError> {
-    tracker.primitives()?.view_to(namespace, receiver, name).await?.map(|view| view.object).ok_or_else(|| ResourceError::not_found(name))
 }
 
 /// Advisory launch observation: callers can warn and still launch with the card.

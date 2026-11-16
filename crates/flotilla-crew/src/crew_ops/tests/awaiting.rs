@@ -114,7 +114,11 @@ impl EngineMessages for RecordingMessages {
         Ok(named
             .iter()
             .filter_map(|(receiver, name)| admitted.get(name).filter(|object| object.spec.receiver == *receiver))
-            .map(|object| flotilla_messaging::SentMessage { standing: standing(object), body: object.spec.body.clone() })
+            .map(|object| flotilla_messaging::SentMessage {
+                standing: standing(object),
+                body: object.spec.body.clone(),
+                supersedes: object.spec.supersedes.clone(),
+            })
             .collect())
     }
     async fn pending_to(&self, _namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {

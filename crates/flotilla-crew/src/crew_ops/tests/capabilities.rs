@@ -331,3 +331,37 @@ async fn image_capabilities_follow_engine_builds() {
     engine.image_builds.poison();
     assert!(card().await.expect_err("checked read").contains("poisoned"));
 }
+
+/// The Message rows loaded and converted by a card change that follows one pending notice, with
+/// `count` other messages open to the crew.
+async fn read_by_a_card_change(count: usize) -> (u64, u64) {
+    use crate::crew_capabilities::{observe_card, CapabilityCardTracker};
+    let (crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
+    let primitives = held.messages().primitives();
+    for index in 0..count {
+        let intent = flotilla_resources::MessageSpec::builder()
+            .sender("system:turn-rules".into())
+            .receiver(held.receiver("work", "coder"))
+            .relation(flotilla_resources::MessageRelation::System)
+            .body(format!("open {index}"))
+            .build();
+        primitives.admit("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
+    }
+    let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
+    let tracker = CapabilityCardTracker::with_message_path(crew.message_path.clone());
+    for card in ["## Your capabilities\n- first\n", "## Your capabilities\n- second\n"] {
+        observe_card(&backend, "flotilla", &session, card, &tracker).await.expect("observe");
+    }
+    let before = primitives.rows_read();
+    observe_card(&backend, "flotilla", &session, "## Your capabilities\n- third\n", &tracker).await.expect("card change");
+    let after = primitives.rows_read();
+    (after.loaded - before.loaded, after.converted - before.converted)
+}
+
+// Behaviour: a card change loads only its pending notice and admission's read-back, whatever else
+// the crew holds, and converts only that read-back (#3108).
+#[tokio::test]
+async fn a_card_change_reads_its_notices_without_converting_them() {
+    assert_eq!(read_by_a_card_change(5).await, (2, 1), "five other messages");
+    assert_eq!(read_by_a_card_change(60).await, (2, 1), "sixty other messages");
+}

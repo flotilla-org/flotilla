@@ -1881,7 +1881,12 @@ impl MessagePrimitives {
             let Some((id, home)) = self.locate_in(&inbox, record).map_err(ResourceError::other)? else { continue };
             let Some((_, created, resource)) = self.load_at(id, home)? else { continue };
             if let Some(standing) = standing(receiver.to_owned(), &resource, created) {
-                sent.push(flotilla_messaging::SentMessage { standing, body: view::body_text(resource.spec().body.value()) });
+                let spec = resource.spec();
+                sent.push(flotilla_messaging::SentMessage {
+                    standing,
+                    body: view::body_text(spec.body.value()),
+                    supersedes: spec.supersedes.as_ref().and_then(|older| record_name(&older.name)),
+                });
             }
         }
         Ok(sent)
