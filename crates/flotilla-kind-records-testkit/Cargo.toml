@@ -1,0 +1,24 @@
+[package]
+name = "flotilla-kind-records-testkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+flotilla-resources = { path = "../flotilla-resources" }
+async-trait = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+
+[lints]
+workspace = true

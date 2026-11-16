@@ -30,6 +30,7 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
+flotilla-kind-records-testkit = { path = "../flotilla-kind-records-testkit" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
 flotilla-log-testkit = { path = "../flotilla-log-testkit" }

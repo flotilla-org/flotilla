@@ -3255,6 +3255,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-kind-records-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "flotilla-build-features-async",
+ "flotilla-resources",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "flotilla-load-driver"
 version = "0.1.0"
 dependencies = [
@@ -3595,6 +3609,7 @@ dependencies = [
  "flotilla-discovery-testkit",
  "flotilla-engine-store",
  "flotilla-environment",
+ "flotilla-kind-records-testkit",
  "flotilla-log-testkit",
  "flotilla-paths",
  "flotilla-protocol",
