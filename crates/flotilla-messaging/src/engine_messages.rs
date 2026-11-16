@@ -61,35 +61,30 @@ pub trait EngineMessages: Send + Sync {
     /// Whether `receiver`'s inbox (an old address) holds the message `record`, local or
     /// replicated, read by its exact identity without loading it.
     async fn holds(&self, namespace: &str, receiver: &str, record: &str) -> Result<bool, flotilla_resources::ResourceError>;
-    /// Where the message `record` in the inbox `intent` is admitted to stands, local or replicated.
+    /// An old-shaped intent in the engine's terms, its parties and references resolved as
+    /// admission resolved them.
+    // Goes once every producer builds its intent in the engine's terms (#3108).
+    async fn intent_of(
+        &self,
+        namespace: &str,
+        old: &flotilla_resources::MessageSpec,
+    ) -> Result<crate::Intent, flotilla_resources::ResourceError>;
+    /// Where the message `record` in `inbox` stands, local or replicated.
     async fn admitted(
         &self,
-        namespace: &str,
-        intent: &flotilla_resources::MessageSpec,
+        inbox: &flotilla_address::Address,
         record: &str,
     ) -> Result<Option<AdmittedMessage>, flotilla_resources::ResourceError>;
-    /// The delivered message in the inbox `intent` is admitted to that suppresses `intent`, if one
-    /// does: one from the same sender about the same subject revision, awaiting a reply or an
-    /// outcome (ADR 0055). Its record name.
-    async fn open_superseded(
-        &self,
-        namespace: &str,
-        intent: &flotilla_resources::MessageSpec,
-    ) -> Result<Option<String>, flotilla_resources::ResourceError>;
+    /// The delivered message in `intent`'s inbox that suppresses `intent`, if one does: one from
+    /// the same sender about the same subject revision, awaiting a reply or an outcome
+    /// (ADR 0055). Its record name.
+    async fn open_superseded(&self, intent: &crate::Intent) -> Result<Option<String>, flotilla_resources::ResourceError>;
     /// The last message admitted to `intent`'s inbox from its sender that is still waiting for
-    /// delivery, local or replicated, read as in `intent`'s receiver.
-    async fn undelivered_from(
-        &self,
-        namespace: &str,
-        intent: &flotilla_resources::MessageSpec,
-    ) -> Result<Option<SentMessage>, flotilla_resources::ResourceError>;
+    /// delivery, local or replicated.
+    async fn undelivered_from(&self, intent: &crate::Intent) -> Result<Option<SentMessage>, flotilla_resources::ResourceError>;
     /// The last open message admitted to `intent`'s inbox from its sender that expects a reply
     /// and refers to one of what `intent` refers to, local or replicated: its record name.
-    async fn awaited_reply_from(
-        &self,
-        namespace: &str,
-        intent: &flotilla_resources::MessageSpec,
-    ) -> Result<Option<String>, flotilla_resources::ResourceError>;
+    async fn awaited_reply_from(&self, intent: &crate::Intent) -> Result<Option<String>, flotilla_resources::ResourceError>;
     /// The messages to `seats` (old crew addresses) still waiting for delivery that a supervisor
     /// sent and no fleet role did, local or replicated, in admission order.
     async fn queued_briefs(&self, namespace: &str, seats: &[String]) -> Result<Vec<SentMessage>, flotilla_resources::ResourceError>;
@@ -110,17 +105,13 @@ pub trait EngineMessages: Send + Sync {
         namespace: &str,
         named: &[(String, String)],
     ) -> Result<Vec<SentMessage>, flotilla_resources::ResourceError>;
-    /// Admits an intent at this home, its receiver's; a repeated name is the message already admitted.
-    async fn admit(
-        &self,
-        namespace: &str,
-        name: &str,
-        intent: &flotilla_resources::MessageSpec,
-    ) -> Result<flotilla_resources::ResourceObject<flotilla_resources::Message>, flotilla_resources::ResourceError>;
+    /// Admits an intent at this home, its receiver's; a repeated name is the message already
+    /// admitted, and a delivered message about the same subject may answer instead (ADR 0055).
+    async fn admit(&self, name: &str, intent: &crate::Intent) -> Result<crate::Admitted, flotilla_resources::ResourceError>;
     /// Where the message `intent` replies to stands, read as its admission
     /// reads it: in this home's replica, or at its home on a miss. With no
     /// `in_reply_to` it is absent.
-    async fn resolve_in_reply_to(&self, namespace: &str, intent: &flotilla_resources::MessageSpec) -> MessageResolution;
+    async fn resolve_in_reply_to(&self, intent: &crate::Intent) -> MessageResolution;
     /// An operator withdraws a queued message to `receiver` (an old address) homed here, on the
     /// convoy's authority.
     async fn withdraw(&self, namespace: &str, receiver: &str, record: &str, convoy: &str) -> Result<(), String>;
@@ -133,7 +124,7 @@ pub trait EngineMessages: Send + Sync {
         &self,
         namespace: &str,
         name: &str,
-        intent: &flotilla_resources::MessageSpec,
+        intent: &crate::Intent,
         home: &str,
         kind: &str,
         about: Option<&str>,

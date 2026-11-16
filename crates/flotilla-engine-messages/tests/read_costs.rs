@@ -61,7 +61,7 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
 
     for n in 0..SETTLED {
         let name = format!("settled-{n}");
-        primitives.admit(NAMESPACE, &name, &intent(BUSY, &name)).await.expect("admit");
+        primitives.admit_old(NAMESPACE, &name, &intent(BUSY, &name)).await.expect("admit");
         let (id, _) = primitives.locate_in(&inbox, &name).expect("locate").expect("admitted");
         primitives.inbox().receive(&session, &id, Transport::Turn).await.expect("receipt");
         primitives.inbox().deliver(&id, Deliver { receiver: session.clone(), transport: Transport::Turn }).await.expect("deliver");
@@ -70,24 +70,25 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     let mark = Timestamp::from_datetime(&chrono::Utc::now());
     for n in 0..2 {
         let name = format!("late-{n}");
-        primitives.admit(NAMESPACE, &name, &intent(BUSY, &name)).await.expect("admit");
+        primitives.admit_old(NAMESPACE, &name, &intent(BUSY, &name)).await.expect("admit");
         let (id, _) = primitives.locate_in(&inbox, &name).expect("locate").expect("admitted");
         primitives.inbox().receive(&session, &id, Transport::Turn).await.expect("receipt");
         primitives.inbox().deliver(&id, Deliver { receiver: session.clone(), transport: Transport::Turn }).await.expect("deliver");
     }
     for n in 0..3 {
         let name = format!("waiting-{n}");
-        primitives.admit(NAMESPACE, &name, &intent(BUSY, &name)).await.expect("admit");
+        primitives.admit_old(NAMESPACE, &name, &intent(BUSY, &name)).await.expect("admit");
     }
     for n in 0..2 {
         let name = format!("quiet-{n}");
-        primitives.admit(NAMESPACE, &name, &intent(QUIET, &name)).await.expect("admit");
+        primitives.admit_old(NAMESPACE, &name, &intent(QUIET, &name)).await.expect("admit");
     }
     let to_person = MessageSpec { sender: "system:stall-judge".into(), ..intent(PERSON, "stalled") };
-    primitives.admit(NAMESPACE, "for-a-person", &to_person).await.expect("admit");
+    primitives.admit_old(NAMESPACE, "for-a-person", &to_person).await.expect("admit");
     let total = SETTLED + 2 + 3 + 2 + 1;
 
-    let (waiting, cost) = measured(primitives.undelivered_from(NAMESPACE, &intent(BUSY, "next"))).await;
+    let next = primitives.intent_of(NAMESPACE, &intent(BUSY, "next")).await.expect("intent");
+    let (waiting, cost) = measured_now(|| primitives.undelivered_from(&next));
     assert_eq!(waiting.expect("pending read").expect("waiting").standing.name, "waiting-2");
     assert_eq!(cost, (3, 0), "a pending read loads only the waiting messages and converts none");
 
@@ -95,7 +96,8 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     assert_eq!(settled.expect("by-name read").expect("held").object.metadata.name, "settled-17");
     assert_eq!(cost, (1, 1), "a by-name read loads and converts one message");
 
-    let (named, cost) = measured(primitives.admitted(NAMESPACE, &intent(QUIET, "quiet-1"), "quiet-1")).await;
+    let quiet_inbox = primitives.intent_of(NAMESPACE, &intent(QUIET, "quiet-1")).await.expect("intent").inbox;
+    let (named, cost) = measured_now(|| primitives.admitted(&quiet_inbox, "quiet-1"));
     assert_eq!(named.expect("by-name read").expect("held").superseded_by, None);
     assert_eq!(cost, (1, 0), "a by-name read for an intent loads one message and converts none");
 
@@ -107,7 +109,8 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     assert!(held.expect("hold read").is_some(), "the waiting messages hold delivery");
     assert_eq!(cost.0, 3, "a delivery hold loads only the waiting messages");
 
-    let (awaited, cost) = measured(primitives.awaited_reply_from(NAMESPACE, &intent(BUSY, "ruling"))).await;
+    let ruling = primitives.intent_of(NAMESPACE, &intent(BUSY, "ruling")).await.expect("intent");
+    let (awaited, cost) = measured_now(|| primitives.awaited_reply_from(&ruling));
     assert_eq!(awaited.expect("open read"), None, "no open message expects a reply");
     assert_eq!(cost, (3, 0), "an open read loads only the open messages and converts none");
 

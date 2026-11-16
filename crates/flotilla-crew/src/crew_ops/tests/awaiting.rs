@@ -8,8 +8,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use flotilla_address::Address;
+use flotilla_engine_messages::{
+    convert::{Conversion, ReferenceAddresses},
+    roles::FleetRoles,
+};
+use flotilla_messaging::Intent;
 use flotilla_resources::{
-    Message, MessageExpectation, MessageSpec, ObjectMeta, ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance,
+    Message, MessageExpectation, MessageReference, MessageSpec, ObjectMeta, ReadResourceObject, ResourceError, ResourceObject,
+    ResourceProvenance,
 };
 
 use super::fixture_with_message_path;
@@ -21,19 +28,44 @@ use flotilla_messaging::EngineMessages;
 /// first `failures` record writes, and records what it is asked to end.
 struct RecordingMessages {
     admitted: Mutex<BTreeMap<String, ResourceObject<Message>>>,
+    /// Each old-shaped intent the port converted, by its conversion: the reads answer from it.
+    converted: Mutex<Vec<(Intent, MessageSpec)>>,
     failures: AtomicUsize,
     records: Mutex<Vec<(String, String)>>,
     ended: Mutex<Vec<(Vec<String>, Option<String>)>>,
+}
+
+/// The records these tests' intents refer to: the convoys and projects they name.
+struct Named;
+impl ReferenceAddresses for Named {
+    fn address(&self, reference: &MessageReference) -> Result<Address, String> {
+        match reference {
+            MessageReference::ControlRecord { resource, .. } if resource.kind == "Convoy" => {
+                Address::convoy(&resource.name).map_err(|error| error.to_string())
+            }
+            MessageReference::ControlRecord { resource, .. } if resource.kind == "Project" => {
+                Address::project(&resource.name).map_err(|error| error.to_string())
+            }
+            other => Err(format!("{other:?} is not named in these tests")),
+        }
+    }
 }
 
 impl RecordingMessages {
     fn new(failures: usize) -> Arc<Self> {
         Arc::new(Self {
             admitted: Mutex::default(),
+            converted: Mutex::default(),
             failures: AtomicUsize::new(failures),
             records: Mutex::default(),
             ended: Mutex::default(),
         })
+    }
+
+    /// The old-shaped intent `intent` was converted from.
+    fn old(&self, intent: &Intent) -> MessageSpec {
+        let converted = self.converted.lock().expect("converted");
+        converted.iter().rev().find(|(held, _)| held == intent).map(|(_, old)| old.clone()).expect("an intent the port converted")
     }
 
     /// The admitted messages to `receivers`; nothing admitted here is delivered.
@@ -76,19 +108,25 @@ impl EngineMessages for RecordingMessages {
     async fn holds(&self, _namespace: &str, receiver: &str, record: &str) -> Result<bool, ResourceError> {
         Ok(self.admitted.lock().expect("admitted").get(record).is_some_and(|object| object.spec.receiver == receiver))
     }
-    async fn admitted(
-        &self,
-        _namespace: &str,
-        intent: &MessageSpec,
-        record: &str,
-    ) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
+    async fn intent_of(&self, _namespace: &str, old: &MessageSpec) -> Result<Intent, ResourceError> {
+        let roles = FleetRoles::declared("fleet").expect("declared roles");
+        let intent = Conversion { roles: &roles, forges: &[], records: &Named }.intent(old).map_err(ResourceError::invalid)?;
+        self.converted.lock().expect("converted").push((intent.clone(), old.clone()));
+        Ok(intent)
+    }
+    async fn admitted(&self, inbox: &Address, record: &str) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
         let admitted = self.admitted.lock().expect("admitted").get(record).cloned();
-        Ok(admitted.filter(|object| object.spec.receiver == intent.receiver).map(|object| flotilla_messaging::AdmittedMessage {
+        let converted = self.converted.lock().expect("converted").clone();
+        let in_inbox = |object: &ResourceObject<Message>| {
+            converted.iter().any(|(intent, old)| intent.inbox == *inbox && old.receiver == object.spec.receiver)
+        };
+        Ok(admitted.filter(in_inbox).map(|object| flotilla_messaging::AdmittedMessage {
             home: self.home(),
             superseded_by: object.status.and_then(|status| status.canonical_predecessor).map(|predecessor| predecessor.name),
         }))
     }
-    async fn open_superseded(&self, _namespace: &str, intent: &MessageSpec) -> Result<Option<String>, ResourceError> {
+    async fn open_superseded(&self, intent: &Intent) -> Result<Option<String>, ResourceError> {
+        let intent = &self.old(intent);
         // A delivered message from the same sender about the same subject, awaiting its answer.
         Ok(self.admitted_to(std::slice::from_ref(&intent.receiver)).into_iter().find_map(|read| {
             let held = &read.object;
@@ -98,16 +136,14 @@ impl EngineMessages for RecordingMessages {
             (same && awaiting).then(|| held.metadata.name.clone())
         }))
     }
-    async fn undelivered_from(
-        &self,
-        _namespace: &str,
-        intent: &MessageSpec,
-    ) -> Result<Option<flotilla_messaging::SentMessage>, ResourceError> {
+    async fn undelivered_from(&self, intent: &Intent) -> Result<Option<flotilla_messaging::SentMessage>, ResourceError> {
+        let intent = &self.old(intent);
         let from =
             self.admitted_to(std::slice::from_ref(&intent.receiver)).into_iter().filter(|read| read.object.spec.sender == intent.sender);
         Ok(from.max_by_key(|read| read.object.metadata.creation_timestamp).map(|read| sent(&read.object)))
     }
-    async fn awaited_reply_from(&self, _namespace: &str, intent: &MessageSpec) -> Result<Option<String>, ResourceError> {
+    async fn awaited_reply_from(&self, intent: &Intent) -> Result<Option<String>, ResourceError> {
+        let intent = &self.old(intent);
         let awaiting = self.admitted_to(std::slice::from_ref(&intent.receiver)).into_iter().filter(|read| {
             let held = &read.object.spec;
             held.sender == intent.sender
@@ -148,27 +184,27 @@ impl EngineMessages for RecordingMessages {
             .map(sent)
             .collect())
     }
-    async fn admit(&self, namespace: &str, name: &str, intent: &MessageSpec) -> Result<ResourceObject<Message>, ResourceError> {
+    async fn admit(&self, name: &str, intent: &Intent) -> Result<flotilla_messaging::Admitted, ResourceError> {
         let object = ResourceObject {
             metadata: ObjectMeta {
                 name: name.to_owned(),
-                namespace: namespace.to_owned(),
+                namespace: "flotilla".to_owned(),
                 resource_version: String::new(),
                 labels: Default::default(),
-                annotations: BTreeMap::from([(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION.to_owned(), "home-a".to_owned())]),
+                annotations: Default::default(),
                 owner_references: Vec::new(),
                 finalizers: Vec::new(),
                 deletion_timestamp: None,
                 creation_timestamp: chrono::Utc::now(),
                 merge: None,
             },
-            spec: intent.clone(),
+            spec: self.old(intent),
             status: None,
         };
-        self.admitted.lock().expect("admitted").insert(name.to_owned(), object.clone());
-        Ok(object)
+        self.admitted.lock().expect("admitted").insert(name.to_owned(), object);
+        Ok(flotilla_messaging::Admitted { record: name.to_owned(), home: self.home() })
     }
-    async fn resolve_in_reply_to(&self, _namespace: &str, intent: &MessageSpec) -> flotilla_messaging::MessageResolution {
+    async fn resolve_in_reply_to(&self, intent: &Intent) -> flotilla_messaging::MessageResolution {
         match &intent.in_reply_to {
             Some(original) if self.admitted.lock().expect("admitted").contains_key(original) => {
                 flotilla_messaging::MessageResolution::Found
@@ -186,7 +222,7 @@ impl EngineMessages for RecordingMessages {
         &self,
         _namespace: &str,
         name: &str,
-        _intent: &MessageSpec,
+        _intent: &Intent,
         home: &str,
         kind: &str,
         _about: Option<&str>,

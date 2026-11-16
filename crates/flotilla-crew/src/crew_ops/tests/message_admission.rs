@@ -97,7 +97,7 @@ async fn read_by_one_turn(count: usize) -> (u64, u64) {
             .relation(MessageRelation::System)
             .body(format!("open {index}"))
             .build();
-        primitives.admit("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
+        primitives.admit_old("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
     }
     let reference = MessageReference::ControlRecord {
         resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", held.launch.clone()),
@@ -125,8 +125,7 @@ async fn read_by_one_turn(count: usize) -> (u64, u64) {
 #[tokio::test]
 async fn a_turn_finds_what_it_supersedes_without_converting_open_messages() {
     let (small, large) = (read_by_one_turn(5).await, read_by_one_turn(60).await);
-    // Admission reads the admitted turn back in the old shape until intents are in the engine's.
-    assert_eq!((small.1, large.1), (1, 1), "no open message is converted: {small:?} {large:?}");
+    assert_eq!((small.1, large.1), (0, 0), "no open message is converted: {small:?} {large:?}");
     assert_eq!(large.0 - small.0, 55, "each open message is loaded once: {small:?} {large:?}");
 }
 
@@ -148,7 +147,7 @@ async fn read_by_follow_ups(count: usize) -> (u64, u64) {
             .relation(MessageRelation::Supervisor)
             .body(format!("continue {index}"))
             .build();
-        primitives.admit("flotilla", &name, &intent).await.expect("admit the follow-up");
+        primitives.admit_old("flotilla", &name, &intent).await.expect("admit the follow-up");
         held.messages().deliver_turn(&receiver, &name, "session").await;
         let mut status = held.engine.view(&backend, &launch).await.status.unwrap_or_default();
         let coder = flotilla_resources::CrewWorkState::builder()
@@ -200,9 +199,8 @@ async fn remote_suppression_restores_workflow_before_replication() {
             assert_eq!(document["kind"], "Message");
             let spec: MessageSpec = serde_json::from_value(document["spec"].clone()).unwrap();
             let name = document["metadata"]["name"].as_str().unwrap();
-            let record = self.0.primitives().admit(namespace, name, &spec).await.map_err(|error| error.to_string())?;
-            let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
-            Ok((ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name), home))
+            let admitted = self.0.primitives().admit_old(namespace, name, &spec).await.map_err(|error| error.to_string())?;
+            Ok((ResourceRef::new("flotilla.work/v1", "Message", namespace, admitted.record), Some(admitted.home)))
         }
     }
     let (crew, backend, probe, held) = fixture(CrewWorkPhase::Done).await;
@@ -222,7 +220,7 @@ async fn remote_suppression_restores_workflow_before_replication() {
         .subject(subject.clone())
         .expectation(MessageExpectation::Reply)
         .build();
-    inbox.primitives().admit("flotilla", "canonical", &existing).await.unwrap();
+    inbox.primitives().admit_old("flotilla", "canonical", &existing).await.unwrap();
     inbox.deliver_turn(&held.receiver("work", "coder"), "canonical", "session").await;
     let publisher = Arc::new(ReceiverPublisher(inbox));
     let publisher_port: Arc<dyn ResourceIntentPublisher> = publisher.clone();
@@ -279,7 +277,7 @@ async fn turn_admission_errors_restore_the_owned_activation() {
                 .relation(flotilla_resources::MessageRelation::System)
                 .body("concurrent intent".into())
                 .build();
-            self.primitives.admit(namespace, &name, &spec).await.map_err(|error| error.to_string())?;
+            self.primitives.admit_old(namespace, &name, &spec).await.map_err(|error| error.to_string())?;
             Ok(())
         }
     }

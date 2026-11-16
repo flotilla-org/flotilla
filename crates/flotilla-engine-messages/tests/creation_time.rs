@@ -53,8 +53,7 @@ async fn a_message_reads_its_admission_time_after_it_is_delivered() {
         .relation(MessageRelation::System)
         .body("review the plan".into())
         .build();
-    let admitted = primitives.admit(NAMESPACE, "plan", &intent).await.expect("admit");
-    assert_eq!(admitted.metadata.creation_timestamp, at(1_000), "admission answers with its own time");
+    primitives.admit_old(NAMESPACE, "plan", &intent).await.expect("admit");
 
     clock.set(at(2_000));
     let (id, _) = primitives.locate_in(&inbox, "plan").expect("locate").expect("admitted");

@@ -2,7 +2,7 @@
 //! Messages only through these methods, from the engine store's replica in
 //! the old shape.
 
-use flotilla_messaging::{MessageAdmission, SentMessage};
+use flotilla_messaging::{Admitted, Intent, SentMessage};
 use flotilla_resources::{InputMeta, MessageSpec, ResourceError};
 
 use crate::crew_ops::CrewService;
@@ -12,10 +12,17 @@ impl CrewService {
         crate::ports::installed_messages(&self.message_path)
     }
 
+    /// An old-shaped intent in the engine's terms, as admission takes it.
+    // Goes once every producer builds its intent in the engine's terms (#3108).
+    async fn intent_of(&self, namespace: &str, old: &MessageSpec) -> Result<Intent, ResourceError> {
+        self.message_primitives()?.intent_of(namespace, old).await
+    }
+
     /// Where the Message `intent` replies to stands, read as its admission reads it.
     pub(crate) async fn resolve_in_reply_to(&self, namespace: &str, intent: &MessageSpec) -> flotilla_messaging::MessageResolution {
-        match self.message_primitives() {
-            Ok(primitives) => primitives.resolve_in_reply_to(namespace, intent).await,
+        let resolved = async { Ok::<_, ResourceError>((self.message_primitives()?, self.intent_of(namespace, intent).await?)) };
+        match resolved.await {
+            Ok((primitives, intent)) => primitives.resolve_in_reply_to(&intent).await,
             Err(error) => flotilla_messaging::MessageResolution::Unknown(error.to_string()),
         }
     }
@@ -39,25 +46,29 @@ impl CrewService {
         intent: &MessageSpec,
         name: &str,
     ) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
-        self.message_primitives()?.admitted(namespace, intent, name).await
+        let intent = self.intent_of(namespace, intent).await?;
+        self.message_primitives()?.admitted(&intent.inbox, name).await
     }
 
     /// The delivered Message in the inbox `intent` is admitted to that suppresses `intent`, if
     /// one does: its name.
     pub(crate) async fn open_superseded(&self, namespace: &str, intent: &MessageSpec) -> Result<Option<String>, ResourceError> {
-        self.message_primitives()?.open_superseded(namespace, intent).await
+        let intent = self.intent_of(namespace, intent).await?;
+        self.message_primitives()?.open_superseded(&intent).await
     }
 
     /// The last Message from `intent`'s sender to its receiver still waiting for delivery, local or
     /// replicated.
     pub(crate) async fn undelivered_from(&self, namespace: &str, intent: &MessageSpec) -> Result<Option<SentMessage>, ResourceError> {
-        self.message_primitives()?.undelivered_from(namespace, intent).await
+        let intent = self.intent_of(namespace, intent).await?;
+        self.message_primitives()?.undelivered_from(&intent).await
     }
 
     /// The last open Message from `intent`'s sender to its receiver expecting a reply about one of
     /// what `intent` refers to, local or replicated: its name.
     pub(crate) async fn awaited_reply_from(&self, namespace: &str, intent: &MessageSpec) -> Result<Option<String>, ResourceError> {
-        self.message_primitives()?.awaited_reply_from(namespace, intent).await
+        let intent = self.intent_of(namespace, intent).await?;
+        self.message_primitives()?.awaited_reply_from(&intent).await
     }
 
     /// The Messages to `seats` still waiting for delivery that a supervisor sent and no fleet role
@@ -80,17 +91,30 @@ impl CrewService {
     /// its producer key's digest, so a repeated name is the message already
     /// admitted; admission answers with another message when a delivered one
     /// about the same subject suppresses it (ADR 0055).
-    pub(crate) async fn admit_message(
+    pub(crate) async fn admit_message(&self, namespace: &str, meta: &InputMeta, spec: &MessageSpec) -> Result<Admitted, ResourceError> {
+        let intent = self.intent_of(namespace, spec).await?;
+        self.message_primitives()?.admit(&meta.name, &intent).await
+    }
+
+    /// Records the sender's half of a send expecting a reply or an outcome once it is admitted at
+    /// `home`: an AwaitingReply record of `kind`, about `about` when given.
+    pub(crate) async fn await_reply(
         &self,
         namespace: &str,
-        meta: &InputMeta,
-        spec: &MessageSpec,
-    ) -> Result<MessageAdmission, ResourceError> {
-        let admitted = self.message_primitives()?.admit(namespace, &meta.name, spec).await?;
-        Ok(if admitted.metadata.name == meta.name {
-            MessageAdmission::Accepted(admitted)
-        } else {
-            MessageAdmission::Suppressed { predecessor: admitted }
-        })
+        name: &str,
+        intent: &MessageSpec,
+        home: &str,
+        kind: &str,
+        about: Option<&str>,
+    ) -> Result<bool, String> {
+        let engine = self.message_primitives().map_err(|error| error.to_string())?;
+        let intent = match self.intent_of(namespace, intent).await {
+            Ok(intent) => intent,
+            // A system producer with no fleet role has no inbox to receive the
+            // reply, so nothing awaits it; recording nothing is the answer.
+            Err(_) if intent.sender.starts_with("system:") => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        };
+        engine.await_reply(namespace, name, &intent, home, kind, about).await
     }
 }

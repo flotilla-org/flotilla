@@ -1007,7 +1007,7 @@ async fn read_by_one_judgement(others: usize) -> (u64, u64, u64) {
             .relation(flotilla_resources::MessageRelation::System)
             .body(format!("turn {index}"))
             .build();
-        home.messages.primitives().admit("flotilla", &format!("turn-{index}"), &intent).await.expect("admit the turn");
+        home.messages.primitives().admit_old("flotilla", &format!("turn-{index}"), &intent).await.expect("admit the turn");
         objects.insert(launch, convoy);
     }
     for convoy in objects.values() {
@@ -1135,11 +1135,11 @@ async fn stall_message_scenario(repeat_report: bool, restart: bool) {
                 .references(request.references.clone())
                 .expectation(request.expectation.clone())
                 .build();
-            let object = self.0.primitives().admit("flotilla", &name, &spec).await.map_err(|error| error.to_string())?;
+            let object = self.0.primitives().admit_old("flotilla", &name, &spec).await.map_err(|error| error.to_string())?;
             Ok(CrewTurnAdmission {
                 new_turn: true,
                 rung: TurnDeliveryRung::WarmSession,
-                message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", object.metadata.name),
+                message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", object.record),
             })
         }
         async fn hold(&self, _: &CrewTurnIntent, _: &HoldAct, _: &str) -> Result<(), String> {

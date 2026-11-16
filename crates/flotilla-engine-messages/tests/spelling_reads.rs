@@ -114,7 +114,7 @@ async fn open_read(unrelated: usize) -> ReadSnapshot {
             .relation(MessageRelation::System)
             .body(name.into())
             .build();
-        primitives.admit(NAMESPACE, name, &intent).await.expect("admit");
+        primitives.admit_old(NAMESPACE, name, &intent).await.expect("admit");
     }
 
     let before = backend.read_snapshot();

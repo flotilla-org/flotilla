@@ -66,7 +66,7 @@ async fn subject_supersession_follows_identity_and_expectation() {
         let primitives = home.primitives();
         let first =
             spec(has_subject.then(|| change_request("head")), if open { MessageExpectation::Reply } else { MessageExpectation::None });
-        primitives.admit(NAMESPACE, "first", &first).await.expect("first");
+        primitives.admit_old(NAMESPACE, "first", &first).await.expect("first");
         if delivered {
             home.deliver_turn(RECEIVER, "first", "session").await;
         }
@@ -82,10 +82,10 @@ async fn subject_supersession_follows_identity_and_expectation() {
         if !same_receiver {
             second.receiver = "flotilla/convoy/work/reviewer".into();
         }
-        let admitted = primitives.admit(NAMESPACE, "second", &second).await.expect("second");
+        let admitted = primitives.admit_old(NAMESPACE, "second", &second).await.expect("second");
         let matches = has_subject && same_revision && same_sender && same_receiver;
         let suppressed = matches && delivered && open;
-        assert_eq!(admitted.metadata.name == "first", suppressed, "case {case:06b}: suppressed");
+        assert_eq!(admitted.record == "first", suppressed, "case {case:06b}: suppressed");
         let superseded =
             matches!(state(primitives, RECEIVER, "first").await, MessageState::Dropped { reason: DropReason::Superseded { .. }, .. });
         assert_eq!(superseded, matches && !delivered, "case {case:06b}: the first superseded");
@@ -108,7 +108,7 @@ async fn concurrent_same_subject_admissions_leave_one_pending_message() {
     for index in 0..8 {
         let primitives = Arc::clone(&primitives);
         let spec = original.clone();
-        tasks.push(tokio::spawn(async move { primitives.admit(NAMESPACE, &format!("message-{index}"), &spec).await.expect("admit") }));
+        tasks.push(tokio::spawn(async move { primitives.admit_old(NAMESPACE, &format!("message-{index}"), &spec).await.expect("admit") }));
     }
     for task in tasks {
         task.await.expect("join");

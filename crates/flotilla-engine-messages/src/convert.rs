@@ -10,18 +10,20 @@
 //! other end, or of a convoy the message refers to, and the fleet otherwise.
 
 use chrono::{DateTime, Utc};
-use flotilla_address::{Address, Condition, Kind};
+use flotilla_address::{Address, Condition, Kind, Revision};
+use flotilla_messaging::{Intent, IntentExpectation, IntentReference};
 use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
 use flotilla_resources::{
     address::{leaf_address, stored_change_request_address, stored_issue_address, stored_repository_address},
     convoy::engine::{launch_address, split_launch},
     convoy_of_segment, ForgeSpec, MessageExpectation, MessageReference, MessageRelation, MessageSpec as OldSpec,
 };
-use flotilla_state_machines::machines::message::{
-    Expectation, MessageBody, MessageRef, MessageReference as Reference, MessageSpec, Relation,
-};
+use flotilla_state_machines::machines::message::{MessageBody, MessageRef, MessageReference as Reference, MessageSpec, Relation};
 
-use super::roles::{FleetRoles, OPERATOR, PERSON_ROLES};
+use super::{
+    admission::engine_spec,
+    roles::{FleetRoles, OPERATOR, PERSON_ROLES},
+};
 
 /// How long an inbox may stay unbound before a message to it may be dropped
 /// as undeliverable: a crew's holder can take this long to provision or
@@ -244,9 +246,8 @@ impl Conversion<'_> {
         Ok(Reference { address, revision: revision.clone(), subject })
     }
 
-    /// The new spec of an old one. `message` maps an old message name (a
-    /// reply's original, a supersession's predecessor) to its reference.
-    pub fn spec(&self, old: &OldSpec, message: &dyn Fn(&str) -> Result<MessageRef, String>) -> Result<MessageSpec, String> {
+    /// An old spec as a producer's intent in the engine's terms.
+    pub fn intent(&self, old: &OldSpec) -> Result<Intent, String> {
         let inbox = self.receiver(old)?;
         let project = inbox.get(Kind::Project).map(str::to_owned);
         let mut references = Vec::with_capacity(old.references.len());
@@ -254,28 +255,43 @@ impl Conversion<'_> {
         for reference in &old.references {
             let subject = !subject_found && old.subject.as_ref() == Some(reference);
             subject_found |= subject;
-            references.push(self.reference(reference, subject)?);
+            let Reference { address, revision, subject } = self.reference(reference, subject)?;
+            let revision = Revision::new(revision).map_err(|error| format!("reference {address}: {error}"))?;
+            references.push(IntentReference { address, revision, subject });
         }
         if !subject_found {
             return Err("the subject is not one of the references".into());
         }
-        let body = body(&old.body, old.body_digest.as_deref())?;
         let expectation = match &old.expectation {
-            MessageExpectation::None => Expectation::Nothing,
-            MessageExpectation::Reply => Expectation::Reply,
-            MessageExpectation::Outcome { condition } => Expectation::Outcome { condition: self.condition(condition, project.as_deref())? },
+            MessageExpectation::None => IntentExpectation::Nothing,
+            MessageExpectation::Reply => IntentExpectation::Reply,
+            MessageExpectation::Outcome { condition } => {
+                IntentExpectation::Outcome { condition: self.condition(condition, project.as_deref())? }
+            }
         };
         let delivery_condition = old.delivery_condition.as_ref().map(|leaf| self.condition(leaf, project.as_deref())).transpose()?;
-        Ok(MessageSpec {
+        Ok(Intent {
+            sender: self.sender_of(old)?,
+            inbox,
+            relation: old.relation,
+            body: body_text(&old.body, old.body_digest.as_deref()),
             references,
-            in_reply_to: old.in_reply_to.as_deref().map(message).transpose()?,
-            supersedes: old.supersedes.as_deref().map(message).transpose()?,
+            in_reply_to: old.in_reply_to.clone(),
+            supersedes: old.supersedes.clone(),
             expectation,
-            deadline: old.deadline.as_ref().map(timestamp),
-            unbound_after: UNBOUND_AFTER.num_microseconds().expect("bounded"),
+            deadline: old.deadline,
             delivery_condition,
-            ..MessageSpec::new(self.sender_of(old)?, inbox, relation(old.relation), body)
+            principal: old.sender.strip_prefix("principal:").map(str::to_owned),
         })
+    }
+
+    /// The new spec of an old one. `message` maps an old message name (a
+    /// reply's original, a supersession's predecessor) to its reference.
+    pub fn spec(&self, old: &OldSpec, message: &dyn Fn(&str) -> Result<MessageRef, String>) -> Result<MessageSpec, String> {
+        let intent = self.intent(old)?;
+        let in_reply_to = intent.in_reply_to.as_deref().map(message).transpose()?;
+        let supersedes = intent.supersedes.as_deref().map(message).transpose()?;
+        engine_spec(&intent, in_reply_to, supersedes)
     }
 }
 
@@ -292,11 +308,14 @@ pub fn relation(relation: MessageRelation) -> Relation {
 /// The body as prose. A terminal body the old audit sweep compacted (empty,
 /// its digest kept) says exactly what was lost.
 pub fn body(text: &str, digest: Option<&str>) -> Result<flotilla_schema::Frozen<MessageBody>, String> {
-    let text = match digest {
+    MessageBody::text(body_text(text, digest)).map_err(|error| format!("body: {error}"))
+}
+
+fn body_text(text: &str, digest: Option<&str>) -> String {
+    match digest {
         Some(digest) if text.is_empty() => format!("[compacted body sha256:{digest}]"),
         _ => text.to_owned(),
-    };
-    MessageBody::text(text).map_err(|error| format!("body: {error}"))
+    }
 }
 
 pub fn timestamp(at: &DateTime<Utc>) -> flotilla_schema::Timestamp {

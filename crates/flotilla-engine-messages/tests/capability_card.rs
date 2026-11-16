@@ -75,7 +75,7 @@ async fn a_capability_card_is_admitted_about_its_sessions_seat() {
         .references(vec![subject.clone()])
         .subject(subject.clone())
         .build();
-    primitives.admit(NAMESPACE, &name, &card).await.expect("the card is admitted");
+    primitives.admit_old(NAMESPACE, &name, &card).await.expect("the card is admitted");
 
     let inbox = primitives.inbox_for(NAMESPACE, receiver).await.expect("the receiver's inbox");
     let (id, _) = primitives.locate_in(&inbox, &name).expect("locate").expect("the admitted card");

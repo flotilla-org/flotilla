@@ -2033,7 +2033,7 @@ mod tests {
                 .relation(MessageRelation::System)
                 .body(name.into())
                 .build();
-            home.primitives().admit("flotilla", name, &intent).await.expect("admit");
+            home.primitives().admit_old("flotilla", name, &intent).await.expect("admit");
         }
         home.deliver_turn("flotilla/coder", "settled", "session-coder").await;
         let views = super::crew_message_views(&backend, "flotilla").await.expect("message views");

@@ -41,7 +41,7 @@ async fn a_seats_vessel_probes_are_bounded_by_the_homes() {
     let many = seat_spelled(32).await;
     assert_eq!(few, many, "the probes do not grow with the other convoys' vessels");
     assert_eq!(many.whole, 0, "no home's vessels are read whole");
-    assert_eq!(many.newest, 4, "the admission's and the view's spellings each probe each of the two homes once");
+    assert_eq!(many.newest, 2, "the view's spelling probes each of the two homes once");
 }
 
 /// The vessel reads made while a message naming the seat is admitted and viewed.
@@ -153,7 +153,7 @@ async fn seat_spelled(others: usize) -> VesselReads {
         .body("about the seat".into())
         .references(vec![seat.clone()])
         .build();
-    primitives.admit(NAMESPACE, &name, &intent).await.expect("admit");
+    primitives.admit_old(NAMESPACE, &name, &intent).await.expect("admit");
 
     let view = primitives.view_to(NAMESPACE, receiver, &name).await.expect("view").expect("the message's view").object;
     assert_eq!(view.spec.references, vec![seat], "the seat is spelled as the session its vessel at `third` holds");

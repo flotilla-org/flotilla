@@ -68,8 +68,8 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
             assert_eq!(document["kind"], "Message");
             let spec: MessageSpec = serde_json::from_value(document["spec"].clone()).expect("Message intent");
             let name = document["metadata"]["name"].as_str().expect("message name");
-            let record = self.messages.primitives().admit(namespace, name, &spec).await.map_err(|error| error.to_string())?;
-            Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
+            let admitted = self.messages.primitives().admit_old(namespace, name, &spec).await.map_err(|error| error.to_string())?;
+            Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, admitted.record))
         }
     }
     let (crew, backend, probe, held) = shaped_fixture(CrewWorkPhase::Working, with_review(receiver_phase == CrewWorkPhase::Done)).await;
@@ -273,7 +273,8 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
             .build();
         let messages = held.messages().messages();
         if escalation_visible {
-            messages.admit("flotilla", "source-escalation", &escalation).await.expect("escalation");
+            let escalation = messages.intent_of("flotilla", &escalation).await.expect("intent");
+            messages.admit("source-escalation", &escalation).await.expect("escalation");
         }
         // No visible escalation and no supervision index must produce an unlinked ruling,
         // rather than inventing a record ID.
@@ -331,7 +332,8 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
         async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<ResourceRef, String> {
             let name = document["metadata"]["name"].as_str().expect("name").to_string();
             let spec: MessageSpec = serde_json::from_value(document["spec"].clone()).expect("intent");
-            self.messages.admit(namespace, &name, &spec).await.map_err(|error| error.to_string())?;
+            let intent = self.messages.intent_of(namespace, &spec).await.map_err(|error| error.to_string())?;
+            self.messages.admit(&name, &intent).await.map_err(|error| error.to_string())?;
             let convoy = self.backend.using::<ResourceConvoy>(namespace).get(&self.launch).await.map_err(|error| error.to_string())?;
             self.engine.abandon(&convoy, "operator", "torn down").await?;
             Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, name))
@@ -444,7 +446,7 @@ async fn read_by_a_repeated_hold(count: usize) -> (u64, u64) {
             .relation(flotilla_resources::MessageRelation::System)
             .body(format!("open {index}"))
             .build();
-        primitives.admit("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
+        primitives.admit_old("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
     }
     let request = crate::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".into())
@@ -688,7 +690,8 @@ impl TurnDeliveryActuator for Delivery {
             .body(request.brief.clone())
             .build();
         let name = flotilla_resources::message_record_name(receiver, &request.sender, &request.source);
-        let record = self.messages.admit(&request.namespace, &name, &intent).await.map_err(|error| error.to_string())?;
+        let intent = self.messages.intent_of(&request.namespace, &intent).await.map_err(|error| error.to_string())?;
+        let record = self.messages.admit(&name, &intent).await.map_err(|error| error.to_string())?;
         let convoys = self.backend.using::<ResourceConvoy>(&request.namespace);
         if request.convoy == self.launch && request.vessel == "work" && request.role == "deputy" {
             // The receiver's home delivers it the turn: its task is noted.
@@ -701,7 +704,7 @@ impl TurnDeliveryActuator for Delivery {
                     request.role.clone(),
                     Utc::now(),
                     request.brief.clone(),
-                    Some(record.metadata.name.clone()),
+                    Some(record.record.clone()),
                     ResumeIntent::Reopen,
                 ),
             )
@@ -735,7 +738,7 @@ impl TurnDeliveryActuator for Delivery {
         Ok(CrewTurnAdmission {
             new_turn: true,
             rung: flotilla_resources::TurnDeliveryRung::WarmSession,
-            message: ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name),
+            message: ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.record),
         })
     }
 }

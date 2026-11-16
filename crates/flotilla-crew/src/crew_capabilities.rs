@@ -523,7 +523,8 @@ async fn publish_card_revision(
         .subject(subject)
         .maybe_supersedes(supersedes)
         .build();
-    primitives.admit(namespace, &name, &spec).await.map_err(|error| error.to_string())?;
+    let intent = primitives.intent_of(namespace, &spec).await.map_err(|error| error.to_string())?;
+    primitives.admit(&name, &intent).await.map_err(|error| error.to_string())?;
     Ok((name, digest))
 }
 

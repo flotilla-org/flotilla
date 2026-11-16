@@ -620,7 +620,7 @@ async fn engine_records_are_not_read_through_another_namespace() {
         .relation(MessageRelation::Peer)
         .body("a".into())
         .build();
-    home.primitives().admit("flotilla", "to-coder", &spec).await.expect("admit");
+    home.primitives().admit_old("flotilla", "to-coder", &spec).await.expect("admit");
     let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
     let items = |reply: Reply| {
         assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
@@ -648,7 +648,7 @@ async fn engine_served_kind_refuses_an_undeclared_query_field() {
         .relation(MessageRelation::Peer)
         .body("a".into())
         .build();
-    home.primitives().admit("flotilla", "to-coder", &spec).await.expect("admit");
+    home.primitives().admit_old("flotilla", "to-coder", &spec).await.expect("admit");
     let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
     let reply = daemon
         .call(CallerAuth::Socket(None), get("/apis/flotilla.work/v1/namespaces/flotilla/messages?fieldSelector=spec.unknown%3Dx"))
@@ -678,7 +678,7 @@ async fn message_queries_answer_only_the_engine_messages_they_select() {
         ("to-reviewer", intent("flotilla/coder", "flotilla/reviewer", "c")),
         ("answer", MessageSpec { in_reply_to: Some("to-coder-a".into()), ..intent("flotilla/coder", "flotilla/reviewer", "d") }),
     ] {
-        primitives.admit("flotilla", name, &spec).await.unwrap_or_else(|error| panic!("admit {name}: {error}"));
+        primitives.admit_old("flotilla", name, &spec).await.unwrap_or_else(|error| panic!("admit {name}: {error}"));
     }
     let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
     let names = |reply: Reply| {

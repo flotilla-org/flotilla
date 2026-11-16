@@ -3309,6 +3309,7 @@ dependencies = [
  "async-trait",
  "bon",
  "chrono",
+ "flotilla-address",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",

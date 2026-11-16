@@ -466,7 +466,7 @@ async fn message_to_coder(case: &Case, name: &str, body: &str) {
         .body(body.into())
         .relation(flotilla_resources::MessageRelation::Supervisor)
         .build();
-    case.home.messages.messages().admit("flotilla", name, &spec).await.expect("message accepted");
+    case.home.messages.primitives().admit_old("flotilla", name, &spec).await.expect("message accepted");
 }
 
 /// Records Message `name` delivered to the coder's session at `at`, as its delivery does.

@@ -10,6 +10,7 @@
 //! ports here ([`OldStoreRecords`]), so each kind that moves later swaps
 //! one implementation.
 
+pub mod admission;
 pub mod attention;
 pub mod attentions;
 pub mod awaiting;
@@ -1005,67 +1006,92 @@ impl MessagePrimitives {
         Ok(self.roles_or_wait(namespace).await?.err())
     }
 
-    /// Admits an old-shaped intent at this home, its receiver's: maps it onto
-    /// the engine spec and enqueues it as `<inbox>/message:<record name>`.
-    /// A repeated name is the message already admitted.
-    pub async fn admit(&self, namespace: &str, name: &str, intent: &OldSpec) -> Result<ResourceObject<OldMessage>, ResourceError> {
-        Ok(self.admit_at(namespace, name, intent).await?.1)
+    /// An old-shaped intent in the engine's terms, as admission takes it.
+    // Goes once every producer builds its intent in the engine's terms (#3108).
+    pub async fn intent_of(&self, namespace: &str, old: &OldSpec) -> Result<flotilla_messaging::Intent, ResourceError> {
+        // Held to the old spec's rules first, as the old store held it (an interrupt only from a
+        // supervisor, references holding the subject).
+        <OldMessage as flotilla_resources::Resource>::validate_spec(
+            &flotilla_resources::InputMeta::builder().name("intent".to_owned()).build(),
+            old,
+        )?;
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        self.spell(&mut OldStoreRecords::empty(namespace), |records| {
+            Conversion { roles: &roles, forges: records.forges(), records }.intent(old)
+        })
+        .await?
+        .map_err(ResourceError::invalid)
+    }
+
+    /// Admits an old-shaped intent: [`Self::intent_of`], then [`Self::admit`].
+    // Goes once every producer builds its intent in the engine's terms (#3108).
+    pub async fn admit_old(&self, namespace: &str, name: &str, old: &OldSpec) -> Result<flotilla_messaging::Admitted, ResourceError> {
+        let intent = self.intent_of(namespace, old).await?;
+        self.admit(name, &intent).await
+    }
+
+    /// Records the sender's half of an old-shaped send: [`Self::intent_of`], then
+    /// [`Self::await_reply`]. A system producer with no fleet role has no inbox to receive the
+    /// reply, so nothing awaits it.
+    // Goes once every producer builds its intent in the engine's terms (#3108).
+    pub async fn await_reply_old(
+        &self,
+        namespace: &str,
+        name: &str,
+        old: &OldSpec,
+        home: &str,
+        kind: &str,
+        about: Option<&str>,
+    ) -> Result<bool, String> {
+        let intent = match self.intent_of(namespace, old).await {
+            Ok(intent) => intent,
+            Err(_) if old.sender.starts_with("system:") => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        };
+        self.await_reply(namespace, name, &intent, home, kind, about).await
+    }
+
+    /// Admits an intent at this home, its receiver's: maps it onto the engine spec and enqueues it
+    /// as `<inbox>/message:<record name>`. A repeated name is the message already admitted.
+    pub async fn admit(&self, name: &str, intent: &flotilla_messaging::Intent) -> Result<flotilla_messaging::Admitted, ResourceError> {
+        let (_, admitted) = self.admit_at(name, intent).await?;
+        Ok(admitted)
     }
 
     /// [`Self::admit`], with the admitted message's engine address.
     pub(crate) async fn admit_at(
         &self,
-        namespace: &str,
         name: &str,
-        intent: &OldSpec,
-    ) -> Result<(String, ResourceObject<OldMessage>), ResourceError> {
-        // The producer's intent is still the old spec: it is held to that spec's rules first, as
-        // the old store held it (an interrupt only from a supervisor, references holding the subject).
-        <OldMessage as flotilla_resources::Resource>::validate_spec(
-            &flotilla_resources::InputMeta::builder().name(name.to_owned()).build(),
-            intent,
-        )?;
-        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        intent: &flotilla_messaging::Intent,
+    ) -> Result<(String, flotilla_messaging::Admitted), ResourceError> {
+        intent.validate().map_err(ResourceError::invalid)?;
         // A message about a subject revision replaces an undelivered one from the same sender to the
         // same receiver about it, and is suppressed while a delivered one awaits its answer
         // (ADR 0055); one that names what it supersedes supersedes only that.
         let _subject_admission =
-            if intent.subject.is_some() && intent.supersedes.is_none() { Some(self.subject_admission.lock().await) } else { None };
+            if intent.subject().is_some() && intent.supersedes.is_none() { Some(self.subject_admission.lock().await) } else { None };
         let implied;
-        let intent = match self.same_subject_as(namespace, name, intent).await? {
+        let intent = match self.same_subject_as(name, intent)? {
             None => intent,
             Some(SameSubject::Undelivered(older)) => {
-                implied = OldSpec { supersedes: Some(older), ..intent.clone() };
+                implied = flotilla_messaging::Intent { supersedes: Some(older), ..intent.clone() };
                 &implied
             }
-            Some(SameSubject::Answering { id, home, record }) => {
-                let object = self.admitted_answer(namespace, &roles, id.clone(), home, &record, intent).await;
-                return Ok((id, object));
-            }
+            Some(SameSubject::Answering { id, home, record }) => return Ok((id, flotilla_messaging::Admitted { record, home })),
         };
-        let mut records = OldStoreRecords::empty(namespace);
-        let (sender, receiver) = self
-            .spell(&mut records, |records| {
-                let conversion = Conversion { roles: &roles, forges: &[], records };
-                (conversion.sender_of(intent), conversion.receiver(intent))
-            })
-            .await?;
         // The messages it names, read from this replica, or at their home on a miss.
         let mut referenced = BTreeMap::new();
         // A reply's original was sent to this sender; a successor's predecessor to this receiver.
-        for (old, inbox) in [(&intent.in_reply_to, sender), (&intent.supersedes, receiver)] {
+        for (old, inbox) in [(&intent.in_reply_to, &intent.sender), (&intent.supersedes, &intent.inbox)] {
             let Some(old) = old else { continue };
-            let read = self.read_message(old, inbox.map_err(ResourceError::invalid)?).await.map_err(ResourceError::invalid)?;
+            let read = self.read_message(old, inbox.clone()).await.map_err(ResourceError::invalid)?;
             referenced.insert(old.clone(), read);
         }
         let spec = {
-            let message = |old: &str| -> Result<MessageRef, String> {
-                let read = referenced.get(old).ok_or_else(|| format!("message `{old}` was not read"))?;
-                Ok(MessageRef::new(read.id.clone(), read.home.clone()))
+            let message = |old: &Option<String>| {
+                old.as_ref().and_then(|old| referenced.get(old)).map(|read| MessageRef::new(read.id.clone(), read.home.clone()))
             };
-            self.spell(&mut records, |records| Conversion { roles: &roles, forges: records.forges(), records }.spec(intent, &message))
-                .await?
-                .map_err(ResourceError::invalid)?
+            admission::engine_spec(intent, message(&intent.in_reply_to), message(&intent.supersedes)).map_err(ResourceError::invalid)?
         };
         // Admission's reads of the messages it names, at the versions read.
         self.world.update(|world| {
@@ -1080,7 +1106,7 @@ impl MessagePrimitives {
         let id = self.inbox.enqueue_as(spec, name).await.map_err(|error| ResourceError::invalid(error.to_string()))?;
         // Who acted is audit (#3938): a person sends as the role they hold, so the record names the
         // role and the admission trace names the principal as given, or that none was named.
-        if let Some(principal) = intent.sender.strip_prefix("principal:") {
+        if let Some(principal) = intent.principal.as_deref() {
             let principal = if principal == flotilla_protocol::PrincipalRef::IMPLICIT_NAME { "none named" } else { principal };
             flotilla_tracing::queued_span(&id, "principal")
                 .in_scope(|| tracing::info!(message.principal = principal, "message sent by a person"));
@@ -1100,44 +1126,10 @@ impl MessagePrimitives {
         if let Some(older) = supersedes.filter(|older| older.home == self.home) {
             // A successor that awaits a reply withdraws its predecessor's record once
             // its own is written (`await_reply`), so the sender never reads as not waiting.
-            let awaits = !matches!(intent.expectation, flotilla_resources::MessageExpectation::None);
+            let awaits = !matches!(intent.expectation, flotilla_messaging::IntentExpectation::Nothing);
             self.supersede(&older.name, &id, !awaits).await;
         }
-        let object = self.admitted_answer(namespace, &roles, id.clone(), self.home.clone(), name, intent).await;
-        Ok((id, object))
-    }
-
-    /// The admitted message `id`, held at `home`, as its producer is answered: its old-shaped view,
-    /// or, when none can be shaped, the producer's intent stamped as the engine stored it. Either
-    /// names `home`, where the sender records its awaiting reply (#3587 layer 7).
-    async fn admitted_answer(
-        &self,
-        namespace: &str,
-        roles: &FleetRoles,
-        id: String,
-        home: String,
-        record: &str,
-        intent: &OldSpec,
-    ) -> ResourceObject<OldMessage> {
-        let mut object = match self.view_at(namespace, roles, id.clone(), home.clone()).await {
-            Ok(Some(view)) => view.object,
-            // The engine keeps no vessel; when no holder names it, answer with the producer's own intent.
-            unshaped => {
-                if let Err(error) = unshaped {
-                    tracing::warn!(message = %record, %error, "admitted message has no old-shaped view; answering with its intent");
-                }
-                let stored = match self.load_at(id, home.clone()) {
-                    Ok(stored) => stored.map(|(_, created, resource)| (created.to_datetime(), resource.version().0.to_string())),
-                    Err(error) => {
-                        tracing::warn!(message = %record, %error, "admitted message did not load; answering with its intent as of now");
-                        None
-                    }
-                };
-                admitted_intent(namespace, record, intent, stored)
-            }
-        };
-        object.metadata.annotations.insert(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION.to_owned(), home);
-        object
+        Ok((id, flotilla_messaging::Admitted { record: name.to_owned(), home: self.home.clone() }))
     }
 
     /// Records the sender's half of a send expecting a reply or an outcome
@@ -1149,34 +1141,20 @@ impl MessagePrimitives {
         &self,
         namespace: &str,
         name: &str,
-        intent: &OldSpec,
+        intent: &flotilla_messaging::Intent,
         home: &str,
         kind: &str,
         about: Option<&str>,
     ) -> Result<bool, String> {
-        use flotilla_resources::MessageExpectation;
+        use flotilla_messaging::IntentExpectation;
         use flotilla_state_machines::machines::awaiting_reply::{Awaited, AwaitingReplySpec};
         let awaited = match intent.expectation {
-            MessageExpectation::None => return Ok(false),
-            MessageExpectation::Reply => Awaited::Reply,
-            MessageExpectation::Outcome { .. } => Awaited::Outcome,
+            IntentExpectation::Nothing => return Ok(false),
+            IntentExpectation::Reply => Awaited::Reply,
+            IntentExpectation::Outcome { .. } => Awaited::Outcome,
         };
         let roles = self.roles(namespace).await?;
-        let (sender, recipient) = self
-            .spell(&mut OldStoreRecords::empty(namespace), |records| {
-                let conversion = Conversion { roles: &roles, forges: &[], records };
-                (conversion.sender_of(intent), conversion.receiver(intent))
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        let sender = match sender {
-            Ok(sender) => sender,
-            // A system producer with no fleet role has no inbox to receive the
-            // reply, so nothing awaits it; recording nothing is the answer.
-            Err(_) if intent.sender.starts_with("system:") => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        let recipient = recipient?;
+        let (sender, recipient) = (intent.sender.clone(), intent.inbox.clone());
         let message = MessageRef::new(Address::message(&recipient, name).map_err(|error| error.to_string())?.as_str(), home);
         let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
         let subject = about.map(|about| conversion.stall_subject(about)).transpose()?;
@@ -1346,21 +1324,9 @@ impl MessagePrimitives {
 
     /// Where the message `intent` replies to stands, read as its admission
     /// reads it: in this replica, or at its home on a miss.
-    pub async fn resolve_in_reply_to(&self, namespace: &str, intent: &OldSpec) -> MessageResolution {
+    pub async fn resolve_in_reply_to(&self, intent: &flotilla_messaging::Intent) -> MessageResolution {
         let Some(original) = &intent.in_reply_to else { return MessageResolution::Absent };
-        let inbox = async {
-            let roles = self.roles(namespace).await?;
-            self.spell(&mut OldStoreRecords::empty(namespace), |records| {
-                Conversion { roles: &roles, forges: &[], records }.sender_of(intent)
-            })
-            .await
-            .map_err(|error| error.to_string())?
-        };
-        let found = match inbox.await {
-            Ok(inbox) => self.find_message(original, inbox).await,
-            Err(error) => Err(error),
-        };
-        match found {
+        match self.find_message(original, intent.sender.clone()).await {
             Ok(Some(_)) => MessageResolution::Found,
             Ok(None) => MessageResolution::Absent,
             Err(error) => MessageResolution::Unknown(error),
@@ -1711,27 +1677,10 @@ impl MessagePrimitives {
             .ok_or_else(|| format!("message `{record}` is not in this home's replica"))
     }
 
-    /// Where the message `record` in the inbox `intent` is admitted to stands, read by its exact
+    /// Where the message `record` in `inbox` stands, read by its exact
     /// identity: the home holding it and what superseded it. Nothing of it is spelled.
-    pub async fn admitted(
-        &self,
-        namespace: &str,
-        intent: &OldSpec,
-        record: &str,
-    ) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
-        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let inbox = self
-            .spell(&mut OldStoreRecords::empty(namespace), |records| Conversion { roles: &roles, forges: &[], records }.receiver(intent))
-            .await?;
-        // No message is admitted to a receiver that converts to no inbox.
-        let inbox = match inbox {
-            Ok(inbox) => inbox,
-            Err(error) => {
-                tracing::debug!(%record, %error, "a receiver with no inbox holds no message");
-                return Ok(None);
-            }
-        };
-        let Some((id, home)) = self.locate_in(&inbox, record).map_err(ResourceError::other)? else { return Ok(None) };
+    pub fn admitted(&self, inbox: &Address, record: &str) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
+        let Some((id, home)) = self.locate_in(inbox, record).map_err(ResourceError::other)? else { return Ok(None) };
         let Some((home, _, resource)) = self.load_at(id, home)? else { return Ok(None) };
         let superseded_by = match resource.state() {
             MessageState::Dropped { reason: DropReason::Superseded { by }, .. } => Some(by.name().to_owned()),
@@ -1742,58 +1691,42 @@ impl MessagePrimitives {
 
     /// What admitting `intent` as `name` meets about its subject: nothing for an intent that
     /// names what it supersedes, has no subject, or is already admitted under `name`.
-    async fn same_subject_as(&self, namespace: &str, name: &str, intent: &OldSpec) -> Result<Option<SameSubject>, ResourceError> {
-        if intent.subject.is_none() || intent.supersedes.is_some() {
+    fn same_subject_as(&self, name: &str, intent: &flotilla_messaging::Intent) -> Result<Option<SameSubject>, ResourceError> {
+        if intent.subject().is_none() || intent.supersedes.is_some() {
             return Ok(None);
         }
-        let inbox = self.inbox_for(namespace, &intent.receiver).await.map_err(ResourceError::invalid)?;
-        if self.locate_in(&inbox, name).map_err(ResourceError::other)?.is_some() {
+        if self.locate_in(&intent.inbox, name).map_err(ResourceError::other)?.is_some() {
             return Ok(None);
         }
-        self.same_subject(namespace, intent, true).await
+        self.same_subject(intent, true)
     }
 
-    /// The delivered message in the inbox `intent` is admitted to that suppresses `intent`, if one
-    /// does: one from the sender `intent` converts to, about the subject revision it converts to,
-    /// awaiting a reply or an outcome (ADR 0055). Admission suppresses `intent` by it too; a
-    /// producer that must act before admitting asks first. Its record name.
-    pub async fn open_superseded(&self, namespace: &str, intent: &OldSpec) -> Result<Option<String>, ResourceError> {
-        Ok(match self.same_subject(namespace, intent, false).await? {
+    /// The delivered message in `intent`'s inbox that suppresses `intent`, if one does: one from
+    /// its sender about its subject revision, awaiting a reply or an outcome (ADR 0055).
+    /// Admission suppresses `intent` by it too; a producer that must act before admitting asks
+    /// first. Its record name.
+    pub fn open_superseded(&self, intent: &flotilla_messaging::Intent) -> Result<Option<String>, ResourceError> {
+        Ok(match self.same_subject(intent, false)? {
             Some(SameSubject::Answering { record, .. }) => Some(record),
             _ => None,
         })
     }
 
-    /// The open message in the inbox `intent` is admitted to from the sender it converts to about
-    /// the subject revision it converts to: delivered and awaiting a reply or an outcome, which
-    /// suppresses it, or, when `undelivered` is asked for, undelivered at this home, which
-    /// `intent` replaces. Each message is compared as the engine holds it; only the intent is
-    /// converted, as admission converts it.
-    async fn same_subject(&self, namespace: &str, intent: &OldSpec, undelivered: bool) -> Result<Option<SameSubject>, ResourceError> {
-        let Some(subject) = &intent.subject else { return Ok(None) };
-        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let converted = self
-            .spell(&mut OldStoreRecords::empty(namespace), |records| -> Result<_, String> {
-                let conversion = Conversion { roles: &roles, forges: records.forges(), records };
-                Ok((conversion.receiver(intent)?, conversion.sender_of(intent)?, conversion.reference(subject, true)?))
-            })
-            .await?;
-        let (inbox, sender, subject) = match converted {
-            Ok(converted) => converted,
-            Err(error) => {
-                tracing::debug!(%error, "an intent that does not convert supersedes nothing");
-                return Ok(None);
-            }
-        };
+    /// The open message in `intent`'s inbox from its sender about its subject revision: delivered
+    /// and awaiting a reply or an outcome, which suppresses it, or, when `undelivered` is asked
+    /// for, undelivered at this home, which `intent` replaces.
+    fn same_subject(&self, intent: &flotilla_messaging::Intent, undelivered: bool) -> Result<Option<SameSubject>, ResourceError> {
+        let Some(subject) = intent.subject() else { return Ok(None) };
+        let (inbox, sender) = (&intent.inbox, &intent.sender);
         let same = |message: &Resource<Message>| {
             let spec = message.spec();
             let about = spec.references.iter().rev().find(|reference| reference.subject);
-            let same =
-                spec.sender == sender && about.is_some_and(|about| about.address == subject.address && about.revision == subject.revision);
+            let same = spec.sender == *sender
+                && about.is_some_and(|about| about.address == subject.address && about.revision == subject.revision.as_str());
             same.then(|| record_name(message.name())).flatten()
         };
         // A suppressing message is delivered, so the undelivered are read only when asked for.
-        for (home, message) in self.in_inbox(&inbox, MessageLabel::Awaiting).map_err(ResourceError::other)? {
+        for (home, message) in self.in_inbox(inbox, MessageLabel::Awaiting).map_err(ResourceError::other)? {
             if matches!(message.spec().expectation, Expectation::Nothing) {
                 continue;
             }
@@ -1804,7 +1737,7 @@ impl MessagePrimitives {
         if !undelivered {
             return Ok(None);
         }
-        for (home, message) in self.in_inbox(&inbox, MessageLabel::Pending).map_err(ResourceError::other)? {
+        for (home, message) in self.in_inbox(inbox, MessageLabel::Pending).map_err(ResourceError::other)? {
             if home == self.home {
                 if let Some(record) = same(&message) {
                     return Ok(Some(SameSubject::Undelivered(record)));
@@ -1906,35 +1839,29 @@ impl MessagePrimitives {
         Ok(sent)
     }
 
-    /// The last message admitted to `intent`'s inbox from its sender, both converted as admission
-    /// converts them, that is still waiting for delivery: read through the inbox's pending index.
-    pub async fn undelivered_from(
-        &self,
-        namespace: &str,
-        intent: &OldSpec,
-    ) -> Result<Option<flotilla_messaging::SentMessage>, ResourceError> {
-        let parties = self.parties(namespace, intent).await?;
+    /// The last message admitted to `intent`'s inbox from its sender that is still waiting for
+    /// delivery: read through the inbox's pending index.
+    pub fn undelivered_from(&self, intent: &flotilla_messaging::Intent) -> Result<Option<flotilla_messaging::SentMessage>, ResourceError> {
         let Some(row) = self
-            .pending_in(&parties.inbox)
+            .pending_in(&intent.inbox)
             .map_err(ResourceError::other)?
             .into_iter()
-            .rfind(|(_, message)| message.spec().sender == parties.sender)
+            .rfind(|(_, message)| message.spec().sender == intent.sender)
         else {
             return Ok(None);
         };
         let created = self.created_of(std::slice::from_ref(&row))?;
-        Ok(created.into_iter().next().and_then(|created| sent_message(intent.receiver.clone(), &row.1, created)))
+        Ok(created.into_iter().next().and_then(|created| sent_message(intent.inbox.to_string(), &row.1, created)))
     }
 
-    /// The last open message admitted to `intent`'s inbox from its sender, both converted as
-    /// admission converts them, that expects a reply and refers to one of what `intent` refers to:
-    /// its record name. Read through the inbox's open indexes.
-    pub async fn awaited_reply_from(&self, namespace: &str, intent: &OldSpec) -> Result<Option<String>, ResourceError> {
-        let parties = self.parties(namespace, intent).await?;
-        let found = self.open_in(&parties.inbox).map_err(ResourceError::other)?.into_iter().filter_map(|(_, message)| {
+    /// The last open message admitted to `intent`'s inbox from its sender that expects a reply
+    /// and refers to one of what `intent` refers to: its record name. Read through the inbox's
+    /// open indexes.
+    pub fn awaited_reply_from(&self, intent: &flotilla_messaging::Intent) -> Result<Option<String>, ResourceError> {
+        let found = self.open_in(&intent.inbox).map_err(ResourceError::other)?.into_iter().filter_map(|(_, message)| {
             let spec = message.spec();
-            let refers = spec.references.iter().any(|reference| parties.references.contains(&reference.address));
-            let awaited = spec.sender == parties.sender && spec.expectation == Expectation::Reply && refers;
+            let refers = spec.references.iter().any(|reference| intent.references.iter().any(|cited| cited.address == reference.address));
+            let awaited = spec.sender == intent.sender && spec.expectation == Expectation::Reply && refers;
             let admitted = spec.admitted_seq;
             awaited.then_some((admitted, message))
         });
@@ -1969,23 +1896,6 @@ impl MessagePrimitives {
         }
         briefs.sort_by_key(|brief| brief.standing.accepted_sequence);
         Ok(briefs)
-    }
-
-    /// `intent`'s sender, inbox and the addresses it refers to, converted as admission converts
-    /// them on the records they name.
-    async fn parties(&self, namespace: &str, intent: &OldSpec) -> Result<Parties, ResourceError> {
-        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        self.spell(&mut OldStoreRecords::empty(namespace), |records| -> Result<Parties, String> {
-            let conversion = Conversion { roles: &roles, forges: &[], records };
-            let references = intent
-                .references
-                .iter()
-                .map(|reference| Ok(conversion.reference(reference, false)?.address))
-                .collect::<Result<_, String>>()?;
-            Ok(Parties { sender: conversion.sender_of(intent)?, inbox: conversion.receiver(intent)?, references })
-        })
-        .await?
-        .map_err(ResourceError::invalid)
     }
 
     /// Each of `inboxes`' open messages, the last one admitted among those settled and the one
@@ -2106,60 +2016,29 @@ enum SameSubject {
     Answering { id: String, home: String, record: String },
 }
 
-/// The producer's own intent as admitted as `name`, when no view of it can be shaped: stamped with
-/// its stored creation and version when `stored` holds them, so a repeat answers the same.
-fn admitted_intent(
-    namespace: &str,
-    name: &str,
-    intent: &OldSpec,
-    stored: Option<(chrono::DateTime<chrono::Utc>, String)>,
-) -> ResourceObject<OldMessage> {
-    let (now, resource_version) = stored.unwrap_or_else(|| (chrono::Utc::now(), String::new()));
-    ResourceObject {
-        metadata: flotilla_resources::ObjectMeta {
-            name: name.to_owned(),
-            namespace: namespace.to_owned(),
-            resource_version,
-            labels: Default::default(),
-            annotations: Default::default(),
-            owner_references: Vec::new(),
-            finalizers: Vec::new(),
-            deletion_timestamp: None,
-            creation_timestamp: now,
-            merge: None,
-        },
-        spec: intent.clone(),
-        status: Some(flotilla_resources::MessageStatus {
-            phase: flotilla_resources::MessagePhase::Deliverable,
-            since: now,
-            reason: Some("waiting for its consumer".into()),
-            ..Default::default()
-        }),
-    }
-}
-
 /// Crew code's port onto this path (`flotilla_messaging::EngineMessages`).
 #[async_trait::async_trait]
 impl flotilla_messaging::EngineMessages for MessagePrimitives {
     async fn holds(&self, namespace: &str, receiver: &str, record: &str) -> Result<bool, ResourceError> {
         MessagePrimitives::holds(self, namespace, receiver, record).await
     }
-    async fn admitted(
+    async fn intent_of(&self, namespace: &str, old: &OldSpec) -> Result<flotilla_messaging::Intent, ResourceError> {
+        MessagePrimitives::intent_of(self, namespace, old).await
+    }
+    async fn admitted(&self, inbox: &Address, record: &str) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
+        MessagePrimitives::admitted(self, inbox, record)
+    }
+    async fn open_superseded(&self, intent: &flotilla_messaging::Intent) -> Result<Option<String>, ResourceError> {
+        MessagePrimitives::open_superseded(self, intent)
+    }
+    async fn undelivered_from(
         &self,
-        namespace: &str,
-        intent: &OldSpec,
-        record: &str,
-    ) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
-        MessagePrimitives::admitted(self, namespace, intent, record).await
+        intent: &flotilla_messaging::Intent,
+    ) -> Result<Option<flotilla_messaging::SentMessage>, ResourceError> {
+        MessagePrimitives::undelivered_from(self, intent)
     }
-    async fn open_superseded(&self, namespace: &str, intent: &OldSpec) -> Result<Option<String>, ResourceError> {
-        MessagePrimitives::open_superseded(self, namespace, intent).await
-    }
-    async fn undelivered_from(&self, namespace: &str, intent: &OldSpec) -> Result<Option<flotilla_messaging::SentMessage>, ResourceError> {
-        MessagePrimitives::undelivered_from(self, namespace, intent).await
-    }
-    async fn awaited_reply_from(&self, namespace: &str, intent: &OldSpec) -> Result<Option<String>, ResourceError> {
-        MessagePrimitives::awaited_reply_from(self, namespace, intent).await
+    async fn awaited_reply_from(&self, intent: &flotilla_messaging::Intent) -> Result<Option<String>, ResourceError> {
+        MessagePrimitives::awaited_reply_from(self, intent)
     }
     async fn queued_briefs(&self, namespace: &str, seats: &[String]) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
         MessagePrimitives::queued_briefs(self, namespace, seats).await
@@ -2179,11 +2058,11 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     ) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
         MessagePrimitives::sent_messages(self, namespace, named).await
     }
-    async fn admit(&self, namespace: &str, name: &str, intent: &OldSpec) -> Result<ResourceObject<OldMessage>, ResourceError> {
-        MessagePrimitives::admit(self, namespace, name, intent).await
+    async fn admit(&self, name: &str, intent: &flotilla_messaging::Intent) -> Result<flotilla_messaging::Admitted, ResourceError> {
+        MessagePrimitives::admit(self, name, intent).await
     }
-    async fn resolve_in_reply_to(&self, namespace: &str, intent: &OldSpec) -> MessageResolution {
-        MessagePrimitives::resolve_in_reply_to(self, namespace, intent).await
+    async fn resolve_in_reply_to(&self, intent: &flotilla_messaging::Intent) -> MessageResolution {
+        MessagePrimitives::resolve_in_reply_to(self, intent).await
     }
     async fn withdraw(&self, namespace: &str, receiver: &str, record: &str, convoy: &str) -> Result<(), String> {
         MessagePrimitives::withdraw(self, namespace, receiver, record, convoy).await
@@ -2195,7 +2074,7 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
         &self,
         namespace: &str,
         name: &str,
-        intent: &OldSpec,
+        intent: &flotilla_messaging::Intent,
         home: &str,
         kind: &str,
         about: Option<&str>,
@@ -2272,7 +2151,7 @@ impl flotilla_messaging::CharterNotices for EngineCharterNotices {
             .map(|(_, name)| name))
     }
     async fn admit(&self, name: &str, spec: &OldSpec, _: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
-        self.primitives.admit(&self.namespace, name, spec).await.map(|_| ())
+        self.primitives.admit_old(&self.namespace, name, spec).await.map(|_| ())
     }
 }
 
@@ -2327,15 +2206,6 @@ fn standing(seat: String, resource: &Resource<Message>, created: CreatedAt) -> O
         since: view::since(resource),
         delivered_at: view::delivered_at(resource),
     })
-}
-
-/// Each `named` (receiver, record) message's inbox, with its receiver and record; a receiver with
-/// no inbox names none.
-/// A message's parties and references as admission converts an intent's.
-struct Parties {
-    sender: Address,
-    inbox: Address,
-    references: Vec<Address>,
 }
 
 /// A message read as in `seat`: where it stands, with its body and the message it supersedes.

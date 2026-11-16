@@ -90,7 +90,7 @@ async fn a_turn_header_frames_as_the_old_view_did() {
             .build(),
     ];
     for (index, intent) in intents.iter().enumerate() {
-        primitives.admit(NAMESPACE, &format!("turn-{index}"), intent).await.expect("admit");
+        primitives.admit_old(NAMESPACE, &format!("turn-{index}"), intent).await.expect("admit");
     }
 
     let roles = primitives.roles(NAMESPACE).await.expect("fleet roles");

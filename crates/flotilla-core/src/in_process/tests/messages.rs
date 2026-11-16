@@ -182,7 +182,7 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         .body("request".into())
         .build();
     designate_fleet(&backend).await;
-    install_engine_messages(&daemon).admit("flotilla", "system-request", &original).await.expect("original system request");
+    install_engine_messages(&daemon).admit_old("flotilla", "system-request", &original).await.expect("original system request");
     let reply = serde_json::json!({"spec":{"sender":"flotilla/c/work/coder","receiver":"system:turn-rules","relation":"peer","body":"answer","in_reply_to":"system-request"}});
     assert_eq!(daemon.message_creation_origin("flotilla", &reply).await.expect("system reply home"), Some(daemon.node_id().clone()));
     let convoys = backend.using::<ResourceConvoy>("flotilla");
@@ -254,7 +254,7 @@ async fn message_send_reads_ignore_unrelated_history() {
                     .relation(MessageRelation::System)
                     .body("unrelated".into())
                     .build();
-                primitives.admit("flotilla", &format!("history-{index}"), &unrelated).await.expect("unrelated message");
+                primitives.admit_old("flotilla", &format!("history-{index}"), &unrelated).await.expect("unrelated message");
             }
         }
         let document = serde_json::json!({
@@ -334,7 +334,7 @@ async fn a_persons_message_traces_its_principal_and_records_its_role() {
             .relation(flotilla_resources::MessageRelation::Peer)
             .body("ruling".into())
             .build();
-        primitives.admit("flotilla", name, &intent).await.expect("admitted");
+        primitives.admit_old("flotilla", name, &intent).await.expect("admitted");
         assert_eq!(stored_sender(&primitives, "system:turn-rules", name).await, "fleet:lab/role:operator", "the record names the role");
         let logged = String::from_utf8(lines.0.lock().expect("lines").clone()).expect("UTF-8");
         assert!(logged.contains(&format!("message.principal=\"{traced}\"")), "{logged}");
@@ -372,7 +372,7 @@ async fn a_declared_principal_reads_back_under_its_own_name() {
         .relation(MessageRelation::Peer)
         .body("approved".into())
         .build();
-    primitives.admit("flotilla", "from-alice", &intent).await.expect("admitted");
+    primitives.admit_old("flotilla", "from-alice", &intent).await.expect("admitted");
     assert_eq!(
         stored_sender(&primitives, "flotilla/gui-approver", "from-alice").await,
         "project:flotilla/role:owner",

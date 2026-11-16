@@ -148,8 +148,8 @@ impl flotilla_crew::leaf_engine::ResourceIntentPublisher for ReceiverIntentPubli
         let spec = serde_json::from_value(document["spec"].clone()).map_err(|error| error.to_string())?;
         let name = document["metadata"]["name"].as_str().ok_or("missing name")?;
         let primitives = self.home.message_primitives().ok_or("the receiver home has no Message path")?;
-        let record = primitives.admit(namespace, name, &spec).await.map_err(|error| error.to_string())?;
-        Ok(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
+        let admitted = primitives.admit_old(namespace, name, &spec).await.map_err(|error| error.to_string())?;
+        Ok(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", namespace, admitted.record))
     }
 }
 

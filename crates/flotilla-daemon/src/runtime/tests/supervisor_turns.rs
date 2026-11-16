@@ -63,7 +63,7 @@ async fn a_message_commit_runs_a_pass_without_listing_messages() {
     let reads = Arc::new(CallerReads::default());
     let rows = || reads.snapshot().get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted));
     // Admission reads back the message it admits; what one admission costs, with nothing listening.
-    attributed(Arc::clone(&reads), primitives.admit(NAMESPACE, "first", &intent)).await.expect("admit");
+    attributed(Arc::clone(&reads), primitives.admit_old(NAMESPACE, "first", &intent)).await.expect("admit");
     let admission = rows();
 
     let (task, ready) = within(&reads, || super::super::tasks::spawn_pending_supervisor_turn_task(Arc::clone(&daemon), NAMESPACE.into()));
@@ -71,7 +71,7 @@ async fn a_message_commit_runs_a_pass_without_listing_messages() {
     ready.await.expect("startup ready");
 
     let (before, read) = (backend.read_snapshot(), rows());
-    attributed(Arc::clone(&reads), primitives.admit(NAMESPACE, "turn", &intent)).await.expect("admit");
+    attributed(Arc::clone(&reads), primitives.admit_old(NAMESPACE, "turn", &intent)).await.expect("admit");
     tokio::time::timeout(Duration::from_secs(5), async {
         while backend.read_snapshot().since(&before).calls("Convoy", ReadOperation::Query) == 0 {
             tokio::task::yield_now().await;

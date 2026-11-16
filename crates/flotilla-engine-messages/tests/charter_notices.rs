@@ -122,7 +122,7 @@ async fn read_by_a_charter_pass(count: usize) -> (u64, u64) {
             .relation(MessageRelation::System)
             .body(format!("other {index}"))
             .build();
-        primitives.admit(NAMESPACE, &format!("other-{index}"), &other).await.expect("another message");
+        primitives.admit_old(NAMESPACE, &format!("other-{index}"), &other).await.expect("another message");
     }
     let ((), reads) = measure(apply_and_notify(&backend, primitives, "second")).await;
     reads.get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted))
@@ -217,7 +217,7 @@ async fn custom_charter_renderer_uses_structured_revision_and_does_not_lock_admi
                 .relation(MessageRelation::System)
                 .body("independent admission".into())
                 .build();
-            self.primitives.admit(NAMESPACE, &format!("render-witness-{witness}"), &independent).await?;
+            self.primitives.admit_old(NAMESPACE, &format!("render-witness-{witness}"), &independent).await?;
             Ok("Custom template without revision marker".into())
         }
     }
@@ -273,12 +273,11 @@ async fn custom_charter_renderer_uses_structured_revision_and_does_not_lock_admi
 }
 
 // Behaviour: a charter pass picks the notice it supersedes without converting the receiver's
-// open messages; the scan loads them through the inbox's index, and only admission's read-back
-// converts.
+// open messages; the scan loads them through the inbox's index, and nothing converts.
 #[tokio::test]
 async fn a_charter_pass_picks_its_predecessor_without_converting_open_messages() {
     let (five, sixty) = (read_by_a_charter_pass(5).await, read_by_a_charter_pass(60).await);
-    assert_eq!(five.1, 1, "five other messages: {five:?}");
-    assert_eq!(sixty.1, 1, "sixty other messages: {sixty:?}");
+    assert_eq!(five.1, 0, "five other messages: {five:?}");
+    assert_eq!(sixty.1, 0, "sixty other messages: {sixty:?}");
     assert_eq!(sixty.0 - five.0, 55, "the scan loads each open message once: {five:?} {sixty:?}");
 }

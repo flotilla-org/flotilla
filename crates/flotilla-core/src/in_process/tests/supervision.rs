@@ -114,7 +114,7 @@ async fn supervisor_turn_reconciliation_noop_contract() {
                 .build();
             flotilla_engine_messages_testkit::designate_fleet(&backend, namespace).await;
             let primitives = install_engine_messages(&daemon);
-            primitives.admit(namespace, "input", &intent).await.expect("new Message");
+            primitives.admit_old(namespace, "input", &intent).await.expect("new Message");
             if terminal_message {
                 // Delivered, it awaits nothing more: it has ended.
                 flotilla_engine_messages_testkit::deliver_turn(&primitives, namespace, &intent.receiver, "input", "session", Utc::now())

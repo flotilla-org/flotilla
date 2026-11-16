@@ -136,7 +136,8 @@ impl KindRecords<OldMessage> for MessageRecords {
         spec: &MessageSpec,
     ) -> Result<Record<OldMessage>, String> {
         let namespace = self.namespace();
-        let (id, _) = self.primitives.admit_at(&namespace, name, spec).await.map_err(|error| error.to_string())?;
+        let intent = self.primitives.intent_of(&namespace, spec).await.map_err(|error| error.to_string())?;
+        let (id, _) = self.primitives.admit_at(name, &intent).await.map_err(|error| error.to_string())?;
         let view = self.primitives.verb_get(&namespace, &id).map_err(|error| error.to_string())?;
         self.object(view.ok_or_else(|| format!("Message {name} is not readable after its admission"))?)
     }

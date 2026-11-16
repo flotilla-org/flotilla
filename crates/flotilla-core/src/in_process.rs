@@ -5541,19 +5541,23 @@ impl InProcessDaemon {
             .map_err(|error| ResourceError::decode(format!("message spec: {error}")))?;
         let spec = flotilla_resources::qualify_message_spec(spec)?;
         let primitives = self.message_primitives().ok_or_else(|| ResourceError::other("no Message path is installed"))?;
-        let object = primitives.admit(namespace, &meta.name, &spec).await?;
+        let intent = primitives.intent_of(namespace, &spec).await?;
+        let admitted = primitives.admit(&meta.name, &intent).await?;
+        // The admitted record (or the one that suppressed it) and the home holding it.
         Ok(flotilla_store::DynamicResourceObject {
             kind: "Message".into(),
             plural: "messages".into(),
             namespace: namespace.to_owned(),
-            value: serde_json::to_value(serde_json::json!({
+            value: serde_json::json!({
                 "apiVersion": "flotilla.work/v1",
                 "kind": "Message",
-                "metadata": object.metadata,
-                "spec": object.spec,
-                "status": object.status,
-            }))
-            .map_err(|error| ResourceError::decode(error.to_string()))?,
+                "metadata": {
+                    "name": admitted.record,
+                    "namespace": namespace,
+                    "annotations": { flotilla_store::replica::ORIGIN_ROOT_ANNOTATION: admitted.home },
+                },
+                "spec": spec,
+            }),
         })
     }
 

@@ -55,20 +55,20 @@ async fn explicit_supersession_and_creation_retries_are_scoped_and_idempotent() 
     let home = home().await;
     let primitives = home.primitives();
     let original = spec(MessageExpectation::None);
-    let first = primitives.admit(NAMESPACE, "original", &original).await.expect("create");
-    let retry = primitives.admit(NAMESPACE, "original", &original).await.expect("retry");
-    assert_eq!((first.metadata.name.as_str(), retry.metadata.name.as_str()), ("original", "original"));
+    let first = primitives.admit_old(NAMESPACE, "original", &original).await.expect("create");
+    let retry = primitives.admit_old(NAMESPACE, "original", &original).await.expect("retry");
+    assert_eq!((first.record.as_str(), retry.record.as_str()), ("original", "original"));
     assert_eq!(held(primitives).await, 1, "a repeat admits nothing more");
     let mut replacement = original.clone();
     replacement.body = "different".into();
-    assert!(primitives.admit(NAMESPACE, "original", &replacement).await.is_err(), "another intent under the name");
+    assert!(primitives.admit_old(NAMESPACE, "original", &replacement).await.is_err(), "another intent under the name");
     replacement.supersedes = Some("original".into());
     replacement.sender = "flotilla/review".into();
-    let successor = primitives.admit(NAMESPACE, "replacement", &replacement).await.expect("explicit successor");
-    assert_eq!(successor.metadata.name, "replacement");
+    let successor = primitives.admit_old(NAMESPACE, "replacement", &replacement).await.expect("explicit successor");
+    assert_eq!(successor.record, "replacement");
     assert!(superseded(&state(primitives, "original").await));
     replacement.interrupting = true;
-    assert!(primitives.admit(NAMESPACE, "interrupt", &replacement).await.is_err(), "an interrupt from no supervisor");
+    assert!(primitives.admit_old(NAMESPACE, "interrupt", &replacement).await.is_err(), "an interrupt from no supervisor");
 }
 
 // Behaviour (ported from messaging's explicit_supersession_replaces_open_expectations): a message
@@ -80,7 +80,7 @@ async fn explicit_supersession_replaces_open_expectations() {
         let home = home().await;
         let primitives = home.primitives();
         let original = spec(expectation.clone());
-        primitives.admit(NAMESPACE, "original", &original).await.expect("original admission");
+        primitives.admit_old(NAMESPACE, "original", &original).await.expect("original admission");
         home.deliver_turn(RECEIVER, "original", "session").await;
         // A delivered message that awaits nothing has ended with its delivery.
         let awaits = !matches!(expectation, MessageExpectation::None);
@@ -88,8 +88,8 @@ async fn explicit_supersession_replaces_open_expectations() {
         assert_eq!(matches!(delivered, MessageState::Awaiting { .. }), awaits, "{delivered:?}");
         let mut replacement = original;
         replacement.supersedes = Some("original".into());
-        let admitted = primitives.admit(NAMESPACE, "replacement", &replacement).await.expect("explicit replacement");
-        assert_eq!(admitted.metadata.name, "replacement", "{expectation:?}");
+        let admitted = primitives.admit_old(NAMESPACE, "replacement", &replacement).await.expect("explicit replacement");
+        assert_eq!(admitted.record, "replacement", "{expectation:?}");
         let after = state(primitives, "original").await;
         assert!(if awaits { superseded(&after) } else { matches!(after, MessageState::Settled { .. }) }, "{after:?}");
     }
@@ -103,10 +103,10 @@ async fn a_name_admitted_again_after_its_message_is_archived_admits_nothing() {
     let home = home().await;
     let primitives = home.primitives();
     let original = spec(MessageExpectation::None);
-    primitives.admit(NAMESPACE, "history", &original).await.expect("admit");
+    primitives.admit_old(NAMESPACE, "history", &original).await.expect("admit");
     let mut successor = original.clone();
     successor.supersedes = Some("history".into());
-    primitives.admit(NAMESPACE, "successor", &successor).await.expect("supersede");
+    primitives.admit_old(NAMESPACE, "successor", &successor).await.expect("supersede");
     assert!(superseded(&state(primitives, "history").await));
     let inbox = primitives.inbox_for(NAMESPACE, RECEIVER).await.expect("inbox");
     let (id, _) = primitives.locate_in(&inbox, "history").expect("locate").expect("admitted");
@@ -129,8 +129,8 @@ async fn a_name_admitted_again_after_its_message_is_archived_admits_nothing() {
         .expect("archive");
     assert!(primitives.message(&id).await.expect("load").is_none(), "no longer held here");
 
-    let again = primitives.admit(NAMESPACE, "history", &original).await.expect("the repeat is taken as admitted");
-    assert_eq!(again.metadata.name, "history");
+    let again = primitives.admit_old(NAMESPACE, "history", &original).await.expect("the repeat is taken as admitted");
+    assert_eq!(again.record, "history");
     assert!(primitives.message(&id).await.expect("load").is_none(), "nothing admitted again");
     assert_eq!(held(primitives).await, 1, "only the successor");
 }

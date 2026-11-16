@@ -10,7 +10,7 @@ use flotilla_resources::{MessageExpectation, MessageReference, MessageRelation, 
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{machines::message::Deliver, Transport};
 use flotilla_store::{
-    load_metrics::{measure, ReadCounts},
+    load_metrics::{measure, measure_now, ReadCounts},
     ResourceBackend,
 };
 use flotilla_store_memory::InMemoryBackend;
@@ -53,21 +53,21 @@ async fn seeded(others: usize) -> (EngineMessagesHome, ResourceBackend) {
     primitives.inbox().bind(inbox.clone(), session.clone()).await.expect("bind");
     for n in 0..others {
         let name = format!("history-{n}");
-        primitives.admit(NAMESPACE, &name, &message(REVIEWER, CODER, MessageRelation::Supervisor, &name)).await.expect("admit");
+        primitives.admit_old(NAMESPACE, &name, &message(REVIEWER, CODER, MessageRelation::Supervisor, &name)).await.expect("admit");
         let (id, _) = primitives.locate_in(&inbox, &name).expect("locate").expect("admitted");
         primitives.inbox().receive(&session, &id, Transport::Turn).await.expect("receipt");
         primitives.inbox().deliver(&id, Deliver { receiver: session.clone(), transport: Transport::Turn }).await.expect("deliver");
         let other = format!("flotilla/other-{n}");
         primitives
-            .admit(NAMESPACE, &format!("elsewhere-{n}"), &message(REVIEWER, &other, MessageRelation::Supervisor, "elsewhere"))
+            .admit_old(NAMESPACE, &format!("elsewhere-{n}"), &message(REVIEWER, &other, MessageRelation::Supervisor, "elsewhere"))
             .await
             .expect("admit");
     }
-    primitives.admit(NAMESPACE, "brief", &message(REVIEWER, CODER, MessageRelation::Supervisor, "first brief")).await.expect("admit");
-    primitives.admit(NAMESPACE, "escalation", &escalation("second brief")).await.expect("admit");
-    primitives.admit(NAMESPACE, "turn", &message("system:turn-rules", CODER, MessageRelation::System, "a turn")).await.expect("admit");
+    primitives.admit_old(NAMESPACE, "brief", &message(REVIEWER, CODER, MessageRelation::Supervisor, "first brief")).await.expect("admit");
+    primitives.admit_old(NAMESPACE, "escalation", &escalation("second brief")).await.expect("admit");
+    primitives.admit_old(NAMESPACE, "turn", &message("system:turn-rules", CODER, MessageRelation::System, "a turn")).await.expect("admit");
     let stall = message("system:stall-judge", CODER, MessageRelation::Supervisor, "a stall");
-    primitives.admit(NAMESPACE, "stall", &stall).await.expect("admit");
+    primitives.admit_old(NAMESPACE, "stall", &stall).await.expect("admit");
     (home, backend)
 }
 
@@ -77,13 +77,14 @@ async fn command_reads(others: usize) -> Vec<(String, ReadCounts)> {
     let primitives: &MessagePrimitives = home.primitives();
     let mut costs = Vec::new();
 
-    let (undelivered, reads) =
-        measure(primitives.undelivered_from(NAMESPACE, &message(REVIEWER, CODER, MessageRelation::Supervisor, "next"))).await;
+    let next = primitives.intent_of(NAMESPACE, &message(REVIEWER, CODER, MessageRelation::Supervisor, "next")).await.expect("intent");
+    let (undelivered, reads) = measure_now(|| primitives.undelivered_from(&next));
     let undelivered = undelivered.expect("undelivered read").expect("an undelivered brief");
     assert_eq!((undelivered.standing.name.as_str(), undelivered.body.as_str()), ("escalation", "second brief"));
     costs.push((format!("undelivered_from: {}", undelivered.standing.name), reads));
 
-    let (awaited, reads) = measure(primitives.awaited_reply_from(NAMESPACE, &escalation(""))).await;
+    let ruling = primitives.intent_of(NAMESPACE, &escalation("")).await.expect("intent");
+    let (awaited, reads) = measure_now(|| primitives.awaited_reply_from(&ruling));
     assert_eq!(awaited.expect("awaited read").as_deref(), Some("escalation"));
     costs.push(("awaited_reply_from".into(), reads));
 

@@ -345,7 +345,7 @@ async fn read_by_a_card_change(count: usize) -> (u64, u64) {
             .relation(flotilla_resources::MessageRelation::System)
             .body(format!("open {index}"))
             .build();
-        primitives.admit("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
+        primitives.admit_old("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
     }
     let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
     let tracker = CapabilityCardTracker::with_message_path(crew.message_path.clone());
@@ -359,10 +359,10 @@ async fn read_by_a_card_change(count: usize) -> (u64, u64) {
     reads.get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted))
 }
 
-// Behaviour: a card change loads only its pending notice and admission's read-back, whatever else
-// the crew holds, and converts only that read-back (#3108).
+// Behaviour: a card change loads only its pending notice, whatever else the crew holds, and
+// converts nothing (#3108).
 #[tokio::test]
 async fn a_card_change_reads_its_notices_without_converting_them() {
-    assert_eq!(read_by_a_card_change(5).await, (2, 1), "five other messages");
-    assert_eq!(read_by_a_card_change(60).await, (2, 1), "sixty other messages");
+    assert_eq!(read_by_a_card_change(5).await, (1, 0), "five other messages");
+    assert_eq!(read_by_a_card_change(60).await, (1, 0), "sixty other messages");
 }

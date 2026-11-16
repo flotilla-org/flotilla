@@ -241,10 +241,12 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     let read = engine_a.read_message(&request, sent.spec().inbox.clone()).await.expect("routed read");
     assert!(read.remote && read.age_micros >= 0 && read.home == home_b, "{read:?}");
     // A reply link resolves at the original's home; a name no home holds is absent, not unknown.
-    assert_eq!(engine_a.resolve_in_reply_to(NS, &answer).await, flotilla_messaging::MessageResolution::Found);
+    let answered = engine_a.intent_of(NS, &answer).await.expect("intent");
+    assert_eq!(engine_a.resolve_in_reply_to(&answered).await, flotilla_messaging::MessageResolution::Found);
     let unsent =
         MessageSpec { in_reply_to: Some(flotilla_resources::message_record_name(&receiver, "system:turn-rules", "never")), ..answer };
-    assert_eq!(engine_a.resolve_in_reply_to(NS, &unsent).await, flotilla_messaging::MessageResolution::Absent);
+    let unsent = engine_a.intent_of(NS, &unsent).await.expect("intent");
+    assert_eq!(engine_a.resolve_in_reply_to(&unsent).await, flotilla_messaging::MessageResolution::Absent);
 
     pump(&store_b, &home_b, &store_a, &mut b_to_a);
 
@@ -304,7 +306,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         let reference = MessageRef::new(message.name(), &home_b);
         assert!(engine_a.awaiting().get(&reference).is_none(), "sender continuation has not written its record yet");
         if !*late_record {
-            engine_a.await_reply(NS, &name, &cancel, &home_b, "reply", None).await.expect("sender record");
+            engine_a.await_reply_old(NS, &name, &cancel, &home_b, "reply", None).await.expect("sender record");
         }
         pump(&store_b, &home_b, &store_a, &mut b_to_a);
         engine_a.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut observer).await.expect("live observation");
@@ -339,7 +341,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         }
         if *late_record {
             engine_a.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut observer).await.expect("drop arrives before the record");
-            engine_a.await_reply(NS, &name, &cancel, &home_b, "reply", None).await.expect("late sender record");
+            engine_a.await_reply_old(NS, &name, &cancel, &home_b, "reply", None).await.expect("late sender record");
             assert_eq!(engine_a.awaiting().get(&reference).expect("late record").label(), AwaitingReplyLabel::Withdrawn);
         }
         if *restart {
@@ -348,7 +350,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         for _ in 0..2 {
             engine_a.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut observer).await.expect("sender observes receiver drop");
             assert_eq!(engine_a.awaiting().get(&reference).expect("sender record").label(), AwaitingReplyLabel::Withdrawn);
-            assert!(!engine_a.await_reply(NS, &name, &cancel, &home_b, "reply", None).await.expect("repeat send"));
+            assert!(!engine_a.await_reply_old(NS, &name, &cancel, &home_b, "reply", None).await.expect("repeat send"));
             assert_eq!(engine_a.awaiting().get(&reference).expect("repeated record").label(), AwaitingReplyLabel::Withdrawn);
             assert_eq!(
                 engine_a.awaiting().get(&MessageRef::new(sent.name(), &home_b)).expect("answered record").label(),

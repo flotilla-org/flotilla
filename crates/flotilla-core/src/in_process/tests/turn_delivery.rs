@@ -328,7 +328,7 @@ async fn read_by_routing_a_reply(count: usize) -> (u64, u64) {
             .relation(flotilla_resources::MessageRelation::System)
             .body(format!("other {index}"))
             .build();
-        primitives.admit("flotilla", &format!("other-{index}"), &intent).await.expect("another message");
+        primitives.admit_old("flotilla", &format!("other-{index}"), &intent).await.expect("another message");
     }
     let reply = serde_json::json!({
         "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"reply"},

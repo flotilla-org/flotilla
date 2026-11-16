@@ -1409,7 +1409,8 @@ impl CrewService {
             }
             return Ok(linked);
         }
-        // The escalation runs the other way: from the crew to this ruling's sender, about the convoy.
+        // The escalation runs the other way: from the crew to this ruling's sender, about the convoy
+        // at any revision: the read compares what it refers to, not at which revision.
         let escalation = flotilla_resources::MessageSpec::builder()
             .sender(receiver.to_owned())
             .receiver(sender.to_owned())
@@ -1417,7 +1418,7 @@ impl CrewService {
             .body(String::new())
             .references(vec![flotilla_resources::MessageReference::ControlRecord {
                 resource: ResourceRef::new("flotilla.work/v1", "Convoy", namespace, convoy_name),
-                revision: String::new(),
+                revision: "any".into(),
             }])
             .build();
         let found = self.awaited_reply_from(namespace, &escalation).await.map_err(|error| error.to_string())?;
@@ -2681,17 +2682,12 @@ impl CrewService {
                 return Err("receiver-home resource mutation router unavailable".into());
             }
             let existing = self.admitted_message(&request.namespace, &intent, &name).await.map_err(|error| error.to_string())?.is_some();
-            let admission = self
+            let admitted = self
                 .admit_message(&request.namespace, &InputMeta::builder().name(name).build(), &intent)
                 .await
                 .map_err(|error| error.to_string())?;
-            let object = match admission {
-                flotilla_messaging::MessageAdmission::Accepted(object) => object,
-                flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
-            };
-            let home = object.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
-            self.record_awaiting(&request.namespace, &object.metadata.name, &intent, home, request.stall_of.as_deref()).await?;
-            (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, object.metadata.name), !existing)
+            self.record_awaiting(&request.namespace, &admitted.record, &intent, Some(admitted.home), request.stall_of.as_deref()).await?;
+            (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, admitted.record), !existing)
         };
         Ok(CrewTurnAdmission { message, new_turn, rung: TurnDeliveryRung::WarmSession })
     }
@@ -2994,17 +2990,12 @@ impl CrewService {
             {
                 return Err("receiver-home resource mutation router unavailable".into());
             }
-            let admission = self
+            let admitted = self
                 .admit_message(&request.namespace, &InputMeta::builder().name(name.clone()).build(), intent)
                 .await
                 .map_err(|error| error.to_string())?;
-            let record = match admission {
-                flotilla_messaging::MessageAdmission::Accepted(record) => record,
-                flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
-            };
-            let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
-            self.record_awaiting(&request.namespace, &record.metadata.name, intent, home, request.stall_of.as_deref()).await?;
-            ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
+            self.record_awaiting(&request.namespace, &admitted.record, intent, Some(admitted.home), request.stall_of.as_deref()).await?;
+            ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, admitted.record)
         };
         Ok(message)
     }
@@ -3282,17 +3273,12 @@ impl CrewService {
         if holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
             return Err("receiver-home resource mutation router unavailable".into());
         }
-        let admission = self
+        let admitted = self
             .admit_message(namespace, &InputMeta::builder().name(name.into()).build(), intent)
             .await
             .map_err(|error| error.to_string())?;
-        let record = match admission {
-            flotilla_messaging::MessageAdmission::Accepted(record) => record,
-            flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
-        };
-        let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
-        self.record_awaiting(namespace, &record.metadata.name, intent, home, None).await?;
-        Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
+        self.record_awaiting(namespace, &admitted.record, intent, Some(admitted.home), None).await?;
+        Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, admitted.record))
     }
 
     /// Records the sender's half of a send expecting a reply or an outcome,
@@ -3312,14 +3298,12 @@ impl CrewService {
         stall_of: Option<&str>,
     ) -> Result<(), String> {
         let Some(kind) = awaiting_kind(&intent.expectation, stall_of) else { return Ok(()) };
-        let engine = self.message_primitives().map_err(|error| error.to_string())?;
         let Some(home) = home else {
             // A receiver home off the engine path answers without it, on every repeat.
             tracing::debug!(message = %name, "the receiver home reported no admitting home; no awaiting-reply record");
             return Ok(());
         };
-        engine
-            .await_reply(namespace, name, intent, &home, kind, stall_of)
+        self.await_reply(namespace, name, intent, &home, kind, stall_of)
             .await
             .map(|_| ())
             .map_err(|error| format!("message `{name}` is admitted, but its awaiting-reply record is not written yet: {error}"))

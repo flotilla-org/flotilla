@@ -755,7 +755,7 @@ async fn a_message_commit_wakes_the_convoys_holding_delivery_without_listing_mes
                 .relation(MessageRelation::System)
                 .body(format!("turn {n}"))
                 .build();
-            primitives.admit(NAMESPACE, &format!("turn-{n}"), &intent).await.expect("admit");
+            primitives.admit_old(NAMESPACE, &format!("turn-{n}"), &intent).await.expect("admit");
         }
     };
     // The test's reads and its watches' count for one caller, as a controller's watches do.
@@ -1291,33 +1291,30 @@ impl flotilla_messaging::EngineMessages for Turns {
     async fn holds(&self, _: &str, _: &str, _: &str) -> Result<bool, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message by name")
     }
-    async fn admitted(
+    async fn intent_of(
         &self,
         _: &str,
         _: &flotilla_resources::MessageSpec,
+    ) -> Result<flotilla_messaging::Intent, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler sends nothing")
+    }
+    async fn admitted(
+        &self,
+        _: &flotilla_address::Address,
         _: &str,
     ) -> Result<Option<flotilla_messaging::AdmittedMessage>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
-    async fn open_superseded(
-        &self,
-        _: &str,
-        _: &flotilla_resources::MessageSpec,
-    ) -> Result<Option<String>, flotilla_resources::ResourceError> {
+    async fn open_superseded(&self, _: &flotilla_messaging::Intent) -> Result<Option<String>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
     async fn undelivered_from(
         &self,
-        _: &str,
-        _: &flotilla_resources::MessageSpec,
+        _: &flotilla_messaging::Intent,
     ) -> Result<Option<flotilla_messaging::SentMessage>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
-    async fn awaited_reply_from(
-        &self,
-        _: &str,
-        _: &flotilla_resources::MessageSpec,
-    ) -> Result<Option<String>, flotilla_resources::ResourceError> {
+    async fn awaited_reply_from(&self, _: &flotilla_messaging::Intent) -> Result<Option<String>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
     async fn queued_briefs(
@@ -1345,12 +1342,11 @@ impl flotilla_messaging::EngineMessages for Turns {
     async fn admit(
         &self,
         _: &str,
-        _: &str,
-        _: &flotilla_resources::MessageSpec,
-    ) -> Result<ResourceObject<flotilla_resources::Message>, flotilla_resources::ResourceError> {
+        _: &flotilla_messaging::Intent,
+    ) -> Result<flotilla_messaging::Admitted, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler admits nothing")
     }
-    async fn resolve_in_reply_to(&self, _: &str, _: &flotilla_resources::MessageSpec) -> flotilla_messaging::MessageResolution {
+    async fn resolve_in_reply_to(&self, _: &flotilla_messaging::Intent) -> flotilla_messaging::MessageResolution {
         unreachable!("the convoy reconciler links no replies")
     }
     async fn withdraw(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), String> {
@@ -1363,7 +1359,7 @@ impl flotilla_messaging::EngineMessages for Turns {
         &self,
         _: &str,
         _: &str,
-        _: &flotilla_resources::MessageSpec,
+        _: &flotilla_messaging::Intent,
         _: &str,
         _: &str,
         _: Option<&str>,
